@@ -1,0 +1,55 @@
+# ---- build trees -----------------------------------------------------------
+build/
+build-*/
+*.o
+*.a
+*.so
+*.so.*
+CMakeCache.txt
+CMakeFiles/
+
+# ---- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+web/.venv/
+
+# External-solver baselines (HiGHS / SciPy / PuLP). NEVER commit: the venv
+# contains libhighs.so, and shipping a competitor solver's binary would
+# contradict the clean-room claim in docs/clean_room_policy.md. Recreate with:
+#   python3 -m venv benchmarks/.venv-baseline
+#   benchmarks/.venv-baseline/bin/pip install -r benchmarks/requirements-baseline.txt
+benchmarks/.venv-baseline/
+
+# ---- competitor log files written into the working tree --------------------
+# highspy drops this in the CWD on every run.
+Highs.log
+
+# ---- generated run outputs -------------------------------------------------
+demo_out/
+nohup.out
+*.out
+*.log
+
+# ---- benchmark INSTANCES ---------------------------------------------------
+# Instance sets are deliberately KEPT in the repo so every published number is
+# reproducible from a clean clone. Only the two bulk downloads below are
+# excluded, purely on size grounds.
+#
+# MIPLIB 2017 collection (~7.3 GB). Re-download:
+#   curl -fL -o /tmp/collection.zip https://miplib.zib.de/downloads/collection.zip
+#   unzip -o -d benchmarks/miplib2017/mps /tmp/collection.zip
+benchmarks/miplib2017/mps/
+benchmarks/miplib2017/*.zip
+# Synthetic scaling-study LPs (generated, up to ~150 MB each). Regenerate:
+#   python3 scripts/gen_lp_ladder.py
+benchmarks/synthetic/mps/
+
+# ---- generated tool binaries -----------------------------------------------
+tools/julia_gpu/bench_julia_gpu_overhead
+tools/julia_gpu/*.jsonl
+
+# ---- benchmark RESULTS (ignore all; force-add the citable runs) ------------
+# Promote a run with:  git add -f benchmarks/results/<stamp>.md <stamp>.jsonl
+benchmarks/results/*
