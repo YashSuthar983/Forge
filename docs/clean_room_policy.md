@@ -1,8 +1,9 @@
 # SOR — Clean-room reference policy
 
 **Status:** team rule · binding for all numeric-core work  
-**Version:** 1.0 — 28 Aug 2026  
-**See also:** `master_spec.md` §7 · `architecture.md` §13
+**See also:** `master_spec.md` §7 · `architecture.md` §13 · `dependency_ledger.md` §4
+
+**This file is the single source of truth for the forbidden-dependency list (§"Forbidden dependencies" below).** Other documents reference this list rather than restating it.
 
 ---
 
@@ -13,6 +14,25 @@ The SIH problem statement requires a solver **built from mathematical foundation
 This document defines how the team may use HiGHS, SCIP, and similar projects **without embedding them** and **without porting their implementations**.
 
 ---
+
+## Forbidden dependencies — the canonical list
+
+Never in the solve path, never linked, never vendored, never translated:
+
+**LP/MIP solvers** — COIN-OR CBC / CLP · HiGHS (including `pdlp_gpu`, which is cuPDLP-C) · GLPK · SCIP / SoPlex / PaPILO · Google OR-Tools / PDLP · NVIDIA cuOpt · CPLEX / Gurobi / Xpress / MOSEK / COPT · SciPy `linprog` · JuMP / MathOptInterface solver backends
+
+**NLP/global solvers** — Ipopt / Bonmin / Couenne / SHOT / BARON
+
+**Numeric kernels** — any third-party sparse LU, sparse Cholesky, or LP/MIP/NLP kernel
+
+**Research first-order LP codes** — cuPDLP / cuPDLP-C / **cuPDLPx** · **HPR-LP / HPR-LP-C** · **PSLP** (the presolver from Cederberg & Boyd, arXiv:2604.23951). These are the codes SOR's first-order engine is modelled on, so they are the *highest-risk* sources to open. Their **papers** are the required input; their repositories are forbidden. See `paper_bibliography.md` Phase 1.
+
+### Explicitly allowed
+
+Language standard library · CUDA toolkit and compiler · **Vulkan / SPIR-V and the shader toolchain** (a device specification, not a solver) · HIP / ROCm / SYCL toolchains · dense BLAS/LAPACK for dense blocks only (ledger it) · published papers and textbooks · public benchmark **instances** (MIPLIB, Netlib, QPLIB, MINLPLib, pooling libraries) · HiGHS/SCIP/CBC as an **external process** for differential testing and baselines — never linked, never inside a certificate.
+
+---
+
 
 ## Core rule
 
@@ -41,14 +61,13 @@ Open-source solver repos: REFERENCE ONLY
 
 ---
 
-## Allowed with caution (one person, logged)
+## Allowed with caution (one person only)
 
 Use only when stuck after paper + oracle comparison.
 
 1. Open upstream source to answer: **"Does this presolve rule / trick appear in the literature?"**
 2. If **yes** → close the repo tab → implement from the **paper**.
 3. If **no** → **do not** implement that rule from their code.
-4. Record in `sor/docs/reference_log.md` (date, person, file looked at, question, outcome, paper used).
 
 **Never** side-by-side reimplementation with their `.cpp` open.
 
@@ -89,7 +108,6 @@ Use only when stuck after paper + oracle comparison.
 | **No** `third_party/highs` (or any solver tree) | Code review + repo scan |
 | Numeric-core PRs require **2nd reviewer** | Git workflow |
 | Commit messages cite **papers**, not line numbers | e.g. `Harris ratio test (Harris 1973)` not `from HiGHS line 420` |
-| **Reference log** when someone opens upstream source | `sor/docs/reference_log.md` |
 | HiGHS baseline labeled `"kind": "external_process"` in bench JSON | Never inside certificate |
 
 ---

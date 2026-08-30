@@ -15,7 +15,7 @@
 //     prox_{sigma g*}(v) = v - sigma * proj_[row_lo,row_hi](v / sigma),
 // which is ONE formula covering equality, <=, >=, and ranged rows.
 //
-// PROTOTYPE SCOPE (docs/prompts/julia_gpu_prototype.md): this is vanilla PDHG.
+// PROTOTYPE SCOPE: this is vanilla PDHG.
 // The competitive first-order engine -- adaptive restarts on normalized duality
 // gap, primal weight balancing, adaptive step size, Halpern/reflected
 // acceleration, feasibility polishing -- is Phase 1 work

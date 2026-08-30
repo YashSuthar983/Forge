@@ -1,7 +1,6 @@
 # SOR — Implementation Plan
 
-**Version:** 2.0 — written 28 Aug 2026
-**Companion docs:** `architecture.md` (contracts and layering), `master_spec.md` (targets, claims, algorithm register)
+**Companion docs:** `architecture.md` (contracts and layering), `master_spec.md` (targets, claims, algorithm register), `paper_bibliography.md` (clean-room papers/DOIs per phase)
 **Planning horizon:** 28 Aug 2026 → Q1 2028. The 20 Sep 2026 SIH idea deadline and the Dec 2026 grand finale are checkpoints inside the plan, not the plan.
 
 ---
@@ -11,7 +10,7 @@
 1. **Vertical slices, never horizontal layers.** Every phase ends with a runnable `sor_solve` → `sor_check` path over real instances. No phase ends with "the LU factorization is done."
 2. **The architecture is built once, the algorithms land continuously.** The six commitments (C1–C6 in `architecture.md`) go in during Phase 0 while the codebase is small enough to shape. Everything after that is filling in seams.
 3. **Every gate is an executable command.** A gate that is a paragraph of prose is not a gate.
-4. **Measure before optimising, and measure against an external process.** HiGHS as a separate binary is the reference oracle from day one. Follow **`sor/docs/clean_room_policy.md`** — oracle by default, upstream source only when logged.
+4. **Measure before optimising, and measure against an external process.** HiGHS as a separate binary is the reference oracle from day one. Follow **`clean_room_policy.md`** — oracle by default, upstream source only when logged.
 5. **Claims lag capability by one phase.** A capability is claimable only after its gate passes on a named public instance set.
 
 ---
@@ -19,7 +18,35 @@
 ## Phase 0 — Spine and SIH submission
 **28 Aug → 20 Sep 2026 · 23 days · deadline-driven**
 
+> **Sequencing precedence (29 Aug–20 Sep):** week-by-week order is **`gpu_first_order_plan.md` §6** (FO/HPR + `LpDevice` before Sprint 1 simplex). This phase still owns the *scope* (G0–G2 gates, SIH PDF). Sprint 1 deliverables below remain in Phase 0 scope but are **reordered after** rethink Weeks 1–2, not cancelled. From Oct 2026 onward, this file’s Phase 1+ tables are authoritative again.
+
 Goal: a credible vertical slice plus the idea PDF. Not a competitive solver — a solver *shaped* correctly, with the hard architectural decisions already made.
+
+> ### Status check, 29 Aug 2026 — day 2 of 23, verified by running the code
+>
+> **Done (not in the original Sprint 0 list, delivered anyway):** MPS reader
+> (93/93 Netlib parse), CSR + SpMV, Ruiz scaling, vanilla PDHG, `Status` /
+> `ProofLevel` / `finalize_result()`, `test_no_unproved_optimal`, 6 passing ctest
+> targets, `.gitignore`, and a working HiGHS/CBC/SciPy external-baseline harness.
+> `ldd` confirms no solver library linked.
+>
+> **Not done from Sprint 0:** `sor_det` (C3), `sor_num` (C4), `sor_transform`
+> (C6), `sor_policy` (C5), `StructureMap` / `FamilyFingerprint` (C2), and **all
+> five `scripts/check_*` gates**. 17 of the 24 modules in `architecture.md` §2 do
+> not exist.
+>
+> **Therefore Gate G0 below cannot currently pass** — 2 of its 4 command lines
+> invoke three scripts that have not been written (`check_layering.py`,
+> `check_forbidden_deps.sh`, `check_no_walltime.sh`). Lines 1 and 4 (build+ctest,
+> and `test_no_unproved_optimal`) do pass. This is a real slip against the
+> plan's own warning that "this is the one week where C1–C6 are cheap," and it
+> should be treated as one rather than quietly re-scoped.
+>
+> **Revised near-term sequencing** supersedes Sprint 1's ordering: the highest
+> measured return right now is in the first-order engine, not the simplex. See
+> `gpu_first_order_plan.md` §6 for the week-by-week plan, which front-loads the
+> primal weight (measured 18× on dual residual), restart, and the timing-overhead
+> fix (measured 1.94×) ahead of sparse LU.
 
 ### 0.1 Sprint 0 — foundations (28 Aug – 2 Sep)
 
@@ -63,13 +90,24 @@ ctest --test-dir build -R test_no_unproved_optimal
 
 **Gate G1:**
 ```bash
-scripts/run_bench.py --suite netlib-full --engine primal-simplex --verify strict
-# Required: >= 80/98 Netlib instances Optimal with checker PASS,
-#           0 instances reporting Optimal with a checker FAIL,
+python3 scripts/run_netlib.py --engine simplex --time-limit 60 \
+        --jsonl benchmarks/results/netlib_simplex.jsonl
+python3 scripts/verify_vs_highs.py benchmarks/results/netlib_simplex.jsonl
+# Required: >= 75/93 Netlib instances Optimal,
+#           0 disagreements against the external HiGHS objective,
 #           all infeasible Netlib cases produce a verified Farkas ray.
 ```
 
 The second condition matters more than the first. A wrong `Optimal` is a project-ending bug; a timeout is a Tuesday.
+
+**Status, measured 30 Aug 2026: the first two conditions PASS.** 81/93 Optimal in
+49 s, 81 agree with HiGHS, 0 disagree. The Farkas condition is **not** met: the
+simplex proves infeasibility by terminating phase 1 with positive infeasibility
+but does not yet emit a ray, so infeasible instances are reported honestly and
+without a certificate. The remaining 12 split into 6 phase-1 stalls (bore3d,
+dfl001, modszk1, stocfor2, tuff, woodw) and 6 whose dual residual sits above
+1e-7 (etamacro, grow22, maros, perold, pilot.ja, pilot87) and are therefore
+demoted to `Feasible` rather than reported as optimal.
 
 ### 0.3 Sprint 2 — MILP, QP, demos, PDF (13 – 20 Sep)
 
@@ -101,7 +139,7 @@ Pre-committed, so day 19 is a decision rather than a panic.
 | Date | If not done | Cut |
 |---|---|---|
 | 8 Sep | Sparse LU with FT update not passing Netlib-small | Drop MILP entirely; ship LP + checker + QP. An honest LP-only slice beats a broken MILP |
-| 12 Sep | Gate G1 below 60/98 | Drop Gomory cuts (`--cuts=none`); B&B with branching only |
+| 12 Sep | Gate G1 below 55/93 | Drop Gomory cuts (`--cuts=none`); B&B with branching only |
 | 15 Sep | Generators not producing valid MPS | Ship two of three; blending LP is mandatory, scheduling MILP next, dispatch QP droppable |
 | 17 Sep | HiGHS baseline confusing the clean-room narrative in PDF review | Drop the baseline; publish quality tables only |
 | 18 Sep | — | **Feature freeze.** PDF and demo script only |
@@ -118,8 +156,9 @@ Goal: an LP engine that is credible against HiGHS, and a working GPU path.
 | Simplex | **Dual simplex primary** · bound-flipping (long-step) ratio test · dual steepest-edge pricing · partial pricing with candidate lists · bound-shifting perturbation and anti-cycling · crash basis · `resolve()` warm-start path |
 | Hypersparsity | Full Hall–McKinnon treatment in FTRAN/BTRAN/pricing. **Expect ~10× on large sparse instances**; this is the phase's largest single win |
 | Presolve | Complete reduction library: probing, clique merging, dual fixing, dominated columns, parallel/duplicate rows and columns, implied-free substitution, doubleton equations, aggregation |
-| First-order | PDHG → restarted PDHG → **Halpern / reflected-restarted (HPR)** · Ruiz + Pock–Chambolle preconditioning · adaptive restarts on normalized duality gap · primal weight balancing · adaptive step size · feasibility polishing |
-| GPU | CUDA `KernelBackend`: fused fixed-pattern SpMV for A and Aᵀ · on-device reductions (no per-iteration host sync) · f32 iterate with f64 refinement · **batched kernels** |
+| First-order | **Halpern restarted PDHG (HPR) directly** — arXiv:2408.12179 · Ruiz + Pock–Chambolle preconditioning · adaptive restart on normalized duality gap · **PID primal-weight control** (cuPDLPx, arXiv:2507.14051) · adaptive step size · iterate averaging · feasibility polishing. **Not** PDHG → PDLP → HPR as three milestones: arXiv:2509.23903 shows cuPDLPx's base algorithm is a special case of HPR-LP's, so that is three rewrites of one loop. Build HPR once and disable features to get the weaker methods |
+| Presolve (first-order) | Lightweight rule subset per **Cederberg & Boyd, arXiv:2604.23951** (Apr 2026). GPU first-order speedups are not end-to-end without it |
+| GPU | **`LpDevice` seam, not per-op `KernelBackend`** (`architecture.md` §3.3.1): device owns state, host calls `hpr_steps(k)` with zero sync and `reduce_kkt()` returning ~8 doubles. Six fused kernels. **Vulkan/SPIR-V primary** — measurable locally on the RX 5500M — CUDA second for a Colab-class parity column. f32 iterate with f64 reductions (mandatory: RDNA1 consumer fp64 is 1/16 rate) · **batched kernels** |
 | Crossover | First-order/interior point → basic solution. Lifts the GPU path to `ProvedOptimalFP` |
 | Accuracy | Gleixner–Steffy iterative refinement on final solutions |
 | Concurrent | `make_concurrent()` racing dual simplex against first-order, deterministic winner selection |
@@ -271,13 +310,14 @@ Sparse LU with a proper update · hypersparsity · presolve · cut *management* 
 |---|---|---|---|
 | Sparse LU + Forrest–Tomlin takes longer than Sprint 1 allows | **High** | Blocks everything | It is the single named critical-path item. Start day 1 of Sprint 1, two people if needed, de-scope trigger at 8 Sep |
 | Hypersparsity underestimated; LP is 100× slow and nobody knows why | **High** | Phase 1 gate miss | Profile against the HiGHS external oracle from day one. Instrument FTRAN/BTRAN result density explicitly |
-| No NVIDIA GPU on the dev machine | Certain | GPU claims unmeasurable | Colab/Kaggle T4 with committed artifacts. Escalate by 7 Sep. If no measured run by 11 Sep: ship source, report unmeasured, **never fabricate a number** |
+| GPU availability — **not a risk** | — | — | There is an **AMD Radeon RX 5500M (Navi 14, 4080 MiB)** with Vulkan 1.4 compute, fp64, a dedicated compute queue, and device access already granted. Only *CUDA* is unavailable. GPU work is measurable locally every day, which is what the "never fabricate a number" rule actually requires. Vulkan primary, CUDA second |
+| Netlib is too small to demonstrate any GPU benefit | **Certain** | GPU story has no venue on the PS's own LP set | Verified: largest Netlib instance is `maros-r7` at 144,848 nnz — the whole suite is a few MB and will not saturate a 224 GB/s device. Use **MIPLIB 2017 LP relaxations** (10⁵–10⁷ nnz) as the GPU tier, and publish the 4 GB VRAM skips on LPfeas honestly. See `gpu_first_order_plan.md` §5.2 |
 | Batched-LP accuracy insufficient for strong branching | Medium | Kills the Phase 2 headline | Measured as a Phase 1 spike, before Phase 2 commits. Fallback is reliability pseudocost, which is the classical default anyway |
 | Learned policies fail to generalise | Medium | Phase 3 workstream | Already scoped *within-family* rather than general-purpose, which is where the literature's replication problem lives. Classical fallback always live |
 | VIPR log emission too expensive for the hot path | Medium | Feature stays opt-in | Acceptable outcome. Opt-in certified mode is still unique in the market |
 | Rational arithmetic is a bigger project than budgeted | Medium | `ProvedOptimalExact` slips | Open question 1 — interval arithmetic plus f64 refinement is the fallback rigor level |
 | A wrong `Optimal` ships | Low | **Project-ending** | Checker on every result; tamper tests; certifying presolve; differential testing vs external HiGHS process |
-| Someone "references" a solver repo under deadline pressure | Medium | **Disqualification** | **`clean_room_policy.md`**: oracle default; logged one-person source lookups; CI dependency gate; 2nd reviewer on numeric-core PRs; `reference_log.md` |
+| Someone "references" a solver repo under deadline pressure | Medium | **Disqualification** | **`clean_room_policy.md`**: oracle default; one-person source lookups only when unavoidable; CI dependency gate; 2nd reviewer on numeric-core PRs |
 | Scope creep from this document | **High** | Everything slips | Phase gates are sequential. No Phase N+1 work begins before Gate GN passes |
 
 ---

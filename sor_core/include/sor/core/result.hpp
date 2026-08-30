@@ -60,7 +60,9 @@ std::string_view to_string(ProofLevel) noexcept;
 
 // Human-readable line for the CLI, e.g.
 //   "feasible (no dual bound - first-order method)"
-// Required by SENIOR_REVIEW.md decision #2.
+// A first-order feasible point must be visibly distinguishable from a proved
+// optimum in CLI output, so that "Feasible" is never over-read as "Optimal".
+// This function is the only place that wording lives.
 std::string_view human_line(Status, ProofLevel) noexcept;
 
 inline constexpr f64 kNaN = std::numeric_limits<f64>::quiet_NaN();

@@ -9,7 +9,7 @@
 // implementing this same interface. Julia is a kernel lab: it lets us write a
 // kernel once, run it on CPU/CUDA/ROCm/oneAPI via KernelAbstractions, and find
 // out which formulations are worth porting. See
-// docs/prompts/julia_gpu_prototype.md and tools/julia_gpu/README.md.
+// tools/julia_gpu/README.md and tools/julia_gpu/README.md.
 //
 // No SIH claim of GPU acceleration may rest on this path.
 #pragma once

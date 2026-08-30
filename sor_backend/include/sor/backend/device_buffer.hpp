@@ -5,9 +5,14 @@
 // C1 (docs/architecture.md §1): the backend owns large buffers; engines never
 // touch raw device pointers. In this prototype every backend stages through
 // host memory -- the CPU backend computes there directly, and the Julia backend
-// serialises from there (docs/prompts/julia_gpu_prototype.md, "DeviceBuffer on
-// Julia path: host-staging buffers in C++"). A real CudaBackend will keep the
-// storage device-resident behind this same interface without changing callers.
+// serialises from there.
+//
+// HONEST LIMITATION: this type does NOT deliver C1. `operator[]` returns a
+// reference and `host()` hands out the vector, so host addressability is part of
+// the contract and callers depend on it. A device-resident backend therefore
+// cannot be dropped in behind this interface -- see docs/architecture.md §3.3.1
+// for why, and for the `LpDevice` seam that replaces it for the first-order
+// engine.
 #pragma once
 
 #include "sor/core/result.hpp"

@@ -1,14 +1,18 @@
 # SOR Julia GPU sidecar — EXPERIMENTAL
 
-**Status: kernel lab. Not the ship path. No SIH claim of GPU acceleration may rest on this.**
+**Status: kernel lab. Not the ship path. No SIH claim of GPU acceleration may rest on this. Slated for deletion — see `sor/docs/dependency_ledger.md` §3.**
 
-The production target is a C++ `CudaBackend` implementing the same
-`sor::backend::KernelBackend` interface. This package exists to write a kernel
-once, run it on CPU/CUDA/ROCm/oneAPI/Metal via KernelAbstractions.jl, and find
-out which formulations are worth porting to C++ CUDA.
+The production target is an in-process **Vulkan compute** backend behind the
+`LpDevice` seam (`sor/docs/architecture.md` §3.3.1), with CUDA as a second
+backend. Vulkan is primary because it is measurable on this machine's AMD
+Radeon RX 5500M today; CUDA has no local hardware. Either way the target is
+device-resident state with fused kernels — **not** a per-op backend called from a
+host loop, which is what this sidecar is and why it loses by 240×.
 
-See `sor/docs/prompts/julia_gpu_prototype.md` for the original brief and
-`sor/docs/architecture.md` §3.3 for the backend contract.
+This package existed to write a kernel once, run it on CPU/CUDA/ROCm/oneAPI/Metal
+via KernelAbstractions.jl, and find out which formulations were worth porting.
+That question has been answered — see "Measured results" below. For the backend
+contract see `sor/docs/architecture.md` §3.3.
 
 ---
 
@@ -23,27 +27,27 @@ Julia never decides anything. It computes vectors.
 
 ---
 
-## Deliberate deviations from the prompt
+## Design choices worth knowing
 
 Three, each with a reason.
 
-### 1. KernelAbstractions.jl in v0, not "CUDA.jl only"
+### 1. KernelAbstractions.jl rather than CUDA.jl directly
 
-The prompt lists KernelAbstractions as "optional later". It is v0 here because
-**KernelAbstractions has a CPU backend**, and the development machine has no
-NVIDIA GPU. Without it, none of this code could be executed or tested at all —
-only written. With it, the same kernel source is exercised on CPU today and on
-CUDA unchanged on a GPU box.
+KernelAbstractions is used rather than CUDA.jl directly because
+**KernelAbstractions has a CPU backend**, and this machine has no NVIDIA GPU.
+Without it none of this code could be executed or tested at all — only written.
+With it, the same kernel source runs on CPU here and on CUDA unchanged on an
+NVIDIA box.
 
 This also matches `architecture.md` §14, which lists ROCm/SYCL portability as an
 extension seam rather than a rewrite.
 
 ### 2. Pattern upload + handle reuse, not inline CSR per call
 
-The prompt's v0 protocol sends `row_ptr`/`col_idx`/`vals` inline on **every**
-call. PDHG performs two SpMVs per iteration across thousands of iterations, so an
-inline pattern would make JSON serialisation of the matrix the entire
-measurement.
+Sending `row_ptr`/`col_idx`/`vals` inline on every call would be the obvious
+protocol, and it is wrong: PDHG performs two SpMVs per iteration across thousands
+of iterations, so an inline pattern makes JSON serialisation of the matrix the
+entire measurement.
 
 Instead: `upload_pattern` and `upload_vals` return integer handles, and the
 per-iteration `spmv` call carries only the vector. The one-time upload cost is
@@ -197,7 +201,7 @@ the correctness result this prototype was built to obtain.
    small to amortise a launch.
 3. **Therefore: the sidecar is a correctness lab, not a performance path.** This
    is the empirical justification for the prompt's own conclusion. Port winning
-   kernels to a C++ `CudaBackend` before making any performance claim.
+   kernels to the in-process Vulkan `LpDevice` backend before making any performance claim.
 
 ### What is still unmeasured
 
