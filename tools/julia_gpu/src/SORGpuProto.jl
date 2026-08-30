@@ -5,7 +5,7 @@ EXPERIMENTAL GPU kernel sidecar for SOR (Sovereign Optimization Runtime), SIH261
 
 This package owns **device kernel execution only**. The C++ codebase owns the
 model IR, presolve, the PDHG control loop, certificates, the checker, and the CLI
-contract. See `sor/docs/prompts/julia_gpu_prototype.md`.
+contract. See `tools/julia_gpu/README.md`.
 
 Clean-room (`sor/docs/clean_room_policy.md`): no optimization solver package is
 loaded here. No JuMP, MathOptInterface, HiGHS, SCIP, Clp, GLPK, or cuOpt.

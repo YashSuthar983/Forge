@@ -4,3 +4,10 @@ build/
 *.so
 CMakeCache.txt
 CMakeFiles/
+
+# Python venv for external-solver baselines — never commit (HiGHS/CBC/SciPy live here,
+# and committing them would also muddy the clean-room story).
+benchmarks/.venv-baseline/
+
+# Generated benchmark artifacts
+benchmarks/results/

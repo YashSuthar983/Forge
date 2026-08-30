@@ -2,27 +2,27 @@
 
 **Product:** SOR (Sovereign Optimization Runtime)
 **Target problem statement:** SIH26119 (MRPL — Indigenous GPU-Accelerated Optimization Solver)
-**Version:** 2.0 — written 28 Aug 2026
-**Status:** authoritative. Supersedes the architecture implied by `SIH26119_build_spec.md` and the module list in `SENIOR_BRIEF_FOR_CLAUDE.md`.
+**Status:** single architecture doc — contracts (C1–C6), APIs, **and** top-down diagrams / solver loops / stitching (Appendix A). GPU seam: `gpu_first_order_plan.md`. Papers: `paper_bibliography.md`.
+**Scope:** this is the only architecture document. There is no older revision to consult and no separate diagram file — top-down views live in Appendix A.
 
 ---
 
-## 0. What changed in v2 and why
+## 0. Load-bearing design decisions
 
-v1 was designed around a 25-day deadline and framed SOR's differentiation as *process* (checker, certificates, honest labels). That framing is correct for hygiene and wrong for competitiveness: a solver with a world-class checker and a mediocre simplex is a mediocre solver.
+The deadline constrains only *what ships first*, never *what the architecture permits*. Every seam below exists so the frontier algorithm can land later without a rewrite.
 
-v2 assumes the 25-day limit constrains only *what ships first*, never *what the architecture permits*. Every seam below exists so that the frontier algorithm can land later without a rewrite.
+Each row is a decision that is expensive-to-impossible to reverse once code exists, with the reason it went that way. Process differentiation — checker, certificates, honest labels, clean-room CI — is necessary hygiene but is not competitiveness: a solver with a world-class checker and a mediocre simplex is a mediocre solver.
 
-| v1 decision | v2 decision | Reason |
-|---|---|---|
-| `FeasibleNoBound` is the terminal status for first-order methods | **Crossover to a basis is in the architecture.** First-order can reach `ProvedOptimal` | Accepting the ceiling permanently caps the GPU path at "approximate". Megiddo / Bixby–Saltzman crossover is a known algorithm |
-| Multi-core is "best-effort, droppable" | **Determinism is a hard requirement.** `DetTick` accounting in every parallel construct from day one | Industry treats run-to-run reproducibility as non-negotiable. Determinism cannot be retrofitted onto a work-stealing tree |
-| Linear blending is "a documented surrogate for bilinear pooling" | **The pooling problem is the product.** Global nonconvex path is a first-class layer | Refinery blending *is* bilinear. Aspen PIMS uses successive-LP and lands in local optima. This is the winnable fight |
-| GPU is for "first-order LP + heuristics only" | GPU also serves **batched strong branching, batched LNS, batched decomposition subproblems, scenario sweeps** | Batched small-LP throughput is the capability legacy codebases structurally cannot retrofit |
-| IR flattens to a matrix at the presolve boundary | **Structure annotations survive every transform** | Decomposition, symmetry, and family-memory all need structure that flattening destroys |
-| Interior-point "deferred" (absent) | Barrier is sequenced late but architecturally present; convex QP goes first-order → active-set → barrier | Deferring is fine. Excluding forecloses conic and large-QP work permanently |
-| Certificates as an audit artifact | **A `ProofLevel` ladder up to VIPR-verified and rational-exact** | This is the one axis where SOR can be world-best, because the field is nearly empty |
-| No adoption path | **MPS/CLI/native API + optional CPLEX/Gurobi shims for direct-API callers** (not PIMS — PIMS-AO solver is proprietary) | A sovereign solver nobody can call standalone is a research project |
+| Decision | Reason |
+|---|---|
+| **Crossover to a basis is in the architecture.** A first-order result can reach `ProvedOptimal` rather than terminating at `FeasibleOnly` | Without it the GPU path is permanently capped at "approximate". Megiddo / Bixby–Saltzman crossover is a known algorithm, not research |
+| **Determinism is a hard requirement**, not best-effort. `DetTick` accounting in every parallel construct from day one | Industry treats run-to-run reproducibility as non-negotiable, and determinism cannot be retrofitted onto a work-stealing tree |
+| **The pooling problem is the product.** The global nonconvex path is a first-class layer, not a documented surrogate | Refinery blending *is* bilinear. Aspen PIMS uses successive-LP and lands in local optima. This is the winnable fight |
+| **GPU serves more than first-order LP** — also batched strong branching, batched LNS, batched decomposition subproblems, scenario sweeps | Batched small-LP throughput is the one capability legacy codebases structurally cannot retrofit, because it is a data-layout property |
+| **Structure annotations survive every transform**; the IR does not flatten to a matrix at the presolve boundary | Decomposition, symmetry detection, and family memory all need structure that flattening destroys |
+| **Barrier is sequenced late but architecturally present.** Convex QP goes first-order → active-set → barrier | Deferring is fine; excluding forecloses conic and large-QP work permanently |
+| **A `ProofLevel` ladder** up to VIPR-verified and rational-exact, not certificates as a mere audit artifact | This is the one axis where SOR can be world-best, because the field is nearly empty |
+| **An adoption path exists:** MPS/CLI/native API, plus optional CPLEX/Gurobi shims for direct-API callers — not PIMS, whose AO solver is proprietary | A sovereign solver nobody can call standalone is a research project |
 
 ---
 
@@ -32,7 +32,7 @@ Six commitments. Each is expensive-to-impossible to retrofit, so each is load-be
 
 | # | Commitment | Enforced by |
 |---|---|---|
-| C1 | **Device-resident data model.** CPU is a backend, not the default | `KernelBackend` owns all large buffers; engines never touch raw pointers |
+| C1 | **Device-resident data model.** CPU is a backend, not the default | ⚠ **Not currently enforced.** `DeviceBuffer` is a `std::vector` with `operator[]` and `host()`, so host addressability is part of the contract and the PDHG loop depends on it. The commitment stands; the mechanism must become the `LpDevice` seam in §3.3.1 |
 | C2 | **Structure-preserving IR.** Block / period / network / bilinear annotations survive transforms | `StructureMap` threaded through `Transform`; layering test forbids engines constructing matrices directly |
 | C3 | **Deterministic by construction.** Identical input + options + thread count → identical output, bit for bit | `DetTick` budget accounting; no wall-clock in any control-flow decision |
 | C4 | **Three-tier numeric tower.** f32 (device) / f64 (working) / rational (verification) | `Scalar` concept; algorithms generic over scalar type |
@@ -161,7 +161,8 @@ public:
 };
 
 std::unique_ptr<KernelBackend> make_cpu_backend();
-std::unique_ptr<KernelBackend> make_cuda_backend(int device);  // nullptr if absent
+std::unique_ptr<KernelBackend> make_vulkan_backend(int device);  // nullptr if absent
+std::unique_ptr<KernelBackend> make_cuda_backend(int device);    // nullptr if absent
 }  // namespace sor::backend
 ```
 
@@ -169,6 +170,22 @@ Two properties this buys:
 
 - **Honest GPU numbers are structural.** Transfer time accrues inside the backend, so a reported GPU time that excludes it is unreachable through the API.
 - **CPU parity is testable.** `test_backend_parity.cpp` runs every kernel on both backends over the same inputs and asserts agreement to a declared tolerance. A CUDA kernel that disagrees with the CPU reference fails the build.
+
+### 3.3.1 Why this is the wrong seam for the first-order engine
+
+Both properties above are real and worth keeping. The **granularity** is wrong, and §5.2 item 7 says why: *"iterates never leave the GPU; a host sync per iteration destroys the entire advantage."* The implemented seam guarantees the opposite.
+
+Three levels of the problem, all verified in code:
+
+1. **`DeviceBuffer` is host memory by contract.** `device_buffer.hpp:66-76` exposes `operator[]` returning `T&` and a `host()` accessor over a `std::vector`. The header comment claims it "may live on host or device." It cannot — host addressability is part of the type, so every caller may depend on it, and `pdhg.cpp` does.
+2. **The engine interleaves host loops with kernel calls.** `pdhg.cpp:222-237` runs four host loops around three backend calls per iteration; `evaluate()` adds five host reduction loops. On a real device that is **~7 host↔device round trips per iteration**. Measured today: 602,092 kernel calls for one `25fv47` solve.
+3. **`std::swap(x.host(), x_new.host())`** at `pdhg.cpp:237` swaps the underlying vectors. Any backend that caches a device pointer per buffer is silently broken by that line. It is correct today only because everything is host memory.
+
+**The fix is to invert the seam:** the device owns the solver state, and the host asks for `k` fused iterations and receives ~8 doubles. `KernelBackend` stays for unit tests and parity checking; the first-order engine moves to an `LpDevice` interface with `upload()`, `hpr_steps(k)`, `reduce_kkt()`, `restart_to()`, and `download()`. Six fused kernels cover the whole loop, and the CPU implements the same interface — so the CPU path gains the fusion benefit too, rather than being a fallback bolted beside a GPU path.
+
+Full interface, kernel list, and rationale: **`gpu_first_order_plan.md` §2.2–2.3.**
+
+**The backend is not CUDA-only.** This machine has no NVIDIA GPU but does have an **AMD Radeon RX 5500M (Navi 14, 4080 MiB)** with Vulkan 1.4 compute, `shaderFloat64`, and a dedicated compute queue — so a GPU backend is measurable locally today via Vulkan/SPIR-V, and CUDA is the second backend for a Colab-class parity column. The governing principle: **a solver must not depend on one accelerator vendor if "sovereign" is to include deployment independence.**
 
 ### 3.4 Model IR — `sor_model/model.hpp`
 
@@ -305,7 +322,7 @@ enum class ProofLevel {
 };
 ```
 
-`Status::Optimal` is writable only by `finalize_result()` in `sor_certify`, and only when `ProofLevel >= ProvedOptimalFP`. A unit test (`test_no_unproved_optimal.cpp`) asserts no other write path exists. This is the v1 rule and it stays exactly as it was — it was the best decision in v1.
+`Status::Optimal` is writable only by `finalize_result()` in `sor_certify`, and only when `ProofLevel >= ProvedOptimalFP`. A unit test (`test_no_unproved_optimal.cpp`) asserts no other write path exists. This is the single most important correctness rule in the codebase and it is not negotiable.
 
 ### 4.2 Tolerances
 
@@ -353,15 +370,36 @@ std::unique_ptr<LpEngine> make_concurrent(std::vector<std::unique_ptr<LpEngine>>
 
 Ordered by measured impact. Teams that build a "textbook simplex" and find it 1000× slow have almost always skipped items 1 and 2.
 
-| # | Technique | Source | Impact |
-|---|---|---|---|
-| 1 | **Hypersparsity exploitation** in FTRAN/BTRAN — sparse triangular solve with reverse-topological DFS | Hall & McKinnon | **~10× on large sparse LP.** The single difference between "fast on `afiro`" and "cannot touch `dlr2`" |
-| 2 | Sparse LU: Markowitz + threshold pivoting; **Forrest–Tomlin / Suhl–Suhl update**; tuned refactorization interval | Forrest–Tomlin; Suhl & Suhl | Without an update you refactorize per iteration and die |
-| 3 | **Dual simplex primary**, with bound-flipping (long-step) ratio test | Koberstein & Suhl | Dual is the warm-start engine for B&B; BFRT is a large constant factor |
-| 4 | Harris two-pass ratio test with tolerance-relaxed pivoting | Harris | Stability *and* speed |
-| 5 | Dual steepest-edge pricing; DEVEX fallback; partial pricing with candidate lists | Forrest & Goldfarb | Iteration-count reduction |
-| 6 | Bound-shifting perturbation + anti-cycling | Standard | Degenerate refinery LPs cycle without it |
-| 7 | Crash basis | Standard | Cold-start iterations |
+| # | Technique | Source | Impact | In SOR |
+|---|---|---|---|---|
+| 1 | **Hypersparsity exploitation** in FTRAN/BTRAN — sparse triangular solve with reverse-topological DFS | Hall & McKinnon | **~10× on large sparse LP.** The single difference between "fast on `afiro`" and "cannot touch `dlr2`" | 🔴 dense triangular solves |
+| 2 | Sparse LU: Markowitz + threshold pivoting; **Forrest–Tomlin / Suhl–Suhl update**; tuned refactorization interval | Forrest–Tomlin; Suhl & Suhl | Without an update you refactorize per iteration and die | 🟡 `sor_la_cpu`: singleton triangularization + Markowitz/threshold LU, **product-form** update every 100 iterations. Forrest–Tomlin not yet — see below |
+| 3 | **Dual simplex primary**, with bound-flipping (long-step) ratio test | Koberstein & Suhl | Dual is the warm-start engine for B&B; BFRT is a large constant factor | 🔴 primal only; single bound flip when the entering variable's own range binds |
+| 4 | Harris two-pass ratio test with tolerance-relaxed pivoting | Harris | Stability *and* speed | 🟢 `sor_engines/simplex.cpp` |
+| 5 | Dual steepest-edge pricing; DEVEX fallback; partial pricing with candidate lists | Forrest & Goldfarb | Iteration-count reduction | 🟡 Dantzig normalized by **static** column norms — no extra solve, and not DEVEX |
+| 6 | Bound-shifting perturbation + anti-cycling | Standard | Degenerate refinery LPs cycle without it | 🟡 Harris tie-break on largest pivot + Bland fallback after 50 zero-length steps. No perturbation |
+| 7 | Crash basis | Standard | Cold-start iterations | 🔴 all-logical start (B = −I) |
+
+**Why product form and not Forrest–Tomlin yet.** Both avoid refactorizing every
+iteration, which is the asymptotic win and the thing item 2 is actually about.
+They differ in the constant: FT keeps the *factors* sparse, whereas the product
+form's eta vectors are as dense as the FTRAN'd entering columns. FT drops in
+behind `la::BasisFactor::update()` without changing a single caller. The
+measured cost of the shortcut, 30 Aug 2026: 81/93 Netlib proved optimal in 49 s
+total, so it is not yet the binding constraint. It will be on Kennington and
+MIPLIB relaxations.
+
+**Two measured lessons from building this**, recorded because both were silent
+failures rather than crashes:
+
+1. The leaving-row pivot threshold is a *stability* parameter, not a zero test.
+   At 1e-9 the basis went singular repeatedly — 23165 repairs on `grow15` — and
+   the solver produced confident wrong objectives. At 1e-7 the repairs went to
+   zero.
+2. A repaired singular basis defines a **different point**, which need not be
+   primal feasible. Continuing in phase 2 from it is how a primal simplex
+   reports a non-optimum as optimal; the driver must fall back to phase 1. This
+   was the actual cause of wrong answers on `blend`, `grow15` and `agg3`.
 
 ### 5.2 First-order engine
 
@@ -380,9 +418,9 @@ Components, all required — a first-order LP solver missing any one of these is
 
 ### 5.3 Crossover — `sor_crossover`
 
-Removes the v1 ceiling. Takes an approximately-optimal interior or first-order point and produces a basic optimal solution, after which the normal simplex optimality proof applies (Megiddo; Bixby–Saltzman). Consequence: the GPU path can terminate at `ProvedOptimalFP`, not `FeasibleOnly`.
+Takes an approximately-optimal interior or first-order point and produces a basic optimal solution, after which the normal simplex optimality proof applies (Megiddo; Bixby–Saltzman). Consequence: the GPU path can terminate at `ProvedOptimalFP`, not `FeasibleOnly`.
 
-`FeasibleOnly` remains a legitimate reported status when crossover is disabled or fails — but it is no longer the destiny of the first-order engine.
+`FeasibleOnly` remains a legitimate reported status when crossover is disabled or fails — but it is not the destiny of the first-order engine.
 
 ---
 
@@ -509,7 +547,7 @@ Benchmark instances: Haverly, Ben-Tal, Foulds, Adhya, and the standard pooling l
 
 ## 9. Decomposition — `sor_decomp`
 
-Requires C2 (structure survives transforms), which is why v1's flatten-at-presolve design had to go.
+Requires C2 (structure survives transforms) — which is precisely why the IR must not flatten to a matrix at the presolve boundary.
 
 ```cpp
 namespace sor::decomp {
@@ -612,7 +650,7 @@ Mutation tests (`test_certificate_tamper.cpp`) perturb each certificate field an
 
 ## 12. API and the adoption path
 
-Missing from v1 entirely, and strategically the most important gap.
+Strategically the most important gap in the whole design.
 
 ```text
 sor_api/
@@ -632,47 +670,18 @@ This is also a defensible clean-room position: implementing a documented API's *
 
 ## 13. Clean-room rules and forbidden dependencies
 
-### 13.1 Forbidden in the solve path
+**Policy / forbidden list / allowed practices:** `clean_room_policy.md` (single source).  
+**Linked dependency inventory + CI script names:** `dependency_ledger.md`.
 
-COIN-OR CBC/CLP · HiGHS (including `pdlp_gpu`, which is cuPDLP-C) · GLPK · SCIP / SoPlex / PaPILO · Google OR-Tools / PDLP · NVIDIA cuOpt · Ipopt / Bonmin / Couenne / SHOT / BARON · CPLEX / Gurobi / Xpress / MOSEK / COPT · SciPy `linprog` · any third-party sparse LU, sparse Cholesky, or LP/MIP/NLP kernel.
-
-### 13.2 The three traps
+### 13.1 Architecture traps (keep here — these are design, not policy)
 
 | Trap | Rule |
 |---|---|
-| **Porting is still derivative.** Reading `HEkkDual.cpp` and re-typing the logic — in C++, Rust, or anything else — is not clean-room | **Papers first.** Upstream source only per **`clean_room_policy.md`** (logged, one person, no side-by-side coding) |
-| Vendor sparse kernels look allowed but are a dead end at the frontier | No library provides a sparse LU with Forrest–Tomlin update, and cuSPARSE SpMV is wrong for PDHG's fixed-pattern repeated A/Aᵀ product. You write both anyway. Keep the `KernelBackend` seam, expect to fill it yourself |
-| Multi-precision arithmetic | `sor_num::Rational` is our own limb arithmetic. GMP is LGPL and, more importantly, is a dependency in the numeric core where the PS is most sensitive |
+| **Porting is still derivative** | Papers first; upstream source only per `clean_room_policy.md` |
+| Vendor sparse kernels are a dead end at the frontier | No library gives Forrest–Tomlin LU; cuSPARSE SpMV is wrong for fixed-pattern A/Aᵀ. Keep `KernelBackend` / `LpDevice`; fill it yourself |
+| Multi-precision in the numeric core | Own `Rational` limbs; avoid GMP in the solve path (LGPL + PS sensitivity) |
 
-### 13.3 Reference policy
-
-Canonical team rule: **`sor/docs/clean_room_policy.md`**. Reference log: **`sor/docs/reference_log.md`**.
-
-| Tier | Practice |
-|---|---|
-| **Allowed** | External HiGHS/SCIP binary; README and cited papers; compare objective/residuals/status on same MPS |
-| **Allowed with caution** | One person, log in `reference_log.md`: "Is this trick in the literature?" → paper implementation or skip |
-| **Forbidden** | Copy-paste, `third_party/highs`, submodules, `#include` solver headers, side-by-side reimplementation, baseline in certificates |
-
-**Default workflow:** oracle (binary), not IDE with upstream repo open.
-
-### 13.4 Explicitly allowed
-
-Language standard library · CUDA toolkit and compiler · dense BLAS/LAPACK for dense blocks only (documented in the ledger) · published papers and textbooks · public benchmark **instances** (MIPLIB, Netlib, QPLIB, MINLPLib, pooling libraries) · HiGHS/SCIP as an **external process** for differential testing and baseline comparison, never linked, never referenced in a certificate.
-
-Differential testing against an external reference process is not just permitted, it is **recommended** — it is the most effective way to find your own bugs. The rule is process isolation, not abstinence. See **`clean_room_policy.md`**.
-
-### 13.5 CI gates
-
-| Script | Asserts |
-|---|---|
-| `scripts/check_forbidden_deps.sh` | `ldd`, `nm`, and the CMake link graph contain no forbidden library |
-| `scripts/check_layering.py` | include graph respects §2; `sor_verify` touches nothing above L2 |
-| `scripts/check_determinism.sh` | same input, 1 vs N threads, twice each → four bit-identical outputs |
-| `scripts/check_no_walltime.sh` | no `chrono` in control flow outside logging and the harness |
-| `scripts/check_backend_parity.sh` | every CUDA kernel agrees with its CPU reference |
-
-**Process gates (not scripts):** numeric-core PRs require a second reviewer; upstream source browsing must be logged in `reference_log.md` per `clean_room_policy.md`.
+Differential testing vs an external HiGHS/SCIP **process** is recommended. Linking those libraries is not. Details: `clean_room_policy.md`.
 
 ---
 
@@ -698,3 +707,618 @@ Genuinely unresolved; each needs a decision before the affected phase starts.
 3. **Batched LP accuracy target.** How loose can a batched strong-branching LP be before branching quality degrades? This is an empirical question that gates §6.3's payoff. *Needs a measurement spike in Phase 1, not a design decision.*
 4. **VIPR hot-path cost.** Unknown until measured. If log emission costs more than ~15%, it stays opt-in permanently rather than becoming the default. *Measure in Phase 3.*
 5. **Compat shim scope.** Which CPLEX/Gurobi entry points, exactly? Needs a real deployment to survey. *Requires MRPL or another industrial contact.*
+
+---
+
+# Appendix A — Diagrams, loops, and stitching
+
+**Legend:** 🟢 exists today · 🟡 partial / prototype · 🔴 planned  
+
+**This appendix is visual only.** Normative contracts and APIs are in §§1–15. Do not treat status icons here as a second capability ladder — that is `master_spec.md` §4. Layer *names* are defined in §2; here they carry 🟢/🟡/🔴 overlays and stitch diagrams only.
+
+## A.0 One-page mental model
+
+```text
+                    ┌─────────────────────────────────────────┐
+                    │  USER / JUDGE / BENCHMARK               │
+                    │  MPS · CLI · API · run_compare.py       │
+                    └───────────────────┬─────────────────────┘
+                                        │
+                    ┌───────────────────▼─────────────────────┐
+                    │  SOR SOLVE PATH                         │
+                    │  I/O → Model → Transforms → Engine(s)   │
+                    │       → Search (MILP) → Finalize        │
+                    └───────────────────┬─────────────────────┘
+                                        │
+              ┌─────────────────────────┼─────────────────────────┐
+              │                         │                         │
+              ▼                         ▼                         ▼
+        ┌──────────┐            ┌──────────────┐          ┌────────────┐
+        │ Backend  │            │ Certificates │          │  Verify    │
+        │ CPU/GPU  │            │ ProofLevel   │          │  (no eng.) │
+        └──────────┘            └──────────────┘          └────────────┘
+```
+
+**Non-negotiable stitch:** engines produce `RawResult` only. Only `finalize_result()` may emit reportable `Status` / `ProofLevel`. Verification never links engines.
+
+---
+
+## A.1 Level 0 — Top system context
+
+```mermaid
+flowchart TB
+  subgraph External["Outside SOR"]
+    User[User / SIH demo]
+    Bench[run_bench / run_compare]
+    HiGHS[HiGHS / CBC as EXTERNAL process]
+    Papers[Papers / textbooks - clean-room input]
+  end
+
+  subgraph SOR["SOR binary / lib"]
+    CLI[sor_solve / sor_check]
+    Core[Solve pipeline]
+    Cert[finalize_result]
+  end
+
+  User --> CLI
+  Bench --> CLI
+  Bench -.->|compare numbers only| HiGHS
+  Papers -.->|algorithms| Core
+  CLI --> Core
+  Core --> Cert
+  Cert -->|SolveResult JSON / stdout| User
+  Cert -->|SolveResult| Bench
+```
+
+| Edge | Meaning |
+|---|---|
+| User → CLI | MPS path + options |
+| Bench ⇢ HiGHS | Separate process; never linked into `libsor` |
+| Papers ⇢ Core | Allowed research; **not** solver source |
+| Core → Cert | Only legal path to `Optimal` |
+
+---
+
+## A.2 Level 1 — Layer cake (status overlay)
+
+Normative module names: **§2**. Status as of 29 Aug 2026 (same verification as `master_spec.md` §4):
+
+```text
+L8  FRONT ENDS     🟡 sor_solve          🔴 sor_check / bench / gen / tune
+L7  VERIFY         🟡 finalize_result    🔴 sor_verify (separate target)
+L6  INTELLIGENCE   🔴 policy · family memory
+L5  SEARCH         🔴 B&B · cuts · branch · heur · global
+L4  ENGINES        🟢 primal simplex     🔴 dual simplex · HPR · barrier · crossover · QP
+                   🟡 PDHG (vanilla)
+L3  TRANSFORM      🟡 Ruiz in-engine     🔴 transform stack / full presolve
+L2  MODEL          🟢 LpProblem · MPS I/O
+L1  LINEAR ALGEBRA 🟢 CSR / CSC / SpMV   🔴 Forrest-Tomlin · hypersparse · LpDevice / Vulkan
+                   🟢 sor_la_cpu LU + product-form update
+L0  PLATFORM       🟡 core/result        🔴 det · num tower
+```
+
+`sor_verify` may include L0–L2 only (never L4 engines) — see §2 layering rule.
+
+## A.3 Level 2 — Module map (what exists vs planned)
+
+### 3.1 Present in the repo today
+
+```text
+sor/
+├── cli/sor_solve.cpp              🟡 L8
+├── sor_core/                      🟡 L0  (result, status, proof types)
+├── sor_sparse/                    🟢 L1  CSR + CSC pattern + values
+├── sor_la_cpu/                    🟢 L1  Markowitz LU, FTRAN/BTRAN, product form
+├── sor_backend/                   🟡 L1  KernelBackend + CpuBackend
+│                                      (+ experimental julia_gpu — cut candidate)
+├── sor_model/                     🟢 L2  LpProblem
+├── sor_io/                        🟢 L2  MPS reader
+├── sor_engines/                   🟢 L4  simplex.cpp (primal) + pdhg.cpp (vanilla)
+├── sor_certify/                   🟡 L7  finalize_result
+├── tests/                         🟢 csr, csc, lu, parity, mps, pdhg, simplex,
+│                                      no-unproved-optimal
+└── scripts/                       🟢 run_bench / run_compare / run_netlib /
+                                       verify_vs_highs
+```
+
+### 3.2 Target modules (stitch plan)
+
+```mermaid
+flowchart LR
+  subgraph L1["L1"]
+    Sparse[sor_sparse]
+    LaCpu[sor_la_cpu LU/FT]
+    Backend[KernelBackend]
+    LpDev[LpDevice CPU/Vulkan/CUDA]
+  end
+
+  subgraph L3["L3"]
+    Stack[TransformStack]
+    Pre[sor_presolve]
+    Scale[scaling]
+  end
+
+  subgraph L4["L4"]
+    PDHG[vanilla PDHG]
+    HPR[HPR / restarted FO]
+    SX[dual/primal simplex]
+    XO[crossover]
+    BAR[barrier]
+    QP[active-set QP]
+  end
+
+  subgraph L5["L5"]
+    Tree[TreeRuntime]
+    Cuts[CutManager]
+    Br[BranchPolicy]
+    He[Heuristics]
+  end
+
+  Sparse --> Backend
+  Sparse --> LaCpu
+  Backend --> LpDev
+  Stack --> Pre
+  Stack --> Scale
+  Pre --> HPR
+  Pre --> SX
+  Scale --> HPR
+  LpDev --> HPR
+  LaCpu --> SX
+  HPR --> XO
+  SX --> XO
+  SX --> Tree
+  Cuts --> Tree
+  Br --> Tree
+  He --> Tree
+  PDHG -.->|evolve into| HPR
+```
+
+---
+
+## A.4 Level 3 — End-to-end solve pipeline (how it stitches)
+
+### 4.1 Target pipeline (all problem classes)
+
+```mermaid
+sequenceDiagram
+  participant CLI as sor_solve
+  participant IO as sor_io
+  participant M as Model IR
+  participant T as Transform stack
+  participant P as Policy
+  participant E as LpEngine / Tree
+  participant B as Backend / LpDevice
+  participant C as finalize_result
+  participant V as sor_verify
+
+  CLI->>IO: read MPS/QPS
+  IO->>M: LpProblem (+ integers flags)
+  M->>T: validate + StructureMap
+  T->>T: presolve - scale - relax
+  P->>E: select engine / branch / cuts
+  E->>B: kernels / LU / SpMV
+  B-->>E: residuals / basis / iterates
+  alt MILP
+    E->>E: B&B loop (node LP warm-starts)
+  end
+  E->>C: RawResult + ProofEvidence
+  C->>C: gate Optimal / ProofLevel
+  C-->>CLI: SolveResult
+  CLI->>V: optional independent check
+```
+
+### 4.2 Prototype pipeline (what runs today)
+
+```mermaid
+sequenceDiagram
+  participant CLI as sor_solve
+  participant IO as MPS reader
+  participant E as solve_pdhg
+  participant B as CpuBackend
+  participant C as finalize_result
+
+  CLI->>IO: read_mps_file_auto
+  IO-->>CLI: LpProblem
+  CLI->>B: make_backend(cpu|julia_gpu)
+  CLI->>E: solve_pdhg(problem, opts, backend)
+  Note over E: Ruiz scale in-place
+  Note over E: power iteration ||A||2
+  loop until max_iter or residual OK
+    E->>B: spmv_t / project / spmv
+    Note over E: host loops between kernels 
+  end
+  E-->>CLI: RawResult
+  CLI->>C: finalize_result(raw, evidence)
+  C-->>CLI: SolveResult (never fake Optimal)
+```
+
+**Stitching gap today:** no Transform stack, no search, no crossover. The primal simplex reaches `ProvedOptimalFP` on its own; the FO engine still cannot, because crossover is what would give it a basis.
+
+---
+
+## A.5 Solver loops (drill-down)
+
+### 5.1 First-order LP — vanilla PDHG (current)
+
+
+Semantics and options: **§5** / `sor_engines/src/pdhg.cpp`. Stitch: Ruiz → power-iteration ‖A‖₂ → fixed τ=σ → SpMVᵀ / project / SpMV / dual prox → residual check → `RawResult` → `finalize_result` (never fake Optimal).
+
+```mermaid
+flowchart TD
+  Start([start]) --> Ruiz[Ruiz equilibration]
+  Ruiz --> Norm[Power iteration ||A||2]
+  Norm --> Init[x = proj 0 onto col box]
+  Init --> Iter{iter < max?}
+  Iter -->|yes| SpT[spmv_t: ATy]
+  SpT --> Xp[x <- proj x − tauc − tauATy]
+  Xp --> Xb[xbar <- 2x − x_old]
+  Xb --> Sp[spmv: A xbar]
+  Sp --> Yp[y <- dual prox]
+  Yp --> Chk{check_every?}
+  Chk -->|no| Iter
+  Chk -->|yes| Eval[pres / dres / gap]
+  Eval --> Conv{within tol?}
+  Conv -->|yes| Out[RawResult Feasible*]
+  Conv -->|no| Iter
+  Iter -->|no| Out2[RawResult Interrupted]
+  Out --> Fin[finalize_result]
+  Out2 --> Fin
+```
+
+
+### 5.2 First-order LP — target HPR / restarted family
+
+Same SpMV + project kernels; control logic from papers (`paper_bibliography.md` § Industry-target stack).
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│  TARGET: LpDevice.hpr_steps(K)   // fused, device-resident   │
+│                                                              │
+│  state on device: x, y, x_avg, y_avg, anchor z⁰, τ, σ, w    │
+│                                                              │
+│  every K steps (NO host sync inside):                        │
+│    Halpern / reflected PDHG updates                          │
+│    running averages                                          │
+│                                                              │
+│  every check_every:                                          │
+│    Kkt = reduce_kkt()          // ~8 doubles D2H only        │
+│    adapt primal weight w (PID)                               │
+│    adapt steps                                               │
+│    if restart_metric triggers:                               │
+│         restart_to(Average|Current|Anchor)                   │
+│    if residuals OK → break                                   │
+│                                                              │
+│  download → optional feasibility polish → crossover → basis  │
+└──────────────────────────────────────────────────────────────┘
+```
+
+```mermaid
+flowchart TD
+  U[upload ScaledLp once] --> Loop
+  subgraph Loop["device-resident"]
+    H[hpr_steps K fused]
+    H --> R[reduce_kkt]
+    R --> W[adapt w / steps]
+    W --> RS{restart?}
+    RS -->|yes| RA[restart_to avg/anchor]
+    RA --> H
+    RS -->|no| OK{tol?}
+    OK -->|no| H
+  end
+  OK -->|yes| DL[download]
+  DL --> Pol[feasibility polish]
+  Pol --> XO[crossover to basis]
+  XO --> Fin[finalize -> ProvedOptimalFP]
+```
+
+**Stitch to backend:** today `KernelBackend` per-op; target `LpDevice` owns state (`gpu_first_order_plan.md` §2.2).
+
+### 5.3 Dual revised simplex (planned) — MIP node hot path
+
+```text
+┌────────────────────────────────────────────────────────────┐
+│  Dual simplex                                              │
+│                                                            │
+│  basis B  →  sparse LU (Markowitz)                         │
+│  LOOP:                                                     │
+│    dual pricing (DSE / DEVEX) → leaving row                │
+│    BTRAN → pivot row                                       │
+│    ratio test (Harris + BFRT bound flips) → entering col   │
+│    FTRAN → update column                                   │
+│    Forrest–Tomlin update of LU  (or refactor every N)      │
+│    hypersparse FTRAN/BTRAN when rhs sparse                 │
+│  until dual feasible + reduced costs OK                    │
+│  → Basis + Optimal evidence                                │
+└────────────────────────────────────────────────────────────┘
+```
+
+```mermaid
+flowchart TD
+  Crash[Crash / warm basis] --> Factor[Sparse LU factorize]
+  Factor --> Price[Dual pricing DSE]
+  Price --> BTRAN[BTRAN pivot row]
+  BTRAN --> Ratio[Harris + BFRT]
+  Ratio --> FTRAN[FTRAN]
+  FTRAN --> FT[Forrest-Tomlin update]
+  FT --> Opt{optimal?}
+  Opt -->|no| Price
+  Opt -->|yes| Basis[Basis + ProvedOptimalFP evidence]
+```
+
+**Stitch to MILP:** each B&B node calls `resolve(warm_basis, bound_delta)` — same LU path, not a cold start.
+
+### 5.4 MILP branch-and-cut (planned)
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  TreeRuntime                                                │
+│                                                             │
+│  root: presolve → LP relax → cuts → heuristics              │
+│  LOOP while nodes and gap open:                             │
+│    select node (best-bound / DFS hybrid)                    │
+│    node presolve / propagate / conflicts                    │
+│    solve / warm-start LP (dual simplex)                     │
+│    if fractional:                                           │
+│       separate cuts (Gomory/MIR/…) via CutManager           │
+│       OR branch (reliability / strong / orbital)            │
+│    update incumbent via heuristics (FP, RINS, diving, CHAP) │
+│    prune by bound                                           │
+│  → incumbent + dual bound → finalize                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+```mermaid
+flowchart TD
+  Root[Root LP + cuts + heuristics] --> Pool[Node pool]
+  Pool --> Pick[Node selection policy]
+  Pick --> NP[Node presolve / propagate]
+  NP --> LP[Dual simplex resolve]
+  LP --> Int{integer feasible?}
+  Int -->|yes| Inc[Update incumbent]
+  Int -->|no| Cut{cuts useful?}
+  Cut -->|yes| Add[CutManager add]
+  Add --> LP
+  Cut -->|no| Br[BranchPolicy]
+  Br --> Pool
+  Inc --> Gap{gap closed?}
+  Gap -->|no| Pool
+  Gap -->|yes| Done[Finalize MIP result]
+```
+
+**Stitch points:**
+- LP engine ← `sor_simplex` (+ optional FO for heuristics only)
+- Cuts / branch / heur ← `Policy<>` seam (classical default)
+- GPU ← batched FO / CHAP-style heuristics, **not** proving node bounds
+
+### 5.5 Concurrent LP (planned finale)
+
+```text
+        ┌─────────────┐
+   Model│             │
+   ─────►  concurrent │──► first finished + valid proof wins
+        │  racers:    │     (DetTick tie-break, not wall clock)
+        │  · dual SX  │
+        │  · HPR-FO   │
+        │  · barrier? │
+        └─────────────┘
+```
+
+---
+
+## A.6 Backend / device stitching
+
+### 6.1 Today — KernelBackend (host-driven)
+
+```text
+  Engine host loop
+       │  call per op
+       ▼
+  ┌────────────────────────┐
+  │  KernelBackend         │
+  │  spmv / spmv_t / proj  │
+  │  dot / batched           │
+  └───────────┬────────────┘
+              │
+     ┌────────┴────────┐
+     ▼                 ▼
+  CpuBackend      JuliaGpuBackend 🟡 experimental
+  (std::vector)   (IPC — measured slow; cut candidate)
+```
+
+Problem: host loops between kernels ⇒ many transfers if a real GPU backend is plugged in.
+
+### 6.2 Target — LpDevice (device-resident FO)
+
+```text
+  Engine control (scalars only)
+       │  hpr_steps(K) / reduce_kkt()
+       ▼
+  ┌──────────────────────────────┐
+  │  LpDevice                    │
+  │  owns A(CSR+CSC), x,y,avgs   │
+  │  fused shaders / CPU kernels │
+  └───────────┬──────────────────┘
+              │
+     ┌────────┼────────┐
+     ▼        ▼        ▼
+   CPU      Vulkan    CUDA
+  fused    RX 5500M   Colab/B200
+```
+
+Simplex stays on **CPU `sor_la_cpu`** (LU + FT); FO/heuristics use `LpDevice`.
+
+---
+
+## A.7 Certificate / proof stitching
+
+Normative types and rules: **§11**. Engines emit `RawResult` + `ProofEvidence` only; `finalize_result` is the sole writer of reportable `Status` / `ProofLevel`.
+
+```mermaid
+flowchart LR
+  Eng[Any engine] -->|RawResult| Fin[finalize_result]
+  Eng -->|ProofEvidence| Fin
+  Fin -->|SolveResult| Out[CLI / JSONL]
+  Out --> Chk[sor_check / sor_verify]
+  Chk -->|PASS/FAIL| Bench[benchmarks]
+  Fin -->|rejects| Bad[fake Optimal without basis]
+```
+
+| ProofLevel band | Who can produce it |
+|---|---|
+| FeasibleOnly / FeasibleWithGap | FO without crossover |
+| ProvedOptimalFP | Simplex **or** FO + crossover |
+| ProvedOptimalExact / Certified | Phase 3 rational / VIPR |
+
+## A.8 Implementation diagram — build order ↔ architecture
+
+Paper/implement order A–G (Presolve → … → GPU): **`paper_bibliography.md`** (Industry-target stack). Week plan 29 Aug–20 Sep: **`gpu_first_order_plan.md` §6**. Macro phases: **`implementation_plan.md`**.
+
+```mermaid
+flowchart TB
+  subgraph Now["NOW "]
+    M0[MPS + CSR + PDHG + finalize]
+  end
+
+  subgraph A["A Presolve"]
+    A1[Transform stack]
+    A2[Andersen rules]
+    A3[Cederberg-Boyd FO rules]
+  end
+
+  subgraph B["B Simplex"]
+    B1[Sparse LU + FT]
+    B2[Hypersparse FTRAN/BTRAN]
+    B3[Dual SX + DSE + Harris/BFRT]
+  end
+
+  subgraph C["C HPR-FO"]
+    C1[Primal weight + restart]
+    C2[Halpern / reflection]
+    C3[LpDevice fused loop]
+  end
+
+  subgraph D["D Crossover"]
+    D1[FO/IPM -> basis]
+  end
+
+  subgraph E["E MILP"]
+    E1[TreeRuntime]
+    E2[CutManager + Gomory/MIR]
+    E3[Branch + FP/RINS]
+  end
+
+  subgraph F["F QP"]
+    F1[Active-set + KKT]
+  end
+
+  subgraph G["G Parallel / GPU"]
+    G1[DetTick parallel tree]
+    G2[Vulkan/CUDA LpDevice]
+    G3[CHAP-style GPU heur]
+  end
+
+  M0 --> A
+  M0 --> C
+  A --> B
+  A --> C
+  B --> D
+  C --> D
+  B --> E
+  D --> E
+  B --> F
+  E --> G
+  C --> G
+```
+
+### Stitch table (who calls whom)
+
+| Caller | Callee | Contract |
+|---|---|---|
+| `sor_solve` | `sor_io` | `LpProblem` |
+| `sor_solve` | `make_backend` / `make_lp_device` | L1 |
+| `sor_solve` | `TransformStack::apply` | reversible reductions |
+| `sor_solve` / Tree | `LpEngine::solve/resolve` | `RawResult` or basis |
+| FO engine | `LpDevice` | fused steps + KKT scalars |
+| Simplex | `sor_la_cpu` | LU / FT / FTRAN / BTRAN |
+| Tree | `CutManager`, `BranchPolicy`, `Heuristics` | `Policy<>` |
+| Any | `finalize_result` | only Optimal writer |
+| Bench | `sor_solve` + external HiGHS | process isolation |
+
+---
+
+
+## A.9 Data structures that must survive the stitch
+
+```text
+Model IR
+  ├── rows/cols, sense, obj_offset
+  ├── A as SparsePattern + values
+  ├── row_lo/hi, col_lo/hi
+  ├── integer/semi-cont flags          (MILP)
+  └── StructureMap                     (blocks, periods, bilinears — must survive presolve)
+
+ScaledLp / WorkingLp
+  └── same, after Transform stack (scales + fixed vars removed)
+
+Basis                              (simplex / crossover)
+  ├── basic column indices
+  └── LU factors (+ update etas)
+
+Device state (FO)
+  └── x, y, averages, anchor, τ, σ, w   — not exposed as host[]
+
+SolveResult
+  ├── Status, ProofLevel
+  ├── x, y, objective, dual_bound
+  └── downgrade_reason, iterations, transfer_stats
+```
+
+---
+
+## A.10 File-level stitch (prototype → target)
+
+```text
+TODAY
+  cli/sor_solve.cpp
+       → io/mps.cpp → model/lp.hpp
+       → backend/cpu_backend.cpp
+       → engines/pdhg.cpp
+       → certify/finalize.cpp
+
+TARGET (additive; keep finalize gate)
+  cli/sor_solve.cpp
+       → io/mps.cpp (+ qps)
+       → transform/stack + presolve/*
+       → engine factory
+            ├─ firstorder/hpr.cpp  → backend/lp_device_{cpu,vulkan,cuda}
+            ├─ simplex/dual.cpp    → la_cpu/lu.cpp + lu_update.cpp + solve.cpp
+            ├─ crossover/*.cpp
+            └─ concurrent.cpp
+       → search/tree.cpp
+            → cuts/*  branch/*  heur/*
+       → qp/active_set.cpp
+       → certify/finalize.cpp
+       → verify/*   (separate CMake target)
+```
+
+---
+
+## A.11 What to read next
+
+| Doc | Use |
+|---|---|
+| §§1–15 above | C1–C6 contracts, APIs |
+| `gpu_first_order_plan.md` | Why `LpDevice` replaces host-driven FO |
+| `paper_bibliography.md` | Industry paper stack + DOI catalog |
+| `implementation_plan.md` | Calendar / gates |
+| `clean_room_policy.md` | Papers yes, solver repos no |
+
+---
+
+## A.12 Bottom line
+
+- **Top:** CLI/bench → solve pipeline → finalize → optional verify.  
+- **Middle:** layers L0–L8; engines below search; verify sealed from engines.  
+- **Loops:** PDHG now → HPR+`LpDevice` for large LP; dual simplex for accuracy + MIP nodes; B&C tree for MILP.  
+- **Stitch:** shared `Model` + transforms → engine(s) → `RawResult` → `finalize_result` → `SolveResult`.  
+- **Build:** A→G order so each new module plugs into an existing seam instead of rewriting the CLI.

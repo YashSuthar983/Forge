@@ -1,6 +1,5 @@
 # SOR — Dependency ledger
 
-**Version:** 1.0 — 28 Aug 2026
 **Binding:** every dependency must appear here with its role and license before it
 enters the tree. See `clean_room_policy.md` and `master_spec.md` §7.
 
@@ -59,42 +58,51 @@ a development tool invoked as a subprocess. See `tools/julia_gpu/README.md`.
 | `CUDA.jl` | not installed | NVIDIA backend, discovered at runtime only | MIT | Allowed when present — vendor toolkit, not a solver |
 
 `CUDA.jl` is intentionally absent from `Project.toml`: its artifacts are multi-GB
-and the development machine has no NVIDIA GPU. `src/device.jl` locates it at
+and this machine has no **NVIDIA** GPU. `src/device.jl` locates it at
 runtime and uses it only if `CUDA.functional()`. Absent or broken → CPU backend
 with `accelerated=false`.
 
+### GPU hardware on this machine
+
+"No NVIDIA GPU" does not mean GPU work is unmeasurable here:
+
+| Item | Value |
+|---|---|
+| Discrete GPU | **AMD Radeon RX 5500M (Navi 14, RDNA1)**, 4080 MiB VRAM |
+| Vulkan | **1.4.318 via RADV**, `shaderFloat64` **true**, `shaderInt64` **true** |
+| Queues | graphics+compute family **and** a dedicated compute-only family |
+| Device access | `/dev/dri/renderD128` already ACL-granted to the dev user |
+| CUDA | absent — no `nvcc`, no NVIDIA hardware |
+| ROCm/HIP | blocked — no `/opt/rocm`, `/dev/kfd` not user-accessible, gfx1012 unsupported upstream |
+
+What is unavailable is **CUDA specifically**, not GPU acceleration. Vulkan compute
+needs nothing installed beyond `glslang-tools`. See
+`gpu_first_order_plan.md` §1 and §4.
+
+### Verdict on this sidecar: remove it
+
+Measured in `tools/julia_gpu/README.md` (10000×10000, 79,982 nnz, 200 iterations,
+both backends single-threaded): **30.6 ms for the C++ CPU path vs 7346 ms for the
+sidecar — 240× slower**, of which 3834 ms (52%) is JSON-over-pipes IPC, and the
+KernelAbstractions CPU backend is ~20× slower than the plain C++ loop on
+per-launch overhead alone. **The GPU path has never executed**, so
+`accelerated` has only ever been `false` and no GPU number exists for SOR.
+
+It succeeded as a correctness lab — identical objectives to every printed digit
+across backends — and that result is now banked. The sidecar and these six ledger
+entries are slated for deletion in favour of an in-process Vulkan backend. Keep
+`tools/julia_gpu/README.md` as the measured record of why.
+
 ---
 
-## 4. Forbidden — must never appear in any of the tables above
+## 4. Forbidden dependencies
 
-Solver libraries, in the solve path or linked in any form:
+**Canonical list and workflow:** `clean_room_policy.md`. Not restated here.
 
-COIN-OR CBC / CLP · HiGHS (including `pdlp_gpu`, which is cuPDLP-C) · GLPK ·
-SCIP / SoPlex / PaPILO · Google OR-Tools / PDLP · NVIDIA cuOpt · Ipopt / Bonmin /
-Couenne / SHOT / BARON · CPLEX / Gurobi / Xpress / MOSEK / COPT · SciPy
-`linprog` · JuMP / MathOptInterface solver backends · any third-party sparse LU,
-sparse Cholesky, or LP/MIP/NLP kernel.
+Ledger-specific notes that stay here:
 
-### Permitted uses of the forbidden list
-
-- **External process baseline.** Running `highs model.mps` as a separate binary
-  and comparing numbers is allowed and recommended — it is the most effective way
-  to find our own bugs. Recorded as `"kind": "external_process"` in benchmark
-  JSON, never inside a certificate.
-- **Their papers.** Reading the literature a project cites is the required
-  clean-room path.
-
-### Not permitted, including under deadline pressure
-
-- Linking (`-lhighs`), `#include`, vendoring, or git submodules.
-- **Porting.** Reading an upstream `.cpp` and re-typing the logic in C++, Rust,
-  Julia, or anything else is derivative work. The paper is the only permitted
-  input.
-- Returning any external solver's output inside a SOR certificate.
-
-Every occasion on which a team member opens an upstream solver source tree must
-be recorded in `reference_log.md`. **As of 28 Aug 2026 that log is empty:** none
-of the code in this repository was written with any solver's source open.
+- Benchmark JSON tags external baselines as `"kind": "external_process"` — never inside a certificate.
+- **As of 28 Aug 2026:** none of the code in this repository was written with any solver's source open.
 
 ---
 
@@ -114,10 +122,8 @@ clean-room claim checkable — commit messages cite papers, never line numbers.
 | MPS format | IBM MPSX convention as documented publicly by Netlib and MIPLIB |
 | FNV-1a hash | public domain reference description |
 
-Not yet implemented, and named here so nobody mistakes the current state for
-more than it is: Forrest–Tomlin update, hypersparse triangular solves, dual
-simplex with BFRT, dual steepest edge, presolve, cut management, branching,
-crossover, restarted/Halpern PDHG. See `master_spec.md` §8 for the full register.
+Planned / not-yet-implemented algorithms: see `master_spec.md` §8 (register) and
+`paper_bibliography.md` (DOIs). This section lists **in-tree** attributions only.
 
 ---
 
@@ -133,6 +139,7 @@ crossover, restarted/Halpern PDHG. See `master_spec.md` §8 for the full registe
 | `ctest -R test_no_unproved_optimal` | nothing can report `Optimal` without evidence |
 | `Pkg.test()` (sidecar) | no forbidden Julia module is loaded |
 
-**Status:** the four `scripts/check_*` gates are specified in
-`implementation_plan.md` Sprint 0 and are **not yet written**. The three test
-gates exist and pass.
+**Status:** **all five** `scripts/check_*` gates named in `architecture.md` §13.5
+are unwritten. This table lists four of them; `check_backend_parity.sh` is the
+fifth. Consequence: **Gate G0 in `implementation_plan.md` cannot pass.** The three
+`ctest` gates above exist and pass.

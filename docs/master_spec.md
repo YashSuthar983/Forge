@@ -2,9 +2,21 @@
 
 **Read this first.** It defines what SOR is, why each piece exists, what we will and will not claim, and the full register of algorithms we intend to own.
 
-**Version:** 2.0 — 28 Aug 2026
-**Companions:** `architecture.md` (how it's built) · `implementation_plan.md` (when it's built) · `clean_room_policy.md` (team reference rules)
-**Supersedes:** the competitive framing in `SENIOR_BRIEF_FOR_CLAUDE.md` §"Competitive positioning" and `SIH26119_PS_ALIGNMENT.md` §2. The *factual* content of `SIH26119_verified_competitive_report.md` stands and is the source for every benchmark number quoted here.
+**Companions / single sources of truth (do not duplicate — link):**
+
+| Topic | Canonical file |
+|---|---|
+| Capability status (§4) | **this file** |
+| Architecture / seams / diagrams | `architecture.md` |
+| Near-term weeks + GPU/`LpDevice` measurements | `gpu_first_order_plan.md` |
+| Macro phases & gates G0–G6 | `implementation_plan.md` |
+| Papers / DOIs | `paper_bibliography.md` |
+| Forbidden deps / clean-room workflow | `clean_room_policy.md` |
+| Linked deps + CI gate list | `dependency_ledger.md` |
+| PS Must/Should table | `SIH26119_PS_ALIGNMENT.md` |
+| Mittelmann / competitor numbers | `SIH26119_verified_competitive_report.md` |
+
+**Scope boundary:** this file owns strategy, targets, claims discipline, and the algorithm register. It supersedes the framing in `SIH26119_PS_ALIGNMENT.md` §2 (but **not** its §1 PS-demand table, which is the only record of the problem statement). External benchmark facts live in `SIH26119_verified_competitive_report.md`.
 
 ---
 
@@ -65,7 +77,7 @@ The LPs that dominate a solver's time are not one huge LP; they are strong-branc
 
 ### Bet 2 + 4 — Learned policies *are* family memory
 
-These were two bets in earlier drafts. They are one.
+These are one bet, not two.
 
 Learned branching and cut selection generalise **poorly** across heterogeneous MIPLIB; the literature has a genuine replication problem. They generalise **excellently within an instance family**.
 
@@ -95,7 +107,7 @@ This is the one axis where SOR can be **world-best**, because the field is nearl
 
 Refinery blending **is** the pooling problem: bilinear, nonconvex, NP-hard. Aspen PIMS — the software MRPL planners actually use — solves it with successive linear programming / distributive recursion, which converges to a *local* optimum. On the textbook Haverly instances, SLP demonstrably gets stuck.
 
-Earlier drafts of our own docs called linear blending "a documented surrogate for bilinear pooling." That honesty was right and the target was wrong. **The pooling problem is the product.**
+It is tempting to treat linear blending as "a documented surrogate for bilinear pooling." That is honest but aims too low. **The pooling problem is the product.**
 
 And the sequencing is better than it looks: piecewise-McCormick relaxation turns a pooling problem into a **MILP**, so a valid global bound needs only the LP/MILP stack — no NLP solver. Incumbents come from an SLP loop (LP plus variable fixing). A credible `ProvedGlobalEpsilon` result is therefore reachable in Phase 2, not Phase 4.
 
@@ -113,35 +125,33 @@ Publishing and maintaining one costs almost nothing relative to the rest of the 
 
 ## 4. Capability ladder
 
-Green rows are claimable. Amber and red are not, at any volume of enthusiasm.
+**Authoritative status table** (last verified by running the code: **30 Aug 2026**). Green/amber rows may be claimed only at the stated level; red rows are not claimable. Module-tree detail: `architecture.md` Appendix A.3. Near-term GPU/FO plan: `gpu_first_order_plan.md` §6.
 
 | Capability | State | Evidence required to go green |
 |---|---|---|
-| Model IR, MPS/QPS I/O, CLI | 🔴 not built | Netlib parses round-trip clean |
-| Independent checker + certificates | 🔴 not built | Tamper tests pass; checker links nothing above L2 |
-| Primal simplex + sparse LU + FT update | 🔴 not built | ≥80/98 Netlib, 0 false `Optimal` |
-| Presolve | 🔴 not built | Reduction counts reported; postsolve exact on Netlib |
-| Dual simplex + hypersparsity + DSE | 🔴 not built | SGM within 3× HiGHS on Netlib+Kennington |
-| First-order LP (HPR family) | 🔴 not built | ≥40/65 LPfeas subset, transfer time included |
-| CUDA backend | 🔴 not built | Backend parity test green on a measured device |
-| Crossover | 🔴 not built | First-order result reaches `ProvedOptimalFP` |
+| Model IR, MPS I/O, CLI | 🟡 works — 93/93 Netlib parse | QPS reader; round-trip test |
+| Independent checker + certificates | 🟡 `finalize_result` + `test_no_unproved_optimal` pass | `sor_verify` separate target; tamper tests |
+| Clean-room (no solver lib linked) | 🟢 verified — `ldd` libc/libstdc++/libm/libgcc only | Keep; add `check_forbidden_deps.sh` to CI |
+| First-order LP (HPR family) | 🔴 vanilla PDHG only — O(1/k), ~1/46 Netlib @ 1e-6. Netlib is now the simplex's job; the FO engine's target is large sparse LP, where simplex is not competitive | Restart + primal weight + Halpern → ≥40/65 LPfeas |
+| Device-resident GPU / Vulkan | 🟡 `LpDevice` + 6 SPIR-V shaders; HPR-vulkan measured | 0 transfers/iteration on hot path; on-device KKT reduce |
+| GPU measured (transfer included) | 🟡 Vulkan HPR on RX 5500M; crossover at ~160k nnz | Tier B MIPLIB LP relaxations |
+| CI gate scripts (`check_*`) | 🔴 all five missing | Gate G0 passes |
+| Determinism (`sor_det`) | 🔴 not built | `check_determinism.sh` bit-identical |
+| Presolve | 🔴 not built | Reduction counts; exact postsolve on Netlib |
+| Primal simplex + sparse LU | 🟢 **81/93 Netlib `ProvedOptimalFP`**, all 81 objectives confirmed against HiGHS as an external process (`scripts/verify_vs_highs.py`), 0 disagreements, 49 s total. Markowitz LU with singleton triangularization, product-form update, Harris two-pass ratio test | Forrest–Tomlin update; hypersparse FTRAN/BTRAN; DEVEX. Remaining 12: 6 phase-1 stalls, 6 dual residual above 1e-7 |
+| Dual simplex + hypersparsity + DSE | 🔴 not built — primal only | SGM within 3× HiGHS on Netlib+Kennington |
+| Crossover | 🔴 not built | FO result reaches `ProvedOptimalFP` |
 | B&B + cut manager + Gomory | 🔴 not built | MIPLIB-easy-20 with honest gaps |
-| Convex QP | 🔴 not built | QPLIB convex subset, KKT residuals reported |
-| Determinism | 🔴 not built | 1 vs N threads, twice each, bit-identical |
-| Batched strong branching | 🔴 not built | Tree-size reduction measured vs pseudocost |
+| Convex QP | 🔴 not built | QPLIB convex subset, KKT residuals |
+| Batched strong branching | 🔴 not built | Tree-size reduction vs pseudocost |
 | MILP at scale | 🔴 not built | ≥120/240 MIPLIB 2017 |
 | Global pooling | 🔴 not built | `ProvedGlobalEpsilon` on Haverly/Ben-Tal/Adhya |
-| VIPR certified | 🔴 not built | Verifier accepts logs for a MIPLIB-easy subset |
-| Rational exact | 🔴 not built | 100% of Netlib verified in rational arithmetic |
-| Family memory | 🔴 not built | ≥5× on 2nd+ same-fingerprint solve |
-| Learned policies | 🔴 not built | ≥1.5× within family, no regression outside |
-| Decomposition | 🔴 not built | Measured win on a block-structured instance |
-| Barrier / IPM | 🔴 not built | Phase 4 |
-| NLP / MINLP | 🔴 not built | Phase 4 |
-| Conic | 🔴 not built | Phase 5 |
-| Compat shims | 🔴 not built | A real model relinks and solves |
+| VIPR certified | 🔴 not built | Verifier accepts MIPLIB-easy subset |
+| Rational exact | 🔴 not built | 100% Netlib rational-verified |
+| Family memory / learned policies / decomp | 🔴 not built | Per §5 targets |
+| Barrier / IPM / NLP / MINLP / conic / shims | 🔴 not built | Phases 4–5 |
 
-Everything is red today. That is the accurate state of the project on 28 Aug 2026: the architecture is decided and no algorithm is implemented.
+Changelog of earlier wrong “everything red” wording: `gpu_first_order_plan.md` §0.2.
 
 ---
 
@@ -152,6 +162,8 @@ A claim without a number is a vibe. These are the numbers, with the public refer
 | Axis | Target | Reference points | Phase |
 |---|---|---|---|
 | LP simplex | SGM within **3×** HiGHS on Netlib + Kennington | HiGHS is the best open LP code | 1 |
+
+**Measured 30 Aug 2026, Netlib (93 instances, 20 s limit, `scripts/run_compare.py --solvers sor,highs`):** SOR shifted geometric mean **0.2937 s** vs HiGHS **0.0914 s** — **3.21×**. Solved 87/93 vs 93/93, of which **81 carry `ProvedOptimalFP`** and 6 more reach the right objective but are demoted for a dual residual or duality gap above tolerance. Kennington not yet run. The target is therefore nearly met on Netlib with none of the three biggest constant-factor items (Forrest–Tomlin, hypersparse solves, DEVEX) implemented.
 | LP first-order (GPU) | **≥40/65** LPfeas subset, transfer included | HiGHS 1.15: 55/65 · cuPDLPx 57 · HPR-LP-C 58 · COPT 65 | 1 |
 | LP first-order (mature) | **≥55/65** LPfeas | parity with HiGHS 1.15 | 3 |
 | MILP | **≥120/240** MIPLIB 2017, 2 h limit | SCIP 136 · HiGHS 158 · OptVerse 210 · COPT 219 | 2 |
@@ -162,7 +174,7 @@ A claim without a number is a vibe. These are the numbers, with the public refer
 | Family re-solve | **≥5×** on 2nd+ solve of a perturbed same-fingerprint model | no solver ships this | 3 |
 | Determinism | bit-identical across 1/4/12 threads, 2 runs each | commercial solvers offer this; open solvers largely do not | 0 |
 
-**COPT parity on MIPLIB (219/240) is a 24–36 month goal, tracked openly and claimed only when measured.** Naming the target is ambition; claiming it before measurement is fraud. Those are different things, and earlier drafts of our docs conflated them by refusing to name the target at all.
+**COPT parity on MIPLIB (219/240) is a 24–36 month goal, tracked openly and claimed only when measured.** Naming the target is ambition; claiming it before measurement is fraud. Those are different things, and refusing to name the target at all conflates them.
 
 ---
 
@@ -191,7 +203,7 @@ A claim without a number is a vibe. These are the numbers, with the public refer
 
 ### 6.3 The honest-and-ambitious rule
 
-Earlier drafts treated honesty and ambition as a tradeoff and resolved it by shrinking the ambition. That was the wrong resolution. The correct one:
+Honesty and ambition are not a tradeoff, and resolving the tension by shrinking the ambition is the wrong move. The rule:
 
 > **Name the frontier target. Refuse to claim it until it is measured. Publish the failures alongside the wins.**
 
@@ -217,33 +229,14 @@ A technical judge respects a team that says "COPT is at 219, we are at 120, here
 2. **Vendor sparse kernels are a dead end at the frontier anyway.** No library provides a sparse LU with Forrest–Tomlin update, and cuSPARSE SpMV is the wrong primitive for PDHG's repeated fixed-pattern A/Aᵀ products. Keep the `KernelBackend` seam; expect to fill it yourself.
 3. **Multi-precision arithmetic.** `sor_num::Rational` is our own limb arithmetic. GMP is LGPL and, more to the point, sits in the numeric core where the problem statement is most sensitive.
 
-### 7.3 Forbidden in the solve path
+### 7.3 Forbidden list, reference tiers, guardrails
 
-COIN-OR CBC/CLP · HiGHS (including `pdlp_gpu` = cuPDLP-C) · GLPK · SCIP / SoPlex / PaPILO · OR-Tools / PDLP · NVIDIA cuOpt · Ipopt / Bonmin / Couenne / SHOT / BARON · CPLEX / Gurobi / Xpress / MOSEK / COPT · SciPy `linprog` · any third-party sparse LU, sparse Cholesky, or LP/MIP/NLP kernel.
+**Single source:** `clean_room_policy.md` (forbidden list including cuPDLPx / HPR-LP / PSLP; allowed / caution / forbidden practices; judges script).  
+**CI gate names:** `dependency_ledger.md` §6.
 
-### 7.4 Reference policy (team rule)
+Do not restate the solver name list here — it drifted when copied.
 
-Full text: **`sor/docs/clean_room_policy.md`**. Summary:
-
-| Tier | Practice |
-|---|---|
-| **Allowed** | HiGHS/SCIP as **external process** only; README + cited papers; same-MPS objective/residual comparison |
-| **Allowed with caution** | One person, logged in **`reference_log.md`**: check if a trick exists in literature → implement from paper or skip |
-| **Forbidden** | Copy/paste, vendored `third_party/highs`, `#include` solver headers, side-by-side reimplementation, baseline output in certificates |
-
-**Default:** oracle (binary comparison), not source browsing.
-
-### 7.5 Guardrails
-
-| Guardrail | Purpose |
-|---|---|
-| `scripts/check_forbidden_deps.sh` in CI | Catches accidental links |
-| No solver code under `third_party/` | No "remove later" vendoring |
-| Numeric-core PRs: **2nd reviewer** | Blocks translated loops |
-| Commit messages cite **papers**, not upstream line numbers | Audit trail |
-| `reference_log.md` when upstream source is opened | Clean-room story for judges |
-
-### 7.6 MIT / Apache licenses do not override the PS
+### 7.4 MIT / Apache licenses do not override the PS
 
 HiGHS (MIT) and SCIP (Apache) are legally copyable with attribution in ordinary software. **SIH still forbids building SOR upon them as the solve engine.** License type is irrelevant to compliance.
 
@@ -277,8 +270,8 @@ Every algorithm SOR intends to own. **Tier 0** = table stakes, ~80% of the code 
 | Bound-shifting perturbation, anti-cycling | Standard | Degenerate refinery LPs cycle without it | 0 | 1 |
 | Scaling: geometric + equilibration, Curtis–Reid | Curtis & Reid | Refinery models mix barrels with sulfur ppm | 0 | 0 |
 | PDHG | Chambolle & Pock | Base first-order method | 0 | 1 |
-| **Restarted PDLP**: adaptive restart on normalized duality gap, primal weight, adaptive step | Applegate et al. 2021 | Largest algorithmic win in the PDLP line | 1 | 1 |
-| **Halpern / reflected-restarted PDHG (HPR)** | HPR-LP line, 2024–25 | Current frontier; 58/65 LPfeas | 1 | 1 |
+| **Restarted PDLP**: adaptive restart on normalized duality gap, primal weight, adaptive step | Applegate et al. 2021 | Largest algorithmic win in the PDLP line. **Measured on our own code: primal weight alone gives 18× on dual residual and cuts `agg`'s objective error 45×** | 1 | 1 |
+| **Halpern / reflected-restarted PDHG (HPR)** | HPR-LP line, 2024–25 (arXiv:2408.12179) | Current frontier; 58/65 LPfeas and **9/12 on the hardest addendum — best of any code**. cuPDLPx's base algorithm is a *special case* of it, so **implement HPR directly rather than PDHG → PDLP → HPR** | 1 | 1 |
 | Feasibility polishing | PDLP / cuOpt | High accuracy, fast | 1 | 1 |
 | Ruiz + Pock–Chambolle preconditioning | Ruiz | Required for first-order convergence | 0 | 1 |
 | **Crossover** — interior/first-order point → basic solution | Megiddo; Bixby & Saltzman | Lifts GPU path to `ProvedOptimalFP` | 1 | 1 |
@@ -414,16 +407,16 @@ Each needs an owner and a date. Listed with the phase they block.
 | 3 | How loose can a batched strong-branching LP be before branch quality degrades? | Phase 2 headline | **Empirical.** Measurement spike in Phase 1, before Phase 2 commits |
 | 4 | VIPR hot-path cost — if >15%, certified mode stays permanently opt-in | Phase 3 | Acceptable either way; opt-in certified is still market-unique |
 | 5 | Which CPLEX/Gurobi entry points do the shims cover? | Phase 5 | Needs a real deployment survey; requires an industrial contact |
-| 6 | GPU access beyond Colab/Kaggle T4 | Phase 1 gate | Escalate by 7 Sep 2026. No measured run by 11 Sep → report unmeasured, never fabricate |
+| 6 | GPU access — **decided** | — | This machine has an **AMD Radeon RX 5500M (Navi 14, 4080 MiB)**, Vulkan 1.4 via RADV, `shaderFloat64`, dedicated compute queue, device access already granted. GPU work is measurable **locally, today** — only CUDA is unavailable. Decision: **Vulkan compute primary, CUDA second.** Honest bandwidth-bound ceiling ~4.4× fp64 / ~6–8× fp32-iterate. The 7 Sep / 11 Sep escalation dates are moot |
 | 7 | Is the product story MRPL-first or process-industry-general? | Phase 5 positioning | Affects whether the benchmark suite is refinery-specific or broader |
 
 ---
 
 ## 12. Bottom line
 
-The previous version of this strategy differentiated on **process** — checker, certificates, honest labels, clean-room CI. Those are correct, rare, and worth keeping. They are also hygiene, not competitiveness.
+Process differentiation — checker, certificates, honest labels, clean-room CI — is correct, rare, and worth keeping. It is also hygiene, not competitiveness.
 
-v2 differentiates on **architecture and algorithms**, at the five places the incumbents' age works against them:
+SOR differentiates on **architecture and algorithms**, at the five places the incumbents' age works against them:
 
 1. Batched small-LP throughput on a device-resident data model → affordable strong branching.
 2. Learned policies fused with per-family solve memory → the one setting where learned decisions actually generalise.

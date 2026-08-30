@@ -36,9 +36,17 @@ target_include_directories(sor_core PUBLIC sor_core/include)
 target_link_libraries(sor_core PRIVATE sor_flags)
 
 # --------------------------- L1: linear algebra ----------------------------
-add_library(sor_sparse sor_sparse/src/csr.cpp)
+add_library(sor_sparse sor_sparse/src/csr.cpp sor_sparse/src/csc.cpp)
 target_include_directories(sor_sparse PUBLIC sor_sparse/include)
 target_link_libraries(sor_sparse PUBLIC sor_core PRIVATE sor_flags)
+
+# Sparse LU of a simplex basis: FTRAN / BTRAN / product-form update.
+# Deliberately depends on sor_core ONLY -- it takes the basis column-wise as
+# plain arrays, so it needs no matrix type and stays usable by crossover and by
+# any future barrier engine.
+add_library(sor_la_cpu sor_la_cpu/src/lu.cpp)
+target_include_directories(sor_la_cpu PUBLIC sor_la_cpu/include)
+target_link_libraries(sor_la_cpu PUBLIC sor_core PRIVATE sor_flags)
 
 set(SOR_BACKEND_SOURCES sor_backend/src/cpu_backend.cpp
                         sor_backend/src/backend_factory.cpp)
@@ -66,9 +74,10 @@ target_include_directories(sor_io PUBLIC sor_io/include)
 target_link_libraries(sor_io PUBLIC sor_model PRIVATE sor_flags)
 
 # ------------------------------ L4: engines --------------------------------
-add_library(sor_engines sor_engines/src/pdhg.cpp)
+add_library(sor_engines sor_engines/src/pdhg.cpp sor_engines/src/simplex.cpp)
 target_include_directories(sor_engines PUBLIC sor_engines/include)
-target_link_libraries(sor_engines PUBLIC sor_model sor_backend PRIVATE sor_flags)
+target_link_libraries(sor_engines PUBLIC sor_model sor_backend sor_la_cpu
+                                  PRIVATE sor_flags)
 
 # --------------------------- L7: verification ------------------------------
 # NOTE: sor_certify links ONLY L0. It must never gain an engine dependency.
@@ -92,10 +101,13 @@ function(sor_add_test name)
 endfunction()
 
 sor_add_test(test_csr                 sor_sparse)
+sor_add_test(test_csc                 sor_sparse)
+sor_add_test(test_lu                  sor_la_cpu)
 sor_add_test(test_backend_parity      sor_backend)
 sor_add_test(test_no_unproved_optimal sor_certify)
 sor_add_test(test_mps                 sor_io)
 sor_add_test(test_pdhg                sor_engines sor_certify sor_io)
+sor_add_test(test_simplex             sor_engines sor_certify sor_io)
 
 if(SOR_ENABLE_JULIA_GPU)
   sor_add_test(test_julia_gpu_parity sor_backend)

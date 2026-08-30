@@ -4,9 +4,8 @@
 #
 #   julia --project=tools/julia_gpu tools/julia_gpu/server.jl [--device auto|cpu|cuda]
 #
-# NOTE: docs/prompts/julia_gpu_prototype.md names src/server.jl as the entry
-# point. That file is library code included by the module, so it cannot also be a
-# script without a self-include cycle. This is the script.
+# NOTE: src/server.jl is library code included by the module, so it cannot also be
+# a top-level script without a self-include cycle. This file is that script.
 
 using SORGpuProto
 
