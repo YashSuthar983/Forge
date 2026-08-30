@@ -36,9 +36,17 @@ target_include_directories(forge_core PUBLIC forge_core/include)
 target_link_libraries(forge_core PRIVATE forge_flags)
 
 # --------------------------- L1: linear algebra ----------------------------
-add_library(forge_sparse forge_sparse/src/csr.cpp)
+add_library(forge_sparse forge_sparse/src/csr.cpp forge_sparse/src/csc.cpp)
 target_include_directories(forge_sparse PUBLIC forge_sparse/include)
 target_link_libraries(forge_sparse PUBLIC forge_core PRIVATE forge_flags)
+
+# Sparse LU of a simplex basis: FTRAN / BTRAN / product-form update.
+# Deliberately depends on forge_core ONLY -- it takes the basis column-wise as
+# plain arrays, so it needs no matrix type and stays usable by crossover and by
+# any future barrier engine.
+add_library(forge_la_cpu forge_la_cpu/src/lu.cpp)
+target_include_directories(forge_la_cpu PUBLIC forge_la_cpu/include)
+target_link_libraries(forge_la_cpu PUBLIC forge_core PRIVATE forge_flags)
 
 set(FORGE_BACKEND_SOURCES forge_backend/src/cpu_backend.cpp
                         forge_backend/src/backend_factory.cpp)
@@ -66,9 +74,10 @@ target_include_directories(forge_io PUBLIC forge_io/include)
 target_link_libraries(forge_io PUBLIC forge_model PRIVATE forge_flags)
 
 # ------------------------------ L4: engines --------------------------------
-add_library(forge_engines forge_engines/src/pdhg.cpp)
+add_library(forge_engines forge_engines/src/pdhg.cpp forge_engines/src/simplex.cpp)
 target_include_directories(forge_engines PUBLIC forge_engines/include)
-target_link_libraries(forge_engines PUBLIC forge_model forge_backend PRIVATE forge_flags)
+target_link_libraries(forge_engines PUBLIC forge_model forge_backend forge_la_cpu
+                                  PRIVATE forge_flags)
 
 # --------------------------- L7: verification ------------------------------
 # NOTE: forge_certify links ONLY L0. It must never gain an engine dependency.
@@ -92,10 +101,13 @@ function(forge_add_test name)
 endfunction()
 
 forge_add_test(test_csr                 forge_sparse)
+forge_add_test(test_csc                 forge_sparse)
+forge_add_test(test_lu                  forge_la_cpu)
 forge_add_test(test_backend_parity      forge_backend)
 forge_add_test(test_no_unproved_optimal forge_certify)
 forge_add_test(test_mps                 forge_io)
 forge_add_test(test_pdhg                forge_engines forge_certify forge_io)
+forge_add_test(test_simplex             forge_engines forge_certify forge_io)
 
 if(FORGE_ENABLE_JULIA_GPU)
   forge_add_test(test_julia_gpu_parity forge_backend)

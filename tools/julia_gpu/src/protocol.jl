@@ -1,7 +1,7 @@
 # JSON request/response handling.
 #
-# DEVIATION from docs/prompts/julia_gpu_prototype.md's v0 protocol, deliberate:
-# the prompt sends row_ptr/col_idx/vals inline on EVERY call. PDHG performs two
+# Deliberate protocol choice:
+# the obvious protocol sends row_ptr/col_idx/vals inline on EVERY call. PDHG does two
 # SpMVs per iteration over thousands of iterations, so an inline pattern would
 # make JSON serialisation dominate the measurement completely and the timing
 # table meaningless.
