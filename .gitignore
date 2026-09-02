@@ -11,3 +11,13 @@ benchmarks/.venv-baseline/
 
 # Generated benchmark artifacts
 benchmarks/results/
+
+# MIPLIB 2017 collection (~7.3GB gzipped MPS). Re-download:
+#   curl -fL -o /tmp/collection.zip https://miplib.zib.de/downloads/collection.zip
+#   unzip -o -d benchmarks/miplib2017/mps /tmp/collection.zip
+benchmarks/miplib2017/mps/
+benchmarks/miplib2017/*.zip
+
+# Synthetic scaling-study LPs (generated, up to ~150 MB each). Regenerate:
+#   python3 scripts/gen_lp_ladder.py
+benchmarks/synthetic/mps/

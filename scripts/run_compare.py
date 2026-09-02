@@ -60,6 +60,9 @@ class SolverResult:
     row_violation: float | None = None
     error: str | None = None
     kind: str = "external_process"
+    rows: int | None = None
+    cols: int | None = None
+    nnz: int | None = None
 
 
 @dataclass
@@ -82,16 +85,26 @@ def shifted_geomean(values: list[float], shift: float = 1.0) -> float | None:
 
 
 def run_sor(exe: Path, mps: Path, time_limit: float, max_iter: int,
-            tol: float, backend: str, engine: str = "simplex") -> SolverResult:
-    r = SolverResult(name="SOR", kind="ours")
+            tol: float, backend: str, engine: str = "simplex",
+            extra: list[str] | None = None, name: str = "SOR") -> SolverResult:
+    r = SolverResult(name=name, kind="ours")
     # --time-limit is passed so the solver stops itself and reports its best
     # point. Relying only on the subprocess timeout below throws the answer away.
-    cmd = [str(exe), str(mps), "--engine", engine, "--backend", backend,
+    eng = engine
+    flags = list(extra or [])
+    if engine == "hpr-full":
+        eng = "hpr"
+        flags.append("--hpr-full")
+    elif engine == "hpr-vanilla":
+        eng = "hpr"
+        flags.append("--hpr-vanilla")
+    cmd = [str(exe), str(mps), "--engine", eng, "--backend", backend,
            "--max-iter", str(max_iter), "--tol", str(tol),
-           "--time-limit", str(time_limit)]
+           "--time-limit", str(time_limit), *flags]
     t0 = time.perf_counter()
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=time_limit)
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=time_limit + 30)
         r.wall_s = time.perf_counter() - t0
         txt = p.stdout
         sm = _PATTERNS["status"].search(txt)
@@ -102,6 +115,9 @@ def run_sor(exe: Path, mps: Path, time_limit: float, max_iter: int,
         r.row_violation = _f(txt, "row_viol")
         it = _f(txt, "iters")
         r.iterations = int(it) if it is not None else None
+        sz = _PATTERNS["rows_cols"].search(txt)
+        if sz:
+            r.rows, r.cols, r.nnz = int(sz[1]), int(sz[2]), int(sz[3])
         if r.status == "unparsed":
             r.error = ((p.stderr or "") + (p.stdout or ""))[:240]
     except subprocess.TimeoutExpired:
@@ -125,7 +141,7 @@ def run_external(python: Path, script: Path, mps: Path,
     t0 = time.perf_counter()
     try:
         p = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=time_limit + 90)
+                           timeout=time_limit + 20)
         wall = time.perf_counter() - t0
         try:
             j = json.loads(p.stdout.strip().splitlines()[-1])
@@ -144,7 +160,7 @@ def run_external(python: Path, script: Path, mps: Path,
     except subprocess.TimeoutExpired:
         r.wall_s = time.perf_counter() - t0
         r.status = "timeout"
-        r.error = f"wall timeout > {time_limit + 90}s"
+        r.error = f"wall timeout > {time_limit + 20}s"
     except Exception as e:  # noqa: BLE001
         r.wall_s = time.perf_counter() - t0
         r.status = "error"
@@ -165,14 +181,42 @@ def probe_size(exe: Path, mps: Path) -> tuple[int | None, int | None, int | None
 
 
 def is_solved(status: str) -> bool:
+    """Count Optimal and Feasible (incl. FeasibleWithGap) as solved.
+
+    First-order engines structurally cannot return Optimal (no basis). Scoring
+    only Optimal would make the table measure a design decision, not quality.
+    """
     s = status.lower().replace("highsmodelstatus.k", "")
-    return s in {"optimal", "feasible"} or s.endswith("optimal")
+    if s in {"optimal", "feasible", "feasiblewithgap"}:
+        return True
+    if s.endswith("optimal"):
+        return True
+    return False
 
 
-def is_usable_primal(status: str) -> bool:
-    """Statuses where a primal objective is still comparable."""
-    s = status.lower()
-    return is_solved(s) or s in {"interrupted", "feasiblewithgap", "iterationlimit"}
+# (display_name, engine, backend_override or None, extra flags)
+# backend_override None → use --backend
+SOR_KEYS = {
+    "sor":            None,  # filled from --engine / --backend at runtime
+    "sor-simplex":    ("SOR-simplex", "simplex", None, []),
+    "sor-pdhg":       ("SOR-pdhg", "pdhg", None, []),
+    "sor-hpr":        ("SOR-hpr", "hpr", None, []),
+    "sor-hpr-full":   ("SOR-hpr-full", "hpr-full", None, []),
+    "sor-hpr-vulkan": ("SOR-hpr-vulkan", "hpr", "vulkan", []),
+}
+
+
+def is_ours(name: str) -> bool:
+    return name == "SOR" or name.startswith("SOR-")
+
+
+def display_name_for(key: str, engine: str) -> str:
+    if key == "sor":
+        return "SOR" if engine == "simplex" else f"SOR-{engine}"
+    spec = SOR_KEYS.get(key)
+    if spec:
+        return spec[0]
+    return key
 
 
 def rel_gap(a: float | None, b: float | None) -> float | None:
@@ -204,15 +248,25 @@ def main() -> int:
     ap.add_argument("--time-limit", type=float, default=20.0)
     ap.add_argument("--max-iter", type=int, default=200000)
     ap.add_argument("--tol", type=float, default=1e-6)
-    ap.add_argument("--backend", default="cpu")
+    ap.add_argument("--backend", default="cpu",
+                    help="default LpDevice/KernelBackend for SOR FO engines")
     ap.add_argument("--engine", default="simplex",
-                    help="SOR engine: simplex (proves optimality) or pdhg")
+                    help="legacy single engine; ignored if --solvers lists sor-* keys")
     ap.add_argument("--obj-tol", type=float, default=1e-4)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--sgm-shift", type=float, default=1.0)
-    ap.add_argument("--solvers", default="sor,highs,cbc,scipy-ipm",
-                    help="comma list: sor,highs,cbc,scipy-ipm,scipy-simplex")
+    ap.add_argument(
+        "--solvers",
+        default="sor-simplex,sor-pdhg,sor-hpr,sor-hpr-full,sor-hpr-vulkan,"
+                "highs,cbc,scipy-ipm,scipy-simplex",
+        help="comma list. SOR: sor (uses --engine), sor-simplex, sor-pdhg, "
+             "sor-hpr, sor-hpr-full, sor-hpr-vulkan. "
+             "External: highs,gurobi,cbc,scipy-ipm,scipy-simplex",
+    )
     ap.add_argument("-o", "--outdir", default="benchmarks/results")
+    ap.add_argument("--resume", default=None,
+                    help="path to an interrupted compare-*.jsonl; skip done "
+                         "instances and append the rest, then rewrite summary/md")
     args = ap.parse_args()
 
     inst_dir = Path(args.instances_dir or ROOT / "benchmarks" / args.suite / "mps")
@@ -239,6 +293,7 @@ def main() -> int:
     wanted = [s.strip().lower() for s in args.solvers.split(",") if s.strip()]
     scripts = {
         "highs": ROOT / "scripts" / "run_highs_baseline.py",
+        "gurobi": ROOT / "scripts" / "run_gurobi_baseline.py",
         "cbc": ROOT / "scripts" / "run_cbc_baseline.py",
         "scipy-ipm": (ROOT / "scripts" / "run_scipy_baseline.py",
                       ["--method", "interior-point"]),
@@ -249,64 +304,131 @@ def main() -> int:
     outdir = ROOT / args.outdir
     outdir.mkdir(parents=True, exist_ok=True)
 
-    env = {
-        "suite": args.suite,
-        "n_instances": len(instances),
-        "time_limit_s": args.time_limit,
-        "max_iter": args.max_iter,
-        "tol": args.tol,
-        "backend": args.backend,
-        "obj_tol": args.obj_tol,
-        "solvers": wanted,
-        "mode": "sequential_per_instance",
-        "host": platform.node(),
-        "platform": platform.platform(),
-        "processor": platform.processor() or platform.machine(),
-        "cpu_count": os.cpu_count(),
-        "note": "Solvers run one-by-one per instance on the same hardware.",
-    }
+    rows: list[InstanceRow] = []
+    solver_names: list[str] = []
+    for s in wanted:
+        solver_names.append(display_name_for(s, args.engine))
+
+    done_stems: set[str] = set()
+    if args.resume:
+        resume_path = Path(args.resume)
+        if not resume_path.is_file():
+            print(f"error: --resume not found: {resume_path}", file=sys.stderr)
+            return 2
+        jsonl = resume_path
+        md = resume_path.with_suffix(".md")
+        # Drop a trailing incomplete summary if present; keep env + instances.
+        kept: list[str] = []
+        for line in jsonl.read_text().splitlines():
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            if rec.get("record") == "summary":
+                continue
+            kept.append(line)
+            if rec.get("record") == "instance":
+                row = InstanceRow(
+                    instance=rec["instance"],
+                    rows=rec.get("rows"),
+                    cols=rec.get("cols"),
+                    nnz=rec.get("nnz"),
+                    results=rec.get("results") or {},
+                    ref_objective=rec.get("ref_objective"),
+                    agreements=rec.get("agreements") or {},
+                )
+                rows.append(row)
+                done_stems.add(row.instance)
+        jsonl.write_text("\n".join(kept) + ("\n" if kept else ""))
+        print(f"resume: {len(done_stems)} instances already done in {jsonl}",
+              flush=True)
+        env = {
+            "suite": args.suite,
+            "n_instances": len(instances),
+            "time_limit_s": args.time_limit,
+            "max_iter": args.max_iter,
+            "tol": args.tol,
+            "backend": args.backend,
+            "engine": args.engine,
+            "obj_tol": args.obj_tol,
+            "solvers": wanted,
+            "mode": "sequential_per_instance",
+            "host": platform.node(),
+            "platform": platform.platform(),
+            "processor": platform.processor() or platform.machine(),
+            "cpu_count": os.cpu_count(),
+            "note": "Solvers run one-by-one per instance on the same hardware. "
+                    "Competitors run once; every SOR engine is a separate column.",
+            "resumed_from": str(resume_path),
+            "already_done": len(done_stems),
+        }
+    else:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        jsonl = outdir / f"compare-{args.suite}-{stamp}.jsonl"
+        md = outdir / f"compare-{args.suite}-{stamp}.md"
+        env = {
+            "suite": args.suite,
+            "n_instances": len(instances),
+            "time_limit_s": args.time_limit,
+            "max_iter": args.max_iter,
+            "tol": args.tol,
+            "backend": args.backend,
+            "engine": args.engine,
+            "obj_tol": args.obj_tol,
+            "solvers": wanted,
+            "mode": "sequential_per_instance",
+            "host": platform.node(),
+            "platform": platform.platform(),
+            "processor": platform.processor() or platform.machine(),
+            "cpu_count": os.cpu_count(),
+            "note": "Solvers run one-by-one per instance on the same hardware. "
+                    "Competitors run once; every SOR engine is a separate column.",
+        }
+        with jsonl.open("w") as f:
+            f.write(json.dumps({"record": "environment", **env}) + "\n")
+
+    todo = [m for m in instances if m.stem not in done_stems]
     print(json.dumps(env, indent=2), flush=True)
-    print(f"\n{len(instances)} instances × {len(wanted)} solvers "
+    n_cols = len(wanted)
+    print(f"\n{len(todo)} remaining / {len(instances)} total × {n_cols} solvers "
           f"(sequential, {args.time_limit}s limit each)\n", flush=True)
 
-    rows: list[InstanceRow] = []
-    solver_names = [s.upper() if s == "sor" else s for s in wanted]
-
-    for i, mps in enumerate(instances, 1):
+    for i, mps in enumerate(todo, 1):
         row = InstanceRow(instance=mps.stem)
-        print(f"── [{i}/{len(instances)}] {mps.stem} ──", flush=True)
+        print(f"── [{i}/{len(todo)} remaining | {mps.stem}] ──", flush=True)
 
-        # Sequential: same order every time, one process at a time.
         for s in wanted:
-            if s == "sor":
+            if s == "sor" or s in SOR_KEYS:
+                if s == "sor":
+                    display, eng, b_ov, extra = (
+                        display_name_for("sor", args.engine),
+                        args.engine, None, [],
+                    )
+                else:
+                    display, eng, b_ov, extra = SOR_KEYS[s]
+                be = b_ov or args.backend
                 res = run_sor(exe, mps, args.time_limit, args.max_iter,
-                              args.tol, args.backend, args.engine)
-                if row.rows is None:
-                    m = None
-                    # size already in SOR output path; re-probe cheaply if needed
-                    row.rows, row.cols, row.nnz = probe_size(exe, mps)
+                              args.tol, be, eng, extra, name=display)
+                if row.rows is None and res.rows is not None:
+                    row.rows, row.cols, row.nnz = res.rows, res.cols, res.nnz
             elif s in scripts:
                 spec = scripts[s]
                 if isinstance(spec, tuple):
                     script, extra = spec
                 else:
                     script, extra = spec, None
-                display = s
                 res = run_external(venv_py, script, mps, args.time_limit,
-                                   display, extra)
+                                   s, extra)
             else:
                 res = SolverResult(name=s, status="unknown_solver",
                                    error=f"unknown solver key {s}")
 
             row.results[res.name] = asdict(res)
-            tag = res.name
-            print(f"    {tag:14s}  status={res.status:16s}  "
+            print(f"    {res.name:16s}  status={res.status:16s}  "
                   f"obj={fmt_obj(res.objective):>14s}  "
                   f"time={fmt_time(res.wall_s)}", flush=True)
 
-        # Reference objective: prefer HiGHS, then CBC, then scipy
         ref = None
-        for key in ("highs", "cbc", "scipy-ipm", "scipy-simplex"):
+        for key in ("highs", "gurobi", "cbc", "scipy-ipm", "scipy-simplex"):
             rd = row.results.get(key)
             if rd and is_solved(rd["status"]) and rd.get("objective") is not None:
                 ref = rd["objective"]
@@ -316,27 +438,18 @@ def main() -> int:
         for name, rd in row.results.items():
             if ref is None or rd.get("objective") is None:
                 row.agreements[name] = None
-            elif not is_solved(rd["status"]) and name != "SOR":
+            elif not is_solved(rd["status"]) and not is_ours(name):
                 row.agreements[name] = None
             else:
                 g = rel_gap(rd["objective"], ref)
                 row.agreements[name] = (g is not None and g <= args.obj_tol)
 
         rows.append(row)
-
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    jsonl = outdir / f"compare-{args.suite}-{stamp}.jsonl"
-    md = outdir / f"compare-{args.suite}-{stamp}.md"
-
-    with jsonl.open("w") as f:
-        f.write(json.dumps({"record": "environment", **env}) + "\n")
-        for row in rows:
+        with jsonl.open("a") as f:
             f.write(json.dumps({"record": "instance", **asdict(row)}) + "\n")
 
     # ---- aggregates ----
-    names = []
-    for s in wanted:
-        names.append("SOR" if s == "sor" else s)
+    names = list(solver_names)
 
     solved_counts = {n: 0 for n in names}
     match_counts = {n: 0 for n in names}
@@ -418,14 +531,14 @@ def main() -> int:
     md.write_text("\n".join(lines) + "\n")
 
     # ---- console summary table ----
-    print("\n" + "=" * 78)
-    print(f"{'Solver':14s} {'Solved':>10s} {'ObjMatch':>10s} {'SGM time':>12s}")
-    print("-" * 78)
+    print("\n" + "=" * 88)
+    print(f"{'Solver':20s} {'Solved':>10s} {'ObjMatch':>10s} {'SGM time':>12s}")
+    print("-" * 88)
     for n in names:
         sgm_s = f"{sgm[n]:.4f}s" if sgm[n] is not None else "—"
-        print(f"{n:14s} {solved_counts[n]:4d}/{len(rows):<4d} "
+        print(f"{n:20s} {solved_counts[n]:4d}/{len(rows):<4d} "
               f"{match_counts[n]:4d}/{len(rows):<4d} {sgm_s:>12s}")
-    print("=" * 78)
+    print("=" * 88)
     print(f"Markdown: {md}")
     print(f"JSONL:    {jsonl}")
     return 0

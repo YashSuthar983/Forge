@@ -10,7 +10,7 @@
 | Architecture / seams / diagrams | `architecture.md` |
 | Near-term weeks + GPU/`LpDevice` measurements | `gpu_first_order_plan.md` |
 | Macro phases & gates G0–G6 | `implementation_plan.md` |
-| Papers / DOIs | `paper_bibliography.md` |
+| Papers / DOIs | `paper_bibliography.md` (single paper ref doc) |
 | Forbidden deps / clean-room workflow | `clean_room_policy.md` |
 | Linked deps + CI gate list | `dependency_ledger.md` |
 | PS Must/Should table | `SIH26119_PS_ALIGNMENT.md` |
@@ -225,7 +225,7 @@ A technical judge respects a team that says "COPT is at 219, we are at 120, here
 
 ### 7.2 The three traps
 
-1. **Porting is still derivative.** Reading `HEkkDual.cpp` and re-typing the logic in C++, Rust, or anything else is not clean-room. **Implement from papers first.** Upstream source may be consulted only under the logged, one-person procedure in **`clean_room_policy.md`** — never side-by-side with an open repo tab while writing numeric core.
+1. **Porting is still derivative.** Reading `HEkkDual.cpp` and re-typing the logic in C++, Rust, or anything else is not clean-room. **Implement from papers first.** Upstream source may be read for understanding under **`clean_room_policy.md`** — log significant lookups, then close the tab before coding; never side-by-side with an open repo file while writing numeric core.
 2. **Vendor sparse kernels are a dead end at the frontier anyway.** No library provides a sparse LU with Forrest–Tomlin update, and cuSPARSE SpMV is the wrong primitive for PDHG's repeated fixed-pattern A/Aᵀ products. Keep the `KernelBackend` seam; expect to fill it yourself.
 3. **Multi-precision arithmetic.** `sor_num::Rational` is our own limb arithmetic. GMP is LGPL and, more to the point, sits in the numeric core where the problem statement is most sensitive.
 
