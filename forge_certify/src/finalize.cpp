@@ -53,7 +53,12 @@ SolveResult finalize_result(RawResult raw, const ProofEvidence& ev) {
     r.status = raw.proposed_status;
 
     if (raw.proposed_status == Status::Optimal) {
-        if (r.proof < ProofLevel::ProvedOptimalFP) {
+        // LP needs ProvedOptimalFP (basis). Convex QP may claim Optimal at
+        // ProvedKKT. Anything weaker is demoted.
+        const bool strong_enough =
+            r.proof >= ProofLevel::ProvedOptimalFP ||
+            r.proof == ProofLevel::ProvedKKT;
+        if (!strong_enough) {
             // The load-bearing rule of the whole codebase.
             r.status = (r.proof >= ProofLevel::FeasibleOnly) ? Status::Feasible
                                                              : Status::NoSolutionFound;

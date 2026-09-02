@@ -677,7 +677,7 @@ This is also a defensible clean-room position: implementing a documented API's *
 
 | Trap | Rule |
 |---|---|
-| **Porting is still derivative** | Papers first; upstream source only per `clean_room_policy.md` |
+| **Porting is still derivative** | Papers first; upstream source for understanding per `clean_room_policy.md` — log, close tab, then code independently |
 | Vendor sparse kernels are a dead end at the frontier | No library gives Forrest–Tomlin LU; cuSPARSE SpMV is wrong for fixed-pattern A/Aᵀ. Keep `KernelBackend` / `LpDevice`; fill it yourself |
 | Multi-precision in the numeric core | Own `Rational` limbs; avoid GMP in the solve path (LGPL + PS sensitivity) |
 

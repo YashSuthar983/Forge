@@ -22,11 +22,19 @@ endif()
 
 option(FORGE_ENABLE_JULIA_GPU
        "Build the EXPERIMENTAL Julia GPU sidecar backend (prototype only)" OFF)
+option(FORGE_ENABLE_VULKAN
+       "Build the Vulkan compute LpDevice (AMD/NVIDIA/Intel)" ON)
 option(FORGE_WARNINGS_AS_ERRORS "Treat warnings as errors" ON)
 
 add_library(forge_flags INTERFACE)
+# -O3 belongs to the build type, not here: hard-coding it made a Debug build
+# silently optimized. -march=native is off by default because it makes published
+# timings unreproducible on any other machine and unfair against a competitor
+# a generic target -- opt in with -DFORGE_NATIVE_ARCH=ON when profiling.
+option(FORGE_NATIVE_ARCH "Build for the host CPU (-march=native); not portable" OFF)
 target_compile_options(forge_flags INTERFACE
   $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic -Wshadow>
+  $<$<AND:$<CXX_COMPILER_ID:GNU,Clang>,$<BOOL:${FORGE_NATIVE_ARCH}>>:-march=native>
   $<$<AND:$<CXX_COMPILER_ID:GNU,Clang>,$<BOOL:${FORGE_WARNINGS_AS_ERRORS}>>:-Werror>
 )
 
@@ -40,16 +48,46 @@ add_library(forge_sparse forge_sparse/src/csr.cpp forge_sparse/src/csc.cpp)
 target_include_directories(forge_sparse PUBLIC forge_sparse/include)
 target_link_libraries(forge_sparse PUBLIC forge_core PRIVATE forge_flags)
 
-# Sparse LU of a simplex basis: FTRAN / BTRAN / product-form update.
-# Deliberately depends on forge_core ONLY -- it takes the basis column-wise as
-# plain arrays, so it needs no matrix type and stays usable by crossover and by
-# any future barrier engine.
 add_library(forge_la_cpu forge_la_cpu/src/lu.cpp)
 target_include_directories(forge_la_cpu PUBLIC forge_la_cpu/include)
 target_link_libraries(forge_la_cpu PUBLIC forge_core PRIVATE forge_flags)
 
-set(FORGE_BACKEND_SOURCES forge_backend/src/cpu_backend.cpp
-                        forge_backend/src/backend_factory.cpp)
+# ---- Vulkan SPIR-V shaders (optional) ------------------------------------
+set(FORGE_SHADER_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/forge_backend/vulkan/shaders)
+set(FORGE_SHADER_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
+set(FORGE_SHADER_NAMES
+  spmv_csr spmv_csc primal_step dual_step halpern_mix avg_update)
+
+if(FORGE_ENABLE_VULKAN)
+  find_package(Vulkan REQUIRED)
+  find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
+  file(MAKE_DIRECTORY ${FORGE_SHADER_BINARY_DIR})
+  set(FORGE_SPV_OUTPUTS)
+  foreach(s ${FORGE_SHADER_NAMES})
+    set(_src ${FORGE_SHADER_SOURCE_DIR}/${s}.comp)
+    set(_spv ${FORGE_SHADER_BINARY_DIR}/${s}.spv)
+    add_custom_command(
+      OUTPUT ${_spv}
+      COMMAND ${GLSLANG_VALIDATOR} -V --target-env vulkan1.2 -o ${_spv} ${_src}
+      DEPENDS ${_src}
+      COMMENT "SPIR-V ${s}.comp"
+      VERBATIM)
+    list(APPEND FORGE_SPV_OUTPUTS ${_spv})
+  endforeach()
+  add_custom_target(forge_shaders ALL DEPENDS ${FORGE_SPV_OUTPUTS})
+endif()
+
+set(FORGE_BACKEND_SOURCES
+  forge_backend/src/cpu_backend.cpp
+  forge_backend/src/backend_factory.cpp
+  forge_backend/src/cpu_lp_device.cpp)
+if(FORGE_ENABLE_VULKAN)
+  list(APPEND FORGE_BACKEND_SOURCES
+    forge_backend/src/vulkan/vk_context.cpp
+    forge_backend/src/vulkan/vk_lp_device.cpp)
+else()
+  list(APPEND FORGE_BACKEND_SOURCES forge_backend/src/vulkan_stub.cpp)
+endif()
 if(FORGE_ENABLE_JULIA_GPU)
   list(APPEND FORGE_BACKEND_SOURCES forge_backend/src/julia_gpu_backend.cpp)
 endif()
@@ -57,9 +95,15 @@ endif()
 add_library(forge_backend ${FORGE_BACKEND_SOURCES})
 target_include_directories(forge_backend PUBLIC forge_backend/include)
 target_link_libraries(forge_backend PUBLIC forge_sparse PRIVATE forge_flags)
+if(FORGE_ENABLE_VULKAN)
+  target_link_libraries(forge_backend PUBLIC Vulkan::Vulkan)
+  target_compile_definitions(forge_backend PUBLIC FORGE_ENABLE_VULKAN=1)
+  target_compile_definitions(forge_backend PRIVATE
+    FORGE_SHADER_DIR=\"${FORGE_SHADER_BINARY_DIR}\")
+  add_dependencies(forge_backend forge_shaders)
+endif()
 if(FORGE_ENABLE_JULIA_GPU)
   target_compile_definitions(forge_backend PUBLIC FORGE_ENABLE_JULIA_GPU=1)
-  # Default sidecar location; overridable at runtime via FORGE_JULIA_PROJECT.
   target_compile_definitions(forge_backend PRIVATE
     FORGE_JULIA_PROJECT_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/tools/julia_gpu\")
 endif()
@@ -69,18 +113,34 @@ add_library(forge_model forge_model/src/lp.cpp)
 target_include_directories(forge_model PUBLIC forge_model/include)
 target_link_libraries(forge_model PUBLIC forge_sparse PRIVATE forge_flags)
 
-add_library(forge_io forge_io/src/mps.cpp)
+add_library(forge_io forge_io/src/mps.cpp forge_io/src/write_mps.cpp forge_io/src/qps.cpp)
 target_include_directories(forge_io PUBLIC forge_io/include)
 target_link_libraries(forge_io PUBLIC forge_model PRIVATE forge_flags)
 
+# ------------------------------ L3: transform ------------------------------
+add_library(forge_presolve forge_presolve/src/presolve.cpp)
+target_include_directories(forge_presolve PUBLIC forge_presolve/include)
+target_link_libraries(forge_presolve PUBLIC forge_model PRIVATE forge_flags)
+
 # ------------------------------ L4: engines --------------------------------
-add_library(forge_engines forge_engines/src/pdhg.cpp forge_engines/src/simplex.cpp)
+add_library(forge_engines
+  forge_engines/src/pdhg.cpp
+  forge_engines/src/simplex.cpp
+  forge_engines/src/dual_simplex.cpp
+  forge_engines/src/dual_edge_weights.cpp
+  forge_engines/src/dual_bfrt.cpp
+  forge_engines/src/hpr.cpp
+  forge_engines/src/qp.cpp)
 target_include_directories(forge_engines PUBLIC forge_engines/include)
-target_link_libraries(forge_engines PUBLIC forge_model forge_backend forge_la_cpu
+target_link_libraries(forge_engines PUBLIC forge_model forge_backend forge_la_cpu forge_presolve
                                   PRIVATE forge_flags)
 
+# ------------------------------ L5: search ---------------------------------
+add_library(forge_search forge_search/src/bab.cpp)
+target_include_directories(forge_search PUBLIC forge_search/include)
+target_link_libraries(forge_search PUBLIC forge_engines PRIVATE forge_flags)
+
 # --------------------------- L7: verification ------------------------------
-# NOTE: forge_certify links ONLY L0. It must never gain an engine dependency.
 add_library(forge_certify forge_certify/src/finalize.cpp)
 target_include_directories(forge_certify PUBLIC forge_certify/include)
 target_link_libraries(forge_certify PUBLIC forge_core PRIVATE forge_flags)
@@ -88,7 +148,10 @@ target_link_libraries(forge_certify PUBLIC forge_core PRIVATE forge_flags)
 # ----------------------------- L8: front ends ------------------------------
 add_executable(forge_solve cli/forge_solve.cpp)
 target_link_libraries(forge_solve PRIVATE
-  forge_io forge_engines forge_certify forge_backend forge_flags)
+  forge_io forge_engines forge_search forge_certify forge_backend forge_flags)
+
+add_executable(forge_gen cli/forge_gen.cpp)
+target_link_libraries(forge_gen PRIVATE forge_io forge_flags)
 
 # --------------------------------- tests -----------------------------------
 enable_testing()
@@ -108,12 +171,18 @@ forge_add_test(test_no_unproved_optimal forge_certify)
 forge_add_test(test_mps                 forge_io)
 forge_add_test(test_pdhg                forge_engines forge_certify forge_io)
 forge_add_test(test_simplex             forge_engines forge_certify forge_io)
+forge_add_test(test_dual_edge_weights   forge_engines)
+forge_add_test(test_presolve             forge_presolve)
+forge_add_test(test_hpr                 forge_engines forge_certify forge_io)
+forge_add_test(test_lp_device           forge_backend forge_engines forge_io)
+forge_add_test(test_milp                forge_search forge_certify forge_io)
+forge_add_test(test_qp                  forge_engines forge_certify)
+forge_add_test(test_qps                 forge_io forge_engines forge_certify)
 
 if(FORGE_ENABLE_JULIA_GPU)
   forge_add_test(test_julia_gpu_parity forge_backend)
-  # Missing julia or a non-functional GPU must SKIP, not fail.
   set_tests_properties(test_julia_gpu_parity PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 message(STATUS "FORGE ${PROJECT_VERSION}  build=${CMAKE_BUILD_TYPE}  "
-               "julia_gpu=${FORGE_ENABLE_JULIA_GPU}")
+               "julia_gpu=${FORGE_ENABLE_JULIA_GPU}  vulkan=${FORGE_ENABLE_VULKAN}")

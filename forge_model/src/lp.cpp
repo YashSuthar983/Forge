@@ -22,16 +22,22 @@ f64 LpProblem::max_row_violation(const std::vector<f64>& x) const {
     const auto& ci = A.pattern.col_idx();
     f64 worst = 0.0;
     for (Index r = 0; r < A.n_rows(); ++r) {
-        f64 act = 0.0;
+        // Netlib models such as dfl001 contain large cancelling terms.  Keep
+        // the activity sum wider than the stored coefficients so the
+        // certificate does not report a spurious violation from f64
+        // accumulation order.
+        long double act = 0.0L;
         for (core::Offset k = rp[static_cast<std::size_t>(r)];
              k < rp[static_cast<std::size_t>(r) + 1]; ++k) {
-            act += A.vals[static_cast<std::size_t>(k)] *
+            act += static_cast<long double>(A.vals[static_cast<std::size_t>(k)]) *
                    x[static_cast<std::size_t>(ci[static_cast<std::size_t>(k)])];
         }
         const f64 lo = row_lo[static_cast<std::size_t>(r)];
         const f64 hi = row_hi[static_cast<std::size_t>(r)];
-        if (act < lo) worst = std::max(worst, lo - act);
-        if (act > hi) worst = std::max(worst, act - hi);
+        if (act < static_cast<long double>(lo))
+            worst = std::max(worst, static_cast<f64>(static_cast<long double>(lo) - act));
+        if (act > static_cast<long double>(hi))
+            worst = std::max(worst, static_cast<f64>(act - static_cast<long double>(hi)));
     }
     return worst;
 }

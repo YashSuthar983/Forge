@@ -1,21 +1,21 @@
-// forge_solve — prototype CLI.
+// forge_solve — CLI for LP / MILP / first-order engines.
 //
 // LAYER L8.
-//
-//   forge_solve model.mps [--engine simplex|pdhg] [--backend cpu|julia_gpu]
-//                       [--max-iter N] [--tol T] [--time-limit S] [--verbose]
-//
-// Prints status, proof level, objective, residuals, and a timing breakdown that
-// always includes host<->device transfer and IPC cost.
 #include "forge/backend/kernel_backend.hpp"
+#include "forge/backend/lp_device.hpp"
 #include "forge/certify/finalize.hpp"
+#include "forge/engines/hpr.hpp"
 #include "forge/engines/pdhg.hpp"
+#include "forge/engines/qp.hpp"
 #include "forge/engines/simplex.hpp"
 #include "forge/io/mps.hpp"
+#include "forge/io/qps.hpp"
+#include "forge/search/bab.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <exception>
 #include <string>
 
@@ -24,24 +24,20 @@ namespace {
 void usage() {
     std::fputs(
         "usage: forge_solve MODEL.mps [options]\n"
-        "  --engine NAME    simplex (default) | pdhg\n"
-        "                   simplex: primal revised simplex, can prove Optimal\n"
-        "                   pdhg:    first-order, cannot prove Optimal by design\n"
-        "  --backend NAME   cpu (default) | julia_gpu (EXPERIMENTAL); pdhg only\n"
-        "  --max-iter N     iteration limit (0 = automatic)\n"
-        "  --tol T          primal/dual tolerance (default 1e-6 pdhg, 1e-7 simplex)\n"
-        "  --time-limit S   wall-clock limit in seconds; returns the best point\n"
-        "                   found so far (simplex only)\n"
+        "  --engine NAME    simplex (default) | pdhg | hpr | milp | qp\n"
+        "  --q-diag LIST    comma-separated diagonal of Q (if not using .qps)\n"
+        "  --backend NAME   cpu (default) | vulkan | julia_gpu\n"
+        "  --method NAME    auto | primal | dual   (simplex)\n"
+        "  --max-iter N     iteration / node limit\n"
+        "  --tol T          feasibility tolerance\n"
+        "  --time-limit S   wall-clock limit in seconds\n"
         "  --no-scaling     skip Ruiz equilibration\n"
-        "  --fixed-mps      force fixed-column MPS parsing\n"
-        "  --free-mps       force free-format MPS parsing\n"
-        "                   (default: try free, fall back to fixed)\n"
-        "  --verbose        print iteration log and per-phase timings\n",
+        "  --no-presolve    skip presolve (simplex/milp)\n"
+        "  --verbose        iteration / node log\n"
+        "  --hpr-vanilla | --hpr-full\n",
         stderr);
 }
 
-// Everything after the status block is common to both engines, so the two
-// branches below differ only in how they produce a SolveResult.
 void print_result(const forge::core::SolveResult& r) {
     std::printf("\nstatus:            %s\n",
                 std::string(forge::core::to_string(r.status)).c_str());
@@ -66,13 +62,26 @@ int exit_code_for(forge::core::Status s) {
     }
 }
 
+void print_transfer(const forge::backend::TransferStats& s) {
+    std::printf("  kernel           %10.3f\n", s.kernel_ms);
+    std::printf("  host->device     %10.3f  (%llu bytes)\n", s.h2d_ms,
+                static_cast<unsigned long long>(s.h2d_bytes));
+    std::printf("  device->host     %10.3f  (%llu bytes)\n", s.d2h_ms,
+                static_cast<unsigned long long>(s.d2h_bytes));
+    std::printf("  ipc overhead     %10.3f\n", s.ipc_ms);
+    std::printf("  kernel calls     %10llu\n",
+                static_cast<unsigned long long>(s.calls));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) { usage(); return 2; }
 
     std::string path, backend_name = "cpu", engine_name = "simplex";
+    std::string q_diag_arg;
     forge::engines::PdhgOptions pdhg_opts;
+    forge::engines::HprOptions hpr_opts;
     forge::engines::SimplexOptions sx_opts;
     forge::io::MpsReadOptions mps_opts;
     bool mps_format_forced = false;
@@ -90,23 +99,52 @@ int main(int argc, char** argv) {
         };
         if      (a == "--backend")  backend_name = next("--backend");
         else if (a == "--engine")   engine_name  = next("--engine");
+        else if (a == "--q-diag")   q_diag_arg   = next("--q-diag");
         else if (a == "--max-iter") {
             const auto n = std::strtoull(next("--max-iter").c_str(), nullptr, 10);
             pdhg_opts.max_iterations = n;
+            hpr_opts.max_iterations  = n;
             sx_opts.max_iterations   = n;
         }
-        else if (a == "--tol") { tol = std::strtod(next("--tol").c_str(), nullptr);
-                                 tol_given = true; }
-        else if (a == "--time-limit")
-            sx_opts.time_limit_s = std::strtod(next("--time-limit").c_str(), nullptr);
-        else if (a == "--no-scaling") { sx_opts.ruiz_iterations = 0;
-                                        pdhg_opts.ruiz_iterations = 0; }
-        else if (a == "--fixed-mps") { mps_opts.fixed_format = true;
-                                       mps_format_forced = true; }
-        else if (a == "--free-mps")  { mps_opts.fixed_format = false;
-                                       mps_format_forced = true; }
-        else if (a == "--verbose")   { pdhg_opts.verbose = true;
-                                       sx_opts.verbose = true; }
+        else if (a == "--tol") {
+            tol = std::strtod(next("--tol").c_str(), nullptr);
+            tol_given = true;
+        }
+        else if (a == "--time-limit") {
+            const double t = std::strtod(next("--time-limit").c_str(), nullptr);
+            sx_opts.time_limit_s = t;
+            hpr_opts.time_limit_s = t;
+        }
+        else if (a == "--method") {
+            const std::string m = next("--method");
+            if      (m == "auto")   sx_opts.method = forge::engines::SimplexMethod::Auto;
+            else if (m == "primal") sx_opts.method = forge::engines::SimplexMethod::Primal;
+            else if (m == "dual")   sx_opts.method = forge::engines::SimplexMethod::Dual;
+            else { std::fprintf(stderr, "error: unknown method '%s'\n", m.c_str()); return 2; }
+        }
+        else if (a == "--no-scaling") {
+            sx_opts.ruiz_iterations = 0;
+            pdhg_opts.ruiz_iterations = 0;
+            hpr_opts.ruiz_iterations = 0;
+        }
+        else if (a == "--no-presolve") sx_opts.presolve = false;
+        else if (a == "--fixed-mps") { mps_opts.fixed_format = true; mps_format_forced = true; }
+        else if (a == "--free-mps")  { mps_opts.fixed_format = false; mps_format_forced = true; }
+        else if (a == "--verbose") {
+            pdhg_opts.verbose = true;
+            hpr_opts.verbose = true;
+            sx_opts.verbose = true;
+        }
+        else if (a == "--hpr-vanilla") {
+            hpr_opts.use_primal_weight = false;
+            hpr_opts.use_restart = false;
+            hpr_opts.use_halpern = false;
+        }
+        else if (a == "--hpr-full") {
+            hpr_opts.use_primal_weight = true;
+            hpr_opts.use_restart = true;
+            hpr_opts.use_halpern = true;
+        }
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else if (!a.empty() && a[0] == '-') {
             std::fprintf(stderr, "error: unknown option '%s'\n", a.c_str());
@@ -116,19 +154,94 @@ int main(int argc, char** argv) {
     }
 
     if (path.empty()) { usage(); return 2; }
-    if (engine_name != "pdhg" && engine_name != "simplex") {
+    if (engine_name != "pdhg" && engine_name != "simplex" && engine_name != "hpr" &&
+        engine_name != "milp" && engine_name != "qp") {
         std::fprintf(stderr,
-                     "error: engine '%s' is not implemented (have 'simplex' and "
-                     "'pdhg'). Refusing rather than substituting.\n",
+                     "error: engine '%s' not implemented "
+                     "(have simplex|pdhg|hpr|milp|qp)\n",
                      engine_name.c_str());
         return 3;
     }
     if (tol_given) {
         pdhg_opts.primal_tol = pdhg_opts.dual_tol = tol;
+        hpr_opts.primal_tol = hpr_opts.dual_tol = hpr_opts.gap_tol = tol;
         sx_opts.primal_feas_tol = sx_opts.dual_feas_tol = tol;
     }
 
     try {
+        const bool path_is_qps = path.size() >= 4 &&
+            (path.compare(path.size() - 4, 4, ".qps") == 0 ||
+             path.compare(path.size() - 4, 4, ".QPS") == 0);
+
+        if (engine_name == "qp") {
+            forge::engines::QpProblem qp;
+            if (!q_diag_arg.empty()) {
+                forge::io::MpsReadReport rep;
+                qp.linear = mps_format_forced
+                    ? forge::io::read_mps_file(path, rep, mps_opts)
+                    : forge::io::read_mps_file_auto(path, rep, mps_opts.strict);
+                for (const auto& w : rep.warnings)
+                    std::fprintf(stderr, "warning: %s\n", w.c_str());
+                qp.q_diag.clear();
+                std::size_t start = 0;
+                while (start <= q_diag_arg.size()) {
+                    const auto comma = q_diag_arg.find(',', start);
+                    const auto tok = q_diag_arg.substr(
+                        start, comma == std::string::npos ? std::string::npos
+                                                          : comma - start);
+                    if (!tok.empty())
+                        qp.q_diag.push_back(std::strtod(tok.c_str(), nullptr));
+                    if (comma == std::string::npos) break;
+                    start = comma + 1;
+                }
+            } else if (path_is_qps) {
+                forge::io::QpsReadReport rep;
+                auto loaded = forge::io::read_qps_file(path, rep, mps_opts);
+                for (const auto& w : rep.warnings)
+                    std::fprintf(stderr, "warning: %s\n", w.c_str());
+                if (rep.has_off_diagonal) {
+                    std::fprintf(stderr,
+                                 "error: QPS has off-diagonal QUADOBJ; "
+                                 "diagonal QP engine only\n");
+                    return 3;
+                }
+                qp.linear = std::move(loaded.linear);
+                qp.q_diag = std::move(loaded.q_diag);
+            } else {
+                std::fprintf(stderr,
+                             "error: --engine qp needs a .qps file or --q-diag\n");
+                return 2;
+            }
+
+            std::printf("model:             %s\n",
+                        qp.linear.name.empty() ? path.c_str()
+                                               : qp.linear.name.c_str());
+            std::printf("rows x cols:       %d x %d   nnz %lld\n",
+                        qp.linear.n_rows(), qp.linear.n_cols(),
+                        static_cast<long long>(qp.linear.nnz()));
+            std::printf("engine:            qp\n");
+
+            forge::engines::QpOptions qopts;
+            qopts.verbose = sx_opts.verbose;
+            if (tol_given) {
+                qopts.feas_tol = tol;
+                qopts.stationarity_tol = tol;
+            }
+            forge::engines::QpDiagnostics diag;
+            auto raw = forge::engines::solve_qp_diag(qp, qopts, diag);
+            const auto ev = forge::engines::qp_evidence(diag, qopts);
+            const auto r = forge::certify::finalize_result(std::move(raw), ev);
+            print_result(r);
+            std::printf("stationarity:      %.3e\n", diag.stationarity);
+            std::printf("max primal viol:   %.3e\n", diag.primal_residual);
+            std::printf("iterations:        %llu\n",
+                        static_cast<unsigned long long>(diag.iterations));
+            std::printf("termination:       %s\n", r.termination_reason.c_str());
+            std::printf("\ntiming (ms)\n");
+            std::printf("  total            %10.3f\n", diag.total_ms);
+            return exit_code_for(r.status);
+        }
+
         forge::io::MpsReadReport rep;
         const auto problem = mps_format_forced
             ? forge::io::read_mps_file(path, rep, mps_opts)
@@ -141,111 +254,131 @@ int main(int argc, char** argv) {
         std::printf("rows x cols:       %d x %d   nnz %lld\n",
                     problem.n_rows(), problem.n_cols(),
                     static_cast<long long>(problem.nnz()));
-        if (rep.n_integer > 0) {
+        if (rep.n_integer > 0)
             std::printf("integer columns:   %zu\n", rep.n_integer);
-            std::printf("NOTE:              solving the LP RELAXATION - this "
-                        "prototype has no branch-and-bound\n");
-        }
         std::printf("engine:            %s\n", engine_name.c_str());
 
+        if (engine_name == "milp") {
+            if (rep.n_integer == 0) {
+                std::fprintf(stderr,
+                             "warning: no integer columns; milp reduces to LP\n");
+            }
+            forge::search::BabOptions bab;
+            bab.lp = sx_opts;
+            bab.verbose = sx_opts.verbose;
+            // --max-iter is the public MILP node limit.  A node LP must not
+            // inherit that value as its own pivot cap: doing so interrupted
+            // the schedule root relaxation at 5000 pivots and left B&B with
+            // no incumbent.  The B&B driver applies the global wall-clock
+            // budget to each relaxation instead.
+            bab.lp.max_iterations = 0;
+            if (sx_opts.max_iterations != 0)
+                bab.max_nodes = sx_opts.max_iterations;
+            if (sx_opts.time_limit_s > 0.0)
+                bab.time_limit_s = sx_opts.time_limit_s;
+            if (tol_given) {
+                bab.primal_feas_tol = tol;
+                bab.int_tol = std::max(tol, 1e-9);
+            }
+            forge::search::BabDiagnostics diag;
+            auto raw = forge::search::solve_milp(problem, bab, diag);
+            const auto ev = forge::search::milp_evidence(diag, bab);
+            const auto r = forge::certify::finalize_result(std::move(raw), ev);
+            print_result(r);
+            if (std::isfinite(diag.dual_bound)) {
+                std::printf("dual bound:        %.10e\n", diag.dual_bound);
+                std::printf("mip gap:           %.3e\n", diag.gap_rel);
+            }
+            std::printf("nodes:             %llu\n",
+                        static_cast<unsigned long long>(diag.nodes));
+            std::printf("lp solves:         %llu\n",
+                        static_cast<unsigned long long>(diag.lp_solves));
+            std::printf("integer feas:      %llu  (heuristic hits %llu)\n",
+                        static_cast<unsigned long long>(diag.integer_feasible),
+                        static_cast<unsigned long long>(diag.heuristic_hits));
+            std::printf("termination:       %s\n", r.termination_reason.c_str());
+            std::printf("\ntiming (ms)\n");
+            std::printf("  total            %10.3f\n", diag.total_ms);
+            return exit_code_for(r.status);
+        }
+
         if (engine_name == "simplex") {
+            if (rep.n_integer > 0) {
+                std::printf("NOTE:              solving the LP RELAXATION "
+                            "(use --engine milp for branch-and-bound)\n");
+            }
             forge::engines::SimplexDiagnostics diag;
             auto raw = forge::engines::solve_simplex(problem, sx_opts, diag, nullptr);
             const auto ev = forge::engines::simplex_evidence(diag, sx_opts);
             const auto r = forge::certify::finalize_result(std::move(raw), ev);
-
             print_result(r);
             if (diag.dual_bound_finite) {
                 std::printf("dual bound:        %.10e\n", r.dual_bound);
                 std::printf("rel gap:           %.3e\n", r.gap_rel);
-            } else {
-                std::printf("dual bound:        none (no finite Lagrangian value "
-                            "at this basis)\n");
             }
-            std::printf("max primal viol:   %.3e   (rows and bounds, recomputed "
-                        "on the unscaled model)\n", r.max_primal_violation);
+            std::printf("max primal viol:   %.3e\n", r.max_primal_violation);
             std::printf("dual residual:     %.3e\n", r.max_dual_violation);
-            std::printf("iterations:        %llu  (phase 1: %llu, phase 2: %llu)\n",
+            std::printf("iterations:        %llu  (phase1 %llu, phase2 %llu)\n",
                         static_cast<unsigned long long>(diag.iterations),
                         static_cast<unsigned long long>(diag.phase1_iterations),
                         static_cast<unsigned long long>(diag.phase2_iterations));
-            std::printf("bound flips:       %llu\n",
-                        static_cast<unsigned long long>(diag.bound_flips));
-            std::printf("refactorizations:  %llu\n",
-                        static_cast<unsigned long long>(diag.refactorizations));
-            std::printf("degenerate steps:  %llu  (bland iterations %llu)\n",
-                        static_cast<unsigned long long>(diag.degenerate_steps),
-                        static_cast<unsigned long long>(diag.bland_iterations));
-            if (diag.basis_repairs > 0)
-                std::printf("basis repairs:     %llu  (singular basis replaced by "
-                            "logicals)\n",
-                            static_cast<unsigned long long>(diag.basis_repairs));
-            std::printf("LU nnz:            %lld   max multiplier %.3e\n",
-                        static_cast<long long>(diag.factor_nnz),
-                        diag.largest_multiplier);
             std::printf("termination:       %s\n", r.termination_reason.c_str());
-
             std::printf("\ntiming (ms)\n");
             std::printf("  total            %10.3f\n", diag.total_ms);
             std::printf("  scaling          %10.3f\n", diag.scaling_ms);
             std::printf("  factorization    %10.3f\n", diag.factor_ms);
             std::printf("  simplex loop     %10.3f\n", diag.loop_ms);
-            if (sx_opts.verbose) {
-                std::printf("  pricing          %10.3f\n", diag.price_ms);
-                std::printf("  ftran + btran    %10.3f\n", diag.solve_ms);
-            } else {
-                std::printf("  pricing          (--verbose; clock reads cost "
-                            "~1.3us each on this host)\n");
+            return exit_code_for(r.status);
+        }
+
+        if (engine_name == "hpr") {
+            auto dev = forge::backend::make_lp_device(backend_name);
+            if (!dev) {
+                std::fprintf(stderr, "warning: LpDevice '%s' unavailable; using cpu\n",
+                             backend_name.c_str());
+                dev = forge::backend::make_cpu_lp_device();
             }
+            std::printf("backend:           %s (accelerated=%s)\n",
+                        std::string(dev->name()).c_str(),
+                        dev->is_accelerated() ? "yes" : "no");
+            forge::engines::HprDiagnostics diag;
+            auto raw = forge::engines::solve_hpr(problem, hpr_opts, *dev, diag);
+            const auto ev = forge::engines::hpr_evidence(diag, hpr_opts);
+            const auto r = forge::certify::finalize_result(std::move(raw), ev);
+            print_result(r);
+            std::printf("max row violation: %.3e\n", r.max_primal_violation);
+            std::printf("dual residual:     %.3e\n", r.max_dual_violation);
+            std::printf("iterations:        %llu\n",
+                        static_cast<unsigned long long>(r.iterations));
+            std::printf("termination:       %s\n", r.termination_reason.c_str());
+            std::printf("\ntiming (ms)\n");
+            std::printf("  total            %10.3f\n", diag.total_ms);
+            print_transfer(diag.device_stats);
             return exit_code_for(r.status);
         }
 
         auto be = forge::backend::make_backend(backend_name);
         if (!be) {
-            std::fprintf(stderr,
-                         "warning: backend '%s' unavailable; falling back to cpu\n",
+            std::fprintf(stderr, "warning: backend '%s' unavailable; using cpu\n",
                          backend_name.c_str());
             be = forge::backend::make_cpu_backend();
         }
         std::printf("backend:           %s (accelerated=%s)\n",
                     std::string(be->name()).c_str(),
                     be->is_accelerated() ? "yes" : "no");
-
         forge::engines::PdhgDiagnostics diag;
         auto raw = forge::engines::solve_pdhg(problem, pdhg_opts, *be, diag);
         const auto ev = forge::engines::pdhg_evidence(diag, pdhg_opts);
         const auto r = forge::certify::finalize_result(std::move(raw), ev);
-
         print_result(r);
-        if (diag.dual_bound_finite) {
-            std::printf("dual bound:        %.10e\n", r.dual_bound);
-            std::printf("rel gap:           %.3e\n", r.gap_rel);
-        } else {
-            std::printf("dual bound:        none (first-order dual not repaired "
-                        "to feasibility)\n");
-        }
         std::printf("max row violation: %.3e\n", r.max_primal_violation);
         std::printf("dual residual:     %.3e\n", r.max_dual_violation);
         std::printf("iterations:        %llu\n",
                     static_cast<unsigned long long>(r.iterations));
-        std::printf("||A|| estimate:    %.6e\n", diag.matrix_norm_estimate);
         std::printf("termination:       %s\n", r.termination_reason.c_str());
-
-        const auto& s = diag.kernel_stats;
         std::printf("\ntiming (ms)\n");
         std::printf("  total            %10.3f\n", diag.total_ms);
-        std::printf("  scaling          %10.3f\n", diag.scaling_ms);
-        std::printf("  norm estimate    %10.3f\n", diag.norm_ms);
-        std::printf("  pdhg loop        %10.3f\n", diag.loop_ms);
-        std::printf("  kernel           %10.3f\n", s.kernel_ms);
-        std::printf("  host->device     %10.3f  (%llu bytes)\n", s.h2d_ms,
-                    static_cast<unsigned long long>(s.h2d_bytes));
-        std::printf("  device->host     %10.3f  (%llu bytes)\n", s.d2h_ms,
-                    static_cast<unsigned long long>(s.d2h_bytes));
-        std::printf("  ipc overhead     %10.3f\n", s.ipc_ms);
-        std::printf("  kernel calls     %10llu\n",
-                    static_cast<unsigned long long>(s.calls));
-
+        print_transfer(diag.kernel_stats);
         return exit_code_for(r.status);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
