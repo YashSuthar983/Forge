@@ -10,7 +10,7 @@
 1. **Vertical slices, never horizontal layers.** Every phase ends with a runnable `sor_solve` → `sor_check` path over real instances. No phase ends with "the LU factorization is done."
 2. **The architecture is built once, the algorithms land continuously.** The six commitments (C1–C6 in `architecture.md`) go in during Phase 0 while the codebase is small enough to shape. Everything after that is filling in seams.
 3. **Every gate is an executable command.** A gate that is a paragraph of prose is not a gate.
-4. **Measure before optimising, and measure against an external process.** HiGHS as a separate binary is the reference oracle from day one. Follow **`clean_room_policy.md`** — oracle by default, upstream source only when logged.
+4. **Measure before optimising, and measure against an external process.** HiGHS as a separate binary is the reference oracle from day one. Follow **`clean_room_policy.md`** — papers first, upstream source allowed for understanding (logged), oracle always for verification.
 5. **Claims lag capability by one phase.** A capability is claimable only after its gate passes on a named public instance set.
 
 ---

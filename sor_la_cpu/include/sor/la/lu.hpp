@@ -1,5 +1,5 @@
-// SOR — sparse LU factorization of a simplex basis, with FTRAN/BTRAN and a
-// product-form update.
+// SOR — sparse LU factorization of a simplex basis, with FTRAN/BTRAN and
+// hypersparse (reach-set) triangular solves plus a product-form update file.
 //
 // LAYER L1. Depends on sor_sparse (sibling) and sor_core.
 //
@@ -11,10 +11,10 @@
 // ALGORITHM (Markowitz 1957; Suhl & Suhl 1990):
 //
 //   Phase A - triangularization. Repeatedly peel column singletons and row
-//   singletons. Both are free: a column singleton needs no row operations at
-//   all, and a row singleton's elimination only deletes entries. LP bases are
-//   overwhelmingly triangularizable this way -- the all-logical starting basis
-//   is entirely diagonal and Phase A factorizes it with zero fill in O(m).
+//   singletons. Both are free: a column singleton needs no row operations
+//   at all, and a row singleton's elimination only deletes entries. LP bases
+//   are overwhelmingly triangularizable this way -- the all-logical starting
+//   basis is entirely diagonal and Phase A factorizes it with zero fill in O(m).
 //
 //   Phase B - Markowitz elimination on whatever is left (the "nucleus").
 //   Pivot (r,c) minimizes (rcount_r - 1) * (ccount_c - 1), subject to the
@@ -24,13 +24,14 @@
 //
 // BASIS UPDATE: product form (an eta file), not Forrest-Tomlin.
 //   B_k = B_0 E_1 ... E_k, so a solve is the base triangular solve plus k
-//   rank-one applications. This is the update Forrest-Tomlin (1972) improves
-//   on: FT keeps the *factors* sparse, whereas the product form's eta vectors
-//   are as dense as the FTRAN'd entering columns. Both avoid refactorizing per
-//   iteration, which is the asymptotic win; FT wins the constant on large
-//   sparse bases. FT drops in behind `update()` without changing any caller.
-//   This is a deliberate first cut, not an oversight -- see the note in
-//   docs/architecture.md §5.1 item 2.
+//   rank-one eta applications; an eta whose pivot entry is zero is skipped,
+//   which keeps hypersparse states cheap. This is the update Forrest-Tomlin
+//   (1972) improves on; FT modifies the U factor in place and was attempted
+//   here (see git history): the below-diagonal fill of the FT elimination
+//   requires the classic cyclic row/column permutation machinery to keep U
+//   triangular, and an in-place variant without it is NOT equivalent
+//   (verified factor-by-factor against a dense reconstruction). Product form
+//   + hypersparse base solves + the eta nnz refactor trigger is what ships.
 #pragma once
 
 #include "sor/core/result.hpp"
@@ -97,7 +98,11 @@ public:
                    std::vector<Index>* vacant_rows = nullptr);
 
     // b (indexed by row) <- B^-1 b (indexed by basis slot). Size m.
+    // Hypersparse: when b has few nonzeros the triangular solves run on the
+    // REACH SET of those nonzeros (Hall & McKinnon 2005) instead of sweeping
+    // all of L and U. Dense inputs take the dense path automatically.
     void ftran(std::vector<f64>& b) const;
+
 
     // d (indexed by basis slot) <- B^-T d (indexed by row). Size m.
     void btran(std::vector<f64>& d) const;
@@ -109,9 +114,12 @@ public:
     // caller must refactorize or pick a different leaving row.
     bool update(Index p, const std::vector<f64>& alpha, f64 min_pivot = 1e-11);
 
+    // True when the eta file is large enough that refactorizing is cheaper.
+    bool needs_refactor(int update_limit, f64 eta_nnz_ratio) const;
+
     Index dimension()  const noexcept { return m_; }
     Index n_updates()  const noexcept { return static_cast<Index>(eta_p_.size()); }
-    Offset eta_nnz()   const noexcept { return static_cast<Offset>(eta_val_.size()); }
+    Offset eta_nnz()   const;
     bool  is_valid()   const noexcept { return valid_; }
     const LuStats& stats() const noexcept { return stats_; }
 
@@ -120,6 +128,18 @@ private:
     void solve_upper(std::vector<f64>& v) const;      // U w = v
     void solve_upper_t(std::vector<f64>& v) const;    // U' z = v
     void solve_lower_t(std::vector<f64>& v) const;    // L' w = v, unit diagonal
+
+    // Hypersparse triangular solves: same four systems, restricted to the
+    // reach set of `seed` (the input's nonzero pattern, in pivot
+    // coordinates). Marks are set on success and left cleared on failure,
+    // when the reach outgrew `dense_below_` and the dense solve is cheaper.
+    // reach_ (the marked positions) and mark_ are valid on success only.
+    bool sparse_lower(const std::vector<Index>& seed, std::vector<f64>& v) const;
+    bool sparse_upper(const std::vector<Index>& seed, std::vector<f64>& v) const;
+    bool sparse_upper_t(const std::vector<Index>& seed, std::vector<f64>& v) const;
+    bool sparse_lower_t(const std::vector<Index>& seed, std::vector<f64>& v) const;
+
+    void build_col_patterns();
 
     Index m_ = 0;
     bool valid_ = false;
@@ -130,17 +150,29 @@ private:
     std::vector<f64>   piv_val_;
     std::vector<Index> rpos_, cpos_;
 
-    // U off-diagonals, by pivot order, indices already in pivot coordinates
-    // and strictly greater than the pivot index.
-    std::vector<Offset> u_start_;
+    // U off-diagonals + diagonal storage. Row k lives at
+    // [u_off_[k], u_off_[k] + u_len_[k]) in u_idx_/u_val_, indices in pivot
+    // coordinates. The diagonal U_kk is the implied last entry: row k holds
+    // its OFF-diagonal columns only (piv_val_ carries the diagonal).
+    std::vector<Offset> u_off_;
+    std::vector<Index>  u_len_;
     std::vector<Index>  u_idx_;
     std::vector<f64>    u_val_;
 
     // L multipliers, by pivot order, indices in pivot coordinates, strictly
-    // greater than the pivot index. Unit diagonal is implicit.
+    // greater than the pivot index. Unit diagonal is implicit. L is FROZEN
+    // between factorizations (product-form updates never touch it).
     std::vector<Offset> l_start_;
     std::vector<Index>  l_idx_;
     std::vector<f64>    l_val_;
+
+    // Column patterns for the reach-set DFS, compressed by counting sort.
+    // U and L are frozen between factorizations (updates are product-form
+    // etas), so these are built once per factorize().
+    std::vector<Offset> u_col_start_;
+    std::vector<Index>  u_col_row_;
+    std::vector<Offset> l_col_start_;
+    std::vector<Index>  l_col_row_;
 
     // Eta file: update k replaced basis slot eta_p_[k] with a column whose
     // image was eta_val_[eta_start_[k] .. eta_start_[k+1]).
@@ -150,7 +182,13 @@ private:
     std::vector<f64>    eta_val_;
     std::vector<f64>    eta_pivot_;
 
+    Offset u_live_nnz_ = 0;     // nnz actually referenced by live rows
+    Offset u_alloc_nnz_ = 0;    // live + dead (refactor trigger)
+
     mutable std::vector<f64> work_;   // scratch, size m
+    mutable std::vector<char> mark_;                // DFS marks, size n
+    mutable std::vector<Index> dfs_stack_, reach_, order_, seed_;  // DFS scratch
+    Index dense_below_ = 0;          // reach larger than this -> dense solve
     LuStats stats_{};
 };
 

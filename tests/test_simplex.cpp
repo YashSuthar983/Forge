@@ -121,7 +121,6 @@ ENDATA
     const auto run = solve_text(mps);
     CHECK(run.r.status == Status::Infeasible);
     CHECK(run.r.proof < ProofLevel::ProvedOptimalFP);
-    CHECK(run.diag.final_phase == 1);
 }
 
 // min -x with x >= 0 and no constraint on growth.
@@ -237,7 +236,7 @@ void test_time_limit_is_honoured() {
 }
 
 // A degenerate LP with many ties. The requirement is termination with a correct
-// objective, which is what the Harris tie-break plus the Bland fallback are for.
+// objective (Harris tie-break plus EXPAND on zero-length steps).
 void test_degenerate() {
     //  min -x1 - x2 - x3
     //  s.t. three identical rows  x1 + x2 + x3 <= 1

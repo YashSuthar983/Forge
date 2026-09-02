@@ -181,9 +181,10 @@ void test_random_solves() {
     }
 }
 
-// The product-form update must agree with factorizing the updated matrix from
-// scratch. This is the check that catches a wrong eta application order, which
-// is otherwise invisible for a single update and only diverges after several.
+// The MPF / Forrest–Tomlin-style update must agree with factorizing the updated
+// matrix from scratch. This is the check that catches a wrong T application
+// order, which is otherwise invisible for a single update and only diverges
+// after several.
 void test_product_form_update() {
     std::mt19937 rng(99u);
     const Index m = 60;
@@ -352,12 +353,114 @@ void test_empty_basis() {
     f.btran(none);
 }
 
+void test_hypersparse_unit_rhs() {
+    const Index m = 80;
+    std::mt19937 rng(42u);
+    ColMat b = random_basis(m, 0.04, rng);
+    BasisFactor f;
+    CHECK(f.factorize(m, b.col_ptr, b.row_idx, b.vals, LuOptions{}));
+
+    // Unit RHS: hypersparse path must match dense.
+    for (Index unit = 0; unit < m; unit += 17) {
+        std::vector<f64> rhs(static_cast<std::size_t>(m), 0.0);
+        rhs[static_cast<std::size_t>(unit)] = 1.0;
+        std::vector<f64> z = rhs;
+        f.ftran(z);
+        const f64 e_f = max_abs_diff(b.apply(z), rhs);
+        ::sor::test::report(e_f <= 1e-8, "hypersparse ftran unit", __FILE__, __LINE__,
+                            "unit=" + std::to_string(unit));
+
+        std::vector<f64> rho(static_cast<std::size_t>(m), 0.0);
+        rho[static_cast<std::size_t>(unit)] = 1.0;
+        std::vector<f64> w = rho;
+        f.btran(w);
+        const f64 e_b = max_abs_diff(b.apply_t(w), rho);
+        ::sor::test::report(e_b <= 1e-8, "hypersparse btran unit", __FILE__, __LINE__,
+                            "unit=" + std::to_string(unit));
+    }
+
+    // A few nonzeros (still sparse): mixed-density seeds.
+    for (int trial = 0; trial < 8; ++trial) {
+        std::vector<f64> rhs(static_cast<std::size_t>(m), 0.0);
+        for (Index t = 0; t < 5; ++t)
+            rhs[static_cast<std::size_t>((trial * 13 + t * 7) % m)] =
+                (t % 2 ? 1.0 : -2.0);
+        std::vector<f64> z = rhs;
+        f.ftran(z);
+        const f64 e_f = max_abs_diff(b.apply(z), rhs);
+        ::sor::test::report(e_f <= 1e-8, "hypersparse ftran few-nnz", __FILE__, __LINE__,
+                            "trial=" + std::to_string(trial));
+
+        std::vector<f64> w = rhs;
+        f.btran(w);
+        const f64 e_b = max_abs_diff(b.apply_t(w), rhs);
+        ::sor::test::report(e_b <= 1e-8, "hypersparse btran few-nnz", __FILE__, __LINE__,
+                            "trial=" + std::to_string(trial));
+    }
+
+    // Through an update chain: each update consumes the FTRAN result of the
+    // entering column (the product-form contract), so the flow mirrors the
+    // engine exactly -- build a column, FTRAN it, update the slot with the
+    // result, then verify every solve against the matrix whose column was
+    // replaced.
+    ColMat b2 = b;
+    for (Index upd = 0; upd < 6; ++upd) {
+        std::vector<f64> aq(static_cast<std::size_t>(m), 0.0);
+        aq[static_cast<std::size_t>((upd * 11 + 3) % m)] = 2.0;
+        aq[static_cast<std::size_t>((upd * 29 + 1) % m)] = 0.5;
+        aq[static_cast<std::size_t>((upd * 7 + 5) % m)] = -1.5;
+        std::vector<f64> alpha = aq;
+        f.ftran(alpha);                      // alpha := B^-1 a_q
+
+        // Leaving slot: the largest |alpha|, mirroring the ratio test.
+        Index p = -1;
+        f64 best = 0.0;
+        for (Index i = 0; i < m; ++i)
+            if (std::fabs(alpha[static_cast<std::size_t>(i)]) > best) {
+                best = std::fabs(alpha[static_cast<std::size_t>(i)]);
+                p = i;
+            }
+        CHECK(p >= 0);
+        if (!f.update(p, alpha)) continue;   // unstable update: skip, not fail
+
+        std::vector<Index> rows;
+        std::vector<f64> vals;
+        for (Index i = 0; i < m; ++i)
+            if (aq[static_cast<std::size_t>(i)] != 0.0) {
+                rows.push_back(i);
+                vals.push_back(aq[static_cast<std::size_t>(i)]);
+            }
+        b2.set_col(p, rows, vals);
+
+        for (Index unit = 0; unit < m; unit += 29) {
+            std::vector<f64> rhs(static_cast<std::size_t>(m), 0.0);
+            rhs[static_cast<std::size_t>(unit)] = 1.0;
+            std::vector<f64> z = rhs;
+            f.ftran(z);
+            const f64 e_f = max_abs_diff(b2.apply(z), rhs);
+            ::sor::test::report(e_f <= 1e-7, "hypersparse ftran etas", __FILE__,
+                                __LINE__,
+                                "upd=" + std::to_string(upd) +
+                                " unit=" + std::to_string(unit));
+
+            std::vector<f64> w = rhs;
+            f.btran(w);
+            const f64 e_b = max_abs_diff(b2.apply_t(w), rhs);
+            ::sor::test::report(e_b <= 1e-7, "hypersparse btran etas", __FILE__,
+                                __LINE__,
+                                "upd=" + std::to_string(upd) +
+                                " unit=" + std::to_string(unit));
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
     test_identity_basis();
     test_random_solves();
     test_product_form_update();
+    test_hypersparse_unit_rhs();
     test_bucket_not_truncated_by_early_exit();
     test_singular_reported();
     test_zero_column();

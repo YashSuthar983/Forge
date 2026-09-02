@@ -1,0 +1,9 @@
+{
+  "generator": "sor_gen",
+  "seed": 42,
+  "instances": [
+  {"kind": "blend_lp", "seed": 42, "path": "examples/crude_blending/blend_s42.mps", "crudes": 4, "products": 3},
+  {"kind": "schedule_milp", "seed": 42, "path": "examples/scheduling/schedule_s42.mps", "periods": 6, "units": 2},
+  {"kind": "dispatch_qp", "seed": 42, "path": "examples/dispatch/dispatch_s42.qps", "gens": 4}
+  ]
+}

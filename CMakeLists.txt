@@ -22,11 +22,19 @@ endif()
 
 option(SOR_ENABLE_JULIA_GPU
        "Build the EXPERIMENTAL Julia GPU sidecar backend (prototype only)" OFF)
+option(SOR_ENABLE_VULKAN
+       "Build the Vulkan compute LpDevice (AMD/NVIDIA/Intel)" ON)
 option(SOR_WARNINGS_AS_ERRORS "Treat warnings as errors" ON)
 
 add_library(sor_flags INTERFACE)
+# -O3 belongs to the build type, not here: hard-coding it made a Debug build
+# silently optimized. -march=native is off by default because it makes published
+# timings unreproducible on any other machine and unfair against a competitor
+# built for a generic target -- opt in with -DSOR_NATIVE_ARCH=ON when profiling.
+option(SOR_NATIVE_ARCH "Build for the host CPU (-march=native); not portable" OFF)
 target_compile_options(sor_flags INTERFACE
   $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic -Wshadow>
+  $<$<AND:$<CXX_COMPILER_ID:GNU,Clang>,$<BOOL:${SOR_NATIVE_ARCH}>>:-march=native>
   $<$<AND:$<CXX_COMPILER_ID:GNU,Clang>,$<BOOL:${SOR_WARNINGS_AS_ERRORS}>>:-Werror>
 )
 
@@ -40,16 +48,46 @@ add_library(sor_sparse sor_sparse/src/csr.cpp sor_sparse/src/csc.cpp)
 target_include_directories(sor_sparse PUBLIC sor_sparse/include)
 target_link_libraries(sor_sparse PUBLIC sor_core PRIVATE sor_flags)
 
-# Sparse LU of a simplex basis: FTRAN / BTRAN / product-form update.
-# Deliberately depends on sor_core ONLY -- it takes the basis column-wise as
-# plain arrays, so it needs no matrix type and stays usable by crossover and by
-# any future barrier engine.
 add_library(sor_la_cpu sor_la_cpu/src/lu.cpp)
 target_include_directories(sor_la_cpu PUBLIC sor_la_cpu/include)
 target_link_libraries(sor_la_cpu PUBLIC sor_core PRIVATE sor_flags)
 
-set(SOR_BACKEND_SOURCES sor_backend/src/cpu_backend.cpp
-                        sor_backend/src/backend_factory.cpp)
+# ---- Vulkan SPIR-V shaders (optional) ------------------------------------
+set(SOR_SHADER_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/sor_backend/vulkan/shaders)
+set(SOR_SHADER_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
+set(SOR_SHADER_NAMES
+  spmv_csr spmv_csc primal_step dual_step halpern_mix avg_update)
+
+if(SOR_ENABLE_VULKAN)
+  find_package(Vulkan REQUIRED)
+  find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
+  file(MAKE_DIRECTORY ${SOR_SHADER_BINARY_DIR})
+  set(SOR_SPV_OUTPUTS)
+  foreach(s ${SOR_SHADER_NAMES})
+    set(_src ${SOR_SHADER_SOURCE_DIR}/${s}.comp)
+    set(_spv ${SOR_SHADER_BINARY_DIR}/${s}.spv)
+    add_custom_command(
+      OUTPUT ${_spv}
+      COMMAND ${GLSLANG_VALIDATOR} -V --target-env vulkan1.2 -o ${_spv} ${_src}
+      DEPENDS ${_src}
+      COMMENT "SPIR-V ${s}.comp"
+      VERBATIM)
+    list(APPEND SOR_SPV_OUTPUTS ${_spv})
+  endforeach()
+  add_custom_target(sor_shaders ALL DEPENDS ${SOR_SPV_OUTPUTS})
+endif()
+
+set(SOR_BACKEND_SOURCES
+  sor_backend/src/cpu_backend.cpp
+  sor_backend/src/backend_factory.cpp
+  sor_backend/src/cpu_lp_device.cpp)
+if(SOR_ENABLE_VULKAN)
+  list(APPEND SOR_BACKEND_SOURCES
+    sor_backend/src/vulkan/vk_context.cpp
+    sor_backend/src/vulkan/vk_lp_device.cpp)
+else()
+  list(APPEND SOR_BACKEND_SOURCES sor_backend/src/vulkan_stub.cpp)
+endif()
 if(SOR_ENABLE_JULIA_GPU)
   list(APPEND SOR_BACKEND_SOURCES sor_backend/src/julia_gpu_backend.cpp)
 endif()
@@ -57,9 +95,15 @@ endif()
 add_library(sor_backend ${SOR_BACKEND_SOURCES})
 target_include_directories(sor_backend PUBLIC sor_backend/include)
 target_link_libraries(sor_backend PUBLIC sor_sparse PRIVATE sor_flags)
+if(SOR_ENABLE_VULKAN)
+  target_link_libraries(sor_backend PUBLIC Vulkan::Vulkan)
+  target_compile_definitions(sor_backend PUBLIC SOR_ENABLE_VULKAN=1)
+  target_compile_definitions(sor_backend PRIVATE
+    SOR_SHADER_DIR=\"${SOR_SHADER_BINARY_DIR}\")
+  add_dependencies(sor_backend sor_shaders)
+endif()
 if(SOR_ENABLE_JULIA_GPU)
   target_compile_definitions(sor_backend PUBLIC SOR_ENABLE_JULIA_GPU=1)
-  # Default sidecar location; overridable at runtime via SOR_JULIA_PROJECT.
   target_compile_definitions(sor_backend PRIVATE
     SOR_JULIA_PROJECT_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/tools/julia_gpu\")
 endif()
@@ -69,18 +113,34 @@ add_library(sor_model sor_model/src/lp.cpp)
 target_include_directories(sor_model PUBLIC sor_model/include)
 target_link_libraries(sor_model PUBLIC sor_sparse PRIVATE sor_flags)
 
-add_library(sor_io sor_io/src/mps.cpp)
+add_library(sor_io sor_io/src/mps.cpp sor_io/src/write_mps.cpp sor_io/src/qps.cpp)
 target_include_directories(sor_io PUBLIC sor_io/include)
 target_link_libraries(sor_io PUBLIC sor_model PRIVATE sor_flags)
 
+# ------------------------------ L3: transform ------------------------------
+add_library(sor_presolve sor_presolve/src/presolve.cpp)
+target_include_directories(sor_presolve PUBLIC sor_presolve/include)
+target_link_libraries(sor_presolve PUBLIC sor_model PRIVATE sor_flags)
+
 # ------------------------------ L4: engines --------------------------------
-add_library(sor_engines sor_engines/src/pdhg.cpp sor_engines/src/simplex.cpp)
+add_library(sor_engines
+  sor_engines/src/pdhg.cpp
+  sor_engines/src/simplex.cpp
+  sor_engines/src/dual_simplex.cpp
+  sor_engines/src/dual_edge_weights.cpp
+  sor_engines/src/dual_bfrt.cpp
+  sor_engines/src/hpr.cpp
+  sor_engines/src/qp.cpp)
 target_include_directories(sor_engines PUBLIC sor_engines/include)
-target_link_libraries(sor_engines PUBLIC sor_model sor_backend sor_la_cpu
+target_link_libraries(sor_engines PUBLIC sor_model sor_backend sor_la_cpu sor_presolve
                                   PRIVATE sor_flags)
 
+# ------------------------------ L5: search ---------------------------------
+add_library(sor_search sor_search/src/bab.cpp)
+target_include_directories(sor_search PUBLIC sor_search/include)
+target_link_libraries(sor_search PUBLIC sor_engines PRIVATE sor_flags)
+
 # --------------------------- L7: verification ------------------------------
-# NOTE: sor_certify links ONLY L0. It must never gain an engine dependency.
 add_library(sor_certify sor_certify/src/finalize.cpp)
 target_include_directories(sor_certify PUBLIC sor_certify/include)
 target_link_libraries(sor_certify PUBLIC sor_core PRIVATE sor_flags)
@@ -88,7 +148,10 @@ target_link_libraries(sor_certify PUBLIC sor_core PRIVATE sor_flags)
 # ----------------------------- L8: front ends ------------------------------
 add_executable(sor_solve cli/sor_solve.cpp)
 target_link_libraries(sor_solve PRIVATE
-  sor_io sor_engines sor_certify sor_backend sor_flags)
+  sor_io sor_engines sor_search sor_certify sor_backend sor_flags)
+
+add_executable(sor_gen cli/sor_gen.cpp)
+target_link_libraries(sor_gen PRIVATE sor_io sor_flags)
 
 # --------------------------------- tests -----------------------------------
 enable_testing()
@@ -108,12 +171,18 @@ sor_add_test(test_no_unproved_optimal sor_certify)
 sor_add_test(test_mps                 sor_io)
 sor_add_test(test_pdhg                sor_engines sor_certify sor_io)
 sor_add_test(test_simplex             sor_engines sor_certify sor_io)
+sor_add_test(test_dual_edge_weights   sor_engines)
+sor_add_test(test_presolve             sor_presolve)
+sor_add_test(test_hpr                 sor_engines sor_certify sor_io)
+sor_add_test(test_lp_device           sor_backend sor_engines sor_io)
+sor_add_test(test_milp                sor_search sor_certify sor_io)
+sor_add_test(test_qp                  sor_engines sor_certify)
+sor_add_test(test_qps                 sor_io sor_engines sor_certify)
 
 if(SOR_ENABLE_JULIA_GPU)
   sor_add_test(test_julia_gpu_parity sor_backend)
-  # Missing julia or a non-functional GPU must SKIP, not fail.
   set_tests_properties(test_julia_gpu_parity PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 message(STATUS "SOR ${PROJECT_VERSION}  build=${CMAKE_BUILD_TYPE}  "
-               "julia_gpu=${SOR_ENABLE_JULIA_GPU}")
+               "julia_gpu=${SOR_ENABLE_JULIA_GPU}  vulkan=${SOR_ENABLE_VULKAN}")
