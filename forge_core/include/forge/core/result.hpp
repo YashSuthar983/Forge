@@ -88,6 +88,12 @@ struct ProofEvidence {
     f64 primal_feas_tol = 1e-7;
     f64 dual_feas_tol   = 1e-7;
     f64 gap_tol         = 1e-9;
+
+    // Farkas certificate (see RawResult::ray): max(0, U - L) recomputed
+    // independently against the unscaled model. kPosInf means either no ray
+    // was proposed or the proposed one is structurally unable to certify
+    // (needed an infinite bound) -- an honest "not proved", never a lie.
+    f64 ray_violation = kPosInf;
 };
 
 // What an engine reports upward. Never shown to a user directly.
@@ -100,6 +106,10 @@ struct RawResult {
 
     std::vector<f64> x;
     std::vector<f64> y;
+    // Farkas infeasibility certificate (row-indexed, original unscaled row
+    // space), populated only alongside proposed_status == Infeasible when
+    // the terminating basis yielded one. Empty is honest: no certificate.
+    std::vector<f64> ray;
 
     std::uint64_t iterations = 0;
     std::string engine;
@@ -118,6 +128,13 @@ struct SolveResult {
 
     std::vector<f64> x;
     std::vector<f64> y;
+    // Farkas infeasibility certificate, present only when status == Infeasible
+    // AND ray_certified is true -- finalize_result() is the sole writer of
+    // ray_certified, the same rule it enforces for Status::Optimal. An empty
+    // ray or ray_certified == false is an honest "infeasible, no proof",
+    // never a wrong claim.
+    std::vector<f64> ray;
+    bool ray_certified = false;
 
     f64 max_primal_violation = kPosInf;
     f64 max_dual_violation   = kPosInf;

@@ -107,6 +107,7 @@ bool BasisFactor::factorize(Index m,
     dense_below_ = 0;
     u_live_nnz_ = 0;
     u_alloc_nnz_ = 0;
+    work_since_factor_ = 0;
     if (singular_slots) singular_slots->clear();
     if (vacant_rows)    vacant_rows->clear();
 
@@ -645,6 +646,7 @@ void BasisFactor::ftran(std::vector<f64>& b) const {
         }
     }
     if (!sp) solve_lower(work_);
+    work_since_factor_ += sp ? static_cast<Offset>(reach_.size()) : static_cast<Offset>(n);
 
     // U-solve (sparse or dense) + scatter.
     sp = false;
@@ -671,6 +673,8 @@ void BasisFactor::ftran(std::vector<f64>& b) const {
         solve_upper(work_);
         for (std::size_t k = 0; k < n; ++k) b[sz(piv_slot_[k])] = work_[k];
     }
+    work_since_factor_ += sp ? static_cast<Offset>(reach_.size()) : static_cast<Offset>(n);
+    work_since_factor_ += static_cast<Offset>(eta_nnz());
 
     // B_k^-1 = E_k^-1 ... E_1^-1 B_0^-1, so the etas apply oldest first.
     // An eta with b[p] == 0 is the identity on b (E^-1 x = x when x_p = 0),
@@ -726,6 +730,7 @@ void BasisFactor::btran(std::vector<f64>& d) const {
         }
     }
     if (!sp) solve_upper_t(work_);
+    work_since_factor_ += sp ? static_cast<Offset>(reach_.size()) : static_cast<Offset>(n);
 
     // L'-solve (sparse or dense) + scatter.
     sp = false;
@@ -750,6 +755,8 @@ void BasisFactor::btran(std::vector<f64>& d) const {
         solve_lower_t(work_);
         for (std::size_t k = 0; k < n; ++k) d[sz(piv_row_[k])] = work_[k];
     }
+    work_since_factor_ += sp ? static_cast<Offset>(reach_.size()) : static_cast<Offset>(n);
+    work_since_factor_ += static_cast<Offset>(eta_nnz());
 }
 
 // ---------------------------------------------------------------------------
@@ -760,12 +767,18 @@ Offset BasisFactor::eta_nnz() const {
     return static_cast<Offset>(eta_val_.size());
 }
 
-bool BasisFactor::needs_refactor(int update_limit, f64 eta_nnz_ratio) const {
+bool BasisFactor::needs_refactor(int update_limit, f64 eta_nnz_ratio,
+                                 Index bump_width_max, f64 work_ratio_max) const {
     if (update_limit > 0 && static_cast<int>(eta_p_.size()) >= update_limit)
         return true;
     if (eta_nnz_ratio > 0.0 && stats_.factor_nnz > 0) {
         const f64 limit = eta_nnz_ratio * static_cast<f64>(stats_.factor_nnz);
         if (static_cast<f64>(eta_nnz()) > limit) return true;
+    }
+    if (bump_width_max > 0 && bump_width_ > bump_width_max) return true;
+    if (work_ratio_max > 0.0 && stats_.factor_nnz > 0) {
+        const f64 limit = work_ratio_max * static_cast<f64>(stats_.factor_nnz);
+        if (static_cast<f64>(work_since_factor_) > limit) return true;
     }
     return false;
 }
@@ -782,6 +795,275 @@ bool BasisFactor::update(Index p, const std::vector<f64>& alpha, f64 min_pivot) 
         }
     }
     eta_start_.push_back(static_cast<Offset>(eta_idx_.size()));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Forrest-Tomlin update
+// ---------------------------------------------------------------------------
+
+// Dense Gauss elimination with partial (row-only) pivoting over the bump.
+// Columns are processed in FIXED role order 0..width-1 (role 0 = the
+// entering data, role c>=1 = the old slot that was at old pivot-step
+// p_step+c) -- no column pivoting, which is what keeps this a "one slot
+// leaves, one slot enters" update rather than a general refactorization.
+// `order[b]` = the bump-LOCAL original row index chosen as the pivot for
+// role/step b; new_l_idx entries are remapped from bump-local original row
+// index to bump-local FINAL offset (0..width-1) before returning, so the
+// caller only needs to add p_step to get global pivot-step coordinates.
+bool BasisFactor::eliminate_bump(std::vector<f64>& bm, Index width,
+                                 const LuOptions& opts,
+                                 std::vector<Index>& order,
+                                 std::vector<f64>& new_diag,
+                                 std::vector<std::vector<Index>>& new_u_idx,
+                                 std::vector<std::vector<f64>>& new_u_val,
+                                 std::vector<std::vector<Index>>& new_l_idx,
+                                 std::vector<std::vector<f64>>& new_l_val) const {
+    order.assign(sz(width), -1);
+    new_diag.assign(sz(width), 0.0);
+    new_u_idx.assign(sz(width), {});
+    new_u_val.assign(sz(width), {});
+    new_l_idx.assign(sz(width), {});
+    new_l_val.assign(sz(width), {});
+    std::vector<char> used(sz(width), 0);
+    const auto at = [&](Index r, Index c) -> f64& {
+        return bm[sz(r) * sz(width) + sz(c)];
+    };
+
+    for (Index b = 0; b < width; ++b) {
+        Index best_row = -1;
+        f64 best_mag = -1.0;
+        for (Index r = 0; r < width; ++r) {
+            if (used[sz(r)]) continue;
+            const f64 mag = std::fabs(at(r, b));
+            if (mag > best_mag) { best_mag = mag; best_row = r; }
+        }
+        if (best_row < 0 || !(best_mag > opts.pivot_tol)) return false;
+        used[sz(best_row)] = 1;
+        order[sz(b)] = best_row;
+        const f64 piv = at(best_row, b);
+        new_diag[sz(b)] = piv;
+        for (Index c = b + 1; c < width; ++c) {
+            const f64 v = at(best_row, c);
+            if (v != 0.0) {
+                new_u_idx[sz(b)].push_back(c);
+                new_u_val[sz(b)].push_back(v);
+            }
+        }
+        for (Index r = 0; r < width; ++r) {
+            if (used[sz(r)]) continue;
+            const f64 arb = at(r, b);
+            if (arb == 0.0) continue;
+            const f64 mult = arb / piv;
+            new_l_idx[sz(b)].push_back(r);  // bump-local ORIGINAL row; remapped below
+            new_l_val[sz(b)].push_back(mult);
+            for (Index c = b; c < width; ++c)
+                at(r, c) -= mult * at(best_row, c);
+        }
+    }
+
+    std::vector<Index> local_to_final(sz(width), -1);
+    for (Index b = 0; b < width; ++b) local_to_final[sz(order[sz(b)])] = b;
+    for (Index b = 0; b < width; ++b)
+        for (auto& idx : new_l_idx[sz(b)]) idx = local_to_final[sz(idx)];
+    return true;
+}
+
+// Same contract as update(): p is a SLOT LABEL, alpha = B_old^-1 a_new
+// already in slot-label coordinates (the standard FTRAN result). See
+// lu.hpp's file header for the algorithm; in short: recover w = L^-1 a_new
+// for the bump via a forward sweep through the CURRENT U (an algebraic
+// identity, not a new triangular system), assemble the dense bump matrix
+// from that plus U's own current bump rows, re-eliminate it with partial
+// pivoting, and splice the result back as the new trailing pivot-steps.
+bool BasisFactor::update_ft(Index p, const std::vector<f64>& alpha,
+                            const LuOptions& opts, f64 min_pivot) {
+    if (m_ == 0 || sz(p) >= sz(m_) || alpha.size() < sz(m_)) return false;
+    const f64 ap = alpha[sz(p)];
+    if (!(std::fabs(ap) > min_pivot)) return false;
+
+    const Index p_step = cpos_[sz(p)];
+    if (p_step < 0) return false;
+    const Index width = m_ - p_step;
+    // x_full[k] = alpha unscattered into pivot-step order, for EVERY step,
+    // not just the bump: a prefix row (k < p_step) can hold an off-diagonal
+    // U entry at column p_step (slot p's OWN old pivot-step) whose value is
+    // a property of slot p's data -- which just changed underneath it -- so
+    // every prefix row needs checking, not just the bump. w_full = U_old *
+    // x_full is that same "undo one solve_upper step" trick, computed for
+    // every row. For k < p_step this is ALREADY the correct final value with
+    // no further correction: (L_old^-1 a_new)[k] depends only on L's steps
+    // 0..k-1 (L is lower triangular), so it is identical whether computed
+    // against L_FULL or against a hypothetical L_prefix -- nothing to strip
+    // out, unlike the bump below.
+    std::vector<f64> x_full(sz(m_));
+    for (Index k = 0; k < m_; ++k) x_full[sz(k)] = alpha[sz(piv_slot_[sz(k)])];
+    std::vector<f64> w_full(sz(m_));
+    for (Index k = 0; k < m_; ++k) {
+        f64 s = piv_val_[sz(k)] * x_full[sz(k)];
+        const Offset beg = u_off_[sz(k)], end = beg + u_len_[sz(k)];
+        for (Offset t = beg; t < end; ++t)
+            s += u_val_[sz(t)] * x_full[sz(u_idx_[sz(t)])];  // j > k always
+        w_full[sz(k)] = s;
+    }
+
+    // Assemble the dense bump: role c>=1 = the old upper-triangular column at
+    // old pivot-step p_step+c, read straight from the CURRENT (pre-update)
+    // U/diagonal; column-role 0 (the entering data, = w_full restricted to
+    // the bump) is written LAST so it can never be clobbered by the
+    // old-column pass below (whose entries -- diagonal at [a][a] for a>=1,
+    // off-diagonal at [a][c] for c>a -- never touch column 0 for any row,
+    // but writing role 0 first and "fixing" the one colliding cell
+    // afterwards is exactly the kind of off-by-one this module has been
+    // burned by before; last-write-wins is simpler to trust).
+    std::vector<f64> bm(sz(width) * sz(width), 0.0);
+    for (Index a = 0; a < width; ++a) {
+        const Index k = p_step + a;
+        if (a >= 1) bm[sz(a) * sz(width) + sz(a)] = piv_val_[sz(k)];
+        const Offset beg = u_off_[sz(k)], end = beg + u_len_[sz(k)];
+        for (Offset t = beg; t < end; ++t) {
+            const Index c = u_idx_[sz(t)] - p_step;  // c > a always, so c >= 1
+            bm[sz(a) * sz(width) + sz(c)] = u_val_[sz(t)];
+        }
+    }
+    for (Index a = 0; a < width; ++a) bm[sz(a) * sz(width)] = w_full[sz(p_step + a)];
+
+    // The values just assembled are contaminated by the OLD bump's own
+    // internal elimination order: `w` was recovered via U * x using the
+    // FULL old factorization (so it equals L_bump_old^-1 applied to the
+    // TRUE prefix-only Schur complement, not that complement itself), and
+    // the old-column reads above are literally OLD U rows, which already
+    // have every earlier bump-internal pivot step folded in (verified by
+    // hand: OLD U's diagonal at a late bump row is NOT the same number as
+    // "apply only the prefix steps" gives -- the two differ by exactly
+    // this L_bump_old factor). Strip it back out with ONE forward multiply
+    // by the OLD bump-local L, using a frozen snapshot as the read source
+    // throughout (this is a plain MULTIPLY, not the recursive SOLVE
+    // solve_lower() does -- reusing that in-place pattern here would
+    // silently compute something else, since a multiply must read
+    // un-mutated source values while a solve deliberately chains through
+    // already-updated ones).
+    {
+        const std::vector<f64> bm_raw = bm;
+        for (Index a = 0; a < width; ++a) {
+            const Offset beg = l_start_[sz(p_step + a)];
+            const Offset end = l_start_[sz(p_step + a) + 1];
+            for (Offset t = beg; t < end; ++t) {
+                const Index i = l_idx_[sz(t)] - p_step;  // bump-local target row
+                const f64 mult = l_val_[sz(t)];
+                for (Index c = 0; c < width; ++c)
+                    bm[sz(i) * sz(width) + sz(c)] += mult * bm_raw[sz(a) * sz(width) + sz(c)];
+            }
+        }
+    }
+
+    std::vector<Index> order;
+    std::vector<f64> new_diag;
+    std::vector<std::vector<Index>> new_u_idx, new_l_idx;
+    std::vector<std::vector<f64>> new_u_val, new_l_val;
+    if (!eliminate_bump(bm, width, opts, order, new_diag, new_u_idx, new_u_val,
+                        new_l_idx, new_l_val))
+        return false;
+
+    // Splice. L's prefix (pivot-steps < p_step) is value-for-value untouched:
+    // L's multipliers only ever depend on OTHER columns' relationship to
+    // each other during elimination, never on slot p's specific values, and
+    // slot p was never itself a prefix pivot column (p_step is beyond every
+    // prefix step by definition). But a prefix step's TARGET can be a row
+    // that lands inside the bump (a prefix pivot can eliminate a column from
+    // a row that only becomes a pivot later, inside [p_step, m)), and the
+    // bump's row permutation `order` just changed which physical row sits at
+    // which pivot-step within that range -- so any prefix l_idx_ entry whose
+    // target falls in [p_step, m) needs that target index remapped through
+    // the SAME permutation, or solve_lower()/btran() will apply the right
+    // multiplier to the wrong row. U doesn't have this problem: column roles
+    // never move (only rows do), so a prefix row's off-diagonal COLUMN
+    // indices stay valid everywhere except the single p_step position that
+    // held slot p's own (now-replaced) data, patched below.
+    std::vector<Index> local_to_final(sz(width));
+    for (Index b = 0; b < width; ++b) local_to_final[sz(order[sz(b)])] = b;
+
+    const std::vector<Index> old_piv_row(piv_row_.begin() + p_step, piv_row_.end());
+    const std::vector<Index> old_piv_slot(piv_slot_.begin() + p_step, piv_slot_.end());
+    constexpr f64 kPrefixPatchTol = 1e-13;
+
+    std::vector<Offset> new_u_off(sz(p_step));
+    std::vector<Index> new_u_len(sz(p_step));
+    std::vector<Index> rebuilt_u_idx;
+    std::vector<f64> rebuilt_u_val;
+    rebuilt_u_idx.reserve(u_idx_.size());
+    rebuilt_u_val.reserve(u_val_.size());
+    for (Index k = 0; k < p_step; ++k) {
+        new_u_off[sz(k)] = static_cast<Offset>(rebuilt_u_idx.size());
+        const Offset beg = u_off_[sz(k)], end = beg + u_len_[sz(k)];
+        for (Offset t = beg; t < end; ++t) {
+            if (u_idx_[sz(t)] == p_step) continue;  // dropped; patched below
+            rebuilt_u_idx.push_back(u_idx_[sz(t)]);
+            rebuilt_u_val.push_back(u_val_[sz(t)]);
+        }
+        if (std::fabs(w_full[sz(k)]) > kPrefixPatchTol) {
+            rebuilt_u_idx.push_back(p_step);
+            rebuilt_u_val.push_back(w_full[sz(k)]);
+        }
+        new_u_len[sz(k)] = static_cast<Index>(rebuilt_u_idx.size()) - static_cast<Index>(new_u_off[sz(k)]);
+    }
+    u_idx_ = std::move(rebuilt_u_idx);
+    u_val_ = std::move(rebuilt_u_val);
+    u_off_ = std::move(new_u_off);
+    u_len_ = std::move(new_u_len);
+
+    std::vector<Offset> new_l_start(sz(p_step) + 1, 0);
+    std::vector<Index> rebuilt_l_idx;
+    std::vector<f64> rebuilt_l_val;
+    rebuilt_l_idx.reserve(sz(l_start_[sz(p_step)]));
+    rebuilt_l_val.reserve(sz(l_start_[sz(p_step)]));
+    for (Index k = 0; k < p_step; ++k) {
+        const Offset beg = l_start_[sz(k)], end = l_start_[sz(k) + 1];
+        for (Offset t = beg; t < end; ++t) {
+            Index target = l_idx_[sz(t)];
+            if (target >= p_step)
+                target = p_step + local_to_final[sz(target - p_step)];
+            rebuilt_l_idx.push_back(target);
+            rebuilt_l_val.push_back(l_val_[sz(t)]);
+        }
+        new_l_start[sz(k) + 1] = static_cast<Offset>(rebuilt_l_idx.size());
+    }
+    l_idx_ = std::move(rebuilt_l_idx);
+    l_val_ = std::move(rebuilt_l_val);
+    l_start_ = std::move(new_l_start);
+    piv_row_.resize(sz(p_step));
+    piv_slot_.resize(sz(p_step));
+    piv_val_.resize(sz(p_step));
+
+    for (Index b = 0; b < width; ++b) {
+        const Index a = order[sz(b)];  // bump-local ORIGINAL row chosen for role b
+        piv_row_.push_back(old_piv_row[sz(a)]);
+        piv_slot_.push_back(b == 0 ? p : old_piv_slot[sz(b)]);
+        piv_val_.push_back(new_diag[sz(b)]);
+
+        u_off_.push_back(static_cast<Offset>(u_idx_.size()));
+        u_len_.push_back(static_cast<Index>(new_u_idx[sz(b)].size()));
+        for (std::size_t t = 0; t < new_u_idx[sz(b)].size(); ++t) {
+            u_idx_.push_back(p_step + new_u_idx[sz(b)][t]);  // role -> global step
+            u_val_.push_back(new_u_val[sz(b)][t]);
+        }
+
+        for (std::size_t t = 0; t < new_l_idx[sz(b)].size(); ++t) {
+            l_idx_.push_back(p_step + new_l_idx[sz(b)][t]);  // final offset -> global step
+            l_val_.push_back(new_l_val[sz(b)][t]);
+        }
+        l_start_.push_back(static_cast<Offset>(l_idx_.size()));
+    }
+
+    for (Index k = p_step; k < m_; ++k) {
+        rpos_[sz(piv_row_[sz(k)])] = k;
+        cpos_[sz(piv_slot_[sz(k)])] = k;
+    }
+
+    build_col_patterns();
+    bump_width_ = width;
+    stats_.factor_nnz = static_cast<Offset>(u_idx_.size() + l_idx_.size()) +
+                        static_cast<Offset>(piv_val_.size());
     return true;
 }
 

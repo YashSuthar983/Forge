@@ -42,6 +42,11 @@ QpsProblem read_qps_file(const std::string& path, QpsReadReport& rep,
                        }),
         rep.warnings.end());
     qp.q_diag.assign(static_cast<std::size_t>(qp.linear.n_cols()), 0.0);
+    // QPS quadratic sections conventionally contain one triangle.  Accumulate
+    // unordered pairs, then mirror off-diagonals to the full symmetric CSR
+    // representation expected by the engine.
+    struct QEntry { core::Index i, j; core::f64 value; };
+    std::vector<QEntry> quadratic;
 
     // Map column names → indices.
     std::unordered_map<std::string, core::Index> col_of;
@@ -98,16 +103,34 @@ QpsProblem read_qps_file(const std::string& path, QpsReadReport& rep,
                 continue;
             }
             ++rep.n_quad_entries;
+            quadratic.push_back({i1->second, i2->second, v});
             if (i1->second != i2->second) {
                 rep.has_off_diagonal = true;
-                rep.warnings.push_back(
-                    "QUADOBJ off-diagonal entry ignored by diagonal QP engine");
             } else {
                 qp.q_diag[static_cast<std::size_t>(i1->second)] += v;
             }
             k += 3;
             break;  // one triple per line is the common case
         }
+    }
+    if (rep.has_off_diagonal) {
+        std::vector<core::Index> rows, cols;
+        std::vector<core::f64> values;
+        rows.reserve(quadratic.size() * 2);
+        cols.reserve(quadratic.size() * 2);
+        values.reserve(quadratic.size() * 2);
+        for (const auto& e : quadratic) {
+            rows.push_back(e.i);
+            cols.push_back(e.j);
+            values.push_back(e.value);
+            if (e.i != e.j) {
+                rows.push_back(e.j);
+                cols.push_back(e.i);
+                values.push_back(e.value);
+            }
+        }
+        qp.q_matrix = sparse::from_triplets(qp.linear.n_cols(), qp.linear.n_cols(),
+                                             rows, cols, values);
     }
     return qp;
 }

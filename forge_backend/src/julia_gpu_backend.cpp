@@ -258,8 +258,10 @@ public:
         stderr_path_ = tmpl;
 
         const std::string proj_arg = "--project=" + project_;
+        // Always warm-start: KernelAbstractions + protocol specialize before
+        // READY. --no-warmup is reserved for the overhead microbench only.
         std::vector<std::string> argv_s{julia, proj_arg, "--startup-file=no",
-                                        script, "--device", device};
+                                        script, "--device", device, "--warmup"};
         std::vector<char*> argv;
         for (auto& s : argv_s) argv.push_back(const_cast<char*>(s.c_str()));
         argv.push_back(nullptr);

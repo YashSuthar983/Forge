@@ -113,7 +113,8 @@ add_library(forge_model forge_model/src/lp.cpp)
 target_include_directories(forge_model PUBLIC forge_model/include)
 target_link_libraries(forge_model PUBLIC forge_sparse PRIVATE forge_flags)
 
-add_library(forge_io forge_io/src/mps.cpp forge_io/src/write_mps.cpp forge_io/src/qps.cpp)
+add_library(forge_io forge_io/src/mps.cpp forge_io/src/write_mps.cpp forge_io/src/qps.cpp
+                   forge_io/src/solution.cpp)
 target_include_directories(forge_io PUBLIC forge_io/include)
 target_link_libraries(forge_io PUBLIC forge_model PRIVATE forge_flags)
 
@@ -129,14 +130,19 @@ add_library(forge_engines
   forge_engines/src/dual_simplex.cpp
   forge_engines/src/dual_edge_weights.cpp
   forge_engines/src/dual_bfrt.cpp
+  forge_engines/src/farkas.cpp
   forge_engines/src/hpr.cpp
-  forge_engines/src/qp.cpp)
+  forge_engines/src/qp.cpp
+  forge_engines/src/qp_pdhcg.cpp
+  forge_engines/src/nlp.cpp)
 target_include_directories(forge_engines PUBLIC forge_engines/include)
 target_link_libraries(forge_engines PUBLIC forge_model forge_backend forge_la_cpu forge_presolve
                                   PRIVATE forge_flags)
 
 # ------------------------------ L5: search ---------------------------------
-add_library(forge_search forge_search/src/bab.cpp)
+add_library(forge_search forge_search/src/bab.cpp forge_search/src/cuts.cpp
+                       forge_search/src/propagate.cpp forge_search/src/miqp.cpp
+                       forge_search/src/minlp.cpp)
 target_include_directories(forge_search PUBLIC forge_search/include)
 target_link_libraries(forge_search PUBLIC forge_engines PRIVATE forge_flags)
 
@@ -152,6 +158,12 @@ target_link_libraries(forge_solve PRIVATE
 
 add_executable(forge_gen cli/forge_gen.cpp)
 target_link_libraries(forge_gen PRIVATE forge_io forge_flags)
+
+add_executable(forge_check cli/forge_check.cpp)
+target_link_libraries(forge_check PRIVATE forge_io forge_engines forge_flags)
+
+add_executable(forge_ext_demo cli/forge_ext_demo.cpp)
+target_link_libraries(forge_ext_demo PRIVATE forge_search forge_certify forge_flags)
 
 # --------------------------------- tests -----------------------------------
 enable_testing()
@@ -169,6 +181,7 @@ forge_add_test(test_lu                  forge_la_cpu)
 forge_add_test(test_backend_parity      forge_backend)
 forge_add_test(test_no_unproved_optimal forge_certify)
 forge_add_test(test_mps                 forge_io)
+forge_add_test(test_solution_io         forge_io)
 forge_add_test(test_pdhg                forge_engines forge_certify forge_io)
 forge_add_test(test_simplex             forge_engines forge_certify forge_io)
 forge_add_test(test_dual_edge_weights   forge_engines)
@@ -176,8 +189,17 @@ forge_add_test(test_presolve             forge_presolve)
 forge_add_test(test_hpr                 forge_engines forge_certify forge_io)
 forge_add_test(test_lp_device           forge_backend forge_engines forge_io)
 forge_add_test(test_milp                forge_search forge_certify forge_io)
+forge_add_test(test_cuts                forge_search forge_engines forge_certify forge_io)
+forge_add_test(test_propagate           forge_search)
 forge_add_test(test_qp                  forge_engines forge_certify)
 forge_add_test(test_qps                 forge_io forge_engines forge_certify)
+forge_add_test(test_ps_must             forge_search forge_engines forge_certify forge_io
+                                      forge_la_cpu)
+forge_add_test(test_extensions          forge_search forge_engines forge_certify)
+target_compile_definitions(test_ps_must PRIVATE
+  FORGE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+  FORGE_BINARY_DIR="${CMAKE_CURRENT_BINARY_DIR}")
+add_dependencies(test_ps_must forge_solve forge_check forge_ext_demo)
 
 if(FORGE_ENABLE_JULIA_GPU)
   forge_add_test(test_julia_gpu_parity forge_backend)

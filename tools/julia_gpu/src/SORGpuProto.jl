@@ -24,15 +24,17 @@ using JSON3
 using KernelAbstractions
 using LinearAlgebra
 using SparseArrays
+import AcceleratedKernels as AK
 
 include("timings.jl")
 include("device.jl")
 include("csr_kernels.jl")
 include("projections.jl")
 include("batched.jl")
+include("overhead.jl")
 include("protocol.jl")
 include("server.jl")
 
-export serve, device_info, DeviceState, select_device
+export serve, device_info, DeviceState, select_device, run_overhead_suite
 
 end # module

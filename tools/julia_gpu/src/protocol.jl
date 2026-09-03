@@ -214,6 +214,36 @@ function handle(s::ServerState, o)
             end
             return ok_response(id, Dict{String,Any}("freed" => true), Stats()), true
 
+        elseif op == "bench_overhead"
+            # Julia-side JIT / first-compile vs warm. Prefer a --no-warmup server
+            # so first_kernel_ms still includes KernelAbstractions specialize cost.
+            n_rows = haskey(o, "n_rows") ? getint(o, "n_rows") : 4096
+            n_cols = haskey(o, "n_cols") ? getint(o, "n_cols") : n_rows
+            nnz_per_row = haskey(o, "nnz_per_row") ? getint(o, "nnz_per_row") : 8
+            warm_iters = haskey(o, "warm_iters") ? getint(o, "warm_iters") : 20
+            ak_n = haskey(o, "ak_n") ? getint(o, "ak_n") : (1 << 20)
+            suite = run_overhead_suite(s.dev; n_rows = n_rows, n_cols = n_cols,
+                                       nnz_per_row = nnz_per_row,
+                                       warm_iters = warm_iters, ak_n = ak_n)
+            # Flatten top-level numeric fields for the minimal C++ JSON scraper.
+            flat = Dict{String,Any}("suite" => suite)
+            if haskey(suite, "ka_spmv") && suite["ka_spmv"] isa AbstractDict
+                for (k, v) in suite["ka_spmv"]
+                    flat["ka_" * string(k)] = v
+                end
+            end
+            if haskey(suite, "ak_foreachindex") && suite["ak_foreachindex"] isa AbstractDict
+                for (k, v) in suite["ak_foreachindex"]
+                    flat["ak_" * string(k)] = v
+                end
+            end
+            if haskey(suite, "device") && suite["device"] isa AbstractDict
+                for (k, v) in suite["device"]
+                    flat["dev_" * string(k)] = v
+                end
+            end
+            return ok_response(id, flat, Stats()), true
+
         else
             return err_response(id, "unknown op '$op'"), true
         end

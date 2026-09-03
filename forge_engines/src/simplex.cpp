@@ -111,9 +111,9 @@ void rematerialize_original(const model::LpProblem& original,
         accum_dual(raw.x[sz(j)], pmin.col_lo[sz(j)], pmin.col_hi[sz(j)],
                    pmin.c[sz(j)] - static_cast<f64>(aty[sz(j)]));
     for (Index i = 0; i < m; ++i)
-        accum_dual(static_cast<f64>(ax[sz(i)]), pmin.row_lo[sz(i)], pmin.row_hi[sz(i)], yout[sz(i)]);
+        accum_dual(static_cast<f64>(ax[sz(i)]), pmin.row_lo[sz(i)], pmin.row_hi[sz(i)],
+                   yout[sz(i)]);
     diag.dual_residual = dres;
-
     bool finite = true;
     f64 dval = 0.0;
     for (Index j = 0; j < ns && finite; ++j) {
@@ -625,8 +625,14 @@ core::RawResult solve_primal_simplex(const model::LpProblem& problem,
         const bool unstable = opts.refactor_multiplier_limit > 0.0 &&
                                mult > opts.refactor_multiplier_limit;
         const bool eta_full = factor.needs_refactor(opts.refactor_interval,
-                                                    opts.refactor_eta_ratio);
-        if (unstable || !factor.update(leave, alpha, opts.pivot_tol) || eta_full ||
+                                                    opts.refactor_eta_ratio,
+                                                    opts.bump_width_max,
+                                                    opts.refactor_work_ratio);
+        const bool updated =
+            opts.update_method == la::UpdateMethod::ForrestTomlin
+                ? factor.update_ft(leave, alpha, la::LuOptions{}, opts.pivot_tol)
+                : factor.update(leave, alpha, opts.pivot_tol);
+        if (unstable || !updated || eta_full ||
             ++since_refactor >= opts.refactor_interval) {
             do_factorize();
             since_refactor = 0;
@@ -978,6 +984,20 @@ core::RawResult solve_primal_simplex(const model::LpProblem& problem,
     diag.basis_dimension = m;
     diag.factor_nnz = factor.stats().factor_nnz;
     diag.largest_multiplier = factor.stats().largest_multiplier;
+
+    // Rebuild the final basis once from scratch before extracting its dual.
+    // The maintained product-form update is excellent for the pivot loop, but
+    // a long eta chain can leave the final BTRAN numerically inconsistent with
+    // the basis that produced x. A fresh factorization is cheap compared with
+    // reporting an unproved optimum and gives the certificate pass an
+    // independent representation of the same basis.
+    if (status == core::Status::Optimal && factor.n_updates() > 0) {
+        do_factorize();
+        since_refactor = 0;
+        if (primal_infeasibility() > opts.primal_feas_tol)
+            status = core::Status::NumericalFailure;
+        diag.status = status;
+    }
 
     // ---- 7. assemble the solution and unscale ---------------------------
     std::vector<f64> x(sz(ns), 0.0);
@@ -1401,12 +1421,22 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
                 // run and nothing has proved anything yet.
                 const bool time_left =
                     opts.time_limit_s <= 0.0 || elapsed(t0) < opts.time_limit_s * 0.95;
-                if (!probe_converging && !proved(best_raw, best_diag) && time_left) {
+                if (!proved(best_raw, best_diag) && time_left) {
                     SimplexOptions esc = opts;      // stall_abort stays false
                     if (opts.time_limit_s > 0.0)
                         esc.time_limit_s =
                             std::max(0.05, opts.time_limit_s - elapsed(t0));
-                    raw = run(true, esc, &esc_basis, &probe_basis);
+                    // Repair the best basis found so far. In particular, when
+                    // primal produced a feasible point but its reconstructed
+                    // dual was not clean, restarting dual from the old probe
+                    // basis throws away the useful primal basis and commonly
+                    // leaves the instance at FeasibleWithGap. A dual cleanup
+                    // from `winner` preserves the primal work and can close
+                    // the certificate in a handful of pivots.
+                    const SimplexBasis* warm_basis = winner;
+                    if (!warm_basis || warm_basis->basic.empty())
+                        warm_basis = &probe_basis;
+                    raw = run(true, esc, &esc_basis, warm_basis);
                     keep_better(&esc_basis);
                 }
             }
@@ -1541,6 +1571,47 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         }
         rematerialize_original(problem, raw, diag, opts);
         raw.iterations = diag.iterations;
+
+        // Presolve currently has a complete primal postsolve but only a
+        // partial dual recovery stack.  Never let that partial lift turn a
+        // valid reduced optimum into an unproved original-space result when
+        // the full solve can still certify it.  Retry the original model
+        // without presolve whenever the lifted candidate fails the same
+        // certificate gate used by finalize_result().
+        const bool presolved_proved =
+            raw.proposed_status == core::Status::Optimal &&
+            diag.primal_residual <= opts.primal_feas_tol &&
+            diag.dual_residual <= opts.dual_feas_tol &&
+            diag.dual_bound_finite && diag.gap_rel <= opts.gap_tol;
+        if (used_presolve && !presolved_proved &&
+            (raw.proposed_status == core::Status::Optimal ||
+             raw.proposed_status == core::Status::Feasible)) {
+            SimplexOptions retry_opts = opts;
+            retry_opts.presolve = false;
+            if (opts.time_limit_s > 0.0) {
+                const double spent =
+                    std::chrono::duration<double>(Clock::now() - presolve_t0).count();
+                retry_opts.time_limit_s = std::max(0.05, opts.time_limit_s - spent);
+            }
+            SimplexDiagnostics retry_diag;
+            SimplexBasis retry_basis;
+            core::RawResult retry_raw =
+                solve_simplex(problem, retry_opts, retry_diag, &retry_basis);
+            const bool retry_proved =
+                retry_raw.proposed_status == core::Status::Optimal &&
+                retry_diag.primal_residual <= retry_opts.primal_feas_tol &&
+                retry_diag.dual_residual <= retry_opts.dual_feas_tol &&
+                retry_diag.dual_bound_finite && retry_diag.gap_rel <= retry_opts.gap_tol;
+            if (retry_proved ||
+                (retry_raw.proposed_status == core::Status::Optimal &&
+                 raw.proposed_status != core::Status::Optimal) ||
+                (retry_raw.proposed_status == core::Status::Feasible &&
+                 raw.proposed_status != core::Status::Feasible)) {
+                raw = std::move(retry_raw);
+                diag = retry_diag;
+                if (out_basis) *out_basis = std::move(retry_basis);
+            }
+        }
     }
     return raw;
 }
@@ -1558,6 +1629,7 @@ core::ProofEvidence simplex_evidence(const SimplexDiagnostics& diag,
     ev.dual_feas_tol        = opts.dual_feas_tol;
     ev.gap_tol              = opts.gap_tol;
     ev.checker_passed       = diag.primal_residual <= opts.primal_feas_tol;
+    ev.ray_violation        = diag.ray_violation;
 
     // The proof of LP optimality is three conditions, not two: primal feasible,
     // dual feasible, AND zero duality gap. The first two are nearly automatic
