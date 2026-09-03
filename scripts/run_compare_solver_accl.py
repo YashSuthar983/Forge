@@ -108,6 +108,8 @@ def main() -> int:
     ap.add_argument("--backend", default="cpu")
     ap.add_argument("--obj-tol", type=float, default=1e-4)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--all", action="store_true",
+                    help="run every suite instance (do not pre-filter accl-loadable)")
     ap.add_argument("-o", "--outdir", default="benchmarks/results")
     args = ap.parse_args()
 
@@ -127,11 +129,17 @@ def main() -> int:
     if args.limit:
         all_instances = all_instances[: args.limit]
 
-    print("Probing which instances solver_accl can load...", flush=True)
-    loadable_all, skipped = probe_loadable_instances(inst_dir)
-    loadable_set = {p.stem for p in loadable_all}
-    instances = [m for m in all_instances if m.stem in loadable_set]
-    print(f"  loadable: {len(instances)} / {len(all_instances)}", flush=True)
+    skipped: list[tuple[str, str]] = []
+    if args.all:
+        instances = list(all_instances)
+        print(f"Running ALL {len(instances)} instances "
+              f"(accl will report skipped/crash where unsupported)", flush=True)
+    else:
+        print("Probing which instances solver_accl can load...", flush=True)
+        loadable_all, skipped = probe_loadable_instances(inst_dir)
+        loadable_set = {p.stem for p in loadable_all}
+        instances = [m for m in all_instances if m.stem in loadable_set]
+        print(f"  loadable: {len(instances)} / {len(all_instances)}", flush=True)
 
     solver_names = [
         "SOR-simplex", "SOR-pdhg", "SOR-hpr",
@@ -148,8 +156,9 @@ def main() -> int:
         "suite": args.suite,
         "competitor": "https://github.com/shreyas-omkar/solver_accl",
         "n_all_instances": len(all_instances),
-        "n_loadable": len(instances),
+        "n_loadable": len(instances) if not args.all else None,
         "n_skipped": len(skipped),
+        "run_all": bool(args.all),
         "time_limit_s": args.time_limit,
         "host": platform.node(),
         "platform": platform.platform(),
@@ -237,8 +246,13 @@ def main() -> int:
         "# SOR vs solver_accl (SovereignSolver)",
         "",
         f"- Competitor: [shreyas-omkar/solver_accl](https://github.com/shreyas-omkar/solver_accl)",
-        f"- Instances: **{len(rows)}** loadable / {len(all_instances)} Netlib "
-        f"({len(skipped)} skipped — bounds/format unsupported by accl)",
+        (
+            f"- Instances: **{len(rows)}** / {len(all_instances)} Netlib "
+            f"(--all; accl may skip unsupported at runtime)"
+            if args.all else
+            f"- Instances: **{len(rows)}** loadable / {len(all_instances)} Netlib "
+            f"({len(skipped)} skipped — bounds/format unsupported by accl)"
+        ),
         f"- Time limit: {args.time_limit}s per solver",
         f"- Host: `{env['host']}` · {env['cpu_count']} CPUs",
         "",
@@ -251,11 +265,12 @@ def main() -> int:
         s = f"{sgm[n]:.4f}" if sgm[n] is not None else "—"
         lines.append(f"| {n} | {solved[n]}/{len(rows)} | {match[n]}/{len(rows)} | {s} |")
 
-    lines += ["", "## Skipped by solver_accl", ""]
-    for name, reason in skipped[:20]:
-        lines.append(f"- {name}: {reason}")
-    if len(skipped) > 20:
-        lines.append(f"- … and {len(skipped)-20} more")
+    if skipped:
+        lines += ["", "## Skipped by solver_accl (pre-filter)", ""]
+        for name, reason in skipped[:20]:
+            lines.append(f"- {name}: {reason}")
+        if len(skipped) > 20:
+            lines.append(f"- … and {len(skipped)-20} more")
 
     lines += ["", "## Per-instance", ""]
     hdr = "| Instance |"

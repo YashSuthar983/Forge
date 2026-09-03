@@ -5,6 +5,7 @@
 // refuse to claim Optimal when it should not". A solver that is right on afiro
 // and wrong about infeasibility is worse than useless.
 #include "sor/certify/finalize.hpp"
+#include "sor/engines/farkas.hpp"
 #include "sor/engines/simplex.hpp"
 #include "sor/io/mps.hpp"
 
@@ -121,6 +122,48 @@ ENDATA
     const auto run = solve_text(mps);
     CHECK(run.r.status == Status::Infeasible);
     CHECK(run.r.proof < ProofLevel::ProvedOptimalFP);
+}
+
+// Same infeasible LP as test_infeasible(), forced through the dual engine
+// (where Farkas capture lives) and checked two ways: finalize_result()'s own
+// gate (ray_certified) and an INDEPENDENTLY re-run farkas_violation() call in
+// this test, so a bug shared between the capture code and the verification
+// code inside finalize_result can't hide.
+void test_infeasible_farkas_certificate() {
+    const std::string mps = R"(NAME          INFEAS
+ROWS
+ N  COST
+ L  R1
+COLUMNS
+    X1        COST      1.0        R1        1.0
+    X2        COST      1.0        R1        1.0
+RHS
+    RHS       R1        1.0
+BOUNDS
+ LO BND       X1        2.0
+ LO BND       X2        2.0
+ENDATA
+)";
+    SimplexOptions opts;
+    opts.method = sor::engines::SimplexMethod::Dual;
+    const auto run = solve_text(mps, opts);
+    CHECK(run.r.status == Status::Infeasible);
+    CHECK(run.r.ray_certified);
+    CHECK(run.r.ray.size() == static_cast<std::size_t>(run.problem.n_rows()));
+
+    const f64 v = sor::engines::farkas_violation(run.problem, run.r.ray);
+    ::sor::test::report(std::isfinite(v) && v <= 1e-7, "independent farkas re-check",
+                        __FILE__, __LINE__, "violation=" + std::to_string(v));
+}
+
+// A feasible LP must never carry a certified ray -- finalize_result()'s gate
+// is keyed on Status::Infeasible, not on whatever an engine happens to leave
+// in raw.ray.
+void test_feasible_lp_has_no_ray() {
+    const auto run = solve_text(sor::test::kTestLpMps);
+    CHECK(run.r.status == Status::Optimal);
+    CHECK(!run.r.ray_certified);
+    CHECK(run.r.ray.empty());
 }
 
 // min -x with x >= 0 and no constraint on growth.
@@ -318,6 +361,29 @@ ENDATA
     CHECK_NEAR(run.r.x[1], 5.0, 1e-9);
 }
 
+// Presolve can tighten a singleton inequality into a variable bound and remove
+// the now-redundant row.  The reduced dual is not automatically a valid dual
+// for the original variable bounds (x=1 is interior to x>=0 here), so the
+// solver must retry without presolve before claiming a proof.
+void test_presolve_certificate_fallback() {
+    const std::string mps = R"(NAME          PRECERT
+ROWS
+ N  COST
+ G  R1
+COLUMNS
+    X1        COST      1.0        R1        1.0
+RHS
+    RHS       R1        1.0
+ENDATA
+)";
+    const auto run = solve_text(mps);
+    CHECK(run.r.status == Status::Optimal);
+    CHECK(run.r.proof == ProofLevel::ProvedOptimalFP);
+    CHECK_NEAR(run.r.objective, 1.0, 1e-9);
+    CHECK(run.r.max_primal_violation <= 1e-9);
+    CHECK(run.r.max_dual_violation <= 1e-9);
+}
+
 }  // namespace
 
 int main() {
@@ -325,6 +391,8 @@ int main() {
     test_basis_wellformed();
     test_features_mps_agrees_with_model();
     test_infeasible();
+    test_infeasible_farkas_certificate();
+    test_feasible_lp_has_no_ray();
     test_unbounded();
     test_equality_and_range();
     test_free_variable();
@@ -333,5 +401,6 @@ int main() {
     test_degenerate();
     test_ill_conditioned();
     test_no_rows();
+    test_presolve_certificate_fallback();
     return sor::test::finish("test_simplex");
 }

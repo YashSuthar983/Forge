@@ -22,16 +22,25 @@
 //   Columns are searched in increasing-count order with a bounded candidate
 //   list, so pivot search does not cost O(nnz) per pivot.
 //
-// BASIS UPDATE: product form (an eta file), not Forrest-Tomlin.
-//   B_k = B_0 E_1 ... E_k, so a solve is the base triangular solve plus k
-//   rank-one eta applications; an eta whose pivot entry is zero is skipped,
-//   which keeps hypersparse states cheap. This is the update Forrest-Tomlin
-//   (1972) improves on; FT modifies the U factor in place and was attempted
-//   here (see git history): the below-diagonal fill of the FT elimination
-//   requires the classic cyclic row/column permutation machinery to keep U
-//   triangular, and an in-place variant without it is NOT equivalent
-//   (verified factor-by-factor against a dense reconstruction). Product form
-//   + hypersparse base solves + the eta nnz refactor trigger is what ships.
+// BASIS UPDATE: two selectable representations (LuOptions-adjacent
+// UpdateMethod), both against the SAME L/U from factorize():
+//
+//   ProductForm (update(), the default): B_k = B_0 E_1 ... E_k, so a solve is
+//   the base triangular solve plus k rank-one eta applications; an eta whose
+//   pivot entry is zero is skipped, which keeps hypersparse states cheap.
+//
+//   ForrestTomlin (update_ft(), selectable): re-triangularizes the affected
+//   "bump" of L/U in place instead of appending an eta, so the eta file never
+//   grows. An EARLIER attempt at this in this codebase was reverted: an
+//   in-place elimination WITHOUT the classic cyclic row/column permutation
+//   machinery produced a factorization that did not match a dense
+//   reconstruction (verified factor-by-factor). The current update_ft() does
+//   the permutation properly -- see its declaration below and lu.cpp -- and
+//   is gated behind tests/test_lu_ft.cpp's own dense-reconstruction
+//   differential suite before it is trusted with a live solve.
+//
+// Both paths share hypersparse base solves and factorize()'s refactor
+// triggers (eta nnz ratio for ProductForm, bump width for ForrestTomlin).
 #pragma once
 
 #include "sor/core/result.hpp"
@@ -59,6 +68,19 @@ struct LuOptions {
     // Columns examined per Markowitz pivot search. Unbounded search is
     // O(nnz) per pivot, which dominates everything on large bases.
     int max_search_cols = 8;
+};
+
+// Which basis-slot-replacement representation update_ft() vs. update() uses.
+//   ProductForm:   update() -- append a rank-one eta (unchanged L/U, growing
+//                  eta file). The existing, default path.
+//   ForrestTomlin: update_ft() -- re-triangularize the affected "bump" of
+//                  L/U in place, so the eta file never grows. Selectable
+//                  once it has passed its own differential test suite and a
+//                  Netlib/MIPLIB regression gate (see plan history) -- not
+//                  the default yet.
+enum class UpdateMethod : std::uint8_t {
+    ProductForm = 0,
+    ForrestTomlin = 1,
 };
 
 struct LuStats {
@@ -114,12 +136,45 @@ public:
     // caller must refactorize or pick a different leaving row.
     bool update(Index p, const std::vector<f64>& alpha, f64 min_pivot = 1e-11);
 
-    // True when the eta file is large enough that refactorizing is cheaper.
-    bool needs_refactor(int update_limit, f64 eta_nnz_ratio) const;
+    // Same contract as update() (slot p leaves, alpha = B_old^-1 a_new), but
+    // re-triangularizes L/U in place (Forrest-Tomlin) instead of appending an
+    // eta. Returns false -- leaving the factorization COMPLETELY UNTOUCHED --
+    // if alpha[p] is too small, or if the bump's own elimination cannot find
+    // an acceptable pivot for some column even after row pivoting (a bump
+    // that is itself near-singular); either way the caller must refactorize.
+    bool update_ft(Index p, const std::vector<f64>& alpha,
+                   const LuOptions& opts, f64 min_pivot = 1e-11);
+
+    // ForrestTomlin only: how many trailing pivot-steps the most recent
+    // update_ft() call re-triangularized (m - p_step). 0 if update_ft() has
+    // never been called since the last factorize(). Exposed so a caller can
+    // trigger a refactor once bumps get wide (see needs_refactor()).
+    Index current_bump_width() const noexcept { return bump_width_; }
+
+    // True when the eta file is large enough that refactorizing is cheaper,
+    // (bump_width_max > 0) when the most recent update_ft() bump grew past
+    // bump_width_max pivot-steps, or (work_ratio_max > 0) when
+    // work_since_factor() has exceeded work_ratio_max * factor_nnz -- see
+    // that accessor's comment. The work trigger applies to EITHER update
+    // representation, unlike the other two (eta ratio is product-form-only,
+    // bump width is Forrest-Tomlin-only).
+    bool needs_refactor(int update_limit, f64 eta_nnz_ratio,
+                        Index bump_width_max = 0, f64 work_ratio_max = 0.0) const;
 
     Index dimension()  const noexcept { return m_; }
     Index n_updates()  const noexcept { return static_cast<Index>(eta_p_.size()); }
     Offset eta_nnz()   const;
+
+    // Cumulative triangular-solve work (nnz actually touched: a hypersparse
+    // reach-set size, or the dense m when the hypersparse path was skipped)
+    // done by ftran()/btran() since the last factorize(), plus the eta-file
+    // sweep cost on every call. Refactorization work-based trigger (cuOpt PR
+    // #1043, 2026): once cheap incremental solves have collectively done as
+    // much work as a fresh factorization would cost, refactorizing is no
+    // longer a net loss even if the eta file / bump width triggers haven't
+    // individually fired yet -- this is the trigger that actually tracks
+    // solve COST, where the other two track proxies for it.
+    Offset work_since_factor() const noexcept { return work_since_factor_; }
     bool  is_valid()   const noexcept { return valid_; }
     const LuStats& stats() const noexcept { return stats_; }
 
@@ -141,8 +196,27 @@ private:
 
     void build_col_patterns();
 
+    // Forrest-Tomlin: dense Gauss elimination with partial (row-only) pivoting
+    // over the (m-p_step)x(m-p_step) bump matrix `bm` (row-major, bm[a*w+b]).
+    // On success, fills `piv` (the bump-local row permutation: bump-local row
+    // index -> final pivot-step offset from p_step, i.e. piv[a] = final
+    // offset of original bump row a) plus the new diagonal, U row entries,
+    // and L multipliers for the bump, one inner vector per new pivot-step
+    // offset. Returns false if no acceptable pivot exists for some column
+    // even after row swaps (near-singular bump).
+    bool eliminate_bump(std::vector<f64>& bm, Index width,
+                        const LuOptions& opts,
+                        std::vector<Index>& piv,
+                        std::vector<f64>& new_diag,
+                        std::vector<std::vector<Index>>& new_u_idx,
+                        std::vector<std::vector<f64>>& new_u_val,
+                        std::vector<std::vector<Index>>& new_l_idx,
+                        std::vector<std::vector<f64>>& new_l_val) const;
+
     Index m_ = 0;
     bool valid_ = false;
+    Index bump_width_ = 0;  // current_bump_width(); 0 until update_ft() runs
+    mutable Offset work_since_factor_ = 0;  // work_since_factor(); reset by factorize()
 
     // Pivot sequence. Pivot k sits at (piv_row_[k], piv_slot_[k]) with value
     // piv_val_[k]. rpos_/cpos_ are the inverse maps, row/slot -> pivot order.
@@ -160,15 +234,17 @@ private:
     std::vector<f64>    u_val_;
 
     // L multipliers, by pivot order, indices in pivot coordinates, strictly
-    // greater than the pivot index. Unit diagonal is implicit. L is FROZEN
-    // between factorizations (product-form updates never touch it).
+    // greater than the pivot index. Unit diagonal is implicit. Frozen between
+    // factorizations under product-form update() (which never touches it);
+    // update_ft() rewrites pivot-steps [p_step, m) of both L and U in place.
     std::vector<Offset> l_start_;
     std::vector<Index>  l_idx_;
     std::vector<f64>    l_val_;
 
     // Column patterns for the reach-set DFS, compressed by counting sort.
-    // U and L are frozen between factorizations (updates are product-form
-    // etas), so these are built once per factorize().
+    // Rebuilt by build_col_patterns(), which factorize() calls once and
+    // update_ft() calls again after every re-triangularization (product-form
+    // update() never touches U/L, so it never needs a rebuild).
     std::vector<Offset> u_col_start_;
     std::vector<Index>  u_col_row_;
     std::vector<Offset> l_col_start_;

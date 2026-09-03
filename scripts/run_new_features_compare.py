@@ -153,11 +153,15 @@ def main() -> int:
     ap.add_argument("--max-nodes", type=int, default=10000)
     ap.add_argument("--limit", type=int, default=0,
                     help="limit MIPLIB instances (0 = all)")
+    ap.add_argument("--baselines-only", default="",
+                    help="comma list; keep only matching baselines "
+                         "(prefix ok: 'highs' keeps highs + highs-qp)")
     ap.add_argument("--examples", default=str(ROOT / "examples"))
     ap.add_argument("--miplib-dir",
                     default=str(ROOT / "benchmarks" / "miplib-easy" / "mps"))
     ap.add_argument("-o", "--outdir", default=str(ROOT / "benchmarks" / "results"))
     args = ap.parse_args()
+    allow = {x.strip() for x in args.baselines_only.split(",") if x.strip()}
 
     exe = ROOT / "build" / "sor_solve"
     if not exe.exists():
@@ -176,9 +180,17 @@ def main() -> int:
         "cbc": ROOT / "scripts" / "run_cbc_baseline.py",
     }
 
+    def filter_bases(bases: list[str]) -> list[str]:
+        if not allow:
+            return bases
+        return [b for b in bases
+                if b in allow or any(b.startswith(a) for a in allow)]
+
     jobs: list[dict] = []
     if args.suite in ("industrial", "all"):
-        jobs.extend(industrial_jobs(Path(args.examples)))
+        for job in industrial_jobs(Path(args.examples)):
+            job["baselines"] = filter_bases(job["baselines"])
+            jobs.append(job)
     if args.suite in ("miplib", "all"):
         mdir = Path(args.miplib_dir)
         if not mdir.is_dir():
@@ -194,7 +206,7 @@ def main() -> int:
                 "path": mps,
                 "engine": "milp",
                 "kind": "milp",
-                "baselines": ["highs", "cbc"],
+                "baselines": filter_bases(["highs", "cbc"]),
             })
 
     outdir = Path(args.outdir)
@@ -264,8 +276,10 @@ def main() -> int:
 
     # Summary markdown
     n = len(rows)
-    sor_ok = sum(1 for r in rows if r["sor"].get("status") in
-                 ("Optimal", "Feasible"))
+    sor_opt = sum(1 for r in rows if r["sor"].get("status") == "Optimal")
+    sor_feasible = sum(1 for r in rows
+                       if r["sor"].get("status") == "Feasible")
+    sor_ok = sor_opt + sor_feasible
     agree_highs = sum(1 for r in rows if r["obj_agree"].get("highs") is True
                       or r["obj_agree"].get("highs-qp") is True)
     agree_cbc = sum(1 for r in rows if r["obj_agree"].get("cbc") is True)
@@ -277,9 +291,14 @@ def main() -> int:
                 f"{args.max_nodes}\n")
         f.write(f"- Baselines: HiGHS (external highspy), CBC (PuLP), "
                 f"HiGHS-QP for dispatch\n")
-        f.write(f"- SOR Optimal/Feasible: **{sor_ok}/{n}**\n")
-        f.write(f"- Obj agree vs HiGHS: **{agree_highs}** · vs CBC: "
-                f"**{agree_cbc}**\n\n")
+        f.write(f"- SOR incumbent coverage (Optimal + Feasible): **{sor_ok}/{n}**\n")
+        f.write(f"- SOR status split: **{sor_opt} Optimal** · "
+                f"**{sor_feasible} Feasible (not proved optimal)**\n")
+        f.write(f"- Exact objective agreement (relative tolerance 1e-3): "
+                f"HiGHS **{agree_highs}** · CBC **{agree_cbc}**\n")
+        f.write("- `Feasible` means a valid incumbent was found; it does not "
+                "claim global optimality. `None` means the reference was "
+                "time-limited or unavailable.\n\n")
         f.write("| Instance | kind | SOR | SOR obj | wall_s | HiGHS | "
                 "HiGHS obj | agree | CBC | CBC obj | agree |\n")
         f.write("|----------|------|-----|---------|-------:|-------|"

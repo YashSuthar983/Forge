@@ -158,6 +158,9 @@ def main() -> int:
     ap.add_argument("--sizes", default="S,M,L,XL",
                     help="comma list of tiers to run")
     ap.add_argument("--kinds", default="blend_lp,schedule_milp,dispatch_qp")
+    ap.add_argument("--baselines-only", default="",
+                    help="comma list; keep only matching baselines "
+                         "(prefix ok: 'highs' keeps highs + highs-qp)")
     ap.add_argument("--outdir-instances",
                     default=str(ROOT / "benchmarks" / "industrial-ladder"))
     ap.add_argument("-o", "--outdir", default=str(ROOT / "benchmarks" / "results"))
@@ -165,6 +168,7 @@ def main() -> int:
 
     wanted_sizes = {s.strip().upper() for s in args.sizes.split(",") if s.strip()}
     wanted_kinds = {k.strip() for k in args.kinds.split(",") if k.strip()}
+    allow = {x.strip() for x in args.baselines_only.split(",") if x.strip()}
 
     gen = ROOT / "build" / "sor_gen"
     exe = ROOT / "build" / "sor_solve"
@@ -189,8 +193,14 @@ def main() -> int:
     jsonl = outdir / f"industrial-perf-{stamp}.jsonl"
     md = outdir / f"industrial-perf-{stamp}.md"
 
-    jobs = [j for j in LADDER
-            if j[0] in wanted_sizes and j[1] in wanted_kinds]
+    jobs = []
+    for tier, kind, engine, gen_args, baselines in LADDER:
+        if tier not in wanted_sizes or kind not in wanted_kinds:
+            continue
+        if allow:
+            baselines = [b for b in baselines
+                         if b in allow or any(b.startswith(a) for a in allow)]
+        jobs.append((tier, kind, engine, gen_args, baselines))
 
     env = {
         "record": "env",

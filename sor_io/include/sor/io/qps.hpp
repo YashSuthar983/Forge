@@ -1,4 +1,4 @@
-// SOR — QPS reader (MPS + QUADOBJ). Diagonal Q only for the current QP engine.
+// SOR — QPS reader (MPS + QUADOBJ/QMATRIX/QSECTION).
 //
 // LAYER L2 — does not depend on engines. The CLI maps this into engines::QpProblem.
 #pragma once
@@ -13,7 +13,8 @@ namespace sor::io {
 
 struct QpsProblem {
     model::LpProblem linear;
-    std::vector<core::f64> q_diag;  // Q for obj = 1/2 x'Qx + c'x
+    std::vector<core::f64> q_diag;  // retained for diagonal fast-path clients
+    sparse::CsrMatrix q_matrix;     // full symmetric Q (both triangles)
 };
 
 struct QpsReadReport : MpsReadReport {
