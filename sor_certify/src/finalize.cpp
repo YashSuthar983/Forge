@@ -40,6 +40,7 @@ SolveResult finalize_result(RawResult raw, const ProofEvidence& ev) {
     r.dual_bound         = raw.dual_bound;
     r.x                  = std::move(raw.x);
     r.y                  = std::move(raw.y);
+    r.ray                = std::move(raw.ray);
     r.iterations         = raw.iterations;
     r.engine             = std::move(raw.engine);
     r.backend            = std::move(raw.backend);
@@ -52,12 +53,29 @@ SolveResult finalize_result(RawResult raw, const ProofEvidence& ev) {
     r.proof  = supported_level(ev);
     r.status = raw.proposed_status;
 
+    // Same rule as Status::Optimal below, applied to the Farkas certificate:
+    // an engine PROPOSES a ray, only this function may certify it, and only
+    // once it is independently re-verified against the unscaled model
+    // (ev.ray_violation, computed by farkas_violation() -- never the
+    // engine's own view of its termination). No ray, or one that doesn't
+    // clear the tolerance, leaves ray_certified false and r.ray cleared: an
+    // honest "infeasible, no proof" rather than a wrong claim.
+    if (r.status == Status::Infeasible && !r.ray.empty() &&
+        std::isfinite(ev.ray_violation) && ev.ray_violation <= ev.primal_feas_tol) {
+        r.ray_certified = true;
+    } else {
+        r.ray.clear();
+    }
+
     if (raw.proposed_status == Status::Optimal) {
         // LP needs ProvedOptimalFP (basis). Convex QP may claim Optimal at
-        // ProvedKKT. Anything weaker is demoted.
+        // ProvedKKT, and a complete branch-and-bound tree may claim Optimal at
+        // ProvedGlobalEpsilon when every relaxation bound is proved. Anything
+        // weaker is demoted.
         const bool strong_enough =
             r.proof >= ProofLevel::ProvedOptimalFP ||
-            r.proof == ProofLevel::ProvedKKT;
+            r.proof == ProofLevel::ProvedKKT ||
+            r.proof == ProofLevel::ProvedGlobalEpsilon;
         if (!strong_enough) {
             // The load-bearing rule of the whole codebase.
             r.status = (r.proof >= ProofLevel::FeasibleOnly) ? Status::Feasible

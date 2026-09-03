@@ -70,6 +70,15 @@ core::RawResult solve_qp_diag(const QpProblem& problem,
     const Index n = lp.n_cols();
     const Index m_all = lp.n_rows();
 
+    if (lp.maximize) {
+        raw.proposed_status = core::Status::Unsupported;
+        raw.termination_reason =
+            "qp_diag_as supports convex minimization only; maximizing an SPD quadratic is nonconvex";
+        diag.termination_reason = raw.termination_reason;
+        diag.total_ms = ms_since(t0);
+        return raw;
+    }
+
     if (static_cast<Index>(problem.q_diag.size()) != n) {
         raw.proposed_status = core::Status::Unsupported;
         raw.termination_reason = "q_diag length must equal n_cols";
@@ -221,6 +230,11 @@ core::RawResult solve_qp_diag(const QpProblem& problem,
             const f64 grad = Q[sz(j)] * x_fast[sz(j)] + c[sz(j)] +
                              acol[sz(j)] * yval;
             const f64 lo = lp.col_lo[sz(j)], hi = lp.col_hi[sz(j)];
+            // A fixed variable has both bound multipliers available, so any
+            // finite stationarity gradient can be balanced. Treating it as
+            // lower-bound-only rejected valid fixed-assignment QP subproblems
+            // and made MIQP enumeration skip the true optimum.
+            if (lo == hi) continue;
             if (std::isfinite(lo) && x_fast[sz(j)] <= lo + opts.feas_tol)
                 stat = std::max(stat, std::max(0.0, -grad));
             else if (std::isfinite(hi) && x_fast[sz(j)] >= hi - opts.feas_tol)
@@ -421,12 +435,15 @@ core::ProofEvidence qp_evidence(const QpDiagnostics& diag, const QpOptions& opts
     ev.has_basis = false;
     ev.max_primal_violation = diag.primal_residual;
     ev.max_dual_violation = diag.stationarity;
-    ev.gap_rel = 0.0;
+    ev.gap_rel = diag.used_general_path ? diag.gap_rel : 0.0;
     ev.primal_feas_tol = opts.feas_tol;
     ev.dual_feas_tol = opts.stationarity_tol;
-    ev.gap_tol = opts.stationarity_tol;
+    ev.gap_tol = opts.gap_tol;
     ev.checker_passed = diag.primal_residual <= opts.feas_tol &&
-                        diag.stationarity <= opts.stationarity_tol;
+                        diag.stationarity <= opts.stationarity_tol &&
+                        (!diag.used_general_path ||
+                         (diag.convexity_certified &&
+                          (!diag.gap_finite || diag.gap_rel <= opts.gap_tol)));
     if (ev.checker_passed)
         ev.claimed_level = core::ProofLevel::ProvedKKT;
     else

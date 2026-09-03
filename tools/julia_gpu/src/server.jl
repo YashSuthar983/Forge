@@ -39,21 +39,40 @@ function read_message(io::IO)
 end
 
 """
-    serve(; device="auto", input=stdin, output=stdout)
+    serve(; device="auto", warmup=true, input=stdin, output=stdout)
 
-Long-lived request loop. Prints `SORGPU_READY <device>` to stderr once the
-backend is selected so the C++ side can wait for startup instead of racing it
-(Julia's JIT warmup is seconds, not milliseconds).
+Long-lived request loop. Prints startup phase timings then
+`SORGPU_READY <device>` to stderr so the C++ side can wait for startup instead
+of racing it (Julia's JIT warmup is seconds, not milliseconds).
+
+Pass `warmup=false` (CLI `--no-warmup`) only when measuring first-compile cost
+via `bench_overhead`. Production always warms: that is the chosen path after
+the C++→Julia overhead bench (pay JIT once at READY, not on the first solve).
 """
 function serve(; device::AbstractString = "auto",
+               warmup::Bool = true,
                input::IO = stdin, output::IO = stdout)
-    dev = select_device(device)
+    t_boot = time_ns()
+    local select_ms
+    local dev
+    select_ms = @elapsed(dev = select_device(device)) * 1e3
     state = ServerState(dev)
 
-    # Warm up the JIT so the first real request is not paying compile time and
-    # skewing the timing table.
-    _warmup!(state)
+    warmup_ms = 0.0
+    if warmup
+        warmup_ms = @elapsed(_warmup!(state)) * 1e3
+    end
+    ready_ms = (time_ns() - t_boot) / 1.0e6
 
+    # Machine-readable phases for the C++ overhead bench (stderr only).
+    println(stderr, "SORGPU_TIMING " * JSON3.write(Dict(
+        "select_device_ms" => select_ms,
+        "warmup_ms" => warmup_ms,
+        "ready_ms" => ready_ms,
+        "warmup_enabled" => warmup,
+        "device" => dev.name,
+        "accelerated" => dev.accelerated,
+    )))
     println(stderr, "$READY_MARKER $(dev.name) accelerated=$(dev.accelerated) " *
                     "julia=$(VERSION) threads=$(Threads.nthreads())")
     flush(stderr)
@@ -77,12 +96,15 @@ end
 """
     _warmup!(state)
 
-Runs one tiny instance of every kernel so KernelAbstractions compiles them
-before any measured call. Failures are logged, never fatal.
+Production path: compile every KernelAbstractions kernel AND specialize the
+JSON `handle` dispatch before `SORGPU_READY`. That way the C++ caller's first
+real RPC is not paying ~2s of Julia method specialize on top of kernel JIT.
+
+`--no-warmup` is measurement-only (see `bench_overhead`).
 """
 function _warmup!(state::ServerState)
     try
-        # 2x2 identity-ish CSR
+        # 2x2 identity-ish CSR — kernel compile
         pat, _, _ = build_pattern(state.dev, 2, 2, [0, 1, 2], [0, 1])
         v, _, _   = to_device(state.dev, [1.0, 1.0])
         tv        = dev_zeros(state.dev, Float64, 2)
@@ -97,6 +119,45 @@ function _warmup!(state::ServerState)
         X, _, _ = to_device(state.dev, [1.0, 2.0, 3.0, 4.0])
         Y = dev_zeros(state.dev, Float64, 4)
         spmv_batched!(state.dev, Y, pat, v, X, 2)
+
+        # Protocol specialize — same ops the C++ backend hits first.
+        # Responses are discarded; this never touches stdin/stdout.
+        handle(state, Dict{String,Any}("op" => "ping", "id" => 0))
+        handle(state, Dict{String,Any}(
+            "op" => "upload_pattern", "id" => 0,
+            "n_rows" => 2, "n_cols" => 2,
+            "row_ptr" => [0, 1, 2], "col_idx" => [0, 1]))
+        handle(state, Dict{String,Any}(
+            "op" => "upload_vals", "id" => 0,
+            "pattern_id" => 1, "vals" => [1.0, 1.0]))
+        handle(state, Dict{String,Any}(
+            "op" => "spmv", "id" => 0,
+            "pattern_id" => 1, "vals_id" => 1, "x" => [1.0, 1.0]))
+        handle(state, Dict{String,Any}(
+            "op" => "spmv_t", "id" => 0,
+            "pattern_id" => 1, "vals_id" => 1, "x" => [1.0, 1.0]))
+        handle(state, Dict{String,Any}(
+            "op" => "project_box", "id" => 0,
+            "x" => [0.5, 0.5], "lo" => [0.0, 0.0], "hi" => [1.0, 1.0]))
+        handle(state, Dict{String,Any}(
+            "op" => "dot", "id" => 0,
+            "a" => [1.0, 2.0], "b" => [3.0, 4.0]))
+        handle(state, Dict{String,Any}(
+            "op" => "free", "id" => 0,
+            "pattern_id" => 1, "vals_id" => 1))
+
+        # Frame encode/decode specialize (this is what made first ping ~2s).
+        buf_out = IOBuffer()
+        write_message(buf_out, Dict{String,Any}("ok" => true, "pong" => true, "id" => 0))
+        frame = take!(buf_out)
+        buf_in = IOBuffer(frame)
+        read_message(buf_in)
+        # End-to-end: write a ping frame, read it, handle, write response.
+        req_buf = IOBuffer()
+        write_message(req_buf, Dict{String,Any}("op" => "ping", "id" => 0))
+        req = read_message(IOBuffer(take!(req_buf)))
+        resp, _ = handle(state, req)
+        write_message(IOBuffer(), resp)
     catch err
         println(stderr, "warmup failed (continuing): $(sprint(showerror, err))")
     end

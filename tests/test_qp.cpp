@@ -69,10 +69,98 @@ void test_dispatch_qp() {
     CHECK(diag.stationarity < 1e-6);
 }
 
+// General sparse Hessian plus a one-sided linear row:
+// min .5 x'[[2,1],[1,2]]x - 3x - 3y, x+y >= 3, 0<=x,y<=5.
+// Symmetry gives the unique solution (1.5, 1.5).
+void test_sparse_off_diagonal_inequality_qp() {
+    QpProblem qp;
+    qp.linear.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
+    qp.linear.c = {-3.0, -3.0};
+    qp.linear.row_lo = {3.0};
+    qp.linear.row_hi = {sor::model::kInf};
+    qp.linear.col_lo = {0.0, 0.0};
+    qp.linear.col_hi = {5.0, 5.0};
+    qp.q_matrix = sor::sparse::from_triplets(
+        2, 2, {0, 0, 1, 1}, {0, 1, 0, 1}, {2.0, 1.0, 1.0, 2.0});
+
+    QpOptions opts;
+    opts.feas_tol = opts.stationarity_tol = opts.gap_tol = 1e-7;
+    QpDiagnostics diag;
+    auto raw = sor::engines::solve_qp(qp, opts, diag);
+    const auto ev = sor::engines::qp_evidence(diag, opts);
+    const auto r = sor::certify::finalize_result(std::move(raw), ev);
+    CHECK(r.status == Status::Optimal);
+    CHECK(r.proof == ProofLevel::ProvedKKT);
+    CHECK(diag.used_general_path);
+    CHECK(diag.convexity_certified);
+    CHECK_NEAR(r.x[0], 1.5, 2e-5);
+    CHECK_NEAR(r.x[1], 1.5, 2e-5);
+    CHECK(diag.gap_rel <= opts.gap_tol);
+}
+
+void test_positive_semidefinite_qp() {
+    QpProblem qp;
+    qp.linear.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
+    qp.linear.c = {0.0, 0.0};
+    qp.linear.row_lo = {2.0};
+    qp.linear.row_hi = {2.0};
+    qp.linear.col_lo = {0.0, 0.0};
+    qp.linear.col_hi = {3.0, 3.0};
+    qp.q_matrix = sor::sparse::from_triplets(
+        2, 2, {0, 0, 1, 1}, {0, 1, 0, 1}, {1.0, -1.0, -1.0, 1.0});
+    QpOptions opts;
+    opts.feas_tol = opts.stationarity_tol = opts.gap_tol = 1e-7;
+    QpDiagnostics diag;
+    auto raw = sor::engines::solve_qp(qp, opts, diag);
+    const auto r = sor::certify::finalize_result(
+        std::move(raw), sor::engines::qp_evidence(diag, opts));
+    CHECK(r.status == Status::Optimal);
+    CHECK_NEAR(r.x[0], 1.0, 2e-5);
+    CHECK_NEAR(r.x[1], 1.0, 2e-5);
+}
+
+void test_indefinite_q_is_refused() {
+    QpProblem qp;
+    qp.linear.A = sor::sparse::from_triplets(0, 2, {}, {}, {});
+    qp.linear.c = {0.0, 0.0};
+    qp.linear.col_lo = {-1.0, -1.0};
+    qp.linear.col_hi = {1.0, 1.0};
+    qp.q_matrix = sor::sparse::from_triplets(
+        2, 2, {0, 0, 1, 1}, {0, 1, 0, 1}, {1.0, 2.0, 2.0, 1.0});
+    QpOptions opts;
+    QpDiagnostics diag;
+    const auto raw = sor::engines::solve_qp(qp, opts, diag);
+    CHECK(raw.proposed_status == Status::Unsupported);
+    CHECK(!diag.convexity_certified);
+}
+
+void test_general_qp_with_free_variables() {
+    QpProblem qp;
+    qp.linear.A = sor::sparse::from_triplets(0, 2, {}, {}, {});
+    qp.linear.c = {-1.0, -2.0};
+    qp.linear.col_lo = {-sor::model::kInf, -sor::model::kInf};
+    qp.linear.col_hi = {sor::model::kInf, sor::model::kInf};
+    qp.q_matrix = sor::sparse::from_triplets(2, 2, {0, 1}, {0, 1}, {1.0, 1.0});
+    QpOptions opts;
+    opts.feas_tol = opts.stationarity_tol = opts.gap_tol = 1e-7;
+    QpDiagnostics diag;
+    auto raw = sor::engines::solve_qp(qp, opts, diag);
+    const auto r = sor::certify::finalize_result(
+        std::move(raw), sor::engines::qp_evidence(diag, opts));
+    CHECK(r.status == Status::Optimal);
+    CHECK_NEAR(r.x[0], 1.0, 2e-5);
+    CHECK_NEAR(r.x[1], 2.0, 2e-5);
+    CHECK(!diag.gap_finite);  // KKT natural map is the certificate in this case.
+}
+
 }  // namespace
 
 int main() {
     test_box_qp();
     test_dispatch_qp();
-    return 0;
+    test_sparse_off_diagonal_inequality_qp();
+    test_positive_semidefinite_qp();
+    test_indefinite_q_is_refused();
+    test_general_qp_with_free_variables();
+    return sor::test::finish("test_qp");
 }

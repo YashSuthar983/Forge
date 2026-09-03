@@ -4,6 +4,7 @@
 #pragma once
 
 #include "sor/core/result.hpp"
+#include "sor/la/lu.hpp"
 #include "sor/model/lp.hpp"
 
 #include <cstdint>
@@ -67,6 +68,23 @@ struct SimplexOptions {
     // this bound. This catches numerical growth earlier than an eta-count
     // trigger while leaving ordinary pivots on the cheap update path.
     f64 refactor_multiplier_limit = 1e6;
+
+    // Basis update representation (sor/la/lu.hpp). ProductForm is the
+    // default; ForrestTomlin re-triangularizes L/U in place instead of
+    // growing an eta file, verified against a dense-reconstruction
+    // differential suite (tests/test_lu.cpp) but not yet measured against
+    // ProductForm on Netlib/MIPLIB, so it stays opt-in until that gate runs.
+    la::UpdateMethod update_method = la::UpdateMethod::ProductForm;
+    // ForrestTomlin only: force a refactor once a bump grows past this many
+    // pivot-steps (0 disables the trigger). See BasisFactor::update_ft().
+    Index bump_width_max = 0;
+    // Work-based refactor trigger (cuOpt PR #1043, 2026): force a refactor
+    // once BasisFactor::work_since_factor() exceeds this many multiples of
+    // factor_nnz -- i.e. once cumulative FTRAN/BTRAN work since the last
+    // factorization has cost as much as a fresh one would. Applies to
+    // EITHER update representation. 0 disables it (default: unmeasured
+    // against Netlib/MIPLIB, so off until it has a gate to clear).
+    f64 refactor_work_ratio = 0.0;
 
     // Partial pricing was removed from both engines. It cannot pay for itself
     // here: the primal already touches every nonbasic column each iteration to
@@ -145,6 +163,17 @@ struct SimplexDiagnostics {
     f64 dual_objective   = 0.0;
     f64 gap_rel          = 0.0;
     bool dual_bound_finite = false;
+
+    // Farkas infeasibility certificate (Chvátal 1983 Ch.8), only meaningful
+    // when the engine proposes Status::Infeasible. raw.ray (row-indexed, in
+    // the ORIGINAL unscaled row space) is a candidate y; ray_violation is
+    // max(0, U - L) recomputed independently against the unscaled model,
+    // where L = min_x (A'y)'x over the column box and U = max_s y's over the
+    // row box -- L > U proves infeasibility, so ray_violation <= tol means
+    // the certificate holds. ray_violation stays at its default (kPosInf,
+    // i.e. "not proved") whenever no finite certificate exists (a column or
+    // row needed an infinite bound), which is an honest gap, not a bug.
+    f64 ray_violation = core::kPosInf;
 
     Index  basis_dimension = 0;
     core::Offset factor_nnz = 0;

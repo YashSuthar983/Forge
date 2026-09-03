@@ -1,6 +1,7 @@
 #include "sor/engines/dual_simplex.hpp"
 #include "sor/engines/dual_bfrt.hpp"
 #include "sor/engines/dual_edge_weights.hpp"
+#include "sor/engines/farkas.hpp"
 
 // Ruiz equilibration is declared in pdhg.hpp and defined in pdhg.cpp. Both
 // engines want it and it is the same algorithm; a third translation unit for one
@@ -69,10 +70,22 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
     const Index m  = p.n_rows();
     const Index ns = p.n_cols();
     const Index nt = ns + m;
-    // Exact DSE rebuilds one BTRAN per basis row after every pivot. Keep the
-    // opt-in path bounded to genuinely small bases; larger models use Devex
-    // rather than turning pricing into an O(m) solve storm.
-    const bool use_exact_dse = (opts.pricing == SimplexPricing::DSE && m <= 64);
+    // Exact DSE (Forrest & Goldfarb 1992): weights are seeded via an
+    // O(m)-BTRAN rebuild (reset_weights(), on the first factorization, after
+    // a basis repair, AND on every routine refactorization -- the periodic
+    // resync bounds numerical drift in the incremental update below; without
+    // it, woodw.mps spun out to 160k+ iterations instead of converging in
+    // ~2000) and maintained per pivot with one extra FTRAN each -- see
+    // apply_pivot's use_exact_dse branch. No size cap needed anymore (the
+    // old approach rebuilt from scratch after EVERY pivot, hence the old
+    // m <= 64 cap) -- but measured HONESTLY on Netlib this is NOT a free
+    // win: iteration counts drop ~3% in aggregate and 3 instances that
+    // NumericalFailure under Devex succeed under DSE, but the extra FTRAN
+    // (plus the periodic O(m) resync) makes total WALL TIME ~2.3x Devex's
+    // across the suite. Left opt-in (default stays Devex) for that reason --
+    // useful for numerically fragile instances, not a default-worthy speed
+    // win as currently measured.
+    const bool use_exact_dse = (opts.pricing == SimplexPricing::DSE);
 
     // ---- 3. the augmented system [A | -I] --------------------------------
     const auto ac = sparse::to_csc(p.A);
@@ -248,6 +261,10 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
     std::vector<f64>    rhs(sz(m), 0.0), y(sz(m), 0.0), alpha(sz(m), 0.0);
     std::vector<f64>    cB(sz(m), 0.0), rho(sz(m), 0.0);
     std::vector<f64>    col_w(sz(nt), 1.0), row_w(sz(m), 1.0);
+    // Exact DSE incremental update workspace: tau = B^-1 * rho, one extra
+    // FTRAN per pivot. See the use_exact_dse branch in apply_pivot's weight
+    // update below.
+    std::vector<f64>    tau(sz(m), 0.0);
     // Dual ratio-test candidates: (column, pivot-row entry, reduced cost) in
     // one fused pass. The old code computed aj and d_j twice per iteration
     // (pass 1 for t_max, pass 2 for pivot selection) -- four full nnz sweeps
@@ -469,11 +486,24 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
         diag.factor_ms += ms_since(t0);
         recompute_xB();
         recompute_pi();
-        // Preserve Devex/DSE history across a numerical refactorization. The
+        // Preserve Devex history across a numerical refactorization. The
         // basis is unchanged, so throwing away edge weights every eta recycle
         // creates avoidable extra pivots. Only initialize on the first factor
         // or after a singular-basis repair changes the basis itself.
-        if (diag.refactorizations == 1 || diag.basis_repairs != repairs_before)
+        //
+        // Exact DSE is different: unlike Devex's deliberately-approximate
+        // weights, its per-pivot incremental update (apply_pivot's
+        // use_exact_dse branch) is only exact in exact arithmetic. Errors in
+        // the r*r*wr / -2*r*tau terms compound multiplicatively pivot over
+        // pivot, and on a long run this is not hypothetical: woodw.mps spun
+        // out to 160k+ iterations and a time-limit Interrupted (Devex solves
+        // it in 2756) before this resync was added. Refactorizations already
+        // happen periodically (refactor_interval), so resyncing exact DSE
+        // weights there bounds the drift to one interval's worth of pivots
+        // for one extra O(m)-BTRAN rebuild -- cheap amortized over an entire
+        // refactor_interval, unlike the old per-PIVOT rebuild this replaced.
+        if (diag.refactorizations == 1 || diag.basis_repairs != repairs_before ||
+            use_exact_dse)
             reset_weights();
         expand_eps = expand_start;
         if (phase == 2 && dual_infeasibility() > 0.0) {
@@ -553,20 +583,48 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
             const f64 leaving_col_w = wq / ap2;
             col_w[sz(vl)] = std::isfinite(leaving_col_w)
                                 ? std::max(1.0, leaving_col_w) : 1.0;
-            // Dual Devex row weights (Forrest & Goldfarb):
-            //   w_r <- max(1, w_r / alpha_rq^2)
-            //   w_i <- max(w_i, (alpha_iq / alpha_rq)^2 * w_r)
-            // The previous version set w_r to max(1, ||rho||^2) -- the exact
-            // steepest-edge norm of the OLD basis. That is a different quantity,
-            // it drops the / alpha_rq^2, and feeding it into the w_i update
-            // inflated every weight. The result was neither Devex nor DSE.
             const f64 wr = row_w[sz(leave)];
-            for (Index i = 0; i < m; ++i) {
-                if (i == leave) continue;
-                const f64 r = alpha[sz(i)] / ap;
-                const f64 candidate = r * r * wr;
-                if (std::isfinite(candidate))
-                    row_w[sz(i)] = std::max(row_w[sz(i)], candidate);
+            if (use_exact_dse) {
+                // Exact dual steepest-edge update (Forrest & Goldfarb 1992).
+                // gamma_i = ||(B^-1)_i,:||^2 (row i of the basis inverse).
+                // A single-column basis replacement updates B^-1 by the usual
+                // elementary row operation, (B_new^-1)_i,: = (B_old^-1)_i,: -
+                // (alpha_i/alpha_r)(B_old^-1)_r,: for i != r, and dividing row
+                // r by alpha_r. Squaring that and expanding the inner product
+                // gives:
+                //   gamma_i <- gamma_i - 2(alpha_i/alpha_r) tau_i
+                //                      + (alpha_i/alpha_r)^2 gamma_r      (i != r)
+                //   gamma_r <- gamma_r / alpha_r^2
+                // where tau_i = <(B_old^-1)_i,:, (B_old^-1)_r,:> =
+                // (B_old^-1 * rho)_i and rho = B_old^-T e_r is already sitting
+                // in `rho` (computed above to build the pivotal row) -- so
+                // this costs exactly one extra FTRAN per pivot, not the O(m)
+                // BTRANs a full rebuild needs.
+                tau = rho;
+                do_ftran(tau);
+                for (Index i = 0; i < m; ++i) {
+                    if (i == leave) continue;
+                    const f64 r = alpha[sz(i)] / ap;
+                    const f64 candidate =
+                        row_w[sz(i)] - 2.0 * r * tau[sz(i)] + r * r * wr;
+                    if (std::isfinite(candidate))
+                        row_w[sz(i)] = std::max(candidate, 1e-10);
+                }
+            } else {
+                // Dual Devex row weights (Forrest & Goldfarb):
+                //   w_r <- max(1, w_r / alpha_rq^2)
+                //   w_i <- max(w_i, (alpha_iq / alpha_rq)^2 * w_r)
+                // The previous version set w_r to max(1, ||rho||^2) -- the exact
+                // steepest-edge norm of the OLD basis. That is a different quantity,
+                // it drops the / alpha_rq^2, and feeding it into the w_i update
+                // inflated every weight. The result was neither Devex nor DSE.
+                for (Index i = 0; i < m; ++i) {
+                    if (i == leave) continue;
+                    const f64 r = alpha[sz(i)] / ap;
+                    const f64 candidate = r * r * wr;
+                    if (std::isfinite(candidate))
+                        row_w[sz(i)] = std::max(row_w[sz(i)], candidate);
+                }
             }
             const f64 leaving_w = wr / ap2;
             row_w[sz(leave)] = std::isfinite(leaving_w)
@@ -583,8 +641,14 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
         const bool unstable = opts.refactor_multiplier_limit > 0.0 &&
                                mult > opts.refactor_multiplier_limit;
         const bool eta_full = factor.needs_refactor(opts.refactor_interval,
-                                                    opts.refactor_eta_ratio);
-        if (unstable || !factor.update(leave, alpha, opts.pivot_tol) || eta_full ||
+                                                    opts.refactor_eta_ratio,
+                                                    opts.bump_width_max,
+                                                    opts.refactor_work_ratio);
+        const bool updated =
+            opts.update_method == la::UpdateMethod::ForrestTomlin
+                ? factor.update_ft(leave, alpha, la::LuOptions{}, opts.pivot_tol)
+                : factor.update(leave, alpha, opts.pivot_tol);
+        if (unstable || !updated || eta_full ||
             ++since_refactor >= opts.refactor_interval) {
             do_factorize();
             since_refactor = 0;
@@ -602,6 +666,10 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
     core::Status status = core::Status::NotSolved;
     std::string reason;
     int since_refactor = 0;
+    // Farkas certificate (row-indexed, ORIGINAL unscaled row space), filled
+    // in at the primal-infeasible-with-no-entering-column termination below.
+    std::vector<f64> farkas_ray;
+    f64 farkas_ray_violation = core::kPosInf;
 
     // ---- stall detection --------------------------------------------------
     // The dual simplex drives the total primal infeasibility monotonically to
@@ -975,6 +1043,19 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
                 if (since_refactor > 0) { do_factorize(); since_refactor = 0; continue; }
                 status = core::Status::Infeasible;
                 reason = "primal-infeasible basic with no dual-feasible entering column";
+                // Farkas certificate: `rho` (already B^-T e_leave, computed
+                // above for the pivotal row) times `srow` gives d_j = srow *
+                // prow[j] for every column j -- exactly the quantity the
+                // eligibility test above just found had the WRONG sign for
+                // EVERY candidate, which is precisely the Farkas sign
+                // condition. Unscale into original row space (same transform
+                // as the final `yout`, since `rho` is a BTRAN output too),
+                // then let farkas_violation() independently confirm it
+                // against the unscaled model rather than trust this derivation.
+                farkas_ray.assign(sz(m), 0.0);
+                for (Index i = 0; i < m; ++i)
+                    farkas_ray[sz(i)] = srow * rho[sz(i)] * scaling.row_scale[sz(i)];
+                farkas_ray_violation = farkas_violation(pmin, farkas_ray);
                 break;
             }
 
@@ -1025,8 +1106,11 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
 
         // Captured BEFORE apply_pivot, which overwrites basis[leave] with q.
         const Index leave_var = (leave >= 0) ? basis[sz(leave)] : -1;
+        // apply_pivot's use_exact_dse branch above already updates row_w
+        // incrementally (one extra FTRAN), so unlike before there is no
+        // O(m)-BTRAN full reset_weights() call needed here every pivot --
+        // that was the entire reason exact DSE was capped to m <= 64.
         const bool was_flip = apply_pivot(q, qdir, t_step, leave);
-        if (use_exact_dse && !was_flip) reset_weights();
         if (!was_flip) {
             // Incremental duals: pi' = pi + (d_q / alpha_rq) * rho makes the
             // entering column's reduced cost exactly zero, and the same scalar
@@ -1203,6 +1287,8 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
     raw.x = std::move(x);
     raw.y.resize(sz(m));
     for (Index i = 0; i < m; ++i) raw.y[sz(i)] = sense * yout[sz(i)];
+    if (status == core::Status::Infeasible && !farkas_ray.empty())
+        raw.ray = std::move(farkas_ray);
     raw.objective  = diag.primal_objective;
     raw.dual_bound = diag.dual_objective;
     raw.iterations = iter;
@@ -1210,6 +1296,7 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
     raw.backend    = "cpu";
     raw.proposed_status = status;
     raw.termination_reason = reason;
+    diag.ray_violation = farkas_ray_violation;
 
     switch (status) {
         case core::Status::Optimal:

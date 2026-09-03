@@ -343,6 +343,38 @@ void test_update_rejects_tiny_pivot() {
     check_solves(b, f, "after refused update", 1e-12);
 }
 
+// Work-based refactor trigger (cuOpt PR #1043, 2026): work_since_factor()
+// accumulates across ftran/btran calls, resets on factorize(), and
+// needs_refactor()'s work_ratio_max fires once it crosses factor_nnz times
+// the ratio -- and never fires when the ratio is 0 (disabled), regardless of
+// how much work has accumulated.
+void test_work_based_refactor_trigger() {
+    std::mt19937 rng(777u);
+    const Index m = 40;
+    ColMat b = random_basis(m, 0.1, rng);
+    BasisFactor f;
+    CHECK(f.factorize(m, b.col_ptr, b.row_idx, b.vals, LuOptions{}));
+    CHECK(f.work_since_factor() == 0);
+
+    std::vector<f64> rhs(static_cast<std::size_t>(m), 1.0);
+    for (int i = 0; i < 5; ++i) {
+        std::vector<f64> z = rhs;
+        f.ftran(z);
+    }
+    const Offset work_after = f.work_since_factor();
+    CHECK(work_after > 0);
+    CHECK(!f.needs_refactor(0, 0.0, 0, 0.0));  // disabled: never fires
+
+    const f64 tiny_ratio = 1e-9;  // guaranteed below by work_after > 0
+    CHECK(f.needs_refactor(0, 0.0, 0, tiny_ratio));
+
+    const f64 huge_ratio = 1e12;  // guaranteed not reached
+    CHECK(!f.needs_refactor(0, 0.0, 0, huge_ratio));
+
+    CHECK(f.factorize(m, b.col_ptr, b.row_idx, b.vals, LuOptions{}));
+    CHECK(f.work_since_factor() == 0);  // reset by factorize()
+}
+
 void test_empty_basis() {
     BasisFactor f;
     std::vector<Offset> cp{0};
@@ -454,6 +486,162 @@ void test_hypersparse_unit_rhs() {
     }
 }
 
+// Forrest-Tomlin update, exactly the differential methodology as
+// test_product_form_update() above but through update_ft()'s dense bump
+// re-triangularization instead of an eta -- dense reconstruction, checked
+// after EVERY update. This is the check that caught the earlier FT attempt's
+// bug (see lu.hpp's file header): an in-place elimination without proper
+// cyclic permutation is invisible for a single update and only diverges
+// after several, so a "looks right once" spot check would have passed it.
+void test_ft_update() {
+    std::mt19937 rng(1234u);
+    const Index m = 60;
+    ColMat b = random_basis(m, 0.05, rng);
+
+    BasisFactor f;
+    CHECK(f.factorize(m, b.col_ptr, b.row_idx, b.vals, LuOptions{}));
+
+    std::uniform_real_distribution<f64> val(-2.0, 2.0);
+    int successes = 0;
+
+    for (int step = 0; step < 40; ++step) {
+        std::vector<Index> rows;
+        std::vector<f64> vs;
+        for (Index i = 0; i < m; ++i)
+            if (i % 7 == step % 7) { rows.push_back(i); vs.push_back(val(rng)); }
+        if (rows.empty()) continue;
+        vs[0] += 5.0;
+
+        std::vector<f64> alpha(static_cast<std::size_t>(m), 0.0);
+        for (std::size_t t = 0; t < rows.size(); ++t)
+            alpha[static_cast<std::size_t>(rows[t])] = vs[t];
+        f.ftran(alpha);
+
+        Index p = -1;
+        f64 best = 0.0;
+        for (Index i = 0; i < m; ++i)
+            if (std::fabs(alpha[static_cast<std::size_t>(i)]) > best) {
+                best = std::fabs(alpha[static_cast<std::size_t>(i)]);
+                p = i;
+            }
+        CHECK(p >= 0);
+        // A fixed bump column order (no column pivoting) can rarely miss a
+        // pivot ordering that a full refactor would find even though the
+        // resulting matrix is genuinely nonsingular (alpha[p] != 0
+        // guarantees that). That's an accepted, documented limitation, not
+        // a bug -- test_ft_rejects_tiny_pivot_untouched() below checks the
+        // factorization survives it. Just skip and keep going here.
+        if (!f.update_ft(p, alpha, LuOptions{})) continue;
+
+        ++successes;
+        b.set_col(p, rows, vs);
+        check_solves(b, f, ("ft update step " + std::to_string(step)).c_str(), 1e-6);
+    }
+    ::sor::test::report(successes > 20, "ft update makes progress", __FILE__, __LINE__,
+                        "successes=" + std::to_string(successes));
+}
+
+// Differential: the SAME sequence of column replacements through update()
+// (product form) and update_ft() must produce basis factors that solve
+// identically, even though their internal representations (a growing eta
+// file vs. a re-triangularized U/L) are completely different.
+void test_ft_matches_product_form() {
+    std::mt19937 rng(5678u);
+    const Index m = 45;
+    ColMat b0 = random_basis(m, 0.06, rng);
+
+    BasisFactor fp, ff;  // product-form, forrest-tomlin
+    CHECK(fp.factorize(m, b0.col_ptr, b0.row_idx, b0.vals, LuOptions{}));
+    CHECK(ff.factorize(m, b0.col_ptr, b0.row_idx, b0.vals, LuOptions{}));
+
+    ColMat b = b0;
+    std::uniform_real_distribution<f64> val(-2.0, 2.0);
+    for (int step = 0; step < 30; ++step) {
+        std::vector<Index> rows;
+        std::vector<f64> vs;
+        for (Index i = 0; i < m; ++i)
+            if (i % 5 == step % 5) { rows.push_back(i); vs.push_back(val(rng)); }
+        if (rows.empty()) continue;
+        vs[0] += 4.0;
+
+        std::vector<f64> aq(static_cast<std::size_t>(m), 0.0);
+        for (std::size_t t = 0; t < rows.size(); ++t)
+            aq[static_cast<std::size_t>(rows[t])] = vs[t];
+
+        // Both factorizations currently represent the SAME matrix b, so
+        // FTRAN of the same incoming column against either picks the same
+        // leaving slot.
+        std::vector<f64> alpha = aq;
+        fp.ftran(alpha);
+        Index p = -1;
+        f64 best = 0.0;
+        for (Index i = 0; i < m; ++i)
+            if (std::fabs(alpha[static_cast<std::size_t>(i)]) > best) {
+                best = std::fabs(alpha[static_cast<std::size_t>(i)]);
+                p = i;
+            }
+        CHECK(p >= 0);
+
+        std::vector<f64> alpha_ff = aq;
+        ff.ftran(alpha_ff);
+
+        const bool ok_p = fp.update(p, alpha);
+        const bool ok_f = ff.update_ft(p, alpha_ff, LuOptions{});
+        if (!ok_p || !ok_f) continue;  // nothing to compare if either declines
+
+        b.set_col(p, rows, vs);
+        check_solves(b, fp, ("diff product-form step " + std::to_string(step)).c_str(), 1e-6);
+        check_solves(b, ff, ("diff forrest-tomlin step " + std::to_string(step)).c_str(), 1e-6);
+    }
+}
+
+// Adversarial bump widths: leave the FIRST slot (bump = the whole matrix,
+// the largest possible bump) and the LAST slot (bump width 1, the smallest).
+void test_ft_bump_extremes() {
+    std::mt19937 rng(999u);
+    for (const Index m : {5, 40}) {
+        ColMat b = random_basis(m, 0.1, rng);
+        BasisFactor f;
+        CHECK(f.factorize(m, b.col_ptr, b.row_idx, b.vals, LuOptions{}));
+
+        std::uniform_real_distribution<f64> val(-2.0, 2.0);
+        const std::vector<Index> leaving_slots = {0, m - 1};
+        for (const Index p : leaving_slots) {
+            std::vector<Index> rows;
+            std::vector<f64> vs;
+            for (Index i = 0; i < m; ++i) { rows.push_back(i); vs.push_back(val(rng)); }
+            vs[static_cast<std::size_t>(p)] += 5.0;
+
+            std::vector<f64> alpha(static_cast<std::size_t>(m), 0.0);
+            for (std::size_t t = 0; t < rows.size(); ++t)
+                alpha[static_cast<std::size_t>(rows[t])] = vs[t];
+            f.ftran(alpha);
+            if (std::fabs(alpha[static_cast<std::size_t>(p)]) < 1e-8) continue;  // unlucky draw
+
+            if (!f.update_ft(p, alpha, LuOptions{})) continue;
+            b.set_col(p, rows, vs);
+            check_solves(b, f, ("bump extreme p=" + std::to_string(p)).c_str(), 1e-6);
+            CHECK(f.current_bump_width() >= 1);
+        }
+    }
+}
+
+// Failure must leave the factorization exactly as usable as before: an
+// intentionally zero alpha[p] is refused up front (same contract as
+// update()), and the OLD matrix must still solve correctly afterwards.
+void test_ft_rejects_tiny_pivot_untouched() {
+    std::mt19937 rng(2024u);
+    const Index m = 5;
+    ColMat b = random_basis(m, 0.2, rng);
+    BasisFactor f;
+    CHECK(f.factorize(m, b.col_ptr, b.row_idx, b.vals, LuOptions{}));
+
+    std::vector<f64> alpha(static_cast<std::size_t>(m), 0.0);
+    alpha[2] = 1.0;  // leaving slot 0, but alpha[0] == 0
+    CHECK(!f.update_ft(0, alpha, LuOptions{}));
+    check_solves(b, f, "after refused ft update", 1e-9);
+}
+
 }  // namespace
 
 int main() {
@@ -466,5 +654,10 @@ int main() {
     test_zero_column();
     test_update_rejects_tiny_pivot();
     test_empty_basis();
+    test_ft_update();
+    test_ft_matches_product_form();
+    test_ft_bump_extremes();
+    test_ft_rejects_tiny_pivot_untouched();
+    test_work_based_refactor_trigger();
     return sor::test::finish("test_lu");
 }

@@ -10,6 +10,7 @@
 #include "sor/engines/simplex.hpp"
 #include "sor/io/mps.hpp"
 #include "sor/io/qps.hpp"
+#include "sor/io/solution.hpp"
 #include "sor/search/bab.hpp"
 
 #include <cstdio>
@@ -17,6 +18,7 @@
 #include <cstring>
 #include <cmath>
 #include <exception>
+#include <fstream>
 #include <string>
 
 namespace {
@@ -27,15 +29,28 @@ void usage() {
         "  --engine NAME    simplex (default) | pdhg | hpr | milp | qp\n"
         "  --q-diag LIST    comma-separated diagonal of Q (if not using .qps)\n"
         "  --backend NAME   cpu (default) | vulkan | julia_gpu\n"
-        "  --method NAME    auto | primal | dual   (simplex)\n"
+        "  --method NAME    auto | primal | dual   (simplex and MILP node LPs)\n"
         "  --max-iter N     iteration / node limit\n"
         "  --tol T          feasibility tolerance\n"
         "  --time-limit S   wall-clock limit in seconds\n"
         "  --no-scaling     skip Ruiz equilibration\n"
         "  --no-presolve    skip presolve (simplex/milp)\n"
         "  --verbose        iteration / node log\n"
-        "  --hpr-vanilla | --hpr-full\n",
+        "  --hpr-vanilla | --hpr-full\n"
+        "  --solution-out PATH   write a plain-text solution file for sor_check\n",
         stderr);
+}
+
+// No-op when `path` is empty (the common case: --solution-out wasn't given).
+void write_solution_out(const std::string& path, const sor::core::SolveResult& r) {
+    if (path.empty()) return;
+    std::ofstream out(path);
+    if (!out) {
+        std::fprintf(stderr, "warning: could not open '%s' for --solution-out\n",
+                     path.c_str());
+        return;
+    }
+    sor::io::write_solution(out, r);
 }
 
 void print_result(const sor::core::SolveResult& r) {
@@ -80,6 +95,7 @@ int main(int argc, char** argv) {
 
     std::string path, backend_name = "cpu", engine_name = "simplex";
     std::string q_diag_arg;
+    std::string solution_out;
     sor::engines::PdhgOptions pdhg_opts;
     sor::engines::HprOptions hpr_opts;
     sor::engines::SimplexOptions sx_opts;
@@ -145,6 +161,7 @@ int main(int argc, char** argv) {
             hpr_opts.use_restart = true;
             hpr_opts.use_halpern = true;
         }
+        else if (a == "--solution-out") solution_out = next("--solution-out");
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else if (!a.empty() && a[0] == '-') {
             std::fprintf(stderr, "error: unknown option '%s'\n", a.c_str());
@@ -199,14 +216,9 @@ int main(int argc, char** argv) {
                 auto loaded = sor::io::read_qps_file(path, rep, mps_opts);
                 for (const auto& w : rep.warnings)
                     std::fprintf(stderr, "warning: %s\n", w.c_str());
-                if (rep.has_off_diagonal) {
-                    std::fprintf(stderr,
-                                 "error: QPS has off-diagonal QUADOBJ; "
-                                 "diagonal QP engine only\n");
-                    return 3;
-                }
                 qp.linear = std::move(loaded.linear);
                 qp.q_diag = std::move(loaded.q_diag);
+                qp.q_matrix = std::move(loaded.q_matrix);
             } else {
                 std::fprintf(stderr,
                              "error: --engine qp needs a .qps file or --q-diag\n");
@@ -222,18 +234,22 @@ int main(int argc, char** argv) {
             std::printf("engine:            qp\n");
 
             sor::engines::QpOptions qopts;
+            qopts.max_iterations = pdhg_opts.max_iterations;
             qopts.verbose = sx_opts.verbose;
             if (tol_given) {
                 qopts.feas_tol = tol;
                 qopts.stationarity_tol = tol;
+                qopts.gap_tol = tol;
             }
             sor::engines::QpDiagnostics diag;
-            auto raw = sor::engines::solve_qp_diag(qp, qopts, diag);
+            auto raw = sor::engines::solve_qp(qp, qopts, diag);
             const auto ev = sor::engines::qp_evidence(diag, qopts);
             const auto r = sor::certify::finalize_result(std::move(raw), ev);
             print_result(r);
+            write_solution_out(solution_out, r);
             std::printf("stationarity:      %.3e\n", diag.stationarity);
             std::printf("max primal viol:   %.3e\n", diag.primal_residual);
+            std::printf("relative gap:      %.3e\n", diag.gap_rel);
             std::printf("iterations:        %llu\n",
                         static_cast<unsigned long long>(diag.iterations));
             std::printf("termination:       %s\n", r.termination_reason.c_str());
@@ -285,6 +301,7 @@ int main(int argc, char** argv) {
             const auto ev = sor::search::milp_evidence(diag, bab);
             const auto r = sor::certify::finalize_result(std::move(raw), ev);
             print_result(r);
+            write_solution_out(solution_out, r);
             if (std::isfinite(diag.dual_bound)) {
                 std::printf("dual bound:        %.10e\n", diag.dual_bound);
                 std::printf("mip gap:           %.3e\n", diag.gap_rel);
@@ -293,9 +310,48 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(diag.nodes));
             std::printf("lp solves:         %llu\n",
                         static_cast<unsigned long long>(diag.lp_solves));
+            std::printf("lp fallbacks:      %llu\n",
+                        static_cast<unsigned long long>(diag.lp_fallbacks));
+            std::printf("integer row roundings: %llu\n",
+                        static_cast<unsigned long long>(diag.integer_row_roundings));
+            std::printf("binary cover cuts: %llu\n",
+                        static_cast<unsigned long long>(diag.binary_cover_cuts));
+            std::printf("GMI cuts:          %llu in %d rounds\n",
+                        static_cast<unsigned long long>(diag.gmi_cuts_added),
+                        diag.cut_rounds);
+            std::printf("cut pool:          %llu inserted, %llu duplicate, "
+                        "%llu dominated, %llu parallel-rejected, %llu aged, "
+                        "%llu evicted\n",
+                        static_cast<unsigned long long>(diag.cut_pool_inserted),
+                        static_cast<unsigned long long>(diag.cut_pool_duplicates),
+                        static_cast<unsigned long long>(diag.cut_pool_dominated),
+                        static_cast<unsigned long long>(diag.cut_pool_parallel_rejections),
+                        static_cast<unsigned long long>(diag.cut_pool_aged_out),
+                        static_cast<unsigned long long>(diag.cut_pool_evicted));
+            std::printf("strong branch LPs: %llu  (pseudocost updates %llu)\n",
+                        static_cast<unsigned long long>(diag.strong_branch_solves),
+                        static_cast<unsigned long long>(diag.pseudocost_updates));
             std::printf("integer feas:      %llu  (heuristic hits %llu)\n",
                         static_cast<unsigned long long>(diag.integer_feasible),
                         static_cast<unsigned long long>(diag.heuristic_hits));
+            std::printf("LP repair:         %llu attempts, %llu hits\n",
+                        static_cast<unsigned long long>(diag.lp_repair_attempts),
+                        static_cast<unsigned long long>(diag.lp_repair_hits));
+            std::printf("feasibility pump:  %llu attempts, %llu hits\n",
+                        static_cast<unsigned long long>(diag.feasibility_pump_attempts),
+                        static_cast<unsigned long long>(diag.feasibility_pump_hits));
+            std::printf("integer dive:      %llu attempts, %llu LPs, %llu hits\n",
+                        static_cast<unsigned long long>(diag.integer_dive_attempts),
+                        static_cast<unsigned long long>(diag.integer_dive_lp_solves),
+                        static_cast<unsigned long long>(diag.integer_dive_hits));
+            std::printf("RENS:              %llu attempts, %llu LPs, %llu hits\n",
+                        static_cast<unsigned long long>(diag.rens_attempts),
+                        static_cast<unsigned long long>(diag.rens_lp_solves),
+                        static_cast<unsigned long long>(diag.rens_hits));
+            std::printf("integer neighborhood: %llu attempts, %llu trials, %llu hits\n",
+                        static_cast<unsigned long long>(diag.integer_neighborhood_attempts),
+                        static_cast<unsigned long long>(diag.integer_neighborhood_trials),
+                        static_cast<unsigned long long>(diag.integer_neighborhood_hits));
             std::printf("termination:       %s\n", r.termination_reason.c_str());
             std::printf("\ntiming (ms)\n");
             std::printf("  total            %10.3f\n", diag.total_ms);
@@ -312,6 +368,7 @@ int main(int argc, char** argv) {
             const auto ev = sor::engines::simplex_evidence(diag, sx_opts);
             const auto r = sor::certify::finalize_result(std::move(raw), ev);
             print_result(r);
+            write_solution_out(solution_out, r);
             if (diag.dual_bound_finite) {
                 std::printf("dual bound:        %.10e\n", r.dual_bound);
                 std::printf("rel gap:           %.3e\n", r.gap_rel);
@@ -346,6 +403,7 @@ int main(int argc, char** argv) {
             const auto ev = sor::engines::hpr_evidence(diag, hpr_opts);
             const auto r = sor::certify::finalize_result(std::move(raw), ev);
             print_result(r);
+            write_solution_out(solution_out, r);
             std::printf("max row violation: %.3e\n", r.max_primal_violation);
             std::printf("dual residual:     %.3e\n", r.max_dual_violation);
             std::printf("iterations:        %llu\n",
@@ -371,6 +429,7 @@ int main(int argc, char** argv) {
         const auto ev = sor::engines::pdhg_evidence(diag, pdhg_opts);
         const auto r = sor::certify::finalize_result(std::move(raw), ev);
         print_result(r);
+        write_solution_out(solution_out, r);
         std::printf("max row violation: %.3e\n", r.max_primal_violation);
         std::printf("dual residual:     %.3e\n", r.max_dual_violation);
         std::printf("iterations:        %llu\n",

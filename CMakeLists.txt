@@ -113,7 +113,8 @@ add_library(sor_model sor_model/src/lp.cpp)
 target_include_directories(sor_model PUBLIC sor_model/include)
 target_link_libraries(sor_model PUBLIC sor_sparse PRIVATE sor_flags)
 
-add_library(sor_io sor_io/src/mps.cpp sor_io/src/write_mps.cpp sor_io/src/qps.cpp)
+add_library(sor_io sor_io/src/mps.cpp sor_io/src/write_mps.cpp sor_io/src/qps.cpp
+                   sor_io/src/solution.cpp)
 target_include_directories(sor_io PUBLIC sor_io/include)
 target_link_libraries(sor_io PUBLIC sor_model PRIVATE sor_flags)
 
@@ -129,14 +130,19 @@ add_library(sor_engines
   sor_engines/src/dual_simplex.cpp
   sor_engines/src/dual_edge_weights.cpp
   sor_engines/src/dual_bfrt.cpp
+  sor_engines/src/farkas.cpp
   sor_engines/src/hpr.cpp
-  sor_engines/src/qp.cpp)
+  sor_engines/src/qp.cpp
+  sor_engines/src/qp_pdhcg.cpp
+  sor_engines/src/nlp.cpp)
 target_include_directories(sor_engines PUBLIC sor_engines/include)
 target_link_libraries(sor_engines PUBLIC sor_model sor_backend sor_la_cpu sor_presolve
                                   PRIVATE sor_flags)
 
 # ------------------------------ L5: search ---------------------------------
-add_library(sor_search sor_search/src/bab.cpp)
+add_library(sor_search sor_search/src/bab.cpp sor_search/src/cuts.cpp
+                       sor_search/src/propagate.cpp sor_search/src/miqp.cpp
+                       sor_search/src/minlp.cpp)
 target_include_directories(sor_search PUBLIC sor_search/include)
 target_link_libraries(sor_search PUBLIC sor_engines PRIVATE sor_flags)
 
@@ -152,6 +158,12 @@ target_link_libraries(sor_solve PRIVATE
 
 add_executable(sor_gen cli/sor_gen.cpp)
 target_link_libraries(sor_gen PRIVATE sor_io sor_flags)
+
+add_executable(sor_check cli/sor_check.cpp)
+target_link_libraries(sor_check PRIVATE sor_io sor_engines sor_flags)
+
+add_executable(sor_ext_demo cli/sor_ext_demo.cpp)
+target_link_libraries(sor_ext_demo PRIVATE sor_search sor_certify sor_flags)
 
 # --------------------------------- tests -----------------------------------
 enable_testing()
@@ -169,6 +181,7 @@ sor_add_test(test_lu                  sor_la_cpu)
 sor_add_test(test_backend_parity      sor_backend)
 sor_add_test(test_no_unproved_optimal sor_certify)
 sor_add_test(test_mps                 sor_io)
+sor_add_test(test_solution_io         sor_io)
 sor_add_test(test_pdhg                sor_engines sor_certify sor_io)
 sor_add_test(test_simplex             sor_engines sor_certify sor_io)
 sor_add_test(test_dual_edge_weights   sor_engines)
@@ -176,8 +189,17 @@ sor_add_test(test_presolve             sor_presolve)
 sor_add_test(test_hpr                 sor_engines sor_certify sor_io)
 sor_add_test(test_lp_device           sor_backend sor_engines sor_io)
 sor_add_test(test_milp                sor_search sor_certify sor_io)
+sor_add_test(test_cuts                sor_search sor_engines sor_certify sor_io)
+sor_add_test(test_propagate           sor_search)
 sor_add_test(test_qp                  sor_engines sor_certify)
 sor_add_test(test_qps                 sor_io sor_engines sor_certify)
+sor_add_test(test_ps_must             sor_search sor_engines sor_certify sor_io
+                                      sor_la_cpu)
+sor_add_test(test_extensions          sor_search sor_engines sor_certify)
+target_compile_definitions(test_ps_must PRIVATE
+  SOR_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+  SOR_BINARY_DIR="${CMAKE_CURRENT_BINARY_DIR}")
+add_dependencies(test_ps_must sor_solve sor_check sor_ext_demo)
 
 if(SOR_ENABLE_JULIA_GPU)
   sor_add_test(test_julia_gpu_parity sor_backend)

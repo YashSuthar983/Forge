@@ -64,7 +64,23 @@ top-level script without a self-include cycle. The entry point is
 
 ---
 
-## Setup
+## Overhead bench (C++ caller → Julia KA/AK)
+
+**Decision: keep warm start.** Production always runs kernel + protocol warmup
+before `SORGPU_READY` (C++ passes `--warmup`). Pay ~0.7–2s once at spawn; do not
+defer JIT onto the first solve. `--no-warmup` is for measuring compile cost only.
+
+```bash
+# from sor/
+g++ -O2 -std=c++20 -o tools/julia_gpu/bench_julia_gpu_overhead \
+    tools/julia_gpu/bench_cpp_caller.cpp
+./tools/julia_gpu/bench_julia_gpu_overhead --warmup    --device cpu --n 4096
+./tools/julia_gpu/bench_julia_gpu_overhead --no-warmup --device cpu --n 4096  # measure only
+```
+
+Latest numbers: `bench_overhead_results.jsonl`.
+
+---
 
 Requires Julia 1.10+. The development box used Julia 1.12.7.
 
