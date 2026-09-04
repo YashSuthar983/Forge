@@ -26,6 +26,7 @@ Verified against CMake targets, headers, and `compare-netlib-20260904-070105` / 
 | Vulkan SPIR-V (6 shaders) | **shipped** | `SOR_ENABLE_VULKAN=ON` default |
 | CUDA `LpDevice` | **stub** | `make_cuda_lp_device()` → `nullptr` |
 | MILP B&B + root GMI cuts | **shipped** | `sor_search/` — root cuts only |
+| AHL lattice reform | **opt-in** | `--lattice-reform`; exact LP-projection μ bounds + exact-equivalence direct-ship / LP-bound certification protocol; markshare applies, exact box + certification landed, full markshare1 not yet closed |
 | Convex QP (+ diagonal fast path) | **shipped** | `qp.cpp`, `qp_pdhcg.cpp` |
 | `finalize_result` gate | **shipped** | sole writer of `Status::Optimal` |
 | `sor_check` independent checker | **shipped** | CLI; not a VIPR verifier |
@@ -206,7 +207,8 @@ flowchart TD
 ```
 
 **Today:** cuts are **root-only** (`cuts.hpp`). Per-node cut extension needs basis-extension machinery not present.  
-**CLI:** `sor_solve --engine milp`.
+**CLI:** `sor_solve --engine milp`.  
+**Lattice (opt-in):** `--lattice-reform` runs AHL/LLL equality reduction before B&B (`lattice_reform.hpp`); μ bounds are the exact LP projection of the original box through `Q`; pure-integer systems ship directly (exact equivalence), forced-zero restrictions (e.g. markshare deviations) certify against the original LP bound or fall back to a full re-solve; postsolve maps μ→x. Needed for market-split; not yet enough alone for MIPLIB markshare Optimal within practical time budgets.
 
 ### 3.4 Convex QP
 
@@ -267,7 +269,7 @@ Only `finalize_result()` may set `Optimal`, and only with sufficient proof + `ch
 | MPS/QPS | `sor_io/include/sor/io/{mps,qps,solution}.hpp` |
 | Presolve | `sor_presolve/include/sor/presolve/presolve.hpp` |
 | Engines | `sor_engines/include/sor/engines/*.hpp` |
-| Search | `sor_search/include/sor/search/{bab,cuts,propagate}.hpp` |
+| Search | `sor_search/include/sor/search/{bab,cuts,propagate,lattice_reform}.hpp` |
 | Gate | `sor_certify/include/sor/certify/finalize.hpp` |
 
 ### Update methods (`lu.hpp`)
