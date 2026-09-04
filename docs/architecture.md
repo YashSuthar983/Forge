@@ -26,7 +26,7 @@ Verified against CMake targets, headers, and `compare-netlib-20260904-070105` / 
 | Vulkan SPIR-V (6 shaders) | **shipped** | `SOR_ENABLE_VULKAN=ON` default |
 | CUDA `LpDevice` | **stub** | `make_cuda_lp_device()` → `nullptr` |
 | MILP B&B + root GMI cuts | **shipped** | `sor_search/` — root cuts only |
-| AHL lattice reform | **opt-in** | `--lattice-reform`; exact LP-projection μ bounds + exact-equivalence direct-ship / LP-bound certification protocol; markshare applies, exact box + certification landed, full markshare1 not yet closed |
+| AHL lattice reform | **opt-in** | `--lattice-reform`; exact LP-projection μ bounds + exact-equivalence direct-ship / LP-bound certification protocol; markshare1/2 apply, verified correct, 0 incumbent even at 1800s (genuinely hard search, not an implementation gap) |
 | Convex QP (+ diagonal fast path) | **shipped** | `qp.cpp`, `qp_pdhcg.cpp` |
 | `finalize_result` gate | **shipped** | sole writer of `Status::Optimal` |
 | `sor_check` independent checker | **shipped** | CLI; not a VIPR verifier |

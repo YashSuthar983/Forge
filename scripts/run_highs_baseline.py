@@ -32,6 +32,9 @@ def main() -> int:
     h = highspy.Highs()
     h.setOptionValue("output_flag", False)
     h.setOptionValue("time_limit", args.time_limit)
+    # SOR's current simplex is serial. Make the external oracle's resource
+    # budget explicit rather than depending on a version-specific default.
+    h.setOptionValue("threads", 1)
     out["version"] = str(h.version())
 
     try:

@@ -710,6 +710,9 @@ core::RawResult solve_dual_simplex_prepared(
 
     // ---- 6. iterate ------------------------------------------------------
     std::uint64_t iter = 0;
+    const auto resync_interval = static_cast<std::uint64_t>(
+        std::max(0, opts.dual_resync_interval));
+    std::uint64_t next_resync = resync_interval;
     const std::uint64_t max_iter =
         opts.max_iterations != 0
             ? opts.max_iterations
@@ -1206,8 +1209,20 @@ core::RawResult solve_dual_simplex_prepared(
         if (phase == 1) ++diag.phase1_iterations;
         else            ++diag.phase2_iterations;
 
-        if (opts.verbose && (iter % 500) == 0) {
+        // Incremental reduced costs are cheap, but long degenerate runs can
+        // accumulate enough roundoff to alter ratio-test choices materially.
+        // Refresh from the current basis at a bounded cadence. This used to
+        // happen only as a side effect of --verbose, making diagnostics change
+        // the algorithm; on Netlib dfl001/degen3 the refresh also reduces the
+        // unstable tail. Factorizations already refresh as well, so the common
+        // short runs normally never pay this extra BTRAN/SpMV.
+        if (resync_interval > 0 && iter == next_resync) {
             recompute_pi();
+            ++diag.dual_resyncs;
+            next_resync += resync_interval;
+        }
+
+        if (opts.verbose && (iter % 500) == 0) {
             f64 obj = 0.0;
             for (Index i = 0; i < m; ++i) obj += cost[sz(basis[sz(i)])] * xB[sz(i)];
             for (Index j = 0; j < nt; ++j)

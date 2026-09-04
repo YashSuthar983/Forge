@@ -1,13 +1,34 @@
 # Simplex Performance Audit
 
 Benchmark protocol: Netlib, 93 models, sequential on the same host, HiGHS as
-**external process**. Latest clean run:
+an **external process**, one thread. The revised harness compares solver-internal
+time to solver-internal time, retains process wall separately, and publishes
+common-set plus penalized metrics. Latest clean run:
 
 | Run | Limit | SOR solved | SOR SGM | HiGHS | Ratio |
 |---|---:|---:|---:|---:|---:|
-| `compare-netlib-20260904-070105` | 30 s | **92/93** | **0.2085 s** | 0.0905 s | **2.30×** |
+| `compare-netlib-20260904-152608` | 30 s | **93/93** | **0.2189 s** | 0.0866 s | **2.53×** |
 
-Miss: `dfl001` (`Interrupted`). All 92 Optimal rows carry `ProvedOptimalFP`.
+All 93 rows are `Optimal`, objective-match HiGHS, and carry
+`ProvedOptimalFP`. On the 92-instance set solved by the prior build, complete
+process wall fell from 43.70 s to 34.44 s and shifted geometric mean from
+0.2302 s to 0.1895 s (about 18%); the new 93rd solve (`dfl001`) takes ~29.5 s.
+
+## Changes in this pass
+
+- Auto dispatch no longer mistakes extremely wide dense LPs for the ordinary
+  dense-blending regime. `fit2d` now takes 219 dual pivots instead of 8,912
+  primal pivots (~20x internal solve speedup).
+- Dual multipliers and reduced costs are refreshed every 500 pivots by default.
+  This removes the old `--verbose` algorithm perturbation, improves `degen3`
+  from 4,787 to 4,402 pivots, and solves `dfl001` inside the 30 s gate.
+- Very large hypersparse models retain one dual state for the full budget
+  instead of rebuilding after Auto's short probe. The exact rebuilt binary
+  solves `dfl001` in one stage at ~27.8 s, leaving useful deadline headroom.
+- The refresh cadence is tunable via `--dual-resync-interval` (`0` disables).
+- The comparison harness now reports solve-only SGM, common-set SGM,
+  penalized SGM, PAR-2 mean, and complete process wall in JSONL. Unsolved
+  objectives no longer count as matches.
 
 ## What Is Actually Implemented
 
@@ -27,7 +48,10 @@ Representative timing shares (verbose runs, earlier Sep profiling — order-of-m
 - `d2q06c`: majority in pricing + solves; factorization secondary
 - `maros-r7` / `greenbea`: solves + pricing dominate
 
-A realistic next milestone is **~1.3–1.7×** HiGHS SGM after FT-as-default + better edge-weight stability; parity needs broader presolve and phase-1 work reduction as well. Do **not** claim sub-1.2× until measured.
+A realistic next milestone is **~1.5–2.0×** HiGHS SGM after a genuinely sparse
+FT/R update, partial BFRT selection, and broader presolve. The current FT bump
+re-elimination is much slower on hard cases and must not simply be made the
+default. Do **not** claim parity until measured.
 
 ## Industrial follow-up (updated 4 Sep 2026)
 

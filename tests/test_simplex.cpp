@@ -94,6 +94,36 @@ void test_auto_primal_first_skips_discarded_dual_probe() {
     CHECK(diag.preprocessing_builds == 1);
 }
 
+void test_auto_dense_extreme_width_keeps_dual_probe() {
+    using sor::engines::detail::prefer_primal_first;
+    using sor::engines::detail::prefer_long_dual_probe;
+
+    // Ordinary wide/sparse and moderately shaped dense models retain the
+    // established primal-first policy.
+    CHECK(prefer_primal_first(244, 2594, 70216));
+    CHECK(prefer_primal_first(100, 200, 6000));
+
+    // Netlib fit2d's regime must reach the dual probe. Density alone used to
+    // route it to primal: 8912 pivots / ~2.6 s versus 219 / ~0.19 s in dual.
+    CHECK(!prefer_primal_first(25, 10500, 130000));
+
+    CHECK(prefer_long_dual_probe(6071, 35632));
+    CHECK(!prefer_long_dual_probe(4999, 30000));
+    CHECK(!prefer_long_dual_probe(6071, 60000));
+}
+
+void test_dual_periodic_resync_is_not_tied_to_verbose() {
+    SimplexOptions opts;
+    opts.method = sor::engines::SimplexMethod::Dual;
+    opts.presolve = false;
+    opts.dual_resync_interval = 1;
+    opts.verbose = false;
+    const auto run = solve_text(sor::test::kTestLpMps, opts);
+    CHECK(run.r.status == Status::Optimal);
+    CHECK(run.diag.iterations > 0);
+    CHECK(run.diag.dual_resyncs > 0);
+}
+
 void test_auto_candidate_order_uses_feasibility_before_gap() {
     SimplexOptions opts;
     sor::core::RawResult early, later;
@@ -465,6 +495,8 @@ ENDATA
 int main() {
     test_fixture_lp();
     test_auto_primal_first_skips_discarded_dual_probe();
+    test_auto_dense_extreme_width_keeps_dual_probe();
+    test_dual_periodic_resync_is_not_tied_to_verbose();
     test_auto_candidate_order_uses_feasibility_before_gap();
     test_basis_wellformed();
     test_features_mps_agrees_with_model();

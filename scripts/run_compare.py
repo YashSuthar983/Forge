@@ -36,6 +36,7 @@ _PATTERNS = {
     # silently records None for whichever engine it was not written for.
     "row_viol": re.compile(r"^max (?:primal viol|row violation):\s+(\S+)", re.M),
     "iters": re.compile(r"^iterations:\s+(\d+)", re.M),
+    "solve_ms": re.compile(r"^  total\s+(\S+)", re.M),
 }
 
 
@@ -55,6 +56,7 @@ class SolverResult:
     status: str = "not_run"
     objective: float | None = None
     wall_s: float | None = None
+    process_wall_s: float | None = None
     iterations: int | None = None
     proof: str | None = None
     row_violation: float | None = None
@@ -105,7 +107,7 @@ def run_sor(exe: Path, mps: Path, time_limit: float, max_iter: int,
     try:
         p = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=time_limit + 30)
-        r.wall_s = time.perf_counter() - t0
+        r.process_wall_s = time.perf_counter() - t0
         txt = p.stdout
         sm = _PATTERNS["status"].search(txt)
         r.status = sm.group(1) if sm else "unparsed"
@@ -115,17 +117,23 @@ def run_sor(exe: Path, mps: Path, time_limit: float, max_iter: int,
         r.row_violation = _f(txt, "row_viol")
         it = _f(txt, "iters")
         r.iterations = int(it) if it is not None else None
+        solve_ms = _f(txt, "solve_ms")
+        # Match the external baselines' solve-only clock. Preserve complete
+        # subprocess wall separately so startup and MPS I/O remain visible.
+        r.wall_s = solve_ms / 1000.0 if solve_ms is not None else r.process_wall_s
         sz = _PATTERNS["rows_cols"].search(txt)
         if sz:
             r.rows, r.cols, r.nnz = int(sz[1]), int(sz[2]), int(sz[3])
         if r.status == "unparsed":
             r.error = ((p.stderr or "") + (p.stdout or ""))[:240]
     except subprocess.TimeoutExpired:
-        r.wall_s = time.perf_counter() - t0
+        r.process_wall_s = time.perf_counter() - t0
+        r.wall_s = r.process_wall_s
         r.status = "timeout"
         r.error = f"wall timeout > {time_limit}s"
     except Exception as e:  # noqa: BLE001
-        r.wall_s = time.perf_counter() - t0
+        r.process_wall_s = time.perf_counter() - t0
+        r.wall_s = r.process_wall_s
         r.status = "error"
         r.error = f"{type(e).__name__}: {e}"
     return r
@@ -143,6 +151,7 @@ def run_external(python: Path, script: Path, mps: Path,
         p = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=time_limit + 20)
         wall = time.perf_counter() - t0
+        r.process_wall_s = wall
         try:
             j = json.loads(p.stdout.strip().splitlines()[-1])
         except Exception:
@@ -158,11 +167,13 @@ def run_external(python: Path, script: Path, mps: Path,
         if j.get("error"):
             r.error = str(j["error"])
     except subprocess.TimeoutExpired:
-        r.wall_s = time.perf_counter() - t0
+        r.process_wall_s = time.perf_counter() - t0
+        r.wall_s = r.process_wall_s
         r.status = "timeout"
         r.error = f"wall timeout > {time_limit + 20}s"
     except Exception as e:  # noqa: BLE001
-        r.wall_s = time.perf_counter() - t0
+        r.process_wall_s = time.perf_counter() - t0
+        r.wall_s = r.process_wall_s
         r.status = "error"
         r.error = f"{type(e).__name__}: {e}"
     return r
@@ -438,7 +449,7 @@ def main() -> int:
         for name, rd in row.results.items():
             if ref is None or rd.get("objective") is None:
                 row.agreements[name] = None
-            elif not is_solved(rd["status"]) and not is_ours(name):
+            elif not is_solved(rd["status"]):
                 row.agreements[name] = None
             else:
                 g = rel_gap(rd["objective"], ref)
@@ -468,6 +479,41 @@ def main() -> int:
                 match_counts[n] += 1
 
     sgm = {n: shifted_geomean(times[n], args.sgm_shift) for n in names}
+    penalized_times = {
+        n: [
+            (row.results[n].get("wall_s")
+             if is_solved(row.results[n]["status"]) and
+                row.results[n].get("wall_s") is not None
+             else 2.0 * args.time_limit)
+            for row in rows if n in row.results
+        ]
+        for n in names
+    }
+    penalized_sgm = {
+        n: shifted_geomean(penalized_times[n], args.sgm_shift) for n in names
+    }
+    par2_mean = {
+        n: (sum(penalized_times[n]) / len(penalized_times[n])
+            if penalized_times[n] else None)
+        for n in names
+    }
+
+    # A per-solver solved-only mean can reward a solver for missing the hardest
+    # instances. Also publish the SGM on the exact subset solved by EVERY
+    # requested solver; this is directly comparable across columns.
+    common_rows = [
+        row for row in rows
+        if all((rd := row.results.get(n)) and is_solved(rd["status"])
+               for n in names)
+    ]
+    common_sgm = {
+        n: shifted_geomean(
+            [row.results[n]["wall_s"] for row in common_rows
+             if row.results[n].get("wall_s") is not None],
+            args.sgm_shift,
+        )
+        for n in names
+    }
 
     summary = {
         "record": "summary",
@@ -475,6 +521,10 @@ def main() -> int:
         "solved": solved_counts,
         "obj_match_vs_ref": match_counts,
         "sgm_wall_s": sgm,
+        "penalized_sgm_wall_s": penalized_sgm,
+        "par2_mean_wall_s": par2_mean,
+        "common_solved_instances": len(common_rows),
+        "common_sgm_wall_s": common_sgm,
     }
     with jsonl.open("a") as f:
         f.write(json.dumps(summary) + "\n")
@@ -491,14 +541,22 @@ def main() -> int:
     lines.append("")
     lines.append("## Summary")
     lines.append("")
-    lines.append("| Solver | Solved | Obj match (vs HiGHS/CBC ref) | SGM time (s) |")
-    lines.append("|--------|-------:|-----------------------------:|-------------:|")
+    lines.append("| Solver | Solved | Obj match (vs HiGHS/CBC ref) | Solve SGM (s) | Common-set SGM (s) | Penalized SGM (s) | PAR-2 mean (s) |")
+    lines.append("|--------|-------:|-----------------------------:|--------------:|-------------------:|------------------:|---------------:|")
     for n in names:
         sgm_s = f"{sgm[n]:.4f}" if sgm[n] is not None else "—"
+        common_sgm_s = f"{common_sgm[n]:.4f}" if common_sgm[n] is not None else "—"
+        penalized_sgm_s = f"{penalized_sgm[n]:.4f}" if penalized_sgm[n] is not None else "—"
+        par2_s = f"{par2_mean[n]:.4f}" if par2_mean[n] is not None else "—"
         lines.append(
             f"| {n} | {solved_counts[n]}/{len(rows)} | "
-            f"{match_counts[n]}/{len(rows)} | {sgm_s} |"
+            f"{match_counts[n]}/{len(rows)} | {sgm_s} | {common_sgm_s} | "
+            f"{penalized_sgm_s} | {par2_s} |"
         )
+    lines.append("")
+    lines.append(f"Common solved set: {len(common_rows)}/{len(rows)} instances. "
+                 "Penalized metrics charge 2× the time limit for an unsolved instance. "
+                 "Times are solver-internal; per-process wall is retained in JSONL.")
     lines.append("")
     lines.append("## Per-instance")
     lines.append("")

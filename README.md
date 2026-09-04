@@ -37,16 +37,21 @@ Vulkan `LpDevice` builds by default (`-DSOR_ENABLE_VULKAN=ON`). CUDA is a stub.
 | `Optimal` only via `finalize_result` | `sor_certify` |
 | Independent checker | `cli/sor_check.cpp` |
 
-## Measured snapshot (4 Sep 2026)
+## Measured snapshot (4 Sep 2026, optimized pass)
 
-Netlib 93 / 30 s — `benchmarks/results/compare-netlib-20260904-070105.md`:
+Netlib 93 / 30 s — `benchmarks/results/compare-netlib-20260904-152608.md`.
+The harness now compares solver-internal time symmetrically and retains complete
+process wall time separately in JSONL:
 
 | Solver | Solved | SGM |
 |---|---:|---:|
-| SOR-simplex | **92/93** (`ProvedOptimalFP`) | 0.2085 s |
-| HiGHS (external) | 93/93 | 0.0905 s |
+| SOR-simplex | **93/93** (`ProvedOptimalFP`) | 0.2189 s |
+| HiGHS (external, 1 thread) | 93/93 | 0.0866 s |
 
-Full index: `benchmarks/results/FULL_PERF_HIGHS_20260904-070105.md`.
+The dispatch fix cuts `fit2d` from 8,912 pivots / ~2.6 s to 219 pivots /
+~0.13 s internal. Periodic dual-state refresh plus uninterrupted large-sparse
+dual dispatch converts the former `dfl001` 30-second miss into a certified
+optimum (latest exact-binary check: ~27.8 s).
 
 ## Docs
 

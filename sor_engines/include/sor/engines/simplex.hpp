@@ -110,6 +110,10 @@ struct SimplexOptions {
     f64   expand_factor     = 10.0;
     f64   expand_max        = 1e-3;
 
+    // Rebuild dual multipliers and reduced costs periodically to bound drift
+    // on long degenerate dual runs. Zero disables the refresh.
+    int dual_resync_interval = 500;
+
     // Abort when the engine's merit function goes flat, instead of running to
     // the iteration or time limit. This is for the Auto dispatcher's short dual
     // PROBE, whose whole job is to find out cheaply whether the dual is the
@@ -218,6 +222,14 @@ struct SimplexDiagnostics {
 };
 
 namespace detail {
+
+// Shape-only part of Auto dispatch, exposed so benchmark-derived routing
+// regressions can be covered without constructing a giant synthetic LP.
+bool prefer_primal_first(Index rows, Index cols, core::Offset nnz);
+
+// Very large hypersparse models should keep one dual state instead of paying
+// an Auto probe/restart boundary near the time limit.
+bool prefer_long_dual_probe(Index rows, core::Offset nnz);
 
 // Model-independent ordering for results produced by Auto's solver stages.
 // A duality gap is an optimality measure only for a primal/dual-feasible pair;
