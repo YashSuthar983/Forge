@@ -232,6 +232,33 @@ void install_work_totals(SimplexDiagnostics& chosen,
 
 }  // namespace
 
+bool detail::prefer_primal_first(Index rows, Index cols, Offset nnz) {
+    if (rows <= 0 || cols <= 0) return false;
+    const auto urows = static_cast<std::uint64_t>(rows);
+    const auto ucols = static_cast<std::uint64_t>(cols);
+    const double density = static_cast<double>(nnz) /
+                           (static_cast<double>(rows) * cols);
+
+    // Wide sparse bases such as woodw are primal-friendly. Dense blending
+    // models are too, but only while the aspect ratio remains moderate. A
+    // dense AND extremely wide matrix is a different regime: on Netlib fit2d
+    // (25 x 10500), primal scans all 10500 columns for 8912 pivots while dual
+    // proves optimality in 219. Do not let density alone suppress that probe.
+    const bool wide_sparse =
+        ucols > 6ull * urows && (rows > 700 || cols < 4000);
+    constexpr std::uint64_t kMaxDensePrimalAspect = 64;
+    const bool moderately_wide_dense =
+        density >= 0.25 && ucols >= urows &&
+        ucols <= kMaxDensePrimalAspect * urows;
+    return wide_sparse || moderately_wide_dense;
+}
+
+bool detail::prefer_long_dual_probe(Index rows, Offset nnz) {
+    if (rows < 5000 || nnz < 0) return false;
+    return static_cast<std::uint64_t>(nnz) <=
+           8ull * static_cast<std::uint64_t>(rows);
+}
+
 bool detail::prefer_simplex_candidate(const core::RawResult& candidate,
                                       const SimplexDiagnostics& candidate_diag,
                                       const core::RawResult& incumbent,
@@ -1551,17 +1578,8 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         // blending models have the same shape for a different reason: their
         // primal ratio test reaches a feasible basis in far fewer pivots,
         // while dual updates repeatedly materialize a dense pivotal row.
-        const double density =
-            (work->n_rows() > 0 && work->n_cols() > 0)
-                ? static_cast<double>(work->nnz()) /
-                      (static_cast<double>(work->n_rows()) * work->n_cols())
-                : 0.0;
-        const bool primal_preferred =
-            work->n_rows() > 0 &&
-            ((static_cast<std::uint64_t>(work->n_cols()) >
-              6ull * static_cast<std::uint64_t>(work->n_rows()) &&
-              (work->n_rows() > 700 || work->n_cols() < 4000)) ||
-             (density >= 0.25 && work->n_cols() >= work->n_rows()));
+        const bool primal_preferred = detail::prefer_primal_first(
+            work->n_rows(), work->n_cols(), work->nnz());
         const SimplexBasis* winner = nullptr;
 
         if (primal_preferred) {
@@ -1609,10 +1627,24 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
             // fit2p. 3000 iterations also keeps the stall detector live (it
             // needs 2048 iterations to fire). The time limit is only a safety
             // net for pathologically slow iterations.
-            probe_opts.max_iterations = 3000;
-            probe_opts.time_limit_s = (opts.time_limit_s > 0.0)
-                                          ? std::min(4.0, std::max(0.5, opts.time_limit_s * 0.25))
-                                          : 4.0;
+            const bool long_dual_probe = detail::prefer_long_dual_probe(
+                work->n_rows(), work->nnz());
+            if (long_dual_probe) {
+                // On a very large hypersparse basis, rebuilding after a
+                // successful short probe is material. Keep the same state for
+                // the full budget. The ordinary probe's merit-based stall
+                // abort is deliberately disabled here: dfl001 has long flat
+                // stretches but is still converging. It goes from a
+                // timing-sensitive 2/3-stage miss to one certified stage.
+                probe_opts.max_iterations = opts.max_iterations;
+                probe_opts.time_limit_s = opts.time_limit_s;
+                probe_opts.stall_abort = false;
+            } else {
+                probe_opts.max_iterations = 3000;
+                probe_opts.time_limit_s = (opts.time_limit_s > 0.0)
+                                              ? std::min(4.0, std::max(0.5, opts.time_limit_s * 0.25))
+                                              : 4.0;
+            }
 
             raw = run(true, probe_opts, &probe_basis, nullptr, true);
             const auto probe_raw = raw;

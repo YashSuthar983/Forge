@@ -38,6 +38,7 @@ void usage() {
         "  --refactor-interval N  maximum basis updates between refactors\n"
         "  --refactor-eta-ratio R refactor when eta nnz exceeds R*factor nnz\n"
         "  --refactor-work-ratio R refactor when solve work exceeds R*factor nnz\n"
+        "  --dual-resync-interval N rebuild dual/reduced costs every N pivots (0=off)\n"
         "  --max-iter N     iteration / node limit\n"
         "  --tol T          feasibility tolerance\n"
         "  --time-limit S   wall-clock limit in seconds\n"
@@ -184,6 +185,9 @@ int main(int argc, char** argv) {
         else if (a == "--refactor-work-ratio")
             sx_opts.refactor_work_ratio =
                 std::strtod(next("--refactor-work-ratio").c_str(), nullptr);
+        else if (a == "--dual-resync-interval")
+            sx_opts.dual_resync_interval =
+                static_cast<int>(std::strtol(next("--dual-resync-interval").c_str(), nullptr, 10));
         else if (a == "--no-scaling") {
             sx_opts.ruiz_iterations = 0;
             pdhg_opts.ruiz_iterations = 0;
