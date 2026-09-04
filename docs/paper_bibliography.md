@@ -206,6 +206,27 @@ Chambolle–Pock PDHG (2011)  →  PDLP (2021)  →  HPR-LP (2024)  →  cuPDLPx
 
 **SOR policy:** Train offline, distill to tree ensemble in C++, keyed by `FamilyFingerprint`.
 
+### 7.4 Market-split / lattice reform (P2 — opt-in)
+
+Hard equality systems where ordinary B&C dual bounds stay weak (Cornuéjols–Dawande “market share”). Classical fix: reduce `Ax=b` over `Z` to a shorter kernel basis via LLL, then B&B in μ-space.
+
+| # | Citation | Link | Role | SOR status |
+|---|----------|------|------|------------|
+| 1 | **Cornuéjols & Dawande (1999)** | [DOI](https://doi.org/10.1007/978-3-642-08514-7_1) | Market-share / markshare hardness | motivating family |
+| 2 | **Aardal, Bixby, Hurkens, Lenstra, Smeltink (2000)** | [DOI](https://doi.org/10.1287/ijoc.12.2.111.11896) | Why B&C fails; classical lattice reform | primary *why* citation |
+| 3 | **Aardal & Wolsey (2007)** | arXiv:[math/0702881](https://arxiv.org/abs/math/0702881) | AHL augmented-matrix recipe (N1/N2, extract `x0`, `Q`) | **implemented** — `lattice_reform.cpp` |
+| 4 | **Lenstra–Lenstra–Lovász (1982)** | [DOI](https://doi.org/10.1007/BF01457454) | LLL lattice basis reduction | exact-integer LLL in same file |
+
+**CLI:** `--lattice-reform` (default off). Verify gates: exact `A·Q=0`, `A·x0=b`; on failure → unmodified MILP.
+
+**Exact-equivalence / certification protocol (Sep 2026, supersedes the earlier restriction-only protocol):** μ bounds are now the EXACT LP projection of the original box through `Q` (2 small LP solves per μ coordinate), not a heuristic starter box — every integer point of the restricted system provably lies in it, replacing the old ±64 guess that under-explored (and, being only a guess, could never itself be trusted as exact). Two regimes, per `LatticeReformMap::exact_equivalence` (true iff no continuous columns were forced to zero):
+- **Exact equivalence** (pure integer equality systems): the transform is a genuine bijection — the transformed problem IS the original in different coordinates, including an LP-real-infeasibility short-circuit (a trivially-infeasible-but-well-formed 2-row marker problem, so `solve_milp` proves it through the ordinary pipeline with no malformed-problem special case) and a verified AHL-level infeasibility signal (paper's `±k·N1, k>1`, cross-checked against the bottom block before being trusted). Terminal statuses and dual bounds ship directly, no fallback re-solve.
+- **Restriction** (continuous columns forced to zero, e.g. markshare's deviation variables): a terminal restricted Optimal is now *certified* against the ORIGINAL problem's own LP relaxation bound `V_LP` (solved once): `V_LP <= V_orig <= V_r`, so `V_r == V_LP` (exact-integer-checked incumbent, tolerance-matched bound) proves `V_orig = V_r` — a rigorous argument, not a heuristic, letting a solved restriction actually close the original instance. Anything not certifiable this way (restricted Infeasible, or a restricted Optimal that doesn't match `V_LP`) still falls back to a full original re-solve, exactly as before.
+
+All three original wrong-answer classes (proved-wrong optimum via forced zeros, false Infeasible, boxed false Optimal on an unbounded problem) plus the new exact-equivalence/certification paths are regression-tested in `test_lattice_reform.cpp`.
+
+**Honest Sep 2026:** transform **applies** to MIPLIB `markshare1/2` (kernel 44, forced-zero continuous deviations — a restriction, not exact-equivalence, so it needs LP-bound certification to close). With the exact LP-projection box (vs. the old ±64 guess), `markshare1` explores far more purposefully (227,352 nodes vs. ~95,000 before, 15 GMI cuts firing vs. 0 before — the tighter box gives the LP relaxation real information) but still finds **0 integer-feasible μ** within a 300s budget; a 1800s run is the next data point. Tiny market-split instances reach certified/direct Optimal with zero fallback. The reformulation is doing real, verified work (tight exact bounds, sound certification) — turning that into a *found* feasible point on the full 44-dimensional markshare lattice within a practical budget is the remaining gap, and the honest next lever (per the paper's own success cases, which were smaller: kernel 26–35) is either substantially more time or a lattice-informed search technique (branching order tied to the reduced basis, short-vector enumeration) beyond generic B&B — not something to guess-implement without further verified grounding.
+
 ---
 
 ## 8. Convex QP (P2–P4)
@@ -280,6 +301,7 @@ LP duality / Farkas: any LP textbook — implement checker from first principles
 | Vanilla PDHG | `pdhg.cpp` | KernelBackend |
 | HPR + Vulkan LpDevice | `hpr.cpp`, `vk_lp_device.cpp` | 6 SPIR-V shaders |
 | MILP root B&C | `sor_search/` | root GMI; reliability branch |
+| AHL lattice reform (opt-in) | `lattice_reform.cpp`, `--lattice-reform` | LLL + AHL; restriction protocol (terminal→re-solve original); markshare applies, Optimal on tiny only |
 | Convex QP | `qp.cpp`, `qp_pdhcg.cpp` | |
 | Ruiz scaling | engines | |
 | MPS/QPS I/O, certify gate | `sor_io/`, `sor_certify/` | |

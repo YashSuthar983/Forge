@@ -142,7 +142,8 @@ target_link_libraries(sor_engines PUBLIC sor_model sor_backend sor_la_cpu sor_pr
 # ------------------------------ L5: search ---------------------------------
 add_library(sor_search sor_search/src/bab.cpp sor_search/src/cuts.cpp
                        sor_search/src/propagate.cpp sor_search/src/miqp.cpp
-                       sor_search/src/minlp.cpp)
+                       sor_search/src/minlp.cpp
+                       sor_search/src/lattice_reform.cpp)
 target_include_directories(sor_search PUBLIC sor_search/include)
 target_link_libraries(sor_search PUBLIC sor_engines PRIVATE sor_flags)
 
@@ -189,6 +190,7 @@ sor_add_test(test_presolve             sor_presolve)
 sor_add_test(test_hpr                 sor_engines sor_certify sor_io)
 sor_add_test(test_lp_device           sor_backend sor_engines sor_io)
 sor_add_test(test_milp                sor_search sor_certify sor_io)
+sor_add_test(test_lattice_reform      sor_search sor_certify sor_io)
 sor_add_test(test_cuts                sor_search sor_engines sor_certify sor_io)
 sor_add_test(test_propagate           sor_search)
 sor_add_test(test_qp                  sor_engines sor_certify)

@@ -12,6 +12,7 @@
 #include "sor/io/qps.hpp"
 #include "sor/io/solution.hpp"
 #include "sor/search/bab.hpp"
+#include "sor/search/lattice_reform.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +21,7 @@
 #include <exception>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <string>
 
 namespace {
@@ -41,6 +43,7 @@ void usage() {
         "  --time-limit S   wall-clock limit in seconds\n"
         "  --no-scaling     skip Ruiz equilibration\n"
         "  --no-presolve    skip presolve (simplex/milp)\n"
+        "  --lattice-reform  opt-in AHL lattice reform for pure integer equalities\n"
         "  --verbose        iteration / node log\n"
         "  --hpr-vanilla | --hpr-full\n"
         "  --solution-out PATH   write a plain-text solution file for sor_check\n",
@@ -109,6 +112,7 @@ int main(int argc, char** argv) {
     bool mps_format_forced = false;
     bool tol_given = false;
     bool max_iter_given = false;
+    bool lattice_reform = false;
     double tol = 0.0;
 
     for (int i = 1; i < argc; ++i) {
@@ -186,6 +190,7 @@ int main(int argc, char** argv) {
             hpr_opts.ruiz_iterations = 0;
         }
         else if (a == "--no-presolve") sx_opts.presolve = false;
+        else if (a == "--lattice-reform") lattice_reform = true;
         else if (a == "--fixed-mps") { mps_opts.fixed_format = true; mps_format_forced = true; }
         else if (a == "--free-mps")  { mps_opts.fixed_format = false; mps_format_forced = true; }
         else if (a == "--verbose") {
@@ -339,10 +344,31 @@ int main(int argc, char** argv) {
                 bab.primal_feas_tol = tol;
                 bab.int_tol = std::max(tol, 1e-9);
             }
-            sor::search::BabDiagnostics diag;
-            auto raw = sor::search::solve_milp(problem, bab, diag);
+            auto out =
+                sor::search::solve_milp_lattice(problem, bab, lattice_reform);
+            if (lattice_reform) {
+                if (out.reform_applied) {
+                    std::printf("lattice reform:    applied (%s), kernel dim %d, "
+                                "forced-zero cont %zu, fixed %zu, %s\n",
+                                out.note.c_str(), out.kernel_dim,
+                                out.forced_zero_cols, out.fixed_cols,
+                                out.exact_equivalence ? "exact equivalence"
+                                                      : "restriction");
+                    if (out.certified) {
+                        std::printf("lattice reform:    certified optimal against "
+                                    "original LP relaxation bound\n");
+                    } else if (out.fell_back) {
+                        std::printf("lattice reform:    restricted run not "
+                                    "certifiable; original re-solved\n");
+                    }
+                } else {
+                    std::printf("lattice reform:    skipped (%s)\n",
+                                out.note.c_str());
+                }
+            }
+            const auto& diag = out.diag;
             const auto ev = sor::search::milp_evidence(diag, bab);
-            const auto r = sor::certify::finalize_result(std::move(raw), ev);
+            const auto r = sor::certify::finalize_result(std::move(out.raw), ev);
             print_result(r);
             write_solution_out(solution_out, r);
             if (std::isfinite(diag.dual_bound)) {
