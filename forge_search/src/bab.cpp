@@ -4130,6 +4130,23 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     diag.total_ms = ms_since(t0);
     diag.termination_reason = reason;
 
+    // A node's .bound is only ever a certified LP bound (see the assignment
+    // above: unproven nodes get -infinity, never a value that could look
+    // artificially tight), so dual_bound_min -- drained from EVERY remaining
+    // open/plunge node -- is a sound global lower bound regardless of
+    // whether the tree was formally exhausted. If it already closes the gap
+    // to within opts.gap_tol, that IS a complete proof of optimality; the
+    // whole point of a gap tolerance is to allow exactly this early exit,
+    // not to require full exhaustion anyway. all_lp_proven is still required
+    // for BOTH paths, conservatively: it is not strictly needed for the
+    // gap-based path's own soundness, but there's no case in these MIPLIB
+    // runs where relaxing it mattered, and keeping it costs nothing while
+    // avoiding a subtler argument about which parts of the tree an unproven
+    // node's failure could have contaminated.
+    const bool gap_proved = have_incumbent && std::isfinite(dual_orig) &&
+                            diag.gap_rel <= opts.gap_tol;
+    diag.globally_proved = all_lp_proven && (tree_exhausted || gap_proved);
+
     raw.iterations = diag.nodes;
     raw.termination_reason = reason;
     raw.dual_bound = dual_orig;
@@ -4137,7 +4154,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     if (have_incumbent) {
         raw.x = std::move(best_x);
         raw.objective = best_incumbent;
-        if (tree_exhausted && all_lp_proven) {
+        if (diag.globally_proved) {
             raw.proposed_status = core::Status::Optimal;
             raw.proposed_level = core::ProofLevel::ProvedGlobalEpsilon;
         } else {
@@ -4160,10 +4177,12 @@ core::ProofEvidence milp_evidence(const BabDiagnostics& diag,
     core::ProofEvidence ev;
     ev.has_basis = false;
     ev.max_primal_violation = 0.0;
-    const bool globally_proved =
-        diag.termination_reason == "tree exhausted" &&
-        std::isfinite(diag.incumbent) && std::isfinite(diag.gap_rel) &&
-        diag.gap_rel <= opts.gap_tol;
+    // Read diag.globally_proved directly (set once, in solve_milp()) rather
+    // than re-deriving it here from termination_reason -- a STRING match on
+    // "tree exhausted" duplicated the proof condition in two places and
+    // silently required full tree exhaustion even when the gap had already
+    // closed to within opts.gap_tol, which is a complete proof on its own.
+    const bool globally_proved = diag.globally_proved;
     ev.max_dual_violation = globally_proved ? 0.0 : core::kPosInf;
     ev.gap_rel = diag.gap_rel;
     ev.primal_feas_tol = opts.primal_feas_tol;

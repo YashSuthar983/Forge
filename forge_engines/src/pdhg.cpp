@@ -144,6 +144,10 @@ core::RawResult solve_pdhg(const model::LpProblem& problem,
 
     // ---- 3. PDHG iteration ----------------------------------------------
     const auto t_loop = Clock::now();
+    const auto deadline = (opts.time_limit_s > 0.0)
+        ? t_loop + std::chrono::duration_cast<Clock::duration>(
+              std::chrono::duration<double>(opts.time_limit_s))
+        : Clock::time_point::max();
     DeviceBuffer<f64> x(nc), y(nr), x_new(nc), xbar(nc);
     DeviceBuffer<f64> Aty, Axbar;
 
@@ -243,6 +247,7 @@ core::RawResult solve_pdhg(const model::LpProblem& problem,
                             static_cast<unsigned long long>(iter + 1),
                             diag.primal_residual, diag.dual_residual,
                             diag.primal_objective);
+            if (Clock::now() >= deadline) { ++iter; break; }
         }
     }
     if (!converged) converged = evaluate();

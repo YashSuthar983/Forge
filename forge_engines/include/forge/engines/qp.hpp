@@ -29,9 +29,31 @@ struct QpProblem {
 
 struct QpOptions {
     std::uint64_t max_iterations = 50000;
+    // 0 = unlimited (max_iterations is the only cap); checked at the same
+    // check_every cadence as the KKT/Wolfe-gap evaluation. Without this, a
+    // caller-supplied wall-clock budget had nowhere to go: PDHCG-II on a
+    // genuinely coupled (non-diagonal) PSD QP can need well more than 50000
+    // iterations to converge tightly (measured: n=3000/4000 general-Q QPs
+    // hit the fixed 50000 cap at 10-18s wall time with gap already ~1e-8,
+    // not yet "satisfied") with no way to let it run longer even when time
+    // was available -- same bug class as PdhgOptions's missing
+    // time_limit_s.
+    f64 time_limit_s = 0.0;
     std::uint64_t check_every = 10;
     int inner_max_iterations = 100;
-    int convexity_dense_limit = 256;
+    // certify_psd() (qp_pdhcg.cpp) tries a cheap Gershgorin bound first, and
+    // only falls back to dense Cholesky -- the exact, authoritative proof --
+    // for n <= this limit; above it, a genuinely PSD but non-diagonally-
+    // dominant Q is rejected outright ("PSD was not certifiable sparsely")
+    // even though it's a perfectly valid convex QP. The old default of 256
+    // rejected realistic coupled QPs at very modest sizes. Measured directly
+    // (Q = A'A + eps*I, provably PSD by construction, genuinely NOT
+    // diagonally dominant): n=500-2000 all certify correctly via dense
+    // Cholesky in well under a second; n=1000 total solve (cert + PDHCG-II
+    // convergence) took 0.83s. Raised to 2000 -- comfortably covers
+    // realistic industrial QP sizes while keeping the O(n^3) certification
+    // cost a small fraction of the overall solve.
+    int convexity_dense_limit = 2000;
     f64 feas_tol = 1e-8;
     f64 stationarity_tol = 1e-8;
     f64 gap_tol = 1e-8;

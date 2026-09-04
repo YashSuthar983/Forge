@@ -71,7 +71,17 @@ def main() -> int:
     ap.add_argument("--instances-dir",
                     default=str(ROOT / "benchmarks" / "miplib-easy" / "mps"))
     ap.add_argument("--time-limit", type=float, default=30.0)
-    ap.add_argument("--max-nodes", type=int, default=5000)
+    # A node cap independent of the time budget is the same trap PDHG's
+    # missing time_limit_s was: --time-limit 30 gave B&C a 30s budget, but
+    # the OLD default of 5000 nodes was routinely hit in well under that
+    # (some instances need 40k-120k+ nodes to converge), so most of the
+    # requested time went unused and instances that would have proved
+    # Optimal reported Feasible instead. Measured directly: raising this
+    # from 5000 to 2000000 took MIPLIB-easy from 4/20 to 9/20 Optimal at the
+    # same 30s time limit. Default high enough that TIME, not this cap, is
+    # normally what stops a run; pass --max-nodes explicitly to cap it back
+    # down for a fast smoke test.
+    ap.add_argument("--max-nodes", type=int, default=2000000)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--no-baseline", action="store_true")
     ap.add_argument("-o", "--outdir", default=str(ROOT / "benchmarks" / "results"))

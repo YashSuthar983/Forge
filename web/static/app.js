@@ -10,54 +10,104 @@
     NumericalFailure: "Numerics failed — try another engine or tighten the model.",
     Unsupported: "This model needs a capability we have not shipped yet.",
     Timeout: "Stopped — raise the time limit in Advanced.",
-    error: "Something went wrong. See the log in Advanced.",
+    error: "Something went wrong. See the log.",
   };
 
   const ORDER = ["blend", "schedule", "dispatch", "sparse"];
-  const FALLBACK_TEMPLATES = [
-    {
-      id: "toy_lp",
-      label: "Start here · tiny LP",
-      blurb: "Two variables, two inequalities.",
-      text: `Maximize
-  3 x + 4 y
-Subject To
-  wood:   x + 2 y <= 14
-  metal:  3 x + y <= 18
-Bounds
-  x >= 0
-  y >= 0
-End
-`,
-    },
-  ];
 
   let selected = "blend";
-  let mode = "preset";
+  let mode = "preset"; // preset | write | file
+  let sourceTab = "mps"; // mps | eq
   let solToken = null;
   let presets = {};
-  let templates = FALLBACK_TEMPLATES;
+  let templates = [];
   let activeTmpl = null;
   let customName = null;
+  let mpsBaseline = "";
+  let mpsDirty = false;
 
   const answer = $("answer");
   const btnSolve = $("btn-solve");
   const btnCheck = $("btn-check");
   const btnWrite = $("btn-write");
-  const writer = $("writer");
   const logEl = $("log");
+  const mpsEl = $("mps_text");
+  const eqEl = $("model_text");
 
   function currentLabel() {
+    if (mode === "file" && customName) return customName;
     if (mode === "write") {
       const t = templates.find((x) => x.id === activeTmpl);
       return t ? t.label : "Your equations";
     }
-    if (mode === "file" && customName) return customName;
-    return presets[selected]?.label || selected;
+    return presets[selected]?.label || selected || "Model";
   }
 
-  function updateSolveHint() {
+  function updateChrome() {
     $("solve-hint").textContent = currentLabel();
+    $("model-title").textContent = currentLabel();
+    $("dirty").hidden = !mpsDirty;
+  }
+
+  function setDirty(on) {
+    mpsDirty = on;
+    updateChrome();
+  }
+
+  function showTab(tab) {
+    sourceTab = tab;
+    $("tab-mps").classList.toggle("active", tab === "mps");
+    $("tab-eq").classList.toggle("active", tab === "eq");
+    $("panel-mps").hidden = tab !== "mps";
+    $("panel-eq").hidden = tab !== "eq";
+  }
+
+  function setMpsText(text, { clean = true } = {}) {
+    mpsEl.value = text || "";
+    mpsBaseline = clean ? mpsEl.value : mpsBaseline;
+    if (clean) setDirty(false);
+    const lines = (text || "").split("\n").length;
+    const bytes = new Blob([text || ""]).size;
+    $("mps-meta").textContent = text
+      ? `${lines} lines · ${(bytes / 1024).toFixed(1)} KB · editable`
+      : "Select a model to inspect";
+  }
+
+  async function loadPreset(id) {
+    selected = id;
+    mode = "preset";
+    customName = null;
+    activeTmpl = null;
+    btnWrite.classList.remove("active");
+    $("file").value = "";
+    const hit = $("file").closest(".file-hit");
+    hit.classList.remove("has-file");
+    hit.querySelector("span").innerHTML = 'Open <code>.mps</code> / <code>.qps</code>';
+
+    const p = presets[id];
+    if (p) {
+      $("engine").value = p.engine || "simplex";
+      $("backend").value = p.backend || "cpu";
+      $("time_limit").value = p.kind === "milp" ? "30" : "15";
+    }
+
+    $("mps-meta").textContent = "Loading…";
+    try {
+      const r = await fetch("/api/model/" + encodeURIComponent(id));
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.detail || "load failed");
+      setMpsText(j.text, { clean: true });
+      if (j.truncated) $("mps-meta").textContent += " · truncated";
+      showTab("mps");
+    } catch (e) {
+      setMpsText("", { clean: true });
+      $("mps-meta").textContent = String(e);
+    }
+
+    renderProblems();
+    renderTemplates();
+    updateChrome();
+    resetAnswer();
   }
 
   function renderTemplates() {
@@ -75,81 +125,40 @@ End
     }
   }
 
-  function applyTemplate(id) {
+  async function applyTemplate(id) {
     const t = templates.find((x) => x.id === id) || templates[0];
     if (!t) return;
-    activeTmpl = t.id;
-    $("model_text").value = t.text;
     mode = "write";
-    writer.hidden = false;
-    btnWrite.classList.add("active");
+    activeTmpl = t.id;
     customName = null;
-    $("file").value = "";
-    $("file").closest(".file-hit").classList.remove("has-file");
+    btnWrite.classList.add("active");
+    eqEl.value = t.text;
     $("engine").value = /Binary|General/i.test(t.text) ? "milp" : "simplex";
     $("time_limit").value = "30";
+    showTab("eq");
     renderTemplates();
     renderProblems();
-    updateSolveHint();
+    updateChrome();
     resetAnswer();
+    await syncEqToMps();
   }
 
-  function setWriteMode(on) {
-    if (on) {
-      mode = "write";
-      customName = null;
-      $("file").value = "";
-      $("file").closest(".file-hit").classList.remove("has-file");
-      writer.hidden = false;
-      btnWrite.classList.add("active");
-      if (!$("model_text").value.trim() && templates[0]) applyTemplate(templates[0].id);
-      else {
-        renderTemplates();
-        updateSolveHint();
-        resetAnswer();
+  async function syncEqToMps() {
+    const text = eqEl.value.trim();
+    if (!text) return;
+    try {
+      const fd = new FormData();
+      fd.append("model_text", text);
+      const r = await fetch("/api/lp-to-mps", { method: "POST", body: fd });
+      const j = await r.json();
+      if (!r.ok) throw new Error(typeof j.detail === "string" ? j.detail : "parse failed");
+      setMpsText(j.mps, { clean: true });
+      if (j.meta?.suggested_engine === "milp" && $("engine").value === "simplex") {
+        $("engine").value = "milp";
       }
-    } else {
-      writer.hidden = true;
-      btnWrite.classList.remove("active");
-      activeTmpl = null;
+    } catch (e) {
+      $("mps-meta").textContent = String(e);
     }
-    renderProblems();
-  }
-
-  function setAnswer(modeCls, verdict, plain, objective, bits) {
-    answer.className = "answer " + modeCls;
-    $("verdict").textContent = verdict;
-    $("plain").textContent = plain || "";
-    if (objective === null || objective === undefined || Number.isNaN(Number(objective))) {
-      $("obj").textContent = "";
-    } else {
-      const n = Number(objective);
-      $("obj").textContent =
-        Math.abs(n) >= 1e6 || (Math.abs(n) > 0 && Math.abs(n) < 1e-3)
-          ? n.toExponential(6)
-          : n.toLocaleString(undefined, { maximumFractionDigits: 6 });
-    }
-
-    const meta = $("meta");
-    if (bits) {
-      meta.hidden = false;
-      $("meta-time").textContent = bits.time || "";
-      $("meta-proof").textContent = bits.proof || "";
-      $("meta-check").textContent = bits.check || "";
-    } else {
-      meta.hidden = true;
-    }
-  }
-
-  function showLog(text, force) {
-    const want = force || $("verbose").checked;
-    if (!want || !text) {
-      logEl.hidden = true;
-      logEl.textContent = "";
-      return;
-    }
-    logEl.hidden = false;
-    logEl.textContent = text;
   }
 
   function renderProblems() {
@@ -167,23 +176,7 @@ End
         `<span class="kind">${escapeHtml(p.kind)}</span>` +
         `<span class="name">${escapeHtml(shortName(p.label))}</span>` +
         `<span class="blurb">${escapeHtml(p.blurb)}</span>`;
-      btn.addEventListener("click", () => {
-        selected = id;
-        mode = "preset";
-        customName = null;
-        activeTmpl = null;
-        writer.hidden = true;
-        btnWrite.classList.remove("active");
-        $("file").value = "";
-        $("file").closest(".file-hit").classList.remove("has-file");
-        $("engine").value = p.engine || "simplex";
-        $("backend").value = p.backend || "cpu";
-        if (p.kind === "milp") $("time_limit").value = "30";
-        else $("time_limit").value = "15";
-        renderProblems();
-        updateSolveHint();
-        resetAnswer();
-      });
+      btn.addEventListener("click", () => loadPreset(id));
       box.appendChild(btn);
     }
   }
@@ -205,10 +198,43 @@ End
       .replace(/"/g, "&quot;");
   }
 
+  function setAnswer(modeCls, verdict, plain, objective, bits) {
+    answer.className = "answer " + modeCls;
+    $("verdict").textContent = verdict;
+    $("plain").textContent = plain || "";
+    if (objective === null || objective === undefined || Number.isNaN(Number(objective))) {
+      $("obj").textContent = "";
+    } else {
+      const n = Number(objective);
+      $("obj").textContent =
+        Math.abs(n) >= 1e6 || (Math.abs(n) > 0 && Math.abs(n) < 1e-3)
+          ? n.toExponential(6)
+          : n.toLocaleString(undefined, { maximumFractionDigits: 6 });
+    }
+    const meta = $("meta");
+    if (bits) {
+      meta.hidden = false;
+      $("meta-time").textContent = bits.time || "";
+      $("meta-proof").textContent = bits.proof || "";
+      $("meta-check").textContent = bits.check || "";
+    } else meta.hidden = true;
+  }
+
+  function showLog(text, force) {
+    const want = force || $("verbose").checked;
+    if (!want || !text) {
+      logEl.hidden = true;
+      logEl.textContent = "";
+      return;
+    }
+    logEl.hidden = false;
+    logEl.textContent = text;
+  }
+
   function resetAnswer() {
     solToken = null;
     btnCheck.hidden = true;
-    setAnswer("idle", "Waiting", "Pick a problem — or write equations — then Solve.", null, null);
+    setAnswer("idle", "Waiting", "Inspect or edit the model, then Optimize.", null, null);
     showLog("");
   }
 
@@ -218,28 +244,23 @@ End
       const r = await fetch("/api/health");
       const j = await r.json();
       presets = j.presets || {};
-      if (Array.isArray(j.learn_templates) && j.learn_templates.length) {
-        templates = j.learn_templates;
-      }
+      templates = Array.isArray(j.learn_templates) ? j.learn_templates : [];
       renderProblems();
       renderTemplates();
-      if (presets[selected]) {
-        $("engine").value = presets[selected].engine;
-        $("backend").value = presets[selected].backend || "cpu";
-      }
-      updateSolveHint();
       const missing = Object.entries(j.bins || {})
         .filter(([, ok]) => !ok)
         .map(([n]) => n);
       if (!j.ok) {
-        el.className = "statusline bad";
+        el.className = "topbar-right bad";
         el.textContent = "Solver binaries missing: " + missing.join(", ");
       } else {
-        el.className = "statusline";
-        el.textContent = "Ready · demos, write-your-own, or .mps";
+        el.className = "topbar-right";
+        el.textContent = "Ready · inspect MPS · edit · optimize";
       }
+      if (presets.blend) await loadPreset("blend");
+      else if (Object.keys(presets)[0]) await loadPreset(Object.keys(presets)[0]);
     } catch {
-      el.className = "statusline bad";
+      el.className = "topbar-right bad";
       el.textContent = "Server offline — run web/run.sh";
     }
   }
@@ -248,26 +269,38 @@ End
     solToken = null;
     btnCheck.hidden = true;
     btnSolve.disabled = true;
-    $("solve-label").textContent = "Solving…";
+    $("solve-label").textContent = "Optimizing…";
     setAnswer("run", "Working", "Running the from-scratch engine…", null, null);
     showLog("");
 
-    const fd = new FormData();
-    const file = $("file").files[0];
-    const text = $("model_text").value.trim();
+    // If on equations tab, refresh MPS first so edits flow through.
+    if (sourceTab === "eq" && eqEl.value.trim()) {
+      await syncEqToMps();
+    }
 
-    if (mode === "write" || (!file && text && !writer.hidden)) {
-      if (!text) {
-        setAnswer("bad", "Failed", "Write some equations first (use a starter above).", null, null);
-        btnSolve.disabled = false;
-        $("solve-label").textContent = "Solve";
-        return;
-      }
-      fd.append("model_text", text);
-    } else if (file) {
-      fd.append("file", file);
-    } else {
+    const fd = new FormData();
+    const mps = mpsEl.value.trim();
+    // Prefer the visible/edited buffer. Also send preset as a safe fallback.
+    if (mps) {
+      fd.append("mps_text", mps);
+    }
+    if (sourceTab === "eq" && eqEl.value.trim() && !mps) {
+      fd.append("model_text", eqEl.value.trim());
+    }
+    if (mode === "preset" && selected) {
       fd.append("preset", selected);
+    }
+    // If user picked a file and buffer somehow empty, upload the file.
+    const file = $("file").files[0];
+    if (!mps && file) {
+      fd.append("file", file);
+    }
+
+    if (!fd.has("mps_text") && !fd.has("model_text") && !fd.has("preset") && !fd.has("file")) {
+      setAnswer("bad", "Failed", "Model buffer is empty — pick a model or paste MPS.", null, null);
+      btnSolve.disabled = false;
+      $("solve-label").textContent = "Optimize";
+      return;
     }
 
     fd.append("engine", $("engine").value);
@@ -285,7 +318,6 @@ End
         showLog(JSON.stringify(j, null, 2), true);
         return;
       }
-
       if (j.engine) $("engine").value = j.engine;
 
       const status = j.timed_out ? "Timeout" : j.status || "error";
@@ -293,7 +325,6 @@ End
         status === "Optimal" ? "ok" :
         status === "Feasible" || status === "Interrupted" || status === "Timeout" ? "warn" :
         "bad";
-
       const verdict =
         status === "Optimal" ? "Optimal" :
         status === "Feasible" ? "Feasible" :
@@ -310,7 +341,11 @@ End
       if (j.cmd) parts.push("$ " + j.cmd.join(" "));
       if (j.stdout) parts.push(j.stdout.trimEnd());
       if (j.stderr) parts.push("--- stderr ---\n" + j.stderr.trimEnd());
-      showLog(parts.join("\n\n"));
+      // Always keep log available; visible when verbose is on
+      if (parts.length) {
+        logEl.textContent = parts.join("\n\n");
+        logEl.hidden = !$("verbose").checked;
+      }
 
       if (j.check_ready && j.sol_token) {
         solToken = j.sol_token;
@@ -322,7 +357,7 @@ End
       showLog(String(e), true);
     } finally {
       btnSolve.disabled = false;
-      $("solve-label").textContent = "Solve";
+      $("solve-label").textContent = "Optimize";
     }
   }
 
@@ -330,7 +365,6 @@ End
     if (!solToken) return;
     btnCheck.disabled = true;
     if (!silent) $("meta-check").textContent = "checking…";
-
     const fd = new FormData();
     fd.append("sol_token", solToken);
     try {
@@ -356,48 +390,70 @@ End
     }
   }
 
-  btnWrite.addEventListener("click", () => {
-    if (mode === "write" && !writer.hidden) {
-      // already open — reload first starter if empty
-      if (!$("model_text").value.trim() && templates[0]) applyTemplate(templates[0].id);
-      return;
-    }
-    setWriteMode(true);
-    if (templates[0]) applyTemplate(templates[0].id);
+  $("tab-mps").addEventListener("click", () => showTab("mps"));
+  $("tab-eq").addEventListener("click", () => {
+    mode = "write";
+    btnWrite.classList.add("active");
+    showTab("eq");
+    renderProblems();
+    updateChrome();
   });
 
-  $("model_text").addEventListener("input", () => {
-    if (mode !== "write") {
-      mode = "write";
-      btnWrite.classList.add("active");
-      writer.hidden = false;
+  btnWrite.addEventListener("click", () => {
+    mode = "write";
+    btnWrite.classList.add("active");
+    showTab("eq");
+    if (!eqEl.value.trim() && templates[0]) applyTemplate(templates[0].id);
+    else {
+      renderProblems();
+      updateChrome();
     }
+  });
+
+  $("btn-to-mps").addEventListener("click", async () => {
+    await syncEqToMps();
+    showTab("mps");
+  });
+
+  mpsEl.addEventListener("input", () => {
+    setDirty(mpsEl.value !== mpsBaseline);
+    mode = mode === "write" ? "write" : "file";
+    updateChrome();
+  });
+
+  eqEl.addEventListener("input", () => {
+    mode = "write";
     activeTmpl = null;
+    btnWrite.classList.add("active");
     renderTemplates();
-    updateSolveHint();
+    updateChrome();
   });
 
   $("file").addEventListener("change", () => {
     const f = $("file").files[0];
     const hit = $("file").closest(".file-hit");
-    if (f) {
-      mode = "file";
-      customName = f.name;
-      activeTmpl = null;
-      writer.hidden = true;
-      btnWrite.classList.remove("active");
-      hit.classList.add("has-file");
-      hit.querySelector("span").textContent = "Using " + f.name;
-      if (f.name.toLowerCase().endsWith(".qps")) $("engine").value = "qp";
-      else if ($("engine").value === "qp") $("engine").value = "simplex";
+    if (!f) return;
+    mode = "file";
+    customName = f.name;
+    activeTmpl = null;
+    btnWrite.classList.remove("active");
+    hit.classList.add("has-file");
+    hit.querySelector("span").textContent = "Using " + f.name;
+    if (f.name.toLowerCase().endsWith(".qps")) $("engine").value = "qp";
+    const reader = new FileReader();
+    reader.onload = () => {
+      setMpsText(String(reader.result || ""), { clean: true });
+      showTab("mps");
       renderProblems();
-      updateSolveHint();
+      updateChrome();
       resetAnswer();
-    }
+    };
+    reader.readAsText(f);
   });
 
   $("verbose").addEventListener("change", () => {
-    if (!$("verbose").checked) showLog("");
+    if ($("verbose").checked && logEl.textContent.trim()) logEl.hidden = false;
+    else if (!$("verbose").checked) logEl.hidden = true;
   });
 
   btnSolve.addEventListener("click", solve);

@@ -8,6 +8,7 @@
 #include "forge/engines/farkas.hpp"
 #include "forge/engines/simplex.hpp"
 #include "forge/io/mps.hpp"
+#include "forge/sparse/csr.hpp"
 
 #include "fixtures.hpp"
 #include "test_helpers.hpp"
@@ -64,6 +65,81 @@ void test_fixture_lp() {
     CHECK(run.diag.dual_bound_finite);
     CHECK_NEAR(run.diag.dual_objective, forge::test::kTestLpOptimum, 1e-9);
     CHECK(run.diag.gap_rel < 1e-9);
+    CHECK(run.diag.preprocessing_builds == 1);
+    CHECK(run.diag.stages >= 1);
+}
+
+void test_auto_primal_first_skips_discarded_dual_probe() {
+    // A deliberately wide, sparse LP exercises Auto's primal-first shape
+    // classifier. The old dispatcher still ran and discarded a 256-iteration
+    // dual probe on this path. A proved primal result must now finish in one
+    // stage while retaining the shared one-build preprocessing invariant.
+    forge::model::LpProblem lp;
+    lp.name = "WIDE_PRIMAL_FIRST";
+    lp.A = forge::sparse::from_triplets(1, 8, {0}, {0}, {1.0});
+    lp.c = {-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    lp.row_lo = {-forge::model::kInf};
+    lp.row_hi = {1.0};
+    lp.col_lo.assign(8, 0.0);
+    lp.col_hi.assign(8, 1.0);
+    lp.is_integer.assign(8, false);
+
+    SimplexOptions opts;
+    opts.presolve = false;  // preserve the deliberately wide shape
+    SimplexDiagnostics diag;
+    const auto raw = forge::engines::solve_simplex(lp, opts, diag);
+    CHECK(raw.proposed_status == Status::Optimal);
+    CHECK_NEAR(raw.objective, -1.0, 1e-9);
+    CHECK(diag.stages == 1);
+    CHECK(diag.preprocessing_builds == 1);
+}
+
+void test_auto_candidate_order_uses_feasibility_before_gap() {
+    SimplexOptions opts;
+    forge::core::RawResult early, later;
+    early.proposed_status = Status::Interrupted;
+    later.proposed_status = Status::Interrupted;
+    early.objective = 1.0;
+    later.objective = 100.0;
+
+    // A dual-feasible early probe may have a numerically zero objective gap
+    // while still being badly primal infeasible. The gap is not an optimality
+    // metric in that state; the later basis with the smaller actual violation
+    // must win. This directly guards Auto's multi-stage selection invariant.
+    SimplexDiagnostics early_diag, later_diag;
+    early_diag.primal_residual = 100.0;
+    early_diag.dual_residual = 0.0;
+    early_diag.dual_bound_finite = true;
+    early_diag.gap_rel = 0.0;
+    later_diag.primal_residual = 1.0;
+    later_diag.dual_residual = 0.0;
+    later_diag.dual_bound_finite = true;
+    later_diag.gap_rel = 10.0;
+    CHECK(forge::engines::detail::prefer_simplex_candidate(
+        later, later_diag, early, early_diag, opts, false));
+    CHECK(!forge::engines::detail::prefer_simplex_candidate(
+        early, early_diag, later, later_diag, opts, false));
+
+    // Once both points are primal and dual feasible, gap becomes legitimate
+    // and is used before objective quality.
+    early_diag.primal_residual = 0.0;
+    later_diag.primal_residual = 0.0;
+    early_diag.gap_rel = 1e-8;
+    later_diag.gap_rel = 1e-10;
+    CHECK(forge::engines::detail::prefer_simplex_candidate(
+        later, later_diag, early, early_diag, opts, false));
+
+    // A usable primal-feasible point dominates an infeasible point regardless
+    // of the latter's status label or apparently better objective.
+    early.proposed_status = Status::Optimal;
+    early_diag.primal_residual = 1e-3;
+    early_diag.gap_rel = 0.0;
+    later.proposed_status = Status::Interrupted;
+    later_diag.primal_residual = 0.0;
+    later_diag.dual_residual = 1.0;
+    later_diag.dual_bound_finite = false;
+    CHECK(forge::engines::detail::prefer_simplex_candidate(
+        later, later_diag, early, early_diag, opts, false));
 }
 
 // Every row must have exactly one basic variable and the basis must be a
@@ -388,6 +464,8 @@ ENDATA
 
 int main() {
     test_fixture_lp();
+    test_auto_primal_first_skips_discarded_dual_probe();
+    test_auto_candidate_order_uses_feasibility_before_gap();
     test_basis_wellformed();
     test_features_mps_agrees_with_model();
     test_infeasible();

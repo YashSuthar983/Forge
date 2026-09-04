@@ -82,7 +82,7 @@ private:
 
 // N vectors of equal length, contiguous. The batched kernels take one shared
 // SparsePattern plus a BatchView -- the shape that makes affordable strong
-// branching possible (docs/architecture.md §6, docs/master_spec.md §3 Bet 1).
+// branching possible (docs/architecture.md §3 — batched LpDevice seam).
 template <class T>
 class BatchView {
 public:
