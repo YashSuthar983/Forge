@@ -253,6 +253,40 @@ async def health() -> dict[str, Any]:
     }
 
 
+@app.get("/api/model/{preset_id}")
+async def get_preset_model(preset_id: str) -> dict[str, Any]:
+    if preset_id not in PRESETS:
+        raise HTTPException(404, f"Unknown preset '{preset_id}'")
+    path = Path(PRESETS[preset_id]["path"])
+    if not path.is_file():
+        raise HTTPException(404, f"File missing: {path}")
+    text = path.read_text(encoding="utf-8", errors="replace")
+    # Cap huge files for the browser editor
+    truncated = False
+    if len(text) > 400_000:
+        text = text[:400_000] + "\n* … truncated for editor …\n"
+        truncated = True
+    return {
+        "id": preset_id,
+        "label": PRESETS[preset_id]["label"],
+        "path": str(path.name),
+        "format": path.suffix.lower().lstrip(".") or "mps",
+        "text": text,
+        "truncated": truncated,
+        "engine": PRESETS[preset_id]["engine"],
+        "backend": PRESETS[preset_id].get("backend", "cpu"),
+    }
+
+
+@app.post("/api/lp-to-mps")
+async def lp_to_mps(model_text: str = Form(...)) -> dict[str, Any]:
+    try:
+        mps, meta = lp_text_to_mps(model_text, name="WEBTEXT")
+    except LpTextError as e:
+        raise HTTPException(400, f"Equation parse error: {e}") from e
+    return {"mps": mps, "meta": meta}
+
+
 @app.post("/api/solve")
 async def solve(
     preset: str | None = Form(default=None),
@@ -263,6 +297,7 @@ async def solve(
     verbose: bool = Form(default=False),
     max_iter: int | None = Form(default=None),
     model_text: str | None = Form(default=None),
+    mps_text: str | None = Form(default=None),
     file: UploadFile | None = File(default=None),
 ) -> dict[str, Any]:
     if time_limit < 0 or time_limit > 300:
@@ -275,7 +310,16 @@ async def solve(
     text_meta: dict[str, Any] | None = None
 
     try:
-        if model_text is not None and model_text.strip():
+        # Edited MPS / QPS buffer wins (Gurobi-style inspect → tweak → optimize).
+        if mps_text is not None and mps_text.strip():
+            raw = mps_text.strip()
+            suffix = ".qps" if "QUADOBJ" in raw.upper() else ".mps"
+            model_path = session / f"model{suffix}"
+            model_path.write_text(raw + ("\n" if not raw.endswith("\n") else ""))
+            display_name = "Edited model"
+            if suffix == ".qps" and engine == "simplex":
+                engine = "qp"
+        elif model_text is not None and model_text.strip():
             try:
                 mps, text_meta = lp_text_to_mps(model_text, name="WEBTEXT")
             except LpTextError as e:
@@ -283,11 +327,6 @@ async def solve(
             model_path = session / "model.mps"
             model_path.write_text(mps)
             display_name = "Your equations"
-            if engine in {"simplex", "auto"} or (
-                engine == "simplex" and text_meta.get("suggested_engine") == "milp"
-            ):
-                # Auto-pick milp when integers present and client left LP engine.
-                pass
             if text_meta.get("suggested_engine") == "milp" and engine == "simplex":
                 engine = "milp"
         elif file is not None and file.filename:
@@ -314,7 +353,8 @@ async def solve(
             display_name = str(info["label"])
         else:
             raise HTTPException(
-                400, "Provide preset=…, model_text=…, or upload a model file"
+                400,
+                "Provide mps_text=…, model_text=…, preset=…, or upload a model file",
             )
 
         sol_path = session / "out.sol"

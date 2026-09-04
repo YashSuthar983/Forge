@@ -222,6 +222,10 @@ bool support_box(const std::vector<f64>& z, const std::vector<f64>& lo,
 core::RawResult solve_qp_general(const QpProblem& p, const QpOptions& opts,
                                  QpDiagnostics& diag) {
     const auto t0 = Clock::now();
+    const auto deadline = (opts.time_limit_s > 0.0)
+        ? t0 + std::chrono::duration_cast<Clock::duration>(
+              std::chrono::duration<double>(opts.time_limit_s))
+        : Clock::time_point::max();
     core::RawResult raw;
     raw.engine = "qp_pdhcg2";
     raw.backend = "cpu";
@@ -440,6 +444,7 @@ core::RawResult solve_qp_general(const QpProblem& p, const QpOptions& opts,
                 std::fprintf(stderr, "qp iter=%llu primal=%.3e dual=%.3e gap=%.3e\n",
                              static_cast<unsigned long long>(k + 1),
                              diag.primal_residual, diag.stationarity, diag.gap_rel);
+            if (Clock::now() >= deadline) break;
         }
     }
     if (diag.iterations == 0 || !converged) converged = evaluate();

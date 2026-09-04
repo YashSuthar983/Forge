@@ -4,7 +4,7 @@
 Runs sor_solve and one or more EXTERNAL baseline solvers over a named instance
 set, cross-checks objectives, and reports shifted geometric means.
 
-Protocol rules this script enforces (sor/docs/master_spec.md §9):
+Protocol rules this script enforces (sor/docs/architecture.md §7–§8):
   * every timeout, numerical failure, and disagreement is reported -- a table
     with no failure rows is a lie;
   * baselines run as separate processes, tagged "kind": "external_process",

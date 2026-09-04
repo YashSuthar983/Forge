@@ -1,59 +1,43 @@
 # Simplex Performance Audit
 
-Benchmark: Netlib, 93 models, 20 s per solver, `tol=1e-7`, sequential on the
-same host. Latest clean run: SOR `92/93`, shifted-geomean wall time `0.1913 s`;
-HiGHS `93/93`, `0.0931 s`; ratio `2.06x`.
+Benchmark protocol: Netlib, 93 models, sequential on the same host, HiGHS as
+**external process**. Latest clean run:
+
+| Run | Limit | SOR solved | SOR SGM | HiGHS | Ratio |
+|---|---:|---:|---:|---:|---:|
+| `compare-netlib-20260904-070105` | 30 s | **92/93** | **0.2085 s** | 0.0905 s | **2.30×** |
+
+Miss: `dfl001` (`Interrupted`). All 92 Optimal rows carry `ProvedOptimalFP`.
 
 ## What Is Actually Implemented
 
+Verified in `sor_la_cpu/src/lu.cpp`, `sor_engines/src/{simplex,dual_simplex,dual_bfrt,dual_edge_weights}.cpp`, `sor_presolve/`.
+
 | Technique in the papers | SOR state | Consequence |
 |---|---|---|
-| Forrest-Tomlin / modified product form | Product-form eta file | FTRAN/BTRAN cost grows with accumulated eta nnz; this is the largest per-iteration gap. |
-| Hall-McKinnon hypersparse solves | Base L/U reach sets only | Eta application is still product-form work, so hypersparsity is not end-to-end. |
-| Forrest-Goldfarb dual steepest edge | Devex-style upper-bound weights | Hard dual models take substantially more pivots: greenbea `9172/2524`, maros-r7 `5586/2457`, d2q06c `10362/5295` (SOR/HiGHS). |
-| Andersen-Andersen presolve | Fixed columns, empty rows, equality singletons | Many HiGHS presolve reductions are absent; small models can remain 5-20x more iterations. |
-| Koberstein/Huangfu-Hall dual phase 1 and collective BFRT | BFRT and incremental flips, but no collective FT update | Phase-1 work and eta maintenance remain expensive on degen3, pilot, and 80bau3b. |
-| Candidate lists / partial pricing | Full leaving-row scan and support pricing | Pricing is still a major share of SOR time on d2q06c and greenbea. |
+| Forrest–Tomlin / modified product form | **Both present**; product-form is **default**; FT via `--basis-update ft`; collective collapse via `collective_ft` | Default path: FTRAN/BTRAN cost grows with eta nnz — still the largest per-iteration gap on long runs |
+| Hall–McKinnon hypersparse solves | Reach-set L/U **and** identity-eta skip (`test_lu` hypersparse+etas) | Default product-form still pays residual eta work between collapses/refactors |
+| Forrest–Goldfarb dual steepest edge | DSE + Devex in `dual_edge_weights.cpp` | Hard dual models can still take more pivots than HiGHS |
+| Andersen–Andersen presolve | v1: fixed columns, empty rows, equality singletons | Many HiGHS reductions absent; small models can remain iteration-heavy |
+| Koberstein / Huangfu–Hall dual phase 1 and collective BFRT | BFRT + incremental flips; `collapse_pending_into_ft` **opt-in** (not full APF) | Phase-1 / multi-flip path still expensive on degen3, pilot, 80bau3b when defaults stay product-form |
+| Candidate lists / partial pricing | Full leaving-row scan and support pricing | Pricing share still large on d2q06c and greenbea |
 
-Representative SOR timing shares from verbose runs are approximately:
+Representative timing shares (verbose runs, earlier Sep profiling — order-of-magnitude still valid):
 
-- `d2q06c`: 2.4 s solves, 1.7 s pricing, 0.4 s factorization.
-- `maros-r7`: 2.3 s solves, 1.2 s pricing.
-- `greenbea`: 1.0 s solves, 0.6 s pricing.
+- `d2q06c`: majority in pricing + solves; factorization secondary
+- `maros-r7` / `greenbea`: solves + pricing dominate
 
-This rules out the earlier claim that Tier 1+2 should automatically reach
-`0.9-1.2x`. With the shipped subset, both pivot count and cost per pivot are
-behind HiGHS. A realistic next milestone is `1.3-1.7x` after a correct
-Forrest-Tomlin/MPF update and better edge weighting; parity requires both,
-broader presolve, and phase-1 work reduction.
+A realistic next milestone is **~1.3–1.7×** HiGHS SGM after FT-as-default + better edge-weight stability; parity needs broader presolve and phase-1 work reduction as well. Do **not** claim sub-1.2× until measured.
 
-## Industrial follow-up (2026-09-02)
+## Industrial follow-up (updated 4 Sep 2026)
 
-The first XXL/HUGE run exposed two workload-specific implementation costs:
+From `industrial-perf-20260904-071353` (seed 42, 120 s):
 
-- The diagonal dispatch QP rebuilt a Schur complement by rescanning the full
-  one-row incidence list on every active-set iteration. The exact one-row KKT
-  reduction now solves one monotone scalar multiplier problem, reducing the
-  8k/10k-generator cases from 57.5/112.8 s to 1.2/1.6 ms of solver time,
-  with a `ProvedKKT` certificate.
-- Auto simplex sent dense blending models through a dual probe and full dual
-  run even though the primal ratio test reached a feasible basis much sooner.
-  A density-aware dispatch now selects the primal path for this family. The
-  XXL/HUGE cases measure 0.20/0.89 s solver time and remain objective-matching
-  and `ProvedOptimalFP`.
-
-MILP remains the main gap. Node LPs now reuse the parent basis and no longer
-inherit the public node limit as a per-node pivot cap. A bounded integer repair
-heuristic produces a root incumbent for the generated schedule XXL model;
-100 warm-started nodes reach a 5.27% gap in 8.2 s. The HUGE root relaxation
-still exceeds a 3 s budget, so the solver reports `time limit` honestly and
-does not claim an infeasible tree. Closing this gap requires classical MIP
-features (reliability branching, cuts, and stronger incumbent heuristics), not
-another LP pricing micro-optimization.
+- **blend_lp:** SOR Optimal and obj-agrees S→HUGE; wall speedup vs HiGHS rises with size (L 1.15× … HUGE **4.29×**). Density-aware auto dispatch keeps blending on the primal path.
+- **dispatch_qp:** diagonal active-set / one-row KKT path is Optimal and agrees through XL; XXL/HUGE SOR Optimal while HiGHS-QP timed out (agree=False — publish honestly).
+- **schedule_milp:** Optimal + obj agree at all tiers, but SOR wall trails HiGHS badly at scale (HUGE **0.03×**). Closing this needs classical MIP depth (node cuts, stronger heuristics), not only LP pricing micro-opts.
 
 ## References
 
-The clean-room bibliography and local notes are in
-[`paper_bibliography.md`](paper_bibliography.md). The relevant primary sources
-are Forrest-Tomlin (1972), Forrest-Goldfarb (1992), Hall-McKinnon (2005),
-Koberstein (2008), and Huangfu-Hall (2015, 2018).
+Primary sources and SOR status tags: [`paper_bibliography.md`](paper_bibliography.md).  
+Capability map: [`architecture.md`](architecture.md).

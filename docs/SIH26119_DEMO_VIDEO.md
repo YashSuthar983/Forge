@@ -30,7 +30,7 @@ Examples: `examples/crude_blending/blend_s42.mps`, `examples/scheduling/schedule
 | Power dispatch **QP** | `./sor_solve examples/dispatch/dispatch_s42.qps --engine qp` | QP path |
 | Schedule **MILP** | `./sor_solve examples/scheduling/schedule_s42.mps --engine milp --time-limit 30 --verbose` | Nodes / incumbent / Feasible or Optimal |
 | GPU FO (if Vulkan works) | `./sor_solve examples/sparse500.mps --engine hpr --backend vulkan` | Backend + transfer table |
-| Netlib credibility | One small Netlib MPS + flash the Netlib summary table | vs HiGHS, honest SGM |
+| Netlib credibility | One small Netlib MPS + flash `compare-netlib-20260904-070105` summary | SOR 92/93 ProvedOptimalFP · SGM 2.30× vs HiGHS |
 | Clean-room | `ldd build-native/sor_solve` | No HiGHS/SCIP/CBC linked |
 
 That is already a **complete PS-aligned video** without any web.
@@ -81,7 +81,7 @@ Browser
 | 1:15–1:45 | **CLI live** | Blend LP → Optimal; `sor_check` PASS |
 | 1:45–2:15 | **CLI live** | Dispatch QP → Optimal; Schedule MILP → incumbent / gap (say Feasible honestly if not proved) |
 | 2:15–2:45 | **Web console** (optional) | Same Blend run from browser — “demo UI calling the same engine” |
-| 2:45–3:15 | Benchmarks | Netlib 92/93 vs HiGHS table; industrial blend size ladder flash |
+| 2:45–3:15 | Benchmarks | Netlib **92/93** `ProvedOptimalFP`, SGM **0.2085 vs 0.0905** HiGHS; industrial blend ladder (SOR faster at large nnz) |
 | 3:15–3:35 | GPU / clean-room | Vulkan HPR transfer line **or** `ldd` showing no solver libs |
 | 3:35–4:00 | Close | Extensible foundation; MIQP/NLP roadmap; GitHub + CLI |
 

@@ -1,11 +1,16 @@
 # SIH 2026 — Idea PPT copy
 
-**Use this file as speaker notes + slide text.** One `## Slide` = one PPT slide. Keep the portal title typos out of spoken lines: **Express = FICO Xpress**, **CEPLEX = IBM ILOG CPLEX**.
+**Use this file as speaker notes + slide text.** One `## Slide` = one PPT slide.  
+Portal typos stay out of spoken lines: **Express = FICO Xpress**, **CEPLEX = IBM ILOG CPLEX**.
 
 Product: **SOR** (Sovereign Optimization Runtime)  
 PS: **SIH26119** · MRPL · Software · Smart Automation
 
-Re-run Netlib / MIPLIB / industrial benches **the day you freeze the PDF** and replace numbers in Slide 8 if they moved.
+**Numbers below verified from** `benchmarks/results/FULL_PERF_HIGHS_20260904-070105.md`  
+(Netlib `compare-netlib-20260904-070105`, industrial `industrial-perf-20260904-071353`, MIPLIB `compare-new-all-20260904-072056`).  
+Re-run the day you freeze the PDF and replace Slide 8 if they moved.
+
+Code truth: `docs/architecture.md`. PS map: `docs/SIH26119_PS_ALIGNMENT.md`.
 
 ---
 
@@ -29,84 +34,104 @@ Footer: GitHub source · Demo video
 
 ## Slide 2 — Idea / Approach
 
-**One line:** A from-scratch LP + MILP + QP engine for Indian industry — no foreign solver library in the binary, sparse numerics, honest proofs, CLI, public benchmarks, GPU where it is actually faster.
+**One line:** A from-scratch LP + MILP + QP engine — no foreign solver library in the binary, sparse numerics, honest proofs, CLI, public benchmarks, GPU where transfer-inclusive time wins.
 
-**Problem:** Refinery scheduling, blending, planning, logistics, and dispatch depend on CPLEX, Gurobi, and Xpress. High recurring licenses, closed internals, no sovereign control. Open solvers (CBC, HiGHS, SCIP) exist but still lag on hard large-scale MILP. The work is the **engine**, not a GUI.
+**Problem:** Refinery scheduling, blending, planning, logistics, and dispatch depend on CPLEX, Gurobi, and Xpress. High recurring licenses, closed internals, no sovereign control. Open solvers exist but still lag on hard large-scale MILP. The work is the **engine**, not a GUI.
 
-**Approach — four layers**
+**Approach — four layers (what the code actually has)**
 
-1. **Sparse LP core** — revised primal + dual simplex, Markowitz LU, Harris / BFRT, scaling, presolve
-2. **MILP search** — branch-and-cut, cutting planes, heuristics, domain propagation
-3. **Convex QP** — dispatch / quadratic planning class
-4. **GPU first-order path** — device-resident HPR/PDHG; timings include host↔device transfer
+1. **Sparse LP core** — revised primal + dual simplex, Markowitz LU, Harris / BFRT, Devex/DSE, Ruiz scaling, v1 presolve; FT update opt-in
+2. **MILP search** — branch-and-cut (root GMI), reliability branching + strong probes, dive / neighbourhood, domain propagation
+3. **Convex QP** — sparse symmetric Q + PDHCG path; diagonal active-set fast path for dispatch
+4. **GPU first-order path** — Vulkan `LpDevice` HPR (6 SPIR-V shaders); timings include host↔device transfer
 
-**Interfaces:** CLI (`sor_solve`, `sor_check`, `sor_gen`) and C++ API. Polished GUI is out of scope (PS).
+**Interfaces:** CLI (`sor_solve`, `sor_check`, `sor_gen`) and C++ libraries. Polished GUI is out of scope (PS).
 
-**Guarantee:** `Optimal` only after residual / proof gating. Independent `sor_check` re-verifies the claim against the original model.
+**Guarantee:** `Optimal` only via `finalize_result()` after residual / proof gating. Independent `sor_check` re-verifies against the original model.
 
-**Non-claims:** not a PIMS plugin; not confidential MRPL data; not “faster than CPLEX/Gurobi” in general.
+**Non-claims:** not a PIMS plugin; not confidential MRPL data; not “faster than CPLEX/Gurobi” in general; not VIPR/rational certified yet.
 
 ---
 
-## Slide 3 — Methodology
+## Slide 3 — Methodology (flow)
 
 ```text
 INPUT  MPS / QPS / C++ API
               │
               ▼
-     Model  →  Presolve + scaling
+     Model  →  Presolve (v1) + Ruiz scaling
               │
-     ┌────────┼──────────────┐
-     ▼        ▼              ▼
-    LP       QP            MILP
-  primal /  active-set    Branch-and-Cut
-  dual      / KKT         cuts · heuristics
-  simplex                 branching · propagation
-  + HPR (CPU/GPU)
-     │        │              │
-     └────────┴──────┬───────┘
-                     ▼
-            Sparse LU (CPU)
-            GPU FO (measured)
-                     ▼
-            Unscale + postsolve + certificate
-                     ▼
-            Independent checker
+     ┌────────┼────────────────┐
+     ▼        ▼                ▼
+    LP       QP              MILP
+  primal /  active-set /    Branch-and-Cut
+  dual      PDHCG           root GMI · heuristics
+  simplex                   reliability branch
+  + HPR (CPU/Vulkan)        · propagation
+     │        │                │
+     └────────┴────────┬───────┘
+                       ▼
+              Sparse LU (CPU) — proof engine
+              GPU FO — approximate path (no crossover yet)
+                       ▼
+              Unscale + postsolve
+                       ▼
+              finalize_result  →  Status + ProofLevel
+                       ▼
+              sor_check (independent residuals / Farkas)
+```
+
+```mermaid
+flowchart LR
+  MPS[MPS/QPS] --> IO[sor_io]
+  IO --> PRE[sor_presolve]
+  PRE --> ENG{engine}
+  ENG -->|simplex| SX[primal/dual LU]
+  ENG -->|hpr| GPU[LpDevice Vulkan/CPU]
+  ENG -->|milp| BB[sor_search B&C]
+  ENG -->|qp| QP[qp / PDHCG]
+  SX --> FIN[finalize_result]
+  GPU --> FIN
+  BB --> FIN
+  QP --> FIN
+  FIN --> CHK[sor_check]
 ```
 
 **Clean-room:** built from mathematical papers, not by linking or translating HiGHS / SCIP / CBC / cuOpt. Those solvers run only as **external processes** for comparison.
 
 ---
 
-## Slide 4 — Tech stack
+## Slide 4 — Tech stack (verified)
 
-| Layer | Choice |
+| Layer | Choice (in tree) |
 |---|---|
 | Language / build | C++20, CMake |
-| GPU | Vulkan + SPIR-V compute (`LpDevice`); CPU fallback |
-| Linear algebra | CSR/CSC, Markowitz sparse LU, FTRAN/BTRAN, product-form and Forrest–Tomlin updates |
-| LP | Primal + dual revised simplex (Harris, Devex, DSE, BFRT), HPR / PDHG |
-| MILP | Branch-and-cut, Gomory MI cuts, reliability branching, dive / neighbourhood, domain propagation |
-| QP | Convex sparse symmetric Hessian, two-sided linear rows + bounds; diagonal active-set fast path |
+| GPU | Vulkan + SPIR-V (`LpDevice`); CUDA stub returns null; optional Julia sidecar OFF by default |
+| Linear algebra | CSR/CSC, Markowitz sparse LU, hypersparse FTRAN/BTRAN, product-form default + Forrest–Tomlin opt-in |
+| LP | Primal + dual revised simplex (Harris, BFRT, Devex, DSE), HPR / PDHG |
+| MILP | B&B + **root** GMI cuts, reliability branching, dive / neighbourhood, propagation |
+| QP | Convex sparse symmetric Hessian; diagonal active-set fast path |
 | I/O | MPS, QPS, solution files |
-| Front ends | `sor_solve` · `sor_check` · `sor_gen` |
-| Benchmarks | Netlib, MIPLIB subset, industrial generators vs **HiGHS (external)** |
+| Front ends | `sor_solve` · `sor_check` · `sor_gen` · `sor_ext_demo` |
+| Benchmarks | Netlib, MIPLIB-easy, industrial generators vs **HiGHS (external)** |
+
+`ldd sor_solve` (Vulkan ON): `libvulkan` + libstdc++ / libm / libgcc / libc — **no solver library**.
 
 ---
 
 ## Slide 5 — Solver layers (what each does)
 
 **LP**  
-Revised simplex on sparse bases. Dual simplex for MIP node LPs (warm start). Harris ratio test + dual bound-flipping for degeneracy. Devex / dual steepest-edge pricing. Ruiz scaling. Presolve + postsolve.
+Revised simplex on sparse bases. Dual simplex for MIP node LPs (warm start). Harris ratio test + dual bound-flipping. Devex / dual steepest-edge. Ruiz scaling. Presolve + postsolve. FT available via `--basis-update ft`.
 
 **MILP**  
-Root cutting-plane loop (Gomory mixed-integer, numerical filters). Reliability branching with strong-branch probes. Rounding repair, integer dive, neighbourhood search. Domain propagation. Relative MIP-gap termination. Honest `Feasible` vs proved `Optimal`.
+Root cutting-plane loop (Gomory MI + pool). Reliability branching with strong-branch probes. Rounding repair, integer dive, neighbourhood search. Domain propagation. Relative MIP-gap termination. Honest `Feasible` vs proved `Optimal`.
 
 **QP**  
-Convex quadratic with sparse symmetric PSD Hessian — inequalities, ranged/equality rows and bounds. PSD, stationarity, feasibility and Wolfe-gap checks gate `Optimal`; diagonal dispatch uses an exact active-set fast path.
+Convex quadratic with sparse symmetric PSD Hessian. PSD, stationarity, feasibility and Wolfe-gap checks gate `Optimal`; diagonal dispatch uses an exact active-set fast path.
 
 **GPU**  
-Device owns iterates. Host calls fused first-order steps and reads a handful of KKT scalars. Report kernel time **and** H2D/D2H. Sparse simplex pivoting stays on CPU (that is where proofs live).
+Device owns HPR iterates. Host calls fused first-order steps. Report kernel time **and** H2D/D2H. Sparse simplex pivoting stays on CPU (that is where proofs live). No FO→basis crossover yet → FO cannot claim `ProvedOptimalFP`.
 
 **Robustness**  
 Farkas check for infeasibility. Status ladder includes `NumericalFailure` and `Unsupported` — never hide a miss as Optimal.
@@ -123,6 +148,7 @@ sor_solve MODEL.mps
     --engine simplex | hpr | milp | qp
     --backend cpu | vulkan
     --method auto | primal | dual
+    --basis-update product | ft
     --solution-out out.sol
                  │
                  ▼
@@ -135,9 +161,9 @@ sor_check MODEL.mps out.sol     independent residuals / Farkas
 **Live demo (2–3 min)**
 
 1. Blend LP → Optimal, objective matches HiGHS  
-2. Small MIPLIB MILP → incumbent + gap  
+2. Small MIPLIB MILP → incumbent + gap (say Feasible honestly when not proved)  
 3. Dispatch QP → Optimal  
-4. Same LP on Vulkan with transfer table  
+4. Same LP on Vulkan HPR with transfer table  
 5. `sor_check` on the written solution  
 
 ---
@@ -155,29 +181,55 @@ Screenshot placeholders:
 
 ---
 
-## Slide 8 — Prototype output (measured)
+## Slide 8 — Prototype output (measured 4 Sep 2026)
 
-*Replace with the freeze-day run. Snapshot from this repo:*
+**Source:** `FULL_PERF_HIGHS_20260904-070105` · host `yash-Bravo-15-B5DD` · HiGHS external only.
 
-**Netlib LP** — 93 instances, 20 s, vs HiGHS external  
+### Netlib LP — 93 instances, 30 s limit
 
 | Solver | Solved | Obj match | SGM time |
 |---|---:|---:|---:|
-| SOR | 92/93 | 92/93 | 0.20 s |
-| HiGHS | 93/93 | 93/93 | 0.09 s |
+| **SOR-simplex** | **92/93** | **92/93** | **0.2085 s** |
+| SOR-pdhg | 8/93 | 28/93 | 0.3598 s |
+| SOR-hpr | 17/93 | 33/93 | 0.5569 s |
+| HiGHS | 93/93 | 93/93 | **0.0905 s** |
 
-Honest line: ~**2×** slower SGM than HiGHS on this set; **0 objective disagreements** on the 92 solved. Miss: `dfl001` time-limited.
+- **92/93** carry `ProvedOptimalFP` (every Optimal instance).  
+- Honest line: ~**2.30×** slower SGM than HiGHS on this set; **0 objective disagreements** on the 92 solved.  
+- Miss: `dfl001` — `Interrupted` at 30 s (HiGHS Optimal in ~5.2 s).
 
-**MIPLIB-easy (20)**  
-Incumbents on most instances; several proved Optimal (`flugpl`, `p0033`, `p0201`, `rgn`, `blend2`, …). Many still **Feasible, not proved** — say that.
+### Industrial generators (seed 42, 120 s) — highlights
 
-**Industrial generators (seed 42)**  
+| Kind | Result |
+|---|---|
+| blend_lp S→HUGE | All Optimal, obj agrees; SOR **faster** from L–HUGE (HUGE **4.29×** vs HiGHS) |
+| schedule_milp S→HUGE | All Optimal, obj agrees; SOR slower at scale (HUGE **0.03×**) — say the gap |
+| dispatch_qp S→XL | Optimal + agree; large diagonal path much faster than HiGHS-QP |
+| dispatch_qp XXL/HUGE | SOR Optimal; HiGHS timed out — obj agree flagged False (honest) |
 
-- Blend LP through large sparse sizes: Optimal, agrees with HiGHS  
-- Dispatch QP: Optimal on the intended demo sizes  
-- Schedule MILP: feasible incumbents; quality/time still behind HiGHS on large sizes  
+### MIPLIB-easy + demos (23 instances, 30 s)
 
-**Baseline:** at least one established open solver (HiGHS), as required.
+| Metric | Value |
+|---|---|
+| Incumbent coverage | **23/23** (10 Optimal · 13 Feasible) |
+| Proved Optimal (examples) | `blend2`, `enigma`, `flugpl`, `mod010`, `p0033`, `p0201`, `rgn` + demos |
+| Message | Many still **Feasible, not proved** — say that out loud |
+
+**Baseline:** HiGHS as external process — satisfies “compare vs ≥1 open solver.”
+
+```mermaid
+flowchart TB
+  subgraph Netlib["Netlib 93"]
+    A[SOR-simplex 92/93 ProvedOptimalFP]
+    B[HiGHS 93/93]
+    A ---|SGM 2.30× slower| B
+  end
+  subgraph Ind["Industrial"]
+    C[blend_lp: SOR wins at large nnz]
+    D[schedule_milp: HiGHS still ahead]
+    E[dispatch_qp: diagonal fast path]
+  end
+```
 
 ---
 
@@ -185,17 +237,17 @@ Incumbents on most instances; several proved Optimal (`flugpl`, `p0033`, `p0201`
 
 **PS success criteria**
 
-1. From-scratch core (no solver library in the link graph)  
-2. LP, MILP, QP on public libraries (MIPLIB, Netlib, QPLIB)  
-3. Robustness: degeneracy, ill-conditioning, weak MIP relaxations  
-4. Basic API **or** CLI — no GUI required  
-5. GPU **where transfer-inclusive time improves**
+1. From-scratch core (no solver library in the link graph) — **met**  
+2. LP, MILP, QP on public libraries — **vertical slices met**  
+3. Robustness: degeneracy, ill-conditioning, weak MIP relaxations — **algorithms present; keep demoing**  
+4. Basic API **or** CLI — **CLI met**  
+5. GPU **where transfer-inclusive time improves** — **Vulkan path exists; show win + non-win**
 
 **Why it is feasible**  
-Vertical slice already solves real Netlib LPs and industrial blend LPs. Architecture is modular (IPM / MIQP / NLP later). Clean-room is checkable (`ldd`, CMake, policy doc).
+Vertical slice already solves real Netlib LPs (92/93 proved) and industrial blend LPs (SOR faster at large nnz). Architecture is modular. Clean-room is checkable (`ldd`, CMake, policy doc).
 
 **Named risks**  
-MILP still trails HiGHS on large schedules. GPU ceiling is memory-bandwidth (~4× on this RDNA1 laptop for fp64 SpMV). Million-variable **proved** MIP is not an SIH claim.
+MILP still trails HiGHS on large schedules. GPU ceiling is memory-bandwidth on this RDNA1 laptop. Million-variable **proved** MIP is not an SIH claim. No crossover yet for FO proofs.
 
 ---
 
@@ -212,7 +264,7 @@ Sovereign optimization engine for refining, blending, planning, logistics, and p
 - GPU for large sparse **continuous** LPs; simplex remains the proof engine  
 
 **Adoption**  
-MPS / CLI / native API. Not a replacement for Aspen PIMS; not a PIMS plugin.
+MPS / CLI / native C++ libs. Not a replacement for Aspen PIMS; not a PIMS plugin.
 
 Do **not** invent an MRPL rupee license figure.
 
@@ -222,81 +274,76 @@ Do **not** invent an MRPL rupee license figure.
 
 1. Huangfu & Hall — dual revised simplex / parallel simplex (2018)  
 2. Forrest & Goldfarb — dual steepest edge (1992)  
-3. Hall & McKinnon — hypersparse FTRAN/BTRAN (2005)  
+3. Forrest & Tomlin — basis update (1972); Hall & McKinnon — hypersparse FTRAN/BTRAN (2005)  
 4. Achterberg — branch-and-cut, cuts, propagation (PhD thesis, 2007)  
 5. Koberstein & Suhl — dual BFRT / dual phase 1  
 6. HPR-LP / first-order GPU LP literature  
 7. MIPLIB, Netlib LP, QPLIB, Mittelmann — public benchmarks  
 
-Footer: GitHub · hosted CLI demo · technical note (`docs/SIH26119_PS_ALIGNMENT.md`)
+Full DOI index: `docs/paper_bibliography.md`  
+Footer: GitHub · hosted CLI demo · `docs/SIH26119_PS_ALIGNMENT.md`
 
 ---
 
-# Appendix A — Optional extra slides (if the template allows 12–13)
+# Appendix A — Optional extra slides
+
+## Extra slide — System architecture (one diagram)
+
+```text
+L8  sor_solve · sor_check · sor_gen
+L7  sor_certify (finalize_result)
+L5  sor_search  (B&C, cuts, propagate)
+L4  sor_engines (simplex, dual, PDHG, HPR, QP)
+L3  sor_presolve
+L2  sor_model · sor_io
+L1  sor_sparse · sor_la_cpu · sor_backend (+ Vulkan)
+L0  sor_core    (Status · ProofLevel)
+```
 
 ## Extra slide — PS coverage map
 
 | PS demand | What we show |
 |---|---|
 | From scratch | `ldd` / no HiGHS-SCIP-CBC-cuOpt in the binary |
-| LP | Netlib table vs HiGHS |
-| MILP | MIPLIB subset + B&C |
-| QP | Dispatch / QPLIB subset |
-| Sparse + robust LA | Markowitz LU, Harris, BFRT |
-| CLI | `sor_solve` / `sor_check` |
+| LP | Netlib 92/93 ProvedOptimalFP vs HiGHS |
+| MILP | MIPLIB-easy + B&C (honest Feasible count) |
+| QP | Dispatch / QPS path |
+| Sparse + robust LA | Markowitz LU, Harris, BFRT, hypersparse, FT opt-in |
+| CLI | `sor_solve` / `sor_check` / `sor_gen` |
 | Industrial class | `sor_gen` blend / schedule / dispatch |
-| GPU if measurable | One win + one non-win, transfer included |
+| GPU if measurable | Vulkan HPR; transfer included; win **and** non-win |
 
 ## Extra slide — What we will not claim
 
 - Faster than CPLEX / Gurobi / Xpress in general  
 - Million-variable MILP proved optimal  
 - GPU accelerates every problem class  
-- NLP / MINLP results  
+- VIPR / rational-exact / crossover (not built)  
 - Confidential MRPL data  
 - A rupee figure for Indian PSU solver spend  
 
 ---
 
-# Appendix B — Not implemented (or partial) but required / strongly named by the PS
+# Appendix B — Gaps (internal freeze list)
 
-**Internal freeze list.** Do not put unimplemented rows on public slides as “done.” Ship these before the idea PDF / finale demo if you want the corresponding bullet.
+Do not put unimplemented rows on public slides as “done.”
 
-## Must (PS body)
-
-| Item | Today | Finish before claiming |
+| Item | Today (verified) | Before claiming “done” |
 |---|---|---|
-| MILP engine | Root B&C + B&B; weak on large MIP | Node cuts, stronger incumbents, more proved Optimal on MIPLIB |
-| QP | Sparse convex Q + two-sided rows implemented | GPU/PID tuning and QPLIB evidence table |
-| Public QP bench | Thin | Named QPLIB subset vs HiGHS |
-| Robustness demo | Algorithms exist | One named degenerate + one ill-conditioned log |
-| Farkas emission | Checker can verify a ray; simplex often does not emit | Verified Farkas on infeasible Netlib |
-| GPU benefit | Vulkan `LpDevice` exists | CPU vs Vulkan HPR table, H2D/D2H included, win **and** non-win |
-| Industrial MILP | Generators exist | Schedule quality closer to HiGHS for the demo size |
-| Large scale | Thousands–large nnz LP | Demo thousands of vars; do **not** claim million-var proved MIP |
-| C/Python API | CLI + C++ | Optional: CLI already satisfies “API or CLI” |
+| MILP at scale | Root B&C; trails HiGHS on large schedules | Node cuts, stronger incumbents |
+| FO proofs | HPR/PDHG Feasible only | Crossover → ProvedOptimalFP |
+| FT default | Implemented, opt-in (`--basis-update ft`) | Enable after Netlib/MIPLIB gate |
+| Collective FT | `collapse_pending_into_ft` opt-in | Default-on after gate; full APF still open |
+| Hypersparse story | Reach-set + identity-eta skip in tree | Publish FT-default + large-sparse timing story |
+| GPU benefit table | Vulkan exists | Published CPU vs Vulkan HPR with H2D/D2H |
+| `sor_verify` / VIPR | Enums only | Separate binary, no engine link |
+| CI `check_*` scripts | Missing | Forbidden-deps / layering / determinism gates |
+| QPLIB table | Thin | Named subset vs HiGHS |
 
-## Should (named: B&B, B&C, cuts, presolve, heuristics, node selection, multi-core, GPU)
-
-| Item | Today | Gap |
-|---|---|---|
-| Branch-and-cut | Root GMI only | Cuts at tree nodes; cut pool |
-| Cut families | GMI + some covers | CMIR / MIR, lifted covers, cliques |
-| Presolve | v1 singletons / fixed / empty | Probing, dual fixing, aggregation |
-| Heuristics | Rounding, dive, neighbourhood | Feasibility / kernel pump, RINS as first-class |
-| Node selection | Best-bound | Hybrid plunge / DIVE |
-| Multi-core | Serial | Parallel node LPs or parallel presolve |
-| Interior-point | Absent | Optional (“may include”) — roadmap slide only |
-| Crossover | Absent | First-order → basic `ProvedOptimalFP` |
-| Forrest–Tomlin default | Implemented, not default | Enable after Netlib/MIPLIB gate |
-| Hypersparse claim | Code present | Show on a large sparse instance |
-
-## Not required (do not treat as PS holes)
-
-GUI · modelling language · confidential plant data · beating CPLEX/Gurobi · NLP/MINLP/MIQP as SIH delivery · AI/ML branching
+**Not required for SIH:** GUI · modelling language · confidential plant data · beating CPLEX · NLP/MINLP as delivery · AI/ML branching
 
 ---
 
 # Appendix C — Spoken 60-second pitch
 
-India’s refineries and grids optimize with closed foreign solvers. We are building **SOR**: a from-scratch LP, MILP, and QP engine — sparse simplex for proofs, first-order methods on GPU where transfer-inclusive time wins, branch-and-cut for integers, CLI plus an independent checker. We compare honestly to HiGHS on Netlib and MIPLIB. We do not wrap an open solver, we do not fake Optimal, and we do not claim we beat CPLEX. The product is a sovereign engine MRPL-class problems can actually call.
+India’s refineries and grids optimize with closed foreign solvers. We are building **SOR**: a from-scratch LP, MILP, and QP engine — sparse simplex for proofs (92 of 93 Netlib instances proved Optimal against HiGHS), first-order methods on Vulkan where transfer-inclusive time wins, branch-and-cut for integers, CLI plus an independent checker. We compare honestly to HiGHS. We do not wrap an open solver, we do not fake Optimal, and we do not claim we beat CPLEX. The product is a sovereign engine MRPL-class problems can actually call.

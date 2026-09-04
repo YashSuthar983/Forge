@@ -1,6 +1,6 @@
 # SOR — Paper Reference (single source of truth)
 
-**Companions:** `master_spec.md` · `implementation_plan.md` · `clean_room_policy.md` · `dependency_ledger.md` §5 · `reference_log.md` (forbidden-repo audit only)
+**Companions:** `architecture.md` · `clean_room_policy.md` · `dependency_ledger.md` §5 · `reference_log.md` (forbidden-repo audit only)
 
 **Rule:** Implement from these papers and textbooks. Do **not** port HiGHS / CBC / SCIP / OR-Tools / cuOpt / cuPDLPx / HPR-LP / PSLP / PaPILO **source**. Their **papers are allowed**. External binaries as oracles only.
 
@@ -19,42 +19,42 @@ Use DOI or arXiv links below. Paywalled journals → arXiv preprint when listed.
 | **§13** | Download queue |
 | **§14** | Maintenance |
 
-**Phase tags:** P0 = now · P1 = Gate G3 LP · P2 = MILP/QP/pooling · P3 = ML/certified · P4 = barrier/NLP
+**Phase tags:** P0 = near-term levers · P1 = LP parity / FO maturity · P2 = MILP/QP depth · P3 = certified/exact · P4 = barrier/NLP
 
 ---
 
 ## 2. Impact-ranked priorities (Sep 2026)
 
-SOR today: **81/93 Netlib `ProvedOptimalFP`**, ~**3.2×** HiGHS SGM, vanilla PDHG on FO, dual simplex with BFRT partial.
+**Measured 4 Sep 2026** (`compare-netlib-20260904-070105`): SOR-simplex **92/93** `ProvedOptimalFP`, SGM **0.2085 s** vs HiGHS **0.0905 s** (**2.30×**). Dual simplex + BFRT + DSE/Devex + v1 presolve + HPR/Vulkan ship; FT is opt-in (`--basis-update ft`).
 
-| Rank | Technique | Expected gain | Papers (§) | SOR target |
+| Rank | Technique | Expected gain | Papers (§) | SOR status |
 |------|-----------|---------------|------------|------------|
-| 1 | Forrest–Tomlin + collective FT | 2–5× basis work | §4.1 #2, #9 | `sor_la_cpu/src/lu.cpp` |
-| 2 | Hypersparse FTRAN/BTRAN | up to ~10× large sparse | §4.1 #4, #8 | `lu.cpp` |
-| 3 | Full dual DSE + BFRT tune | fewer iterations | §4.1 #5–8 | `dual_simplex.cpp` |
-| 4 | LP presolve | 2–10× end-to-end | §6 | `sor_presolve/` |
-| 5 | HPR (restart + PID weight) | 40+/65 LPfeas | §5 | `hpr.cpp` |
-| 6 | Crossover FO→basis | `ProvedOptimalFP` on GPU | §5.3 | `sor_crossover/` (new) |
-| 7 | B&C + reliability branch | credible MIP | §7 | `sor_search/` (new) |
-| 8 | PAMI/SIP parallel dual | ~1.5–2× multi-core | §4.1 #8 | after serial ≤3× HiGHS |
+| 1 | Make FT **default** + tune collective collapse | 2–5× basis work | §4.1 #2, #9 | FT + `collapse_pending_into_ft` **in tree** (both opt-in); product-form still default |
+| 2 | Hypersparse end-to-end on default path | large-sparse pivots | §4.1 #4, #8 | Reach-set FTRAN/BTRAN **+ eta skip** shipped (`test_lu`); default product-form still accumulates eta cost |
+| 3 | Dual DSE/BFRT constant-factor tune | fewer / cheaper iters | §4.1 #5–8 | DSE/Devex + BFRT **shipped**; still behind HiGHS on hard models |
+| 4 | Broader LP/MILP presolve | 2–10× end-to-end | §6 | v1 **shipped**; probing/aggregation missing |
+| 5 | HPR maturity (restart + PID weight) | 40+/65 LPfeas | §5 | `hpr.cpp` + Vulkan; Netlib FO still weak (17/93) |
+| 6 | Crossover FO→basis | GPU path → `ProvedOptimalFP` | §5.3 | **not built** |
+| 7 | Node cuts + stronger MILP heuristics | credible MIP at scale | §7 | Root B&C **shipped**; node cuts missing |
+| 8 | PAMI/SIP parallel dual | ~1.5–2× multi-core | §4.1 #8 | after serial closer to HiGHS |
 
-**Do not start:** barrier IPM, GNN branching, VIPR, global pooling until rows 1–6 are green.
+**Do not start:** barrier IPM, GNN branching, VIPR, global pooling until crossover + FT-default + broader presolve are green.
 
 ---
 
 ## 3. Implement order A–G
 
 ```text
-A. Presolve          — Andersen + Cederberg–Boyd FO rules          (§6)
-B. Dual simplex      — Maros → FT → hypersparse → DSE → BFRT      (§4.1)
-C. HPR first-order   — primal weight → restart → Halpern           (§5)
-D. Crossover         — Bixby–Saltzman / Schork IPX                  (§5.3)
-E. MILP              — Achterberg thesis → reliability → cuts       (§7)
-F. Convex QP         — DAQP active-set + KKT cert                   (§8)
-G. Parallel + GPU    — device SpMV · CHAP heuristics · PAMI later   (§5, §9, §4.1)
+A. Broader presolve  — probing / dual fixing / aggregation         (§6)     ← v1 done
+B. FT-default + tune — default FT; collective collapse on by default (§4.1) ← both exist, opt-in
+C. Keep hypersparse  — measure on large sparse with FT default       (§4.1) ← reach+eta skip done
+D. HPR maturity      — restart + PID weight → LPfeas                (§5)     ← prototype + Vulkan
+E. Crossover         — Bixby–Saltzman / Schork IPX / spiral         (§5.3)   ← missing
+F. MILP depth        — node cuts · stronger heuristics              (§7)     ← root B&C done
+G. Parallel + batch  — batched SpMV · PAMI later                    (§5, §9) ← Vulkan HPR done
 ```
 
-Build **one** HPR FO loop; vanilla PDHG = same loop with features off. Do not ship three FO engines.
+Vanilla PDHG (`pdhg.cpp`) and HPR (`hpr.cpp`) are separate entry points today; do not add a third FO engine.
 
 ---
 
@@ -64,15 +64,15 @@ Build **one** HPR FO loop; vanilla PDHG = same loop with features off. Do not sh
 
 | # | Citation | Link | Why | SOR status |
 |---|----------|------|-----|------------|
-| 1 | **Maros**, *Computational Techniques of the Simplex Method* (2003) | [DOI](https://doi.org/10.1007/978-1-4615-0257-9) | Implementation bible | partial — primal |
-| 2 | **Forrest & Tomlin (1972)** | [DOI](https://doi.org/10.1007/BF01584548) | Basis update — critical | **not implemented** |
+| 1 | **Maros**, *Computational Techniques of the Simplex Method* (2003) | [DOI](https://doi.org/10.1007/978-1-4615-0257-9) | Implementation bible | primal + dual in tree |
+| 2 | **Forrest & Tomlin (1972)** | [DOI](https://doi.org/10.1007/BF01584548) | Basis update — critical | **implemented** (`UpdateMethod::ForrestTomlin`, `--basis-update ft`); product-form still default |
 | 3 | **Suhl & Suhl (1990)** | [DOI](https://doi.org/10.1287/ijoc.2.4.325) | Sparse LU for bases | `lu.cpp` |
-| 4 | **Hall & McKinnon (2005)** | [DOI](https://doi.org/10.1007/s10589-005-4803-z) | Hypersparse FTRAN/BTRAN | **not implemented** |
-| 5 | **Forrest & Goldfarb (1992)** | [DOI](https://doi.org/10.1007/BF01581089) | Dual steepest-edge / DEVEX | partial Devex |
+| 4 | **Hall & McKinnon (2005)** | [DOI](https://doi.org/10.1007/s10589-005-4803-z) | Hypersparse FTRAN/BTRAN | **shipped** — reach-set L/U + identity-eta skip; `test_lu` hypersparse+etas |
+| 5 | **Forrest & Goldfarb (1992)** | [DOI](https://doi.org/10.1007/BF01581089) | Dual steepest-edge / DEVEX | `dual_edge_weights.cpp` — DSE + Devex |
 | 6 | **Harris (1973)** | [DOI](https://doi.org/10.1007/BF01580108) | Two-pass ratio test | `simplex.cpp`, `dual_simplex.cpp` |
-| 7 | **Koberstein (2008)** | [DOI](https://doi.org/10.1007/s10589-008-9207-4) | Dual simplex + BFRT line | partial |
-| 8 | **Huangfu & Hall (2018)** — *Parallelizing the dual revised simplex* | [DOI](https://doi.org/10.1007/s12532-017-0130-5) · arXiv:[1503.01889](https://arxiv.org/abs/1503.01889) | HiGHS dual blueprint; PAMI/SIP; Table 1 time shares | partial — BFRT only |
-| 9 | **Huangfu & Hall (2015)** — *Novel update techniques* | [DOI](https://doi.org/10.1007/s10589-014-9689-1) · [PDF](https://optimization-online.org/wp-content/uploads/2013/02/3774.pdf) | Collective FT/APF for multi-flip BFRT | **not implemented** |
+| 7 | **Koberstein (2008)** | [DOI](https://doi.org/10.1007/s10589-008-9207-4) | Dual simplex + BFRT line | `dual_simplex.cpp` + `dual_bfrt.cpp` |
+| 8 | **Huangfu & Hall (2018)** — *Parallelizing the dual revised simplex* | [DOI](https://doi.org/10.1007/s12532-017-0130-5) · arXiv:[1503.01889](https://arxiv.org/abs/1503.01889) | HiGHS dual blueprint; PAMI/SIP; Table 1 time shares | serial dual + BFRT; PAMI/SIP not built |
+| 9 | **Huangfu & Hall (2015)** — *Novel update techniques* | [DOI](https://doi.org/10.1007/s10589-014-9689-1) · [PDF](https://optimization-online.org/wp-content/uploads/2013/02/3774.pdf) | Collective FT/APF for multi-flip BFRT | **partial** — `collapse_pending_into_ft()` + `collective_ft` opt-in; not full multi-column APF |
 | 10 | **Koberstein & Suhl (2007)** — dual phase 1 | [DOI](https://doi.org/10.1007/s10589-007-9018-z) | Dual-feasible start | partial |
 | — | **Markowitz (1957)** | [DOI](https://doi.org/10.1287/mnsc.3.3.255) | Threshold pivoting | `lu.cpp` |
 | — | **Tomlin (1972)** | [DOI](https://doi.org/10.1147/rd.164.0415) | Sparse inverse practice | ref |
@@ -81,16 +81,16 @@ Build **one** HPR FO loop; vanilla PDHG = same loop with features off. Do not sh
 
 **Huangfu & Hall 2018 — dual iteration time share (typical):**
 
-| Component | ~% | SOR |
+| Component | ~% | SOR (4 Sep 2026) |
 |-----------|-----|-----|
-| FTRAN | 37% | basic LU |
-| BTRAN | 12% | basic LU |
-| SPMV | 11% | CSR |
-| CHUZC/BFRT | 8% | implemented |
-| UPDATE-FACTOR | 7% | MPF only |
-| CHUZR/DSE | 6% | partial |
+| FTRAN | 37% | hypersparse reach-set + eta skip |
+| BTRAN | 12% | same |
+| SPMV | 11% | CSR/CSC |
+| CHUZC/BFRT | 8% | `dual_bfrt.cpp` |
+| UPDATE-FACTOR | 7% | product-form **default**; FT + collective collapse **opt-in** |
+| CHUZR/DSE | 6% | DSE + Devex in `dual_edge_weights.cpp` |
 
-**Simplex impl sequence:** FT in `lu.cpp` → hypersparse → full DSE → collective FT-BFRT → dual phase-1 → PAMI/SIP last.
+**Simplex next levers (measured gap still ~2.3× Netlib SGM):** FT-as-default → enable collective collapse by default → broader presolve → pricing/partial pricing → PAMI/SIP last.
 
 ### 4.2 Textbooks
 
@@ -113,11 +113,11 @@ Chambolle–Pock PDHG (2011)  →  PDLP (2021)  →  HPR-LP (2024)  →  cuPDLPx
 
 | # | Citation | Link | Role | SOR status |
 |---|----------|------|------|------------|
-| 1 | **Chen et al. — HPR-LP** | arXiv:[2408.12179](https://arxiv.org/abs/2408.12179) · [DOI](https://doi.org/10.1007/s12532-025-00292-0) | **Target FO algorithm** | partial HPR |
-| 2 | **Lu, Peng, Yang — cuPDLPx** | arXiv:[2507.14051](https://arxiv.org/abs/2507.14051) | PID primal weight + restart | paper only |
+| 1 | **Chen et al. — HPR-LP** | arXiv:[2408.12179](https://arxiv.org/abs/2408.12179) · [DOI](https://doi.org/10.1007/s12532-025-00292-0) | **Target FO algorithm** | `hpr.cpp` + Vulkan `LpDevice` (partial vs full HPR-LP) |
+| 2 | **Lu, Peng, Yang — cuPDLPx** | arXiv:[2507.14051](https://arxiv.org/abs/2507.14051) | PID primal weight + restart | paper only — do not port source |
 | 3 | **Applegate et al. — PDLP** (NeurIPS 2021) | [PDF](https://proceedings.neurips.cc/paper/2021/file/a8fbbd3b11424ce032ba813493d95ad7-Paper.pdf) | Restart theory | read |
 | 4 | **Applegate et al.** faster FO | arXiv:[2105.12715](https://arxiv.org/abs/2105.12715) | Restart theory | read |
-| 5 | **Applegate et al.** infeasibility | arXiv:[2102.04592](https://arxiv.org/abs/2102.04592) | FO infeasibility certs | P2 |
+| 5 | **Applegate et al.** infeasibility | arXiv:[2102.04592](https://arxiv.org/abs/2102.04592) | FO infeasibility certs | not built |
 | 6 | **Chambolle & Pock (2011)** | [DOI](https://doi.org/10.1007/s10851-010-0251-1) | Base PDHG | `pdhg.cpp` vanilla |
 | 7 | **Pock & Chambolle (2011)** ICCV | [DOI](https://doi.org/10.1109/ICCV.2011.6126441) | Diagonal precond | optional |
 | 8 | **Zhang et al. — FO GPU survey** | arXiv:[2509.23903](https://arxiv.org/abs/2509.23903) | cuPDLPx ⊂ HPR | read |
@@ -126,14 +126,15 @@ Chambolle–Pock PDHG (2011)  →  PDLP (2021)  →  HPR-LP (2024)  →  cuPDLPx
 
 > **Clean-room:** cuPDLPx / PSLP **source** forbidden. Cederberg–Boyd paper lists presolve rules to implement from scratch.
 
-### 5.2 Crossover & high accuracy (P1)
+### 5.2 Crossover & high accuracy
 
-| # | Citation | Link | Role |
-|---|----------|------|------|
-| 1 | **Megiddo (1991)** | [DOI](https://doi.org/10.1287/ijoc.3.1.63) | Crossover foundations |
-| 2 | **Bixby & Saltzman (1994)** | [DOI](https://doi.org/10.1016/0167-6377(94)90075-2) | Practical crossover |
-| 3 | **Schork — IPX (2019)** | [PDF](https://www.pure.ed.ac.uk/ws/files/134475941/ipmBasis_1_.pdf) | Basis-precond IPM + push crossover |
-| 4 | **Gleixner, Steffy, Wolter (2016)** | [DOI](https://doi.org/10.1287/ijoc.2016.0692) | Iterative refinement → exact |
+| # | Citation | Link | Role | SOR status |
+|---|----------|------|------|------------|
+| 1 | **Megiddo (1991)** | [DOI](https://doi.org/10.1287/ijoc.3.1.63) | Crossover foundations | **not built** |
+| 2 | **Bixby & Saltzman (1994)** | [DOI](https://doi.org/10.1016/0167-6377(94)90075-2) | Practical crossover | **not built** |
+| 3 | **Schork — IPX (2019)** | [PDF](https://www.pure.ed.ac.uk/ws/files/134475941/ipmBasis_1_.pdf) | Basis-precond IPM + push crossover | **not built** |
+| 4 | **Liu & Lu (2025)** PDHG-spiral | DOI:10.1287/ijoc.2024.0996 | GPU-friendly FO→vertex | **not built** |
+| 5 | **Gleixner, Steffy, Wolter (2016)** | [DOI](https://doi.org/10.1287/ijoc.2016.0692) | Iterative refinement → exact | **not built** |
 
 ### 5.3 Interior-point (P4 — read early, build late)
 
@@ -209,13 +210,14 @@ Chambolle–Pock PDHG (2011)  →  PDLP (2021)  →  HPR-LP (2024)  →  cuPDLPx
 
 ## 8. Convex QP (P2–P4)
 
-| # | Citation | Link | Role | Phase |
+| # | Citation | Link | Role | SOR status |
 |---|----------|------|------|-------|
-| 1 | Goldfarb–Idnani / null-space active-set | textbooks | KKT cert path | P2 |
-| 2 | **DAQP — Arnström et al. (2022)** | [DOI](https://doi.org/10.1109/TAC.2022.3176430) | Dual active-set + MIQP | **P2 target** |
-| 3 | **PIQP — Schwan et al. (2023)** | arXiv:[2304.00290](https://doi.org/10.48550/arxiv.2304.00290) | Proximal IPM sparse QP | P4 |
-| 4 | **Nys-IP-PMM (2024)** | arXiv:[2404.14524](https://arxiv.org/abs/2404.14524) | Matrix-free IPM | P4 |
-| 5 | **HiGHS QP** (Feldmeier) | HiGHS docs | Parity reference | paper only |
+| 1 | Goldfarb–Idnani / null-space active-set | textbooks | KKT cert path | **partial** — diagonal active-set in `qp.cpp` |
+| 2 | **DAQP — Arnström et al. (2022)** | [DOI](https://doi.org/10.1109/TAC.2022.3176430) | Dual active-set + MIQP | diagonal fast path only |
+| 3 | **PDHCG-II** | arXiv:[2602.23967](https://arxiv.org/abs/2602.23967) | FO sparse QP | **CPU core in** `qp_pdhcg.cpp`; GPU/PID extras not claimed |
+| 4 | **PIQP — Schwan et al. (2023)** | arXiv:[2304.00290](https://doi.org/10.48550/arxiv.2304.00290) | Proximal IPM sparse QP | not built |
+| 5 | **HPR-QP** | arXiv:[2507.02470](https://arxiv.org/abs/2507.02470) | HPR for QP | not built (HPR is LP-only) |
+| 6 | **HiGHS QP** (Feldmeier) | HiGHS docs | Parity reference | external oracle only |
 
 ---
 
@@ -266,15 +268,21 @@ LP duality / Farkas: any LP textbook — implement checker from first principles
 | Source | Location | Notes |
 |--------|----------|-------|
 | Markowitz + Suhl singleton tri | `sor_la_cpu/src/lu.cpp` | |
+| Hypersparse FTRAN/BTRAN | `lu.cpp` | Hall–McKinnon reach sets + identity-eta skip; `test_lu` |
+| Forrest–Tomlin update | `lu.cpp` `update_ft()` | opt-in `--basis-update ft` |
+| Collective FT collapse | `lu.cpp` `collapse_pending_into_ft()` | opt-in `collective_ft` in simplex options |
+| Product-form (MPF) update | `lu.cpp` | **default** |
 | Harris ratio test | `simplex.cpp`, `dual_simplex.cpp` | |
-| Primal revised simplex + phase 1 | `simplex.cpp` | 81/93 Netlib Aug 2026 |
-| BFRT (dual phase 2) | `dual_simplex.cpp` | Koberstein/Huangfu line |
-| Devex (partial) | `dual_simplex.cpp` | not full DSE |
-| MPF basis update | `lu.cpp` | FT not yet |
-| Vanilla PDHG | `pdhg.cpp` | no restart |
-| HPR prototype | `hpr.cpp` | incomplete vs HPR-LP |
+| Primal + dual revised simplex | `simplex.cpp`, `dual_simplex.cpp` | **92/93** Netlib ProvedOptimalFP (4 Sep 2026) |
+| BFRT | `dual_bfrt.cpp` | Koberstein/Huangfu line |
+| DSE + Devex | `dual_edge_weights.cpp` | |
+| Presolve v1 + postsolve | `sor_presolve/` | Andersen-class subset |
+| Vanilla PDHG | `pdhg.cpp` | KernelBackend |
+| HPR + Vulkan LpDevice | `hpr.cpp`, `vk_lp_device.cpp` | 6 SPIR-V shaders |
+| MILP root B&C | `sor_search/` | root GMI; reliability branch |
+| Convex QP | `qp.cpp`, `qp_pdhcg.cpp` | |
 | Ruiz scaling | engines | |
-| MPS I/O, certify gate | `sor_io/`, `sor_certify/` | |
+| MPS/QPS I/O, certify gate | `sor_io/`, `sor_certify/` | |
 
 Log forbidden-repo lookups that influenced design in `reference_log.md`.
 

@@ -1,5 +1,5 @@
 // The load-bearing invariant of the codebase: nothing can report Optimal
-// without evidence. docs/architecture.md §4.1, docs/master_spec.md §3 (Bet 3).
+// without evidence. docs/architecture.md §4 (finalize_result invariant).
 #include "sor/certify/finalize.hpp"
 #include "test_helpers.hpp"
 

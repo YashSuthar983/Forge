@@ -454,9 +454,14 @@ Using HiGHS **as an external baseline executable** (separate process, not linked
 
 ## 10. Current repo status vs the bar
 
-**Capability ladder:** `master_spec.md` §4 is authoritative for what is built. In brief: the MPS reader parses 93/93 Netlib instances; vanilla PDHG is present and converges on ~1 of 46 at 1e-6; all five `check_*` gate scripts are missing, so Gate G0 cannot pass; no GPU backend exists, though the hardware for one does (`gpu_first_order_plan.md` §1).
+**Capability ladder:** `architecture.md` §0 / §8 is authoritative for what is built (verified against code + benches). In brief (4 Sep 2026):
 
-The competitive and Mittelmann tables in §§4–5 of **this file** are the single source for *external* numbers. SOR's own targets cite them from `master_spec.md` §5.
+- Netlib: SOR-simplex **92/93** `ProvedOptimalFP`, SGM **2.30×** vs HiGHS (`compare-netlib-20260904-070105`)
+- Dual simplex, FT (opt-in), hypersparse base solves, v1 presolve, MILP root B&C, convex QP: **in tree**
+- Vulkan `LpDevice` HPR: **in tree**; CUDA stub only; FO→basis crossover: **absent**
+- `scripts/check_*` CI gates: **still missing** — do not claim automated Gate G0
+
+The competitive and Mittelmann tables in §§4–5 of **this file** remain the single source for *external* vendor/Mittelmann numbers. SOR’s own measured counts live in `benchmarks/results/` and are summarized in `architecture.md` §7.
 
 ---
 

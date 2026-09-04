@@ -624,25 +624,49 @@ bool BasisFactor::sparse_lower_t(const std::vector<Index>& seed,
 void BasisFactor::ftran(std::vector<f64>& b) const {
     if (m_ == 0) return;
     const auto n = piv_val_.size();
-    for (std::size_t k = 0; k < n; ++k) work_[k] = b[sz(piv_row_[k])];
+    // Permute the RHS and collect its sparse seed in the SAME pass. The old
+    // path copied all n entries, scanned all n again to count nonzeros, then
+    // scanned all n a third time to materialize the seed. Once more than n/4
+    // nonzeros have been seen the sparse path cannot be selected, so stop
+    // tracking immediately while completing only the mandatory permutation.
+    bool seed_is_sparse = n >= 64;
+    seed_.clear();
+    for (std::size_t k = 0; k < n; ++k) {
+        const f64 value = b[sz(piv_row_[k])];
+        work_[k] = value;
+        if (seed_is_sparse && value != 0.0) {
+            seed_.push_back(static_cast<Index>(k));
+            if (4 * seed_.size() > n) {
+                seed_is_sparse = false;
+                seed_.clear();
+            }
+        }
+    }
+
+    // Collect a seed after the first triangular solve. Abort the scan as soon
+    // as the existing 25%-density gate is exceeded; the dense fallback does
+    // not need the remaining nonzero count.
+    const auto collect_seed = [&]() {
+        seed_.clear();
+        if (n < 64) return false;
+        for (std::size_t k = 0; k < n; ++k) {
+            if (work_[k] == 0.0) continue;
+            seed_.push_back(static_cast<Index>(k));
+            if (4 * seed_.size() > n) {
+                seed_.clear();
+                return false;
+            }
+        }
+        return true;
+    };
 
     // L-solve (sparse or dense). The seed is built only when the input is
-    // sparse enough to plausibly win: counting first avoids an O(n) vector
-    // allocation on every dense call.
+    // sparse enough to plausibly win.
     bool sp = false;
-    if (n >= 64) {
-        Index nz = 0;
-        for (std::size_t k = 0; k < n; ++k)
-            if (work_[k] != 0.0) ++nz;
-        if (4 * nz <= static_cast<Index>(n)) {
-            seed_.clear();
-            seed_.reserve(sz(nz));
-            for (std::size_t k = 0; k < n; ++k)
-                if (work_[k] != 0.0) seed_.push_back(static_cast<Index>(k));
-            if (sparse_lower(seed_, work_)) {
-                sp = true;
-                for (const Index k : reach_) mark_[sz(k)] = 0;
-            }
+    if (seed_is_sparse) {
+        if (sparse_lower(seed_, work_)) {
+            sp = true;
+            for (const Index k : reach_) mark_[sz(k)] = 0;
         }
     }
     if (!sp) solve_lower(work_);
@@ -650,18 +674,9 @@ void BasisFactor::ftran(std::vector<f64>& b) const {
 
     // U-solve (sparse or dense) + scatter.
     sp = false;
-    if (n >= 64) {
-        Index nz = 0;
-        for (std::size_t k = 0; k < n; ++k)
-            if (work_[k] != 0.0) ++nz;
-        if (4 * nz <= static_cast<Index>(n)) {
-            seed_.clear();
-            seed_.reserve(sz(nz));
-            for (std::size_t k = 0; k < n; ++k)
-                if (work_[k] != 0.0) seed_.push_back(static_cast<Index>(k));
-            if (sparse_upper(seed_, work_))
-                sp = true;                   // marks stay set for the scatter
-        }
+    if (collect_seed()) {
+        if (sparse_upper(seed_, work_))
+            sp = true;                   // marks stay set for the scatter
     }
     if (sp) {
         // Only the U reach can be nonzero: the fused scatter zeroes the rest,
@@ -685,14 +700,26 @@ void BasisFactor::ftran(std::vector<f64>& b) const {
         const f64 pv = b[p] / eta_pivot_[t];
         for (Offset k = eta_start_[t]; k < eta_start_[t + 1]; ++k) {
             const auto i = sz(eta_idx_[sz(k)]);
-            if (i != p) b[i] -= eta_val_[sz(k)] * pv;
+            // update() excludes p when constructing every eta slice.
+            b[i] -= eta_val_[sz(k)] * pv;
         }
         b[p] = pv;
     }
 }
 
 void BasisFactor::btran(std::vector<f64>& d) const {
-    if (m_ == 0) return;
+    (void)btran_impl(d, nullptr);
+}
+
+bool BasisFactor::btran_with_support(std::vector<f64>& d,
+                                     std::vector<Index>& support) const {
+    return btran_impl(d, &support);
+}
+
+bool BasisFactor::btran_impl(std::vector<f64>& d,
+                             std::vector<Index>* support) const {
+    if (support) support->clear();
+    if (m_ == 0) return true;
 
     // B_k^-T = B_0^-T E_1^-T ... E_k^-T, so the etas apply newest first.
     // The transposed eta E^-T only writes position p; every other entry is
@@ -704,29 +731,49 @@ void BasisFactor::btran(std::vector<f64>& d) const {
         f64 s = d[p];
         for (Offset k = eta_start_[t]; k < eta_start_[t + 1]; ++k) {
             const auto i = sz(eta_idx_[sz(k)]);
-            if (i != p) s -= eta_val_[sz(k)] * d[i];
+            // update() excludes p when constructing every eta slice.
+            s -= eta_val_[sz(k)] * d[i];
         }
         d[p] = s / eta_pivot_[t];
     }
 
     const auto n = piv_val_.size();
-    for (std::size_t k = 0; k < n; ++k) work_[k] = d[sz(piv_slot_[k])];
+    // Fuse the basis-slot permutation with sparse-seed construction, exactly
+    // as in ftran(). Etas have already been applied above, so this observes
+    // the true input pattern to the base U' solve.
+    bool seed_is_sparse = n >= 64;
+    seed_.clear();
+    for (std::size_t k = 0; k < n; ++k) {
+        const f64 value = d[sz(piv_slot_[k])];
+        work_[k] = value;
+        if (seed_is_sparse && value != 0.0) {
+            seed_.push_back(static_cast<Index>(k));
+            if (4 * seed_.size() > n) {
+                seed_is_sparse = false;
+                seed_.clear();
+            }
+        }
+    }
+    const auto collect_seed = [&]() {
+        seed_.clear();
+        if (n < 64) return false;
+        for (std::size_t k = 0; k < n; ++k) {
+            if (work_[k] == 0.0) continue;
+            seed_.push_back(static_cast<Index>(k));
+            if (4 * seed_.size() > n) {
+                seed_.clear();
+                return false;
+            }
+        }
+        return true;
+    };
 
     // U'-solve (sparse or dense).
     bool sp = false;
-    if (n >= 64) {
-        Index nz = 0;
-        for (std::size_t k = 0; k < n; ++k)
-            if (work_[k] != 0.0) ++nz;
-        if (4 * nz <= static_cast<Index>(n)) {
-            seed_.clear();
-            seed_.reserve(sz(nz));
-            for (std::size_t k = 0; k < n; ++k)
-                if (work_[k] != 0.0) seed_.push_back(static_cast<Index>(k));
-            if (sparse_upper_t(seed_, work_)) {
-                sp = true;
-                for (const Index k : reach_) mark_[sz(k)] = 0;
-            }
+    if (seed_is_sparse) {
+        if (sparse_upper_t(seed_, work_)) {
+            sp = true;
+            for (const Index k : reach_) mark_[sz(k)] = 0;
         }
     }
     if (!sp) solve_upper_t(work_);
@@ -734,20 +781,21 @@ void BasisFactor::btran(std::vector<f64>& d) const {
 
     // L'-solve (sparse or dense) + scatter.
     sp = false;
-    if (n >= 64) {
-        Index nz = 0;
-        for (std::size_t k = 0; k < n; ++k)
-            if (work_[k] != 0.0) ++nz;
-        if (4 * nz <= static_cast<Index>(n)) {
-            seed_.clear();
-            seed_.reserve(sz(nz));
-            for (std::size_t k = 0; k < n; ++k)
-                if (work_[k] != 0.0) seed_.push_back(static_cast<Index>(k));
-            if (sparse_lower_t(seed_, work_))
-                sp = true;
-        }
+    if (collect_seed()) {
+        if (sparse_lower_t(seed_, work_))
+            sp = true;
     }
     if (sp) {
+        if (support) {
+            support->reserve(reach_.size());
+            for (const Index k : reach_)
+                if (work_[sz(k)] != 0.0)
+                    support->push_back(piv_row_[sz(k)]);
+            // The dual pivotal-row kernel historically visits rho in original
+            // row order. Preserve that floating-point accumulation order so
+            // exposing the sparse support cannot alter pivot decisions.
+            std::sort(support->begin(), support->end());
+        }
         for (std::size_t k = 0; k < n; ++k)
             d[sz(piv_row_[k])] = mark_[k] ? work_[k] : 0.0;
         for (const Index k : reach_) mark_[sz(k)] = 0;
@@ -757,6 +805,7 @@ void BasisFactor::btran(std::vector<f64>& d) const {
     }
     work_since_factor_ += sp ? static_cast<Offset>(reach_.size()) : static_cast<Offset>(n);
     work_since_factor_ += static_cast<Offset>(eta_nnz());
+    return sp;
 }
 
 // ---------------------------------------------------------------------------
@@ -795,6 +844,61 @@ bool BasisFactor::update(Index p, const std::vector<f64>& alpha, f64 min_pivot) 
         }
     }
     eta_start_.push_back(static_cast<Offset>(eta_idx_.size()));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Collective FT: fold every pending product-form eta into L/U via a
+// sequence of update_ft() calls, then clear the eta file. See lu.hpp for
+// why this reuses update_ft() unchanged instead of a new combined
+// multi-column bump algorithm.
+// ---------------------------------------------------------------------------
+
+bool BasisFactor::collapse_pending_into_ft(const LuOptions& opts, f64 min_pivot) {
+    if (eta_p_.empty()) return true;
+
+    // Snapshot every pending eta's ORIGINAL (p, alpha) as recorded by
+    // update() -- alpha is already alpha[eta_p_[t]] = eta_pivot_[t] plus the
+    // sparse eta_idx_/eta_val_ slice, i.e. exactly the vector update_ft()
+    // needs, in the SAME slot-coordinate space update_ft() expects (each
+    // alpha_t is B_{t-1}^-1 a_new_t relative to the basis as it stood right
+    // before pivot t, which is exactly the state replaying etas 0..t-1 in
+    // order reproduces).
+    struct Pending { Index p; std::vector<f64> alpha; };
+    std::vector<Pending> pending;
+    pending.reserve(eta_p_.size());
+    for (std::size_t t = 0; t < eta_p_.size(); ++t) {
+        Pending pe;
+        pe.p = eta_p_[t];
+        pe.alpha.assign(sz(m_), 0.0);
+        pe.alpha[sz(pe.p)] = eta_pivot_[t];
+        for (Offset k = eta_start_[t]; k < eta_start_[t + 1]; ++k)
+            pe.alpha[sz(eta_idx_[sz(k)])] = eta_val_[sz(k)];
+        pending.push_back(std::move(pe));
+    }
+
+    // The live eta file is about to be superseded pivot-by-pivot below; clear
+    // it up front so a failure partway through can re-insert exactly the
+    // etas that did NOT get folded (see the catch-up loop), rather than
+    // trying to surgically erase a prefix of the SoA arrays.
+    eta_p_.clear(); eta_pivot_.clear();
+    eta_idx_.clear(); eta_val_.clear();
+    eta_start_.assign(1, 0);
+
+    for (std::size_t t = 0; t < pending.size(); ++t) {
+        if (update_ft(pending[t].p, pending[t].alpha, opts, min_pivot)) continue;
+        // Bump for this eta turned out near-singular. Etas [0, t) are
+        // already correctly folded into L/U (update_ft() mutates
+        // atomically-on-success, never partially). Re-insert [t, end) via
+        // the cheap product-form update() -- valid because the CURRENT
+        // factorization (after folding [0, t)) is exactly the basis each
+        // remaining alpha was computed relative to, same as it was live.
+        // Each alpha[p] already passed this same min_pivot check once when
+        // it was first recorded, so this re-insertion cannot itself fail.
+        for (std::size_t u = t; u < pending.size(); ++u)
+            update(pending[u].p, pending[u].alpha, min_pivot);
+        return false;
+    }
     return true;
 }
 
@@ -869,6 +973,142 @@ bool BasisFactor::eliminate_bump(std::vector<f64>& bm, Index width,
     return true;
 }
 
+// Sparse counterpart of eliminate_bump() above: identical algorithm (partial
+// row-pivoting Gauss elimination, fixed column-role order, no column
+// pivoting), but brow_cols[a]/brow_vals[a] hold only row a's ACTUAL nonzero
+// (column, value) pairs, sorted ascending by column, instead of a dense
+// width-length array slice. bcol_rows[c] is the column->rows index (which
+// bump-local rows currently have a nonzero at column c), maintained
+// incrementally as fill-in occurs during elimination -- the same technique
+// factorize()'s Elim struct already uses for the Markowitz phase, just
+// reused here for the bump's own (much smaller, but still potentially wide)
+// elimination. Row content is mutated in place except for the CURRENT
+// pivot row's own data, which is read from a stable snapshot (pivot_cols/
+// pivot_vals below) since it is marked `used` and never touched again.
+bool BasisFactor::eliminate_bump_sparse(
+    std::vector<std::vector<Index>>& brow_cols,
+    std::vector<std::vector<f64>>& brow_vals, Index width,
+    const LuOptions& opts, std::vector<Index>& order, std::vector<f64>& new_diag,
+    std::vector<std::vector<Index>>& new_u_idx, std::vector<std::vector<f64>>& new_u_val,
+    std::vector<std::vector<Index>>& new_l_idx, std::vector<std::vector<f64>>& new_l_val) const {
+    order.assign(sz(width), -1);
+    new_diag.assign(sz(width), 0.0);
+    new_u_idx.assign(sz(width), {});
+    new_u_val.assign(sz(width), {});
+    new_l_idx.assign(sz(width), {});
+    new_l_val.assign(sz(width), {});
+    std::vector<char> used(sz(width), 0);
+
+    std::vector<std::vector<Index>> bcol_rows(sz(width));
+    for (Index a = 0; a < width; ++a)
+        for (const Index c : brow_cols[sz(a)]) bcol_rows[sz(c)].push_back(a);
+
+    // Reusable scratch for the row merge below (row_r <- row_r - mult *
+    // pivot_row): allocated ONCE for the whole bump, not per merge. The
+    // first sparse version of this function allocated a fresh pair of
+    // std::vectors for every single (pivot step, affected row) merge --
+    // correct, but measured SLOWER than the original dense O(width^3)
+    // version on real Netlib instances (25fv47: 12-15s vs the dense
+    // version's 7-9s), because per-merge heap allocation overhead dominated
+    // at the moderate bump widths this codebase actually sees. scratch/
+    // in_scratch/touched implement scatter-accumulate-gather entirely in
+    // pre-sized buffers reused across every merge in this call.
+    std::vector<f64> scratch(sz(width), 0.0);
+    std::vector<char> in_scratch(sz(width), 0);
+    std::vector<Index> touched;
+    touched.reserve(sz(width));
+
+    const auto find_val = [&](Index r, Index c) -> const f64* {
+        const auto& rc = brow_cols[sz(r)];
+        for (std::size_t t = 0; t < rc.size(); ++t)
+            if (rc[t] == c) return &brow_vals[sz(r)][t];
+        return nullptr;
+    };
+
+    for (Index b = 0; b < width; ++b) {
+        Index best_row = -1;
+        f64 best_mag = -1.0;
+        {
+            auto& cr = bcol_rows[sz(b)];
+            std::size_t w = 0;
+            for (std::size_t t = 0; t < cr.size(); ++t) {
+                const Index r = cr[t];
+                if (used[sz(r)]) continue;
+                const f64* v = find_val(r, b);
+                if (v == nullptr) continue;  // cancelled to exact zero earlier
+                cr[w++] = r;
+                const f64 mag = std::fabs(*v);
+                if (mag > best_mag) { best_mag = mag; best_row = r; }
+            }
+            cr.resize(w);
+        }
+        if (best_row < 0 || !(best_mag > opts.pivot_tol)) return false;
+        used[sz(best_row)] = 1;
+        order[sz(b)] = best_row;
+        const f64 piv = *find_val(best_row, b);
+        new_diag[sz(b)] = piv;
+
+        const auto pivot_cols = brow_cols[sz(best_row)];  // best_row is `used` now: stable
+        const auto pivot_vals = brow_vals[sz(best_row)];
+        for (std::size_t t = 0; t < pivot_cols.size(); ++t)
+            if (pivot_cols[t] > b) {
+                new_u_idx[sz(b)].push_back(pivot_cols[t]);
+                new_u_val[sz(b)].push_back(pivot_vals[t]);
+            }
+
+        for (const Index r : bcol_rows[sz(b)]) {
+            if (used[sz(r)]) continue;
+            const f64* arb = find_val(r, b);
+            if (arb == nullptr) continue;
+            const f64 mult = *arb / piv;
+            new_l_idx[sz(b)].push_back(r);
+            new_l_val[sz(b)].push_back(mult);
+
+            // row_r <- row_r - mult * pivot_row, via scatter/accumulate/
+            // gather on the reusable scratch buffers (no per-merge heap
+            // allocation -- see the comment above scratch's declaration).
+            touched.clear();
+            {
+                const auto& rc = brow_cols[sz(r)];
+                const auto& rv = brow_vals[sz(r)];
+                for (std::size_t t = 0; t < rc.size(); ++t) {
+                    scratch[sz(rc[t])] = rv[t];
+                    in_scratch[sz(rc[t])] = 1;
+                    touched.push_back(rc[t]);
+                }
+            }
+            for (std::size_t t = 0; t < pivot_cols.size(); ++t) {
+                const Index c = pivot_cols[t];
+                const f64 contrib = -mult * pivot_vals[t];
+                if (in_scratch[sz(c)]) {
+                    scratch[sz(c)] += contrib;
+                } else {
+                    scratch[sz(c)] = contrib;
+                    in_scratch[sz(c)] = 1;
+                    touched.push_back(c);
+                    bcol_rows[sz(c)].push_back(r);  // possible fill-in; harmless
+                                                     // duplicate if c was already there
+                }
+            }
+            std::sort(touched.begin(), touched.end());
+            brow_cols[sz(r)].clear();
+            brow_vals[sz(r)].clear();
+            for (const Index c : touched) {
+                const f64 v = scratch[sz(c)];
+                if (v != 0.0) { brow_cols[sz(r)].push_back(c); brow_vals[sz(r)].push_back(v); }
+                scratch[sz(c)] = 0.0;
+                in_scratch[sz(c)] = 0;
+            }
+        }
+    }
+
+    std::vector<Index> local_to_final(sz(width), -1);
+    for (Index b = 0; b < width; ++b) local_to_final[sz(order[sz(b)])] = b;
+    for (Index b = 0; b < width; ++b)
+        for (auto& idx : new_l_idx[sz(b)]) idx = local_to_final[sz(idx)];
+    return true;
+}
+
 // Same contract as update(): p is a SLOT LABEL, alpha = B_old^-1 a_new
 // already in slot-label coordinates (the standard FTRAN result). See
 // lu.hpp's file header for the algorithm; in short: recover w = L^-1 a_new
@@ -898,35 +1138,79 @@ bool BasisFactor::update_ft(Index p, const std::vector<f64>& alpha,
     // out, unlike the bump below.
     std::vector<f64> x_full(sz(m_));
     for (Index k = 0; k < m_; ++k) x_full[sz(k)] = alpha[sz(piv_slot_[sz(k)])];
-    std::vector<f64> w_full(sz(m_));
-    for (Index k = 0; k < m_; ++k) {
-        f64 s = piv_val_[sz(k)] * x_full[sz(k)];
-        const Offset beg = u_off_[sz(k)], end = beg + u_len_[sz(k)];
-        for (Offset t = beg; t < end; ++t)
-            s += u_val_[sz(t)] * x_full[sz(u_idx_[sz(t)])];  // j > k always
-        w_full[sz(k)] = s;
-    }
 
-    // Assemble the dense bump: role c>=1 = the old upper-triangular column at
-    // old pivot-step p_step+c, read straight from the CURRENT (pre-update)
-    // U/diagonal; column-role 0 (the entering data, = w_full restricted to
-    // the bump) is written LAST so it can never be clobbered by the
-    // old-column pass below (whose entries -- diagonal at [a][a] for a>=1,
-    // off-diagonal at [a][c] for c>a -- never touch column 0 for any row,
-    // but writing role 0 first and "fixing" the one colliding cell
-    // afterwards is exactly the kind of off-by-one this module has been
-    // burned by before; last-write-wins is simpler to trust).
-    std::vector<f64> bm(sz(width) * sz(width), 0.0);
-    for (Index a = 0; a < width; ++a) {
-        const Index k = p_step + a;
-        if (a >= 1) bm[sz(a) * sz(width) + sz(a)] = piv_val_[sz(k)];
-        const Offset beg = u_off_[sz(k)], end = beg + u_len_[sz(k)];
-        for (Offset t = beg; t < end; ++t) {
-            const Index c = u_idx_[sz(t)] - p_step;  // c > a always, so c >= 1
-            bm[sz(a) * sz(width) + sz(c)] = u_val_[sz(t)];
+    // w_full = U_old * x_full, computed COLUMN-driven instead of row-driven.
+    // Row-driven ("for every row k, sum row k's entries against x_full") is
+    // O(m + nnz(U)) unconditionally, even though x_full (alpha's own
+    // support) is typically sparse for an incremental pivot -- most rows
+    // contribute nothing. Column-driven instead visits, for each nonzero
+    // x_full[j], only the rows that actually have a U entry at column j
+    // (via u_col_start_/u_col_row_, already maintained for the hypersparse
+    // solves), giving O(m) to find x_full's own nonzero positions (alpha
+    // arrives as a plain dense m-vector with no separate sparsity list, so
+    // that scan can't be avoided) plus O(sum of column densities touched)
+    // instead of O(nnz(U)) for the summation itself. Mathematically this is
+    // the SAME w = U*x, just accumulated in a different order -- floating
+    // point can differ in the last ULP from reordered summation, which is
+    // exactly why this was verified against the OLD row-driven computation
+    // (bit-for-bit across the full test suite and a live Netlib run) before
+    // that old computation was deleted; see sor-forrest-tomlin-item2 memory
+    // for why an FT change gets this level of scrutiny.
+    std::vector<f64> w_full(sz(m_), 0.0);
+    for (Index k = 0; k < m_; ++k) {
+        const f64 xk = x_full[sz(k)];
+        if (xk != 0.0) w_full[sz(k)] += piv_val_[sz(k)] * xk;
+    }
+    for (Index j = 0; j < m_; ++j) {
+        const f64 xj = x_full[sz(j)];
+        if (xj == 0.0) continue;
+        const Offset cbeg = u_col_start_[sz(j)], cend = u_col_start_[sz(j) + 1];
+        for (Offset ct = cbeg; ct < cend; ++ct) {
+            const Index k = u_col_row_[sz(ct)];
+            // Linear, not binary, search: a prior update_ft() call's prefix
+            // patch (below) appends its replacement entry at the END of a
+            // row's list rather than in sorted position, so row segments are
+            // NOT reliably sorted by column here -- discovered by the
+            // differential check against the row-driven reference this
+            // rewrite was verified against (see the comment above).
+            const Offset rbeg = u_off_[sz(k)], rend = rbeg + u_len_[sz(k)];
+            for (Offset rt = rbeg; rt < rend; ++rt) {
+                if (u_idx_[sz(rt)] == j) { w_full[sz(k)] += u_val_[sz(rt)] * xj; break; }
+            }
         }
     }
-    for (Index a = 0; a < width; ++a) bm[sz(a) * sz(width)] = w_full[sz(p_step + a)];
+
+    // Assemble the bump SPARSELY instead of into a dense width*width array
+    // (that dense assembly plus the dense L-strip below and dense
+    // elimination were measured at 25-227x slower than product-form on real
+    // Netlib instances -- O(width^2)-O(width^3) work regardless of actual
+    // fill). Per bump-local row a: role c>=1 = the old upper-triangular
+    // column at old pivot-step p_step+c, read straight from the CURRENT
+    // (pre-update) U/diagonal; role 0 (entering data, w_full restricted to
+    // the bump) is inserted LAST, matching the dense version's "never
+    // clobbered, old-column entries never touch column 0" invariant. Each
+    // row is sorted ascending by column for the merge-based L-strip and
+    // elimination below (do NOT assume u_idx_ itself is already in that
+    // order for this purpose -- verified fine for a fresh bump row, see the
+    // w_full rewrite's comment above for the one place in this file where
+    // that assumption is actually false).
+    std::vector<std::vector<Index>> brow_cols(sz(width));
+    std::vector<std::vector<f64>> brow_vals(sz(width));
+    for (Index a = 0; a < width; ++a) {
+        const Index k = p_step + a;
+        std::vector<std::pair<Index, f64>> row;
+        if (a >= 1) row.emplace_back(a, piv_val_[sz(k)]);
+        const Offset beg = u_off_[sz(k)], end = beg + u_len_[sz(k)];
+        for (Offset t = beg; t < end; ++t)
+            row.emplace_back(u_idx_[sz(t)] - p_step, u_val_[sz(t)]);  // c > a always, so c >= 1
+        std::sort(row.begin(), row.end(),
+                 [](const auto& x, const auto& y) { return x.first < y.first; });
+        const f64 w0 = w_full[sz(k)];
+        if (w0 != 0.0) row.insert(row.begin(), {0, w0});
+        brow_cols[sz(a)].reserve(row.size());
+        brow_vals[sz(a)].reserve(row.size());
+        for (const auto& [c, v] : row) { brow_cols[sz(a)].push_back(c); brow_vals[sz(a)].push_back(v); }
+    }
 
     // The values just assembled are contaminated by the OLD bump's own
     // internal elimination order: `w` was recovered via U * x using the
@@ -938,21 +1222,39 @@ bool BasisFactor::update_ft(Index p, const std::vector<f64>& alpha,
     // "apply only the prefix steps" gives -- the two differ by exactly
     // this L_bump_old factor). Strip it back out with ONE forward multiply
     // by the OLD bump-local L, using a frozen snapshot as the read source
-    // throughout (this is a plain MULTIPLY, not the recursive SOLVE
-    // solve_lower() does -- reusing that in-place pattern here would
-    // silently compute something else, since a multiply must read
-    // un-mutated source values while a solve deliberately chains through
-    // already-updated ones).
+    // throughout, merged sparsely (ascending merge, same technique
+    // factorize()'s Elim::eliminate() already uses) instead of a dense
+    // O(width) add per (row, L-entry) pair.
     {
-        const std::vector<f64> bm_raw = bm;
+        const auto brow_cols_raw = brow_cols;
+        const auto brow_vals_raw = brow_vals;
         for (Index a = 0; a < width; ++a) {
             const Offset beg = l_start_[sz(p_step + a)];
             const Offset end = l_start_[sz(p_step + a) + 1];
             for (Offset t = beg; t < end; ++t) {
                 const Index i = l_idx_[sz(t)] - p_step;  // bump-local target row
                 const f64 mult = l_val_[sz(t)];
-                for (Index c = 0; c < width; ++c)
-                    bm[sz(i) * sz(width) + sz(c)] += mult * bm_raw[sz(a) * sz(width) + sz(c)];
+                std::vector<Index> mc; std::vector<f64> mv;
+                const auto& ic = brow_cols[sz(i)]; const auto& iv = brow_vals[sz(i)];
+                const auto& ac = brow_cols_raw[sz(a)]; const auto& av = brow_vals_raw[sz(a)];
+                std::size_t x = 0, y = 0;
+                while (x < ic.size() || y < ac.size()) {
+                    const Index jx = (x < ic.size()) ? ic[x] : kBigIndex;
+                    const Index jy = (y < ac.size()) ? ac[y] : kBigIndex;
+                    if (jx < jy) {
+                        mc.push_back(jx); mv.push_back(iv[x]); ++x;
+                    } else if (jy < jx) {
+                        const f64 v = mult * av[y];
+                        if (v != 0.0) { mc.push_back(jy); mv.push_back(v); }
+                        ++y;
+                    } else {
+                        const f64 v = iv[x] + mult * av[y];
+                        if (v != 0.0) { mc.push_back(jx); mv.push_back(v); }
+                        ++x; ++y;
+                    }
+                }
+                brow_cols[sz(i)] = std::move(mc);
+                brow_vals[sz(i)] = std::move(mv);
             }
         }
     }
@@ -961,8 +1263,8 @@ bool BasisFactor::update_ft(Index p, const std::vector<f64>& alpha,
     std::vector<f64> new_diag;
     std::vector<std::vector<Index>> new_u_idx, new_l_idx;
     std::vector<std::vector<f64>> new_u_val, new_l_val;
-    if (!eliminate_bump(bm, width, opts, order, new_diag, new_u_idx, new_u_val,
-                        new_l_idx, new_l_val))
+    if (!eliminate_bump_sparse(brow_cols, brow_vals, width, opts, order, new_diag,
+                               new_u_idx, new_u_val, new_l_idx, new_l_val))
         return false;
 
     // Splice. L's prefix (pivot-steps < p_step) is value-for-value untouched:
