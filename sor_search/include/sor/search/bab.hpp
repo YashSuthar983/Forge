@@ -43,6 +43,10 @@ struct BabOptions {
     std::uint64_t integer_neighborhood_max_trials = 10000;
     double integer_neighborhood_time_s = 3.0;
     double integer_neighborhood_lp_time_s = 0.01;
+    // Feasibility Pump (Fischetti, Glover, Lodi 2005)
+    bool feasibility_pump = true;
+    std::uint64_t feasibility_pump_max_passes = 100;
+    double feasibility_pump_time_s = 5.0;
     // Tighten finite row bounds to the nearest integer when every nonzero
     // coefficient and column in that row are integral. This is an exact
     // integer-feasibility presolve, not a relaxation of the original MILP.

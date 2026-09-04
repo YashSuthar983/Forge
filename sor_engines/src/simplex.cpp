@@ -226,8 +226,59 @@ void install_work_totals(SimplexDiagnostics& chosen,
     chosen.basis_update_calls = total.basis_update_calls;
     chosen.loop_ms            = total.loop_ms;
     chosen.total_ms           = total.total_ms;
-    chosen.preprocessing_builds = total.preprocessing_builds;
     chosen.largest_update_multiplier = total.largest_update_multiplier;
+}
+
+void apply_crash(CrashStrategy strategy, Index m, Index ns,
+                 const Offset* acp, const Index* ari,
+                 const std::vector<f64>& lo, const std::vector<f64>& hi,
+                 std::vector<Index>& basis, std::vector<Index>& slot_of,
+                 std::vector<NonbasicStatus>& st, std::vector<f64>& value) {
+    if (strategy != CrashStrategy::Bixby) return;
+
+    // A lightweight structural crash: prefer free variables and singletons to
+    // form a triangular initial basis. This avoids starting from the all-slack
+    // logical basis when structural columns are obviously independent.
+    std::vector<int> row_covered(sz(m), 0);
+    
+    auto try_add = [&](Index j) {
+        if (st[sz(j)] == NonbasicStatus::Basic) return;
+        Index count = 0;
+        Index target_row = -1;
+        for (Offset k = acp[sz(j)]; k < acp[sz(j) + 1]; ++k) {
+            Index r = ari[sz(k)];
+            if (!row_covered[sz(r)]) {
+                target_row = r;
+                ++count;
+            }
+        }
+        if (count == 1 && target_row >= 0) {
+            // Replace the logical at target_row with structural j
+            Index logical = ns + target_row;
+            // Logical leaves, j enters
+            basis[sz(target_row)] = j;
+            slot_of[sz(j)] = target_row;
+            st[sz(j)] = NonbasicStatus::Basic;
+            
+            // Park the logical
+            slot_of[sz(logical)] = -1;
+            st[sz(logical)] = NonbasicStatus::AtLower;
+            value[sz(logical)] = 0.0;
+            
+            row_covered[sz(target_row)] = 1;
+        }
+    };
+
+    // Pass 1: Free variables
+    for (Index j = 0; j < ns; ++j) {
+        if (lo[sz(j)] <= -model::kInf && hi[sz(j)] >= model::kInf) {
+            try_add(j);
+        }
+    }
+    // Pass 2: Singletons (variables with only 1 non-zero in uncovered rows)
+    for (Index j = 0; j < ns; ++j) {
+        try_add(j);
+    }
 }
 
 }  // namespace
@@ -499,6 +550,8 @@ core::RawResult solve_primal_simplex_prepared(
         slot_of[sz(ns + i)] = i;
         st[sz(ns + i)] = NonbasicStatus::Basic;
     }
+
+    apply_crash(opts.crash, m, ns, acp.data(), ari.data(), lo, hi, basis, slot_of, st, value);
 
     std::vector<Index> nonbasic;
     std::vector<Index> nonbasic_pos(sz(nt), -1);

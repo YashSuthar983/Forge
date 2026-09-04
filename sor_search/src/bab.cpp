@@ -3550,13 +3550,20 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                     opts.lp_rounding_repair_time_s, xh);
                 if (rounded) ++diag.lp_repair_hits;
             }
-            if (repair_due && mip.n_cols() <= 1000 &&
+            if (opts.feasibility_pump && repair_due && mip.n_cols() <= 1000 &&
                 mip.nnz() <= 10000) {
                 ++diag.feasibility_pump_attempts;
+                double pump_budget = opts.feasibility_pump_time_s;
+                if (opts.time_limit_s > 0.0) {
+                    const double left = opts.time_limit_s -
+                        std::chrono::duration<double>(Clock::now() - t0).count();
+                    pump_budget = std::min(pump_budget, std::max(0.0, left));
+                }
                 std::vector<f64> pumped;
-                const bool pump_ok = try_feasibility_pump(
-                    problem, lp_raw.x, opts.int_tol,
-                    opts.primal_feas_tol, 12, 5000, 0.08, pumped);
+                if (pump_budget > 0.0) {
+                    const bool pump_ok = try_feasibility_pump(
+                        problem, lp_raw.x, opts.int_tol,
+                        opts.primal_feas_tol, opts.feasibility_pump_max_passes, 5000, pump_budget, pumped);
                 if (pump_ok) {
                     const f64 pobj = mip.objective(pumped);
                     if (std::isfinite(pobj) &&
@@ -3567,6 +3574,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                         xh = std::move(pumped);
                     }
                     ++diag.feasibility_pump_hits;
+                }
                 }
             }
             if (diag.nodes == 1 && mip.n_cols() <= 3000 &&

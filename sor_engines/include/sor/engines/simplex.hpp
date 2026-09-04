@@ -34,6 +34,11 @@ enum class SimplexMethod : std::uint8_t {
     Dual   = 2,
 };
 
+enum class CrashStrategy : std::uint8_t {
+    None  = 0,
+    Bixby = 1,
+};
+
 struct SimplexBasis {
     Index n_struct = 0;
     std::vector<Index> basic;
@@ -54,6 +59,7 @@ struct SimplexOptions {
 
     SimplexMethod  method  = SimplexMethod::Auto;
     SimplexPricing pricing = SimplexPricing::Devex;
+    CrashStrategy  crash   = CrashStrategy::None;
 
     // Refactor after this many basis updates. Product-form etas are as dense
     // as the FTRAN'd entering columns, so unlike Forrest-Tomlin (HiGHS runs
