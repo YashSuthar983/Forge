@@ -9,8 +9,17 @@ CMakeFiles/
 # and committing them would also muddy the clean-room story).
 benchmarks/.venv-baseline/
 
-# Generated benchmark artifacts
-benchmarks/results/
+# Generated benchmark artifacts (keep directory ignored; force-add promoted runs)
+benchmarks/results/*
+!benchmarks/results/FULL_PERF_20260904-092218.md
+!benchmarks/results/FULL_PERF_20260904-092218.log
+!benchmarks/results/FULL_PERF_nohup_20260904-092218.out
+!benchmarks/results/compare-netlib-20260904-092218.md
+!benchmarks/results/compare-netlib-20260904-092218.jsonl
+!benchmarks/results/industrial-perf-20260904-101927.md
+!benchmarks/results/industrial-perf-20260904-101927.jsonl
+!benchmarks/results/compare-new-all-20260904-102744.md
+!benchmarks/results/compare-new-all-20260904-102744.jsonl
 
 # MIPLIB 2017 collection (~7.3GB gzipped MPS). Re-download:
 #   curl -fL -o /tmp/collection.zip https://miplib.zib.de/downloads/collection.zip

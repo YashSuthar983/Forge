@@ -1,0 +1,948 @@
+# FULL PERFORMANCE BENCHMARK
+stamp=20260904-092218 host=yash-Bravo-15-B5DD time_limit=30s industrial_limit=120s
+started=2026-09-04T09:22:18+05:30
+
+=== [1/3] Netlib LP (93) solvers=sor-simplex,sor-pdhg,sor-hpr,highs,cbc,scipy-ipm,scipy-simplex ===
+{
+  "suite": "netlib",
+  "n_instances": 93,
+  "time_limit_s": 30.0,
+  "max_iter": 200000,
+  "tol": 1e-06,
+  "backend": "cpu",
+  "engine": "simplex",
+  "obj_tol": 0.0001,
+  "solvers": [
+    "sor-simplex",
+    "sor-pdhg",
+    "sor-hpr",
+    "highs",
+    "cbc",
+    "scipy-ipm",
+    "scipy-simplex"
+  ],
+  "mode": "sequential_per_instance",
+  "host": "yash-Bravo-15-B5DD",
+  "platform": "Linux-6.17.0-42-generic-x86_64-with-glibc2.39",
+  "processor": "x86_64",
+  "cpu_count": 12,
+  "note": "Solvers run one-by-one per instance on the same hardware. Competitors run once; every SOR engine is a separate column."
+}
+
+93 remaining / 93 total × 7 solvers (sequential, 30.0s limit each)
+
+── [1/93 remaining | 25fv47] ──
+    SOR-simplex       status=Optimal           obj=       5501.85  time=523.5ms
+    SOR-pdhg          status=Interrupted       obj=       5513.35  time=2.856s
+    SOR-hpr           status=Interrupted       obj=       5514.08  time=3.356s
+    highs             status=Optimal           obj=       5501.85  time=127.5ms
+    cbc               status=Optimal           obj=       5501.85  time=198.5ms
+    scipy-ipm         status=Optimal           obj=       5501.85  time=9.484s
+    scipy-simplex     status=Infeasible        obj=       14237.9  time=39.594s
+── [2/93 remaining | 80bau3b] ──
+    SOR-simplex       status=Optimal           obj=        987224  time=1.607s
+    SOR-pdhg          status=Interrupted       obj=        987707  time=8.579s
+    SOR-hpr           status=Interrupted       obj=        987707  time=10.201s
+    highs             status=Optimal           obj=        987224  time=106.7ms
+    cbc               status=Optimal           obj=        987224  time=305.1ms
+    scipy-ipm         status=timeout           obj=             —  time=50.104s
+    scipy-simplex     status=timeout           obj=             —  time=50.074s
+── [3/93 remaining | adlittle] ──
+    SOR-simplex       status=Optimal           obj=        225495  time=3.9ms
+    SOR-pdhg          status=Interrupted       obj=        225495  time=164.3ms
+    SOR-hpr           status=Feasible          obj=        225495  time=127.5ms
+    highs             status=Optimal           obj=        225495  time=2.0ms
+    cbc               status=Optimal           obj=        225495  time=19.3ms
+    scipy-ipm         status=Optimal           obj=        225495  time=9.2ms
+    scipy-simplex     status=Optimal           obj=        225495  time=50.5ms
+── [4/93 remaining | afiro] ──
+    SOR-simplex       status=Optimal           obj=      -464.753  time=2.5ms
+    SOR-pdhg          status=Feasible          obj=      -464.753  time=5.1ms
+    SOR-hpr           status=Feasible          obj=      -464.753  time=4.3ms
+    highs             status=Optimal           obj=      -464.753  time=2.0ms
+    cbc               status=Optimal           obj=      -464.753  time=5.5ms
+    scipy-ipm         status=Optimal           obj=      -464.753  time=8.0ms
+    scipy-simplex     status=Optimal           obj=      -464.753  time=8.3ms
+── [5/93 remaining | agg] ──
+    SOR-simplex       status=Optimal           obj=  -3.59918e+07  time=10.0ms
+    SOR-pdhg          status=Interrupted       obj=  -3.26091e+07  time=603.8ms
+    SOR-hpr           status=Interrupted       obj=  -3.26091e+07  time=807.2ms
+    highs             status=Optimal           obj=  -3.59918e+07  time=10.2ms
+    cbc               status=Optimal           obj=  -3.59918e+07  time=26.5ms
+    scipy-ipm         status=NumericalFailure  obj=  -3.59918e+07  time=1.931s
+    scipy-simplex     status=NumericalFailure  obj=  -3.01376e+07  time=1.220s
+── [6/93 remaining | agg2] ──
+    SOR-simplex       status=Optimal           obj=  -2.02393e+07  time=15.7ms
+    SOR-pdhg          status=Interrupted       obj=  -1.83246e+07  time=881.5ms
+    SOR-hpr           status=Interrupted       obj=  -1.69103e+07  time=1.255s
+    highs             status=Optimal           obj=  -2.02393e+07  time=16.4ms
+    cbc               status=Optimal           obj=  -2.02393e+07  time=26.7ms
+    scipy-ipm         status=NumericalFailure  obj=  -2.02391e+07  time=2.124s
+    scipy-simplex     status=NumericalFailure  obj=  -1.56679e+07  time=1.304s
+── [7/93 remaining | agg3] ──
+    SOR-simplex       status=Optimal           obj=   1.03121e+07  time=25.4ms
+    SOR-pdhg          status=Interrupted       obj=   1.36576e+07  time=888.8ms
+    SOR-hpr           status=Interrupted       obj=   1.51163e+07  time=1.309s
+    highs             status=Optimal           obj=   1.03121e+07  time=6.8ms
+    cbc               status=Optimal           obj=   1.03121e+07  time=18.4ms
+    scipy-ipm         status=NumericalFailure  obj=   1.03121e+07  time=2.046s
+    scipy-simplex     status=NumericalFailure  obj=   1.76624e+07  time=1.264s
+── [8/93 remaining | bandm] ──
+    SOR-simplex       status=Optimal           obj=      -158.628  time=19.8ms
+    SOR-pdhg          status=Interrupted       obj=      -158.631  time=869.8ms
+    SOR-hpr           status=Interrupted       obj=       -158.62  time=947.0ms
+    highs             status=Optimal           obj=      -158.628  time=12.3ms
+    cbc               status=Optimal           obj=      -158.628  time=19.4ms
+    scipy-ipm         status=crash             obj=             —  time=590.5ms
+    scipy-simplex     status=crash             obj=             —  time=587.0ms
+── [9/93 remaining | beaconfd] ──
+    SOR-simplex       status=Optimal           obj=       33592.5  time=6.2ms
+    SOR-pdhg          status=Interrupted       obj=       33793.5  time=1.026s
+    SOR-hpr           status=Interrupted       obj=       33796.3  time=963.3ms
+    highs             status=Optimal           obj=       33592.5  time=4.3ms
+    cbc               status=Optimal           obj=       33592.5  time=13.3ms
+    scipy-ipm         status=Optimal           obj=       33592.5  time=68.3ms
+    scipy-simplex     status=Optimal           obj=       33592.5  time=125.4ms
+── [10/93 remaining | blend] ──
+    SOR-simplex       status=Optimal           obj=      -30.8121  time=3.9ms
+    SOR-pdhg          status=Interrupted       obj=      -30.8118  time=187.6ms
+    SOR-hpr           status=Feasible          obj=      -30.8122  time=51.2ms
+    highs             status=Optimal           obj=      -30.8121  time=5.5ms
+    cbc               status=crash             obj=             —  time=216.4ms
+    scipy-ipm         status=crash             obj=             —  time=595.7ms
+    scipy-simplex     status=crash             obj=             —  time=530.6ms
+── [11/93 remaining | bnl1] ──
+    SOR-simplex       status=Optimal           obj=       1977.63  time=55.8ms
+    SOR-pdhg          status=Interrupted       obj=       1958.68  time=1.711s
+    SOR-hpr           status=Interrupted       obj=       1964.82  time=1.968s
+    highs             status=Optimal           obj=       1977.63  time=24.1ms
+    cbc               status=Optimal           obj=       1977.63  time=45.2ms
+    scipy-ipm         status=Optimal           obj=       1977.63  time=8.373s
+    scipy-simplex     status=timeout           obj=             —  time=50.012s
+── [12/93 remaining | bnl2] ──
+    SOR-simplex       status=Optimal           obj=       1811.24  time=417.5ms
+    SOR-pdhg          status=Interrupted       obj=        1847.5  time=4.924s
+    SOR-hpr           status=Interrupted       obj=       1860.03  time=5.859s
+    highs             status=Optimal           obj=       1811.24  time=46.0ms
+    cbc               status=Optimal           obj=       1811.24  time=110.7ms
+    scipy-ipm         status=Optimal           obj=       1811.24  time=42.678s
+    scipy-simplex     status=timeout           obj=             —  time=50.065s
+── [13/93 remaining | boeing1] ──
+    SOR-simplex       status=Optimal           obj=      -335.214  time=38.9ms
+    SOR-pdhg          status=Interrupted       obj=      -298.518  time=821.2ms
+    SOR-hpr           status=Interrupted       obj=      -284.019  time=1.156s
+    highs             status=Optimal           obj=      -335.214  time=18.1ms
+    cbc               status=crash             obj=             —  time=220.1ms
+    scipy-ipm         status=crash             obj=             —  time=573.3ms
+    scipy-simplex     status=crash             obj=             —  time=580.9ms
+── [14/93 remaining | boeing2] ──
+    SOR-simplex       status=Optimal           obj=      -315.019  time=5.5ms
+    SOR-pdhg          status=Interrupted       obj=      -304.664  time=381.5ms
+    SOR-hpr           status=Interrupted       obj=      -302.185  time=388.8ms
+    highs             status=Optimal           obj=      -315.019  time=3.5ms
+    cbc               status=crash             obj=             —  time=167.8ms
+    scipy-ipm         status=crash             obj=             —  time=566.2ms
+    scipy-simplex     status=crash             obj=             —  time=535.6ms
+── [15/93 remaining | bore3d] ──
+    SOR-simplex       status=Optimal           obj=       1373.08  time=5.8ms
+    SOR-pdhg          status=Interrupted       obj=       1399.64  time=528.7ms
+    SOR-hpr           status=Interrupted       obj=       1435.78  time=525.4ms
+    highs             status=Optimal           obj=       1373.08  time=2.8ms
+    cbc               status=Optimal           obj=       1373.08  time=12.0ms
+    scipy-ipm         status=Optimal           obj=       1373.08  time=750.4ms
+    scipy-simplex     status=timeout           obj=             —  time=50.026s
+── [16/93 remaining | brandy] ──
+    SOR-simplex       status=Optimal           obj=       1518.51  time=18.6ms
+    SOR-pdhg          status=Interrupted       obj=       1518.92  time=699.3ms
+    SOR-hpr           status=Interrupted       obj=          1519  time=686.5ms
+    highs             status=Optimal           obj=       1518.51  time=15.0ms
+    cbc               status=Optimal           obj=       1518.51  time=15.4ms
+    scipy-ipm         status=Optimal           obj=       1518.51  time=114.0ms
+    scipy-simplex     status=Optimal           obj=       1518.51  time=398.6ms
+── [17/93 remaining | capri] ──
+    SOR-simplex       status=Optimal           obj=       2690.01  time=10.9ms
+    SOR-pdhg          status=Interrupted       obj=       2734.21  time=602.7ms
+    SOR-hpr           status=Interrupted       obj=       2739.41  time=653.5ms
+    highs             status=Optimal           obj=       2690.01  time=4.4ms
+    cbc               status=Optimal           obj=       2690.01  time=16.3ms
+    scipy-ipm         status=Optimal           obj=       2690.01  time=1.153s
+    scipy-simplex     status=Optimal           obj=       2690.01  time=1.550s
+── [18/93 remaining | cycle] ──
+    SOR-simplex       status=Optimal           obj=      -5.22639  time=114.5ms
+    SOR-pdhg          status=Interrupted       obj=      -4.52357  time=6.223s
+    SOR-hpr           status=Interrupted       obj=      -4.45183  time=6.883s
+    highs             status=Optimal           obj=      -5.22639  time=203.1ms
+    cbc               status=Optimal           obj=      -5.22639  time=69.2ms
+    scipy-ipm         status=Optimal           obj=      -5.22637  time=39.649s
+    scipy-simplex     status=timeout           obj=             —  time=50.018s
+── [19/93 remaining | czprob] ──
+    SOR-simplex       status=Optimal           obj=    2.1852e+06  time=33.7ms
+    SOR-pdhg          status=Interrupted       obj=   2.18515e+06  time=3.852s
+    SOR-hpr           status=Interrupted       obj=   2.18524e+06  time=4.545s
+    highs             status=Optimal           obj=    2.1852e+06  time=24.3ms
+    cbc               status=Optimal           obj=    2.1852e+06  time=54.9ms
+    scipy-ipm         status=Optimal           obj=    2.1852e+06  time=9.022s
+    scipy-simplex     status=Optimal           obj=    2.1852e+06  time=18.924s
+── [20/93 remaining | d2q06c] ──
+    SOR-simplex       status=Optimal           obj=        122784  time=3.238s
+    SOR-pdhg          status=Interrupted       obj=        124412  time=9.221s
+    SOR-hpr           status=Interrupted       obj=        125105  time=10.895s
+    highs             status=Optimal           obj=        122784  time=612.2ms
+    cbc               status=Optimal           obj=        122784  time=1.108s
+    scipy-ipm         status=crash             obj=             —  time=701.8ms
+    scipy-simplex     status=crash             obj=             —  time=709.1ms
+── [21/93 remaining | d6cube] ──
+    SOR-simplex       status=Optimal           obj=       315.492  time=172.2ms
+    SOR-pdhg          status=Interrupted       obj=       315.958  time=11.489s
+    SOR-hpr           status=Interrupted       obj=       315.958  time=13.492s
+    highs             status=Optimal           obj=       315.492  time=110.9ms
+    cbc               status=Optimal           obj=       315.492  time=144.5ms
+    scipy-ipm         status=Optimal           obj=       315.492  time=3.629s
+    scipy-simplex     status=timeout           obj=             —  time=50.062s
+── [22/93 remaining | degen2] ──
+    SOR-simplex       status=Optimal           obj=      -1435.18  time=39.8ms
+    SOR-pdhg          status=Interrupted       obj=      -1435.18  time=1.152s
+    SOR-hpr           status=Feasible          obj=      -1435.18  time=722.6ms
+    highs             status=Optimal           obj=      -1435.18  time=15.7ms
+    cbc               status=Optimal           obj=      -1435.18  time=24.3ms
+    scipy-ipm         status=Optimal           obj=      -1435.18  time=1.018s
+    scipy-simplex     status=Optimal           obj=      -1435.18  time=5.594s
+── [23/93 remaining | degen3] ──
+    SOR-simplex       status=Optimal           obj=      -987.294  time=788.1ms
+    SOR-pdhg          status=Interrupted       obj=      -987.292  time=6.308s
+    SOR-hpr           status=Interrupted       obj=      -987.294  time=6.924s
+    highs             status=Optimal           obj=      -987.294  time=150.9ms
+    cbc               status=Optimal           obj=      -987.294  time=178.7ms
+    scipy-ipm         status=Optimal           obj=      -987.294  time=9.960s
+    scipy-simplex     status=timeout           obj=             —  time=50.051s
+── [24/93 remaining | dfl001] ──
+    SOR-simplex       status=Interrupted       obj=   1.12657e+07  time=30.123s
+    SOR-pdhg          status=Interrupted       obj=   6.33937e+06  time=25.774s
+    SOR-hpr           status=Interrupted       obj=   3.52693e+06  time=30.043s
+    highs             status=Optimal           obj=   1.12664e+07  time=5.945s
+    cbc               status=crash             obj=             —  time=432.6ms
+    scipy-ipm         status=crash             obj=             —  time=833.6ms
+    scipy-simplex     status=crash             obj=             —  time=801.0ms
+── [25/93 remaining | e226] ──
+    SOR-simplex       status=Optimal           obj=      -11.6389  time=20.1ms
+    SOR-pdhg          status=Interrupted       obj=      -11.6284  time=776.1ms
+    SOR-hpr           status=Interrupted       obj=       -11.617  time=802.4ms
+    highs             status=Optimal           obj=      -11.6389  time=8.0ms
+    cbc               status=crash             obj=             —  time=175.8ms
+    scipy-ipm         status=crash             obj=             —  time=645.2ms
+    scipy-simplex     status=crash             obj=             —  time=582.3ms
+── [26/93 remaining | etamacro] ──
+    SOR-simplex       status=Optimal           obj=      -755.715  time=17.1ms
+    SOR-pdhg          status=Interrupted       obj=      -755.576  time=961.5ms
+    SOR-hpr           status=Interrupted       obj=      -755.492  time=1.009s
+    highs             status=Optimal           obj=      -755.715  time=8.8ms
+    cbc               status=Optimal           obj=      -755.715  time=22.0ms
+    scipy-ipm         status=Optimal           obj=      -755.715  time=7.904s
+    scipy-simplex     status=Optimal           obj=      -755.715  time=5.988s
+── [27/93 remaining | fffff800] ──
+    SOR-simplex       status=Optimal           obj=        555680  time=22.8ms
+    SOR-pdhg          status=Interrupted       obj=        686444  time=1.971s
+    SOR-hpr           status=Interrupted       obj=        686444  time=2.071s
+    highs             status=Optimal           obj=        555680  time=10.8ms
+    cbc               status=Optimal           obj=        555680  time=28.4ms
+    scipy-ipm         status=NumericalFailure  obj=        555680  time=6.197s
+    scipy-simplex     status=NumericalFailure  obj=        773838  time=3.925s
+── [28/93 remaining | finnis] ──
+    SOR-simplex       status=Optimal           obj=        172791  time=27.2ms
+    SOR-pdhg          status=Interrupted       obj=        172821  time=920.3ms
+    SOR-hpr           status=Interrupted       obj=        172790  time=1.027s
+    highs             status=Optimal           obj=        172791  time=8.7ms
+    cbc               status=Optimal           obj=        172791  time=18.9ms
+    scipy-ipm         status=Optimal           obj=        172791  time=5.758s
+    scipy-simplex     status=Optimal           obj=        172791  time=5.275s
+── [29/93 remaining | fit1d] ──
+    SOR-simplex       status=Optimal           obj=      -9146.38  time=39.5ms
+    SOR-pdhg          status=Interrupted       obj=       -9146.4  time=3.320s
+    SOR-hpr           status=Interrupted       obj=      -9146.37  time=4.131s
+    highs             status=Optimal           obj=      -9146.38  time=12.0ms
+    cbc               status=Optimal           obj=      -9146.38  time=34.1ms
+    scipy-ipm         status=Optimal           obj=      -9146.38  time=9.433s
+    scipy-simplex     status=Optimal           obj=      -9146.38  time=49.060s
+── [30/93 remaining | fit1p] ──
+    SOR-simplex       status=Optimal           obj=       9146.38  time=68.4ms
+    SOR-pdhg          status=Interrupted       obj=       9146.39  time=3.070s
+    SOR-hpr           status=Interrupted       obj=       9146.37  time=3.630s
+    highs             status=Optimal           obj=       9146.38  time=40.8ms
+    cbc               status=Optimal           obj=       9146.38  time=55.9ms
+    scipy-ipm         status=Optimal           obj=       9146.38  time=9.938s
+    scipy-simplex     status=NumericalFailure  obj=        585389  time=18.260s
+── [31/93 remaining | fit2d] ──
+    SOR-simplex       status=Optimal           obj=      -68464.3  time=2.810s
+    SOR-pdhg          status=Interrupted       obj=      -68464.1  time=30.085s
+    SOR-hpr           status=Interrupted       obj=      -68463.7  time=30.100s
+    highs             status=Optimal           obj=      -68464.3  time=139.9ms
+    cbc               status=Optimal           obj=      -68464.3  time=456.9ms
+    scipy-ipm         status=timeout           obj=             —  time=50.181s
+    scipy-simplex     status=timeout           obj=             —  time=50.154s
+── [32/93 remaining | fit2p] ──
+    SOR-simplex       status=Optimal           obj=       68464.3  time=2.460s
+    SOR-pdhg          status=Interrupted       obj=         68464  time=19.656s
+    SOR-hpr           status=Interrupted       obj=       68463.8  time=26.553s
+    highs             status=Optimal           obj=       68464.3  time=1.055s
+    cbc               status=Optimal           obj=       68464.3  time=1.574s
+    scipy-ipm         status=timeout           obj=             —  time=50.103s
+    scipy-simplex     status=timeout           obj=             —  time=50.090s
+── [33/93 remaining | forplan] ──
+    SOR-simplex       status=Optimal           obj=      -664.219  time=13.7ms
+    SOR-pdhg          status=Interrupted       obj=       739.728  time=1.365s
+    SOR-hpr           status=Interrupted       obj=       773.516  time=1.483s
+    highs             status=Optimal           obj=      -664.219  time=17.3ms
+    cbc               status=crash             obj=             —  time=195.7ms
+    scipy-ipm         status=crash             obj=             —  time=568.4ms
+    scipy-simplex     status=crash             obj=             —  time=559.1ms
+── [34/93 remaining | ganges] ──
+    SOR-simplex       status=Optimal           obj=       -109586  time=48.2ms
+    SOR-pdhg          status=Interrupted       obj=      -99043.6  time=2.929s
+    SOR-hpr           status=Interrupted       obj=      -96794.8  time=3.185s
+    highs             status=Optimal           obj=       -109586  time=15.8ms
+    cbc               status=Optimal           obj=       -109586  time=33.6ms
+    scipy-ipm         status=NumericalFailure  obj=       -109586  time=19.725s
+    scipy-simplex     status=Optimal           obj=       -109586  time=31.086s
+── [35/93 remaining | gfrd-pnc] ──
+    SOR-simplex       status=Optimal           obj=   6.90224e+06  time=29.5ms
+    SOR-pdhg          status=Interrupted       obj=   6.91364e+06  time=1.160s
+    SOR-hpr           status=Interrupted       obj=   6.92562e+06  time=1.313s
+    highs             status=Optimal           obj=   6.90224e+06  time=7.6ms
+    cbc               status=crash             obj=             —  time=224.4ms
+    scipy-ipm         status=crash             obj=             —  time=595.7ms
+    scipy-simplex     status=crash             obj=             —  time=575.5ms
+── [36/93 remaining | greenbea] ──
+    SOR-simplex       status=Optimal           obj=  -7.25552e+07  time=1.712s
+    SOR-pdhg          status=Interrupted       obj=  -2.75502e+07  time=10.280s
+    SOR-hpr           status=Interrupted       obj=  -2.75502e+07  time=11.028s
+    highs             status=Optimal           obj=  -7.25552e+07  time=192.5ms
+    cbc               status=Optimal           obj=  -7.25552e+07  time=590.3ms
+    scipy-ipm         status=crash             obj=             —  time=760.9ms
+    scipy-simplex     status=crash             obj=             —  time=791.4ms
+── [37/93 remaining | greenbeb] ──
+    SOR-simplex       status=Optimal           obj=  -4.30226e+06  time=1.908s
+    SOR-pdhg          status=Interrupted       obj=    -4.305e+06  time=9.888s
+    SOR-hpr           status=Interrupted       obj=    -4.305e+06  time=11.184s
+    highs             status=Optimal           obj=  -4.30226e+06  time=346.6ms
+    cbc               status=Optimal           obj=  -4.30226e+06  time=403.9ms
+    scipy-ipm         status=crash             obj=             —  time=762.3ms
+    scipy-simplex     status=crash             obj=             —  time=733.8ms
+── [38/93 remaining | grow15] ──
+    SOR-simplex       status=Optimal           obj=  -1.06871e+08  time=70.0ms
+    SOR-pdhg          status=Interrupted       obj=  -3.40006e+07  time=1.468s
+    SOR-hpr           status=Interrupted       obj=  -3.40006e+07  time=1.548s
+    highs             status=Optimal           obj=  -1.06871e+08  time=36.0ms
+    cbc               status=crash             obj=             —  time=174.1ms
+    scipy-ipm         status=crash             obj=             —  time=551.9ms
+    scipy-simplex     status=crash             obj=             —  time=572.8ms
+── [39/93 remaining | grow22] ──
+    SOR-simplex       status=Optimal           obj=  -1.60834e+08  time=317.7ms
+    SOR-pdhg          status=Interrupted       obj=  -5.15408e+07  time=2.169s
+    SOR-hpr           status=Interrupted       obj=  -5.15408e+07  time=2.349s
+    highs             status=Optimal           obj=  -1.60834e+08  time=82.0ms
+    cbc               status=crash             obj=             —  time=187.7ms
+    scipy-ipm         status=crash             obj=             —  time=660.2ms
+    scipy-simplex     status=crash             obj=             —  time=550.6ms
+── [40/93 remaining | grow7] ──
+    SOR-simplex       status=Optimal           obj=  -4.77878e+07  time=53.6ms
+    SOR-pdhg          status=Interrupted       obj=  -1.52588e+07  time=690.9ms
+    SOR-hpr           status=Interrupted       obj=  -1.52588e+07  time=720.1ms
+    highs             status=Optimal           obj=  -4.77878e+07  time=10.8ms
+    cbc               status=crash             obj=             —  time=188.6ms
+    scipy-ipm         status=crash             obj=             —  time=534.2ms
+    scipy-simplex     status=crash             obj=             —  time=519.2ms
+── [41/93 remaining | israel] ──
+    SOR-simplex       status=Optimal           obj=       -896645  time=19.3ms
+    SOR-pdhg          status=Interrupted       obj=       -896315  time=477.9ms
+    SOR-hpr           status=Interrupted       obj=       -895359  time=680.3ms
+    highs             status=Optimal           obj=       -896645  time=6.0ms
+    cbc               status=Optimal           obj=       -896645  time=12.3ms
+    scipy-ipm         status=Optimal           obj=       -896645  time=173.3ms
+    scipy-simplex     status=NumericalFailure  obj=        330582  time=336.4ms
+── [42/93 remaining | kb2] ──
+    SOR-simplex       status=Optimal           obj=       -1749.9  time=14.7ms
+    SOR-pdhg          status=Interrupted       obj=      -1750.03  time=109.0ms
+    SOR-hpr           status=Interrupted       obj=      -1749.54  time=107.3ms
+    highs             status=Optimal           obj=       -1749.9  time=1.1ms
+    cbc               status=Optimal           obj=       -1749.9  time=5.6ms
+    scipy-ipm         status=Optimal           obj=       -1749.9  time=7.5ms
+    scipy-simplex     status=Optimal           obj=       -1749.9  time=43.8ms
+── [43/93 remaining | lotfi] ──
+    SOR-simplex       status=Optimal           obj=      -25.2647  time=15.8ms
+    SOR-pdhg          status=Interrupted       obj=       219.588  time=422.2ms
+    SOR-hpr           status=Interrupted       obj=       220.015  time=458.6ms
+    highs             status=Optimal           obj=      -25.2647  time=3.3ms
+    cbc               status=Optimal           obj=      -25.2647  time=9.4ms
+    scipy-ipm         status=Optimal           obj=      -25.2647  time=277.9ms
+    scipy-simplex     status=Optimal           obj=      -25.2647  time=182.9ms
+── [44/93 remaining | maros-r7] ──
+    SOR-simplex       status=Optimal           obj=   1.49719e+06  time=3.792s
+    SOR-pdhg          status=Interrupted       obj=   1.49727e+06  time=30.095s
+    SOR-hpr           status=Interrupted       obj=   1.49751e+06  time=30.103s
+    highs             status=Optimal           obj=   1.49719e+06  time=686.9ms
+    cbc               status=Optimal           obj=   1.49719e+06  time=1.321s
+    scipy-ipm         status=timeout           obj=             —  time=50.115s
+    scipy-simplex     status=timeout           obj=             —  time=50.118s
+── [45/93 remaining | maros] ──
+    SOR-simplex       status=Optimal           obj=      -58063.7  time=224.8ms
+    SOR-pdhg          status=Interrupted       obj=      -52548.7  time=2.753s
+    SOR-hpr           status=Interrupted       obj=        -50299  time=3.389s
+    highs             status=Optimal           obj=      -58063.7  time=41.1ms
+    cbc               status=Optimal           obj=      -58063.7  time=58.8ms
+    scipy-ipm         status=NumericalFailure  obj=      -58063.4  time=14.654s
+    scipy-simplex     status=timeout           obj=             —  time=50.056s
+── [46/93 remaining | modszk1] ──
+    SOR-simplex       status=Optimal           obj=        320.62  time=39.5ms
+    SOR-pdhg          status=Interrupted       obj=        628920  time=1.623s
+    SOR-hpr           status=Interrupted       obj=        628920  time=1.736s
+    highs             status=Optimal           obj=        320.62  time=14.9ms
+    cbc               status=Optimal           obj=        320.62  time=39.2ms
+    scipy-ipm         status=Optimal           obj=        320.62  time=9.147s
+    scipy-simplex     status=timeout           obj=             —  time=50.012s
+── [47/93 remaining | nesm] ──
+    SOR-simplex       status=Optimal           obj=    1.4076e+07  time=395.6ms
+    SOR-pdhg          status=Interrupted       obj=   1.40761e+07  time=3.942s
+    SOR-hpr           status=Interrupted       obj=   1.40761e+07  time=4.511s
+    highs             status=Optimal           obj=    1.4076e+07  time=133.1ms
+    cbc               status=crash             obj=             —  time=220.2ms
+    scipy-ipm         status=crash             obj=             —  time=565.8ms
+    scipy-simplex     status=crash             obj=             —  time=555.2ms
+── [48/93 remaining | perold] ──
+    SOR-simplex       status=Optimal           obj=      -9380.76  time=199.6ms
+    SOR-pdhg          status=Interrupted       obj=      -5941.89  time=1.856s
+    SOR-hpr           status=Interrupted       obj=      -5941.89  time=2.137s
+    highs             status=Optimal           obj=      -9380.76  time=58.2ms
+    cbc               status=Optimal           obj=      -9380.76  time=82.8ms
+    scipy-ipm         status=NumericalFailure  obj=      -9380.74  time=11.086s
+    scipy-simplex     status=timeout           obj=             —  time=50.011s
+── [49/93 remaining | pilot.ja] ──
+    SOR-simplex       status=Optimal           obj=      -6113.14  time=706.3ms
+    SOR-pdhg          status=Interrupted       obj=      -3599.26  time=3.661s
+    SOR-hpr           status=Interrupted       obj=      -3574.74  time=4.696s
+    highs             status=Optimal           obj=      -6113.14  time=64.1ms
+    cbc               status=Optimal           obj=      -6113.14  time=207.3ms
+    scipy-ipm         status=NumericalFailure  obj=      -6113.12  time=13.738s
+    scipy-simplex     status=timeout           obj=             —  time=50.013s
+── [50/93 remaining | pilot] ──
+    SOR-simplex       status=Optimal           obj=      -557.488  time=7.361s
+    SOR-pdhg          status=Interrupted       obj=      -503.308  time=11.754s
+    SOR-hpr           status=Interrupted       obj=      -496.083  time=13.028s
+    highs             status=Optimal           obj=       -557.49  time=876.8ms
+    cbc               status=Optimal           obj=       -557.49  time=880.7ms
+    scipy-ipm         status=Optimal           obj=      -557.488  time=48.270s
+    scipy-simplex     status=timeout           obj=             —  time=50.037s
+── [51/93 remaining | pilot.we] ──
+    SOR-simplex       status=Optimal           obj=  -2.72011e+06  time=302.3ms
+    SOR-pdhg          status=Interrupted       obj=  -2.65457e+06  time=2.830s
+    SOR-hpr           status=Interrupted       obj=  -1.92109e+06  time=3.272s
+    highs             status=Optimal           obj=  -2.72011e+06  time=116.7ms
+    cbc               status=Optimal           obj=  -2.72011e+06  time=127.6ms
+    scipy-ipm         status=NumericalFailure  obj=  -2.72011e+06  time=16.249s
+    scipy-simplex     status=timeout           obj=             —  time=50.035s
+── [52/93 remaining | pilot4] ──
+    SOR-simplex       status=Optimal           obj=      -2581.14  time=89.0ms
+    SOR-pdhg          status=Interrupted       obj=      -50.5961  time=1.412s
+    SOR-hpr           status=Interrupted       obj=      -38.8806  time=1.728s
+    highs             status=Optimal           obj=      -2581.14  time=29.5ms
+    cbc               status=Optimal           obj=      -2581.14  time=45.7ms
+    scipy-ipm         status=NumericalFailure  obj=      -2581.13  time=8.440s
+    scipy-simplex     status=timeout           obj=             —  time=50.013s
+── [53/93 remaining | pilot87] ──
+    SOR-simplex       status=Optimal           obj=        301.71  time=12.174s
+    SOR-pdhg          status=Interrupted       obj=       326.309  time=18.170s
+    SOR-hpr           status=Interrupted       obj=       331.419  time=22.816s
+    highs             status=Optimal           obj=        301.71  time=3.329s
+    cbc               status=Optimal           obj=        301.71  time=3.603s
+    scipy-ipm         status=timeout           obj=             —  time=50.073s
+    scipy-simplex     status=timeout           obj=             —  time=50.019s
+── [54/93 remaining | pilotnov] ──
+    SOR-simplex       status=Optimal           obj=      -4497.28  time=232.7ms
+    SOR-pdhg          status=Interrupted       obj=      -964.152  time=3.743s
+    SOR-hpr           status=Interrupted       obj=      -807.163  time=4.278s
+    highs             status=Optimal           obj=      -4497.28  time=126.0ms
+    cbc               status=Optimal           obj=      -4497.28  time=102.7ms
+    scipy-ipm         status=NumericalFailure  obj=      -4497.27  time=10.225s
+    scipy-simplex     status=timeout           obj=             —  time=50.047s
+── [55/93 remaining | recipe] ──
+    SOR-simplex       status=Optimal           obj=      -266.616  time=2.8ms
+    SOR-pdhg          status=Feasible          obj=      -266.616  time=29.9ms
+    SOR-hpr           status=Feasible          obj=      -266.616  time=66.0ms
+    highs             status=Optimal           obj=      -266.616  time=2.2ms
+    cbc               status=Optimal           obj=      -266.616  time=7.8ms
+    scipy-ipm         status=Optimal           obj=      -266.616  time=273.6ms
+    scipy-simplex     status=Optimal           obj=      -266.616  time=224.8ms
+── [56/93 remaining | sc105] ──
+    SOR-simplex       status=Optimal           obj=      -52.2021  time=3.7ms
+    SOR-pdhg          status=Interrupted       obj=      -39.3086  time=141.5ms
+    SOR-hpr           status=Interrupted       obj=       -39.143  time=142.4ms
+    highs             status=Optimal           obj=      -52.2021  time=3.5ms
+    cbc               status=Optimal           obj=      -52.2021  time=8.8ms
+    scipy-ipm         status=Optimal           obj=      -52.2021  time=10.1ms
+    scipy-simplex     status=Optimal           obj=      -52.2021  time=53.6ms
+── [57/93 remaining | sc205] ──
+    SOR-simplex       status=Optimal           obj=      -52.2021  time=6.7ms
+    SOR-pdhg          status=Interrupted       obj=      -2.49246  time=239.4ms
+    SOR-hpr           status=Interrupted       obj=      -2.42778  time=288.7ms
+    highs             status=Optimal           obj=      -52.2021  time=2.9ms
+    cbc               status=Optimal           obj=      -52.2021  time=8.1ms
+    scipy-ipm         status=Optimal           obj=      -52.2021  time=111.0ms
+    scipy-simplex     status=Optimal           obj=      -52.2021  time=201.0ms
+── [58/93 remaining | sc50a] ──
+    SOR-simplex       status=Optimal           obj=      -64.5751  time=2.7ms
+    SOR-pdhg          status=Feasible          obj=      -64.5751  time=23.3ms
+    SOR-hpr           status=Feasible          obj=      -64.5751  time=35.8ms
+    highs             status=Optimal           obj=      -64.5751  time=1.4ms
+    cbc               status=Optimal           obj=      -64.5751  time=7.5ms
+    scipy-ipm         status=Optimal           obj=      -64.5751  time=5.5ms
+    scipy-simplex     status=Optimal           obj=      -64.5751  time=16.9ms
+── [59/93 remaining | sc50b] ──
+    SOR-simplex       status=Optimal           obj=           -70  time=2.9ms
+    SOR-pdhg          status=Feasible          obj=           -70  time=27.0ms
+    SOR-hpr           status=Feasible          obj=           -70  time=25.1ms
+    highs             status=Optimal           obj=           -70  time=6.5ms
+    cbc               status=Optimal           obj=           -70  time=14.6ms
+    scipy-ipm         status=Optimal           obj=           -70  time=5.5ms
+    scipy-simplex     status=Optimal           obj=           -70  time=16.7ms
+── [60/93 remaining | scagr25] ──
+    SOR-simplex       status=Optimal           obj=  -1.47534e+07  time=18.7ms
+    SOR-pdhg          status=Interrupted       obj=  -1.47503e+07  time=700.8ms
+    SOR-hpr           status=Interrupted       obj=  -1.47536e+07  time=739.3ms
+    highs             status=Optimal           obj=  -1.47534e+07  time=7.9ms
+    cbc               status=Optimal           obj=  -1.47534e+07  time=13.7ms
+    scipy-ipm         status=NumericalFailure  obj=  -1.47534e+07  time=1.378s
+    scipy-simplex     status=NumericalFailure  obj=  -5.40498e+06  time=1.567s
+── [61/93 remaining | scagr7] ──
+    SOR-simplex       status=Optimal           obj=  -2.33139e+06  time=4.3ms
+    SOR-pdhg          status=Interrupted       obj=  -2.33058e+06  time=194.3ms
+    SOR-hpr           status=Interrupted       obj=  -2.33141e+06  time=192.4ms
+    highs             status=Optimal           obj=  -2.33139e+06  time=4.6ms
+    cbc               status=Optimal           obj=  -2.33139e+06  time=18.7ms
+    scipy-ipm         status=Optimal           obj=  -2.33139e+06  time=23.8ms
+    scipy-simplex     status=Optimal           obj=  -2.33139e+06  time=108.7ms
+── [62/93 remaining | scfxm1] ──
+    SOR-simplex       status=Optimal           obj=       18416.8  time=13.5ms
+    SOR-pdhg          status=Interrupted       obj=       18419.3  time=765.2ms
+    SOR-hpr           status=Interrupted       obj=         18460  time=884.1ms
+    highs             status=Optimal           obj=       18416.8  time=7.8ms
+    cbc               status=Optimal           obj=       18416.8  time=16.9ms
+    scipy-ipm         status=Optimal           obj=       18416.8  time=717.4ms
+    scipy-simplex     status=timeout           obj=             —  time=50.057s
+── [63/93 remaining | scfxm2] ──
+    SOR-simplex       status=Optimal           obj=       36660.3  time=32.1ms
+    SOR-pdhg          status=Interrupted       obj=       36664.3  time=1.837s
+    SOR-hpr           status=Interrupted       obj=       36674.1  time=1.725s
+    highs             status=Optimal           obj=       36660.3  time=17.5ms
+    cbc               status=Optimal           obj=       36660.3  time=35.2ms
+    scipy-ipm         status=Optimal           obj=       36660.3  time=6.219s
+    scipy-simplex     status=timeout           obj=             —  time=50.024s
+── [64/93 remaining | scfxm3] ──
+    SOR-simplex       status=Optimal           obj=       54901.3  time=81.3ms
+    SOR-pdhg          status=Interrupted       obj=       54906.4  time=2.599s
+    SOR-hpr           status=Interrupted       obj=       54959.4  time=2.447s
+    highs             status=Optimal           obj=       54901.3  time=28.7ms
+    cbc               status=Optimal           obj=       54901.3  time=51.6ms
+    scipy-ipm         status=Optimal           obj=       54901.3  time=8.077s
+    scipy-simplex     status=timeout           obj=             —  time=50.051s
+── [65/93 remaining | scorpion] ──
+    SOR-simplex       status=Optimal           obj=       1878.12  time=10.2ms
+    SOR-pdhg          status=Interrupted       obj=       1865.04  time=679.2ms
+    SOR-hpr           status=Interrupted       obj=       1865.02  time=649.5ms
+    highs             status=Optimal           obj=       1878.12  time=3.6ms
+    cbc               status=Optimal           obj=       1878.12  time=11.8ms
+    scipy-ipm         status=Optimal           obj=       1878.12  time=537.8ms
+    scipy-simplex     status=Optimal           obj=       1878.12  time=378.8ms
+── [66/93 remaining | scrs8] ──
+    SOR-simplex       status=Optimal           obj=       904.297  time=14.8ms
+    SOR-pdhg          status=Interrupted       obj=       700.494  time=1.195s
+    SOR-hpr           status=Interrupted       obj=       700.494  time=1.417s
+    highs             status=Optimal           obj=       904.297  time=11.7ms
+    cbc               status=Optimal           obj=       904.297  time=23.2ms
+    scipy-ipm         status=Optimal           obj=       904.297  time=6.046s
+    scipy-simplex     status=Optimal           obj=       904.297  time=4.801s
+── [67/93 remaining | scsd1] ──
+    SOR-simplex       status=Optimal           obj=       8.66667  time=7.8ms
+    SOR-pdhg          status=Feasible          obj=       8.66667  time=172.2ms
+    SOR-hpr           status=Feasible          obj=       8.66666  time=185.4ms
+    highs             status=Optimal           obj=       8.66667  time=3.2ms
+    cbc               status=Optimal           obj=       8.66667  time=14.8ms
+    scipy-ipm         status=Optimal           obj=       8.66667  time=71.7ms
+    scipy-simplex     status=Optimal           obj=       8.66667  time=318.4ms
+── [68/93 remaining | scsd6] ──
+    SOR-simplex       status=Optimal           obj=          50.5  time=19.3ms
+    SOR-pdhg          status=Feasible          obj=          50.5  time=1.253s
+    SOR-hpr           status=Feasible          obj=          50.5  time=950.1ms
+    highs             status=Optimal           obj=          50.5  time=7.6ms
+    cbc               status=Optimal           obj=          50.5  time=22.7ms
+    scipy-ipm         status=Optimal           obj=          50.5  time=218.3ms
+    scipy-simplex     status=NumericalFailure  obj=       57.1861  time=2.266s
+── [69/93 remaining | scsd8] ──
+    SOR-simplex       status=Optimal           obj=           905  time=89.0ms
+    SOR-pdhg          status=Interrupted       obj=       905.003  time=2.828s
+    SOR-hpr           status=Feasible          obj=           905  time=1.273s
+    highs             status=Optimal           obj=           905  time=36.9ms
+    cbc               status=Optimal           obj=           905  time=57.6ms
+    scipy-ipm         status=Optimal           obj=           905  time=2.147s
+    scipy-simplex     status=Infeasible        obj=       15303.2  time=2.507s
+── [70/93 remaining | sctap1] ──
+    SOR-simplex       status=Optimal           obj=       1412.25  time=7.1ms
+    SOR-pdhg          status=Interrupted       obj=       1409.91  time=652.1ms
+    SOR-hpr           status=Feasible          obj=       1412.25  time=348.6ms
+    highs             status=Optimal           obj=       1412.25  time=6.3ms
+    cbc               status=Optimal           obj=       1412.25  time=15.3ms
+    scipy-ipm         status=Optimal           obj=       1412.25  time=383.1ms
+    scipy-simplex     status=Optimal           obj=       1412.25  time=884.4ms
+── [71/93 remaining | sctap2] ──
+    SOR-simplex       status=Optimal           obj=       1724.81  time=22.1ms
+    SOR-pdhg          status=Interrupted       obj=        1724.8  time=2.367s
+    SOR-hpr           status=Feasible          obj=       1724.81  time=1.491s
+    highs             status=Optimal           obj=       1724.81  time=12.8ms
+    cbc               status=Optimal           obj=       1724.81  time=35.5ms
+    scipy-ipm         status=Optimal           obj=       1724.81  time=6.379s
+    scipy-simplex     status=timeout           obj=             —  time=50.014s
+── [72/93 remaining | sctap3] ──
+    SOR-simplex       status=Optimal           obj=          1424  time=32.9ms
+    SOR-pdhg          status=Feasible          obj=          1424  time=950.5ms
+    SOR-hpr           status=Feasible          obj=          1424  time=950.0ms
+    highs             status=Optimal           obj=          1424  time=17.0ms
+    cbc               status=Optimal           obj=          1424  time=47.0ms
+    scipy-ipm         status=Optimal           obj=          1424  time=9.619s
+    scipy-simplex     status=timeout           obj=             —  time=50.015s
+── [73/93 remaining | seba] ──
+    SOR-simplex       status=Optimal           obj=       15711.6  time=10.3ms
+    SOR-pdhg          status=Interrupted       obj=       15862.7  time=1.670s
+    SOR-hpr           status=Interrupted       obj=       16076.4  time=1.768s
+    highs             status=Optimal           obj=       15711.6  time=5.6ms
+    cbc               status=crash             obj=             —  time=221.4ms
+    scipy-ipm         status=crash             obj=             —  time=612.5ms
+    scipy-simplex     status=crash             obj=             —  time=590.4ms
+── [74/93 remaining | share1b] ──
+    SOR-simplex       status=Optimal           obj=      -76589.3  time=5.0ms
+    SOR-pdhg          status=Interrupted       obj=        -56949  time=408.5ms
+    SOR-hpr           status=Interrupted       obj=      -55519.4  time=444.8ms
+    highs             status=Optimal           obj=      -76589.3  time=3.7ms
+    cbc               status=Optimal           obj=      -76589.3  time=10.7ms
+    scipy-ipm         status=Optimal           obj=      -76589.3  time=328.9ms
+    scipy-simplex     status=Optimal           obj=      -76589.3  time=273.9ms
+── [75/93 remaining | share2b] ──
+    SOR-simplex       status=Optimal           obj=      -415.732  time=3.7ms
+    SOR-pdhg          status=Interrupted       obj=      -415.579  time=235.2ms
+    SOR-hpr           status=Interrupted       obj=      -415.732  time=226.7ms
+    highs             status=Optimal           obj=      -415.732  time=4.7ms
+    cbc               status=Optimal           obj=      -415.732  time=8.4ms
+    scipy-ipm         status=Optimal           obj=      -415.732  time=9.6ms
+    scipy-simplex     status=Optimal           obj=      -415.732  time=118.6ms
+── [76/93 remaining | shell] ──
+    SOR-simplex       status=Optimal           obj=   1.20883e+09  time=18.4ms
+    SOR-pdhg          status=Interrupted       obj=   1.20886e+09  time=1.732s
+    SOR-hpr           status=Interrupted       obj=   1.20889e+09  time=1.864s
+    highs             status=Optimal           obj=   1.20883e+09  time=12.2ms
+    cbc               status=Optimal           obj=   1.20883e+09  time=28.3ms
+    scipy-ipm         status=NumericalFailure  obj=   1.20878e+09  time=15.087s
+    scipy-simplex     status=Optimal           obj=   1.20883e+09  time=16.299s
+── [77/93 remaining | ship04l] ──
+    SOR-simplex       status=Optimal           obj=   1.79332e+06  time=18.9ms
+    SOR-pdhg          status=Interrupted       obj=   1.73322e+06  time=2.211s
+    SOR-hpr           status=Interrupted       obj=   1.67742e+06  time=2.620s
+    highs             status=Optimal           obj=   1.79332e+06  time=9.1ms
+    cbc               status=Optimal           obj=   1.79332e+06  time=41.5ms
+    scipy-ipm         status=Optimal           obj=   1.79332e+06  time=3.160s
+    scipy-simplex     status=Optimal           obj=   1.79332e+06  time=1.910s
+── [78/93 remaining | ship04s] ──
+    SOR-simplex       status=Optimal           obj=   1.79871e+06  time=9.1ms
+    SOR-pdhg          status=Interrupted       obj=   1.74884e+06  time=1.545s
+    SOR-hpr           status=Interrupted       obj=    1.6865e+06  time=1.777s
+    highs             status=Optimal           obj=   1.79871e+06  time=7.3ms
+    cbc               status=Optimal           obj=   1.79871e+06  time=26.1ms
+    scipy-ipm         status=Optimal           obj=   1.79871e+06  time=650.4ms
+    scipy-simplex     status=Optimal           obj=   1.79871e+06  time=811.8ms
+── [79/93 remaining | ship08l] ──
+    SOR-simplex       status=Optimal           obj=   1.90906e+06  time=24.4ms
+    SOR-pdhg          status=Interrupted       obj=   1.74863e+06  time=4.224s
+    SOR-hpr           status=Interrupted       obj=   1.59837e+06  time=5.570s
+    highs             status=Optimal           obj=   1.90906e+06  time=18.8ms
+    cbc               status=Optimal           obj=   1.90906e+06  time=64.8ms
+    scipy-ipm         status=Optimal           obj=   1.90906e+06  time=8.317s
+    scipy-simplex     status=Optimal           obj=   1.90906e+06  time=14.914s
+── [80/93 remaining | ship08s] ──
+    SOR-simplex       status=Optimal           obj=    1.9201e+06  time=13.3ms
+    SOR-pdhg          status=Interrupted       obj=   1.79525e+06  time=2.426s
+    SOR-hpr           status=Interrupted       obj=   1.64857e+06  time=3.120s
+    highs             status=Optimal           obj=    1.9201e+06  time=10.4ms
+    cbc               status=Optimal           obj=    1.9201e+06  time=37.1ms
+    scipy-ipm         status=Optimal           obj=    1.9201e+06  time=4.409s
+    scipy-simplex     status=Optimal           obj=    1.9201e+06  time=2.792s
+── [81/93 remaining | ship12l] ──
+    SOR-simplex       status=Optimal           obj=   1.47019e+06  time=60.3ms
+    SOR-pdhg          status=Interrupted       obj=   1.37356e+06  time=5.343s
+    SOR-hpr           status=Interrupted       obj=   1.34976e+06  time=6.458s
+    highs             status=Optimal           obj=   1.47019e+06  time=23.6ms
+    cbc               status=Optimal           obj=   1.47019e+06  time=75.6ms
+    scipy-ipm         status=Optimal           obj=   1.47019e+06  time=14.214s
+    scipy-simplex     status=Optimal           obj=   1.47019e+06  time=24.922s
+── [82/93 remaining | ship12s] ──
+    SOR-simplex       status=Optimal           obj=   1.48924e+06  time=14.9ms
+    SOR-pdhg          status=Interrupted       obj=   1.41847e+06  time=2.980s
+    SOR-hpr           status=Interrupted       obj=   1.37214e+06  time=3.327s
+    highs             status=Optimal           obj=   1.48924e+06  time=12.0ms
+    cbc               status=Optimal           obj=   1.48924e+06  time=43.6ms
+    scipy-ipm         status=Optimal           obj=   1.48924e+06  time=5.341s
+    scipy-simplex     status=Optimal           obj=   1.48924e+06  time=4.718s
+── [83/93 remaining | sierra] ──
+    SOR-simplex       status=Optimal           obj=   1.53944e+07  time=25.3ms
+    SOR-pdhg          status=Feasible          obj=   1.53944e+07  time=1.768s
+    SOR-hpr           status=Interrupted       obj=   1.53944e+07  time=2.959s
+    highs             status=Optimal           obj=   1.53944e+07  time=18.7ms
+    cbc               status=crash             obj=             —  time=238.9ms
+    scipy-ipm         status=crash             obj=             —  time=617.9ms
+    scipy-simplex     status=crash             obj=             —  time=604.3ms
+── [84/93 remaining | stair] ──
+    SOR-simplex       status=Optimal           obj=      -251.267  time=25.2ms
+    SOR-pdhg          status=Interrupted       obj=      -251.257  time=1.240s
+    SOR-hpr           status=Interrupted       obj=      -250.471  time=1.164s
+    highs             status=Optimal           obj=      -251.267  time=13.7ms
+    cbc               status=Optimal           obj=      -251.267  time=22.6ms
+    scipy-ipm         status=Optimal           obj=      -251.267  time=1.227s
+    scipy-simplex     status=Infeasible        obj=        -208.8  time=1.391s
+── [85/93 remaining | standata] ──
+    SOR-simplex       status=Optimal           obj=        1257.7  time=6.1ms
+    SOR-pdhg          status=Interrupted       obj=       1238.01  time=1.072s
+    SOR-hpr           status=Feasible          obj=        1257.7  time=362.7ms
+    highs             status=Optimal           obj=        1257.7  time=5.6ms
+    cbc               status=Optimal           obj=        1257.7  time=18.7ms
+    scipy-ipm         status=Optimal           obj=        1257.7  time=3.137s
+    scipy-simplex     status=Optimal           obj=        1257.7  time=1.939s
+── [86/93 remaining | standgub] ──
+    SOR-simplex       status=Optimal           obj=        1257.7  time=5.5ms
+    SOR-pdhg          status=Interrupted       obj=       1238.01  time=1.086s
+    SOR-hpr           status=Feasible          obj=        1257.7  time=382.8ms
+    highs             status=Optimal           obj=        1257.7  time=5.6ms
+    cbc               status=Optimal           obj=        1257.7  time=20.5ms
+    scipy-ipm         status=Optimal           obj=        1257.7  time=3.066s
+    scipy-simplex     status=Optimal           obj=        1257.7  time=2.165s
+── [87/93 remaining | standmps] ──
+    SOR-simplex       status=Optimal           obj=       1406.02  time=10.7ms
+    SOR-pdhg          status=Interrupted       obj=       1405.38  time=1.374s
+    SOR-hpr           status=Interrupted       obj=       1405.58  time=1.448s
+    highs             status=Optimal           obj=       1406.02  time=6.3ms
+    cbc               status=Optimal           obj=       1406.02  time=18.3ms
+    scipy-ipm         status=Optimal           obj=       1406.02  time=3.869s
+    scipy-simplex     status=Optimal           obj=       1406.02  time=3.354s
+── [88/93 remaining | stocfor1] ──
+    SOR-simplex       status=Optimal           obj=        -41132  time=3.4ms
+    SOR-pdhg          status=Interrupted       obj=      -41074.3  time=198.6ms
+    SOR-hpr           status=Feasible          obj=        -41132  time=62.3ms
+    highs             status=Optimal           obj=        -41132  time=2.0ms
+    cbc               status=Optimal           obj=        -41132  time=7.1ms
+    scipy-ipm         status=Optimal           obj=        -41132  time=11.9ms
+    scipy-simplex     status=Optimal           obj=        -41132  time=80.5ms
+── [89/93 remaining | stocfor2] ──
+    SOR-simplex       status=Optimal           obj=      -39024.4  time=359.5ms
+    SOR-pdhg          status=Interrupted       obj=      -39028.2  time=3.255s
+    SOR-hpr           status=Interrupted       obj=      -39024.3  time=3.817s
+    highs             status=Optimal           obj=      -39024.4  time=25.7ms
+    cbc               status=Optimal           obj=      -39024.4  time=56.7ms
+    scipy-ipm         status=Optimal           obj=      -39024.4  time=43.352s
+    scipy-simplex     status=timeout           obj=             —  time=50.076s
+── [90/93 remaining | tuff] ──
+    SOR-simplex       status=Optimal           obj=      0.292148  time=9.9ms
+    SOR-pdhg          status=Interrupted       obj=       0.48797  time=1.538s
+    SOR-hpr           status=Interrupted       obj=      0.394124  time=1.703s
+    highs             status=Optimal           obj=      0.292148  time=9.6ms
+    cbc               status=Optimal           obj=      0.292148  time=22.0ms
+    scipy-ipm         status=Optimal           obj=      0.292148  time=1.613s
+    scipy-simplex     status=timeout           obj=             —  time=50.057s
+── [91/93 remaining | vtp.base] ──
+    SOR-simplex       status=Optimal           obj=        129831  time=5.9ms
+    SOR-pdhg          status=Interrupted       obj=        130076  time=381.8ms
+    SOR-hpr           status=Interrupted       obj=        122222  time=393.3ms
+    highs             status=Optimal           obj=        129831  time=1.9ms
+    cbc               status=Optimal           obj=        129831  time=9.1ms
+    scipy-ipm         status=NumericalFailure  obj=        129831  time=759.5ms
+    scipy-simplex     status=Optimal           obj=        129831  time=766.6ms
+── [92/93 remaining | wood1p] ──
+    SOR-simplex       status=Optimal           obj=        1.4429  time=113.6ms
+    SOR-pdhg          status=Interrupted       obj=       1.49081  time=22.070s
+    SOR-hpr           status=Feasible          obj=        1.4429  time=18.251s
+    highs             status=Optimal           obj=        1.4429  time=82.7ms
+    cbc               status=Optimal           obj=        1.4429  time=150.8ms
+    scipy-ipm         status=Optimal           obj=        1.4429  time=9.177s
+    scipy-simplex     status=timeout           obj=             —  time=50.052s
+── [93/93 remaining | woodw] ──
+    SOR-simplex       status=Optimal           obj=       1.30448  time=239.9ms
+    SOR-pdhg          status=Interrupted       obj=       1.30453  time=13.419s
+    SOR-hpr           status=Interrupted       obj=       1.30454  time=15.030s
+    highs             status=Optimal           obj=       1.30448  time=72.9ms
+    cbc               status=Optimal           obj=       1.30448  time=171.6ms
+    scipy-ipm         status=NumericalFailure  obj=       1.30447  time=41.783s
+    scipy-simplex     status=timeout           obj=             —  time=50.017s
+
+========================================================================================
+Solver                   Solved   ObjMatch     SGM time
+----------------------------------------------------------------------------------------
+SOR-simplex            92/93     93/93        0.2302s
+SOR-pdhg                8/93     28/93        0.4087s
+SOR-hpr                17/93     33/93        0.6039s
+highs                  93/93     93/93        0.0965s
+cbc                    80/93     80/93        0.1209s
+scipy-ipm              56/93     56/93        2.6548s
+scipy-simplex          37/93     37/93        1.9143s
+========================================================================================
+Markdown: /home/yash/Desktop/Sih/sor/benchmarks/results/compare-netlib-20260904-092218.md
+JSONL:    /home/yash/Desktop/Sih/sor/benchmarks/results/compare-netlib-20260904-092218.jsonl
+=== [2/3] Industrial ladder S,M,L,XL,XXL,HUGE ===
+Industrial size ladder · 18 jobs · limit 120.0s
+
+== blend_lp/S  gen=blend --crudes 12 --products 8 ==
+  size 18x20 nnz=136
+  SOR  Optimal       obj=21218603.575  wall=3.02ms  solver_ms=0.154
+  highs    Optimal       obj=21218603.574869998  solve=1.25ms  agree=True  speedup(SOR vs highs solve)=0.4159875206350262
+
+== blend_lp/M  gen=blend --crudes 60 --products 30 ==
+  size 62x90 nnz=1980
+  SOR  Optimal       obj=406858886.13  wall=4.53ms  solver_ms=0.592
+  highs    Optimal       obj=406858886.13327  solve=6.66ms  agree=True  speedup(SOR vs highs solve)=1.4706682107557043
+
+== blend_lp/L  gen=blend --crudes 200 --products 80 ==
+  size 162x280 nnz=16560
+  SOR  Optimal       obj=3811632020.6  wall=18.31ms  solver_ms=5.8
+  highs    Optimal       obj=3811632020.634  solve=20.27ms  agree=True  speedup(SOR vs highs solve)=1.1070048100064496
+
+== blend_lp/XL  gen=blend --crudes 500 --products 150 ==
+  size 302x650 nnz=76300
+  SOR  Optimal       obj=17653904010.0  wall=67.91ms  solver_ms=21.691
+  highs    Optimal       obj=17653904009.942272  solve=97.85ms  agree=True  speedup(SOR vs highs solve)=1.440906305380865
+
+== blend_lp/XXL  gen=blend --crudes 1200 --products 300 ==
+  size 602x1500 nnz=363000
+  SOR  Optimal       obj=83686115383.0  wall=366.60ms  solver_ms=158.099
+  highs    Optimal       obj=83686115382.7457  solve=941.59ms  agree=True  speedup(SOR vs highs solve)=2.568427992238683
+
+== blend_lp/HUGE  gen=blend --crudes 2500 --products 500 ==
+  size 1002x3000 nnz=1256000
+  SOR  Optimal       obj=281735104090.0  wall=1.748s  solver_ms=1060.308
+  highs    Optimal       obj=281735104087.981  solve=7.589s  agree=True  speedup(SOR vs highs solve)=4.342356478526976
+
+== schedule_milp/S  gen=schedule --periods 24 --units 6 ==
+  size 168x288 nnz=570
+  SOR  Optimal       obj=2791.4649  wall=11.96ms  solver_ms=5.101
+  highs    Optimal       obj=2791.4649  solve=24.91ms  agree=True  speedup(SOR vs highs solve)=2.082830730961581
+  cbc      Optimal       obj=2791.4648999999995  solve=67.97ms  agree=True  speedup(SOR vs cbc solve)=5.684441260553512
+
+== schedule_milp/M  gen=schedule --periods 48 --units 12 ==
+  size 624x1152 nnz=2292
+  SOR  Optimal       obj=9197.1363  wall=33.39ms  solver_ms=28.136
+  highs    Optimal       obj=9197.1363  solve=16.86ms  agree=True  speedup(SOR vs highs solve)=0.5050193415678234
+  cbc      Optimal       obj=9197.136299999996  solve=345.70ms  agree=True  speedup(SOR vs cbc solve)=10.352519280717386
+
+== schedule_milp/L  gen=schedule --periods 96 --units 20 ==
+  size 2016x3840 nnz=7660
+  SOR  Optimal       obj=27850.2342  wall=272.34ms  solver_ms=259.089
+  highs    Optimal       obj=27850.2342  solve=59.04ms  agree=True  speedup(SOR vs highs solve)=0.21677561986906874
+  cbc      Optimal       obj=27850.23420000002  solve=867.82ms  agree=True  speedup(SOR vs cbc solve)=3.186506751601865
+
+== schedule_milp/XL  gen=schedule --periods 168 --units 30 ==
+  size 5208x10080 nnz=20130
+  SOR  Optimal       obj=63789.6816  wall=1.867s  solver_ms=1838.926
+  highs    Optimal       obj=63789.6816  solve=183.71ms  agree=True  speedup(SOR vs highs solve)=0.0984247085264199
+  cbc      Optimal       obj=63789.68160000001  solve=2.283s  agree=True  speedup(SOR vs cbc solve)=1.223280091235771
+
+== schedule_milp/XXL  gen=schedule --periods 336 --units 40 ==
+  size 13776x26880 nnz=53720
+  SOR  Optimal       obj=180354.3728  wall=11.033s  solver_ms=10951.342
+  highs    Optimal       obj=180354.3728  solve=598.35ms  agree=True  speedup(SOR vs highs solve)=0.05423056031524412
+  cbc      Optimal       obj=180354.37280000027  solve=12.700s  agree=True  speedup(SOR vs cbc solve)=1.1510025954628618
+
+== schedule_milp/HUGE  gen=schedule --periods 672 --units 50 ==
+  size 34272x67200 nnz=134350
+  SOR  Optimal       obj=447369.0216  wall=67.181s  solver_ms=66955.826
+  highs    Optimal       obj=447369.0216  solve=1.893s  agree=True  speedup(SOR vs highs solve)=0.028170063054686195
+  cbc      Optimal       obj=447369.0215999985  solve=53.965s  agree=True  speedup(SOR vs cbc solve)=0.8032789334337272
+
+== dispatch_qp/S  gen=dispatch --gens 40 ==
+  size 1x40 nnz=40
+  SOR  Optimal       obj=46819.048083  wall=2.06ms  solver_ms=0.015
+  highs-qp Optimal       obj=46819.04808264857  solve=11.99ms  agree=True  speedup(SOR vs highs-qp solve)=5.812785582011741
+
+== dispatch_qp/M  gen=dispatch --gens 200 ==
+  size 1x200 nnz=200
+  SOR  Optimal       obj=232310.13442  wall=2.63ms  solver_ms=0.061
+  highs-qp Optimal       obj=232310.1344163082  solve=8.99ms  agree=True  speedup(SOR vs highs-qp solve)=3.4134201199229026
+
+== dispatch_qp/L  gen=dispatch --gens 1000 ==
+  size 1x1000 nnz=1000
+  SOR  Optimal       obj=1150294.1043  wall=4.80ms  solver_ms=0.275
+  highs-qp Optimal       obj=1150294.1043271748  solve=753.74ms  agree=True  speedup(SOR vs highs-qp solve)=156.92345740026883
+
+== dispatch_qp/XL  gen=dispatch --gens 4000 ==
+  size 1x4000 nnz=4000
+  SOR  Optimal       obj=4545674.4218  wall=13.68ms  solver_ms=1.155
+  highs-qp Optimal       obj=4545674.421766391  solve=78.958s  agree=True  speedup(SOR vs highs-qp solve)=5772.608657859187
+
+== dispatch_qp/XXL  gen=dispatch --gens 8000 ==
+  size 1x8000 nnz=8000
+  SOR  Optimal       obj=9095410.6611  wall=27.92ms  solver_ms=2.382
+  highs-qp TimeLimit     obj=9362611.491388548  solve=120.023s  agree=False  speedup(SOR vs highs-qp solve)=4298.266569611886
+
+== dispatch_qp/HUGE  gen=dispatch --gens 10000 ==
+  size 1x10000 nnz=10000
+  SOR  Optimal       obj=11417149.644  wall=33.25ms  solver_ms=2.809
+  highs-qp TimeLimit     obj=12105222.78751809  solve=120.042s  agree=False  speedup(SOR vs highs-qp solve)=3610.4432918205403
+
+wrote /home/yash/Desktop/Sih/sor/benchmarks/results/industrial-perf-20260904-101927.jsonl
+wrote /home/yash/Desktop/Sih/sor/benchmarks/results/industrial-perf-20260904-101927.md
+=== [3/3] MIPLIB-easy + industrial demos ===
+== blend_lp (lp / simplex) ==
+  SOR Optimal obj=1708676.1279 wall=0.0020772179996129125 | highs Optimal obj=1708676.127863171 agree=True
+== schedule_milp (milp / milp) ==
+  SOR Optimal obj=535.6339 wall=0.0019609650007623713 | highs Optimal obj=535.6338999999999 agree=True | cbc Optimal obj=535.6338999999999 agree=True
+== dispatch_qp (qp / qp) ==
+  SOR Optimal obj=4224.1497228 wall=0.0018483489993741387 | highs-qp Optimal obj=4224.149722789151 agree=True
+== assign1-5-8 (milp / milp) ==
+  SOR Feasible obj=214.0 wall=30.01001762299984 | highs TimeLimit obj=211.99999999999986 agree=None | cbc TimeLimit obj=212.0 agree=None
+== blend2 (milp / milp) ==
+  SOR Optimal obj=7.598985 wall=6.287055783000142 | highs Optimal obj=7.598985 agree=True | cbc Optimal obj=7.598985 agree=True
+== enigma (milp / milp) ==
+  SOR Optimal obj=0.0 wall=2.486576545999924 | highs Optimal obj=0.0 agree=True | cbc Optimal obj=0.0 agree=True
+== flugpl (milp / milp) ==
+  SOR Optimal obj=1201500.0 wall=0.05491696300032345 | highs Optimal obj=1201500.0 agree=True | cbc Optimal obj=1201500.0 agree=True
+== gen-ip002 (milp / milp) ==
+  SOR Feasible obj=-4770.8663426 wall=8.226837846000308 | highs TimeLimit obj=-4762.7873726 agree=None | cbc crash obj=None agree=None
+== gen-ip054 (milp / milp) ==
+  SOR Feasible obj=6858.8789592 wall=4.473548302000381 | highs TimeLimit obj=6858.262906057774 agree=None | cbc crash obj=None agree=None
+== gt2 (milp / milp) ==
+  SOR Optimal obj=21166.0 wall=5.456287291000081 | highs Optimal obj=21166.0 agree=True | cbc Optimal obj=21166.0 agree=True
+== lseu (milp / milp) ==
+  SOR Feasible obj=1120.0 wall=6.361962421000499 | highs Optimal obj=1120.0000000000002 agree=True | cbc Optimal obj=1120.0 agree=True
+== markshare1 (milp / milp) ==
+  SOR Feasible obj=19.0 wall=7.1578623879995575 | highs TimeLimit obj=26.999999999999936 agree=None | cbc TimeLimit obj=12.0 agree=None
+== markshare2 (milp / milp) ==
+  SOR Feasible obj=39.0 wall=8.029328921999877 | highs TimeLimit obj=40.999999999999766 agree=None | cbc TimeLimit obj=22.0 agree=None
+== misc03 (milp / milp) ==
+  SOR Feasible obj=3360.0 wall=30.006773041000088 | highs Optimal obj=3359.9999999999955 agree=True | cbc Optimal obj=3360.0 agree=True
+== mod008 (milp / milp) ==
+  SOR Feasible obj=307.0 wall=8.335180762999698 | highs Optimal obj=306.99999999999767 agree=True | cbc Optimal obj=307.0 agree=True
+== mod010 (milp / milp) ==
+  SOR Optimal obj=6548.0 wall=0.36143328199977987 | highs Optimal obj=6548.0 agree=True | cbc Optimal obj=6548.0 agree=True
+== n5-3 (milp / milp) ==
+  SOR Feasible obj=10998.748588 wall=30.02003865899951 | highs TimeLimit obj=8275.000000000002 agree=None | cbc TimeLimit obj=8940.0 agree=None
+== p0033 (milp / milp) ==
+  SOR Optimal obj=3089.0 wall=0.12358543499976804 | highs Optimal obj=3088.999999999999 agree=True | cbc Optimal obj=3089.0 agree=True
+== p0201 (milp / milp) ==
+  SOR Optimal obj=7615.0 wall=3.490729039999678 | highs Optimal obj=7614.999999997075 agree=True | cbc Optimal obj=7615.0 agree=True
+== pk1 (milp / milp) ==
+  SOR Feasible obj=17.0 wall=10.916572733000066 | highs TimeLimit obj=13.999999999999915 agree=None | cbc Optimal obj=11.0 agree=False
+== rgn (milp / milp) ==
+  SOR Optimal obj=82.19999924 wall=5.263995156999954 | highs Optimal obj=82.19999923999991 agree=True | cbc Optimal obj=82.19999976 agree=True
+== stein27 (milp / milp) ==
+  SOR Optimal obj=18.0 wall=3.93241208299969 | highs Optimal obj=17.999999999999982 agree=True | cbc Optimal obj=18.0 agree=True
+== vpm1 (milp / milp) ==
+  SOR Feasible obj=20.0 wall=25.98984472600023 | highs Optimal obj=20.0 agree=True | cbc Optimal obj=20.0 agree=True
+
+wrote /home/yash/Desktop/Sih/sor/benchmarks/results/compare-new-all-20260904-102744.jsonl
+wrote /home/yash/Desktop/Sih/sor/benchmarks/results/compare-new-all-20260904-102744.md
+summary: SOR 23/23 · HiGHS agree 16 · CBC agree 14
+
+=== DONE 2026-09-04T10:37:18+05:30 ===
+netlib:     /home/yash/Desktop/Sih/sor/benchmarks/results/compare-netlib-20260904-092218.md
+industrial: /home/yash/Desktop/Sih/sor/benchmarks/results/industrial-perf-20260904-101927.md
+new/mip:    /home/yash/Desktop/Sih/sor/benchmarks/results/compare-new-all-20260904-102744.md
