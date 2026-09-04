@@ -142,7 +142,8 @@ target_link_libraries(forge_engines PUBLIC forge_model forge_backend forge_la_cp
 # ------------------------------ L5: search ---------------------------------
 add_library(forge_search forge_search/src/bab.cpp forge_search/src/cuts.cpp
                        forge_search/src/propagate.cpp forge_search/src/miqp.cpp
-                       forge_search/src/minlp.cpp)
+                       forge_search/src/minlp.cpp
+                       forge_search/src/lattice_reform.cpp)
 target_include_directories(forge_search PUBLIC forge_search/include)
 target_link_libraries(forge_search PUBLIC forge_engines PRIVATE forge_flags)
 
@@ -189,6 +190,7 @@ forge_add_test(test_presolve             forge_presolve)
 forge_add_test(test_hpr                 forge_engines forge_certify forge_io)
 forge_add_test(test_lp_device           forge_backend forge_engines forge_io)
 forge_add_test(test_milp                forge_search forge_certify forge_io)
+forge_add_test(test_lattice_reform      forge_search forge_certify forge_io)
 forge_add_test(test_cuts                forge_search forge_engines forge_certify forge_io)
 forge_add_test(test_propagate           forge_search)
 forge_add_test(test_qp                  forge_engines forge_certify)
