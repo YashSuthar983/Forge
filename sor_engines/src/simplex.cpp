@@ -1,5 +1,6 @@
 #include "sor/engines/simplex.hpp"
 #include "sor/engines/dual_simplex.hpp"
+#include "simplex_prepared.hpp"
 
 // Ruiz equilibration is declared in pdhg.hpp and defined in pdhg.cpp. Both
 // engines want it and it is the same algorithm; a third translation unit for one
@@ -153,6 +154,8 @@ void accumulate_work(SimplexDiagnostics& total,
     total.phase2_iterations += stage.phase2_iterations;
     total.bound_flips       += stage.bound_flips;
     total.refactorizations  += stage.refactorizations;
+    total.collective_ft_collapses += stage.collective_ft_collapses;
+    total.collective_ft_skips += stage.collective_ft_skips;
     total.degenerate_steps  += stage.degenerate_steps;
     total.bland_iterations  += stage.bland_iterations;
     total.expand_steps      += stage.expand_steps;
@@ -164,11 +167,22 @@ void accumulate_work(SimplexDiagnostics& total,
     total.pricing_calls     += stage.pricing_calls;
     total.solve_calls       += stage.solve_calls;
     total.scaling_ms        += stage.scaling_ms;
+    total.csc_ms            += stage.csc_ms;
+    total.preprocessing_ms  += stage.preprocessing_ms;
     total.factor_ms         += stage.factor_ms;
     total.price_ms          += stage.price_ms;
     total.solve_ms          += stage.solve_ms;
+    total.ftran_ms          += stage.ftran_ms;
+    total.btran_ms          += stage.btran_ms;
+    total.pivotal_row_ms    += stage.pivotal_row_ms;
+    total.ratio_test_ms     += stage.ratio_test_ms;
+    total.basis_update_ms   += stage.basis_update_ms;
+    total.ftran_calls       += stage.ftran_calls;
+    total.btran_calls       += stage.btran_calls;
+    total.basis_update_calls += stage.basis_update_calls;
     total.loop_ms           += stage.loop_ms;
     total.total_ms          += stage.total_ms;
+    total.preprocessing_builds += stage.preprocessing_builds;
     total.largest_update_multiplier = std::max(total.largest_update_multiplier,
                                                stage.largest_update_multiplier);
     ++total.stages;
@@ -182,6 +196,8 @@ void install_work_totals(SimplexDiagnostics& chosen,
     chosen.phase2_iterations = total.phase2_iterations;
     chosen.bound_flips        = total.bound_flips;
     chosen.refactorizations   = total.refactorizations;
+    chosen.collective_ft_collapses = total.collective_ft_collapses;
+    chosen.collective_ft_skips = total.collective_ft_skips;
     chosen.degenerate_steps   = total.degenerate_steps;
     chosen.bland_iterations   = total.bland_iterations;
     chosen.expand_steps       = total.expand_steps;
@@ -195,46 +211,233 @@ void install_work_totals(SimplexDiagnostics& chosen,
     chosen.stages             = total.stages;
     chosen.probe_ms           = total.probe_ms;
     chosen.scaling_ms         = total.scaling_ms;
+    chosen.csc_ms             = total.csc_ms;
+    chosen.preprocessing_ms   = total.preprocessing_ms;
     chosen.factor_ms          = total.factor_ms;
     chosen.price_ms           = total.price_ms;
     chosen.solve_ms           = total.solve_ms;
+    chosen.ftran_ms           = total.ftran_ms;
+    chosen.btran_ms           = total.btran_ms;
+    chosen.pivotal_row_ms     = total.pivotal_row_ms;
+    chosen.ratio_test_ms      = total.ratio_test_ms;
+    chosen.basis_update_ms    = total.basis_update_ms;
+    chosen.ftran_calls        = total.ftran_calls;
+    chosen.btran_calls        = total.btran_calls;
+    chosen.basis_update_calls = total.basis_update_calls;
     chosen.loop_ms            = total.loop_ms;
     chosen.total_ms           = total.total_ms;
+    chosen.preprocessing_builds = total.preprocessing_builds;
     chosen.largest_update_multiplier = total.largest_update_multiplier;
 }
 
 }  // namespace
 
-core::RawResult solve_primal_simplex(const model::LpProblem& problem,
-                                     const SimplexOptions& opts,
-                                     SimplexDiagnostics& diag,
-                                     SimplexBasis* out_basis) {
+bool detail::prefer_simplex_candidate(const core::RawResult& candidate,
+                                      const SimplexDiagnostics& candidate_diag,
+                                      const core::RawResult& incumbent,
+                                      const SimplexDiagnostics& incumbent_diag,
+                                      const SimplexOptions& opts,
+                                      bool maximize) {
+    const auto proved = [&](const core::RawResult& r,
+                            const SimplexDiagnostics& d) {
+        return r.proposed_status == core::Status::Optimal &&
+               d.primal_residual <= opts.primal_feas_tol &&
+               d.dual_residual <= opts.dual_feas_tol &&
+               d.dual_bound_finite && d.gap_rel <= opts.gap_tol;
+    };
+    const bool candidate_proved = proved(candidate, candidate_diag);
+    const bool incumbent_proved = proved(incumbent, incumbent_diag);
+    if (candidate_proved != incumbent_proved) return candidate_proved;
+
+    const auto farkas_proved = [&](const core::RawResult& r,
+                                   const SimplexDiagnostics& d) {
+        return r.proposed_status == core::Status::Infeasible &&
+               !r.ray.empty() && std::isfinite(d.ray_violation) &&
+               d.ray_violation <= opts.primal_feas_tol;
+    };
+    const bool candidate_farkas = farkas_proved(candidate, candidate_diag);
+    const bool incumbent_farkas = farkas_proved(incumbent, incumbent_diag);
+    if (candidate_farkas != incumbent_farkas) return candidate_farkas;
+
+    // A reportable feasible point is more useful than any infeasible iterate,
+    // independent of which engine produced it or what its (invalid) gap says.
+    const bool candidate_primal =
+        std::isfinite(candidate_diag.primal_residual) &&
+        candidate_diag.primal_residual <= opts.primal_feas_tol;
+    const bool incumbent_primal =
+        std::isfinite(incumbent_diag.primal_residual) &&
+        incumbent_diag.primal_residual <= opts.primal_feas_tol;
+    if (candidate_primal != incumbent_primal) return candidate_primal;
+
+    const bool candidate_dual =
+        std::isfinite(candidate_diag.dual_residual) &&
+        candidate_diag.dual_residual <= opts.dual_feas_tol &&
+        candidate_diag.dual_bound_finite;
+    const bool incumbent_dual =
+        std::isfinite(incumbent_diag.dual_residual) &&
+        incumbent_diag.dual_residual <= opts.dual_feas_tol &&
+        incumbent_diag.dual_bound_finite;
+    if (candidate_primal && candidate_dual != incumbent_dual)
+        return candidate_dual;
+
+    const auto materially_less = [](f64 a, f64 b) {
+        if (!std::isfinite(a)) return false;
+        if (!std::isfinite(b)) return true;
+        const f64 scale = 1.0 + std::max(std::fabs(a), std::fabs(b));
+        return a < b - 1e-12 * scale;
+    };
+
+    // A duality gap is meaningful only when both endpoints are feasible.
+    if (candidate_primal && candidate_dual && incumbent_dual) {
+        if (materially_less(candidate_diag.gap_rel, incumbent_diag.gap_rel))
+            return true;
+        if (materially_less(incumbent_diag.gap_rel, candidate_diag.gap_rel))
+            return false;
+    }
+
+    // On incomplete iterates, the normalized KKT residual is the
+    // engine-independent progress metric. Taking the maximum prevents an
+    // iterate that is excellent on only one side from looking converged.
+    const f64 candidate_kkt = std::max(
+        candidate_diag.primal_residual / std::max(opts.primal_feas_tol, 1e-30),
+        candidate_diag.dual_residual / std::max(opts.dual_feas_tol, 1e-30));
+    const f64 incumbent_kkt = std::max(
+        incumbent_diag.primal_residual / std::max(opts.primal_feas_tol, 1e-30),
+        incumbent_diag.dual_residual / std::max(opts.dual_feas_tol, 1e-30));
+    if (!candidate_primal) {
+        if (materially_less(candidate_kkt, incumbent_kkt)) return true;
+        if (materially_less(incumbent_kkt, candidate_kkt)) return false;
+    }
+
+    // Break equal KKT envelopes by the individual residuals. This is the key
+    // rule that prevents a stale early probe with a coincidentally tiny gap
+    // from winning over a later, more accurate basis.
+    if (materially_less(candidate_diag.primal_residual,
+                        incumbent_diag.primal_residual))
+        return true;
+    if (materially_less(incumbent_diag.primal_residual,
+                        candidate_diag.primal_residual))
+        return false;
+    if (materially_less(candidate_diag.dual_residual,
+                        incumbent_diag.dual_residual))
+        return true;
+    if (materially_less(incumbent_diag.dual_residual,
+                        candidate_diag.dual_residual))
+        return false;
+
+    // Only compare objectives between primal-feasible points. For infeasible
+    // iterates the objective has no optimization meaning.
+    if (candidate_primal && std::isfinite(candidate.objective) &&
+        std::isfinite(incumbent.objective)) {
+        const f64 candidate_merit = maximize ? -candidate.objective
+                                             : candidate.objective;
+        const f64 incumbent_merit = maximize ? -incumbent.objective
+                                             : incumbent.objective;
+        if (materially_less(candidate_merit, incumbent_merit)) return true;
+        if (materially_less(incumbent_merit, candidate_merit)) return false;
+    }
+
+    const auto status_rank = [](core::Status s) {
+        switch (s) {
+            case core::Status::Optimal: return 4;
+            case core::Status::Feasible: return 3;
+            case core::Status::Interrupted: return 2;
+            case core::Status::Infeasible:
+            case core::Status::Unbounded: return 1;
+            default: return 0;
+        }
+    };
+    const int candidate_rank = status_rank(candidate.proposed_status);
+    const int incumbent_rank = status_rank(incumbent.proposed_status);
+    if (candidate_rank != incumbent_rank) return candidate_rank > incumbent_rank;
+
+    // An exact tie is not evidence of improvement. Preserve the incumbent,
+    // including any certificate payload that may not be reflected in metrics.
+    return false;
+}
+
+SimplexPrepared prepare_simplex_model(const model::LpProblem& problem,
+                                      const SimplexOptions& opts) {
+    const auto t_all = Clock::now();
+    SimplexPrepared out;
+    out.sense = problem.maximize ? -1.0 : 1.0;
+    out.pmin = problem;
+    if (out.pmin.maximize) {
+        for (auto& v : out.pmin.c) v = -v;
+        out.pmin.maximize = false;
+    }
+    out.scaled = out.pmin;
+    const auto t_scale = Clock::now();
+    out.scaling = ruiz_scale(out.scaled, opts.ruiz_iterations);
+    out.scaling_ms = ms_since(t_scale);
+    const auto t_csc = Clock::now();
+    out.csc = sparse::to_csc(out.scaled.A);
+    out.csc_ms = ms_since(t_csc);
+
+    const Index m = out.scaled.n_rows();
+    const Index ns = out.scaled.n_cols();
+    const Index nt = ns + m;
+    out.lo.resize(sz(nt));
+    out.hi.resize(sz(nt));
+    out.cost.assign(sz(nt), 0.0);
+    for (Index j = 0; j < ns; ++j) {
+        out.lo[sz(j)] = out.scaled.col_lo[sz(j)];
+        out.hi[sz(j)] = out.scaled.col_hi[sz(j)];
+        out.cost[sz(j)] = out.scaled.c[sz(j)];
+    }
+    for (Index i = 0; i < m; ++i) {
+        out.lo[sz(ns + i)] = out.scaled.row_lo[sz(i)];
+        out.hi[sz(ns + i)] = out.scaled.row_hi[sz(i)];
+    }
+
+    // The augmented matrix is [A | -I]. Pricing norms include the historical
+    // unit regularizer, hence 1 + ||column||^2 (2 for a logical column).
+    out.colnorm2.assign(sz(nt), 2.0);
+    const auto& cp = out.csc.pattern.col_ptr();
+    for (Index j = 0; j < ns; ++j) {
+        f64 norm2 = 1.0;
+        for (Offset k = cp[sz(j)]; k < cp[sz(j) + 1]; ++k)
+            norm2 += out.csc.vals[sz(k)] * out.csc.vals[sz(k)];
+        out.colnorm2[sz(j)] = norm2;
+    }
+
+    out.dual_tolerance.assign(sz(nt), opts.dual_feas_tol);
+    out.primal_tolerance.assign(sz(nt), opts.primal_feas_tol);
+    for (Index j = 0; j < ns; ++j) {
+        out.dual_tolerance[sz(j)] =
+            std::max(opts.dual_feas_tol * out.scaling.col_scale[sz(j)], 1e-12);
+        out.primal_tolerance[sz(j)] =
+            std::max(opts.primal_feas_tol / out.scaling.col_scale[sz(j)], 1e-12);
+    }
+    for (Index i = 0; i < m; ++i) {
+        out.dual_tolerance[sz(ns + i)] =
+            std::max(opts.dual_feas_tol / out.scaling.row_scale[sz(i)], 1e-12);
+        out.primal_tolerance[sz(ns + i)] =
+            std::max(opts.primal_feas_tol * out.scaling.row_scale[sz(i)], 1e-12);
+    }
+    out.total_ms = ms_since(t_all);
+    return out;
+}
+
+core::RawResult solve_primal_simplex_prepared(
+    const SimplexPrepared& prepared, const SimplexOptions& opts,
+    SimplexDiagnostics& diag, SimplexBasis* out_basis) {
     const auto t_all = Clock::now();
     const bool time_detail = opts.verbose;   // see the note on clock cost below
     Clock::time_point t_part{};
     const bool use_devex = (opts.pricing != SimplexPricing::Dantzig);
 
-    // ---- 1. minimization form, unscaled. This copy is the reference the final
-    //         residuals are measured against, so it must NOT be scaled. -------
-    model::LpProblem pmin = problem;
-    const f64 sense = problem.maximize ? -1.0 : 1.0;
-    if (pmin.maximize) {
-        for (auto& v : pmin.c) v = -v;
-        pmin.maximize = false;
-    }
-
-    // ---- 2. scaled working copy ------------------------------------------
-    model::LpProblem p = pmin;
-    const auto t_scale = Clock::now();
-    const RuizScaling scaling = ruiz_scale(p, opts.ruiz_iterations);
-    diag.scaling_ms = ms_since(t_scale);
+    const auto& pmin = prepared.pmin;
+    const auto& p = prepared.scaled;
+    const auto& scaling = prepared.scaling;
+    const f64 sense = prepared.sense;
 
     const Index m  = p.n_rows();
     const Index ns = p.n_cols();
     const Index nt = ns + m;
 
     // ---- 3. the augmented system [A | -I] --------------------------------
-    const auto ac = sparse::to_csc(p.A);
+    const auto& ac = prepared.csc;
     const auto& acp = ac.pattern.col_ptr();
     const auto& ari = ac.pattern.row_idx();
 
@@ -249,24 +452,12 @@ core::RawResult solve_primal_simplex(const model::LpProblem& problem,
         }
     };
 
-    std::vector<f64> lo(sz(nt)), hi(sz(nt)), cost(sz(nt), 0.0);
-    for (Index j = 0; j < ns; ++j) {
-        lo[sz(j)] = p.col_lo[sz(j)];
-        hi[sz(j)] = p.col_hi[sz(j)];
-        cost[sz(j)] = p.c[sz(j)];
-    }
-    for (Index i = 0; i < m; ++i) {
-        lo[sz(ns + i)] = p.row_lo[sz(i)];
-        hi[sz(ns + i)] = p.row_hi[sz(i)];
-    }
+    const auto& lo = prepared.lo;
+    const auto& hi = prepared.hi;
+    const auto& cost = prepared.cost;
 
     // Static column norms used when pricing == Dantzig.
-    std::vector<f64> colnorm2(sz(nt), 1.0);
-    for (Index j = 0; j < nt; ++j) {
-        f64 s = 1.0;
-        for_col(j, [&](Index, f64 v) { s += v * v; });
-        colnorm2[sz(j)] = s;
-    }
+    const auto& colnorm2 = prepared.colnorm2;
 
     // Per-column dual thresholds in SCALED space so that "no improving
     // column" means the same thing on the UNSCALED model the gate measures
@@ -274,22 +465,14 @@ core::RawResult solve_primal_simplex(const model::LpProblem& problem,
     // engine). Without this, pilot/etamacro terminated with a wrong-sign
     // reduced cost of 1.2-1.5e-7 unscaled -- inside the 1e-7 SCALED slack,
     // outside the certificate gate's tolerance.
-    std::vector<f64> dtol(sz(nt), opts.dual_feas_tol);
-    for (Index j = 0; j < ns; ++j)
-        dtol[sz(j)] = std::max(opts.dual_feas_tol * scaling.col_scale[sz(j)], 1e-12);
-    for (Index i = 0; i < m; ++i)
-        dtol[sz(ns + i)] = std::max(opts.dual_feas_tol / scaling.row_scale[sz(i)], 1e-12);
+    const auto& dtol = prepared.dual_tolerance;
 
     // Primal feasibility is checked in the scaled working model but certified
     // after unscaling. For x = D_c x_hat, an original-space tolerance maps to
     // tol / D_c in x_hat; for row activity D_r A x, it maps to tol * D_r.
     // A single absolute scaled tolerance accepted large original violations on
     // badly scaled rows (dfl001 stopped with 76 units of row error).
-    std::vector<f64> ptol(sz(nt), opts.primal_feas_tol);
-    for (Index j = 0; j < ns; ++j)
-        ptol[sz(j)] = std::max(opts.primal_feas_tol / scaling.col_scale[sz(j)], 1e-12);
-    for (Index i = 0; i < m; ++i)
-        ptol[sz(ns + i)] = std::max(opts.primal_feas_tol * scaling.row_scale[sz(i)], 1e-12);
+    const auto& ptol = prepared.primal_tolerance;
 
     // ---- 4. state --------------------------------------------------------
     std::vector<Index> basis(sz(m));
@@ -628,15 +811,39 @@ core::RawResult solve_primal_simplex(const model::LpProblem& problem,
                                                     opts.refactor_eta_ratio,
                                                     opts.bump_width_max,
                                                     opts.refactor_work_ratio);
+        const auto update_t0 = Clock::now();
         const bool updated =
             opts.update_method == la::UpdateMethod::ForrestTomlin
                 ? factor.update_ft(leave, alpha, la::LuOptions{}, opts.pivot_tol)
                 : factor.update(leave, alpha, opts.pivot_tol);
-        if (unstable || !updated || eta_full ||
-            ++since_refactor >= opts.refactor_interval) {
-            do_factorize();
-            since_refactor = 0;
+        diag.basis_update_ms += ms_since(update_t0);
+        ++diag.basis_update_calls;
+        const bool wants_refactor = unstable || !updated || eta_full ||
+                                     ++since_refactor >= opts.refactor_interval;
+        if (!wants_refactor) return;
+        // Collective FT (item 2 Phase 2) -- see dual_simplex.cpp's identical
+        // block for the full rationale.
+        if (opts.collective_ft && !unstable && updated &&
+            opts.update_method == la::UpdateMethod::ProductForm) {
+            constexpr Index kCollectiveMaxDimension = 512;
+            constexpr Index kCollectiveMaxUpdates = 64;
+            if (factor.dimension() <= kCollectiveMaxDimension &&
+                factor.n_updates() <= kCollectiveMaxUpdates) {
+                const auto collapse_t0 = Clock::now();
+                const bool collapsed = factor.collapse_pending_into_ft(
+                    la::LuOptions{}, opts.pivot_tol);
+                diag.basis_update_ms += ms_since(collapse_t0);
+                if (collapsed) {
+                    ++diag.collective_ft_collapses;
+                    since_refactor = 0;
+                    return;
+                }
+            } else {
+                ++diag.collective_ft_skips;
+            }
         }
+        do_factorize();
+        since_refactor = 0;
     };
 
     // ---- 6. iterate ------------------------------------------------------
@@ -711,11 +918,19 @@ core::RawResult solve_primal_simplex(const model::LpProblem& problem,
             if (time_detail) diag.solve_ms += ms_since(t_part);
             if (time_detail) t_part = Clock::now();
             const bool ph2 = (phase == 2);
-            for (Index j = 0; j < nt; ++j) {
+            // Structural columns use the CSC directly. Logical columns are
+            // exactly -e_i, so their reduced cost is c_i + y_i; routing them
+            // through for_col() paid a branch and callback for every row on
+            // every phase-1 rebuild. This split preserves the original
+            // arithmetic order for structural columns and is exact for -I.
+            for (Index j = 0; j < ns; ++j) {
                 f64 dj = ph2 ? cost[sz(j)] : 0.0;
-                for_col(j, [&](Index i, f64 v) { dj -= v * y[sz(i)]; });
+                for (Offset k = acp[sz(j)]; k < acp[sz(j) + 1]; ++k)
+                    dj -= ac.vals[sz(k)] * y[sz(ari[sz(k)])];
                 redcost[sz(j)] = dj;
             }
+            for (Index i = 0; i < m; ++i)
+                redcost[sz(ns + i)] = (ph2 ? cost[sz(ns + i)] : 0.0) + y[sz(i)];
             if (time_detail) diag.price_ms += ms_since(t_part);
             d_valid = true;
             ++diag.dual_rebuilds;
@@ -974,7 +1189,7 @@ core::RawResult solve_primal_simplex(const model::LpProblem& problem,
                 if (st[sz(j)] != NonbasicStatus::Basic) obj += cost[sz(j)] * value[sz(j)];
             std::printf("  iter %8llu  phase %d  infeas %.6e  obj %.10e\n",
                         static_cast<unsigned long long>(iter), phase,
-                        primal_infeasibility(), sense * obj + problem.obj_offset);
+                        primal_infeasibility(), sense * obj + pmin.obj_offset);
         }
     }
     diag.loop_ms = ms_since(t_loop);
@@ -1070,7 +1285,7 @@ core::RawResult solve_primal_simplex(const model::LpProblem& problem,
 
     f64 obj_min = 0.0;
     for (Index j = 0; j < ns; ++j) obj_min += pmin.c[sz(j)] * x[sz(j)];
-    diag.primal_objective = sense * obj_min + problem.obj_offset;
+    diag.primal_objective = sense * obj_min + pmin.obj_offset;
 
     // Lagrangian dual value: inf over the boxes of d'x + y'z. At an optimal
     // basis this equals the primal objective, so the gap is an independent
@@ -1107,7 +1322,7 @@ core::RawResult solve_primal_simplex(const model::LpProblem& problem,
     }
     diag.dual_bound_finite = finite && std::isfinite(dval);
     diag.dual_objective = diag.dual_bound_finite
-                              ? sense * dval + problem.obj_offset
+                              ? sense * dval + pmin.obj_offset
                               : std::numeric_limits<f64>::quiet_NaN();
     diag.gap_rel = diag.dual_bound_finite
                        ? std::fabs(diag.primal_objective - diag.dual_objective) /
@@ -1156,6 +1371,21 @@ core::RawResult solve_primal_simplex(const model::LpProblem& problem,
     return raw;
 }
 
+core::RawResult solve_primal_simplex(const model::LpProblem& problem,
+                                     const SimplexOptions& opts,
+                                     SimplexDiagnostics& diag,
+                                     SimplexBasis* out_basis) {
+    const auto t0 = Clock::now();
+    const auto prepared = prepare_simplex_model(problem, opts);
+    auto raw = solve_primal_simplex_prepared(prepared, opts, diag, out_basis);
+    diag.scaling_ms = prepared.scaling_ms;
+    diag.csc_ms = prepared.csc_ms;
+    diag.preprocessing_ms = prepared.total_ms;
+    diag.preprocessing_builds = 1;
+    diag.total_ms = ms_since(t0);
+    return raw;
+}
+
 core::RawResult solve_simplex(const model::LpProblem& problem,
                               const SimplexOptions& opts,
                               SimplexDiagnostics& diag,
@@ -1170,6 +1400,10 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         used_presolve = true;
     }
     const double presolve_ms = opts.presolve ? ms_since(presolve_t0) : 0.0;
+    // Build the immutable numeric representation once. Auto may run a dual
+    // probe, committed dual, primal, and dual cleanup; all four stages solve
+    // the identical transformed model and now share this scaling and CSC.
+    const auto prepared = prepare_simplex_model(*work, opts);
 
     // Each dispatch candidate gets its OWN basis capture: when the winner is
     // chosen after the fact, out_basis must hold the basis that produced the
@@ -1188,8 +1422,8 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
                          bool probe = false) -> core::RawResult {
         diag = SimplexDiagnostics{};
         core::RawResult result = dual
-            ? solve_dual_simplex(*work, o, diag, basis, warm)
-            : solve_primal_simplex(*work, o, diag, basis);
+            ? solve_dual_simplex_prepared(prepared, o, diag, basis, warm)
+            : solve_primal_simplex_prepared(prepared, o, diag, basis);
         accumulate_work(cumulative, diag, probe);
         return result;
     };
@@ -1245,17 +1479,6 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
     };
 
     core::RawResult raw;
-    // Certificate strength ordering used to pick between two candidate results.
-    const auto rank = [](core::Status s) {
-        switch (s) {
-            case core::Status::Optimal: return 4;
-            case core::Status::Feasible: return 3;
-            case core::Status::Interrupted: return 2;
-            case core::Status::Infeasible:
-            case core::Status::Unbounded: return 1;
-            default: return 0;
-        }
-    };
     if (opts.method == SimplexMethod::Primal) {
         raw = run(false, opts, &prim_basis);
         install_basis(prim_basis);
@@ -1283,7 +1506,8 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
             const auto dual_raw = raw;
             const auto dual_diag = diag;
             raw = run(false, prim_opts, &prim_basis2);
-            if (rank(raw.proposed_status) <= rank(dual_raw.proposed_status)) {
+            if (!detail::prefer_simplex_candidate(raw, diag, dual_raw, dual_diag,
+                                                  opts, problem.maximize)) {
                 raw = dual_raw;
                 diag = dual_diag;
             } else {
@@ -1293,8 +1517,8 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         install_basis(probe_basis);
     } else {
         // ---- Auto dispatch ------------------------------------------------
-        // Three stages, each entered only because the previous one did not
-        // produce a proof:
+        // For models not classified primal-first, three stages are entered
+        // only because the previous one did not produce a proof:
         //
         //   1. a SHORT dual probe with stall_abort on. Cheap, and it settles the
         //      many instances the dual finishes in a few hundred iterations
@@ -1309,7 +1533,7 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         //      costs nothing when stages 1-2 succeed, and when they fail the
         //      budget was going to be spent anyway.
         //
-        // The best certificate of whatever ran is kept, ranked by rank().
+        // Keep the mathematically strongest candidate produced by any stage.
         const auto proved = [&](const core::RawResult& r, const SimplexDiagnostics& d) {
             return r.proposed_status == core::Status::Optimal &&
                    d.primal_residual <= opts.primal_feas_tol &&
@@ -1321,11 +1545,9 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         };
         const auto t0 = Clock::now();
 
-        SimplexOptions probe_opts = opts;
-        probe_opts.stall_abort = true;
         // Very wide, sparse models are commonly primal-friendly: the dual
-        // probe otherwise burns a full long-step solve before discovering that
-        // primal finishes almost immediately (woodw/wood1p).  Dense bounded
+        // otherwise burns a long-step solve before discovering that primal
+        // finishes almost immediately (woodw/wood1p). Dense bounded
         // blending models have the same shape for a different reason: their
         // primal ratio test reaches a feasible basis in far fewer pivots,
         // while dual updates repeatedly materialize a dense pivotal row.
@@ -1340,114 +1562,152 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
               6ull * static_cast<std::uint64_t>(work->n_rows()) &&
               (work->n_rows() > 700 || work->n_cols() < 4000)) ||
              (density >= 0.25 && work->n_cols() >= work->n_rows()));
-        // The probe budget is ITERATION-based, not time-based: the
-        // "is the dual the right engine" decision is then deterministic.
-        // A wall-clock budget put the decision near a coin-flip boundary on
-        // fit2p (dual 2.0s vs primal 7.7s) and machine noise silently
-        // rerouted the instance run-to-run. 3000 iterations also keeps the
-        // stall detector live (it needs kFlatLimit x kMeritEvery = 2048
-        // iterations to fire; a 2000-iteration probe could never stall).
-        // The time limit below is only a safety net for pathologically slow
-        // iterations.
-        probe_opts.max_iterations = primal_preferred ? 256 : 3000;
-        probe_opts.time_limit_s = (opts.time_limit_s > 0.0)
-            ? (primal_preferred
-                 ? std::min(0.5, std::max(0.25, opts.time_limit_s * 0.05))
-                 : std::min(4.0, std::max(0.5, opts.time_limit_s * 0.25)))
-            : 4.0;
+        const SimplexBasis* winner = nullptr;
 
-        raw = run(true, probe_opts, &probe_basis, nullptr, true);
-        const auto probe_raw = raw;
-        const auto probe_diag = diag;
-        const SimplexBasis* winner = &probe_basis;
+        if (primal_preferred) {
+            // The shape classifier already says that the primal is the right
+            // engine. The former implementation still spent 256 dual pivots
+            // to confirm that decision, then discarded their basis because a
+            // dual basis is not a primal warm start. Measured after the shared
+            // preprocessing fix, that no-progress probe was 29 ms on wood1p
+            // (89 -> 60 ms when omitted) and 17 ms on woodw (187 -> 170 ms).
+            // Run primal first and keep dual as a certificate cleanup/fallback
+            // only when primal does not prove the model.
+            SimplexOptions primal_opts = opts;
+            if (opts.time_limit_s > 0.0)
+                primal_opts.time_limit_s = std::max(0.05, opts.time_limit_s * 0.85);
+            raw = run(false, primal_opts, &prim_basis);
+            winner = &prim_basis;
 
-        if (!proved(probe_raw, probe_diag)) {
-            auto best_raw = probe_raw;
-            auto best_diag = probe_diag;
-            const auto keep_better = [&](const SimplexBasis* cand) {
-                if (rank(raw.proposed_status) > rank(best_raw.proposed_status) ||
-                    (rank(raw.proposed_status) == rank(best_raw.proposed_status) &&
-                     diag.gap_rel < best_diag.gap_rel)) {
-                    best_raw = raw;
-                    best_diag = diag;
-                    winner = cand;
-                }
-            };
-
-            // A probe that exhausted its iteration budget WITHOUT stalling
-            // is the right engine needing more time: commit the remaining
-            // budget to the dual (warm-started from the probe) before trying
-            // the primal. The gate is the STALL FLAG alone -- merit-ratio
-            // gates misfire on BFRT duals because bound flips make the
-            // primal-infeasibility merit NON-MONOTONE (fit2p: 5.3e5 -> 2.1e4
-            // -> 7.3e4 -> 1.9e4 while the dual objective rises steadily).
-            // A probe that STALLED routes primal-first: woodw's dual stalls
-            // and its primal solves in 0.17s.
-            const bool probe_converging =
-                !primal_preferred &&
-                !probe_diag.stalled &&
-                probe_raw.proposed_status == core::Status::Interrupted;
-            if (probe_converging) {
-                SimplexOptions esc = opts;          // stall_abort stays false
-                if (opts.time_limit_s > 0.0)
-                    esc.time_limit_s =
-                        std::max(0.05, opts.time_limit_s - elapsed(t0));
-                // Continue the probe rather than restart it: the probe's
-                // basis is passed as a warm start, so the committed dual pays
-                // only for the iterations the probe had left.
-                raw = run(true, esc, &esc_basis, &probe_basis);
-                keep_better(&esc_basis);
-            }
-
-            // ---- primal (always tried unless the committed dual proved) --
-            if (!proved(best_raw, best_diag)) {
-                SimplexOptions primal_opts = opts;
-                if (opts.time_limit_s > 0.0) {
-                    // Hold back a slice for the committed dual below -- unless
-                    // the probe already showed the dual cannot run this
-                    // instance at all (NumericalFailure: the esc run would
-                    // hit the same state), in which case the primal is the
-                    // only engine left and gets everything.
-                    const bool probe_dead =
-                        probe_raw.proposed_status == core::Status::NumericalFailure;
-                    const double left = opts.time_limit_s - elapsed(t0);
-                    primal_opts.time_limit_s =
-                        std::max(0.05, probe_dead ? left : left * 0.6);
-                }
-                raw = run(false, primal_opts, &prim_basis);
-                keep_better(&prim_basis);
-
-                // Last resort: the dual, committed, if it has not had a real
-                // run and nothing has proved anything yet.
+            if (!proved(raw, diag)) {
+                const auto primal_raw = raw;
+                const auto primal_diag = diag;
                 const bool time_left =
                     opts.time_limit_s <= 0.0 || elapsed(t0) < opts.time_limit_s * 0.95;
-                if (!proved(best_raw, best_diag) && time_left) {
-                    SimplexOptions esc = opts;      // stall_abort stays false
+                if (time_left) {
+                    SimplexOptions esc = opts;
                     if (opts.time_limit_s > 0.0)
-                        esc.time_limit_s =
-                            std::max(0.05, opts.time_limit_s - elapsed(t0));
-                    // Repair the best basis found so far. In particular, when
-                    // primal produced a feasible point but its reconstructed
-                    // dual was not clean, restarting dual from the old probe
-                    // basis throws away the useful primal basis and commonly
-                    // leaves the instance at FeasibleWithGap. A dual cleanup
-                    // from `winner` preserves the primal work and can close
-                    // the certificate in a handful of pivots.
-                    const SimplexBasis* warm_basis = winner;
-                    if (!warm_basis || warm_basis->basic.empty())
-                        warm_basis = &probe_basis;
-                    raw = run(true, esc, &esc_basis, warm_basis);
-                    keep_better(&esc_basis);
+                        esc.time_limit_s = std::max(0.05, opts.time_limit_s - elapsed(t0));
+                    const SimplexBasis* warm = prim_basis.basic.empty() ? nullptr : &prim_basis;
+                    raw = run(true, esc, &esc_basis, warm);
+                    if (detail::prefer_simplex_candidate(raw, diag,
+                                                         primal_raw, primal_diag,
+                                                         opts, problem.maximize)) {
+                        winner = &esc_basis;
+                    } else {
+                        raw = primal_raw;
+                        diag = primal_diag;
+                    }
                 }
             }
-            raw = best_raw;
-            diag = best_diag;
+        } else {
+            SimplexOptions probe_opts = opts;
+            probe_opts.stall_abort = true;
+            // The probe budget is ITERATION-based, not time-based: the
+            // "is the dual the right engine" decision is deterministic. A
+            // wall-clock budget put the decision near a coin-flip boundary on
+            // fit2p. 3000 iterations also keeps the stall detector live (it
+            // needs 2048 iterations to fire). The time limit is only a safety
+            // net for pathologically slow iterations.
+            probe_opts.max_iterations = 3000;
+            probe_opts.time_limit_s = (opts.time_limit_s > 0.0)
+                                          ? std::min(4.0, std::max(0.5, opts.time_limit_s * 0.25))
+                                          : 4.0;
+
+            raw = run(true, probe_opts, &probe_basis, nullptr, true);
+            const auto probe_raw = raw;
+            const auto probe_diag = diag;
+            winner = &probe_basis;
+
+            if (!proved(probe_raw, probe_diag)) {
+                auto best_raw = probe_raw;
+                auto best_diag = probe_diag;
+                const auto keep_better = [&](const SimplexBasis* cand) {
+                    if (detail::prefer_simplex_candidate(raw, diag,
+                                                         best_raw, best_diag,
+                                                         opts, problem.maximize)) {
+                        best_raw = raw;
+                        best_diag = diag;
+                        winner = cand;
+                    }
+                };
+
+                // A probe that exhausted its iteration budget WITHOUT stalling
+                // is the right engine needing more time: commit the remaining
+                // budget to the dual (warm-started from the probe) before trying
+                // the primal. The gate is the STALL FLAG alone -- merit-ratio
+                // gates misfire on BFRT duals because bound flips make the
+                // primal-infeasibility merit NON-MONOTONE (fit2p: 5.3e5 -> 2.1e4
+                // -> 7.3e4 -> 1.9e4 while the dual objective rises steadily).
+                // A probe that STALLED routes primal-first: woodw's dual stalls
+                // and its primal solves in 0.17s.
+                const bool probe_converging =
+                    !probe_diag.stalled && probe_raw.proposed_status == core::Status::Interrupted;
+                if (probe_converging) {
+                    SimplexOptions esc = opts; // stall_abort stays false
+                    if (opts.time_limit_s > 0.0)
+                        esc.time_limit_s = std::max(0.05, opts.time_limit_s - elapsed(t0));
+                    // Continue the probe rather than restart it: the probe's
+                    // basis is passed as a warm start, so the committed dual pays
+                    // only for the iterations the probe had left.
+                    raw = run(true, esc, &esc_basis, &probe_basis);
+                    keep_better(&esc_basis);
+                }
+
+                // ---- primal (always tried unless the committed dual proved) --
+                if (!proved(best_raw, best_diag)) {
+                    SimplexOptions primal_opts = opts;
+                    if (opts.time_limit_s > 0.0) {
+                        // Hold back a slice for the committed dual below -- unless
+                        // the probe already showed the dual cannot run this
+                        // instance at all (NumericalFailure: the esc run would
+                        // hit the same state), in which case the primal is the
+                        // only engine left and gets everything.
+                        const bool probe_dead =
+                            probe_raw.proposed_status == core::Status::NumericalFailure;
+                        const double left = opts.time_limit_s - elapsed(t0);
+                        primal_opts.time_limit_s = std::max(0.05, probe_dead ? left : left * 0.6);
+                    }
+                    raw = run(false, primal_opts, &prim_basis);
+                    keep_better(&prim_basis);
+
+                    // Last resort: the dual, committed, if it has not had a real
+                    // run and nothing has proved anything yet.
+                    const bool time_left =
+                        opts.time_limit_s <= 0.0 || elapsed(t0) < opts.time_limit_s * 0.95;
+                    if (!proved(best_raw, best_diag) && time_left) {
+                        SimplexOptions esc = opts; // stall_abort stays false
+                        if (opts.time_limit_s > 0.0)
+                            esc.time_limit_s = std::max(0.05, opts.time_limit_s - elapsed(t0));
+                        // Repair the best basis found so far. In particular, when
+                        // primal produced a feasible point but its reconstructed
+                        // dual was not clean, restarting dual from the old probe
+                        // basis throws away the useful primal basis and commonly
+                        // leaves the instance at FeasibleWithGap. A dual cleanup
+                        // from `winner` preserves the primal work and can close
+                        // the certificate in a handful of pivots.
+                        const SimplexBasis* warm_basis = winner;
+                        if (!warm_basis || warm_basis->basic.empty())
+                            warm_basis = &probe_basis;
+                        raw = run(true, esc, &esc_basis, warm_basis);
+                        keep_better(&esc_basis);
+                    }
+                }
+                raw = best_raw;
+                diag = best_diag;
+            }
         }
         install_basis(*winner);
     }
 
     install_work_totals(diag, cumulative);
+    diag.scaling_ms += prepared.scaling_ms;
+    diag.csc_ms += prepared.csc_ms;
+    diag.preprocessing_ms += prepared.total_ms;
+    diag.total_ms += prepared.total_ms;
+    diag.preprocessing_builds += 1;
     diag.presolve_ms = presolve_ms;
+    diag.total_ms += presolve_ms;
     if (used_presolve) {
         diag.presolve_rows_removed = pmap.stats.rows_removed;
         diag.presolve_cols_removed = pmap.stats.cols_removed;

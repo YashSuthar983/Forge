@@ -129,6 +129,17 @@ struct BabDiagnostics {
     f64 incumbent = core::kPosInf;
     f64 dual_bound = core::kNaN;
     f64 gap_rel = core::kPosInf;
+    // True iff the incumbent is proved optimal to within opts.gap_tol: EITHER
+    // the tree was fully exhausted, OR the drained dual bound already closes
+    // the gap (both require every node visited to have had a certified LP --
+    // see all_lp_proven in bab.cpp). Set once, in solve_milp(), and read
+    // directly by milp_evidence() instead of re-deriving it from
+    // termination_reason -- a previous version of milp_evidence() string-
+    // matched termination_reason == "tree exhausted", which meant an
+    // instance whose gap already closed to exactly 0 before the time/node
+    // limit hit (dual_bound == incumbent, a complete proof) was still
+    // reported as merely Feasible instead of Optimal.
+    bool globally_proved = false;
     double total_ms = 0.0;
     std::string termination_reason;
 };

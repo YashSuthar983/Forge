@@ -155,7 +155,7 @@ not fully reproduced.
 | # | Status | Current evidence / remaining gap |
 |---:|---|---|
 | 1 | **Partial** | Root GMI/cover separation is integrated in `bab.cpp`; no tree-node separation/local-cut lifecycle yet. |
-| 2 | **Partial** | Selectable Forrest–Tomlin bump update exists; collective FT and APF do not. |
+| 2 | **Partial** | Selectable Forrest–Tomlin bump update **and** `collapse_pending_into_ft()` (opt-in `collective_ft`) exist; full multi-column APF / default-on collective path does not. |
 | 3 | **Implemented** | Reach-set hypersparse FTRAN/BTRAN, including eta-chain differential tests. |
 | 4 | **Implemented** | Exact small-basis DSE plus scalable Devex/DSE updates in dual simplex. |
 | 5 | **Implemented** | Revised dual simplex with warm starts, Harris tests, and BFRT. |
@@ -260,30 +260,34 @@ being presented as a complete industrial implementation.
 
 ---
 
-## 9. Architecture (PS-aligned)
+## 9. Architecture (PS-aligned — what ships vs target)
 
 ```text
-INPUTS (MPS/QPS, C/Python API)
+INPUTS (MPS/QPS, CLI)                    ← C/Python API: C++ libs today
         │
         ▼
-MODEL → PRESOLVE/SCALING (Achterberg 2019 + Chen 2025 + PSLP)
+MODEL → PRESOLVE v1 + Ruiz               ← probing/PSLP = target
         │
    ┌────┼────────────────┐
    ▼    ▼                ▼
   LP    QP              MILP
-  dual  DAQP /          Branch-and-Cut
-  simplex PDHCG-II /    cuts · pool · Kernel Pump
-  + HPR   HPR-QP        DIVE · reliability+ · Hoen conflicts
-   │    │                │
+  primal/dual           Branch-and-Cut
+  simplex               root GMI · RINS/RENS
+  + HPR (CPU/Vulkan)    reliability + strong probes
+   │    PDHCG / diag AS  · propagation
    └────┴───────┬────────┘
                 ▼
-         sparse LU (FT / hypersparse)
-         CPU | GPU (measured)
+         sparse LU (product-form default;
+                    FT + collective collapse opt-in;
+                    hypersparse FTRAN/BTRAN)
+         CPU proof path | Vulkan FO (no crossover yet)
                 ▼
-         unscale + postsolve + Cert
+         unscale + postsolve + finalize_result
                 ▼
-         INDEPENDENT CHECKER
+         sor_check (independent)
 ```
+
+**Measured (4 Sep 2026):** Netlib SOR-simplex **92/93** `ProvedOptimalFP`, SGM **2.30×** vs HiGHS — see `architecture.md` §7.
 
 ---
 

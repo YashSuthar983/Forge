@@ -226,7 +226,7 @@ the correctness result this prototype was built to obtain.
 CUDA code path is written and type-checked by KernelAbstractions but is
 **unverified**, and no GPU speedup figure exists for SOR at all.
 
-Per `implementation_plan.md` Phase 0 risk register: report unmeasured, never
+Per `docs/architecture.md` claims discipline: report unmeasured, never
 fabricate.
 
 ---

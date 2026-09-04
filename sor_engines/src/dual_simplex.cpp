@@ -2,6 +2,7 @@
 #include "sor/engines/dual_bfrt.hpp"
 #include "sor/engines/dual_edge_weights.hpp"
 #include "sor/engines/farkas.hpp"
+#include "simplex_prepared.hpp"
 
 // Ruiz equilibration is declared in pdhg.hpp and defined in pdhg.cpp. Both
 // engines want it and it is the same algorithm; a third translation unit for one
@@ -42,30 +43,17 @@ constexpr f64 kAtBound = 1e-9;
 
 }  // namespace
 
-core::RawResult solve_dual_simplex(const model::LpProblem& problem,
-                                   const SimplexOptions& opts,
-                                   SimplexDiagnostics& diag,
-                                   SimplexBasis* out_basis,
-                                   const SimplexBasis* warm) {
+core::RawResult solve_dual_simplex_prepared(
+    const SimplexPrepared& prepared, const SimplexOptions& opts,
+    SimplexDiagnostics& diag, SimplexBasis* out_basis,
+    const SimplexBasis* warm) {
     const auto t_all = Clock::now();
-    const bool time_detail = opts.verbose;
-    Clock::time_point t_part{};
     const bool use_devex = (opts.pricing != SimplexPricing::Dantzig);
 
-    // ---- 1. minimization form, unscaled. This copy is the reference the final
-    //         residuals are measured against, so it must NOT be scaled. -------
-    model::LpProblem pmin = problem;
-    const f64 sense = problem.maximize ? -1.0 : 1.0;
-    if (pmin.maximize) {
-        for (auto& v : pmin.c) v = -v;
-        pmin.maximize = false;
-    }
-
-    // ---- 2. scaled working copy ------------------------------------------
-    model::LpProblem p = pmin;
-    const auto t_scale = Clock::now();
-    const RuizScaling scaling = ruiz_scale(p, opts.ruiz_iterations);
-    diag.scaling_ms = ms_since(t_scale);
+    const auto& pmin = prepared.pmin;
+    const auto& p = prepared.scaled;
+    const auto& scaling = prepared.scaling;
+    const f64 sense = prepared.sense;
 
     const Index m  = p.n_rows();
     const Index ns = p.n_cols();
@@ -88,7 +76,7 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
     const bool use_exact_dse = (opts.pricing == SimplexPricing::DSE);
 
     // ---- 3. the augmented system [A | -I] --------------------------------
-    const auto ac = sparse::to_csc(p.A);
+    const auto& ac = prepared.csc;
     const auto& acp = ac.pattern.col_ptr();
     const auto& ari = ac.pattern.row_idx();
 
@@ -101,23 +89,11 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
         }
     };
 
-    std::vector<f64> lo(sz(nt)), hi(sz(nt)), cost(sz(nt), 0.0);
-    for (Index j = 0; j < ns; ++j) {
-        lo[sz(j)] = p.col_lo[sz(j)];
-        hi[sz(j)] = p.col_hi[sz(j)];
-        cost[sz(j)] = p.c[sz(j)];
-    }
-    for (Index i = 0; i < m; ++i) {
-        lo[sz(ns + i)] = p.row_lo[sz(i)];
-        hi[sz(ns + i)] = p.row_hi[sz(i)];
-    }
+    const auto& lo = prepared.lo;
+    const auto& hi = prepared.hi;
+    const auto& cost = prepared.cost;
 
-    std::vector<f64> colnorm2(sz(nt), 1.0);
-    for (Index j = 0; j < nt; ++j) {
-        f64 s = 1.0;
-        for_col(j, [&](Index, f64 v) { s += v * v; });
-        colnorm2[sz(j)] = s;
-    }
+    const auto& colnorm2 = prepared.colnorm2;
 
     // Per-column dual-feasibility thresholds in SCALED space, chosen so that
     // "d_j within tolerance" means the same thing on the UNSCALED model the
@@ -126,21 +102,13 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
     // |y'| <= tol / row_scale for row logicals (y_unscaled = y' * row_scale).
     // A flat scaled tolerance let pilot (col 3645, d = -1.5e-7 unscaled but
     // -1.0e-7 scaled) terminate "Optimal" with a residual the gate rejects.
-    std::vector<f64> dtol(sz(nt), opts.dual_feas_tol);
-    for (Index j = 0; j < ns; ++j)
-        dtol[sz(j)] = std::max(opts.dual_feas_tol * scaling.col_scale[sz(j)], 1e-12);
-    for (Index i = 0; i < m; ++i)
-        dtol[sz(ns + i)] = std::max(opts.dual_feas_tol / scaling.row_scale[sz(i)], 1e-12);
+    const auto& dtol = prepared.dual_tolerance;
 
     // Per-variable primal tolerances in scaled coordinates. Structural
     // variable bounds scale by 1 / D_c; row-logical bounds scale by D_r. The
     // certificate is unscaled, so using opts.primal_feas_tol directly here can
     // accept large original-space violations on ill-scaled rows (dfl001).
-    std::vector<f64> ptol(sz(nt), opts.primal_feas_tol);
-    for (Index j = 0; j < ns; ++j)
-        ptol[sz(j)] = std::max(opts.primal_feas_tol / scaling.col_scale[sz(j)], 1e-12);
-    for (Index i = 0; i < m; ++i)
-        ptol[sz(ns + i)] = std::max(opts.primal_feas_tol * scaling.row_scale[sz(i)], 1e-12);
+    const auto& ptol = prepared.primal_tolerance;
 
     // ---- 4. state --------------------------------------------------------
     std::vector<Index> basis(sz(m));
@@ -250,8 +218,35 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
 
     // ---- 5. factorization ------------------------------------------------
     BasisFactor factor;
-    const auto do_ftran = [&](std::vector<f64>& v) { ++diag.solve_calls; factor.ftran(v); };
-    const auto do_btran = [&](std::vector<f64>& v) { ++diag.solve_calls; factor.btran(v); };
+    const auto do_ftran = [&](std::vector<f64>& v) {
+        const auto t0 = Clock::now();
+        factor.ftran(v);
+        const double dt = ms_since(t0);
+        ++diag.solve_calls;
+        ++diag.ftran_calls;
+        diag.ftran_ms += dt;
+        diag.solve_ms += dt;
+    };
+    const auto do_btran = [&](std::vector<f64>& v) {
+        const auto t0 = Clock::now();
+        factor.btran(v);
+        const double dt = ms_since(t0);
+        ++diag.solve_calls;
+        ++diag.btran_calls;
+        diag.btran_ms += dt;
+        diag.solve_ms += dt;
+    };
+    const auto do_btran_with_support = [&](std::vector<f64>& v,
+                                           std::vector<Index>& support) {
+        const auto t0 = Clock::now();
+        const bool sparse = factor.btran_with_support(v, support);
+        const double dt = ms_since(t0);
+        ++diag.solve_calls;
+        ++diag.btran_calls;
+        diag.btran_ms += dt;
+        diag.solve_ms += dt;
+        return sparse;
+    };
     la::LuOptions lu_opts;
     lu_opts.pivot_tol = std::min(opts.pivot_tol, 1e-11);
 
@@ -284,8 +279,15 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
     // ranges over the pivotal row's SUPPORT instead of every nonbasic column.
     std::vector<f64>   redcost(sz(nt), 0.0);
     std::vector<f64>   prow(sz(nt), 0.0);
-    std::vector<char>  prow_used(sz(nt), 0);
+    // Generation stamps make pivotal-row assembly O(nnz touched), without a
+    // separate clear over the previous support. Structural columns can occur
+    // in several rho rows; logical -I columns occur exactly once and therefore
+    // need neither a stamp lookup nor accumulation.
+    std::vector<std::uint32_t> prow_stamp(sz(ns), 0);
+    std::uint32_t prow_generation = 0;
     std::vector<Index> prow_idx;
+    std::vector<Index> rho_support;
+    bool rho_is_sparse = false;
     // Phase-1 batch flips: which columns moved since the last xB correction.
     std::vector<char>  flip_touched(sz(nt), 0);
     std::vector<Index> flipped_list;
@@ -297,20 +299,35 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
 
     // alpha_r = rho' [A | -I], visiting only rows where rho is nonzero.
     const auto build_pivotal_row = [&]() {
-        for (const Index j : prow_idx) { prow[sz(j)] = 0.0; prow_used[sz(j)] = 0; }
+        const auto t0 = Clock::now();
         prow_idx.clear();
-        for (Index i = 0; i < m; ++i) {
+        if (++prow_generation == 0) {
+            std::fill(prow_stamp.begin(), prow_stamp.end(), 0);
+            prow_generation = 1;
+        }
+        const auto add_rho_row = [&](Index i) {
             const f64 r = rho[sz(i)];
-            if (r == 0.0) continue;
+            if (r == 0.0) return;
             for (Offset k = arp[sz(i)]; k < arp[sz(i) + 1]; ++k) {
                 const Index j = aci[sz(k)];
-                if (!prow_used[sz(j)]) { prow_used[sz(j)] = 1; prow_idx.push_back(j); }
-                prow[sz(j)] += r * avl[sz(k)];
+                if (prow_stamp[sz(j)] != prow_generation) {
+                    prow_stamp[sz(j)] = prow_generation;
+                    prow[sz(j)] = r * avl[sz(k)];
+                    prow_idx.push_back(j);
+                } else {
+                    prow[sz(j)] += r * avl[sz(k)];
+                }
             }
             const Index jl = ns + i;
-            if (!prow_used[sz(jl)]) { prow_used[sz(jl)] = 1; prow_idx.push_back(jl); }
-            prow[sz(jl)] -= r;
+            prow[sz(jl)] = -r;
+            prow_idx.push_back(jl);
+        };
+        if (rho_is_sparse) {
+            for (const Index i : rho_support) add_rho_row(i);
+        } else {
+            for (Index i = 0; i < m; ++i) add_rho_row(i);
         }
+        diag.pivotal_row_ms += ms_since(t0);
     };
 
     const auto reset_weights = [&]() {
@@ -398,15 +415,19 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
         return s;
     };
 
-    // Exact reduced cost from the current pi. Used only to (re)build redcost[];
-    // the loop reads redcost[] directly.
-    const auto exact_reduced_cost = [&](Index j) {
-        f64 d = cost[sz(j)];
-        for_col(j, [&](Index i, f64 v) { d -= v * y[sz(i)]; });
-        return d;
-    };
     const auto rebuild_redcost = [&]() {
-        for (Index j = 0; j < nt; ++j) redcost[sz(j)] = exact_reduced_cost(j);
+        // Traverse structural CSC columns directly and exploit the augmented
+        // logical block's exact -I structure. This avoids generic visitor
+        // overhead on m logical columns while keeping each structural dot
+        // product in the same order as the previous implementation.
+        for (Index j = 0; j < ns; ++j) {
+            f64 d = cost[sz(j)];
+            for (Offset k = acp[sz(j)]; k < acp[sz(j) + 1]; ++k)
+                d -= ac.vals[sz(k)] * y[sz(ari[sz(k)])];
+            redcost[sz(j)] = d;
+        }
+        for (Index i = 0; i < m; ++i)
+            redcost[sz(ns + i)] = cost[sz(ns + i)] + y[sz(i)];
         d_valid = true;
         ++diag.dual_rebuilds;
     };
@@ -644,15 +665,47 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
                                                     opts.refactor_eta_ratio,
                                                     opts.bump_width_max,
                                                     opts.refactor_work_ratio);
+        const auto update_t0 = Clock::now();
         const bool updated =
             opts.update_method == la::UpdateMethod::ForrestTomlin
                 ? factor.update_ft(leave, alpha, la::LuOptions{}, opts.pivot_tol)
                 : factor.update(leave, alpha, opts.pivot_tol);
-        if (unstable || !updated || eta_full ||
-            ++since_refactor >= opts.refactor_interval) {
-            do_factorize();
-            since_refactor = 0;
+        diag.basis_update_ms += ms_since(update_t0);
+        ++diag.basis_update_calls;
+        const bool wants_refactor = unstable || !updated || eta_full ||
+                                     ++since_refactor >= opts.refactor_interval;
+        if (!wants_refactor) return;
+        // Collective FT (item 2 Phase 2): the eta file (or periodic interval)
+        // wants cleanup, but nothing is numerically wrong -- try folding the
+        // pending etas into L/U in place instead of paying a full Markowitz
+        // refactorize. Never attempted after an unstable/failed update: those
+        // need the safety of a genuinely fresh factorization, not a
+        // representation shuffle of a basis that may itself be suspect.
+        if (opts.collective_ft && !unstable && updated &&
+            opts.update_method == la::UpdateMethod::ProductForm) {
+            // The exact collective implementation replays single FT bumps.
+            // Bound that superlinear work; large sparse bases take the
+            // predictable full-refactor path rather than overrun a time limit
+            // inside one uninterruptible collapse.
+            constexpr Index kCollectiveMaxDimension = 512;
+            constexpr Index kCollectiveMaxUpdates = 64;
+            if (factor.dimension() <= kCollectiveMaxDimension &&
+                factor.n_updates() <= kCollectiveMaxUpdates) {
+                const auto collapse_t0 = Clock::now();
+                const bool collapsed = factor.collapse_pending_into_ft(
+                    la::LuOptions{}, opts.pivot_tol);
+                diag.basis_update_ms += ms_since(collapse_t0);
+                if (collapsed) {
+                    ++diag.collective_ft_collapses;
+                    since_refactor = 0;
+                    return;
+                }
+            } else {
+                ++diag.collective_ft_skips;
+            }
         }
+        do_factorize();
+        since_refactor = 0;
     };
 
     // ---- 6. iterate ------------------------------------------------------
@@ -759,7 +812,7 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
             //      (its status changed side, not its d), so it is never also
             //      an entering candidate -- the continue guarantees it.
             bool flipped = false;
-            if (time_detail) t_part = Clock::now();
+            const auto price_t0 = Clock::now();
             f64 best = 0.0;
             for (const Index j : nonbasic) {
                 if (lo[sz(j)] == hi[sz(j)]) continue;
@@ -810,7 +863,7 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
                 const f64 score = viol * viol / std::max(den, 1e-30);
                 if (score > best) { best = score; q = j; qdir = dir; d_enter = d; }
             }
-            if (time_detail) diag.price_ms += ms_since(t_part);
+            diag.price_ms += ms_since(price_t0);
             if (flipped) {
                 // Adjust xB incrementally (one FTRAN over the flipped
                 // columns) instead of the full recompute_xB sweep.
@@ -842,9 +895,7 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
 
             std::fill(alpha.begin(), alpha.end(), 0.0);
             for_col(q, [&](Index i, f64 v) { alpha[sz(i)] += v; });
-            if (time_detail) t_part = Clock::now();
             do_ftran(alpha);
-            if (time_detail) diag.solve_ms += ms_since(t_part);
 
             const f64 p1_slack = opts.harris_slack +
                                  (expand_active ? expand_eps : 0.0);
@@ -895,7 +946,7 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
             if (leave >= 0) {
                 std::fill(rho.begin(), rho.end(), 0.0);
                 rho[sz(leave)] = 1.0;
-                do_btran(rho);
+                rho_is_sparse = do_btran_with_support(rho, rho_support);
                 build_pivotal_row();
                 if (use_devex) {
                     const f64 ap = alpha[sz(leave)];
@@ -911,7 +962,7 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
         } else {
             // ---- dual phase 2: leave a bound-violating basic; Harris/EXPAND
             //      ratio test on nonbasic reduced costs picks the entering column.
-            if (time_detail) t_part = Clock::now();
+            const auto price_t0 = Clock::now();
 
             const auto row_viol = [&](Index i, f64& viol, bool& to_lower) -> bool {
                 const Index v = basis[sz(i)];
@@ -952,7 +1003,7 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
             // NumericalFailure with objective -93825.97 instead of Optimal at
             // 5501.845888. fit2p also needed 14443 iterations instead of 10457.
             for (Index i = 0; i < m; ++i) consider_row(i);
-            if (time_detail) diag.price_ms += ms_since(t_part);
+            diag.price_ms += ms_since(price_t0);
 
             if (leave < 0) {
                 if (since_refactor > 0) { do_factorize(); since_refactor = 0; continue; }
@@ -973,9 +1024,7 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
 
             std::fill(rho.begin(), rho.end(), 0.0);
             rho[sz(leave)] = 1.0;
-            if (time_detail) t_part = Clock::now();
-            do_btran(rho);
-            if (time_detail) diag.solve_ms += ms_since(t_part);
+            rho_is_sparse = do_btran_with_support(rho, rho_support);
 
             const f64 dual_slack = opts.harris_slack +
                                    (expand_active ? expand_eps : 0.0);
@@ -987,7 +1036,7 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
             // qualify. Reduced costs are read from the maintained redcost[]
             // instead of being recomputed, so this whole block is one sparse
             // row pass rather than a full O(nnz(A)) column sweep.
-            if (time_detail) t_part = Clock::now();
+            const auto row_price_t0 = Clock::now();
             build_pivotal_row();
             cand_j.clear(); cand_aj.clear(); cand_d.clear();
             for (const Index j : prow_idx) {
@@ -1007,11 +1056,12 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
                 cand_aj.push_back(aj);
                 cand_d.push_back(redcost[sz(j)]);
             }
-            if (time_detail) diag.price_ms += ms_since(t_part);
+            diag.price_ms += ms_since(row_price_t0);
 
             const Index vl = basis[sz(leave)];
             const f64 target = leave_to_lower ? lo[sz(vl)] : hi[sz(vl)];
             const f64 delta_primal = xB[sz(leave)] - target;
+            const auto ratio_t0 = Clock::now();
             const f64 harris_theta =
                 dual_harris_theta(cand_j, cand_aj, cand_d, st, srow, dual_slack);
 
@@ -1038,6 +1088,9 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
             if (!choice.ok || choice.pivot < 0)
                 choice = dual_legacy_ratio(cand_j, cand_aj, cand_d, st, srow,
                                            harris_theta, opts.pivot_tol);
+            const double ratio_dt = ms_since(ratio_t0);
+            diag.ratio_test_ms += ratio_dt;
+            diag.price_ms += ratio_dt;
 
             if (!choice.ok || choice.pivot < 0) {
                 if (since_refactor > 0) { do_factorize(); since_refactor = 0; continue; }
@@ -1076,9 +1129,7 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
 
             std::fill(alpha.begin(), alpha.end(), 0.0);
             for_col(q, [&](Index i, f64 v) { alpha[sz(i)] += v; });
-            if (time_detail) t_part = Clock::now();
             do_ftran(alpha);
-            if (time_detail) diag.solve_ms += ms_since(t_part);
 
             if (used_bfrt) {
                 for (const Index j : prow_idx) {
@@ -1164,7 +1215,7 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
             std::printf("  iter %8llu  phase %d  dual-infeas %.6e  prim-infeas %.6e  obj %.10e\n",
                         static_cast<unsigned long long>(iter), phase,
                         dual_infeasibility(), primal_infeasibility(),
-                        sense * obj + problem.obj_offset);
+                        sense * obj + pmin.obj_offset);
         }
     }
     diag.loop_ms = ms_since(t_loop);
@@ -1245,7 +1296,7 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
 
     f64 obj_min = 0.0;
     for (Index j = 0; j < ns; ++j) obj_min += pmin.c[sz(j)] * x[sz(j)];
-    diag.primal_objective = sense * obj_min + problem.obj_offset;
+    diag.primal_objective = sense * obj_min + pmin.obj_offset;
 
     bool finite = true;
     f64 dval = 0.0;
@@ -1269,7 +1320,7 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
     }
     diag.dual_bound_finite = finite && std::isfinite(dval);
     diag.dual_objective = diag.dual_bound_finite
-                              ? sense * dval + problem.obj_offset
+                              ? sense * dval + pmin.obj_offset
                               : std::numeric_limits<f64>::quiet_NaN();
     diag.gap_rel = diag.dual_bound_finite
                        ? std::fabs(diag.primal_objective - diag.dual_objective) /
@@ -1317,6 +1368,22 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
     }
 
     diag.total_ms = ms_since(t_all);
+    return raw;
+}
+
+core::RawResult solve_dual_simplex(const model::LpProblem& problem,
+                                   const SimplexOptions& opts,
+                                   SimplexDiagnostics& diag,
+                                   SimplexBasis* out_basis,
+                                   const SimplexBasis* warm) {
+    const auto t0 = Clock::now();
+    const auto prepared = prepare_simplex_model(problem, opts);
+    auto raw = solve_dual_simplex_prepared(prepared, opts, diag, out_basis, warm);
+    diag.scaling_ms = prepared.scaling_ms;
+    diag.csc_ms = prepared.csc_ms;
+    diag.preprocessing_ms = prepared.total_ms;
+    diag.preprocessing_builds = 1;
+    diag.total_ms = ms_since(t0);
     return raw;
 }
 

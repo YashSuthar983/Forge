@@ -19,6 +19,7 @@
 #include <cmath>
 #include <exception>
 #include <fstream>
+#include <limits>
 #include <string>
 
 namespace {
@@ -30,6 +31,11 @@ void usage() {
         "  --q-diag LIST    comma-separated diagonal of Q (if not using .qps)\n"
         "  --backend NAME   cpu (default) | vulkan | julia_gpu\n"
         "  --method NAME    auto | primal | dual   (simplex and MILP node LPs)\n"
+        "  --basis-update NAME  product | ft       (simplex basis updates)\n"
+        "  --collective-ft  fold pending product updates into L/U at cleanup\n"
+        "  --refactor-interval N  maximum basis updates between refactors\n"
+        "  --refactor-eta-ratio R refactor when eta nnz exceeds R*factor nnz\n"
+        "  --refactor-work-ratio R refactor when solve work exceeds R*factor nnz\n"
         "  --max-iter N     iteration / node limit\n"
         "  --tol T          feasibility tolerance\n"
         "  --time-limit S   wall-clock limit in seconds\n"
@@ -102,6 +108,7 @@ int main(int argc, char** argv) {
     sor::io::MpsReadOptions mps_opts;
     bool mps_format_forced = false;
     bool tol_given = false;
+    bool max_iter_given = false;
     double tol = 0.0;
 
     for (int i = 1; i < argc; ++i) {
@@ -121,6 +128,7 @@ int main(int argc, char** argv) {
             pdhg_opts.max_iterations = n;
             hpr_opts.max_iterations  = n;
             sx_opts.max_iterations   = n;
+            max_iter_given = true;
         }
         else if (a == "--tol") {
             tol = std::strtod(next("--tol").c_str(), nullptr);
@@ -130,6 +138,19 @@ int main(int argc, char** argv) {
             const double t = std::strtod(next("--time-limit").c_str(), nullptr);
             sx_opts.time_limit_s = t;
             hpr_opts.time_limit_s = t;
+            pdhg_opts.time_limit_s = t;
+            // PDHG/HPR's max_iterations is a fixed default (100000/200000),
+            // not the "0 = auto-scale to problem size" convention the
+            // simplex engines use -- so with a time budget also given, an
+            // UNCHANGED default iteration cap was usually the thing that
+            // actually stopped the loop (100000 PDHG iterations run in well
+            // under a second on most Netlib instances), silently discarding
+            // most of the requested time budget. When a time limit is
+            // explicitly requested, let it be the real constraint.
+            if (!max_iter_given) {
+                pdhg_opts.max_iterations = std::numeric_limits<std::uint64_t>::max();
+                hpr_opts.max_iterations = std::numeric_limits<std::uint64_t>::max();
+            }
         }
         else if (a == "--method") {
             const std::string m = next("--method");
@@ -138,6 +159,27 @@ int main(int argc, char** argv) {
             else if (m == "dual")   sx_opts.method = sor::engines::SimplexMethod::Dual;
             else { std::fprintf(stderr, "error: unknown method '%s'\n", m.c_str()); return 2; }
         }
+        else if (a == "--basis-update") {
+            const std::string method = next("--basis-update");
+            if (method == "product")
+                sx_opts.update_method = sor::la::UpdateMethod::ProductForm;
+            else if (method == "ft")
+                sx_opts.update_method = sor::la::UpdateMethod::ForrestTomlin;
+            else {
+                std::fprintf(stderr, "error: unknown basis update '%s'\n", method.c_str());
+                return 2;
+            }
+        }
+        else if (a == "--collective-ft") sx_opts.collective_ft = true;
+        else if (a == "--refactor-interval")
+            sx_opts.refactor_interval =
+                static_cast<int>(std::strtol(next("--refactor-interval").c_str(), nullptr, 10));
+        else if (a == "--refactor-eta-ratio")
+            sx_opts.refactor_eta_ratio =
+                std::strtod(next("--refactor-eta-ratio").c_str(), nullptr);
+        else if (a == "--refactor-work-ratio")
+            sx_opts.refactor_work_ratio =
+                std::strtod(next("--refactor-work-ratio").c_str(), nullptr);
         else if (a == "--no-scaling") {
             sx_opts.ruiz_iterations = 0;
             pdhg_opts.ruiz_iterations = 0;
@@ -235,6 +277,7 @@ int main(int argc, char** argv) {
 
             sor::engines::QpOptions qopts;
             qopts.max_iterations = pdhg_opts.max_iterations;
+            qopts.time_limit_s = sx_opts.time_limit_s;
             qopts.verbose = sx_opts.verbose;
             if (tol_given) {
                 qopts.feas_tol = tol;
@@ -383,8 +426,28 @@ int main(int argc, char** argv) {
             std::printf("\ntiming (ms)\n");
             std::printf("  total            %10.3f\n", diag.total_ms);
             std::printf("  scaling          %10.3f\n", diag.scaling_ms);
+            std::printf("  CSR->CSC         %10.3f\n", diag.csc_ms);
+            std::printf("  preparation      %10.3f\n", diag.preprocessing_ms);
+            std::printf("  presolve         %10.3f\n", diag.presolve_ms);
             std::printf("  factorization    %10.3f\n", diag.factor_ms);
+            std::printf("  pricing          %10.3f\n", diag.price_ms);
+            std::printf("  triangular solve %10.3f\n", diag.solve_ms);
+            std::printf("    FTRAN          %10.3f  (%llu calls)\n", diag.ftran_ms,
+                        static_cast<unsigned long long>(diag.ftran_calls));
+            std::printf("    BTRAN          %10.3f  (%llu calls)\n", diag.btran_ms,
+                        static_cast<unsigned long long>(diag.btran_calls));
+            std::printf("    pivotal rows   %10.3f\n", diag.pivotal_row_ms);
+            std::printf("    ratio tests    %10.3f\n", diag.ratio_test_ms);
+            std::printf("  basis updates    %10.3f  (%llu calls)\n", diag.basis_update_ms,
+                        static_cast<unsigned long long>(diag.basis_update_calls));
+            std::printf("  refactors/cFT    %10llu / %llu  (%llu guarded skips)\n",
+                        static_cast<unsigned long long>(diag.refactorizations),
+                        static_cast<unsigned long long>(diag.collective_ft_collapses),
+                        static_cast<unsigned long long>(diag.collective_ft_skips));
             std::printf("  simplex loop     %10.3f\n", diag.loop_ms);
+            std::printf("  auto stages/builds %8llu / %llu\n",
+                        static_cast<unsigned long long>(diag.stages),
+                        static_cast<unsigned long long>(diag.preprocessing_builds));
             return exit_code_for(r.status);
         }
 

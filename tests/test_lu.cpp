@@ -22,6 +22,8 @@ using sor::la::LuOptions;
 
 namespace {
 
+inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
+
 // A basis matrix held column-wise, exactly as BasisFactor::factorize takes it.
 struct ColMat {
     Index m = 0;
@@ -147,7 +149,7 @@ void check_solves(const ColMat& b, const BasisFactor& f, const char* what, f64 t
 // The all-logical starting basis: -I. Must factorize with zero fill, entirely
 // by singleton peeling, because that is the basis every cold start begins from.
 void test_identity_basis() {
-    const Index m = 50;
+    const Index m = 128;
     ColMat b;
     b.m = m;
     for (Index j = 0; j < m; ++j) {
@@ -164,6 +166,14 @@ void test_identity_basis() {
     // nnz(L) + nnz(U) + m diagonal entries, with no fill, is exactly m.
     CHECK(f.stats().factor_nnz == m);
     check_solves(b, f, "identity", 1e-12);
+
+    std::vector<f64> unit(static_cast<std::size_t>(m), 0.0);
+    unit[17] = 1.0;
+    std::vector<Index> support;
+    CHECK(f.btran_with_support(unit, support));
+    CHECK(support.size() == 1);
+    CHECK(support[0] == 17);
+    CHECK_NEAR(unit[17], -1.0, 1e-12);
 }
 
 void test_random_solves() {
@@ -476,12 +486,21 @@ void test_hypersparse_unit_rhs() {
                                 " unit=" + std::to_string(unit));
 
             std::vector<f64> w = rhs;
-            f.btran(w);
+            std::vector<Index> support;
+            const bool sparse_support = f.btran_with_support(w, support);
             const f64 e_b = max_abs_diff(b2.apply_t(w), rhs);
             ::sor::test::report(e_b <= 1e-7, "hypersparse btran etas", __FILE__,
                                 __LINE__,
                                 "upd=" + std::to_string(upd) +
                                 " unit=" + std::to_string(unit));
+            if (sparse_support) {
+                CHECK(std::is_sorted(support.begin(), support.end()));
+                std::vector<char> present(static_cast<std::size_t>(m), 0);
+                for (const Index i : support) present[static_cast<std::size_t>(i)] = 1;
+                for (Index i = 0; i < m; ++i)
+                    CHECK((w[static_cast<std::size_t>(i)] != 0.0) ==
+                          static_cast<bool>(present[static_cast<std::size_t>(i)]));
+            }
         }
     }
 }
@@ -642,6 +661,88 @@ void test_ft_rejects_tiny_pivot_untouched() {
     check_solves(b, f, "after refused ft update", 1e-9);
 }
 
+// Collective FT (item 2 Phase 2, docs/SIH26119_PS_ALIGNMENT.md §5):
+// collapse_pending_into_ft() folds a BATCH of pending product-form etas into
+// L/U via sequential update_ft() calls. Its entire contract is that this is
+// a pure REPRESENTATION change -- ftran()/btran() must return IDENTICAL
+// results before and after, for every unit vector, even though internally
+// the eta file went from N pending entries to zero. That transparency, not
+// just "still solves the current matrix", is what this checks: capture
+// ftran(e_i) for every i against the eta-file representation, collapse, and
+// compare against the SAME e_i again post-collapse.
+void test_collective_ft_transparent() {
+    std::mt19937 rng(42u);
+    const Index m = 30;
+    ColMat b = random_basis(m, 0.08, rng);
+    BasisFactor f;
+    CHECK(f.factorize(m, b.col_ptr, b.row_idx, b.vals, LuOptions{}));
+
+    std::uniform_real_distribution<f64> val(-2.0, 2.0);
+    int pending_updates = 0;
+    for (int step = 0; step < 8; ++step) {
+        std::vector<Index> rows;
+        std::vector<f64> vs;
+        for (Index i = 0; i < m; ++i)
+            if (i % 6 == step % 6) { rows.push_back(i); vs.push_back(val(rng)); }
+        if (rows.empty()) continue;
+        vs[0] += 4.0;
+
+        std::vector<f64> alpha(sz(m), 0.0);
+        for (std::size_t t = 0; t < rows.size(); ++t) alpha[sz(rows[t])] = vs[t];
+        f.ftran(alpha);
+        Index p = -1; f64 best = 0.0;
+        for (Index i = 0; i < m; ++i)
+            if (std::fabs(alpha[sz(i)]) > best) { best = std::fabs(alpha[sz(i)]); p = i; }
+        CHECK(p >= 0);
+        if (!f.update(p, alpha)) continue;  // product-form: pending eta added
+        b.set_col(p, rows, vs);
+        ++pending_updates;
+    }
+    ::sor::test::report(pending_updates >= 3, "batch has several pending etas",
+                        __FILE__, __LINE__, "count=" + std::to_string(pending_updates));
+    CHECK(f.n_updates() == pending_updates);
+
+    // Snapshot ftran(e_i) for every i BEFORE collapsing.
+    std::vector<std::vector<f64>> before(sz(m));
+    for (Index i = 0; i < m; ++i) {
+        std::vector<f64> e(sz(m), 0.0);
+        e[sz(i)] = 1.0;
+        f.ftran(e);
+        before[sz(i)] = e;
+    }
+
+    const bool collapsed = f.collapse_pending_into_ft(LuOptions{});
+    ::sor::test::report(collapsed, "collective collapse succeeded", __FILE__, __LINE__,
+                        "n_updates_after=" + std::to_string(f.n_updates()));
+    if (collapsed) CHECK(f.n_updates() == 0);
+
+    for (Index i = 0; i < m; ++i) {
+        std::vector<f64> e(sz(m), 0.0);
+        e[sz(i)] = 1.0;
+        f.ftran(e);
+        for (Index k = 0; k < m; ++k)
+            CHECK_NEAR(e[sz(k)], before[sz(i)][sz(k)], 1e-8);
+    }
+    // And the collapsed factorization must still solve the ACTUAL current
+    // matrix correctly, not just agree with its own pre-collapse self.
+    check_solves(b, f, "after collective collapse", 1e-6);
+}
+
+// The same transparency check, but from a cold factorize() with NO pending
+// etas at all -- collapse_pending_into_ft() must be a correct no-op rather
+// than, say, misreading an empty eta file as one entry.
+void test_collective_ft_noop_when_nothing_pending() {
+    std::mt19937 rng(7u);
+    const Index m = 10;
+    ColMat b = random_basis(m, 0.2, rng);
+    BasisFactor f;
+    CHECK(f.factorize(m, b.col_ptr, b.row_idx, b.vals, LuOptions{}));
+    CHECK(f.n_updates() == 0);
+    CHECK(f.collapse_pending_into_ft(LuOptions{}));
+    CHECK(f.n_updates() == 0);
+    check_solves(b, f, "collapse with nothing pending", 1e-9);
+}
+
 }  // namespace
 
 int main() {
@@ -659,5 +760,7 @@ int main() {
     test_ft_bump_extremes();
     test_ft_rejects_tiny_pivot_untouched();
     test_work_based_refactor_trigger();
+    test_collective_ft_transparent();
+    test_collective_ft_noop_when_nothing_pending();
     return sor::test::finish("test_lu");
 }

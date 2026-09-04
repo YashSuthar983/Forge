@@ -18,8 +18,8 @@
 // PROTOTYPE SCOPE: this is vanilla PDHG.
 // The competitive first-order engine -- adaptive restarts on normalized duality
 // gap, primal weight balancing, adaptive step size, Halpern/reflected
-// acceleration, feasibility polishing -- is Phase 1 work
-// (docs/implementation_plan.md). Do not benchmark this against PDLP or HPR-LP
+// acceleration, feasibility polishing -- lives in hpr.cpp (LpDevice path).
+// See docs/architecture.md §3.2. Do not benchmark this against PDLP or HPR-LP
 // and expect a fair comparison.
 //
 // This engine can NEVER return Status::Optimal: it produces no basis, so
@@ -38,6 +38,14 @@ using core::f64;
 
 struct PdhgOptions {
     std::uint64_t max_iterations = 100000;
+    // 0 = unlimited (max_iterations is the only cap); checked every
+    // check_every iterations, same cadence as the residual evaluation.
+    // Without this, a caller-supplied wall-clock budget (e.g. sor_solve's
+    // --time-limit) had no way to reach PDHG at all: max_iterations=100000
+    // iterations take well under a second on most Netlib instances, so PDHG
+    // was stopping and reporting Interrupted with 8+ unused seconds left on
+    // a 10s budget on the vast majority of instances.
+    f64 time_limit_s = 0.0;
     std::uint64_t check_every    = 200;    // residual evaluation interval
     f64 primal_tol = 1e-6;
     f64 dual_tol   = 1e-6;

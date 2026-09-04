@@ -62,7 +62,11 @@ CscMatrix to_csc(const CsrMatrix& a) {
     }
 
     CscMatrix out;
-    out.pattern = CscPattern(nr, nc, std::move(col_ptr), std::move(row_idx));
+    // The counting-sort construction above establishes every CscPattern
+    // invariant from an already-validated CSR pattern. Calling validate()
+    // here rescanned the complete transpose immediately after constructing it.
+    out.pattern = CscPattern(nr, nc, std::move(col_ptr), std::move(row_idx),
+                             CscPattern::TrustedCsrTransposeTag{});
     out.vals    = std::move(vals);
     return out;
 }

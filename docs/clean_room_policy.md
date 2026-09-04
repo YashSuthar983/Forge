@@ -1,7 +1,7 @@
 # SOR — Clean-room reference policy
 
 **Status:** team rule · binding for all numeric-core work  
-**See also:** `master_spec.md` §7 · `architecture.md` §13 · `dependency_ledger.md` §4
+**See also:** `architecture.md` §8 · `dependency_ledger.md` §4 · `paper_bibliography.md`
 
 **This file is the single source of truth for the forbidden-dependency list (§"Forbidden dependencies" below).** Other documents reference this list rather than restating it.
 

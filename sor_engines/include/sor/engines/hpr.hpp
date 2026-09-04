@@ -4,7 +4,7 @@
 //
 // Built directly against LpDevice so there is never a host-loop version to port.
 // Feature ladder (disable to weaken): Halpern → restart → primal weight →
-// vanilla PDHG. See docs/gpu_first_order_plan.md §3.
+// vanilla PDHG. See docs/architecture.md §3.2.
 #pragma once
 
 #include "sor/backend/lp_device.hpp"

@@ -129,6 +129,13 @@ public:
     // d (indexed by basis slot) <- B^-T d (indexed by row). Size m.
     void btran(std::vector<f64>& d) const;
 
+    // Same solve, additionally returning the exact nonzero support of the
+    // row-indexed result when the final L' solve stayed hypersparse. Returns
+    // false (and clears `support`) when the dense path was selected. This lets
+    // dual simplex form rho'A without rescanning all m rows after BTRAN.
+    bool btran_with_support(std::vector<f64>& d,
+                            std::vector<Index>& support) const;
+
     // Record that basis slot p has been replaced by a column whose image under
     // the PRE-update basis is `alpha` (i.e. alpha = B^-1 a_q, the FTRAN result
     // the ratio test already computed). Returns false if alpha[p] is too small
@@ -144,6 +151,23 @@ public:
     // that is itself near-singular); either way the caller must refactorize.
     bool update_ft(Index p, const std::vector<f64>& alpha,
                    const LuOptions& opts, f64 min_pivot = 1e-11);
+
+    // Collective FT (Huangfu & Hall 2015 Phase 2 in docs/SIH26119_PS_ALIGNMENT.md
+    // §5 item 2): folds every PENDING product-form eta (from update(), not
+    // update_ft()) into L/U via a sequence of update_ft() calls -- reusing
+    // that already-verified single-update path exactly, rather than a new
+    // combined multi-column bump-elimination algorithm -- then clears the
+    // eta file. The point is purely a representation change from the
+    // caller's point of view: ftran()/btran() must produce IDENTICAL results
+    // before and after (this is what tests/test_lu_ft.cpp's collective suite
+    // checks), it just stops paying the eta-file sweep cost on every
+    // subsequent solve. On a mid-sequence failure (one eta's bump turns out
+    // near-singular), the etas already folded stay folded and every
+    // remaining pending eta is correctly re-inserted via update() so no
+    // update is silently lost; returns false in that case (some etas may
+    // still be pending -- check n_updates()), true when the eta file ends up
+    // fully empty.
+    bool collapse_pending_into_ft(const LuOptions& opts, f64 min_pivot = 1e-11);
 
     // ForrestTomlin only: how many trailing pivot-steps the most recent
     // update_ft() call re-triangularized (m - p_step). 0 if update_ft() has
@@ -194,6 +218,8 @@ private:
     bool sparse_upper_t(const std::vector<Index>& seed, std::vector<f64>& v) const;
     bool sparse_lower_t(const std::vector<Index>& seed, std::vector<f64>& v) const;
 
+    bool btran_impl(std::vector<f64>& d, std::vector<Index>* support) const;
+
     void build_col_patterns();
 
     // Forrest-Tomlin: dense Gauss elimination with partial (row-only) pivoting
@@ -212,6 +238,25 @@ private:
                         std::vector<std::vector<f64>>& new_u_val,
                         std::vector<std::vector<Index>>& new_l_idx,
                         std::vector<std::vector<f64>>& new_l_val) const;
+
+    // Same contract and same mathematical algorithm as eliminate_bump()
+    // (partial row-pivoting Gauss elimination) but on a SPARSE row
+    // representation instead of a dense width*width array -- the dense
+    // version costs O(width^3) regardless of actual fill, which measured
+    // catastrophically (25-227x slower than product-form on real Netlib
+    // instances) once bump width grows past a few dozen. brow_cols/brow_vals
+    // are per-bump-local-row (col, val) pairs, SORTED ascending by column;
+    // update_ft() assembles them (bump assembly + the old-bump-L strip) the
+    // same way it used to build the dense `bm`, just sparsely.
+    bool eliminate_bump_sparse(std::vector<std::vector<Index>>& brow_cols,
+                               std::vector<std::vector<f64>>& brow_vals,
+                               Index width, const LuOptions& opts,
+                               std::vector<Index>& piv,
+                               std::vector<f64>& new_diag,
+                               std::vector<std::vector<Index>>& new_u_idx,
+                               std::vector<std::vector<f64>>& new_u_val,
+                               std::vector<std::vector<Index>>& new_l_idx,
+                               std::vector<std::vector<f64>>& new_l_val) const;
 
     Index m_ = 0;
     bool valid_ = false;

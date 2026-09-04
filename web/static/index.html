@@ -7,118 +7,152 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Sora:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/app.css" />
+  <link rel="stylesheet" href="/static/app.css?v=12" />
 </head>
 <body>
   <div class="bg" aria-hidden="true"></div>
 
   <div class="topbar">
-    <span><strong>SOR</strong><span class="sep">·</span>Optimization Runtime</span>
-    <span>LP · MILP · QP<span class="sep">·</span>from scratch</span>
+    <div class="topbar-left">
+      <span><strong>SOR</strong><span class="sep">·</span>Optimization Runtime</span>
+      <label class="file-hit top-file">
+        <input type="file" id="file" accept=".mps,.qps" />
+        <span>Open <code>.mps</code> / <code>.qps</code></span>
+      </label>
+    </div>
+    <span class="topbar-right" id="health">Starting…</span>
   </div>
 
-  <main class="shell">
+  <main class="shell workspace">
     <header class="brand-block">
       <p class="logo">SOR</p>
-      <p class="tag">Interactive solver console — demos, or write your own equations.</p>
+      <p class="tag">Inspect or edit the model, set options, optimize.</p>
     </header>
 
-    <section class="pick" aria-label="Choose a problem">
-      <p class="step">1 · Choose</p>
-      <div class="problems" id="problems"></div>
+    <div class="panes">
+      <!-- LEFT: models -->
+      <aside class="pane-left" aria-label="Models">
+        <p class="step-dark">Models</p>
+        <div class="problems" id="problems"></div>
 
-      <div class="learn" id="learn">
         <button type="button" class="problem write-toggle" id="btn-write">
           <span class="kind">learn</span>
-          <span class="name">Write your own equations</span>
-          <span class="blurb">Type Maximize / Subject To / Bounds — same idea as Gurobi or HiGHS text models.</span>
+          <span class="name">Write equations</span>
+          <span class="blurb">LP text → editable MPS.</span>
         </button>
+      </aside>
 
-        <div class="writer" id="writer" hidden>
-          <p class="writer-lead">Pick a starter, edit the numbers, then press Solve.</p>
-          <div class="templates" id="templates" role="list"></div>
-          <label class="writer-label" for="model_text">Equations</label>
-          <textarea id="model_text" spellcheck="false" rows="14" placeholder="Maximize
-  3 x + 4 y
-Subject To
-  c1: x + 2 y <= 14
-Bounds
-  x >= 0
-  y >= 0
-End"></textarea>
-          <p class="writer-help">
-            <strong>How to write it</strong><br />
-            1. <code>Maximize</code> or <code>Minimize</code> + objective<br />
-            2. <code>Subject To</code> + constraints with <code>&lt;=</code> <code>&gt;=</code> <code>=</code><br />
-            3. <code>Bounds</code> (optional) · <code>Binary</code> / <code>General</code> for integers<br />
-            4. <code>End</code>
-          </p>
-        </div>
+      <!-- RIGHT: editor + options + result -->
+      <div class="pane-right-stack">
+        <section class="pane-right" aria-label="Model inspector">
+          <div class="inspector-head">
+            <div>
+              <p class="step-light">Model</p>
+              <p class="model-title" id="model-title">—</p>
+            </div>
+            <div class="tabs" role="tablist">
+              <button type="button" class="tab active" data-tab="mps" id="tab-mps">MPS</button>
+              <button type="button" class="tab" data-tab="eq" id="tab-eq">Equations</button>
+            </div>
+          </div>
+
+          <div class="editor-wrap" id="panel-mps">
+            <div class="editor-toolbar">
+              <span id="mps-meta">Select a model to inspect</span>
+              <span class="dirty" id="dirty" hidden>edited</span>
+            </div>
+            <textarea id="mps_text" class="code-edit" spellcheck="false" rows="16"
+              placeholder="NAME …&#10;ROWS&#10;…&#10;ENDATA"></textarea>
+          </div>
+
+          <div class="editor-wrap" id="panel-eq" hidden>
+            <div class="editor-toolbar">
+              <span>Learner LP text</span>
+              <button type="button" class="mini" id="btn-to-mps">Update MPS from equations</button>
+            </div>
+            <div class="templates" id="templates" role="list"></div>
+            <textarea id="model_text" class="code-edit eq-edit" spellcheck="false" rows="12"
+              placeholder="Maximize&#10;  3 x + 4 y&#10;Subject To&#10;  …&#10;End"></textarea>
+            <p class="writer-help">
+              <strong>How to write it</strong> —
+              <code>Maximize</code>/<code>Minimize</code> ·
+              <code>Subject To</code> ·
+              <code>Bounds</code> ·
+              <code>Binary</code>/<code>General</code> ·
+              <code>End</code>
+            </p>
+          </div>
+        </section>
+
+        <!-- LEFT/RIGHT: Optimize | Parameters -->
+        <section class="run-split" aria-label="Run">
+          <div class="run-left">
+            <p class="step-light">Run</p>
+            <button type="button" class="solve" id="btn-solve">
+              <span id="solve-label">Optimize</span>
+              <span class="solve-hint" id="solve-hint">—</span>
+            </button>
+            <div class="toggles">
+              <label class="toggle"><input type="checkbox" id="verbose" /> Show solver log</label>
+              <label class="toggle"><input type="checkbox" id="autocheck" checked /> Verify residuals</label>
+            </div>
+          </div>
+
+          <div class="run-right">
+            <p class="step-light">Options</p>
+            <div class="adv-grid">
+              <label>Engine
+                <select id="engine">
+                  <option value="simplex">simplex (continuous LP)</option>
+                  <option value="milp">milp (integers)</option>
+                  <option value="qp">qp (quadratic)</option>
+                  <option value="hpr">hpr (first-order LP)</option>
+                  <option value="pdhg">pdhg (first-order LP)</option>
+                </select>
+              </label>
+              <label>Hardware
+                <select id="backend">
+                  <option value="cpu">CPU</option>
+                  <option value="vulkan">GPU (Vulkan)</option>
+                </select>
+              </label>
+              <label>Simplex method
+                <select id="method">
+                  <option value="auto">auto</option>
+                  <option value="dual">dual</option>
+                  <option value="primal">primal</option>
+                </select>
+              </label>
+              <label>Time limit (s)
+                <input type="number" id="time_limit" value="30" min="0" max="300" />
+              </label>
+            </div>
+          </div>
+        </section>
+
+        <section class="answer idle" id="answer" aria-live="polite" aria-label="Answer">
+          <p class="step-light">Result</p>
+          <div class="answer-grid">
+            <div class="answer-main">
+              <p class="verdict" id="verdict">Waiting</p>
+              <p class="plain" id="plain">Load a model, edit if you want, then Optimize.</p>
+              <p class="obj" id="obj"></p>
+            </div>
+            <div class="answer-side">
+              <div class="meta" id="meta" hidden>
+                <span id="meta-time"></span>
+                <span id="meta-proof"></span>
+                <span id="meta-check"></span>
+              </div>
+              <button type="button" class="verify" id="btn-check" hidden>Verify again</button>
+            </div>
+          </div>
+          <pre class="log" id="log" hidden></pre>
+        </section>
       </div>
-
-      <label class="file-hit">
-        <input type="file" id="file" accept=".mps,.qps" />
-        <span>Or drop a solver file <code>.mps</code> / <code>.qps</code></span>
-      </label>
-    </section>
-
-    <section class="go" aria-label="Solve">
-      <p class="step">2 · Solve</p>
-      <button type="button" class="solve" id="btn-solve">
-        <span id="solve-label">Solve</span>
-        <span class="solve-hint" id="solve-hint">Crude blending</span>
-      </button>
-      <details class="advanced">
-        <summary>Advanced</summary>
-        <div class="adv-grid">
-          <label>Engine
-            <select id="engine">
-              <option value="simplex">simplex</option>
-              <option value="milp">milp</option>
-              <option value="qp">qp</option>
-              <option value="hpr">hpr</option>
-              <option value="pdhg">pdhg</option>
-            </select>
-          </label>
-          <label>Hardware
-            <select id="backend">
-              <option value="cpu">CPU</option>
-              <option value="vulkan">GPU (Vulkan)</option>
-            </select>
-          </label>
-          <label>Simplex method
-            <select id="method">
-              <option value="auto">auto</option>
-              <option value="dual">dual</option>
-              <option value="primal">primal</option>
-            </select>
-          </label>
-          <label>Time limit (s)
-            <input type="number" id="time_limit" value="30" min="0" max="300" />
-          </label>
-        </div>
-        <label class="toggle"><input type="checkbox" id="verbose" /> Show raw solver log</label>
-        <label class="toggle"><input type="checkbox" id="autocheck" checked /> Verify residuals after solve</label>
-      </details>
-    </section>
-
-    <section class="answer idle" id="answer" aria-live="polite" aria-label="Answer">
-      <p class="step">3 · Answer</p>
-      <p class="verdict" id="verdict">Waiting</p>
-      <p class="plain" id="plain">Pick a problem and press Solve.</p>
-      <p class="obj" id="obj"></p>
-      <div class="meta" id="meta" hidden>
-        <span id="meta-time"></span>
-        <span id="meta-proof"></span>
-        <span id="meta-check"></span>
-      </div>
-      <button type="button" class="verify" id="btn-check" hidden>Verify again</button>
-      <pre class="log" id="log" hidden></pre>
-    </section>
-
-    <p class="statusline" id="health">Starting…</p>
+    </div>
   </main>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=12"></script>
 </body>
 </html>

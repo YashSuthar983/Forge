@@ -5,7 +5,7 @@
 // Replaces the per-op KernelBackend as the FO engine's contract. The device owns
 // iterates; the host asks for work and receives scalars. There is deliberately
 // no operator[] and no host() — host addressability cannot be depended on.
-// See docs/gpu_first_order_plan.md §2.2.
+// See docs/architecture.md §3.2 (LpDevice / HPR path).
 #pragma once
 
 #include "sor/backend/device_buffer.hpp"

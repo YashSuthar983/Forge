@@ -85,6 +85,17 @@ struct SimplexOptions {
     // EITHER update representation. 0 disables it (default: unmeasured
     // against Netlib/MIPLIB, so off until it has a gate to clear).
     f64 refactor_work_ratio = 0.0;
+    // Collective FT (Huangfu & Hall 2015 Phase 2, item 2 of
+    // docs/SIH26119_PS_ALIGNMENT.md §5): when the product-form eta file hits
+    // refactor_eta_ratio, try BasisFactor::collapse_pending_into_ft() (fold
+    // the pending etas into L/U via sequential update_ft() calls, verified
+    // representation-transparent in tests/test_lu.cpp) before falling back
+    // to a full factorize(). Only applies when update_method is still
+    // ProductForm (ForrestTomlin never accumulates an eta file). The replay
+    // implementation is guarded to small bases/update batches: an unrestricted
+    // large-basis trial exceeded 10 s for work Product Form did in 0.37 s.
+    // It therefore remains opt-in and large cases safely refactor instead.
+    bool collective_ft = false;
 
     // Partial pricing was removed from both engines. It cannot pay for itself
     // here: the primal already touches every nonbasic column each iteration to
@@ -120,6 +131,8 @@ struct SimplexDiagnostics {
     std::uint64_t phase2_iterations = 0;
     std::uint64_t bound_flips       = 0;
     std::uint64_t refactorizations  = 0;
+    std::uint64_t collective_ft_collapses = 0;  // full refactors avoided via collapse_pending_into_ft()
+    std::uint64_t collective_ft_skips = 0;      // rejected by bounded-work production guard
     std::uint64_t degenerate_steps  = 0;
     std::uint64_t bland_iterations  = 0;
     std::uint64_t expand_steps      = 0;
@@ -181,12 +194,43 @@ struct SimplexDiagnostics {
     f64 largest_update_multiplier = 0.0;
 
     double scaling_ms = 0.0;
+    double csc_ms     = 0.0;
+    // Complete one-time preparation cost: minimization/scaled-model copies,
+    // Ruiz scaling, CSC conversion, augmented bounds/costs, norms and scaled
+    // feasibility tolerances. This is shared by every Auto stage.
+    double preprocessing_ms = 0.0;
     double factor_ms  = 0.0;
     double price_ms   = 0.0;
     double solve_ms   = 0.0;
+    double ftran_ms   = 0.0;
+    double btran_ms   = 0.0;
+    double pivotal_row_ms = 0.0;
+    double ratio_test_ms  = 0.0;
+    double basis_update_ms = 0.0;
+    std::uint64_t ftran_calls = 0;
+    std::uint64_t btran_calls = 0;
+    std::uint64_t basis_update_calls = 0;
     double loop_ms    = 0.0;
     double total_ms   = 0.0;
+    // One for solve_simplex()/direct primal/dual calls. Auto used to report
+    // up to four because every stage rebuilt scaling and CSC independently.
+    std::uint64_t preprocessing_builds = 0;
 };
+
+namespace detail {
+
+// Model-independent ordering for results produced by Auto's solver stages.
+// A duality gap is an optimality measure only for a primal/dual-feasible pair;
+// for interrupted infeasible iterates, actual feasibility residuals determine
+// progress. Exposed in detail solely so the dispatch invariant can be tested.
+bool prefer_simplex_candidate(const core::RawResult& candidate,
+                              const SimplexDiagnostics& candidate_diag,
+                              const core::RawResult& incumbent,
+                              const SimplexDiagnostics& incumbent_diag,
+                              const SimplexOptions& opts,
+                              bool maximize);
+
+}  // namespace detail
 
 core::RawResult solve_simplex(const model::LpProblem& problem,
                               const SimplexOptions& opts,

@@ -31,7 +31,17 @@ using core::Index;
 struct CutOptions {
     int max_rounds = 20;
     f64 min_progress_rel = 1e-4;   // stop the round loop if bound gain falls below this
-    f64 dynamism_max = 1e6;        // reject a cut whose max|coef|/min|coef| exceeds this
+    // Reject a cut whose max|coef|/min|coef| exceeds this. 1e6 (the old
+    // default) is far too permissive: on rgn.mps (MIPLIB-easy) a GMI cut
+    // with dynamism in [1e3, 1e6) made the ROOT node's post-cut LP return
+    // proposed_status=Optimal with a NaN-contaminated solution vector and a
+    // dual residual of ~28 -- relaxation_proved() correctly refused to trust
+    // it (no wrong answer reached the B&C proof), but the node then gave up
+    // immediately ("node LP unproved") instead of continuing, so the whole
+    // instance silently went from solvable (4013 nodes, Optimal) to an
+    // instant failure. Verified empirically: 1e2 fixes rgn.mps; 1e3 and
+    // above all reproduce the failure identically.
+    f64 dynamism_max = 1e2;
     f64 violation_min = 1e-4;      // reject a cut that doesn't cut off the current point by this much
     f64 frac_min = 1e-4;           // skip tableau rows whose fractional part is too close to 0/1
     int max_cuts_per_round = 200;

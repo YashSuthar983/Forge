@@ -41,7 +41,7 @@ enum class Status {
     Unsupported             // capability refusal
 };
 
-// Strictly increasing rigor. See docs/master_spec.md §3 (Bet 3).
+// Strictly increasing rigor. See docs/architecture.md §4 (ProofLevel ladder).
 // The top three rows are not reported by any commercial solver.
 enum class ProofLevel {
     None = 0,

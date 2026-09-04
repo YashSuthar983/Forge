@@ -1,7 +1,7 @@
 # Batched kernels: ONE shared sparsity pattern, N right-hand sides.
 #
 # This is the capability the whole prototype exists to explore
-# (sor/docs/architecture.md §6, sor/docs/master_spec.md §3 Bet 1). The LPs a
+# (sor/docs/architecture.md §3 — batched LpDevice seam). The LPs a
 # solver actually spends its time on -- strong-branching children, diving
 # iterations, LNS relaxations, decomposition subproblems, scenario instances --
 # differ from one another only in their bound vectors, so they share a pattern
