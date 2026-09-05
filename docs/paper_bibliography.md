@@ -288,7 +288,7 @@ LP duality / Farkas: any LP textbook — implement checker from first principles
 
 | Source | Location | Notes |
 |--------|----------|-------|
-| Markowitz + Suhl singleton tri | `sor_la_cpu/src/lu.cpp` | |
+| Markowitz + Suhl singleton tri | `src/la/src/lu.cpp` | |
 | Hypersparse FTRAN/BTRAN | `lu.cpp` | Hall–McKinnon reach sets + identity-eta skip; `test_lu` |
 | Forrest–Tomlin update | `lu.cpp` `update_ft()` | opt-in `--basis-update ft` |
 | Collective FT collapse | `lu.cpp` `collapse_pending_into_ft()` | opt-in `collective_ft` in simplex options |
@@ -297,14 +297,14 @@ LP duality / Farkas: any LP textbook — implement checker from first principles
 | Primal + dual revised simplex | `simplex.cpp`, `dual_simplex.cpp` | **92/93** Netlib ProvedOptimalFP (4 Sep 2026) |
 | BFRT | `dual_bfrt.cpp` | Koberstein/Huangfu line |
 | DSE + Devex | `dual_edge_weights.cpp` | |
-| Presolve v1 + postsolve | `sor_presolve/` | Andersen-class subset |
+| Presolve v1 + postsolve | `src/presolve/` | Andersen-class subset |
 | Vanilla PDHG | `pdhg.cpp` | KernelBackend |
 | HPR + Vulkan LpDevice | `hpr.cpp`, `vk_lp_device.cpp` | 6 SPIR-V shaders |
-| MILP root B&C | `sor_search/` | root GMI; reliability branch |
+| MILP root B&C | `src/search/` | root GMI; reliability branch |
 | AHL lattice reform (opt-in) | `lattice_reform.cpp`, `--lattice-reform` | LLL + AHL; restriction protocol (terminal→re-solve original); markshare applies, Optimal on tiny only |
 | Convex QP | `qp.cpp`, `qp_pdhcg.cpp` | |
 | Ruiz scaling | engines | |
-| MPS/QPS I/O, certify gate | `sor_io/`, `sor_certify/` | |
+| MPS/QPS I/O, certify gate | `src/io/`, `src/certify/` | |
 
 Log forbidden-repo lookups that influenced design in `reference_log.md`.
 

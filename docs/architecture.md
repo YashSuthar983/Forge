@@ -14,18 +14,18 @@ Verified against CMake targets, headers, and `compare-netlib-20260904-070105` / 
 
 | Area | State | Evidence |
 |---|---|---|
-| MPS / QPS / solution I/O | **shipped** | `sor_io/`; Netlib 93/93 parse |
+| MPS / QPS / solution I/O | **shipped** | `src/io/`; Netlib 93/93 parse |
 | Primal + dual revised simplex | **shipped** | `simplex.cpp`, `dual_simplex.cpp`; Auto dispatch |
-| Markowitz LU, hypersparse FTRAN/BTRAN | **shipped** | `sor_la_cpu/src/lu.cpp`; `test_lu` |
+| Markowitz LU, hypersparse FTRAN/BTRAN | **shipped** | `src/la/src/lu.cpp`; `test_lu` |
 | Forrest–Tomlin update | **shipped (opt-in)** | `--basis-update ft`; default is product-form; `collapse_pending_into_ft` + `collective_ft` also opt-in |
 | Harris / BFRT / Devex / DSE | **shipped** | `dual_bfrt.cpp`, `dual_edge_weights.cpp` |
-| Presolve + postsolve (v1) | **shipped** | `sor_presolve/` — Andersen-class subset |
+| Presolve + postsolve (v1) | **shipped** | `src/presolve/` — Andersen-class subset |
 | Ruiz scaling | **shipped** | shared via engines / `simplex_prepared` |
 | PDHG (vanilla) | **shipped** | `pdhg.cpp` + `KernelBackend` |
 | HPR on `LpDevice` | **shipped** | `hpr.cpp`; CPU + Vulkan |
 | Vulkan SPIR-V (6 shaders) | **shipped** | `SOR_ENABLE_VULKAN=ON` default |
 | CUDA `LpDevice` | **stub** | `make_cuda_lp_device()` → `nullptr` |
-| MILP B&B + root GMI cuts | **shipped** | `sor_search/` — root cuts only |
+| MILP B&B + root GMI cuts | **shipped** | `src/search/` — root cuts only |
 | AHL lattice reform | **opt-in** | `--lattice-reform`; exact LP-projection μ bounds + exact-equivalence direct-ship / LP-bound certification protocol; markshare1/2 apply, verified correct, 0 incumbent even at 1800s (genuinely hard search, not an implementation gap) |
 | Convex QP (+ diagonal fast path) | **shipped** | `qp.cpp`, `qp_pdhcg.cpp` |
 | `finalize_result` gate | **shipped** | sole writer of `Status::Optimal` |
@@ -242,7 +242,7 @@ sequenceDiagram
 
 ---
 
-## 4. Core types (`sor_core/include/sor/core/result.hpp`)
+## 4. Core types (`src/core/include/sor/core/result.hpp`)
 
 ### Status
 
@@ -260,17 +260,17 @@ Only `finalize_result()` may set `Optimal`, and only with sufficient proof + `ch
 
 | Concern | Header / source |
 |---|---|
-| Results / proof | `sor_core/include/sor/core/result.hpp` |
-| CSR / CSC | `sor_sparse/include/sor/sparse/{csr,csc}.hpp` |
-| Sparse LU | `sor_la_cpu/include/sor/la/lu.hpp` |
-| `KernelBackend` | `sor_backend/include/sor/backend/kernel_backend.hpp` |
-| `LpDevice` | `sor_backend/include/sor/backend/lp_device.hpp` |
-| Model | `sor_model/include/sor/model/lp.hpp` |
-| MPS/QPS | `sor_io/include/sor/io/{mps,qps,solution}.hpp` |
-| Presolve | `sor_presolve/include/sor/presolve/presolve.hpp` |
-| Engines | `sor_engines/include/sor/engines/*.hpp` |
-| Search | `sor_search/include/sor/search/{bab,cuts,propagate,lattice_reform}.hpp` |
-| Gate | `sor_certify/include/sor/certify/finalize.hpp` |
+| Results / proof | `src/core/include/sor/core/result.hpp` |
+| CSR / CSC | `src/sparse/include/sor/sparse/{csr,csc}.hpp` |
+| Sparse LU | `src/la/include/sor/la/lu.hpp` |
+| `KernelBackend` | `src/backend/include/sor/backend/kernel_backend.hpp` |
+| `LpDevice` | `src/backend/include/sor/backend/lp_device.hpp` |
+| Model | `src/model/include/sor/model/lp.hpp` |
+| MPS/QPS | `src/io/include/sor/io/{mps,qps,solution}.hpp` |
+| Presolve | `src/presolve/include/sor/presolve/presolve.hpp` |
+| Engines | `src/engines/include/sor/engines/*.hpp` |
+| Search | `src/search/include/sor/search/{bab,cuts,propagate,lattice_reform}.hpp` |
+| Gate | `src/certify/include/sor/certify/finalize.hpp` |
 
 ### Update methods (`lu.hpp`)
 

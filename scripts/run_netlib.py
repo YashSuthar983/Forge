@@ -4,7 +4,7 @@
 Reports, per instance: status, proof level, objective, primal violation, dual
 residual, relative duality gap, iterations, wall time. The headline number is
 how many instances reach Status=Optimal, which requires ProofLevel >=
-ProvedOptimalFP and therefore a basis -- see sor_certify/finalize.cpp.
+ProvedOptimalFP and therefore a basis -- see src/certify/src/finalize.cpp.
 
   python3 scripts/run_netlib.py --engine simplex --time-limit 60
 """
