@@ -3044,11 +3044,24 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     infer_implied_integers(mip);
 
     if (mip.n_integer() == 0) {
-        // Pure LP — just call simplex.
+        // Pure LP — just call simplex. The raw result carries the LP's own
+        // proposed status, but the MILP evidence machinery reads THIS diag,
+        // so it must reflect what actually happened: a certified relaxation
+        // of a tree with a single (root) node is exactly the "tree
+        // exhausted, every LP proved" case, and without these fields
+        // finalize_result would downgrade the LP's Optimal to
+        // NoSolutionFound (observed on industrial blend_lp instances fed to
+        // --engine milp). An uncertified LP stays honestly uncertified.
         engines::SimplexDiagnostics sd;
         raw = engines::solve_simplex(problem, opts.lp, sd, nullptr);
         diag.lp_solves = 1;
         diag.nodes = 1;
+        if (relaxation_proved(raw, sd, opts.lp)) {
+            diag.globally_proved = true;
+            diag.incumbent = raw.objective;
+            diag.dual_bound = raw.objective;
+            diag.gap_rel = 0.0;
+        }
         diag.total_ms = ms_since(t0);
         diag.termination_reason = "no integer columns; LP solve";
         return raw;
@@ -3087,15 +3100,12 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     // and the final dual-bound drain below must account for both -- nothing
     // is dropped, this only changes visitation ORDER.
     std::vector<Node> plunge_stack;
-    {
-        Node root;
-        root.col_lo = mip.col_lo;
-        root.col_hi = mip.col_hi;
-        root.bound = -std::numeric_limits<f64>::infinity();
-        root.depth = 0;
-        open.push(std::move(root));
-    }
-
+    // Root basis seeding (set below): when the cut loop ran, its final
+    // proved basis warm-starts the root node LP, which would otherwise
+    // re-solve the identical relaxation cold -- measured as a full ~20-28s
+    // duplicate solve on schedule_milp HUGE.
+    engines::SimplexBasis cut_loop_basis;
+    bool have_cut_loop_basis = false;
     std::uint64_t tightened_row_bounds = 0;
     model::LpProblem search_problem = mip;
     if (opts.integer_row_rounding)
@@ -3123,6 +3133,14 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         CutDiagnostics cut_diag;
         CutPool cut_pool(opts.cut);
         f64 prev_bound = core::kNaN;
+        // Warm continuation across cut rounds: cuts only ADD ROWS, so the
+        // previous round's basis extends naturally (each new row's logical
+        // basic in that row) and the dual re-optimizes from it in a handful
+        // of pivots instead of a full cold solve. Measured on
+        // schedule_milp HUGE: each cold round cost ~28s; the warm rounds
+        // are near-free. A failed warm solve falls back to the cold path.
+        engines::SimplexBasis& prior_basis = cut_loop_basis;
+        bool& have_prior = have_cut_loop_basis;
         for (int round = 0; round < opts.cut.max_rounds; ++round) {
             if (timed_out()) break;
             engines::SimplexOptions cut_lp_opts = opts.lp;
@@ -3143,12 +3161,46 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             }
             engines::SimplexDiagnostics cut_sd;
             engines::SimplexBasis cut_basis;
-            const auto cut_lp_raw = engines::solve_simplex(
-                search_problem, cut_lp_opts, cut_sd, &cut_basis);
-            ++diag.lp_solves;
+            core::RawResult cut_lp_raw;
+            bool warm_used = false;
+            if (have_prior) {
+                // Row extension: ns is unchanged and old indices are stable
+                // (apply_cuts appends rows only).
+                engines::SimplexBasis ext = prior_basis;
+                const Index ns_ = search_problem.n_cols();
+                const Index m_old =
+                    static_cast<Index>(prior_basis.basic.size());
+                const Index m_new = search_problem.n_rows();
+                if (m_new >= m_old &&
+                    static_cast<Index>(ext.status.size()) == ns_ + m_old) {
+                    ext.status.resize(sz(ns_ + m_new));
+                    for (Index i = m_old; i < m_new; ++i) {
+                        ext.basic.push_back(ns_ + i);
+                        ext.status[sz(ns_ + i)] = engines::NonbasicStatus::Basic;
+                    }
+                    cut_lp_raw = engines::solve_dual_simplex(
+                        search_problem, cut_lp_opts, cut_sd, &cut_basis, &ext);
+                    ++diag.lp_solves;
+                    warm_used = relaxation_proved(cut_lp_raw, cut_sd, cut_lp_opts);
+                }
+            }
+            if (!warm_used) {
+                if (have_prior) {
+                    // The warm dual failed to prove; redo the round cold.
+                    // (The wasted warm attempt is charged to lp_solves.)
+                    cut_sd = engines::SimplexDiagnostics{};
+                    cut_basis = engines::SimplexBasis{};
+                }
+                cut_lp_raw = engines::solve_simplex(
+                    search_problem, cut_lp_opts, cut_sd, &cut_basis);
+                ++diag.lp_solves;
+            }
             if (!relaxation_proved(cut_lp_raw, cut_sd, cut_lp_opts)) break;
             if (round == 0) diag.root_bound_before_cuts = cut_lp_raw.objective;
             diag.root_bound_after_cuts = cut_lp_raw.objective;
+            prior_basis = cut_basis;
+            have_prior = true;
+            (void)0;
 
             bool integer_ok = true;
             for (Index j = 0; j < search_problem.n_cols(); ++j) {
@@ -3184,6 +3236,35 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         diag.cut_pool_parallel_rejections = cut_diag.pool_rejected_parallel;
         diag.cut_pool_aged_out = cut_diag.pool_aged_out;
         diag.cut_pool_evicted = cut_diag.pool_evicted;
+    }
+
+    {
+        Node root;
+        root.col_lo = mip.col_lo;
+        root.col_hi = mip.col_hi;
+        root.bound = -std::numeric_limits<f64>::infinity();
+        root.depth = 0;
+        if (have_cut_loop_basis) {
+            // Extend the cut loop's final basis to search_problem's current
+            // dimensions (rows may have been added after the last solved
+            // round) and seed the root with it.
+            const Index ns_ = search_problem.n_cols();
+            const Index m_old =
+                static_cast<Index>(cut_loop_basis.basic.size());
+            const Index m_new = search_problem.n_rows();
+            if (static_cast<Index>(cut_loop_basis.status.size()) == ns_ + m_old &&
+                m_new >= m_old) {
+                cut_loop_basis.status.resize(sz(ns_ + m_new));
+                for (Index i = m_old; i < m_new; ++i) {
+                    cut_loop_basis.basic.push_back(ns_ + i);
+                    cut_loop_basis.status[sz(ns_ + i)] =
+                        engines::NonbasicStatus::Basic;
+                }
+                root.basis = std::move(cut_loop_basis);
+                root.has_basis = true;
+            }
+        }
+        open.push(std::move(root));
     }
 
     // The matrix and static model data never change during B&B. Reuse one

@@ -125,16 +125,60 @@ public:
     // all of L and U. Dense inputs take the dense path automatically.
     void ftran(std::vector<f64>& b) const;
 
+    // Same solve, additionally returning an over-approximation of the
+    // nonzero support of the slot-indexed result when the final U solve
+    // stayed hypersparse (U-reach plus eta-touched positions; entries may
+    // be zero, so downstream loops still guard on the value). Returns false
+    // (and clears `support`) when the dense path was selected. PARTIAL-WRITE
+    // contract in the sparse case: only the reach slots of b are written
+    // (values bit-identical to ftran()'s); everything else is left STALE.
+    // Valid only for callers that reset the previous support (and their
+    // scatter rows) before the next call -- the dual engine's alpha
+    // discipline maintains exactly that.
+    bool ftran_with_support(std::vector<f64>& b,
+                            std::vector<Index>& support) const;
+
+    // Seeded FTRAN: `seed_rows` is an over-approximation of b's nonzero ROW
+    // positions (the caller's scatter support; duplicates and zeros are
+    // fine). Valid only under the caller's reset-by-previous-support
+    // discipline, which leaves b zero outside (previous support ∪ seed) --
+    // that is what makes the classic fallback path (a full read of b) see
+    // the same vector. Skips the O(n) permute/seed scan via the row->pivot
+    // inverse and collects the U seed from the L-reach only. Values are
+    // bit-identical to ftran_with_support's (the sparse kernels do the same
+    // arithmetic on the same factors); any fallback (empty/oversized seed,
+    // non-pivot row, dense gates, or a sparse-U failure after a seeded L)
+    // re-runs the classic fully-scanning path, which is valid because the
+    // reset guarantees the input is zero outside the declared seed.
+    bool ftran_seeded_with_support(std::vector<f64>& b,
+                                   const std::vector<Index>& seed_rows,
+                                   std::vector<Index>& support) const;
 
     // d (indexed by basis slot) <- B^-T d (indexed by row). Size m.
     void btran(std::vector<f64>& d) const;
 
-    // Same solve, additionally returning the exact nonzero support of the
-    // row-indexed result when the final L' solve stayed hypersparse. Returns
-    // false (and clears `support`) when the dense path was selected. This lets
-    // dual simplex form rho'A without rescanning all m rows after BTRAN.
+    // Same solve, additionally returning the nonzero support of the
+    // row-indexed result when the final L' solve stayed hypersparse.
+    // Returns false (and clears `support`) when the dense path was selected.
+    // This lets the dual form rho'A without rescanning all m rows after
+    // BTRAN. PARTIAL-WRITE contract (sparse case): only the reach rows of d
+    // are written (values bit-identical); the caller MUST zero the previous
+    // support AND the previous input seed slot before the next call -- see
+    // the dual engine's rho discipline.
     bool btran_with_support(std::vector<f64>& d,
                             std::vector<Index>& support) const;
+
+    // Seeded BTRAN: `seed_slots` is an over-approximation of d's nonzero
+    // SLOT positions at entry (the dual's rho is exactly e_leave). The eta
+    // firing-set uses it as the input seed directly (skipping the O(m)
+    // nonzero scan) and the post-eta permute becomes
+    // O(|seeds ∪ fired eta pivots|) via the cpos_ slot->pivot inverse. Callers
+    // must satisfy the partial-write reset contract above (previous support
+    // ∪ previous input seed slot). Same fallback and bit-identity
+    // properties as the seeded FTRAN.
+    bool btran_seeded_with_support(std::vector<f64>& d,
+                                   const std::vector<Index>& seed_slots,
+                                   std::vector<Index>& support) const;
 
     // Record that basis slot p has been replaced by a column whose image under
     // the PRE-update basis is `alpha` (i.e. alpha = B^-1 a_q, the FTRAN result
@@ -218,7 +262,12 @@ private:
     bool sparse_upper_t(const std::vector<Index>& seed, std::vector<f64>& v) const;
     bool sparse_lower_t(const std::vector<Index>& seed, std::vector<f64>& v) const;
 
-    bool btran_impl(std::vector<f64>& d, std::vector<Index>* support) const;
+    // seed_rows / seed_slots: caller-declared INPUT nonzero positions, or
+    // null for the classic self-scanning path.
+    bool ftran_impl(std::vector<f64>& b, std::vector<Index>* support,
+                    const std::vector<Index>* seed_rows) const;
+    bool btran_impl(std::vector<f64>& d, std::vector<Index>* support,
+                    const std::vector<Index>* seed_slots) const;
 
     void build_col_patterns();
 
@@ -268,6 +317,10 @@ private:
     std::vector<Index> piv_row_, piv_slot_;
     std::vector<f64>   piv_val_;
     std::vector<Index> rpos_, cpos_;
+    // Same inverses with -1 for unmapped positions, so the seeded solves can
+    // detect a caller seed position that carries no pivot (vacant-row states
+    // between a truncated factorization and its repair) and fall back to the
+    // classic fully-scanning path.
 
     // U off-diagonals + diagonal storage. Row k lives at
     // [u_off_[k], u_off_[k] + u_len_[k]) in u_idx_/u_val_, indices in pivot
@@ -309,6 +362,40 @@ private:
     mutable std::vector<f64> work_;   // scratch, size m
     mutable std::vector<char> mark_;                // DFS marks, size n
     mutable std::vector<Index> dfs_stack_, reach_, order_, seed_;  // DFS scratch
+    // Slot-space support stamps for ftran_with_support's partial-write eta
+    // loop (O(1) "is this slot in the current support" tests; a fresh
+    // generation per call).
+    mutable std::vector<std::uint32_t> support_stamp_;  // size m (slot space)
+    mutable std::uint32_t support_gen_ = 0;
+    // Reverse eta incidence for btran's firing-set path: rev_[i] lists the
+    // etas that READ slot i (their pivot position p_t == i or i is in their
+    // slice). Maintained by update() (append), factorize() and
+    // collapse_pending_into_ft() (clear). Lets btran_impl process only the
+    // etas that can fire on a sparse input instead of scanning every eta
+    // slice unconditionally — output is bit-identical because a skipped eta
+    // is an exact no-op (all its reads are zero).
+    std::vector<std::vector<Index>> rev_;  // size m (slot space)
+    // Firing-set worklist membership stamps for btran_impl (fresh generation
+    // per call; indexed by eta number).
+    mutable std::vector<std::uint32_t> fire_stamp_;
+    mutable std::uint32_t fire_gen_ = 0;
+    // Reusable buffers for btran_impl's firing set. These were fresh
+    // std::vectors per call, i.e. two heap allocations on every BTRAN (50k+
+    // per HUGE solve).
+    mutable std::vector<Index> fire_input_seed_;
+    mutable std::vector<Index> fire_heap_;
+    // Slots written by the firing-set eta pass. The seeded BTRAN permute needs
+    // these on top of the caller's declared input seed, because a fired eta
+    // writes its pivot slot and that slot then feeds the U' solve.
+    mutable std::vector<Index> fire_touched_;
+    // Seeded-solve bookkeeping. The classic permute overwrites every entry of
+    // work_, so it can be read blind; a SEEDED permute writes only the seeded
+    // pivot positions and therefore requires work_ to be zero everywhere else.
+    // work_dirty_ lists the pivot positions written since the last clear, and
+    // work_all_dirty_ records that a dense/classic pass wrote all of work_ (so
+    // the next seeded call must pay one full clear before it can trust it).
+    mutable std::vector<Index> work_dirty_;
+    mutable bool work_all_dirty_ = true;
     Index dense_below_ = 0;          // reach larger than this -> dense solve
     LuStats stats_{};
 };

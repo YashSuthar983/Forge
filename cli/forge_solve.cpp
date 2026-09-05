@@ -475,6 +475,17 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(diag.collective_ft_collapses),
                         static_cast<unsigned long long>(diag.collective_ft_skips));
             std::printf("  simplex loop     %10.3f\n", diag.loop_ms);
+            std::printf("  flip batches     %10.3f  (%llu batches)\n", diag.flip_ms,
+                        static_cast<unsigned long long>(diag.flip_batches));
+            std::printf("  apply_pivot      %10.3f\n", diag.pivot_apply_ms);
+            std::printf("  alpha sparse     %llu / %llu iters, avg support %llu\n",
+                        static_cast<unsigned long long>(diag.alpha_sparse_iters),
+                        static_cast<unsigned long long>(
+                            diag.alpha_sparse_iters + diag.alpha_dense_iters),
+                        static_cast<unsigned long long>(
+                            diag.alpha_sparse_iters
+                                ? diag.alpha_support_entries / diag.alpha_sparse_iters
+                                : 0));
             std::printf("  auto stages/builds %8llu / %llu\n",
                         static_cast<unsigned long long>(diag.stages),
                         static_cast<unsigned long long>(diag.preprocessing_builds));

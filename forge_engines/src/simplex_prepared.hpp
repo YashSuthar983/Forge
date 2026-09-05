@@ -33,7 +33,8 @@ SimplexPrepared prepare_simplex_model(const model::LpProblem& problem,
 
 core::RawResult solve_primal_simplex_prepared(
     const SimplexPrepared& prepared, const SimplexOptions& opts,
-    SimplexDiagnostics& diag, SimplexBasis* out_basis);
+    SimplexDiagnostics& diag, SimplexBasis* out_basis,
+    const SimplexBasis* warm = nullptr);
 
 core::RawResult solve_dual_simplex_prepared(
     const SimplexPrepared& prepared, const SimplexOptions& opts,

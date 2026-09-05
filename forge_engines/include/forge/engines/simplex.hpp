@@ -211,6 +211,18 @@ struct SimplexDiagnostics {
     double pivotal_row_ms = 0.0;
     double ratio_test_ms  = 0.0;
     double basis_update_ms = 0.0;
+    // Dual hypersparse-support diagnostics (ftran_with_support path):
+    // sparse_iters counts iterations whose entering-column FTRAN returned a
+    // support; support_entries accumulates |support| so the average density
+    // is measurable; flip_batches times apply_flip_shift (untimed O(m)
+    // fill+add historically hidden inside the loop); pivot_apply_ms times
+    // apply_pivot itself (status swap, weight updates, xB shift).
+    std::uint64_t alpha_sparse_iters = 0;
+    std::uint64_t alpha_dense_iters  = 0;
+    std::uint64_t alpha_support_entries = 0;
+    std::uint64_t flip_batches = 0;
+    double flip_ms = 0.0;
+    double pivot_apply_ms = 0.0;
     std::uint64_t ftran_calls = 0;
     std::uint64_t btran_calls = 0;
     std::uint64_t basis_update_calls = 0;
