@@ -1,180 +1,154 @@
-# SIH26119 — Presentable demo (CLI + thin web) for the video
+# SIH26119 — Demo video (CLI + web)
 
-**PS rule (do not fight this):**  
-> “A robust optimization engine with a basic application programming interface (API) or command-line interface is sufficient; **a polished graphical user interface is not required**.”  
-> Emphasis is on the **solver core**, not modelling tools.
+**Build for this demo:** `sor/build` with **cpu + vulkan**.  
+Other backends (if any) stay off-camera — do not discuss them in the video.
 
-**What that means for us**
-
-| Do | Do not |
-|---|---|
-| Film **CLI** as the primary product interface | Claim we built a modelling language / Aspen alternative |
-| Add a **thin web console** that shells out to `sor_solve` / `sor_check` / `sor_gen` | Make the web UI the story (“look at our dashboard”) |
-| Show engine: LP / MILP / QP, proofs, HiGHS compare, industrial cases | Fake Optimal, hide Feasible as Optimal, claim GPU always wins |
-| Say “demo UI over our sovereign engine” | Say “polished GUI product” |
-
-Web is **optional packaging for the video**. CLI alone already satisfies the PS.
+**Product line:** CLI is the interface; web is a thin console over the same binaries.
 
 ---
 
-## 1. What you can film **today** (already built)
-
-Binaries: `build-native/sor_solve`, `sor_check`, `sor_gen`  
-Examples: `examples/crude_blending/blend_s42.mps`, `examples/scheduling/schedule_s42.mps`, `examples/dispatch/dispatch_s42.qps`
-
-| Beat | Command | What the viewer sees |
-|---|---|---|
-| Generate industrial case | `./sor_gen all --seed 42 --outdir examples/` | Refinery-shaped public instances |
-| Crude blending **LP** | `./sor_solve examples/crude_blending/blend_s42.mps --engine simplex --solution-out /tmp/blend.sol` | `Optimal` + proof level + objective |
-| Independent check | `./sor_check examples/crude_blending/blend_s42.mps /tmp/blend.sol` | PASS residuals (sovereignty / honesty) |
-| Power dispatch **QP** | `./sor_solve examples/dispatch/dispatch_s42.qps --engine qp` | QP path |
-| Schedule **MILP** | `./sor_solve examples/scheduling/schedule_s42.mps --engine milp --time-limit 30 --verbose` | Nodes / incumbent / Feasible or Optimal |
-| GPU FO (if Vulkan works) | `./sor_solve examples/sparse500.mps --engine hpr --backend vulkan` | Backend + transfer table |
-| Netlib credibility | One small Netlib MPS + flash `compare-netlib-20260904-070105` summary | SOR 92/93 ProvedOptimalFP · SGM 2.30× vs HiGHS |
-| Clean-room | `ldd build-native/sor_solve` | No HiGHS/SCIP/CBC linked |
-
-That is already a **complete PS-aligned video** without any web.
-
----
-
-## 2. Recommended presentable surface: **CLI + thin web console**
-
-### Product story (one sentence for the video)
-
-> SOR is a from-scratch LP / MILP / QP engine. The CLI is the product interface; this web page is a demo console that runs the same binaries.
-
-### Thin web — what to build (1–2 days max)
-
-A single-page app that **does not** reimplement the solver:
-
-```text
-Browser
-  → small FastAPI / Flask / Node server
-      → subprocess: sor_gen | sor_solve | sor_check
-  ← JSON: status, proof, objective, time, log tail
-```
-
-**Screens (keep to 3):**
-
-1. **Solve** — pick preset (Blend LP / Schedule MILP / Dispatch QP / Upload MPS) → Run → status / proof / objective / wall time  
-2. **Verify** — after solve, one-click `sor_check` → pass/fail residuals  
-3. **Compare** (optional) — show precomputed HiGHS row for the same preset (external process; never claim in-process)
-
-**Do not build:** modelling canvas, drag-drop constraints, full MIPLIB browser, fancy charts of 50 metrics. That fights the PS.
-
-**Stack suggestion (fastest):**
-
-- Backend: Python FastAPI, `asyncio.create_subprocess_exec` on `sor_solve`  
-- Frontend: one HTML + vanilla JS or minimal React  
-- Auth: none (localhost demo)  
-- Timeout: kill subprocess at 60s so the video never hangs  
-
----
-
-## 3. Video script (3–4 minutes)
-
-| Time | Shot | Narration / action |
-|---|---|---|
-| 0:00–0:20 | Title card | SIH26119 · SOR · sovereign LP/MILP/QP engine · MRPL / Smart Automation |
-| 0:20–0:45 | Problem | India depends on CPLEX / Gurobi / Xpress; we need an inspectable engine, not another GUI |
-| 0:45–1:15 | Architecture one slide | From-scratch · simplex + B&C + QP · GPU where measured · `finalize_result` + `sor_check` |
-| 1:15–1:45 | **CLI live** | Blend LP → Optimal; `sor_check` PASS |
-| 1:45–2:15 | **CLI live** | Dispatch QP → Optimal; Schedule MILP → incumbent / gap (say Feasible honestly if not proved) |
-| 2:15–2:45 | **Web console** (optional) | Same Blend run from browser — “demo UI calling the same engine” |
-| 2:45–3:15 | Benchmarks | Netlib **92/93** `ProvedOptimalFP`, SGM **0.2085 vs 0.0905** HiGHS; industrial blend ladder (SOR faster at large nnz) |
-| 3:15–3:35 | GPU / clean-room | Vulkan HPR transfer line **or** `ldd` showing no solver libs |
-| 3:35–4:00 | Close | Extensible foundation; MIQP/NLP roadmap; GitHub + CLI |
-
-**Cut if short on time:** drop web; keep CLI + table + `sor_check`. That still fully matches the PS.
-
----
-
-## 4. Preset pack for demos (always use these)
-
-| Preset | File | Engine | Expect |
-|---|---|---|---|
-| A — Blend | `examples/crude_blending/blend_s42.mps` | `simplex` | Optimal, fast |
-| B — Dispatch | `examples/dispatch/dispatch_s42.qps` | `qp` | Optimal, fast |
-| C — Schedule | `examples/scheduling/schedule_s42.mps` | `milp` | Feasible or Optimal; use `--time-limit 30` |
-| D — Netlib small | e.g. `afiro` / `adlittle` | `simplex` | Optimal, matches HiGHS |
-| E — Sparse FO | `examples/sparse500.mps` | `hpr` + `cpu` or `vulkan` | Feasible / residuals; show timing |
-
-Avoid filming huge schedule MILP that times out ugly unless you narrate “incumbent under time limit.”
-
----
-
-## 5. PS checklist — what the video must prove
-
-| PS demand | How we show it in the video |
-|---|---|
-| LP + MILP + QP | Presets A, C, B |
-| From scratch | `ldd` / spoken “no HiGHS linked” |
-| Sparse / robust engine | Simplex on blend + Netlib; mention Harris / LU |
-| CLI or API | Live `sor_solve` |
-| Benchmarks vs ≥1 solver | Netlib / MIPLIB table vs HiGHS |
-| Industrial scope | `sor_gen` blend / schedule / dispatch |
-| GPU where measurable | One Vulkan (or honest “CPU FO today; GPU seam ready”) |
-| Not polished GUI | Say once: “CLI is enough per PS; web is demo only” |
-| Modular later MIQP/NLP | One roadmap line — do not demo unfinished NLP as production |
-
----
-
-## 6. Build order for “presentable” this week
-
-### Must (film without these and you look incomplete)
-
-1. Freeze 5 preset commands in a `demo.sh` that always works  
-2. Re-run Netlib + one MIPLIB-easy table the morning of recording  
-3. Practice narration for Feasible vs Optimal  
-4. Record CLI-only cut as the safe master  
-
-### Should (makes web + video nicer)
-
-5. Thin FastAPI + one HTML page (upload MPS optional)  
-6. Show `sor_check` as a button after every solve  
-7. Side panel: status · proof · objective · ms · engine · backend  
-
-### Skip for SIH video
-
-- Full modelling UI  
-- Login / cloud multi-tenant  
-- Live Mittelmann leaderboard  
-- Claiming NLP/MINLP as solved  
-
----
-
-## 7. Suggested `demo.sh` (CLI film track)
+## Quick start
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="${ROOT}/build-native"
-EX="${ROOT}/examples"
+cd /home/yash/Desktop/Sih/sor
 
-echo "=== 1. Blend LP ==="
-"$BIN/sor_solve" "$EX/crude_blending/blend_s42.mps" --engine simplex \
-  --solution-out /tmp/sor_blend.sol
-"$BIN/sor_check" "$EX/crude_blending/blend_s42.mps" /tmp/sor_blend.sol
+# CLI film track (writes demo_out/*.sol + *.log)
+chmod +x scripts/demo.sh
+./scripts/demo.sh all
 
-echo "=== 2. Dispatch QP ==="
-"$BIN/sor_solve" "$EX/dispatch/dispatch_s42.qps" --engine qp
-
-echo "=== 3. Schedule MILP ==="
-"$BIN/sor_solve" "$EX/scheduling/schedule_s42.mps" --engine milp --time-limit 30
-
-echo "=== 4. First-order (CPU) ==="
-"$BIN/sor_solve" "$EX/sparse500.mps" --engine hpr --backend cpu --max-iter 50000
-
-# Optional GPU:
-# "$BIN/sor_solve" "$EX/sparse500.mps" --engine hpr --backend vulkan --max-iter 50000
-
-echo "=== 5. Clean-room ==="
-ldd "$BIN/sor_solve" | head
+# Web console
+./web/run.sh
+# → http://127.0.0.1:8765
 ```
+
+| Surface | How to launch | What judges see |
+|---------|---------------|-----------------|
+| **CLI** | `./scripts/demo.sh all` | Terminal I/O, proofs, `sor_check`, `ldd` |
+| **Python API** | `python3 scripts/sor_repl.py` | `solve()` / `check()` |
+| **Web** | `./web/run.sh` | Same engines via model list + options |
 
 ---
 
-## 8. One-line verdict
+## Inputs / options / outputs
 
-**PS wants the engine.** Film **CLI + checker + industrial presets + HiGHS table**. Add a **thin web console** only as a second camera angle that calls the same binaries — never as the main claim.
+### Engines & backends (this demo)
+
+| | Values |
+|--|--------|
+| `--engine` | `simplex` · `milp` · `qp` · `hpr` · `pdhg` |
+| `--backend` | `cpu` · `vulkan` |
+| `--method` | `auto` · `primal` · `dual` (simplex / milp) |
+| Other | `--time-limit` · `--max-iter` · `--tol` · `--verbose` · `--solution-out` |
+
+### Presets
+
+| ID | File | Engine | Backend | Expect on camera |
+|----|------|--------|---------|------------------|
+| **blend** | `examples/crude_blending/blend_s42.mps` | simplex | cpu | `Optimal` · `ProvedOptimalFP` |
+| **dispatch** | `examples/dispatch/dispatch_s42.qps` | qp | cpu | `Optimal` · `ProvedKKT` |
+| **schedule** | `examples/scheduling/schedule_s42.mps` | milp | cpu | `Optimal` (or Feasible — say it honestly) |
+| **hpr_cpu** | `examples/sparse500.mps` | hpr | cpu | Feasible / limit — **not** proved Optimal |
+| **hpr_vulkan** | `examples/sparse500.mps` | hpr | vulkan | Feasible + **host↔device** timing lines |
+
+### Output artifacts (`demo_out/`)
+
+| File | From |
+|------|------|
+| `blend.sol` / `blend.log` | CLI blend |
+| `check.log` | `sor_check` |
+| `dispatch.sol` / `.log` | QP |
+| `schedule.sol` / `.log` | MILP |
+| `hpr_cpu.sol` / `hpr_vulkan.sol` | FO |
+| `web_*.sol` | Web solves |
+| `ldd.txt` | Clean-room |
+
+**Stdout fields to zoom on:** `status` · `proof_level` · `objective` · `timing (ms)` · for HPR Vulkan also `host->device` / `device->host`.
+
+---
+
+## Video script (~3:30)
+
+| Time | Shot | Action / say |
+|------|------|----------------|
+| 0:00–0:20 | Title | SIH26119 · SOR · Point Blank · sovereign LP/MILP/QP |
+| 0:20–0:40 | Problem | Closed foreign solvers; we need an inspectable engine |
+| 0:40–1:00 | Architecture slide | Simplex proofs · B&C · QP · Vulkan HPR · `finalize_result` + `sor_check` |
+| 1:00–1:35 | **CLI blend** | `./scripts/demo.sh blend` → Optimal · ProvedOptimalFP |
+| 1:35–1:55 | **CLI check** | `./scripts/demo.sh check` → **VERIFIED** |
+| 1:55–2:20 | **CLI qp + milp** | `./scripts/demo.sh qp` then `milp` |
+| 2:20–2:50 | **Web** | Open `http://127.0.0.1:8765` · preset Blend · Solve · Verify |
+| 2:50–3:15 | **Vulkan HPR** | Web or CLI `hpr-vulkan` · show transfer lines · “FO ≈ Feasible, simplex proves Optimal” |
+| 3:15–3:30 | Clean-room + close | `./scripts/demo.sh cleanroom` · GitHub · “CLI is the product” |
+
+**If short:** drop web; keep CLI blend → check → qp → milp → cleanroom.
+
+---
+
+## CLI cheat sheet (film-ready)
+
+```bash
+# 1 Blend LP
+./build/sor_solve examples/crude_blending/blend_s42.mps \
+  --engine simplex --method auto \
+  --solution-out demo_out/blend.sol
+
+# 2 Independent verify
+./build/sor_check examples/crude_blending/blend_s42.mps demo_out/blend.sol
+
+# 3 Dispatch QP
+./build/sor_solve examples/dispatch/dispatch_s42.qps \
+  --engine qp --solution-out demo_out/dispatch.sol
+
+# 4 Schedule MILP
+./build/sor_solve examples/scheduling/schedule_s42.mps \
+  --engine milp --time-limit 30 --verbose \
+  --solution-out demo_out/schedule.sol
+
+# 5 Vulkan HPR (GPU FO)
+./build/sor_solve examples/sparse500.mps \
+  --engine hpr --backend vulkan --max-iter 50000 --time-limit 30 \
+  --solution-out demo_out/hpr_vulkan.sol
+
+# 6 Clean-room
+ldd ./build/sor_solve | head
+```
+
+Or one shot: `./scripts/demo.sh all`
+
+---
+
+## Web UI — what to click
+
+1. Preset **Blend LP** → **Solve** → read Status / Proof / Objective  
+2. **Verify with sor_check** → VERIFIED  
+3. Preset **Dispatch QP** → Solve  
+4. Preset **Schedule MILP** → Solve (time limit 30)  
+5. Preset **HPR (Vulkan GPU)** → Solve → scroll to transfer timing  
+6. Optional: paste MPS text → Solve  
+
+Options panel mirrors CLI: engine, backend (`cpu`/`vulkan`), method, time limit, max iter, tol, verbose.
+
+---
+
+## Narration rules
+
+| Do | Do not |
+|----|--------|
+| Say Feasible vs Optimal correctly | Call HPR “proved Optimal” |
+| Say web calls the same CLI binaries | Sell a polished modelling GUI |
+| Show Vulkan transfer-inclusive time | Claim GPU always faster |
+| Show `ldd` clean of foreign solvers | Compare live to CPLEX/Gurobi as “we beat them” |
+
+---
+
+## PS checklist (video must hit)
+
+| Demand | Beat |
+|--------|------|
+| LP + MILP + QP | blend · schedule · dispatch |
+| From scratch | `ldd` / spoken |
+| CLI | `demo.sh` |
+| Checker | `sor_check` VERIFIED |
+| Industrial | `sor_gen` / blend·schedule·dispatch presets |
+| GPU where measurable | HPR + vulkan + transfer lines |
+| Not polished GUI | one line: “CLI is enough; web is demo only” |

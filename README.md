@@ -13,6 +13,10 @@ ctest --test-dir build --output-on-failure
 ./build/sor_solve path/to/model.mps --engine simplex --solution-out out.sol
 ./build/sor_check path/to/model.mps out.sol
 ./build/sor_gen all --seed 42 --outdir examples/
+
+# Python API / REPL (same binaries)
+python3 scripts/sor_repl.py
+python3 scripts/sor_repl.py --one-shot
 ```
 
 | Flag | Values |
