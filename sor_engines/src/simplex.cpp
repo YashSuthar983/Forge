@@ -448,7 +448,8 @@ SimplexPrepared prepare_simplex_model(const model::LpProblem& problem,
 
 core::RawResult solve_primal_simplex_prepared(
     const SimplexPrepared& prepared, const SimplexOptions& opts,
-    SimplexDiagnostics& diag, SimplexBasis* out_basis) {
+    SimplexDiagnostics& diag, SimplexBasis* out_basis,
+    const SimplexBasis* warm) {
     const auto t_all = Clock::now();
     const bool time_detail = opts.verbose;   // see the note on clock cost below
     Clock::time_point t_part{};
@@ -520,11 +521,67 @@ core::RawResult solve_primal_simplex_prepared(
     };
 
     // Cold start: all logicals basic, so B = -I and the LU peels it in O(m).
-    for (Index j = 0; j < ns; ++j) park(j);
-    for (Index i = 0; i < m; ++i) {
-        basis[sz(i)] = ns + i;
-        slot_of[sz(ns + i)] = i;
-        st[sz(ns + i)] = NonbasicStatus::Basic;
+    // Warm start: a basis exported by the dual engine on the SAME prepared
+    // model (e.g. a dual that died mid-phase-1 in a dispatcher fallback).
+    // The statuses and basic set are installed directly; values are re-parked
+    // at their status bound, and the existing machinery takes over --
+    // do_factorize() repairs a singular basis and drops to phase 1 when the
+    // basis is primal-infeasible, which is exactly the state a failed dual
+    // leaves behind. This converts a dispatcher fallback from a cold restart
+    // into a continuation (schedule_milp HUGE: the dual's 50k iterations of
+    // basis progress are kept instead of discarded).
+    bool warm_installed = false;
+    if (warm != nullptr && warm->basic.size() == sz(m) &&
+        warm->status.size() == sz(nt)) {
+        warm_installed = true;
+        std::vector<char> seen(sz(nt), 0);
+        for (Index s = 0; s < m; ++s) {
+            const Index j = warm->basic[sz(s)];
+            if (j < 0 || j >= nt || seen[sz(j)]) { warm_installed = false; break; }
+            seen[sz(j)] = 1;
+        }
+        if (warm_installed) {
+            for (Index j = 0; j < nt; ++j) park(j);   // safe defaults first
+            for (Index s = 0; s < m; ++s) {
+                const Index j = warm->basic[sz(s)];
+                basis[sz(s)] = j;
+                slot_of[sz(j)] = s;
+                st[sz(j)] = NonbasicStatus::Basic;
+            }
+            for (Index j = 0; j < nt; ++j) {
+                if (st[sz(j)] == NonbasicStatus::Basic) continue;
+                switch (warm->status[sz(j)]) {
+                    case NonbasicStatus::AtLower:
+                        if (lo[sz(j)] > -kInf) {
+                            st[sz(j)] = NonbasicStatus::AtLower;
+                            value[sz(j)] = lo[sz(j)];
+                        }
+                        break;
+                    case NonbasicStatus::AtUpper:
+                        if (hi[sz(j)] < kInf) {
+                            st[sz(j)] = NonbasicStatus::AtUpper;
+                            value[sz(j)] = hi[sz(j)];
+                        }
+                        break;
+                    case NonbasicStatus::AtZeroFree:
+                        st[sz(j)] = NonbasicStatus::AtZeroFree;
+                        value[sz(j)] = 0.0;
+                        break;
+                    default:
+                        break;   // keep the parked default
+                }
+            }
+            if (opts.verbose)
+                std::printf("  [primal] warm start from dual basis\n");
+        }
+    }
+    if (!warm_installed) {
+        for (Index j = 0; j < ns; ++j) park(j);
+        for (Index i = 0; i < m; ++i) {
+            basis[sz(i)] = ns + i;
+            slot_of[sz(ns + i)] = i;
+            st[sz(ns + i)] = NonbasicStatus::Basic;
+        }
     }
 
     std::vector<Index> nonbasic;
@@ -550,6 +607,7 @@ core::RawResult solve_primal_simplex_prepared(
         nonbasic.pop_back();
         nonbasic_pos[sz(j)] = -1;
     };
+
 
     // ---- 5. factorization ------------------------------------------------
     BasisFactor factor;
@@ -582,6 +640,59 @@ core::RawResult solve_primal_simplex_prepared(
     // first. That guard is what makes maintaining d[] safe rather than a way to
     // report a wrong Optimal.
     std::vector<f64>  redcost(sz(nt), 0.0);
+
+    f64 dtol_scale = 1.0;
+    // ---- entering-column candidate list ----------------------------------
+    // The full scan visited every nonbasic column each iteration to find the
+    // argmax improving column. Membership ("the eligibility test passes")
+    // changes only when a column's reduced cost or status changes, and both
+    // change only on the sparse pivotal-row update, on apply_pivot's two
+    // columns, and on full rebuilds -- so the candidate set is maintained
+    // exactly by those hooks and selection iterates O(candidates) instead of
+    // O(nt). Selection recomputes each member's score from the CURRENT
+    // redcost with the full scan's arithmetic, and ties break toward the
+    // SMALLEST nonbasic-list position (the full scan picks the first max in
+    // list order), so the chosen column is bit-identical to the full scan's.
+    std::vector<Index> cand_list;
+    std::vector<Index> cand_pos(sz(nt), -1);
+    bool cand_all_dirty = true;   // first rebuild happens with the first d rebuild
+    const auto cand_add = [&](Index j) {
+        if (j < 0 || j >= nt || cand_pos[sz(j)] >= 0) return;
+        cand_pos[sz(j)] = static_cast<Index>(cand_list.size());
+        cand_list.push_back(j);
+    };
+    const auto cand_remove = [&](Index j) {
+        if (j < 0 || j >= nt) return;
+        const Index pos = cand_pos[sz(j)];
+        if (pos < 0) return;
+        const Index last = cand_list.back();
+        cand_list[sz(pos)] = last;
+        cand_pos[sz(last)] = pos;
+        cand_list.pop_back();
+        cand_pos[sz(j)] = -1;
+    };
+    const auto cand_eligible = [&](Index j) -> bool {
+        if (st[sz(j)] == NonbasicStatus::Basic) return false;
+        if (lo[sz(j)] == hi[sz(j)]) return false;
+        const f64 dj = redcost[sz(j)];
+        const f64 tj = dtol[sz(j)] * dtol_scale;
+        switch (st[sz(j)]) {
+            case NonbasicStatus::AtLower:   return dj < -tj;
+            case NonbasicStatus::AtUpper:   return dj > tj;
+            case NonbasicStatus::AtZeroFree: return std::fabs(dj) > tj;
+            default:                        return false;
+        }
+    };
+    const auto refresh_cand = [&](Index j) {
+        if (cand_eligible(j)) cand_add(j);
+        else                  cand_remove(j);
+    };
+    const auto rebuild_candidates = [&]() {
+        cand_list.clear();
+        std::fill(cand_pos.begin(), cand_pos.end(), -1);
+        for (const Index j : nonbasic)
+            if (cand_eligible(j)) cand_add(j);
+    };
     std::vector<f64>  prow(sz(nt), 0.0);      // dense accumulator for alpha_r
     std::vector<char> prow_used(sz(nt), 0);
     std::vector<Index> prow_idx;              // support of alpha_r
@@ -884,13 +995,21 @@ core::RawResult solve_primal_simplex_prepared(
     core::Status status = core::Status::NotSolved;
     std::string reason;
     int since_refactor = 0;
-    int polish_reprices = 0;
-    // Cleanup escalation: dtol is divided by this factor when the final basis
-    // is feasible and dual-clean but the duality gap still exceeds gap_tol --
-    // the signature of marginal columns whose |d| sits just under tolerance.
-    f64 dtol_scale = 1.0;
+     int polish_reprices = 0;
+     // Cleanup escalation: dtol is divided by this factor when the final basis
+     // is feasible and dual-clean but the duality gap still exceeds gap_tol --
+     // the signature of marginal columns whose |d| sits just under tolerance.
+     // dtol_scale hoisted to the state section (the candidate-list machinery
+     // reads it); mutated only at the gap-cleanup escalation below.
+     // (declaration moved; see state section)
 
-    const auto t_loop = Clock::now();
+     // Debug/profiling (P2 trace-diff): SOR_PRIMAL_TRACE=<file> dumps one
+     // line per committed pivot. Opened once; closed at loop exit.
+     std::FILE* trace_fp = nullptr;
+     if (const char* tp = std::getenv("SOR_PRIMAL_TRACE"))
+         trace_fp = std::fopen(tp, "w");
+
+     const auto t_loop = Clock::now();
     for (;;) {
         if (iter >= max_iter) {
             status = core::Status::Interrupted;
@@ -960,17 +1079,41 @@ core::RawResult solve_primal_simplex_prepared(
                 redcost[sz(ns + i)] = (ph2 ? cost[sz(ns + i)] : 0.0) + y[sz(i)];
             if (time_detail) diag.price_ms += ms_since(t_part);
             d_valid = true;
+            rebuild_candidates();
             ++diag.dual_rebuilds;
         }
 
-        // ---- entering variable: a scalar scan over the maintained d[] ------
+        // ---- entering variable: argmax over the candidate list --------------
+        // Same arithmetic and tie semantics as the former full scan over
+        // `nonbasic`; ties resolve toward the smallest nonbasic-list position
+        // (the scan picked the first max in list order). Stale members (a
+        // status/reduced cost changed without a refresh yet) are skipped by
+        // the dir == 0 guard, exactly as the full scan skipped them.
         ++diag.pricing_calls;
         if (time_detail) t_part = Clock::now();
+        if (cand_all_dirty) {
+            rebuild_candidates();
+            cand_all_dirty = false;
+        }
+        // Debug/profiling hook (P2 trace-diff): SOR_PRIMAL_FULLSCAN forces the
+        // original O(nt) scan; SOR_PRIMAL_TRACE=<file> dumps one line per
+        // committed pivot. Neither affects defaults.
+        static const bool kForceFullScan =
+            std::getenv("SOR_PRIMAL_FULLSCAN") != nullptr;
         Index q = -1;
         int qdir = 0;
         f64 best = 0.0;
-        for (const Index j : nonbasic) {
-            if (lo[sz(j)] == hi[sz(j)]) continue;
+        Index q_pos = -1;
+        const auto scan_body = [&](auto&& visit) {
+            if (kForceFullScan) {
+                for (const Index j : nonbasic) visit(j);
+            } else {
+                for (const Index j : cand_list) visit(j);
+            }
+        };
+        scan_body([&](Index j) {
+            if (st[sz(j)] == NonbasicStatus::Basic) return;
+            if (lo[sz(j)] == hi[sz(j)]) return;
             const f64 dj = redcost[sz(j)];
             int dir = 0;
             f64 viol = 0.0;
@@ -991,14 +1134,17 @@ core::RawResult solve_primal_simplex_prepared(
                 default:
                     break;
             }
-            if (dir == 0) continue;
+            if (dir == 0) return;
             const f64 den = use_devex && std::isfinite(col_w[sz(j)])
                                 ? col_w[sz(j)]
                                 : ((std::isfinite(colnorm2[sz(j)]) && colnorm2[sz(j)] > 0.0)
                                      ? colnorm2[sz(j)] : 1.0);
             const f64 score = viol * viol / std::max(den, 1e-30);
-            if (score > best) { best = score; q = j; qdir = dir; }
-        }
+            const Index jpos = nonbasic_pos[sz(j)];
+            if (score > best || (score == best && q >= 0 && jpos < q_pos)) {
+                best = score; q = j; qdir = dir; q_pos = jpos;
+            }
+        });
         if (time_detail) diag.price_ms += ms_since(t_part);
 
         // ---- termination --------------------------------------------------
@@ -1061,6 +1207,7 @@ core::RawResult solve_primal_simplex_prepared(
                         pobj += cost[sz(basis[sz(s)])] * xB[sz(s)];
                     if (std::fabs(pobj - dval) > opts.gap_tol * (1.0 + std::fabs(pobj))) {
                         dtol_scale /= 100.0;
+                        cand_all_dirty = true;   // widened eligibility under the new tolerance
                         polish_reprices = 0;
                         continue;
                     }
@@ -1077,6 +1224,7 @@ core::RawResult solve_primal_simplex_prepared(
         }
 
         // ---- ratio test ---------------------------------------------------
+        Index vl_refresh = -1;   // leaving var, captured pre-apply_pivot for the refresh
         std::fill(alpha.begin(), alpha.end(), 0.0);
         for_col(q, [&](Index i, f64 v) { alpha[sz(i)] += v; });
         if (time_detail) t_part = Clock::now();
@@ -1149,6 +1297,7 @@ core::RawResult solve_primal_simplex_prepared(
             if (time_detail) diag.price_ms += ms_since(t_part);
 
             const Index vl = basis[sz(leave)];
+            vl_refresh = vl;
             const f64 arq = prow[sz(q)];
             // alpha_rq computed two ways: from the pivotal row and from the
             // FTRAN'd column. They are the same number in exact arithmetic, so
@@ -1170,6 +1319,11 @@ core::RawResult solve_primal_simplex_prepared(
                 // picks up -theta_d, since its own pivotal-row entry is 1.
                 redcost[sz(q)] = 0.0;
                 redcost[sz(vl)] = -theta_d;
+                // Reduced costs changed for exactly the pivotal row's
+                // nonbasic support (plus q and vl below): refresh those
+                // memberships so the next selection sees the same candidate
+                // set a full scan would have seen.
+                for (const Index j : prow_idx) refresh_cand(j);
 
                 if (use_devex) {
                     const f64 ap2 = std::max(arq * arq, 1e-30);
@@ -1181,13 +1335,23 @@ core::RawResult solve_primal_simplex_prepared(
                     }
                 }
             } else {
-                d_valid = false;
+                d_valid = false;   // full rebuild (and candidate rebuild) next iteration
                 ++diag.dual_resyncs;
             }
         }
 
         const bool was_flip = apply_pivot(q, qdir, t, leave);
+        // apply_pivot changed q's status (basic, or flipped bound on a
+        // bound-flip pivot) and, on a basis change, the leaving variable's
+        // status: refresh both candidacies against their post-pivot state.
+        refresh_cand(q);
+        if (!was_flip && leave >= 0) refresh_cand(vl_refresh);
         if (!was_flip) maybe_update_factor(leave, since_refactor);
+        if (trace_fp)
+            std::fprintf(trace_fp, "%llu %d %d %d %.17g %d\n",
+                         static_cast<unsigned long long>(iter + 1), phase,
+                         static_cast<int>(q), static_cast<int>(leave),
+                         static_cast<double>(t), was_flip ? 1 : 0);
         polish_reprices = 0;   // a pivot invalidates the polish state
 
         if (t <= 1e-12) {
@@ -1220,6 +1384,7 @@ core::RawResult solve_primal_simplex_prepared(
         }
     }
     diag.loop_ms = ms_since(t_loop);
+    if (trace_fp) std::fclose(trace_fp);
     diag.iterations = iter;
     diag.final_phase = phase;
     diag.status = status;
@@ -1401,10 +1566,12 @@ core::RawResult solve_primal_simplex_prepared(
 core::RawResult solve_primal_simplex(const model::LpProblem& problem,
                                      const SimplexOptions& opts,
                                      SimplexDiagnostics& diag,
-                                     SimplexBasis* out_basis) {
+                                     SimplexBasis* out_basis,
+                                     const SimplexBasis* warm) {
     const auto t0 = Clock::now();
     const auto prepared = prepare_simplex_model(problem, opts);
-    auto raw = solve_primal_simplex_prepared(prepared, opts, diag, out_basis);
+    auto raw = solve_primal_simplex_prepared(prepared, opts, diag, out_basis,
+                                             warm);
     diag.scaling_ms = prepared.scaling_ms;
     diag.csc_ms = prepared.csc_ms;
     diag.preprocessing_ms = prepared.total_ms;
@@ -1450,7 +1617,7 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         diag = SimplexDiagnostics{};
         core::RawResult result = dual
             ? solve_dual_simplex_prepared(prepared, o, diag, basis, warm)
-            : solve_primal_simplex_prepared(prepared, o, diag, basis);
+            : solve_primal_simplex_prepared(prepared, o, diag, basis, warm);
         accumulate_work(cumulative, diag, probe);
         return result;
     };
@@ -1505,6 +1672,33 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         *out_basis = std::move(outb);
     };
 
+
+    // Warm-start quality gate for the primal fallback: a basis donated by a
+    // dual that died mid-run is only worth adopting when it carries real
+    // structural progress. An early phase-1 death leaves a basis that is
+    // still mostly logical columns -- the primal from there is WORSE than
+    // its cold start (measured: maros-r7 auto fell to 7.7s from 3.2s with an
+    // unconditional warm), while a deep-run donor is much better (schedule
+    // HUGE: cold primal 54.7s vs 7s warm, similar pivot counts but the
+    // mature basis keeps every hypersparse iteration cheap). Signal: the
+    // fraction of basic slots holding structural (non-logical) columns.
+    const auto warm_basis_is_mature = [&](const SimplexBasis& b,
+                                          std::uint64_t donor_iters) {
+        if (b.basic.empty()) return false;
+        const Index ns_ = prepared.pmin.n_cols();   // prepared structural count
+        Index structural = 0;
+        for (const Index j : b.basic)
+            if (j >= 0 && j < ns_) ++structural;
+        if (structural * 10 < static_cast<Index>(b.basic.size()) * 6)
+            return false;   // <60% structural: an early phase-1 death
+        // The donor must also have run long enough relative to the problem
+        // (pilot.ja's probe donor is ~0.75*m pivots and still a bad primal
+        // start; schedule HUGE's committed donor is 1.5*m and an excellent
+        // one). 1.2*m separates the two measured classes.
+        return donor_iters >= static_cast<std::uint64_t>(b.basic.size()) +
+                                  static_cast<std::uint64_t>(b.basic.size()) / 5;
+    };
+
     core::RawResult raw;
     if (opts.method == SimplexMethod::Primal) {
         raw = run(false, opts, &prim_basis);
@@ -1532,7 +1726,17 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
             SimplexBasis prim_basis2;
             const auto dual_raw = raw;
             const auto dual_diag = diag;
-            raw = run(false, prim_opts, &prim_basis2);
+            // Continue from the dual's final basis instead of restarting
+            // cold: the failed dual still made real basis progress (a
+            // mid-phase-1 state is primal-infeasible, which the primal's own
+            // phase 1 is designed to clean up). An unusable warm basis
+            // (dimensions or duplicates) falls back to a cold start inside
+            // the engine, so this can only help.
+            const SimplexBasis* dual_warm =
+                (probe_basis.basic.empty() ||
+                 !warm_basis_is_mature(probe_basis, dual_diag.iterations))
+                    ? nullptr : &probe_basis;
+            raw = run(false, prim_opts, &prim_basis2, dual_warm);
             if (!detail::prefer_simplex_candidate(raw, diag, dual_raw, dual_diag,
                                                   opts, problem.maximize)) {
                 raw = dual_raw;
@@ -1650,6 +1854,7 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
             const auto probe_raw = raw;
             const auto probe_diag = diag;
             winner = &probe_basis;
+            std::uint64_t winner_iters = probe_diag.iterations;
 
             if (!proved(probe_raw, probe_diag)) {
                 auto best_raw = probe_raw;
@@ -1661,6 +1866,7 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
                         best_raw = raw;
                         best_diag = diag;
                         winner = cand;
+                        winner_iters = diag.iterations;
                     }
                 };
 
@@ -1700,7 +1906,11 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
                         const double left = opts.time_limit_s - elapsed(t0);
                         primal_opts.time_limit_s = std::max(0.05, probe_dead ? left : left * 0.6);
                     }
-                    raw = run(false, primal_opts, &prim_basis);
+                    const SimplexBasis* auto_warm =
+                        (winner && !winner->basic.empty() &&
+                         warm_basis_is_mature(*winner, winner_iters))
+                            ? winner : nullptr;
+                    raw = run(false, primal_opts, &prim_basis, auto_warm);
                     keep_better(&prim_basis);
 
                     // Last resort: the dual, committed, if it has not had a real

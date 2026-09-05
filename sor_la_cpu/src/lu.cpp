@@ -7,6 +7,7 @@
 namespace sor::la {
 namespace {
 
+
 constexpr Index kBigIndex = std::numeric_limits<Index>::max();
 
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
@@ -102,8 +103,17 @@ bool BasisFactor::factorize(Index m,
     l_col_start_.clear(); l_col_row_.clear();
     eta_p_.clear();    eta_start_.assign(1, 0);
     eta_idx_.clear();  eta_val_.clear();   eta_pivot_.clear();
+    rev_.assign(sz(m), {});
     work_.assign(sz(m), 0.0);
+    // work_ is freshly zeroed, so a seeded solve may trust it immediately --
+    // but any stale dirty list from the previous factorization refers to a
+    // different pivot order and must be dropped.
+    work_dirty_.clear();
+    work_all_dirty_ = false;
+    fire_touched_.clear();
     mark_.clear();    dfs_stack_.clear();  reach_.clear();  order_.clear(); seed_.clear();
+    support_stamp_.assign(sz(m), 0);
+    support_gen_ = 0;
     dense_below_ = 0;
     u_live_nnz_ = 0;
     u_alloc_nnz_ = 0;
@@ -622,25 +632,88 @@ bool BasisFactor::sparse_lower_t(const std::vector<Index>& seed,
 // ---------------------------------------------------------------------------
 
 void BasisFactor::ftran(std::vector<f64>& b) const {
-    if (m_ == 0) return;
+    ftran_impl(b, nullptr, nullptr);
+}
+
+bool BasisFactor::ftran_with_support(std::vector<f64>& b,
+                                     std::vector<Index>& support) const {
+    return ftran_impl(b, &support, nullptr);
+}
+
+bool BasisFactor::ftran_seeded_with_support(
+    std::vector<f64>& b, const std::vector<Index>& seed_rows,
+    std::vector<Index>& support) const {
+    return ftran_impl(b, &support, &seed_rows);
+}
+
+bool BasisFactor::ftran_impl(std::vector<f64>& b,
+                             std::vector<Index>* support,
+                             const std::vector<Index>* seed_rows) const {
+    if (support) support->clear();
+    if (m_ == 0) return true;
     const auto n = piv_val_.size();
-    // Permute the RHS and collect its sparse seed in the SAME pass. The old
-    // path copied all n entries, scanned all n again to count nonzeros, then
-    // scanned all n a third time to materialize the seed. Once more than n/4
-    // nonzeros have been seen the sparse path cannot be selected, so stop
-    // tracking immediately while completing only the mandatory permutation.
     bool seed_is_sparse = n >= 64;
     seed_.clear();
-    for (std::size_t k = 0; k < n; ++k) {
-        const f64 value = b[sz(piv_row_[k])];
-        work_[k] = value;
-        if (seed_is_sparse && value != 0.0) {
-            seed_.push_back(static_cast<Index>(k));
-            if (4 * seed_.size() > n) {
-                seed_is_sparse = false;
-                seed_.clear();
+
+    // SEEDED permute: the caller has declared the rows where b may be nonzero,
+    // so only those need moving into work_ -- O(|seed|) instead of the O(n)
+    // gather below. Valid only because work_ is known zero outside the
+    // positions this path writes (work_dirty_ / work_all_dirty_), and because
+    // the caller guarantees b is zero outside seed_rows. Any surprise (no
+    // pivot for a declared row, oversized seed) abandons the attempt and falls
+    // through to the classic path, which overwrites work_ completely and is
+    // therefore always safe to reach from a half-finished seeded permute.
+    bool seeded = false;
+    if (seed_rows != nullptr && seed_is_sparse && !seed_rows->empty() &&
+        4 * seed_rows->size() <= n && rpos_.size() >= sz(m_)) {
+        if (work_all_dirty_) {
+            std::fill(work_.begin(), work_.end(), 0.0);
+            work_all_dirty_ = false;
+        } else {
+            for (const Index k : work_dirty_) work_[sz(k)] = 0.0;
+        }
+        work_dirty_.clear();
+        seeded = true;
+        for (const Index i : *seed_rows) {
+            if (i < 0 || sz(i) >= rpos_.size()) { seeded = false; break; }
+            const Index k = rpos_[sz(i)];
+            if (k < 0 || sz(k) >= n) { seeded = false; break; }
+            const f64 value = b[sz(i)];
+            if (value == 0.0) continue;
+            // A caller may declare the same row twice (a column scatter that
+            // accumulates); only the first sighting enters the seed.
+            if (work_[sz(k)] == 0.0) {
+                seed_.push_back(k);
+                work_dirty_.push_back(k);
+            }
+            work_[sz(k)] = value;
+        }
+        if (seeded && 4 * seed_.size() > n) seeded = false;
+        if (!seeded) seed_.clear();
+    }
+
+    // Classic path: permute the RHS and collect its sparse seed in the SAME
+    // pass. The old path copied all n entries, scanned all n again to count
+    // nonzeros, then scanned all n a third time to materialize the seed. Once
+    // more than n/4 nonzeros have been seen the sparse path cannot be
+    // selected, so stop tracking immediately while completing only the
+    // mandatory permutation.
+    if (!seeded) {
+        for (std::size_t k = 0; k < n; ++k) {
+            const f64 value = b[sz(piv_row_[k])];
+            work_[k] = value;
+            if (seed_is_sparse && value != 0.0) {
+                seed_.push_back(static_cast<Index>(k));
+                if (4 * seed_.size() > n) {
+                    seed_is_sparse = false;
+                    seed_.clear();
+                }
             }
         }
+        // work_ now holds a value at every position; a later seeded call must
+        // clear all of it before it can assume zeros.
+        work_all_dirty_ = true;
+        work_dirty_.clear();
     }
 
     // Collect a seed after the first triangular solve. Abort the scan as soon
@@ -666,26 +739,55 @@ void BasisFactor::ftran(std::vector<f64>& b) const {
     if (seed_is_sparse) {
         if (sparse_lower(seed_, work_)) {
             sp = true;
+            // The solve wrote work_ over its reach; record that so a later
+            // seeded call knows exactly what to clear.
+            work_dirty_.insert(work_dirty_.end(), reach_.begin(), reach_.end());
             for (const Index k : reach_) mark_[sz(k)] = 0;
         }
     }
-    if (!sp) solve_lower(work_);
+    if (!sp) {
+        solve_lower(work_);
+        work_all_dirty_ = true;      // dense pass touched every position
+    }
     work_since_factor_ += sp ? static_cast<Offset>(reach_.size()) : static_cast<Offset>(n);
 
     // U-solve (sparse or dense) + scatter.
     sp = false;
     if (collect_seed()) {
-        if (sparse_upper(seed_, work_))
+        if (sparse_upper(seed_, work_)) {
             sp = true;                   // marks stay set for the scatter
+            work_dirty_.insert(work_dirty_.end(), reach_.begin(), reach_.end());
+        }
     }
+    // Slot-space membership stamps for the support (O(1) tests in the eta
+    // loop below). A fresh generation per call; slots are stamped as they
+    // enter the support.
+    if (sp && support) {
+        if (++support_gen_ == 0) ++support_gen_;   // 0 is the "unstamped" value
+    }
+    const std::uint32_t sgen = (sp && support) ? support_gen_ : 0;
     if (sp) {
         // Only the U reach can be nonzero: the fused scatter zeroes the rest,
-        // keeping the all-m-outputs-written contract of the dense path.
-        for (std::size_t k = 0; k < n; ++k)
-            b[sz(piv_slot_[k])] = mark_[k] ? work_[k] : 0.0;
+        // keeping the all-m-outputs-written contract of the dense path. The
+        // support variant writes ONLY the reach (values identical: mark_ is
+        // set exactly on the reach) and records it, leaving other entries
+        // stale for a caller that resets by support.
+        if (support) {
+            support->reserve(reach_.size() + eta_p_.size());
+            for (const Index k : reach_) {
+                const auto slot = sz(piv_slot_[sz(k)]);
+                b[slot] = work_[sz(k)];
+                support->push_back(slot);
+                support_stamp_[slot] = sgen;
+            }
+        } else {
+            for (std::size_t k = 0; k < n; ++k)
+                b[sz(piv_slot_[k])] = mark_[k] ? work_[k] : 0.0;
+        }
         for (const Index k : reach_) mark_[sz(k)] = 0;
     } else {
         solve_upper(work_);
+        work_all_dirty_ = true;      // dense pass touched every position
         for (std::size_t k = 0; k < n; ++k) b[sz(piv_slot_[k])] = work_[k];
     }
     work_since_factor_ += sp ? static_cast<Offset>(reach_.size()) : static_cast<Offset>(n);
@@ -693,48 +795,173 @@ void BasisFactor::ftran(std::vector<f64>& b) const {
 
     // B_k^-1 = E_k^-1 ... E_1^-1 B_0^-1, so the etas apply oldest first.
     // An eta with b[p] == 0 is the identity on b (E^-1 x = x when x_p = 0),
-    // so hypersparse states skip the eta arithmetic entirely.
+    // so hypersparse states skip the eta arithmetic entirely. In partial-
+    // write mode the base solve wrote ONLY the support: a nonzero b[p]
+    // outside the support is a STALE input-scatter value (the caller's
+    // entering column landed on this slot index), not an output -- the
+    // output is zero there, so the eta is the identity there and must be
+    // skipped. Slice entries outside the support are stale too, so their
+    // update is an ASSIGNMENT from zero, not an accumulation. Both tests
+    // are O(1) via the stamps set during the scatter.
     for (std::size_t t = 0; t < eta_p_.size(); ++t) {
         const auto p = sz(eta_p_[t]);
+        // Keep the historical zero skip FIRST: a zero b[p] makes the eta the
+        // identity regardless of mode, and skipping the slice scan is what
+        // keeps hypersparse states cheap.
         if (b[p] == 0.0) continue;
+        if (sgen != 0 && support_stamp_[p] != sgen) continue;   // stale, not output
         const f64 pv = b[p] / eta_pivot_[t];
         for (Offset k = eta_start_[t]; k < eta_start_[t + 1]; ++k) {
             const auto i = sz(eta_idx_[sz(k)]);
             // update() excludes p when constructing every eta slice.
-            b[i] -= eta_val_[sz(k)] * pv;
+            if (sgen != 0 && support_stamp_[i] != sgen) {
+                b[i] = -eta_val_[sz(k)] * pv;          // stale/zero: assign
+                if (support) {
+                    support->push_back(i);
+                    support_stamp_[i] = sgen;
+                }
+            } else {
+                b[i] -= eta_val_[sz(k)] * pv;          // genuine accumulation
+            }
         }
         b[p] = pv;
+        // p passed the stamp gate, so it is already in the support from the
+        // scatter -- no push needed (a duplicate would double-apply every
+        // downstream per-pivot update at p).
     }
+    // sp == false: the dense path wrote every slot (caller must treat b as
+    // fully overwritten and reset with a full clear next time). Sorting the
+    // support preserves the dense loops' ascending visiting order, so
+    // ratio-test tie-breaking cannot change (same rationale as
+    // btran_impl).
+    if (sp && support) std::sort(support->begin(), support->end());
+    // sp == false: the dense path wrote every slot (caller must treat b as
+    // fully overwritten and reset with a full clear next time).
+    return sp;
 }
 
 void BasisFactor::btran(std::vector<f64>& d) const {
-    (void)btran_impl(d, nullptr);
+    (void)btran_impl(d, nullptr, nullptr);
 }
 
 bool BasisFactor::btran_with_support(std::vector<f64>& d,
                                      std::vector<Index>& support) const {
-    return btran_impl(d, &support);
+    return btran_impl(d, &support, nullptr);
+}
+
+bool BasisFactor::btran_seeded_with_support(
+    std::vector<f64>& d, const std::vector<Index>& seed_slots,
+    std::vector<Index>& support) const {
+    return btran_impl(d, &support, &seed_slots);
 }
 
 bool BasisFactor::btran_impl(std::vector<f64>& d,
-                             std::vector<Index>* support) const {
+                             std::vector<Index>* support,
+                             const std::vector<Index>* seed_slots) const {
     if (support) support->clear();
     if (m_ == 0) return true;
 
     // B_k^-T = B_0^-T E_1^-T ... E_k^-T, so the etas apply newest first.
-    // The transposed eta E^-T only writes position p; every other entry is
-    // read-only. The eta index scan is still required by product form, so keep
-    // this loop branch-free; checking every d[i] for zero was measured as a
-    // regression on eta-heavy Netlib instances.
-    for (std::size_t t = eta_p_.size(); t-- > 0;) {
-        const auto p = sz(eta_p_[t]);
-        f64 s = d[p];
-        for (Offset k = eta_start_[t]; k < eta_start_[t + 1]; ++k) {
-            const auto i = sz(eta_idx_[sz(k)]);
-            // update() excludes p when constructing every eta slice.
-            s -= eta_val_[sz(k)] * d[i];
+    //
+    // Firing-set path for sparse inputs: an eta is an EXACT no-op when every
+    // slot it reads (its pivot p and its slice) is zero at its turn, so it
+    // suffices to process the etas reachable from the input's nonzero
+    // positions through the reverse incidence rev_ — a skipped eta writes
+    // zero to an already-zero position, and processing order among fired
+    // etas stays newest-first, so values are bit-identical to the full scan.
+    // Nonzeros can only originate at (a) the input seed and (b) a FIRED
+    // eta's write position; a 0→nonzero write at slot p can newly fire only
+    // etas OLDER than the writer (newer ones have already been processed and
+    // legitimately saw the pre-write value), so pushes filter on u < t.
+    bool used_firing = false;
+    if (eta_p_.size() >= 8 && rev_.size() == sz(m_)) {
+        std::size_t nz = 0;
+        std::vector<Index>& input_seed = fire_input_seed_;   // reused buffer
+        input_seed.clear();
+        bool too_dense = false;
+        if (seed_slots != nullptr && seed_slots->size() * 8 <= sz(m_)) {
+            // The caller declared where d is nonzero (the dual's rho is a
+            // single unit slot), so the O(m) scan below is unnecessary. Zeros
+            // inside the declared seed are harmless: an eta reached from a
+            // zero slot simply computes the same value it would have anyway.
+            for (const Index i : *seed_slots) {
+                if (i < 0 || sz(i) >= sz(m_)) { too_dense = true; break; }
+                input_seed.push_back(i);
+            }
+        } else {
+            for (Index i = 0; i < m_; ++i) {
+                if (d[sz(i)] == 0.0) continue;
+                ++nz;
+                if (nz * 8 > sz(m_)) { too_dense = true; break; }
+                input_seed.push_back(i);
+            }
         }
-        d[p] = s / eta_pivot_[t];
+        if (!too_dense) {
+            used_firing = true;
+            fire_touched_.clear();
+            if (fire_stamp_.size() < eta_p_.size())
+                fire_stamp_.assign(eta_p_.size(), 0);
+            if (++fire_gen_ == 0) {
+                std::fill(fire_stamp_.begin(), fire_stamp_.end(), 0);
+                ++fire_gen_;
+            }
+            std::vector<Index>& heap = fire_heap_;   // reused buffer
+            heap.clear();
+            const auto push = [&](Index t) {
+                if (fire_stamp_[sz(t)] == fire_gen_) return;
+                fire_stamp_[sz(t)] = fire_gen_;
+                heap.push_back(t);
+                std::push_heap(heap.begin(), heap.end());
+            };
+            for (const Index i : input_seed)
+                for (const Index t : rev_[sz(i)]) push(t);
+            Offset fired_entries = 0;
+            const std::size_t n_eta = eta_p_.size();
+            while (!heap.empty()) {
+                std::pop_heap(heap.begin(), heap.end());
+                const Index t = heap.back();
+                heap.pop_back();
+                const auto p = sz(eta_p_[sz(t)]);
+                f64 s = d[p];
+                for (Offset k = eta_start_[sz(t)]; k < eta_start_[sz(t) + 1]; ++k) {
+                    const auto i = sz(eta_idx_[sz(k)]);
+                    // update() excludes p when constructing every eta slice.
+                    s -= eta_val_[sz(k)] * d[i];
+                }
+                const f64 old = d[p];
+                d[p] = s / eta_pivot_[sz(t)];
+                // This slot now carries an eta-produced value that the U'
+                // solve must see, so the seeded permute has to include it.
+                fire_touched_.push_back(static_cast<Index>(p));
+                fired_entries += 1 + static_cast<Offset>(
+                                            eta_start_[sz(t) + 1] - eta_start_[sz(t)]);
+                if (d[p] != 0.0 && old == 0.0) {
+                    // Only OLDER readers can newly fire on this write.
+                    for (const Index u : rev_[p])
+                        if (u < t) push(u);
+                }
+            }
+            (void)n_eta;
+            work_since_factor_ += fired_entries;
+        }
+    }
+    if (!used_firing) {
+        // Dense-input / eta-poor fallback: the transposed eta E^-T only
+        // writes position p; every other entry is read-only. The eta index
+        // scan is still required by product form, so keep this loop
+        // branch-free; checking every d[i] for zero was measured as a
+        // regression on eta-heavy Netlib instances.
+        for (std::size_t t = eta_p_.size(); t-- > 0;) {
+            const auto p = sz(eta_p_[t]);
+            f64 s = d[p];
+            for (Offset k = eta_start_[t]; k < eta_start_[t + 1]; ++k) {
+                const auto i = sz(eta_idx_[sz(k)]);
+                // update() excludes p when constructing every eta slice.
+                s -= eta_val_[sz(k)] * d[i];
+            }
+            d[p] = s / eta_pivot_[t];
+        }
+        work_since_factor_ += static_cast<Offset>(eta_nnz());
     }
 
     const auto n = piv_val_.size();
@@ -743,16 +970,59 @@ bool BasisFactor::btran_impl(std::vector<f64>& d,
     // the true input pattern to the base U' solve.
     bool seed_is_sparse = n >= 64;
     seed_.clear();
-    for (std::size_t k = 0; k < n; ++k) {
-        const f64 value = d[sz(piv_slot_[k])];
-        work_[k] = value;
-        if (seed_is_sparse && value != 0.0) {
-            seed_.push_back(static_cast<Index>(k));
-            if (4 * seed_.size() > n) {
-                seed_is_sparse = false;
-                seed_.clear();
+
+    // SEEDED permute (slot space, via cpos_). Same contract and same fallback
+    // discipline as ftran_impl's. Note the eta loops above may have written
+    // slots OUTSIDE the declared input seed, so the seed used here is the
+    // caller's slots PLUS every eta pivot that fired -- collected during the
+    // firing-set pass. Without the firing set there is no such record, so the
+    // seeded permute is only attempted when the firing-set path ran.
+    bool seeded = false;
+    if (seed_slots != nullptr && used_firing && seed_is_sparse &&
+        cpos_.size() >= sz(m_)) {
+        const std::size_t declared = seed_slots->size() + fire_touched_.size();
+        if (declared > 0 && 4 * declared <= n) {
+            if (work_all_dirty_) {
+                std::fill(work_.begin(), work_.end(), 0.0);
+                work_all_dirty_ = false;
+            } else {
+                for (const Index k : work_dirty_) work_[sz(k)] = 0.0;
+            }
+            work_dirty_.clear();
+            seeded = true;
+            const auto take = [&](Index i) {
+                if (i < 0 || sz(i) >= cpos_.size()) { seeded = false; return; }
+                const Index k = cpos_[sz(i)];
+                if (k < 0 || sz(k) >= n) { seeded = false; return; }
+                const f64 value = d[sz(i)];
+                if (value == 0.0) return;
+                if (work_[sz(k)] == 0.0) {
+                    seed_.push_back(k);
+                    work_dirty_.push_back(k);
+                }
+                work_[sz(k)] = value;
+            };
+            for (const Index i : *seed_slots)   { if (!seeded) break; take(i); }
+            for (const Index i : fire_touched_) { if (!seeded) break; take(i); }
+            if (seeded && 4 * seed_.size() > n) seeded = false;
+            if (!seeded) seed_.clear();
+        }
+    }
+
+    if (!seeded) {
+        for (std::size_t k = 0; k < n; ++k) {
+            const f64 value = d[sz(piv_slot_[k])];
+            work_[k] = value;
+            if (seed_is_sparse && value != 0.0) {
+                seed_.push_back(static_cast<Index>(k));
+                if (4 * seed_.size() > n) {
+                    seed_is_sparse = false;
+                    seed_.clear();
+                }
             }
         }
+        work_all_dirty_ = true;
+        work_dirty_.clear();
     }
     const auto collect_seed = [&]() {
         seed_.clear();
@@ -773,17 +1043,23 @@ bool BasisFactor::btran_impl(std::vector<f64>& d,
     if (seed_is_sparse) {
         if (sparse_upper_t(seed_, work_)) {
             sp = true;
+            work_dirty_.insert(work_dirty_.end(), reach_.begin(), reach_.end());
             for (const Index k : reach_) mark_[sz(k)] = 0;
         }
     }
-    if (!sp) solve_upper_t(work_);
+    if (!sp) {
+        solve_upper_t(work_);
+        work_all_dirty_ = true;      // dense pass touched every position
+    }
     work_since_factor_ += sp ? static_cast<Offset>(reach_.size()) : static_cast<Offset>(n);
 
     // L'-solve (sparse or dense) + scatter.
     sp = false;
     if (collect_seed()) {
-        if (sparse_lower_t(seed_, work_))
+        if (sparse_lower_t(seed_, work_)) {
             sp = true;
+            work_dirty_.insert(work_dirty_.end(), reach_.begin(), reach_.end());
+        }
     }
     if (sp) {
         if (support) {
@@ -796,15 +1072,24 @@ bool BasisFactor::btran_impl(std::vector<f64>& d,
             // exposing the sparse support cannot alter pivot decisions.
             std::sort(support->begin(), support->end());
         }
+        // NOTE: this scatter stays FULL (all m rows) even for seeded callers.
+        // A partial write was tried and is WRONG: the firing-set eta loop above
+        // writes d at fired eta PIVOT SLOTS, which are neither the output reach
+        // nor anything the caller can enumerate, so those values survive as
+        // stale nonzeros into the next iteration. Measured: trace divergence on
+        // every model tried plus a 2-3x slowdown. Removing this O(m) term needs
+        // the eta-written slots folded into the caller's reset contract.
         for (std::size_t k = 0; k < n; ++k)
             d[sz(piv_row_[k])] = mark_[k] ? work_[k] : 0.0;
         for (const Index k : reach_) mark_[sz(k)] = 0;
     } else {
         solve_lower_t(work_);
+        work_all_dirty_ = true;      // dense pass touched every position
         for (std::size_t k = 0; k < n; ++k) d[sz(piv_row_[k])] = work_[k];
     }
     work_since_factor_ += sp ? static_cast<Offset>(reach_.size()) : static_cast<Offset>(n);
-    work_since_factor_ += static_cast<Offset>(eta_nnz());
+    // Eta work was already accounted inside the firing-set / plain loops
+    // above (actual entries touched in the firing path).
     return sp;
 }
 
@@ -837,10 +1122,25 @@ bool BasisFactor::update(Index p, const std::vector<f64>& alpha, f64 min_pivot) 
     if (!(std::fabs(ap) > min_pivot)) return false;
     eta_p_.push_back(p);
     eta_pivot_.push_back(ap);
-    for (Index i = 0; i < m_; ++i) {
-        if (alpha[sz(i)] != 0.0 && i != p) {
-            eta_idx_.push_back(i);
-            eta_val_.push_back(alpha[sz(i)]);
+    // Reverse incidence: eta t reads slot p and every slice slot i.
+    const auto t = static_cast<Index>(eta_p_.size() - 1);
+    if (rev_.size() == sz(m_)) {
+        rev_[sz(p)].push_back(t);
+        for (Index i = 0; i < m_; ++i) {
+            if (alpha[sz(i)] != 0.0 && i != p) {
+                eta_idx_.push_back(i);
+                eta_val_.push_back(alpha[sz(i)]);
+                rev_[sz(i)].push_back(t);
+            }
+        }
+    } else {
+        // rev_ not built (stale or truncated factorize) — etas still work;
+        // btran falls back to the plain full scan.
+        for (Index i = 0; i < m_; ++i) {
+            if (alpha[sz(i)] != 0.0 && i != p) {
+                eta_idx_.push_back(i);
+                eta_val_.push_back(alpha[sz(i)]);
+            }
         }
     }
     eta_start_.push_back(static_cast<Offset>(eta_idx_.size()));
@@ -884,6 +1184,7 @@ bool BasisFactor::collapse_pending_into_ft(const LuOptions& opts, f64 min_pivot)
     eta_p_.clear(); eta_pivot_.clear();
     eta_idx_.clear(); eta_val_.clear();
     eta_start_.assign(1, 0);
+    for (auto& r : rev_) r.clear();
 
     for (std::size_t t = 0; t < pending.size(); ++t) {
         if (update_ft(pending[t].p, pending[t].alpha, opts, min_pivot)) continue;

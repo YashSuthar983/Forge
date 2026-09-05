@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <string>
 #include <vector>
@@ -236,10 +237,38 @@ core::RawResult solve_dual_simplex_prepared(
         diag.btran_ms += dt;
         diag.solve_ms += dt;
     };
-    const auto do_btran_with_support = [&](std::vector<f64>& v,
-                                           std::vector<Index>& support) {
+    // Seeded FTRAN. The entering column's scatter positions ARE the input
+    // support, so the O(m) permute/seed scan inside the solve is avoidable.
+    // The reset discipline at each call site (zero the previous OUTPUT
+    // support, then the stale-seed stamp pass that zeroes any input position
+    // the output did not claim) is what leaves alpha zero outside this seed.
+    std::vector<Index> ftran_seed;
+    const auto do_ftran_seeded = [&](std::vector<f64>& v,
+                                     const std::vector<Index>& seed,
+                                     std::vector<Index>& support) {
         const auto t0 = Clock::now();
-        const bool sparse = factor.btran_with_support(v, support);
+        const bool sparse = factor.ftran_seeded_with_support(v, seed, support);
+        const double dt = ms_since(t0);
+        ++diag.solve_calls;
+        ++diag.ftran_calls;
+        diag.ftran_ms += dt;
+        diag.solve_ms += dt;
+        return sparse;
+    };
+
+    // Seeded variant. Every BTRAN in the pivot loop starts from rho = e_leave,
+    // a SINGLE nonzero, yet the unseeded entry point must scan all m entries to
+    // discover that and then permute all m into the workspace. Declaring the
+    // seed collapses both to O(1) (Gilbert & Peierls 1988: a sparse solve must
+    // cost O(flops), not O(n)). The reset discipline immediately below every
+    // call site -- zero the previous OUTPUT support, then set rho[leave] -- is
+    // what makes `rho is zero outside {leave}` true, which the contract needs.
+    std::vector<Index> btran_seed(1, 0);
+    const auto do_btran_seeded = [&](std::vector<f64>& v, Index seed_slot,
+                                     std::vector<Index>& support) {
+        btran_seed[0] = seed_slot;
+        const auto t0 = Clock::now();
+        const bool sparse = factor.btran_seeded_with_support(v, btran_seed, support);
         const double dt = ms_since(t0);
         ++diag.solve_calls;
         ++diag.btran_calls;
@@ -247,6 +276,10 @@ core::RawResult solve_dual_simplex_prepared(
         diag.solve_ms += dt;
         return sparse;
     };
+    // FTRAN that additionally reports the output support when the solve
+    // stayed hypersparse. Partial-write contract: entries outside the
+    // support are STALE -- the production sites reset the previous
+    // support and clean stale seed positions before each scatter.
     la::LuOptions lu_opts;
     lu_opts.pivot_tol = std::min(opts.pivot_tol, 1e-11);
 
@@ -255,6 +288,14 @@ core::RawResult solve_dual_simplex_prepared(
     std::vector<f64>    bvals;
     std::vector<f64>    rhs(sz(m), 0.0), y(sz(m), 0.0), alpha(sz(m), 0.0);
     std::vector<f64>    cB(sz(m), 0.0), rho(sz(m), 0.0);
+    // Per-SLOT copies of the basic variable's bounds and feasibility
+    // tolerance. chuzr scans every slot and previously reached them through
+    // basis[i] -- five random accesses per row. lo/hi/ptol are never written
+    // after setup, so caching them per slot turns the scan into four
+    // sequential streams. Refreshed wherever basis[] changes: initial setup,
+    // singular-basis repair, and the pivot itself.
+    std::vector<f64>    slot_lo(sz(m), 0.0), slot_hi(sz(m), 0.0),
+                        slot_ptol(sz(m), 0.0);
     std::vector<f64>    col_w(sz(nt), 1.0), row_w(sz(m), 1.0);
     // Exact DSE incremental update workspace: tau = B^-1 * rho, one extra
     // FTRAN per pivot. See the use_exact_dse branch in apply_pivot's weight
@@ -279,6 +320,62 @@ core::RawResult solve_dual_simplex_prepared(
     // ranges over the pivotal row's SUPPORT instead of every nonbasic column.
     std::vector<f64>   redcost(sz(nt), 0.0);
     std::vector<f64>   prow(sz(nt), 0.0);
+    // ---- dual phase-1 candidate list ---------------------------------------
+    // Phase-1 pricing scanned every nonbasic column each iteration for
+    // wrong-sign (dual-infeasible) columns. Membership changes only when a
+    // reduced cost or a status changes, and those change only on the sparse
+    // pivotal-row updates, apply_pivot's two columns, the phase-1 flip pass
+    // itself, and full rebuilds -- so the set is maintained exactly by those
+    // hooks and the phase-1 pass iterates O(candidates). The pass's flip
+    // list is sorted by nonbasic-list position before apply_flip_shift so
+    // the FTRAN accumulation order (and hence every downstream value) is
+    // identical to the original full-scan pass, and the entering choice
+    // keeps the scan's tie rule (max score, then first in nonbasic order =
+    // smallest nonbasic_pos).
+    std::vector<Index> d1_cand;
+    std::vector<Index> d1_cand_pos(sz(nt), -1);
+    bool d1_cand_dirty = true;
+    const auto d1_add = [&](Index j) {
+        if (j < 0 || j >= nt || d1_cand_pos[sz(j)] >= 0) return;
+        d1_cand_pos[sz(j)] = static_cast<Index>(d1_cand.size());
+        d1_cand.push_back(j);
+    };
+    const auto d1_remove = [&](Index j) {
+        if (j < 0 || j >= nt) return;
+        const Index pos = d1_cand_pos[sz(j)];
+        if (pos < 0) return;
+        const Index last = d1_cand.back();
+        d1_cand[sz(pos)] = last;
+        d1_cand_pos[sz(last)] = pos;
+        d1_cand.pop_back();
+        d1_cand_pos[sz(j)] = -1;
+    };
+    // Wrong-sign test, identical conditions to the former scan: fixed and
+    // basic columns are never candidates; boxed and one-sided alike are
+    // candidates exactly when their status-dependent sign test fails.
+    const auto d1_wrong_sign = [&](Index j) -> bool {
+        if (st[sz(j)] == NonbasicStatus::Basic) return false;
+        if (lo[sz(j)] == hi[sz(j)]) return false;
+        const f64 d = redcost[sz(j)];
+        const f64 tj = dtol[sz(j)];
+        switch (st[sz(j)]) {
+            case NonbasicStatus::AtLower:    return d < -tj;
+            case NonbasicStatus::AtUpper:    return d > tj;
+            case NonbasicStatus::AtZeroFree: return std::fabs(d) > tj;
+            default:                         return false;
+        }
+    };
+    const auto d1_refresh = [&](Index j) {
+        if (d1_wrong_sign(j)) d1_add(j);
+        else                  d1_remove(j);
+    };
+    const auto d1_rebuild = [&]() {
+        d1_cand.clear();
+        std::fill(d1_cand_pos.begin(), d1_cand_pos.end(), -1);
+        for (const Index j : nonbasic)
+            if (d1_wrong_sign(j)) d1_add(j);
+        d1_cand_dirty = false;
+    };
     // Generation stamps make pivotal-row assembly O(nnz touched), without a
     // separate clear over the previous support. Structural columns can occur
     // in several rho rows; logical -I columns occur exactly once and therefore
@@ -288,8 +385,46 @@ core::RawResult solve_dual_simplex_prepared(
     std::vector<Index> prow_idx;
     std::vector<Index> rho_support;
     bool rho_is_sparse = false;
+    // alpha (= B^-1 a_q) support discipline (Hall & McKinnon hypersparse):
+    // ftran_with_support writes only the returned support, and the
+    // production sites zero the stale input-scatter positions, so `alpha`
+    // is nonzero exactly on alpha_support. All downstream per-pivot loops
+    // that historically swept all m slots then iterate alpha_support
+    // instead -- on wide sparse models that is the difference between ~5
+    // O(m) sweeps per pivot and ~5 O(|alpha|).
+    // alpha_dense marks "the last ftran took the dense path and wrote every
+    // slot", forcing a full clear at the next production site.
+    std::vector<Index> alpha_support;
+    // Stale-seed stamps: ftran_with_support never rewrites its INPUT
+    // positions (the entering-column scatter, row-indexed), so after the
+    // solve those positions still hold stale input values unless they
+    // coincidentally sit in the output support. Each production site stamps
+    // the support and zeroes unclaimed seed positions, so `alpha` is
+    // nonzero exactly on alpha_support afterwards and every downstream
+    // loop may iterate the support alone.
+    std::vector<std::uint32_t> alpha_stamp(sz(m), 0);
+    std::uint32_t alpha_stamp_gen = 0;
+    // Adaptive gate: the sparse path pays a per-pivot bookkeeping cost
+    // (support sort, stamps, reset) that only wins when alpha is genuinely
+    // thin. Netlib measured: hypersparse models (fit1p, bnl2) win up to 5x,
+    // dense-ish ones (pilot.ja, degen3) LOSE up to 1.8x from pure overhead.
+    // Track the average support size; once it exceeds ~1/16 of m the model
+    // is dense-ish, so fall back to the plain full-write FTRAN and dense
+    // loops for the rest of the run. The transition is seamless: the next
+    // production site still resets by the last support before going dense.
+    bool alpha_sparse_enabled = m >= 512;
+    // Debug/profiling hooks (P0 trace-diff): SOR_DUAL_FORCE_DENSE disables
+    // the hypersparse alpha path regardless of size; SOR_DUAL_TRACE=<file>
+    // dumps one line per committed pivot. Neither affects defaults.
+    if (std::getenv("SOR_DUAL_FORCE_DENSE") != nullptr)
+        alpha_sparse_enabled = false;
+    std::FILE* trace_fp = nullptr;
+    if (const char* tp = std::getenv("SOR_DUAL_TRACE"))
+        trace_fp = std::fopen(tp, "w");
+    std::uint64_t alpha_sparse_calls = 0;
+    std::uint64_t alpha_sparse_sum = 0;
+    bool alpha_is_sparse = false;
     // Phase-1 batch flips: which columns moved since the last xB correction.
-    std::vector<char>  flip_touched(sz(nt), 0);
     std::vector<Index> flipped_list;
     bool d_valid = false;
 
@@ -370,6 +505,16 @@ core::RawResult solve_dual_simplex_prepared(
         }
     };
 
+    const auto refresh_slot_bounds = [&](Index i) {
+        const Index v = basis[sz(i)];
+        slot_lo[sz(i)]   = lo[sz(v)];
+        slot_hi[sz(i)]   = hi[sz(v)];
+        slot_ptol[sz(i)] = ptol[sz(v)];
+    };
+    const auto sync_slot_bounds = [&]() {
+        for (Index i = 0; i < m; ++i) refresh_slot_bounds(i);
+    };
+
     const auto recompute_xB = [&]() {
         std::fill(rhs.begin(), rhs.end(), 0.0);
         for (const Index j : nonbasic) {
@@ -391,6 +536,8 @@ core::RawResult solve_dual_simplex_prepared(
     // phase-1 iterations, 12.9s -> under a second of flip maintenance).
     const auto apply_flip_shift = [&](const std::vector<Index>& flipped) {
         if (flipped.empty()) return;
+        const auto flip_t0 = Clock::now();
+        ++diag.flip_batches;
         std::fill(rhs.begin(), rhs.end(), 0.0);
         for (const Index j : flipped) {
             // value[j] was already moved to the other bound; the shift is the
@@ -403,6 +550,7 @@ core::RawResult solve_dual_simplex_prepared(
         }
         do_ftran(rhs);
         for (Index i = 0; i < m; ++i) xB[sz(i)] += rhs[sz(i)];
+        diag.flip_ms += ms_since(flip_t0);
     };
 
     const auto primal_infeasibility = [&]() {
@@ -461,6 +609,9 @@ core::RawResult solve_dual_simplex_prepared(
         y = cB;
         do_btran(y);
         rebuild_redcost();
+        // Every reduced cost changed: phase-1 candidacy must be rebuilt at
+        // the next pass.
+        d1_cand_dirty = true;
     };
 
     // Dual phase is owned here for the same reason primal owns it: a repaired
@@ -505,6 +656,9 @@ core::RawResult solve_dual_simplex_prepared(
         }
         ++diag.refactorizations;
         diag.factor_ms += ms_since(t0);
+        // Covers both the first factorization and any singular-basis repair
+        // above, which is the only other place basis[] changes wholesale.
+        sync_slot_bounds();
         recompute_xB();
         recompute_pi();
         // Preserve Devex history across a numerical refactorization. The
@@ -559,7 +713,18 @@ core::RawResult solve_dual_simplex_prepared(
 
     const auto apply_pivot = [&](Index q, int qdir, f64 t, Index leave) {
         const f64 xp_before = (leave < 0) ? 0.0 : xB[sz(leave)];
-        for (Index i = 0; i < m; ++i) xB[sz(i)] -= static_cast<f64>(qdir) * t * alpha[sz(i)];
+        // xB is slot-indexed, alpha is slot-indexed: iterate alpha's
+        // touched set when the last FTRAN stayed hypersparse (entries with
+        // alpha == 0 leave xB unchanged). Dense state keeps the full sweep.
+        if (alpha_is_sparse) {
+            for (const Index i : alpha_support) {
+                if (alpha[sz(i)] == 0.0) continue;
+                xB[sz(i)] -= static_cast<f64>(qdir) * t * alpha[sz(i)];
+            }
+        } else {
+            for (Index i = 0; i < m; ++i)
+                xB[sz(i)] -= static_cast<f64>(qdir) * t * alpha[sz(i)];
+        }
 
         if (leave < 0) {
             if (st[sz(q)] == NonbasicStatus::AtLower) {
@@ -595,6 +760,7 @@ core::RawResult solve_dual_simplex_prepared(
         basis[sz(leave)] = q;
         slot_of[sz(q)] = leave;
         st[sz(q)] = NonbasicStatus::Basic;
+        refresh_slot_bounds(leave);
         xB[sz(leave)] = q_from + static_cast<f64>(qdir) * t;
 
         if (use_devex) {
@@ -623,14 +789,26 @@ core::RawResult solve_dual_simplex_prepared(
                 // BTRANs a full rebuild needs.
                 tau = rho;
                 do_ftran(tau);
-                for (Index i = 0; i < m; ++i) {
-                    if (i == leave) continue;
+                const auto w_iter = [&](auto&& fn) {
+                    if (alpha_is_sparse) {
+                        for (const Index i : alpha_support) {
+                            if (i == leave || alpha[sz(i)] == 0.0) continue;
+                            fn(i);
+                        }
+                    } else {
+                        for (Index i = 0; i < m; ++i) {
+                            if (i == leave || alpha[sz(i)] == 0.0) continue;
+                            fn(i);
+                        }
+                    }
+                };
+                w_iter([&](Index i) {
                     const f64 r = alpha[sz(i)] / ap;
                     const f64 candidate =
                         row_w[sz(i)] - 2.0 * r * tau[sz(i)] + r * r * wr;
                     if (std::isfinite(candidate))
                         row_w[sz(i)] = std::max(candidate, 1e-10);
-                }
+                });
             } else {
                 // Dual Devex row weights (Forrest & Goldfarb):
                 //   w_r <- max(1, w_r / alpha_rq^2)
@@ -639,13 +817,27 @@ core::RawResult solve_dual_simplex_prepared(
                 // steepest-edge norm of the OLD basis. That is a different quantity,
                 // it drops the / alpha_rq^2, and feeding it into the w_i update
                 // inflated every weight. The result was neither Devex nor DSE.
-                for (Index i = 0; i < m; ++i) {
-                    if (i == leave) continue;
+                // alpha_iq == 0 leaves w_i unchanged in both update rules, so the
+                // loop may run over alpha's support only.
+                const auto w_iter = [&](auto&& fn) {
+                    if (alpha_is_sparse) {
+                        for (const Index i : alpha_support) {
+                            if (i == leave) continue;
+                            fn(i);
+                        }
+                    } else {
+                        for (Index i = 0; i < m; ++i) {
+                            if (i == leave) continue;
+                            fn(i);
+                        }
+                    }
+                };
+                w_iter([&](Index i) {
                     const f64 r = alpha[sz(i)] / ap;
                     const f64 candidate = r * r * wr;
                     if (std::isfinite(candidate))
                         row_w[sz(i)] = std::max(row_w[sz(i)], candidate);
-                }
+                });
             }
             const f64 leaving_w = wr / ap2;
             row_w[sz(leave)] = std::isfinite(leaving_w)
@@ -805,20 +997,45 @@ core::RawResult solve_dual_simplex_prepared(
 
         ++diag.pricing_calls;
         if (phase == 1) {
-            // ---- dual phase 1, ONE fused pass over the columns:
+            // ---- dual phase 1: one pass over the wrong-sign CANDIDATE list.
             //      1. boxed wrong-sign nonbasics flip (dual feasibility
             //         restored for free -- pi does not move);
-            //      2. if nothing flipped, the same pass has already priced
-            //         the remaining (necessarily one-sided/free) candidates,
-            //         so the old second full scan is gone.
+            //      2. if nothing flipped, the same pass priced the remaining
+            //         (necessarily one-sided/free) candidates.
             //      A column flipped in this pass is dual-feasible afterwards
             //      (its status changed side, not its d), so it is never also
-            //      an entering candidate -- the continue guarantees it.
+            //      an entering candidate. Stale members (membership not yet
+            //      refreshed) are skipped by the same sign tests the full
+            //      scan used, so the pass is exact for any staleness.
             bool flipped = false;
             const auto price_t0 = Clock::now();
             f64 best = 0.0;
-            for (const Index j : nonbasic) {
-                if (lo[sz(j)] == hi[sz(j)]) continue;
+            Index q_pos = -1;
+            if (d1_cand_dirty) d1_rebuild();
+            // Debug/profiling (P2-dual trace-diff): SOR_DUAL_FULLSCAN forces
+            // the original full nonbasic scan. In normal operation the pass
+            // ALSO falls back to the full scan whenever the candidate list
+            // is dense (schedule-class models enter phase 1 with most
+            // columns dual-infeasible, and iterating a near-complete list
+            // plus the refresh/sort bookkeeping measured 3% SLOWER than the
+            // plain scan there, while sparse-candidate models win ~7%).
+            // Iterating `nonbasic` is exact: it is a superset of the list
+            // and the body's own sign tests filter to the same columns.
+            static const bool kDualForceFullScan =
+                std::getenv("SOR_DUAL_FULLSCAN") != nullptr;
+            const bool d1_full_pass =
+                kDualForceFullScan || d1_cand.size() * 8 > sz(nt);
+            flipped_list.clear();
+            const auto d1_scan = [&](auto&& fn) {
+                if (d1_full_pass) {
+                    for (const Index j : nonbasic) fn(j);
+                } else {
+                    for (const Index j : d1_cand) fn(j);
+                }
+            };
+            d1_scan([&](Index j) {
+                if (st[sz(j)] == NonbasicStatus::Basic) return;
+                if (lo[sz(j)] == hi[sz(j)]) return;
                 const f64 d = reduced_cost(j);
                 const bool boxed = lo[sz(j)] > -kInf && hi[sz(j)] < kInf;
                 if (boxed) {
@@ -826,19 +1043,19 @@ core::RawResult solve_dual_simplex_prepared(
                         st[sz(j)] = NonbasicStatus::AtUpper;
                         value[sz(j)] = hi[sz(j)];
                         ++diag.bound_flips;
-                        flip_touched[sz(j)] = 1;
+                        flipped_list.push_back(j);
                         flipped = true;
-                        continue;
+                        return;
                     }
                     if (st[sz(j)] == NonbasicStatus::AtUpper && d > dtol[sz(j)]) {
                         st[sz(j)] = NonbasicStatus::AtLower;
                         value[sz(j)] = lo[sz(j)];
                         ++diag.bound_flips;
-                        flip_touched[sz(j)] = 1;
+                        flipped_list.push_back(j);
                         flipped = true;
-                        continue;
+                        return;
                     }
-                    continue;   // boxed and feasible: never an entering column here
+                    return;   // boxed and feasible: never an entering column here
                 }
                 // One-sided or free: an entering candidate when wrong-signed.
                 int dir = 0;
@@ -859,25 +1076,30 @@ core::RawResult solve_dual_simplex_prepared(
                     default:
                         break;
                 }
-                if (dir == 0) continue;
-                if (flipped) continue;   // a flip this pass defers pivoting
+                if (dir == 0) return;
+                if (flipped) return;   // a flip this pass defers pivoting
                 const f64 den = (use_devex && std::isfinite(col_w[sz(j)]))
                                     ? col_w[sz(j)] : 1.0;
                 const f64 score = viol * viol / std::max(den, 1e-30);
-                if (score > best) { best = score; q = j; qdir = dir; d_enter = d; }
-            }
+                const Index jpos = nonbasic_pos[sz(j)];
+                if (score > best || (score == best && q >= 0 && jpos < q_pos)) {
+                    best = score; q = j; qdir = dir; d_enter = d; q_pos = jpos;
+                }
+            });
             diag.price_ms += ms_since(price_t0);
             if (flipped) {
-                // Adjust xB incrementally (one FTRAN over the flipped
-                // columns) instead of the full recompute_xB sweep.
-                flipped_list.clear();
-                for (const Index j : nonbasic) {
-                    if (flip_touched[sz(j)]) {
-                        flipped_list.push_back(j);
-                        flip_touched[sz(j)] = 0;
-                    }
-                }
+                // Restore the original pass's flip ORDER (ascending nonbasic
+                // position, i.e. the order the full scan encountered them)
+                // before the FTRAN gather, so rhs accumulation -- and every
+                // downstream value -- is bit-identical to the full scan.
+                std::sort(flipped_list.begin(), flipped_list.end(),
+                          [&](Index a, Index b) {
+                              return nonbasic_pos[sz(a)] < nonbasic_pos[sz(b)];
+                          });
                 apply_flip_shift(flipped_list);
+                // A flipped column is dual-feasible at its new status; its
+                // membership must reflect that.
+                for (const Index j : flipped_list) d1_refresh(j);
                 ++iter;
                 ++diag.phase1_iterations;
                 continue;
@@ -896,9 +1118,47 @@ core::RawResult solve_dual_simplex_prepared(
                 continue;
             }
 
-            std::fill(alpha.begin(), alpha.end(), 0.0);
-            for_col(q, [&](Index i, f64 v) { alpha[sz(i)] += v; });
-            do_ftran(alpha);
+            // Reset the previous support (alpha is zero outside it after the
+            // stale-seed cleanup below), scatter the entering column, solve
+            // with support. A partial-write FTRAN never rewrites its INPUT
+            // positions (the entering-column scatter), so afterwards those
+            // positions still hold stale input values unless they coincide
+            // with the output support: stamp the support and zero the
+            // unclaimed seed positions, leaving alpha nonzero exactly on
+            // alpha_support.
+            if (alpha_is_sparse) {
+                for (const Index i : alpha_support) alpha[sz(i)] = 0.0;
+            } else {
+                std::fill(alpha.begin(), alpha.end(), 0.0);
+            }
+            ftran_seed.clear();
+            for_col(q, [&](Index i, f64 v) {
+                alpha[sz(i)] += v;
+                ftran_seed.push_back(i);
+            });
+            if (alpha_sparse_enabled) {
+                alpha_is_sparse = do_ftran_seeded(alpha, ftran_seed, alpha_support);
+            } else {
+                alpha_is_sparse = false;
+                do_ftran(alpha);
+            }
+            if (alpha_is_sparse) {
+                ++diag.alpha_sparse_iters;
+                diag.alpha_support_entries += alpha_support.size();
+                ++alpha_sparse_calls;
+                alpha_sparse_sum += alpha_support.size();
+                if ((alpha_sparse_calls & 31u) == 0u &&
+                    alpha_sparse_sum > (alpha_sparse_calls * sz(m)) / 16) {
+                    alpha_sparse_enabled = false;
+                }
+                ++alpha_stamp_gen;
+                for (const Index s : alpha_support) alpha_stamp[sz(s)] = alpha_stamp_gen;
+                for_col(q, [&](Index i, f64) {
+                    if (alpha_stamp[sz(i)] != alpha_stamp_gen) alpha[sz(i)] = 0.0;
+                });
+            } else {
+                ++diag.alpha_dense_iters;
+            }
 
             const f64 p1_slack = opts.harris_slack +
                                  (expand_active ? expand_eps : 0.0);
@@ -909,25 +1169,36 @@ core::RawResult solve_dual_simplex_prepared(
                 t_bound = hi[sz(q)] - lo[sz(q)];
 
             f64 t_max = t_bound;
-            for (Index i = 0; i < m; ++i) {
-                const f64 a = alpha[sz(i)];
-                if (std::fabs(a) <= opts.pivot_tol) continue;
+            const auto p1_scan = [&](auto&& fn) {
+                if (alpha_is_sparse) {
+                    for (const Index i : alpha_support) {
+                        const f64 a = alpha[sz(i)];
+                        if (std::fabs(a) <= opts.pivot_tol) continue;
+                        fn(i, a);
+                    }
+                } else {
+                    for (Index i = 0; i < m; ++i) {
+                        const f64 a = alpha[sz(i)];
+                        if (std::fabs(a) <= opts.pivot_tol) continue;
+                        fn(i, a);
+                    }
+                }
+            };
+            p1_scan([&](Index i, f64 a) {
                 const f64 tb = block_t(i, -static_cast<f64>(qdir) * a, p1_slack);
                 if (tb < t_max) t_max = tb;
-            }
+            });
             if (t_max < 0.0) t_max = 0.0;
 
             f64 best_piv = 0.0;
             t_step = 0.0;
             leave = -1;
-            for (Index i = 0; i < m; ++i) {
-                const f64 a = alpha[sz(i)];
+            p1_scan([&](Index i, f64 a) {
                 const f64 mag = std::fabs(a);
-                if (mag <= opts.pivot_tol) continue;
                 const f64 te = block_t(i, -static_cast<f64>(qdir) * a, 0.0);
-                if (!(te < kInf) || te > t_max) continue;
+                if (!(te < kInf) || te > t_max) return;
                 if (mag > best_piv) { best_piv = mag; leave = i; t_step = std::max(0.0, te); }
-            }
+            });
 
             if (leave < 0 && !(t_bound < kInf)) {
                 if (since_refactor > 0) { do_factorize(); since_refactor = 0; continue; }
@@ -947,9 +1218,14 @@ core::RawResult solve_dual_simplex_prepared(
             t_step = (leave < 0) ? t_bound : t_step;
 
             if (leave >= 0) {
-                std::fill(rho.begin(), rho.end(), 0.0);
+                // rho reset by previous OUTPUT support (see the phase-2 site).
+                if (rho_is_sparse) {
+                    for (const Index i : rho_support) rho[sz(i)] = 0.0;
+                } else {
+                    std::fill(rho.begin(), rho.end(), 0.0);
+                }
                 rho[sz(leave)] = 1.0;
-                rho_is_sparse = do_btran_with_support(rho, rho_support);
+                rho_is_sparse = do_btran_seeded(rho, leave, rho_support);
                 build_pivotal_row();
                 if (use_devex) {
                     const f64 ap = alpha[sz(leave)];
@@ -968,14 +1244,14 @@ core::RawResult solve_dual_simplex_prepared(
             const auto price_t0 = Clock::now();
 
             const auto row_viol = [&](Index i, f64& viol, bool& to_lower) -> bool {
-                const Index v = basis[sz(i)];
-                if (xB[sz(i)] < lo[sz(v)] - ptol[sz(v)]) {
-                    viol = lo[sz(v)] - xB[sz(i)];
+                const f64 x = xB[sz(i)], t = slot_ptol[sz(i)];
+                if (x < slot_lo[sz(i)] - t) {
+                    viol = slot_lo[sz(i)] - x;
                     to_lower = true;
                     return true;
                 }
-                if (xB[sz(i)] > hi[sz(v)] + ptol[sz(v)]) {
-                    viol = xB[sz(i)] - hi[sz(v)];
+                if (x > slot_hi[sz(i)] + t) {
+                    viol = x - slot_hi[sz(i)];
                     to_lower = false;
                     return true;
                 }
@@ -1012,6 +1288,7 @@ core::RawResult solve_dual_simplex_prepared(
                 if (since_refactor > 0) { do_factorize(); since_refactor = 0; continue; }
                 if (dual_infeasibility() > 0.0) {
                     phase = 1;
+                    d1_cand_dirty = true;   // insurance: membership from scratch
                     ++diag.phase_restarts;
                     if (diag.phase_restarts > 32) expand_active = false;
                     continue;
@@ -1025,9 +1302,15 @@ core::RawResult solve_dual_simplex_prepared(
                 break;
             }
 
-            std::fill(rho.begin(), rho.end(), 0.0);
+            // rho reset by previous OUTPUT support (btran fully writes its
+            // output, so stale nonzeros are exactly the previous support).
+            if (rho_is_sparse) {
+                for (const Index i : rho_support) rho[sz(i)] = 0.0;
+            } else {
+                std::fill(rho.begin(), rho.end(), 0.0);
+            }
             rho[sz(leave)] = 1.0;
-            rho_is_sparse = do_btran_with_support(rho, rho_support);
+            rho_is_sparse = do_btran_seeded(rho, leave, rho_support);
 
             const f64 dual_slack = opts.harris_slack +
                                    (expand_active ? expand_eps : 0.0);
@@ -1091,9 +1374,11 @@ core::RawResult solve_dual_simplex_prepared(
             if (!choice.ok || choice.pivot < 0)
                 choice = dual_legacy_ratio(cand_j, cand_aj, cand_d, st, srow,
                                            harris_theta, opts.pivot_tol);
-            const double ratio_dt = ms_since(ratio_t0);
-            diag.ratio_test_ms += ratio_dt;
-            diag.price_ms += ratio_dt;
+            // The ratio test gets its OWN bucket. It used to be added to
+            // price_ms as well, so the verbose profile double-counted it and
+            // overstated pricing by exactly ratio_test_ms -- which is the
+            // number any pricing work would be sized against.
+            diag.ratio_test_ms += ms_since(ratio_t0);
 
             if (!choice.ok || choice.pivot < 0) {
                 if (since_refactor > 0) { do_factorize(); since_refactor = 0; continue; }
@@ -1130,16 +1415,56 @@ core::RawResult solve_dual_simplex_prepared(
                 apply_flip_shift(choice.flips);
             }
 
-            std::fill(alpha.begin(), alpha.end(), 0.0);
-            for_col(q, [&](Index i, f64 v) { alpha[sz(i)] += v; });
-            do_ftran(alpha);
+            // Reset, scatter, solve with support, stale-seed cleanup — the
+            // same discipline as the phase-1 site above.
+            if (alpha_is_sparse) {
+                for (const Index i : alpha_support) alpha[sz(i)] = 0.0;
+            } else {
+                std::fill(alpha.begin(), alpha.end(), 0.0);
+            }
+            ftran_seed.clear();
+            for_col(q, [&](Index i, f64 v) {
+                alpha[sz(i)] += v;
+                ftran_seed.push_back(i);
+            });
+            if (alpha_sparse_enabled) {
+                alpha_is_sparse = do_ftran_seeded(alpha, ftran_seed, alpha_support);
+            } else {
+                alpha_is_sparse = false;
+                do_ftran(alpha);
+            }
+            if (alpha_is_sparse) {
+                ++diag.alpha_sparse_iters;
+                diag.alpha_support_entries += alpha_support.size();
+                ++alpha_sparse_calls;
+                alpha_sparse_sum += alpha_support.size();
+                if ((alpha_sparse_calls & 31u) == 0u &&
+                    alpha_sparse_sum > (alpha_sparse_calls * sz(m)) / 16) {
+                    alpha_sparse_enabled = false;
+                }
+                ++alpha_stamp_gen;
+                for (const Index s : alpha_support) alpha_stamp[sz(s)] = alpha_stamp_gen;
+                for_col(q, [&](Index i, f64) {
+                    if (alpha_stamp[sz(i)] != alpha_stamp_gen) alpha[sz(i)] = 0.0;
+                });
+            } else {
+                ++diag.alpha_dense_iters;
+            }
 
             if (used_bfrt) {
                 for (const Index j : prow_idx) {
                     if (st[sz(j)] == NonbasicStatus::Basic) continue;
                     redcost[sz(j)] -= theta_dual * prow[sz(j)];
+                    d1_refresh(j);
                 }
-                for (Index i = 0; i < m; ++i) y[sz(i)] += theta_dual * rho[sz(i)];
+                // y is row-indexed and rho's support is row-indexed; iterate
+                // the support when the BTRAN stayed hypersparse.
+                if (rho_is_sparse) {
+                    for (const Index i : rho_support)
+                        y[sz(i)] += theta_dual * rho[sz(i)];
+                } else {
+                    for (Index i = 0; i < m; ++i) y[sz(i)] += theta_dual * rho[sz(i)];
+                }
                 d_enter = redcost[sz(q)];
             }
 
@@ -1164,7 +1489,14 @@ core::RawResult solve_dual_simplex_prepared(
         // incrementally (one extra FTRAN), so unlike before there is no
         // O(m)-BTRAN full reset_weights() call needed here every pivot --
         // that was the entire reason exact DSE was capped to m <= 64.
+        const auto pivot_t0 = Clock::now();
         const bool was_flip = apply_pivot(q, qdir, t_step, leave);
+        diag.pivot_apply_ms += ms_since(pivot_t0);
+        // apply_pivot changed q's status (basic, or flipped bound on a
+        // bound-flip) and, on a basis change, the leaving variable's status;
+        // refresh both phase-1 candidacies against their post-pivot state.
+        // Inside the !was_flip branch below, the reduced-cost updates refresh
+        // the pivotal row's support as they go.
         if (!was_flip) {
             // Incremental duals: pi' = pi + (d_q / alpha_rq) * rho makes the
             // entering column's reduced cost exactly zero, and the same scalar
@@ -1180,20 +1512,32 @@ core::RawResult solve_dual_simplex_prepared(
             if (used_bfrt && row_ok && leave_var >= 0) {
                 redcost[sz(q)] = 0.0;
                 redcost[sz(leave_var)] = -theta_dual;
+                d1_refresh(q);
+                d1_refresh(leave_var);
             } else if (row_ok && d_valid && leave_var >= 0) {
                 const f64 theta = d_enter / arq;
-                for (Index i = 0; i < m; ++i) y[sz(i)] += theta * rho[sz(i)];
+                if (rho_is_sparse) {
+                    for (const Index i : rho_support)
+                        y[sz(i)] += theta * rho[sz(i)];
+                } else {
+                    for (Index i = 0; i < m; ++i) y[sz(i)] += theta * rho[sz(i)];
+                }
                 for (const Index j : prow_idx) {
                     if (st[sz(j)] == NonbasicStatus::Basic) continue;
                     redcost[sz(j)] -= theta * prow[sz(j)];
+                    d1_refresh(j);
                 }
                 redcost[sz(q)] = 0.0;
                 redcost[sz(leave_var)] = -theta;
+                d1_refresh(q);
+                d1_refresh(leave_var);
             } else {
                 recompute_pi();                     // exact pi AND exact redcost
                 ++diag.dual_resyncs;
             }
             maybe_update_factor(leave, since_refactor);
+        } else {
+            d1_refresh(q);   // bound flip: status changed, d unchanged
         }
 
         if (t_step <= 1e-12) {
@@ -1208,6 +1552,15 @@ core::RawResult solve_dual_simplex_prepared(
         ++iter;
         if (phase == 1) ++diag.phase1_iterations;
         else            ++diag.phase2_iterations;
+
+        if (trace_fp) {
+            std::fprintf(trace_fp, "%llu %d %d %d %.17g %.17g %d\n",
+                         static_cast<unsigned long long>(iter), phase,
+                         static_cast<int>(q), static_cast<int>(leave),
+                         static_cast<double>(t_step),
+                         static_cast<double>(theta_dual),
+                         used_bfrt ? 1 : 0);
+        }
 
         // Incremental reduced costs are cheap, but long degenerate runs can
         // accumulate enough roundoff to alter ratio-test choices materially.
@@ -1234,6 +1587,7 @@ core::RawResult solve_dual_simplex_prepared(
         }
     }
     diag.loop_ms = ms_since(t_loop);
+    if (trace_fp) std::fclose(trace_fp);
 
     diag.iterations = iter;
     diag.final_phase = phase;
