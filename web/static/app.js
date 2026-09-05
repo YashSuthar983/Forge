@@ -280,19 +280,18 @@
 
     const fd = new FormData();
     const mps = mpsEl.value.trim();
-    // Prefer the visible/edited buffer. Also send preset as a safe fallback.
-    if (mps) {
-      fd.append("mps_text", mps);
-    }
-    if (sourceTab === "eq" && eqEl.value.trim() && !mps) {
+    // Equations tab: send model_text so Maximize/Minimize display flip is known.
+    // Otherwise prefer the MPS buffer (inspect / edit / upload).
+    if (sourceTab === "eq" && eqEl.value.trim()) {
       fd.append("model_text", eqEl.value.trim());
+    } else if (mps) {
+      fd.append("mps_text", mps);
     }
     if (mode === "preset" && selected) {
       fd.append("preset", selected);
     }
-    // If user picked a file and buffer somehow empty, upload the file.
     const file = $("file").files[0];
-    if (!mps && file) {
+    if (!fd.has("mps_text") && !fd.has("model_text") && file) {
       fd.append("file", file);
     }
 
