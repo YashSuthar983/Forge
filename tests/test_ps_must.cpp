@@ -136,9 +136,12 @@ void test_m7_cli_and_m8_public_harnesses() {
     CHECK(fs::is_regular_file(bin / "sor_ext_demo"));
     CHECK(regular_file_count(src / "benchmarks/netlib/mps") > 0);
     CHECK(regular_file_count(src / "benchmarks/miplib-easy/mps") > 0);
-    CHECK(fs::is_regular_file(src / "scripts/run_highs_baseline.py"));
-    CHECK(fs::is_regular_file(src / "scripts/run_cbc_baseline.py"));
-    CHECK(fs::is_regular_file(src / "scripts/run_highs_qp_baseline.py"));
+    // M8 requires a public harness that measures SOR against independent
+    // reference solvers. That used to be one script per baseline
+    // (run_highs_baseline.py, run_cbc_baseline.py, ...); they are now a single
+    // tool that drives HiGHS, CBC, SciPy and Gurobi as external processes and
+    // prints the runs side by side.
+    CHECK(fs::is_regular_file(src / "scripts/compare.py"));
 }
 
 void test_m9_industrial_vertical_slices() {
