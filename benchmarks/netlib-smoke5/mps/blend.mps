@@ -1,1 +1,1 @@
-./benchmarks/netlib/mps/blend.mps
+../../netlib/mps/blend.mps

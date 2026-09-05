@@ -1,1 +1,1 @@
-./benchmarks/netlib/mps/beaconfd.mps
+../../netlib/mps/beaconfd.mps

@@ -1,1 +1,1 @@
-./benchmarks/netlib/mps/adlittle.mps
+../../netlib/mps/adlittle.mps
