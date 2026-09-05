@@ -13,6 +13,10 @@ ctest --test-dir build --output-on-failure
 ./build/forge_solve path/to/model.mps --engine simplex --solution-out out.sol
 ./build/forge_check path/to/model.mps out.sol
 ./build/forge_gen all --seed 42 --outdir examples/
+
+# Python API / REPL (same binaries)
+python3 scripts/forge_repl.py
+python3 scripts/forge_repl.py --one-shot
 ```
 
 | Flag | Values |
