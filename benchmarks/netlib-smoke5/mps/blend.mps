@@ -1,1 +1,1 @@
-/home/yash/Desktop/Sih/sor/benchmarks/netlib/mps/blend.mps
+../../netlib/mps/blend.mps

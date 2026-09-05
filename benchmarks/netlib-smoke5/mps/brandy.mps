@@ -1,1 +1,1 @@
-/home/yash/Desktop/Sih/sor/benchmarks/netlib/mps/brandy.mps
+../../netlib/mps/brandy.mps

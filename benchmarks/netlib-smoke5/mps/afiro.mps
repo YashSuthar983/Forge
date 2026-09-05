@@ -1,1 +1,1 @@
-/home/yash/Desktop/Sih/sor/benchmarks/netlib/mps/afiro.mps
+../../netlib/mps/afiro.mps

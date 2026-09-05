@@ -1,1 +1,1 @@
-/home/yash/Desktop/Sih/sor/benchmarks/netlib/mps/beaconfd.mps
+../../netlib/mps/beaconfd.mps

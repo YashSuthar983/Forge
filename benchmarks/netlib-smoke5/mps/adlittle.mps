@@ -1,1 +1,1 @@
-/home/yash/Desktop/Sih/sor/benchmarks/netlib/mps/adlittle.mps
+../../netlib/mps/adlittle.mps

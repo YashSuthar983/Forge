@@ -1,5 +1,18 @@
 # SIH26119 — copy-paste + verified comparisons
 
+**One-time setup on a fresh clone.** The baseline venv holds the *external*
+solvers (HiGHS/SciPy) used only as separate processes for comparison. It is
+deliberately not in the repository — it contains `libhighs.so`, and shipping a
+competitor's binary would contradict `docs/clean_room_policy.md`. Recreate it:
+
+```bash
+python3 -m venv benchmarks/.venv-baseline
+benchmarks/.venv-baseline/bin/pip install -r benchmarks/requirements-baseline.txt
+```
+
+Only the `PY=` comparison beats need it; every `$SOLVE` / `$CHECK` beat runs
+against SOR alone and works immediately after `cmake --build`.
+
 ```bash
 cd /home/yash/Desktop/Sih/sor
 mkdir -p demo_out
