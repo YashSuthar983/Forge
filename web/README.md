@@ -6,13 +6,10 @@ Thin browser UI over `sor_solve` / `sor_check`. **Not** a modelling product — 
 
 ```bash
 # from repo root (sor/)
-cmake --build build-native -j"$(nproc)"   # need sor_solve, sor_check
+cmake --build build -j"$(nproc)"   # need sor_solve, sor_check
 
-cd web
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python app.py
+./web/run.sh
+# or: cd web && source .venv/bin/activate && python app.py
 ```
 
 Open **http://127.0.0.1:8765**
@@ -21,7 +18,7 @@ Optional env:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SOR_BIN_DIR` | `../build-native` | Directory with `sor_solve`, `sor_check`, `sor_gen` |
+| `SOR_BIN_DIR` | `../build` then `../build-native` | Directory with `sor_solve`, `sor_check`, `sor_gen` |
 | `SOR_EXAMPLES` | `../examples` | Preset MPS/QPS |
 | `SOR_WEB_TIMEOUT` | `90` | Max subprocess seconds |
 | `SOR_WEB_HOST` / `SOR_WEB_PORT` | `127.0.0.1` / `8765` | Bind address |

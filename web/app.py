@@ -91,7 +91,17 @@ End
 
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = Path(__file__).resolve().parent / "static"
-DEFAULT_BIN = Path(os.environ.get("SOR_BIN_DIR", ROOT / "build-native"))
+def _default_bin() -> Path:
+    env = os.environ.get("SOR_BIN_DIR")
+    if env:
+        return Path(env)
+    for cand in (ROOT / "build", ROOT / "build-native"):
+        if (cand / "sor_solve").is_file():
+            return cand
+    return ROOT / "build"
+
+
+DEFAULT_BIN = _default_bin()
 DEFAULT_EXAMPLES = Path(os.environ.get("SOR_EXAMPLES", ROOT / "examples"))
 DEFAULT_TIMEOUT = float(os.environ.get("SOR_WEB_TIMEOUT", "90"))
 SESSIONS = Path(tempfile.gettempdir()) / "sor_web_sessions"
@@ -135,6 +145,15 @@ PRESETS: dict[str, dict[str, Any]] = {
 STATUS_RE = re.compile(r"^status:\s+(\S+)", re.M)
 PROOF_RE = re.compile(r"^proof_level:\s+(\S+)", re.M)
 OBJ_RE = re.compile(r"^objective:\s+([^\s]+)", re.M)
+SOR_SENSE_RE = re.compile(r"^\*\s*SOR_SENSE\s+(MAXIMIZE|MINIMIZE)\s*$", re.M | re.I)
+
+
+def _mps_sense_meta(mps: str) -> dict[str, Any] | None:
+    """Recover maximize/minimize when solving an edited MPS from Write equations."""
+    m = SOR_SENSE_RE.search(mps)
+    if not m:
+        return None
+    return {"maximize": m.group(1).upper() == "MAXIMIZE"}
 HUMAN_RE = re.compile(r"^ {19}(.+)$", re.M)
 DOWNGRADE_RE = re.compile(r"^downgrade:\s+(.+)$", re.M)
 ENGINE_RE = re.compile(r"^engine:\s+(\S+)", re.M)
@@ -317,6 +336,7 @@ async def solve(
             model_path = session / f"model{suffix}"
             model_path.write_text(raw + ("\n" if not raw.endswith("\n") else ""))
             display_name = "Edited model"
+            text_meta = _mps_sense_meta(raw)
             if suffix == ".qps" and engine == "simplex":
                 engine = "qp"
         elif model_text is not None and model_text.strip():
