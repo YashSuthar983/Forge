@@ -272,16 +272,87 @@ Do **not** invent an MRPL rupee license figure.
 
 ## Slide 11 — Research and references
 
-1. Huangfu & Hall — dual revised simplex / parallel simplex (2018)  
-2. Forrest & Goldfarb — dual steepest edge (1992)  
-3. Forrest & Tomlin — basis update (1972); Hall & McKinnon — hypersparse FTRAN/BTRAN (2005)  
-4. Achterberg — branch-and-cut, cuts, propagation (PhD thesis, 2007)  
-5. Koberstein & Suhl — dual BFRT / dual phase 1  
-6. HPR-LP / first-order GPU LP literature  
-7. MIPLIB, Netlib LP, QPLIB, Mittelmann — public benchmarks  
+**Purpose:** credibility + resource hub (not a dry bibliography). Judges see *where ideas came from* and get *one-tap access* to evidence.
 
-Full DOI index: `docs/paper_bibliography.md`  
-Footer: GitHub · hosted CLI demo · `docs/PS_ALIGNMENT.md`
+```text
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Point Blank                          RESEARCH AND REFERENCES    2026│
+├────────────────────────────────────────────┬─────────────────────────────┤
+│  MAIN LIST (7 rows, alt. blue / green)     │                             │
+│                                            │      ┌─────────────┐        │
+│  1  Huangfu & Hall (2018)                  │      │             │        │
+│     Dual revised simplex / PAMI blueprint  │      │   QR CODE   │        │
+│                                            │      │             │        │
+│  2  Forrest–Tomlin (1972) · Hall–McKinnon  │      └─────────────┘        │
+│     (2005) — FT update + hypersparse LA    │                             │
+│                                            │   Try out FORGE HERE          │
+│  3  Koberstein / Koberstein–Suhl           │   (hosted CLI / web console)│
+│     Dual BFRT + dual phase 1               │                             │
+│                                            │                             │
+│  4  HPR-LP — Chen et al. (MPC 2025)        │                             │
+│     Halpern Peaceman–Rachford GPU FO LP    │                             │
+│     arXiv:2408.12179                       │                             │
+│                                            │                             │
+│  5  cuPDLPx — Lu, Peng, Yang (2025)        │                             │
+│     Restart + PID primal weight            │                             │
+│     arXiv:2507.14051                       │                             │
+│                                            │                             │
+│  6  Achterberg (2007) + Andersen–Andersen  │                             │
+│     Branch-and-cut · LP/MILP presolve      │                             │
+│                                            │                             │
+│  7  Netlib · MIPLIB 2017 · Mittelmann      │                             │
+│     Public benchmarks (independent oracle) │                             │
+├────────────────────────────────────────────┴─────────────────────────────┤
+│  DELIVERABLES (four equal tiles)                                         │
+│                                                                          │
+│  Paper Index          GitHub Source         Hosted Demo       Whitepaper │
+│  paper_bibliography   (FORGE clean-room)      Try FORGE HERE      PS align + │
+│  · arXiv DOIs         no HiGHS/SCIP/cuOpt   CLI / web console architecture│
+│                                                                          │
+│  note under GitHub: “From-scratch LP·MILP·QP · Vulkan HPR”               │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                              page · 11   │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### Layout notes (match OAAS demo slide)
+
+| Zone | Content |
+|------|---------|
+| **Header** | Left: **Point Blank** · Center: **RESEARCH AND REFERENCES** · Right: **2026** logo |
+| **Left list** | 7 alternating rows (light blue / green) — papers + benchmark community, not only authors |
+| **Right CTA** | Large QR → hosted demo URL · caption **“Try out FORGE HERE.”** |
+| **Bottom strip** | 4 links: Paper Index → GitHub → Hosted Demo → Whitepaper |
+| **Footer** | Page **11** bottom-right |
+
+### Visual hierarchy (judge eye path)
+
+```text
+RESEARCH AND REFERENCES
+        ↓
+ Sources / papers / benchmarks  ←→  QR / live demo
+        ↓
+ Paper Index | GitHub | Hosted Demo | Whitepaper
+```
+
+Three layers:
+
+1. **Credibility** — peer-reviewed simplex + HPR/GPU FO foundations  
+2. **Demonstration** — QR to try FORGE  
+3. **Verification** — bibliography, source, live system, write-up  
+
+### Paste URLs before freeze
+
+| Tile | Placeholder |
+|------|-------------|
+| QR / Hosted Demo | `https://<your-hosted-forge-demo>` |
+| GitHub Source | `https://github.com/<org>/forge` |
+| Paper Index | repo `docs/paper_bibliography.md` (or raw GitHub URL) |
+| Whitepaper | `docs/PS_ALIGNMENT.md` + `docs/architecture.md` (or PDF export) |
+
+### Speaker one-liner
+
+> “We did not wrap HiGHS. Every major technique has a paper; you can scan the QR to run the same CLI judges will see, then open the repo and the paper index.”
 
 ---
 
