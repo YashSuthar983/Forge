@@ -1,0 +1,18 @@
+# External-solver baselines used ONLY as separate processes for differential
+# testing and benchmark comparison. Never linked into SOR, never in the solve
+# path, never in a certificate -- see docs/clean_room_policy.md.
+#
+# Recreate with:
+#   python3 -m venv benchmarks/.venv-baseline
+#   benchmarks/.venv-baseline/bin/pip install -r benchmarks/requirements-baseline.txt
+#
+# The venv itself is .gitignore'd: it contains libhighs.so, and committing a
+# competitor solver's binary would contradict the clean-room claim.
+
+highspy==1.15.1
+scipy==1.18.1
+numpy==2.5.2
+PuLP==3.3.2
+pandas==3.0.5
+matplotlib==3.11.1
+PyYAML==6.0.3
