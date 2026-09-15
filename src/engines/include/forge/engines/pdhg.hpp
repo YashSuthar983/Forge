@@ -79,7 +79,16 @@ struct RuizScaling {
 };
 
 // Scales `p` in place. Exposed for testing.
-RuizScaling ruiz_scale(model::LpProblem& p, int iterations);
+//
+// `power_of_two` rounds every factor to the nearest power of two before it is
+// applied. Scaling is then EXACT in binary floating point -- a factor of 2^k
+// only changes an exponent, so every scaled coefficient keeps the mantissa of
+// the original, and unscaling recovers it bit for bit. The price is a coarser
+// equilibration: a factor may be off its ideal value by up to sqrt(2), so a
+// scaled row spans a factor of 2 rather than being flat. Standard practice in
+// production simplex codes for exactly this trade.
+RuizScaling ruiz_scale(model::LpProblem& p, int iterations,
+                       bool power_of_two = false);
 
 // Solves and returns a RawResult. The caller must pass it through
 // certify::finalize_result to obtain a reportable SolveResult. This engine

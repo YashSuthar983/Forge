@@ -1,5 +1,6 @@
 add_library(forge_search
-  src/bab.cpp src/cuts.cpp src/propagate.cpp
+  src/bab.cpp src/cuts.cpp src/propagate.cpp src/conflict.cpp
+  src/feasjump.cpp src/lns.cpp src/covers.cpp src/mir.cpp
   src/miqp.cpp src/minlp.cpp src/lattice_reform.cpp)
 add_library(forge::search ALIAS forge_search)
 target_include_directories(forge_search PUBLIC include)

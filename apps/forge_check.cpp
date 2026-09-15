@@ -49,8 +49,22 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--tol") {
-            if (i + 1 >= argc) { usage(); return 2; }
-            tol = std::strtod(argv[++i], nullptr);
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "error: --tol needs a value\n");
+                return 2;
+            }
+            // strtod with a null end pointer accepts "abc" as 0 and takes
+            // "nan"/"inf" at face value, so a mistyped tolerance silently
+            // changed what the checker accepts instead of failing.
+            const std::string text = argv[++i];
+            std::size_t used = 0;
+            try { tol = std::stod(text, &used); } catch (const std::exception&) { used = 0; }
+            if (used != text.size() || !std::isfinite(tol) || !(tol > 0.0)) {
+                std::fprintf(stderr,
+                             "error: --tol expects a finite number greater than 0, "
+                             "got '%s'\n", text.c_str());
+                return 2;
+            }
         } else if (a == "-h" || a == "--help") {
             usage();
             return 0;
