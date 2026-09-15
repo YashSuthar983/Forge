@@ -37,11 +37,25 @@ enum class ConflictCutMode : std::uint8_t {
 };
 
 struct ConflictCutOptions {
+    // Default on for Latest. Dense pure-binary MIPs (enigma) auto-select
+    // SafeLimited unless force_paper; Classical forces off via policy.
     bool enabled = true;
-    // Latest default = paper-complete path.
+    // Latest default = paper-complete; dense binaries may switch to SafeLimited.
     ConflictCutMode mode = ConflictCutMode::Paper;
+    // When true, keep Paper even on dense pure-binary (--conflict-cut-paper).
+    bool force_paper = false;
     int max_resolve_steps = 64;
     f64 tol = 1e-9;
+    // Cap global conflict cuts per solve. Adaptive in bab: start here, may
+    // rise to max_learned_cuts_hi when cuts help, stays low on many aborts.
+    int max_learned_cuts = 24;
+    int max_learned_cuts_hi = 48;
+    // Branch-trail assignment nogoods (WP-2), independent of the Mexi path:
+    // cheap, binary-only, valid by node-infeasibility. Classical turns these
+    // off too via apply_conflict_cut_policy; the dense-binary Mexi auto-off
+    // leaves them on (no trail analysis, no LP stall).
+    bool nogood_cuts = true;
+    int max_nogood_cuts = 24;
     // Prefer cMIR reduction (Prop. 2 / general Marchand–Wolsey) before / with
     // the coefficient-tightening loop.
     bool use_cmirror = true;
@@ -95,21 +109,59 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
                                             const ConflictCutOptions& opts,
                                             ConflictCutDiagnostics& diag);
 
-// Validity check for tiny binary models (enumeration).
-bool conflict_cut_valid_binary(const model::LpProblem& lp,
-                               const CutRow& cut,
-                               f64 tol = 1e-9);
+// Outcome of a cut validity check. The checkers are fail-closed: they never
+// CLAIM validity they did not verify.
+//   Refuted    — a point feasible for `lp` (rows + bounds) that violates the
+//                cut was exhibited; the cut is invalid for this model.
+//   Verified   — the complete integer box (all integer columns enumerated,
+//                every continuous column fixed) contains no violating point;
+//                the cut is valid for every integer-feasible point.
+//   Unverified — the box is too large to enumerate or a continuous column is
+//                free; no conclusion. The caller decides via derivation trust
+//                (Mexi cuts derive from global rows only; nogoods derive from
+//                nodes proven infeasible under their full branch path).
+enum class CutValidity : std::uint8_t {
+    Refuted = 0,
+    Verified = 1,
+    Unverified = 2,
+};
 
-// Validity check for tiny general-integer / mixed models (bounded enumeration
-// over integers; continuous columns must be fixed or the check is skipped).
-bool conflict_cut_valid_general(const model::LpProblem& lp,
-                                const CutRow& cut,
-                                f64 tol = 1e-9,
-                                std::size_t max_points = 1u << 16,
-                                bool* enumerated = nullptr);
+// Binary-box check. Complete (Verified/Refuted) only when every integer
+// column is binary, every continuous column is fixed, and the binary count
+// fits the enumeration budget; otherwise a cheap refutation-only sweep over
+// the cut support runs (sound when it fires, Unverified when it does not).
+CutValidity conflict_cut_check_binary(const model::LpProblem& lp,
+                                      const CutRow& cut,
+                                      f64 tol = 1e-9);
+
+// General-integer check. Complete (Verified/Refuted) when every continuous
+// column is fixed and the integer box fits max_points; otherwise
+// Unverified. `enumerated` (optional) reports whether the complete
+// enumeration ran.
+CutValidity conflict_cut_check_general(const model::LpProblem& lp,
+                                       const CutRow& cut,
+                                       f64 tol = 1e-9,
+                                       std::size_t max_points = 1u << 16,
+                                       bool* enumerated = nullptr);
+
+// Assignment nogood from Branch trail entries (binary only):
+//   sum_{j fixed 0} x_j + sum_{j fixed 1} (1 - x_j) >= 1
+// Returns nullopt if fewer than one branched binary.
+std::optional<CutRow> build_nogood_from_branch_trail(const PropTrail& trail,
+                                                     const model::LpProblem& lp,
+                                                     f64 tol = 1e-9);
+
+// True iff the cut has no usable support (empty / all-near-zero coefs).
+bool conflict_cut_near_empty(const CutRow& cut, f64 tol = 1e-12);
 
 inline void apply_conflict_cut_policy(MilpPolicy policy, ConflictCutOptions& o) {
-    if (policy == MilpPolicy::Classical) o.enabled = false;
+    // Classical ablation: all conflict-derived learning off — Mexi analysis
+    // AND branch-trail nogoods. Latest keeps the struct defaults (enabled /
+    // nogood_cuts = true) subject to CLI --no-conflict-cut / --no-nogood-cuts.
+    if (policy == MilpPolicy::Classical) {
+        o.enabled = false;
+        o.nogood_cuts = false;
+    }
 }
 
 }  // namespace sor::search

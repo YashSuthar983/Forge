@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <optional>
 #include <vector>
 
 namespace sor::search {
@@ -843,19 +844,54 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
     return geq_to_cut(clean);
 }
 
-bool conflict_cut_valid_binary(const model::LpProblem& lp,
-                               const CutRow& cut,
-                               f64 tol) {
+CutValidity conflict_cut_check_binary(const model::LpProblem& lp,
+                                      const CutRow& cut,
+                                      f64 tol) {
     const Index n = lp.n_cols();
+    // Complete enumeration is possible only when the whole box is decided:
+    // every integer column binary, every continuous column fixed. Anything
+    // else leaves room for a violating point outside the sweep, so the
+    // result there is at most a refutation, never a verification.
     std::vector<Index> bins;
+    bins.reserve(sz(n));
+    bool complete = true;
     for (Index j = 0; j < n; ++j) {
-        if (!lp.is_integer.empty() && lp.is_integer[sz(j)] &&
-            lp.col_lo[sz(j)] >= -tol && lp.col_hi[sz(j)] <= 1.0 + tol)
-            bins.push_back(j);
+        const bool is_int =
+            !lp.is_integer.empty() && lp.is_integer[sz(j)];
+        if (is_int) {
+            if (lp.col_lo[sz(j)] >= -tol && lp.col_hi[sz(j)] <= 1.0 + tol) {
+                bins.push_back(j);
+            } else {
+                complete = false;  // general integer freedom
+            }
+        } else if (lp.col_lo[sz(j)] != lp.col_hi[sz(j)]) {
+            complete = false;  // free continuous column
+        }
     }
-    if (bins.empty()) return true;
-    const std::size_t nb = bins.size();
-    if (nb > 20) return true;
+
+    // Refutation sweep over a candidate set: points built from enumerated
+    // columns with everything else at its fixed value (0 when free) are
+    // genuine LP points, so a violating one is a definitive witness. Used
+    // for the full binary set when complete, else for the cut support.
+    std::vector<Index> sweep;
+    if (complete) {
+        if (bins.size() > 16) return CutValidity::Unverified;  // 2^16 budget
+        sweep = bins;
+    } else {
+        // Support-only sweep: sound for refutation, not for verification
+        // (columns outside the support sit at 0/fixed, not their whole box).
+        if (!cut.cols.empty() && cut.cols.size() <= 20) {
+            for (Index j : cut.cols) {
+                if (j < 0 || j >= n) continue;
+                if (!lp.is_integer.empty() && lp.is_integer[sz(j)] &&
+                    lp.col_lo[sz(j)] >= -tol && lp.col_hi[sz(j)] <= 1.0 + tol)
+                    sweep.push_back(j);
+            }
+        }
+        if (sweep.empty()) return CutValidity::Unverified;
+    }
+
+    const std::size_t nb = sweep.size();
     const std::size_t total = static_cast<std::size_t>(1) << nb;
     std::vector<f64> x(static_cast<std::size_t>(n), 0.0);
     for (Index j = 0; j < n; ++j) {
@@ -864,23 +900,25 @@ bool conflict_cut_valid_binary(const model::LpProblem& lp,
     }
     for (std::size_t mask = 0; mask < total; ++mask) {
         for (std::size_t b = 0; b < nb; ++b)
-            x[sz(bins[b])] = static_cast<f64>((mask >> b) & 1);
+            x[sz(sweep[b])] = static_cast<f64>((mask >> b) & 1);
         if (lp.max_row_violation(x) > tol || lp.max_bound_violation(x) > tol)
             continue;
         f64 lhs = 0.0;
         for (std::size_t t = 0; t < cut.cols.size(); ++t)
             lhs += cut.vals[t] * x[sz(cut.cols[t])];
-        if (std::isfinite(cut.row_lo) && lhs + tol < cut.row_lo) return false;
-        if (std::isfinite(cut.row_hi) && lhs > cut.row_hi + tol) return false;
+        if (std::isfinite(cut.row_lo) && lhs + tol < cut.row_lo)
+            return CutValidity::Refuted;
+        if (std::isfinite(cut.row_hi) && lhs > cut.row_hi + tol)
+            return CutValidity::Refuted;
     }
-    return true;
+    return complete ? CutValidity::Verified : CutValidity::Unverified;
 }
 
-bool conflict_cut_valid_general(const model::LpProblem& lp,
-                                const CutRow& cut,
-                                f64 tol,
-                                std::size_t max_points,
-                                bool* enumerated) {
+CutValidity conflict_cut_check_general(const model::LpProblem& lp,
+                                       const CutRow& cut,
+                                       f64 tol,
+                                       std::size_t max_points,
+                                       bool* enumerated) {
     if (enumerated) *enumerated = false;
     const Index n = lp.n_cols();
     std::vector<Index> ints;
@@ -888,7 +926,10 @@ bool conflict_cut_valid_general(const model::LpProblem& lp,
     std::size_t product = 1;
     for (Index j = 0; j < n; ++j) {
         if (lp.is_integer.empty() || !lp.is_integer[sz(j)]) {
-            if (lp.col_lo[sz(j)] != lp.col_hi[sz(j)]) return true;
+            // A free continuous column puts points outside any enumeration:
+            // unverifiable (fail-closed), NOT silently valid.
+            if (lp.col_lo[sz(j)] != lp.col_hi[sz(j)])
+                return CutValidity::Unverified;
             continue;
         }
         const int lj = static_cast<int>(std::ceil(lp.col_lo[sz(j)] - tol));
@@ -897,14 +938,13 @@ bool conflict_cut_valid_general(const model::LpProblem& lp,
         const std::size_t span = static_cast<std::size_t>(uj - lj + 1);
         if (product > max_points / std::max<std::size_t>(span, 1)) {
             if (enumerated) *enumerated = false;
-            return true;
+            return CutValidity::Unverified;
         }
         product *= span;
         ints.push_back(j);
         lo_i.push_back(lj);
         hi_i.push_back(uj);
     }
-    if (ints.empty()) return true;
     if (enumerated) *enumerated = true;
 
     std::vector<int> cur(ints.size());
@@ -934,12 +974,62 @@ bool conflict_cut_valid_general(const model::LpProblem& lp,
             f64 lhs = 0.0;
             for (std::size_t t = 0; t < cut.cols.size(); ++t)
                 lhs += cut.vals[t] * x[sz(cut.cols[t])];
-            if (std::isfinite(cut.row_lo) && lhs + tol < cut.row_lo) return false;
-            if (std::isfinite(cut.row_hi) && lhs > cut.row_hi + tol) return false;
+            if (std::isfinite(cut.row_lo) && lhs + tol < cut.row_lo)
+                return CutValidity::Refuted;
+            if (std::isfinite(cut.row_hi) && lhs > cut.row_hi + tol)
+                return CutValidity::Refuted;
         }
         if (!advance()) break;
     }
+    return CutValidity::Verified;
+}
+
+bool conflict_cut_near_empty(const CutRow& cut, f64 tol) {
+    if (cut.cols.empty() || cut.vals.empty()) return true;
+    if (cut.cols.size() != cut.vals.size()) return true;
+    for (f64 v : cut.vals)
+        if (std::fabs(v) > tol) return false;
     return true;
+}
+
+std::optional<CutRow> build_nogood_from_branch_trail(const PropTrail& trail,
+                                                    const model::LpProblem& lp,
+                                                    f64 tol) {
+    const Index n = lp.n_cols();
+    // Last Branch assignment wins per variable (deeper decisions override).
+    std::vector<int> assign(static_cast<std::size_t>(n), -1);  // -1 unset, 0/1
+    for (const auto& e : trail.entries()) {
+        if (e.kind != ReasonKind::Branch) continue;
+        if (e.var < 0 || e.var >= n) continue;
+        if (lp.is_integer.empty() || !lp.is_integer[sz(e.var)]) continue;
+        // Binary only (global box [0,1]).
+        if (lp.col_lo[sz(e.var)] < -tol || lp.col_hi[sz(e.var)] > 1.0 + tol)
+            continue;
+        // Branch to 1: raise lower bound to 1. Branch to 0: drop upper to 0.
+        if (e.dir == BoundDir::Lower && e.new_bound >= 1.0 - tol)
+            assign[sz(e.var)] = 1;
+        else if (e.dir == BoundDir::Upper && e.new_bound <= tol)
+            assign[sz(e.var)] = 0;
+    }
+    CutRow row;
+    row.name = "nogood";
+    int n_true = 0;
+    for (Index j = 0; j < n; ++j) {
+        const int a = assign[sz(j)];
+        if (a < 0) continue;
+        row.cols.push_back(j);
+        if (a == 0) {
+            row.vals.push_back(1.0);  // x_j
+        } else {
+            row.vals.push_back(-1.0);  // -x_j from (1 - x_j)
+            ++n_true;
+        }
+    }
+    if (row.cols.empty()) return std::nullopt;
+    // sum False x + sum True (1-x) >= 1  ⇒  ... >= 1 - n_true
+    row.row_lo = 1.0 - static_cast<f64>(n_true);
+    row.row_hi = model::kInf;
+    return row;
 }
 
 }  // namespace sor::search

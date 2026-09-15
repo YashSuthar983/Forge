@@ -19,16 +19,11 @@ DualInitialPricingStrategy choose_dual_initial_pricing(
     const long double aspect =
         static_cast<long double>(structural_cols) / row_count;
     const long double row_degree = static_cast<long double>(nnz) / row_count;
-    const long double boxed_fraction = structural_cols > 0
-        ? static_cast<long double>(boxed_structural_cols) /
-              static_cast<long double>(structural_cols)
-        : 0.0L;
 
     if (rows >= 512 && aspect < 1.0L && row_degree < 4.0L)
         return DualInitialPricingStrategy::Dantzig;
-    if (rows >= 512 && aspect > 4.0L && row_degree >= 20.0L &&
-        boxed_fraction >= 0.5L)
-        return DualInitialPricingStrategy::Dantzig;
+    // Wide boxed models still benefit from edge weights. Box density alone
+    // does not justify Dantzig pricing; retain DSE and its measured fallback.
     if (rows >= 1000 && rows < 3000 && aspect >= 1.0L &&
         aspect < 2.0L && row_degree < 8.0L)
         return DualInitialPricingStrategy::Devex;

@@ -97,8 +97,13 @@ void LiveMatrix::build(const model::LpProblem& problem,
         }
         recompute_row_activity(i);
     }
-    for (Index j = 0; j < n; ++j)
-        if (col_active[sz(j)]) recompute_col_locks(j);
+    // The aggregation-only path needs matrix incidence, but never reads locks.
+    // Computing each lock rescans its incident rows and can cost sum(degree^2)
+    // on wide matrices even when presolve makes no reductions.
+    if (options.live_reductions) {
+        for (Index j = 0; j < n; ++j)
+            if (col_active[sz(j)]) recompute_col_locks(j);
+    }
 }
 
 void LiveMatrix::seed_all_queues() {

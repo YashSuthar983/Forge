@@ -43,6 +43,17 @@ void ScMilpModel::clear() {
     loaded = false;
 }
 
+bool ScMilpModel::finite() const {
+    if (!std::isfinite(intercept)) return false;
+    for (f64 v : weights)
+        if (!std::isfinite(v)) return false;
+    for (f64 v : stratum_bias)
+        if (!std::isfinite(v)) return false;
+    for (f64 v : proj)
+        if (!std::isfinite(v)) return false;
+    return true;
+}
+
 void ScMilpModel::embed(const BranchFeatureVec& x,
                         std::array<f64, kScMilpEmbedDim>& z) const {
     z.fill(0.0);
@@ -129,6 +140,21 @@ ScMilpModel fit_sc_milp_contrastive(const std::vector<ScMilpSample>& samples,
     const f64 lam = std::max(0.0, opts.contrastive_weight);
     const f64 tau = std::max(1e-3, opts.contrastive_tau);
     const f64 alpha = opts.stratum_alpha;
+    constexpr f64 kClip = 10.0;
+    auto clip_inplace = [](f64& v) {
+        if (!std::isfinite(v)) {
+            v = 0.0;
+            return;
+        }
+        if (v > kClip) v = kClip;
+        if (v < -kClip) v = -kClip;
+    };
+    auto sanitize_model = [&](ScMilpModel& m) {
+        clip_inplace(m.intercept);
+        for (f64& v : m.weights) clip_inplace(v);
+        for (f64& v : m.stratum_bias) clip_inplace(v);
+        for (f64& v : m.proj) clip_inplace(v);
+    };
 
     for (int epoch = 0; epoch < opts.epochs; ++epoch) {
         // --- L_sup: pairwise ranking + within-decision expert push ---
@@ -144,6 +170,10 @@ ScMilpModel fit_sc_milp_contrastive(const std::vector<ScMilpSample>& samples,
                 const f64 margin =
                     model.score(samples[pos].feats) -
                     model.score(samples[neg].feats);
+                if (!std::isfinite(margin)) {
+                    sanitize_model(model);
+                    continue;
+                }
                 const f64 g = (1.0 - sigmoid(margin));
                 ++pair_count;
                 for (int k = 0; k < kBranchFeatureDim; ++k) {
@@ -181,6 +211,10 @@ ScMilpModel fit_sc_milp_contrastive(const std::vector<ScMilpSample>& samples,
             std::vector<f64> scores(idxs.size(), 0.0);
             for (std::size_t t = 0; t < idxs.size(); ++t) {
                 scores[t] = model.score(samples[idxs[t]].feats);
+                if (!std::isfinite(scores[t])) {
+                    sanitize_model(model);
+                    scores[t] = 0.0;
+                }
                 max_s = std::max(max_s, scores[t]);
             }
             f64 Z = 0.0;
@@ -188,7 +222,7 @@ ScMilpModel fit_sc_milp_contrastive(const std::vector<ScMilpSample>& samples,
                 s = std::exp(s - max_s);
                 Z += s;
             }
-            if (!(Z > 0.0)) continue;
+            if (!(Z > 0.0) || !std::isfinite(Z)) continue;
             for (std::size_t t = 0; t < idxs.size(); ++t) {
                 const f64 p = scores[t] / Z;
                 const f64 target = (idxs[t] == expert) ? 1.0 : 0.0;
@@ -203,7 +237,7 @@ ScMilpModel fit_sc_milp_contrastive(const std::vector<ScMilpSample>& samples,
         }
 
         // --- L_cons: dynamic stratified contrastive on embeddings ---
-        if (lam <= 0.0) continue;
+        if (lam > 0.0) {
         std::vector<std::array<f64, kScMilpEmbedDim>> Z(samples.size());
         std::vector<int> G(samples.size(), 0);
         for (std::size_t i = 0; i < samples.size(); ++i) {
@@ -243,6 +277,7 @@ ScMilpModel fit_sc_milp_contrastive(const std::vector<ScMilpSample>& samples,
                 const f64 sim_n = w * cosine_sim(Z[i], Z[nidx]) / tau;
                 // Gradient on score of (sim_p - sim_n): push embeds apart/together.
                 const f64 margin = sim_p - sim_n;
+                if (!std::isfinite(margin)) continue;
                 const f64 g = lam * (1.0 - sigmoid(margin)) * lr;
                 // Update projection rows via feature outer products (approx).
                 for (int r = 0; r < kScMilpEmbedDim; ++r) {
@@ -268,13 +303,25 @@ ScMilpModel fit_sc_milp_contrastive(const std::vector<ScMilpSample>& samples,
                 ++cons_count;
             }
         }
+        }
+        sanitize_model(model);
+        if (!model.finite()) {
+            model.clear();
+            return model;
+        }
     }
 
+    sanitize_model(model);
+    if (!model.finite()) {
+        model.clear();
+        return model;
+    }
     model.loaded = true;
     return model;
 }
 
 bool save_sc_milp_model(const std::string& path, const ScMilpModel& model) {
+    if (!model.finite()) return false;
     std::ofstream out(path);
     if (!out) return false;
     out << "SOR_SC_MILP 2\n";
@@ -341,6 +388,12 @@ bool load_sc_milp_model(const std::string& path, ScMilpModel& model) {
     }
     if (model.base_dim <= 0 || model.base_dim > kBranchFeatureDim) return false;
     if (model.n_strata != kBranchStratumCount) return false;
+    // P0 (2026-09-14): refuse NaN-poisoned weights — old fits wrote "nan"
+    // and load treated them as loaded=true, silently disabling learned branch.
+    if (!model.finite()) {
+        model.clear();
+        return false;
+    }
     model.loaded = true;
     return true;
 }
@@ -350,12 +403,18 @@ Index pick_sc_milp_branch(const ScMilpModel& model,
                           const std::vector<BranchFeatureVec>& feats,
                           bool allow_heuristic) {
     if (candidates.empty() || candidates.size() != feats.size()) return -1;
-    if (!model.loaded && !allow_heuristic) return -1;
+    const bool use_model = model.loaded && model.finite();
+    if (!use_model && !allow_heuristic) return -1;
     Index best = -1;
     f64 best_s = -std::numeric_limits<f64>::infinity();
     for (std::size_t k = 0; k < candidates.size(); ++k) {
-        const f64 s = model.loaded ? model.score(feats[k])
-                                   : heuristic_sc_milp_score(feats[k]);
+        f64 s = use_model ? model.score(feats[k])
+                          : heuristic_sc_milp_score(feats[k]);
+        if (!std::isfinite(s)) {
+            if (!allow_heuristic) continue;
+            s = heuristic_sc_milp_score(feats[k]);
+            if (!std::isfinite(s)) continue;
+        }
         if (s > best_s) {
             best_s = s;
             best = candidates[k];

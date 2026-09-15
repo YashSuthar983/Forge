@@ -36,7 +36,7 @@ Vulkan `LpDevice` builds by default (`-DSOR_ENABLE_VULKAN=ON`). CUDA is a stub.
 | Markowitz LU, hypersparse FTRAN/BTRAN, FT opt-in | `sor_la_cpu` |
 | Presolve v1, Ruiz scaling | `sor_presolve` / engines |
 | HPR on CPU/Vulkan; vanilla PDHG | `hpr.cpp` / `pdhg.cpp` |
-| MILP root B&C | `sor_search` |
+| MILP B&B (Latest: learned branch/cuts/LNS) | `sor_search` |
 | Convex QP | `qp.cpp` |
 | `Optimal` only via `finalize_result` | `sor_certify` |
 | Independent checker | `cli/sor_check.cpp` |

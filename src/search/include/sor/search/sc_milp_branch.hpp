@@ -50,6 +50,8 @@ struct ScMilpModel {
     bool loaded = false;
 
     void clear();
+    // True when every weight / bias / proj entry is finite (safe to score).
+    bool finite() const;
     // Contrastive / ranking score (higher = prefer to branch).
     f64 score(const BranchFeatureVec& x) const;
     void embed(const BranchFeatureVec& x, std::array<f64, kScMilpEmbedDim>& z) const;
@@ -70,9 +72,9 @@ struct ScMilpCollector {
 };
 
 struct ScMilpFitOptions {
-    f64 lr = 0.05;
+    f64 lr = 0.02;  // lower default: 0.05 + contrastive proj diverged to NaN
     int epochs = 40;
-    f64 contrastive_weight = 0.5;  // λ on L_cons; L = L_sup + λ L_cons
+    f64 contrastive_weight = 0.25;  // λ on L_cons; L = L_sup + λ L_cons
     f64 contrastive_tau = 0.08;
     f64 stratum_alpha = 0.75;  // α in w(g,g') = σ(α |g-g'|)
     int pair_cap = 8000;

@@ -7,6 +7,7 @@
 #include "test_helpers.hpp"
 
 #include <cstdio>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -95,6 +96,42 @@ void test_fit_rank_and_roundtrip() {
     std::vector<sor::core::Index> cands = {0, 1};
     std::vector<BranchFeatureVec> feats = {a, b};
     CHECK(sor::search::pick_sc_milp_branch(loaded, cands, feats) == 1);
+    std::remove(path);
+}
+
+void test_load_rejects_nan_poisoned_model() {
+    // P0 regression: NaN weights must not set loaded=true.
+    const char* path = "sc_milp_nan_poison.model";
+    {
+        std::ofstream out(path);
+        out << "SOR_SC_MILP 2\n"
+               "base_dim 24\n"
+               "n_strata 8\n"
+               "embed_dim 8\n"
+               "intercept 0\n"
+               "weights";
+        for (int i = 0; i < 24; ++i) out << " nan";
+        out << "\nstratum_bias";
+        for (int i = 0; i < 8; ++i) out << " nan";
+        out << "\nproj";
+        for (int i = 0; i < 8 * 24; ++i) out << " 0.1";
+        out << "\n";
+    }
+    ScMilpModel m;
+    CHECK(!sor::search::load_sc_milp_model(path, m));
+    CHECK(!m.loaded);
+    CHECK(m.finite());  // cleared
+    // Pick must fall back to heuristic, not NaN argmax.
+    BranchFeatureVec a{};
+    a.fill(0.0);
+    a[0] = 0.1;
+    BranchFeatureVec b{};
+    b.fill(0.0);
+    b[0] = 0.5;
+    b[7] = 1.0;
+    std::vector<sor::core::Index> cands = {0, 1};
+    std::vector<BranchFeatureVec> feats = {a, b};
+    CHECK(sor::search::pick_sc_milp_branch(m, cands, feats, true) == 1);
     std::remove(path);
 }
 
@@ -187,6 +224,7 @@ void test_auto_prefers_sc_without_sparse_model() {
 int main() {
     test_stratum_and_heuristic();
     test_fit_rank_and_roundtrip();
+    test_load_rejects_nan_poisoned_model();
     test_bab_sc_milp_fires();
     test_classical_ignores_sc_milp();
     test_auto_prefers_sc_without_sparse_model();

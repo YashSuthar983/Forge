@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <deque>
+#include <fstream>
 #include <limits>
 #include <numeric>
 #include <queue>
@@ -3000,6 +3001,23 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     apply_policy_tree_cuts(opts.policy, tree_cut_opts);
     ConflictCutOptions conflict_cut_opts = opts.conflict_cut;
     apply_conflict_cut_policy(opts.policy, conflict_cut_opts);
+    // Dense pure-binary (enigma-class): Mexi trail+analysis stalls node LPs
+    // (Interrupted / unproved) even in SafeLimited. Keep default-on for mixed
+    // MIPs; auto-disable here unless --conflict-cut-paper / force_paper.
+    if (conflict_cut_opts.enabled && !conflict_cut_opts.force_paper) {
+        Index n_bin = 0, n_int = 0;
+        for (Index j = 0; j < problem.n_cols(); ++j) {
+            if (problem.is_integer.empty() || !problem.is_integer[sz(j)])
+                continue;
+            ++n_int;
+            if (problem.col_lo[sz(j)] >= -1e-9 &&
+                problem.col_hi[sz(j)] <= 1.0 + 1e-9)
+                ++n_bin;
+        }
+        if (n_bin >= 80 && n_bin == n_int)
+            conflict_cut_opts.enabled = false;
+    }
+    int conflict_cut_cap = conflict_cut_opts.max_learned_cuts;
     DynSepOptions dynsep_opts = opts.dynsep;
     // Sync nested separator option structs / force-allow from BabOptions.
     dynsep_opts.zerohalf = opts.zerohalf;
@@ -3010,6 +3028,8 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     if (opts.zerohalf_cuts) dynsep_opts.allow_zerohalf = true;
     if (opts.flow_cover_cuts) dynsep_opts.allow_flowcover = true;
     apply_dynsep_policy(opts.policy, dynsep_opts);
+    // The small short-budget light-arm clamp lives AFTER the L2Sep block
+    // below (it must override the prior's optional-arm enables).
 
     L2SepOptions l2sep_opts = opts.l2sep;
     apply_l2sep_policy(opts.policy, l2sep_opts);
@@ -3050,6 +3070,19 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         if (opts.zerohalf_cuts) dynsep_opts.allow_zerohalf = true;
         if (opts.flow_cover_cuts) dynsep_opts.allow_flowcover = true;
     }
+    // Small short-budget instances keep DynSep ON but under a structural
+    // light-arm clamp (measured 2026-09-14, gt2/lseu: MIR/cover arms stalled
+    // dual proofs). L2Sep still runs first and sets its own allow/budget
+    // priors; this clamp then OVERRIDES the optional arms — it is a
+    // structural rule keyed on (n_cols, time limit), not an L2Sep decision.
+    if (milp_policy_is_latest(opts.policy) && dynsep_opts.enabled &&
+        problem.n_cols() <= 400 && opts.time_limit_s > 0.0 &&
+        opts.time_limit_s <= 60.0) {
+        dynsep_opts.max_depth_optional = 0;
+        dynsep_opts.max_optional_arms = 1;
+        if (!opts.mir_cuts) dynsep_opts.allow_mir = false;
+        if (!opts.lifted_cover_cuts) dynsep_opts.allow_cover = false;
+    }
 
     DynSepController dynsep(dynsep_opts);
     f64 dynsep_last_gain = 0.0;
@@ -3086,13 +3119,35 @@ core::RawResult solve_milp(const model::LpProblem& problem,
 
     const bool latest_branch = milp_policy_is_latest(opts.policy);
     const bool sparse_sb_want = latest_branch && opts.sparse_sb.enabled;
-    if (sparse_sb_want && !opts.sparse_sb.model_path.empty()) {
-        if (!load_sparse_sb_model(opts.sparse_sb.model_path, sparse_sb_model))
+    auto try_default_model = [](std::string& path, const char* leaf) {
+        if (!path.empty()) return;
+        const char* cands[] = {
+            "models/milp/",
+            "./models/milp/",
+            "../models/milp/",
+            "share/sor/milp/",
+        };
+        for (const char* prefix : cands) {
+            std::string p = std::string(prefix) + leaf;
+            std::ifstream in(p);
+            if (in) {
+                path = std::move(p);
+                return;
+            }
+        }
+    };
+    // Copy paths so we can fill defaults without mutating caller's options.
+    SparseSbOptions sparse_sb_opts = opts.sparse_sb;
+    ScMilpOptions sc_milp_opts = opts.sc_milp;
+    try_default_model(sparse_sb_opts.model_path, "sparse_sb.model");
+    try_default_model(sc_milp_opts.model_path, "sc_milp.model");
+    if (sparse_sb_want && !sparse_sb_opts.model_path.empty()) {
+        if (!load_sparse_sb_model(sparse_sb_opts.model_path, sparse_sb_model))
             sparse_sb_model.clear();
     }
-    const bool sc_milp_want = latest_branch && opts.sc_milp.enabled;
-    if (sc_milp_want && !opts.sc_milp.model_path.empty()) {
-        if (!load_sc_milp_model(opts.sc_milp.model_path, sc_milp_model))
+    const bool sc_milp_want = latest_branch && sc_milp_opts.enabled;
+    if (sc_milp_want && !sc_milp_opts.model_path.empty()) {
+        if (!load_sc_milp_model(sc_milp_opts.model_path, sc_milp_model))
             sc_milp_model.clear();
     }
     const bool lifted_want = latest_branch && opts.lifted.enabled;
@@ -3121,18 +3176,24 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         if (!latest_branch) return BranchStrategy::Auto;
         if (opts.branch_strategy != BranchStrategy::Auto)
             return opts.branch_strategy;
-        // Auto: sparse-SB if model else SC-MILP / Lifted heuristics else RB.
-        if (sparse_sb_model.loaded) return BranchStrategy::SparseSb;
+        // Auto: SC-MILP when available (enigma-scale proofs). Sparse-SB only
+        // on larger models — cold Sparse-SB hurt dense binaries. Tiny models
+        // without SC fall through to reliability (BranchStrategy::Auto).
         if (sc_milp_want &&
-            (sc_milp_model.loaded || opts.sc_milp.use_heuristic_without_model))
+            (sc_milp_model.loaded || sc_milp_opts.use_heuristic_without_model))
             return BranchStrategy::ScMilp;
-        if (lifted_want) return BranchStrategy::Lifted;
-        return BranchStrategy::SparseSb;  // falls through to RB without model
+        if (mip.n_cols() > 250 && sparse_sb_model.loaded)
+            return BranchStrategy::SparseSb;
+        if (mip.n_cols() > 250 && lifted_want) return BranchStrategy::Lifted;
+        return BranchStrategy::Auto;  // reliability / pseudocost path
     };
     const BranchStrategy branch_strat = resolve_branch_strategy();
     diag.branch_strategy_resolved = branch_strat;
 
-    const bool sparse_sb_model_ready = sparse_sb_want && sparse_sb_model.loaded;
+    const bool sparse_sb_model_ready =
+        sparse_sb_want && sparse_sb_model.loaded &&
+        (opts.branch_strategy == BranchStrategy::SparseSb ||
+         mip.n_cols() > 250);
     const bool collect_sparse_sb =
         sparse_sb_want && opts.sparse_sb.collect_labels;
     const bool collect_sc_milp =
@@ -3169,6 +3230,10 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     // certified node LPs still control correctness.
     const bool use_reliability = opts.reliability_branching &&
         n <= 2000 && mip.nnz() <= 10000;
+    // Latest + small models: plunge toward integer for faster proofs (enigma).
+    const bool hybrid_nodes =
+        opts.hybrid_node_selection ||
+        (milp_policy_is_latest(opts.policy) && n <= 500);
     std::uint64_t strong_branch_budget = use_reliability
         ? opts.strong_branch_nodes : 0;
     std::vector<Index> col_degree(sz(n), 0);
@@ -3201,6 +3266,12 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     // duplicate solve on schedule_milp HUGE.
     engines::SimplexBasis cut_loop_basis;
     bool have_cut_loop_basis = false;
+    // True once a root relaxation (cut loop or root node LP) has been
+    // CERTIFIED optimal with a finite objective. Every node LP is a
+    // restriction of the root box, so this implies no descendant can be
+    // unbounded — which is what makes an InfeasibleOrUnbounded node status
+    // trustworthy as "infeasible" for nogood learning below.
+    bool root_relaxation_bounded = false;
     std::uint64_t tightened_row_bounds = 0;
     model::LpProblem search_problem = mip;
     if (opts.integer_row_rounding)
@@ -3309,22 +3380,47 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     f64 last_dual_bound = -std::numeric_limits<f64>::infinity();
     std::uint64_t last_dual_node = 0;
 
-    auto heuristics_over_budget = [&]() {
+    auto heuristics_over_budget = [&](double intended_budget_ms = 0.0) {
         if (opts.time_limit_s <= 0.0) return false;
         // Two regimes, because the trade-off genuinely reverses. With no
         // incumbent the heuristics are the only thing that can produce one and
         // the tree has nothing to prune against, so they get most of the
         // budget. Once an incumbent exists the tree is what closes the gap, and
         // every further second in a heuristic is a second it does not get.
+        // Third: small residual gap → proof mode (even tighter heuristic share).
+        const bool proof_mode =
+            have_incumbent && std::isfinite(diag.gap_rel) &&
+            diag.gap_rel >= 0.0 &&
+            diag.gap_rel < opts.heuristic_proof_gap;
         const double frac =
             !have_incumbent ? opts.heuristic_budget_frac_no_incumbent
             : dual_stalled  ? opts.heuristic_budget_frac_stalled
+            : proof_mode   ? opts.heuristic_budget_frac_proof
                             : opts.heuristic_budget_frac;
         if (frac >= 1.0) return false;
         const bool over = diag.heuristic_ms + diag.feasjump_ms + diag.sub_mip_ms >
                           frac * opts.time_limit_s * 1000.0;
-        if (over) ++diag.heuristic_budget_blocks;
+        if (over) {
+            ++diag.heuristic_budget_blocks;
+            if (intended_budget_ms > 0.0)
+                diag.heuristic_budget_blocked_ms += intended_budget_ms;
+        }
         return over;
+    };
+    auto in_proof_mode = [&]() {
+        return have_incumbent && std::isfinite(diag.gap_rel) &&
+               diag.gap_rel >= 0.0 &&
+               diag.gap_rel < opts.heuristic_proof_gap;
+    };
+    // Live gap for proof-mode gates. Without this, diag.gap_rel stays +inf
+    // until teardown and heuristics_over_budget never enters proof_mode
+    // (gt2 spent ~45% wall in Balans with incumbent already at opt).
+    auto refresh_live_gap = [&](f64 dual_min_working) {
+        if (!have_incumbent || !std::isfinite(best_incumbent)) return;
+        if (!std::isfinite(dual_min_working)) return;
+        const f64 dual_orig = sense * dual_min_working;
+        diag.gap_rel = std::fabs(best_incumbent - dual_orig) /
+                       (1.0 + std::fabs(best_incumbent));
     };
 
 
@@ -3341,7 +3437,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     auto try_feasjump = [&](const std::vector<f64>* seed, double budget,
                             f64 cutoff) -> bool {
         if (!opts.feasibility_jump || budget <= 0.01) return false;
-        if (heuristics_over_budget()) return false;
+        if (heuristics_over_budget(budget * 1000.0)) return false;
         FeasJumpOptions fo;
         fo.time_limit_s = budget;
         fo.feas_tol = opts.primal_feas_tol;
@@ -3376,6 +3472,12 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         best_x = std::move(xf);
         ++diag.feasjump_hits;
         ++diag.heuristic_hits;
+        {
+            f64 dual_min = last_dual_bound;
+            if (!open.empty() && std::isfinite(open.top().bound))
+                dual_min = open.top().bound;
+            refresh_live_gap(dual_min);
+        }
         if (opts.verbose)
             std::printf("  [milp] feasjump incumbent %.10e at node %llu\n",
                         best_incumbent,
@@ -3473,13 +3575,23 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         best_incumbent = o;
         best_x = xs;
         ++diag.heuristic_hits;
+        {
+            f64 dual_min = last_dual_bound;
+            if (!open.empty() && std::isfinite(open.top().bound))
+                dual_min = open.top().bound;
+            refresh_live_gap(dual_min);
+        }
         return true;
     };
 
     // Classical: AlnsScheduler over Neighborhood. Latest: Balans over
-    // Neighborhood + KP/MRENS/FeasJump/BTBS/CL-TLNS.
+    // Neighborhood + KP/MRENS/FeasJump/BTBS/CL-TLNS. On small short-budget
+    // MIPs Balans burns wall clock that Classical spends closing the dual
+    // (gt2/lseu); keep Balans for larger models.
     const bool use_balans =
-        milp_policy_is_latest(opts.policy) && opts.balans.enabled;
+        milp_policy_is_latest(opts.policy) && opts.balans.enabled &&
+        !(mip.n_cols() <= 400 && opts.time_limit_s > 0.0 &&
+          opts.time_limit_s <= 60.0);
     AlnsScheduler alns(opts.lns);
     BalansScheduler balans(opts.balans);
     std::uint32_t lns_rng =
@@ -3595,6 +3707,8 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                 ++diag.lp_solves;
             }
             if (!relaxation_proved(cut_lp_raw, cut_sd, cut_lp_opts)) break;
+            // Certified finite root relaxation: all descendant LPs are bounded.
+            root_relaxation_bounded = true;
             if (round == 0) diag.root_bound_before_cuts = cut_lp_raw.objective;
             diag.root_bound_after_cuts = cut_lp_raw.objective;
 
@@ -4003,6 +4117,78 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     model::LpProblem node_lp = global_lp;
     std::uint64_t local_cut_seq = 0;
 
+    auto refresh_conflict_cap = [&]() {
+        if (diag.conflict_cut_diag.aborted >
+            2u * (1u + diag.conflict_cuts_global)) {
+            conflict_cut_cap = std::min(conflict_cut_cap,
+                                       conflict_cut_opts.max_learned_cuts);
+        } else if (diag.conflict_cuts_global >= 1 &&
+                   diag.conflict_cut_diag.aborted <=
+                       diag.conflict_cut_diag.learned) {
+            conflict_cut_cap =
+                std::max(conflict_cut_cap, conflict_cut_opts.max_learned_cuts_hi);
+        }
+    };
+    auto try_apply_validated_global_cut = [&](const CutRow& learned,
+                                              bool as_nogood) -> bool {
+        if (conflict_cut_near_empty(learned, conflict_cut_opts.tol)) {
+            if (!as_nogood) ++diag.conflict_cut_diag.aborted;
+            return false;
+        }
+        // Defense-in-depth gate, fail-closed on REFUTATION only:
+        //   Refuted   -> a feasible point violating the cut was exhibited;
+        //                reject outright.
+        //   Verified  -> the full integer box was enumerated and the cut
+        //                holds; accept.
+        //   Unverified-> the box cannot be enumerated (free continuous
+        //                columns, too many integer points). Accept on
+        //                derivation trust: Mexi cuts are analyzed against
+        //                GLOBAL rows only (flugpl fix) and nogoods come from
+        //                nodes proven infeasible under their full branch
+        //                path. Those derivations carry the soundness; the
+        //                checkers exist to catch derivation bugs whenever a
+        //                witness is reachable inside the sweep budget.
+        const CutValidity vb = conflict_cut_check_binary(
+            global_lp, learned, conflict_cut_opts.tol);
+        const CutValidity vg =
+            (vb == CutValidity::Refuted)
+                ? CutValidity::Refuted
+                : conflict_cut_check_general(global_lp, learned,
+                                             conflict_cut_opts.tol);
+        if (vb == CutValidity::Refuted || vg == CutValidity::Refuted) {
+            if (!as_nogood) ++diag.conflict_cut_diag.aborted;
+            return false;
+        }
+        global_lp = apply_cuts(global_lp, {learned}, opts.cut);
+        if (as_nogood) {
+            ++diag.nogood_cuts_global;
+        } else {
+            ++diag.conflict_cuts_global;
+            refresh_conflict_cap();
+        }
+        return true;
+    };
+    auto try_learn_nogood = [&](const PropTrail& trail) {
+        // Separate switch from the Mexi path: --no-conflict-cut /
+        // Classical turn both off via policy / CLI; the dense-binary
+        // auto-off leaves nogoods on (no trail analysis involved). The cap
+        // keeps global_lp growth bounded on infeasible-heavy trees.
+        if (!conflict_cut_opts.nogood_cuts) return;
+        if (diag.nogood_cuts_global >=
+            static_cast<std::uint64_t>(conflict_cut_opts.max_nogood_cuts))
+            return;
+        auto ng = build_nogood_from_branch_trail(trail, global_lp,
+                                                 conflict_cut_opts.tol);
+        if (!ng) return;
+        (void)try_apply_validated_global_cut(*ng, /*as_nogood=*/true);
+    };
+
+    // Tree-restart bookkeeping (Latest).
+    std::uint64_t nodes_since_incumbent_improve = 0;
+    bool had_significant_incumbent_jump = false;
+    f64 last_incumbent_for_restart = best_incumbent;
+    int tree_restarts_done = 0;
+
     std::string reason = "node limit";
     bool stopped_early = false;
     bool all_lp_proven = true;
@@ -4052,6 +4238,108 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         }
         ++diag.nodes;
 
+        // Incumbent-improve clock for tree restarts (Latest).
+        if (have_incumbent && std::isfinite(best_incumbent)) {
+            const bool better =
+                !std::isfinite(last_incumbent_for_restart) ||
+                (mip.maximize
+                     ? best_incumbent > last_incumbent_for_restart + 1e-15
+                     : best_incumbent < last_incumbent_for_restart - 1e-15);
+            if (better) {
+                if (!std::isfinite(last_incumbent_for_restart)) {
+                    had_significant_incumbent_jump = true;
+                } else {
+                    const f64 scale =
+                        1.0 + std::fabs(last_incumbent_for_restart);
+                    const f64 rel =
+                        std::fabs(best_incumbent - last_incumbent_for_restart) /
+                        scale;
+                    if (rel > opts.tree_restart_improve_rel)
+                        had_significant_incumbent_jump = true;
+                }
+                nodes_since_incumbent_improve = 0;
+                last_incumbent_for_restart = best_incumbent;
+            } else {
+                ++nodes_since_incumbent_improve;
+            }
+        } else {
+            ++nodes_since_incumbent_improve;
+        }
+
+        // One-shot tree restart under Latest after a significant incumbent
+        // jump followed by a long dry spell.
+        if (milp_policy_is_latest(opts.policy) && opts.tree_restart &&
+            tree_restarts_done < opts.tree_restart_max &&
+            had_significant_incumbent_jump && have_incumbent &&
+            nodes_since_incumbent_improve >= opts.tree_restart_node_gap) {
+            while (!open.empty()) open.pop();
+            plunge_stack.clear();
+
+            // Reduced-cost fixing from a certified root LP (dual prices).
+            {
+                model::LpProblem root_lp = global_lp;
+                root_lp.col_lo = root_lo;
+                root_lp.col_hi = root_hi;
+                engines::SimplexOptions ropts = opts.lp;
+                ropts.verbose = false;
+                engines::SimplexDiagnostics rsd;
+                engines::SimplexBasis rbas;
+                auto rraw =
+                    engines::solve_simplex(root_lp, ropts, rsd, &rbas);
+                ++diag.lp_solves;
+                diag.lp_iterations += rsd.iterations;
+                if (relaxation_proved(rraw, rsd, ropts) &&
+                    static_cast<Index>(rraw.y.size()) == root_lp.n_rows() &&
+                    static_cast<Index>(rraw.x.size()) == n) {
+                    const f64 dual_min = sense * rraw.objective;
+                    const f64 inc_min = sense * best_incumbent;
+                    const f64 gap = std::max(0.0, inc_min - dual_min);
+                    std::vector<f64> rc(sz(n), 0.0);
+                    for (Index j = 0; j < n; ++j)
+                        rc[sz(j)] = global_lp.c[sz(j)];
+                    const auto& rp = global_lp.A.pattern.row_ptr();
+                    const auto& ci = global_lp.A.pattern.col_idx();
+                    for (Index i = 0; i < global_lp.n_rows(); ++i) {
+                        const f64 yi = rraw.y[sz(i)];
+                        for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1];
+                             ++k)
+                            rc[sz(ci[sz(k)])] -= yi * global_lp.A.vals[sz(k)];
+                    }
+                    if (global_lp.maximize)
+                        for (f64& v : rc) v = -v;
+                    const f64 rctol = opts.primal_feas_tol;
+                    for (Index j = 0; j < n; ++j) {
+                        if (root_hi[sz(j)] <= root_lo[sz(j)] + rctol)
+                            continue;
+                        if (std::fabs(rraw.x[sz(j)] - root_lo[sz(j)]) <=
+                                rctol &&
+                            rc[sz(j)] >= gap - rctol) {
+                            root_hi[sz(j)] = root_lo[sz(j)];
+                        } else if (std::fabs(rraw.x[sz(j)] - root_hi[sz(j)]) <=
+                                       rctol &&
+                                   rc[sz(j)] <= -gap + rctol) {
+                            root_lo[sz(j)] = root_hi[sz(j)];
+                        }
+                    }
+                }
+            }
+
+            Node root;
+            root.col_lo = root_lo;
+            root.col_hi = root_hi;
+            root.bound = -std::numeric_limits<f64>::infinity();
+            root.depth = 0;
+            open.push(std::move(root));
+            ++diag.tree_restarts;
+            ++tree_restarts_done;
+            nodes_since_incumbent_improve = 0;
+            if (opts.verbose)
+                std::printf("  [milp] tree restart #%d at node %llu\n",
+                            tree_restarts_done,
+                            static_cast<unsigned long long>(diag.nodes));
+            continue;  // drop the stalled node; expand rebuilt root next
+        }
+
         // Track the global dual bound. Under best-bound selection the popped
         // node's own bound IS the global bound, so its movement is exactly the
         // signal for whether the tree is still making progress. Plunge nodes
@@ -4063,6 +4351,12 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                 last_dual_bound = node.bound;
                 last_dual_node = diag.nodes;
             }
+            refresh_live_gap(node.bound);
+        } else if (have_incumbent) {
+            f64 dual_min = last_dual_bound;
+            if (!open.empty() && std::isfinite(open.top().bound))
+                dual_min = open.top().bound;
+            refresh_live_gap(dual_min);
         }
         // "Not converting nodes into proof" has two faces: the bound has
         // stopped moving, or it is moving but is still so far from the
@@ -4101,7 +4395,12 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         }
         if (opts.domain_propagation) {
             PropagateResult prop;
-            if (conflict_cut_opts.enabled) {
+            // Trail + Mexi analysis is expensive on dense binaries (enigma).
+            // Cap learned cuts; after the budget, use plain propagation.
+            const bool mexi_active =
+                conflict_cut_opts.enabled &&
+                static_cast<int>(diag.conflict_cuts_global) < conflict_cut_cap;
+            if (mexi_active) {
                 prop = propagate_bounds_trail(
                     node_lp, node.col_lo, node.col_hi, &node.prop_trail,
                     node.depth, opts.primal_feas_tol, opts.propagation_max_rounds);
@@ -4113,7 +4412,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             diag.propagation_tightenings += prop.tightened;
             if (!prop.feasible) {
                 ++diag.propagation_prunes;
-                if (conflict_cut_opts.enabled) {
+                if (mexi_active) {
                     ConflictAnalysisContext cctx;
                     // Analyze against the global LP only. node_lp may contain
                     // local tree cuts (GMI under branched bounds); those must
@@ -4127,10 +4426,11 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                     cctx.n_global_rows = global_lp.n_rows();
                     if (auto learned = analyze_conflict_cuts(
                             cctx, conflict_cut_opts, diag.conflict_cut_diag)) {
-                        global_lp = apply_cuts(global_lp, {*learned}, opts.cut);
-                        ++diag.conflict_cuts_global;
+                        (void)try_apply_validated_global_cut(
+                            *learned, /*as_nogood=*/false);
                     }
                 }
+                try_learn_nogood(node.prop_trail);
                 continue;
             }
         }
@@ -4148,6 +4448,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             diag.conflict_prop_tightenings += forced;
             if (!ok) {
                 ++diag.conflict_prop_prunes;
+                try_learn_nogood(node.prop_trail);
                 continue;
             }
         }
@@ -4235,6 +4536,17 @@ core::RawResult solve_milp(const model::LpProblem& problem,
 
         if (lp_raw.proposed_status == core::Status::Infeasible ||
             lp_raw.proposed_status == core::Status::InfeasibleOrUnbounded) {
+            // Nogood trust: a plain Infeasible is the same certificate the
+            // prune itself trusts. InfeasibleOrUnbounded is only safe to
+            // turn into a GLOBAL cut when the certified root relaxation
+            // rules out the unbounded arm (every descendant of a bounded
+            // root box is bounded); without that, the node may merely be
+            // unbounded and excluding its assignment globally could cut off
+            // feasible points.
+            const bool infeasible_trusted =
+                lp_raw.proposed_status == core::Status::Infeasible ||
+                root_relaxation_bounded;
+            if (infeasible_trusted) try_learn_nogood(node.prop_trail);
             continue;  // prune
         }
         // An interrupted/numerically unproved relaxation is not evidence that
@@ -4260,6 +4572,8 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             break;
         }
         const bool node_lp_proved = relaxation_proved(lp_raw, sd, lp_opts);
+        if (node_lp_proved && node.depth == 0 && std::isfinite(lp_raw.objective))
+            root_relaxation_bounded = true;
         if (!node_lp_proved) {
             all_lp_proven = false;
             if (!lp_point_feasible) {
@@ -4336,6 +4650,8 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                     have_incumbent = true;
                     best_incumbent = lp_obj;
                     best_x = lp_raw.x;
+                    refresh_live_gap(std::isfinite(lp_obj_min) ? lp_obj_min
+                                                               : last_dual_bound);
                     if (opts.verbose) {
                         std::printf("  [milp] incumbent %.10e at node %llu\n",
                                     best_incumbent,
@@ -4351,7 +4667,8 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         // feasibility pump and the structured searches, and on several
         // instances it was the single largest consumer of wall time.
         const auto t_heur = Clock::now();
-        if (opts.rounding_heuristic && !heuristics_over_budget()) {
+        if (opts.rounding_heuristic &&
+            !heuristics_over_budget(opts.lp_rounding_repair_time_s * 1000.0)) {
             std::vector<f64> xh;
             bool rounded = false;
             f64 rounded_obj = mip.maximize
@@ -4730,6 +5047,8 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             const bool lns_on = opts.sub_mip_lns && opts.sub_mip_depth == 0 &&
                                 (use_balans ? opts.balans.enabled
                                             : opts.lns.enabled) &&
+                                !in_proof_mode() &&
+                                !heuristics_over_budget() &&
                                 diag.nodes >= last_lns_node + interval;
             if (lns_on) {
                 last_lns_node = diag.nodes;
@@ -4784,7 +5103,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                     double budget = std::min(opts.lns.call_time_s,
                                              std::max(0.0, seconds_left() * 0.5));
                     const bool blocked =
-                        heuristics_over_budget() ||
+                        heuristics_over_budget(budget * 1000.0) ||
                         (opts.time_limit_s > 0.0 &&
                          diag.sub_mip_ms >
                              opts.lns.budget_frac * opts.time_limit_s * 1000.0);
@@ -4841,7 +5160,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                         std::min(opts.balans.call_time_s,
                                  std::max(0.0, seconds_left() * 0.5));
                     const bool blocked =
-                        heuristics_over_budget() ||
+                        heuristics_over_budget(budget * 1000.0) ||
                         (opts.time_limit_s > 0.0 &&
                          diag.sub_mip_ms >
                              opts.balans.budget_frac * opts.time_limit_s *
@@ -5137,8 +5456,12 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         }
 
         // Dedicated Kernel Pump at the root under Latest (incumbent hunt).
+        // Skip on small short-budget MIPs: KP eats root wall that HiGHS spends
+        // on cuts/branch; Balans can still call KP later if needed.
+        const bool kp_root_ok =
+            !(n <= 400 && opts.time_limit_s > 0.0 && opts.time_limit_s <= 45.0);
         if (use_balans && opts.kernel_pump.enabled && diag.nodes == 1 &&
-            !heuristics_over_budget() &&
+            kp_root_ok && !heuristics_over_budget() &&
             static_cast<Index>(lp_raw.x.size()) == n) {
             const auto t_kp = Clock::now();
             KernelPumpOptions ko = opts.kernel_pump;
@@ -5393,7 +5716,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                 return false;
             const Index sc_br = pick_sc_milp_branch(
                 sc_milp_model, candidates, cand_feats,
-                opts.sc_milp.use_heuristic_without_model);
+                sc_milp_opts.use_heuristic_without_model);
             if (sc_br < 0) return false;
             br = sc_br;
             ++diag.sc_milp_picks;
@@ -5726,6 +6049,16 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             if (opts.clique_cuts) dynsep_opts.allow_clique = true;
             if (opts.zerohalf_cuts) dynsep_opts.allow_zerohalf = true;
             if (opts.flow_cover_cuts) dynsep_opts.allow_flowcover = true;
+            // Re-assert the structural light-arm clamp after the mid-tree
+            // L2Sep re-apply (it would otherwise re-enable MIR/cover).
+            if (milp_policy_is_latest(opts.policy) && dynsep_opts.enabled &&
+                problem.n_cols() <= 400 && opts.time_limit_s > 0.0 &&
+                opts.time_limit_s <= 60.0) {
+                dynsep_opts.max_depth_optional = 0;
+                dynsep_opts.max_optional_arms = 1;
+                if (!opts.mir_cuts) dynsep_opts.allow_mir = false;
+                if (!opts.lifted_cover_cuts) dynsep_opts.allow_cover = false;
+            }
             dynsep.update_options(dynsep_opts);
             last_l2sep_node = diag.nodes;
             diag.l2sep = l2sep_diag;
@@ -5739,6 +6072,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             (diag.nodes > last_dual_node) ? (diag.nodes - last_dual_node) : 0;
         if (tree_cut_opts.enabled && node_lp_proved &&
             !node_basis.basic.empty() &&
+            !in_proof_mode() &&
             should_separate_at_node(node.depth, since_dual, tree_cut_opts)) {
             ++diag.tree_cut_nodes;
             DynSepRoundInput dsin;
@@ -5918,14 +6252,20 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             for (int t = 0; t < take; ++t) {
                 ManagedCut mc;
                 mc.row = tcands[ranked[static_cast<std::size_t>(t)].second];
-                // GMI from local tableau is local; ZH/FC/MIR/cover from rows
-                // with local box are still treated as local for safety.
-                mc.global = false;
+                // Tableau GMI under node bounds is subtree-local. Row-derived
+                // ZH / flow / MIR / cover are globally valid for GCS promote.
+                const std::string& nm = mc.row.name;
+                const bool tableau_gmi = nm.rfind("GMI_", 0) == 0;
+                mc.global = !tableau_gmi;
                 mc.created_depth = node.depth;
                 mc.created_node = diag.nodes;
-                mc.id = "local-" + std::to_string(++local_cut_seq);
+                mc.id = (mc.global ? "g-" : "local-") +
+                        std::to_string(++local_cut_seq);
                 sel_names.push_back(mc.row.name);
                 eff_sum += ranked[static_cast<std::size_t>(t)].first;
+                // Keep on the local trial list for optional parent reoptimize;
+                // children do not inherit (warm-start). Global ones are also
+                // observed into GCS for promote/reinject.
                 new_locals.push_back(std::move(mc));
             }
             if (take > 0) {
@@ -6003,12 +6343,17 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         down.col_hi[sz(br)] = std::min(down.col_hi[sz(br)], floor_v);
         down.bound = node.bound;
         down.depth = node.depth + 1;
-        if (conflict_cut_opts.enabled) {
-            down.prop_trail.push(br, BoundDir::Upper, floor_v, down_old_hi,
-                                 ReasonKind::Branch, -1, down.depth);
-        }
+        // Always record Branch reasons for nogood / Mexi trails.
+        down.prop_trail.push(br, BoundDir::Upper, floor_v, down_old_hi,
+                             ReasonKind::Branch, -1, down.depth);
         down.basis = node_basis;
-        down.has_basis = !node_basis.basic.empty() && new_locals.empty();
+        // Do not inherit local cuts into children: applying them changes the
+        // LP row count and was wiping dual warm-starts under Latest (gt2 /
+        // mod008 showed 0 warm hits vs classical ~100%). Local GMI stays
+        // node-local for this solve only; children restart from the warm
+        // parent basis without those rows.
+        down.active_local.clear();
+        down.has_basis = !node_basis.basic.empty();
         down.parent_branch_var = br;
         down.parent_branch_dir = -1;
         down.parent_bound = node_lp_proved && std::isfinite(lp_obj_min)
@@ -6020,24 +6365,16 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         up.col_lo[sz(br)] = std::max(up.col_lo[sz(br)], ceil_v);
         up.bound = node.bound;
         up.depth = node.depth + 1;
-        if (conflict_cut_opts.enabled) {
-            up.prop_trail.push(br, BoundDir::Lower, ceil_v, up_old_lo,
-                               ReasonKind::Branch, -1, up.depth);
-        }
+        up.prop_trail.push(br, BoundDir::Lower, ceil_v, up_old_lo,
+                           ReasonKind::Branch, -1, up.depth);
         up.basis = node_basis;
-        up.has_basis = !node_basis.basic.empty() && new_locals.empty();
+        up.active_local.clear();
+        up.has_basis = !node_basis.basic.empty();
         up.parent_branch_var = br;
         up.parent_branch_dir = +1;
         up.parent_bound = node_lp_proved && std::isfinite(lp_obj_min)
                               ? lp_obj_min : core::kNaN;
         up.parent_branch_distance = ceil_v - xv;
-
-        if (!new_locals.empty()) {
-            down.active_local.insert(down.active_local.end(),
-                                     new_locals.begin(), new_locals.end());
-            up.active_local.insert(up.active_local.end(),
-                                   new_locals.begin(), new_locals.end());
-        }
 
         // Best-bound remains the proof ordering; integer_up_bias only picks
         // which child is the more promising integer direction on degenerate
@@ -6053,7 +6390,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         const bool fallback_range =
             fallback.col_lo[sz(br)] <= fallback.col_hi[sz(br)] + 1e-12;
 
-        const bool plunge_this = opts.hybrid_node_selection &&
+        const bool plunge_this = hybrid_nodes &&
                                  node.plunge_len < opts.plunge_max_depth &&
                                  preferred_range;
         if (plunge_this) {
@@ -6145,7 +6482,21 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     // node's failure could have contaminated.
     const bool gap_proved = have_incumbent && std::isfinite(dual_orig) &&
                             diag.gap_rel <= opts.gap_tol;
-    diag.globally_proved = all_lp_proven && (tree_exhausted || gap_proved);
+    // Correctness gate: never claim Optimal if the dual bound crosses the
+    // incumbent (would require an invalid cut / bound). Keep Feasible.
+    bool dual_crosses_incumbent = false;
+    if (have_incumbent && std::isfinite(dual_orig)) {
+        const f64 dual_min = sense * dual_orig;
+        const f64 inc_min = sense * best_incumbent;
+        if (dual_min >
+            inc_min + opts.gap_tol * (1.0 + std::fabs(inc_min))) {
+            dual_crosses_incumbent = true;
+            if (reason.find("dual crossed") == std::string::npos)
+                reason += "; dual crossed incumbent (refused Optimal)";
+        }
+    }
+    diag.globally_proved = all_lp_proven && !dual_crosses_incumbent &&
+                           (tree_exhausted || gap_proved);
 
     diag.lns.arms = alns.arms();
     diag.balans.arms = balans.arms();

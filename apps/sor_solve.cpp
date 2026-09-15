@@ -113,7 +113,10 @@ void usage() {
         "  --planbb-mcts-depth N  PlanB&B MCTS depth cap (default 3)\n"
         "  --no-planbb-mcts       use shallow lookahead only (no MCTS)\n"
         "  --no-conflict-prop  skip conflict-graph propagation at nodes\n"
-        "  --no-conflict-cut   disable Mexi cut-based conflict (Latest default on)\n"
+        "  --conflict-cut      enable Mexi cut-based conflict (default on)\n"
+        "  --no-conflict-cut   disable conflict learning (Mexi cuts + nogoods)\n"
+        "  --conflict-cut-paper  force Paper Mexi even on dense pure-binary\n"
+        "  --no-nogood-cuts    disable branch-trail nogood cuts only\n"
         "  --no-dynsep         disable DynSep separator adapter (Latest default on)\n"
         "  --dynsep-backend B  auto|gnn|ucb (default auto: GNN if model else UCB)\n"
         "  --dynsep-model PATH load DynSep GNN (SOR_DYNSEP); Latest prefers GNN\n"
@@ -426,7 +429,9 @@ int main(int argc, char** argv) {
     double cut_par_penalty = -1.0;
     double cut_extra_scores = -1.0;
     bool conflict_propagation = true;
-    bool conflict_cut = true;
+    bool conflict_cut = true;  // default-on; auto-off on dense pure-binary
+    bool conflict_cut_paper = false;
+    bool nogood_cuts = true;
     bool dynsep = true;
     double dynsep_ucb = -1.0;
     int dynsep_max_optional = -1;
@@ -672,7 +677,10 @@ int main(int argc, char** argv) {
         else if (a == "--cut-parallel-penalty")
             cut_par_penalty = parse_real(next("--cut-parallel-penalty"), "--cut-parallel-penalty", 0.0);
         else if (a == "--no-conflict-prop") conflict_propagation = false;
+        else if (a == "--conflict-cut") conflict_cut = true;
         else if (a == "--no-conflict-cut") conflict_cut = false;
+        else if (a == "--conflict-cut-paper") conflict_cut_paper = true;
+        else if (a == "--no-nogood-cuts") nogood_cuts = false;
         else if (a == "--no-dynsep") dynsep = false;
         else if (a == "--dynsep-backend")
             dynsep_backend = next("--dynsep-backend");
@@ -969,6 +977,12 @@ int main(int argc, char** argv) {
             }
             bab.conflict_propagation = conflict_propagation;
             bab.conflict_cut.enabled = conflict_cut;
+            // --no-conflict-cut is the conflict-LEARNING family switch:
+            // both the Mexi path and branch-trail nogoods go off together.
+            bab.conflict_cut.nogood_cuts = conflict_cut && nogood_cuts;
+            bab.conflict_cut.force_paper = conflict_cut_paper;
+            if (conflict_cut_paper)
+                bab.conflict_cut.mode = sor::search::ConflictCutMode::Paper;
             bab.dynsep.enabled = dynsep;
             bab.dynsep.model_path = dynsep_model;
             bab.dynsep.collect_labels = dynsep_collect;
@@ -1146,9 +1160,16 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(diag.cl_tlns.fixed),
                         static_cast<unsigned long long>(diag.cl_tlns.free_integer),
                         diag.cl_tlns.seconds);
-            std::printf("heuristics:        %.1f ms total, %llu budget blocks\n",
+            std::printf("heuristics:        %.1f ms total, %.1f ms blocked "
+                        "(%llu denials)\n",
                         diag.heuristic_ms + diag.feasjump_ms + diag.sub_mip_ms,
+                        diag.heuristic_budget_blocked_ms,
                         static_cast<unsigned long long>(diag.heuristic_budget_blocks));
+            std::printf("conflict learning: %llu mexi cuts global "
+                        "(%llu aborted), %llu nogoods global\n",
+                        static_cast<unsigned long long>(diag.conflict_cuts_global),
+                        static_cast<unsigned long long>(diag.conflict_cut_diag.aborted),
+                        static_cast<unsigned long long>(diag.nogood_cuts_global));
             std::printf("feasibility jump:  %llu attempts, %llu hits, %llu moves, "
                         "%llu reweights, %llu restarts, best %zu violated rows "
                         "(%.1f ms)\n",

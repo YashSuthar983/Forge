@@ -8,6 +8,12 @@ build-*/
 CMakeCache.txt
 CMakeFiles/
 
+# ---- models ----------------------------------------------------------------
+# Shipped solver models under models/milp/ ARE tracked. Training outputs and
+# backups are reproducible via apps/sor_milp_train and stay local.
+models/milp-retrain/
+models/**/*.bak
+
 # ---- Python ----------------------------------------------------------------
 __pycache__/
 *.py[cod]

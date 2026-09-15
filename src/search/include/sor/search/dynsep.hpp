@@ -96,8 +96,9 @@ struct DynSepOptions {
     // Always schedule these when allowed (cheap / historically useful baseline).
     bool always_gmi = true;
     bool always_ib = true;
-    // Arms the bandit / GNN may enable. MIR/cover/clique default false
-    // (measurement); ZH/flow default true as DynSep engines with small budgets.
+    // Arms the bandit / GNN may enable. MIR/cover/clique stay opt-in:
+    // enabling MIR+cover by default stalled dual proofs on gt2 (Latest
+    // Feasible @1.4% gap; --no-dynsep Optimal in 15s). ZH/flow remain on.
     bool allow_gmi = true;
     bool allow_mir = false;
     bool allow_cover = false;
@@ -117,8 +118,8 @@ struct DynSepOptions {
     // DynSep can surface GF(2) aggregates and SI-lifted flow covers.
     int budget_zerohalf = 60;
     int budget_flowcover = 60;
-    // Skip optional arms deeper than this (root-heavy separation).
-    int max_depth_optional = 4;
+    // Optional arms (MIR/cover/…) only near the root — tree DynSep stays GMI/IB.
+    int max_depth_optional = 1;
     ZeroHalfOptions zerohalf;
     FlowCoverOptions flowcover;
 };

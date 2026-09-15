@@ -20,6 +20,7 @@ using sor::search::BabOptions;
 using sor::search::ConflictAnalysisContext;
 using sor::search::ConflictCutMode;
 using sor::search::ConflictCutOptions;
+using sor::search::CutValidity;
 using sor::search::MilpPolicy;
 
 namespace {
@@ -81,7 +82,10 @@ void test_analyze_learns_valid_cut() {
     const auto cut = sor::search::analyze_conflict_cuts(ctx, opts, cd);
     CHECK(cut.has_value());
     CHECK(cd.learned >= 1);
-    CHECK(sor::search::conflict_cut_valid_binary(lp, *cut));
+    // Pure-binary model, no continuous columns: the checker enumerates the
+    // whole box, so this is a VERIFIED validity proof (not an assumption).
+    CHECK(sor::search::conflict_cut_check_binary(lp, *cut) ==
+          CutValidity::Verified);
 }
 
 void test_latest_bab_learns_global_conflict_cut() {
@@ -120,8 +124,89 @@ void test_classical_default_off() {
     CHECK(!o.enabled);
     BabOptions latest;
     latest.policy = MilpPolicy::Latest;
+    // Product default: Mexi on again (SafeLimited auto for dense binary).
     CHECK(latest.conflict_cut.enabled);
     CHECK(latest.conflict_cut.mode == ConflictCutMode::Paper);
+}
+
+void test_nogood_from_branch_trail_valid() {
+    auto lp = read_text(kPairInfeas);
+    sor::search::PropTrail trail;
+    // x1=1, x2=1 — classic infeasible assignment under CAP.
+    trail.push(0, sor::search::BoundDir::Lower, 1.0, 0.0,
+               sor::search::ReasonKind::Branch, -1, 1);
+    trail.push(1, sor::search::BoundDir::Lower, 1.0, 0.0,
+               sor::search::ReasonKind::Branch, -1, 1);
+    const auto ng =
+        sor::search::build_nogood_from_branch_trail(trail, lp, 1e-9);
+    CHECK(ng.has_value());
+    CHECK(!sor::search::conflict_cut_near_empty(*ng));
+    // Nogood: (1-x1)+(1-x2) >= 1  ⇒  -x1 -x2 >= -1
+    CHECK(ng->cols.size() == 2);
+    CHECK(sor::search::conflict_cut_check_binary(lp, *ng) ==
+          CutValidity::Verified);
+}
+
+// Tri-state checker semantics (fail-closed): a free continuous column makes
+// verification impossible; the checker must say Unverified, never silently
+// claim validity. Complete boxes give Verified / Refuted definitively.
+void test_validity_check_tri_state() {
+    // Mixed model: binary x, free continuous y in [0,1], x + y <= 1.
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
+    lp.row_lo = {-sor::model::kInf};
+    lp.row_hi = {1.0};
+    lp.c = {1.0, 0.0};
+    lp.col_lo = {0.0, 0.0};
+    lp.col_hi = {1.0, 1.0};
+    lp.is_integer = {true, false};
+
+    // Valid cut on y alone: cannot be verified (y free) -> Unverified.
+    sor::search::CutRow cut_y;
+    cut_y.cols = {1};
+    cut_y.vals = {1.0};
+    cut_y.row_lo = -sor::model::kInf;
+    cut_y.row_hi = 1.0;
+    CHECK(sor::search::conflict_cut_check_binary(lp, cut_y) ==
+          CutValidity::Unverified);
+    CHECK(sor::search::conflict_cut_check_general(lp, cut_y) ==
+          CutValidity::Unverified);
+
+    // Invalid cut x <= 0 (x=1, y=0 is feasible): the support sweep finds the
+    // witness even though y is free -> Refuted.
+    sor::search::CutRow cut_x;
+    cut_x.cols = {0};
+    cut_x.vals = {1.0};
+    cut_x.row_lo = -sor::model::kInf;
+    cut_x.row_hi = 0.0;
+    CHECK(sor::search::conflict_cut_check_binary(lp, cut_x) ==
+          CutValidity::Refuted);
+
+    // Pure-binary complete box: valid -> Verified, invalid -> Refuted.
+    auto b2 = read_text(kPairInfeas);
+    sor::search::CutRow valid;
+    valid.cols = {0, 1};
+    valid.vals = {1.0, 1.0};
+    valid.row_lo = -sor::model::kInf;
+    valid.row_hi = 1.0;  // x1 + x2 <= 1 (CAP)
+    CHECK(sor::search::conflict_cut_check_binary(b2, valid) ==
+          CutValidity::Verified);
+    sor::search::CutRow invalid;
+    invalid.cols = {0, 1};
+    invalid.vals = {1.0, 1.0};
+    invalid.row_lo = -sor::model::kInf;
+    invalid.row_hi = 0.5;  // (1,0) violates
+    CHECK(sor::search::conflict_cut_check_binary(b2, invalid) ==
+          CutValidity::Refuted);
+}
+
+void test_near_empty_cut_refused() {
+    sor::search::CutRow empty;
+    CHECK(sor::search::conflict_cut_near_empty(empty));
+    sor::search::CutRow zeros;
+    zeros.cols = {0, 1};
+    zeros.vals = {0.0, 0.0};
+    CHECK(sor::search::conflict_cut_near_empty(zeros));
 }
 
 // Tiny general-integer conflict: 2x + 2y <= 3 with x,y in {0,1,2}.
@@ -172,8 +257,10 @@ void test_general_integer_conflict_safe() {
     CHECK(cd.general_int_reasons >= 1 || cd.learned >= 1 || cd.aborted >= 1);
     if (cut) {
         bool enumerated = false;
-        CHECK(sor::search::conflict_cut_valid_general(lp, *cut, 1e-9,
-                                                      1u << 12, &enumerated));
+        CHECK(sor::search::conflict_cut_check_general(lp, *cut, 1e-9,
+                                                       1u << 12,
+                                                       &enumerated) ==
+              CutValidity::Verified);
         CHECK(enumerated);
         CHECK(cd.learned >= 1);
     } else {
@@ -212,6 +299,7 @@ void test_general_integer_disabled_aborts() {
     ctx.trail = &trail;
     ctx.conflict_row = 0;
     ConflictCutOptions opts;
+    opts.enabled = true;
     opts.mode = ConflictCutMode::Paper;
     opts.allow_general_integer = false;
     sor::search::ConflictCutDiagnostics cd;
@@ -238,6 +326,7 @@ void test_safe_limited_skips_cmir_on_nonbinary() {
     ctx.conflict_row = 0;
 
     ConflictCutOptions opts;
+    opts.enabled = true;
     opts.mode = ConflictCutMode::SafeLimited;
     opts.use_cmirror = true;
     opts.allow_general_integer = true;
@@ -300,6 +389,7 @@ void test_mixed_binary_example2_safe() {
     ctx.conflict_row = 2;
 
     ConflictCutOptions opts;
+    opts.enabled = true;
     opts.mode = ConflictCutMode::Paper;
     opts.use_cmirror = true;
     sor::search::ConflictCutDiagnostics cd;
@@ -312,8 +402,13 @@ void test_mixed_binary_example2_safe() {
         lp_fix.col_hi[3] = hi[3];
         lp_fix.col_lo[4] = lo[4];
         lp_fix.col_hi[4] = hi[4];
-        CHECK(sor::search::conflict_cut_valid_binary(lp_fix, *cut) ||
-              sor::search::conflict_cut_valid_general(lp_fix, *cut));
+        // y1 keeps its [0, 0.75] freedom, so neither checker can VERIFY;
+        // the assertion is the safety property itself: no feasible point
+        // within the sweep refutes the learned cut.
+        CHECK(sor::search::conflict_cut_check_binary(lp_fix, *cut) !=
+              CutValidity::Refuted);
+        CHECK(sor::search::conflict_cut_check_general(lp_fix, *cut) !=
+              CutValidity::Refuted);
     } else {
         CHECK(cd.aborted >= 1);
         CHECK(cd.learned == 0);
@@ -323,6 +418,84 @@ void test_mixed_binary_example2_safe() {
 void test_paper_mode_default() {
     ConflictCutOptions o;
     CHECK(o.mode == ConflictCutMode::Paper);
+    CHECK(o.nogood_cuts);  // Latest default: branch-trail nogoods on
+}
+
+// 2x1 + 2x2 + 2x3 = 3 with binaries: the LP relaxation sits at the fractional
+// point (1/2,1/2,1/2) so the tree must branch, and every integer leaf is
+// infeasible (the row can only sum to 0, 2, 4 or 6) — branches like
+// x1=0,x2=0 (forcing 2x3=3 > 1) are the canonical nogood source.
+const char* kNogoodModel = R"(NAME          NOGOOD
+ROWS
+ N  COST
+ G  EQLO
+ L  EQHI
+COLUMNS
+    MARK0000  'MARKER'                 'INTORG'
+    X1        COST      1              EQLO      2
+    X1        EQHI      2
+    X2        COST      1              EQLO      2
+    X2        EQHI      2
+    X3        COST      1              EQLO      2
+    X3        EQHI      2
+    MARK0001  'MARKER'                 'INTEND'
+RHS
+    RHS       EQLO      3              EQHI      3
+BOUNDS
+ UI BND       X1        1
+ UI BND       X2        1
+ UI BND       X3        1
+ENDATA
+)";
+
+BabOptions nogood_test_options() {
+    BabOptions opts;
+    opts.max_nodes = 50;
+    opts.feasibility_jump = false;
+    opts.sub_mip_lns = false;
+    opts.probing = false;
+    opts.mip_presolve = false;
+    opts.symmetry = false;
+    opts.cuts_enabled = false;
+    opts.rounding_heuristic = false;
+    opts.lp_rounding_repair = false;
+    opts.integer_dive = false;
+    opts.integer_neighborhood = false;
+    opts.conflict_propagation = false;
+    return opts;
+}
+
+void test_latest_bab_learns_nogood() {
+    auto lp = read_text(kNogoodModel);
+    BabOptions opts = nogood_test_options();
+    opts.policy = MilpPolicy::Latest;
+    opts.conflict_cut.enabled = true;
+    opts.conflict_cut.nogood_cuts = true;
+    BabDiagnostics diag;
+    sor::search::solve_milp(lp, opts, diag);
+    CHECK(diag.nogood_cuts_global >= 1);
+}
+
+void test_classical_learns_no_conflict_family() {
+    // Classical ablation must run the classical path only: neither Mexi
+    // conflict cuts nor branch-trail nogoods may reach global_lp.
+    auto lp = read_text(kNogoodModel);
+    BabOptions opts = nogood_test_options();
+    opts.policy = MilpPolicy::Classical;
+    BabDiagnostics diag;
+    sor::search::solve_milp(lp, opts, diag);
+    CHECK(diag.conflict_cuts_global == 0);
+    CHECK(diag.nogood_cuts_global == 0);
+}
+
+void test_nogood_cap_zero_disables_learning() {
+    auto lp = read_text(kNogoodModel);
+    BabOptions opts = nogood_test_options();
+    opts.policy = MilpPolicy::Latest;
+    opts.conflict_cut.max_nogood_cuts = 0;
+    BabDiagnostics diag;
+    sor::search::solve_milp(lp, opts, diag);
+    CHECK(diag.nogood_cuts_global == 0);
 }
 
 void test_local_cut_row_aborts_global_learn() {
@@ -406,6 +579,45 @@ void test_flugpl_latest_dual_not_above_opt() {
     }
 }
 
+void test_enigma_latest_not_false_infeasible() {
+    // P0 (2026-09-13): Mexi conflict cuts falsely proved ENIGMA Infeasible.
+    // Latest defaults (conflict on + SafeLimited for dense binary) must not
+    // claim Infeasible; HiGHS / Classical Optimal 0.
+    const char* candidates[] = {
+        "benchmarks/miplib-easy/mps/enigma.mps",
+        "../benchmarks/miplib-easy/mps/enigma.mps",
+        "sor/benchmarks/miplib-easy/mps/enigma.mps",
+    };
+    const char* path = nullptr;
+    for (const char* c : candidates) {
+        std::ifstream in(c);
+        if (in) {
+            path = c;
+            break;
+        }
+    }
+    if (!path) {
+        ::sor::test::report(true, "enigma: skipped (no mps)", __FILE__,
+                            __LINE__);
+        return;
+    }
+    sor::io::MpsReadReport rep;
+    auto lp = sor::io::read_mps_file(path, rep);
+    BabOptions opts;
+    opts.policy = MilpPolicy::Latest;
+    opts.time_limit_s = 20.0;
+    // Explicit default-on conflict (struct default); do not force Paper.
+    CHECK(opts.conflict_cut.enabled);
+    BabDiagnostics diag;
+    auto raw = sor::search::solve_milp(lp, opts, diag);
+    const auto ev = sor::search::milp_evidence(diag, opts);
+    const auto r = sor::certify::finalize_result(std::move(raw), ev);
+    CHECK(r.status != Status::Infeasible);
+    if (r.status == Status::Optimal) {
+        CHECK_NEAR(diag.incumbent, 0.0, 1e-6);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -413,11 +625,18 @@ int main() {
     test_analyze_learns_valid_cut();
     test_latest_bab_learns_global_conflict_cut();
     test_classical_default_off();
+    test_nogood_from_branch_trail_valid();
+    test_validity_check_tri_state();
+    test_near_empty_cut_refused();
     test_general_integer_conflict_safe();
     test_general_integer_disabled_aborts();
     test_safe_limited_skips_cmir_on_nonbinary();
     test_mixed_binary_example2_safe();
     test_local_cut_row_aborts_global_learn();
+    test_latest_bab_learns_nogood();
+    test_classical_learns_no_conflict_family();
+    test_nogood_cap_zero_disables_learning();
     test_flugpl_latest_dual_not_above_opt();
+    test_enigma_latest_not_false_infeasible();
     return sor::test::finish("test_conflict_cut");
 }

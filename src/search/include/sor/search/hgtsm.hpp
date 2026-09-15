@@ -51,7 +51,9 @@ struct HgtsmOptions {
     int lasso_max_iter = 200;
     int max_nonzero = 200;
     // When a graph payload is loaded, use it unless prefer_linear is set.
-    bool prefer_linear = false;
+    // Default linear: tripartite scoring is costly in the tree; graph only when
+    // explicitly wanted (`prefer_linear=false` + loaded graph model).
+    bool prefer_linear = true;
     HgtsmSequenceKind sequence = HgtsmSequenceKind::TransformerLite;
     int emb_dim = kHgtsmEmbDim;
     int n_msg_layers = kHgtsmMsgLayers;
