@@ -61,6 +61,7 @@ class Run:
     environment: dict[str, object]
     # results[solver label][instance] -> the aggregated Result
     results: dict[str, dict[str, Result]]
+    metadata: list[dict[str, object]] = dataclasses.field(default_factory=list)
     segments: int = 1
     segment: int = -1
 
@@ -85,10 +86,17 @@ def load_run(path: Path, segment: int = -1) -> Run:
     except OSError as e:
         raise RunFileError(f"{path}: {e}") from e
 
-    # Split into sweeps at each environment record. Records that precede the
-    # first environment record still form a segment, so a hand-written file
-    # with no environment record at all reads as one sweep.
-    segments: list[tuple[dict[str, object], list[dict[str, object]]]] = []
+    # Only compare.py's environment record starts a sweep. Claim protocol
+    # metadata (preflight, postflight, checks, reruns and the final gate) is
+    # attached to that sweep and never creates an empty trailing segment.
+    # Legacy claim artifacts encoded those records as environments with a
+    # claim_role; recognise them explicitly as metadata too.
+    segments: list[tuple[dict[str, object], list[dict[str, object]],
+                         list[dict[str, object]]]] = []
+    pending_metadata: list[dict[str, object]] = []
+    metadata_kinds = {"metadata", "preflight", "postflight",
+                      "independent_check", "baseline_eligibility",
+                      "performance", "gate", "rerun", "gate_accept"}
     for line_no, line in enumerate(text.splitlines(), 1):
         line = line.strip()
         if not line:
@@ -99,17 +107,35 @@ def load_run(path: Path, segment: int = -1) -> Run:
             raise RunFileError(f"{path} line {line_no}: {e}") from e
         if not isinstance(rec, dict):
             raise RunFileError(f"{path} line {line_no}: record is not an object")
-        if rec.get("record") == "environment":
-            segments.append((rec, []))
-        else:
+        kind = rec.get("record")
+        legacy_metadata = (kind == "environment" and
+                           (rec.get("claim_role") is not None or
+                            rec.get("gate_accept") is not None or
+                            rec.get("gate_accept_voided") is not None))
+        if kind in metadata_kinds or legacy_metadata:
+            if segments:
+                segments[-1][2].append(rec)
+            else:
+                pending_metadata.append(rec)
+        elif kind == "environment":
+            segments.append((rec, [], pending_metadata))
+            pending_metadata = []
+        elif kind in ("run", "aggregate"):
             if not segments:
-                segments.append(({}, []))
+                segments.append(({}, [], pending_metadata))
+                pending_metadata = []
             segments[-1][1].append(rec)
+        else:
+            raise RunFileError(
+                f"{path} line {line_no}: unknown record type {kind!r}")
+
+    if pending_metadata and segments:
+        segments[-1][2].extend(pending_metadata)
 
     if not segments:
         raise RunFileError(f"{path}: no records")
     try:
-        env, records = segments[segment]
+        env, records, metadata = segments[segment]
     except IndexError as e:
         raise RunFileError(
             f"{path}: --segment {segment} out of range "
@@ -118,6 +144,7 @@ def load_run(path: Path, segment: int = -1) -> Run:
     # Group repetitions, then aggregate each group the way compare.py's own
     # summary does, so a median here means the same thing it did there.
     grouped: dict[tuple[str, str], list[Result]] = {}
+    aggregates: dict[tuple[str, str], list[Result]] = {}
     for line_no, rec in enumerate(records, 1):
         unknown = set(rec) - _RESULT_FIELDS - {"record"}
         if unknown:
@@ -131,16 +158,30 @@ def load_run(path: Path, segment: int = -1) -> Run:
             raise RunFileError(f"{path}: bad run record: {e}") from e
         if not r.solver or not r.instance:
             raise RunFileError(f"{path}: run record without solver/instance")
-        grouped.setdefault((r.solver, r.instance), []).append(r)
+        target = aggregates if rec.get("record") == "aggregate" else grouped
+        target.setdefault((r.solver, r.instance), []).append(r)
 
     results: dict[str, dict[str, Result]] = {}
-    for (solver, instance), runs in grouped.items():
-        results.setdefault(solver, {})[instance] = \
-            compare.aggregate_repetitions(runs)
+    for key in sorted(set(grouped) | set(aggregates)):
+        solver, instance = key
+        active = [r for r in aggregates.get(key, [])
+                  if not r.claim_superseded and r.claim_selected is not False]
+        if len(active) > 1:
+            raise RunFileError(
+                f"{path}: {solver}/{instance} has {len(active)} selected "
+                "aggregate records")
+        if active:
+            selected = active[0]
+        elif aggregates.get(key):
+            raise RunFileError(
+                f"{path}: {solver}/{instance} has no selected aggregate")
+        else:
+            selected = compare.aggregate_repetitions(grouped[key])
+        results.setdefault(solver, {})[instance] = selected
 
     if not results:
         raise RunFileError(f"{path}: sweep contains no run records")
-    return Run(path=path, environment=env, results=results,
+    return Run(path=path, environment=env, results=results, metadata=metadata,
                segments=len(segments), segment=segment)
 
 
@@ -443,7 +484,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="iterations added to both sides of an iteration ratio")
     ap.add_argument("--sgm-shift", type=float, default=1.0,
                     help="shift for the shifted geometric mean, in seconds")
-    ap.add_argument("--obj-rel-tol", type=float, default=1e-4)
+    ap.add_argument("--obj-rel-tol", type=float, default=1e-7,
+                    help="claim-facing objective agreement: max(abs_tol, rel_tol*(1+|reference|)). 1e-7 is the public gate; use the named 1e-6 continuity command for the historical lane.")
     ap.add_argument("--obj-abs-tol", type=float, default=1e-7)
     ap.add_argument("--allow-missing", action="store_true",
                     help="do not fail solely because an instance is in one run "
