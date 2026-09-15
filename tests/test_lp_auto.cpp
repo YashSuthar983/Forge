@@ -150,7 +150,7 @@ int main() {
         const auto staged_problem = multistage_problem();
         core::LpOptions unavailable;
         unavailable.strategy = core::LpStrategy::Auto;
-        unavailable.backend = "julia_gpu";
+        unavailable.backend = "cuda";
         unavailable.time_limit_s = 1.0;
         core::LpDiagnostics diagnostics;
         core::ProofEvidence evidence;

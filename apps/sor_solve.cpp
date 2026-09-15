@@ -35,7 +35,7 @@ void usage() {
         "usage: sor_solve MODEL.mps [options]\n"
         "  --engine NAME    simplex (default) | auto | primal | dual | pdhg | hpr | milp | qp\n"
         "  --q-diag LIST    comma-separated diagonal of Q (if not using .qps)\n"
-        "  --backend NAME   cpu (default) | vulkan | julia_gpu\n"
+        "  --backend NAME   cpu (default) | vulkan | cuda\n"
         "  --method NAME    auto | primal | dual   (simplex and MILP node LPs)\n"
         "  --pricing NAME   choose | dantzig | devex | dse  (simplex pricing)\n"
         "  --basis-update NAME  product | ft       (simplex basis updates)\n"
@@ -585,9 +585,9 @@ int main(int argc, char** argv) {
     // engine.  An unavailable non-CPU backend is reported as Unsupported; it
     // must never turn a requested claim run into an unlabelled CPU run.
     if (backend_name != "cpu" && backend_name != "vulkan" &&
-        backend_name != "julia_gpu") {
+        backend_name != "cuda") {
         std::fprintf(stderr,
-                     "error: unknown backend '%s' (have cpu|vulkan|julia_gpu)\n",
+                     "error: unknown backend '%s' (have cpu|vulkan|cuda)\n",
                      backend_name.c_str());
         return 2;
     }

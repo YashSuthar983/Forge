@@ -51,10 +51,6 @@ benchmarks/miplib-small/mps/
 #   python3 scripts/gen_lp_ladder.py
 benchmarks/synthetic/mps/
 
-# ---- generated tool binaries -----------------------------------------------
-tools/julia_gpu/bench_julia_gpu_overhead
-tools/julia_gpu/*.jsonl
-
 # ---- benchmark RESULTS (ignore all; force-add the citable runs) ------------
 # Promote a run with:  git add -f benchmarks/results/<stamp>.md <stamp>.jsonl
 benchmarks/results/*
@@ -75,3 +71,6 @@ benchmarks/results/*
 # cites them by DOI/arXiv). 38 MB of published PDFs, so they are kept locally
 # rather than redistributed through this repository's history.
 docs/papers/
+
+# Local Netlib emps binary (source: benchmarks/netlib/raw/emps.c)
+benchmarks/tools/

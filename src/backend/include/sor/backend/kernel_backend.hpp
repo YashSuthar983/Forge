@@ -24,9 +24,8 @@ public:
 
     virtual std::string_view name() const = 0;
 
-    // True when the backend is actually executing on an accelerator. The Julia
-    // sidecar reports false when CUDA.functional() is false, so timing tables
-    // can never silently label a CPU run as GPU.
+    // True when the backend is actually executing on an accelerator, so timing
+    // tables can never silently label a CPU run as GPU.
     virtual bool is_accelerated() const = 0;
 
     // ---- single-instance kernels -------------------------------------------
@@ -66,7 +65,7 @@ public:
 std::unique_ptr<KernelBackend> make_cpu_backend();
 
 // Resolve a backend by name; returns nullptr when unavailable so callers must
-// handle the fallback explicitly. Recognised: "cpu", "julia_gpu".
+// handle the fallback explicitly. Recognised: "cpu".
 std::unique_ptr<KernelBackend> make_backend(std::string_view name);
 
 }  // namespace sor::backend

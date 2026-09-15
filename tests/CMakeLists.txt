@@ -88,8 +88,3 @@ target_compile_definitions(test_cli_validation PRIVATE
   SOR_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
   SOR_BINARY_DIR="${CMAKE_BINARY_DIR}")
 add_dependencies(test_cli_validation sor_solve sor_check)
-
-if(SOR_ENABLE_JULIA_GPU)
-  sor_add_test(test_julia_gpu_parity sor_backend)
-  set_tests_properties(test_julia_gpu_parity PROPERTIES SKIP_RETURN_CODE 77)
-endif()

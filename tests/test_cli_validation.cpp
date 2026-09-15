@@ -335,7 +335,7 @@ void test_lp_dispatch_and_diagnostic_flags() {
 
 void test_unavailable_backends_are_not_silently_replaced() {
     const Run hpr = run({solve_exe, model, "--engine", "hpr",
-                         "--backend", "julia_gpu"});
+                         "--backend", "cuda"});
     CHECK(hpr.exit_code != 0);
     CHECK(contains(hpr.output, "Unsupported"));
     CHECK(contains(hpr.output, "unavailable for HPR"));

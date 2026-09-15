@@ -22,7 +22,7 @@ python3 scripts/sor_repl.py --one-shot
 | Flag | Values |
 |---|---|
 | `--engine` | `simplex` (default) · `pdhg` · `hpr` · `milp` · `qp` |
-| `--backend` | `cpu` · `vulkan` · `julia_gpu` (experimental) |
+| `--backend` | `cpu` · `vulkan` · `cuda` (stub) |
 | `--method` | `auto` · `primal` · `dual` |
 | `--basis-update` | `product` (default) · `ft` |
 
