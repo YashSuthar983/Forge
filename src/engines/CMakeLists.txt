@@ -3,7 +3,8 @@ add_library(sor_engines
   src/simplex.cpp
   src/dual_simplex.cpp
   src/dual_edge_weights.cpp
-  src/dual_bfrt.cpp
+  src/dual_cost_perturbation.cpp
+  src/dual_ratio_test.cpp
   src/farkas.cpp
   src/hpr.cpp
   src/qp.cpp

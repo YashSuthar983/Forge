@@ -14,6 +14,7 @@ namespace sor::engines {
 
 using core::f64;
 using core::Index;
+using core::Offset;
 
 enum class NonbasicStatus : std::uint8_t {
     Basic = 0,
@@ -26,6 +27,7 @@ enum class SimplexPricing : std::uint8_t {
     Dantzig = 0,
     Devex   = 1,
     DSE     = 2,
+    Choose  = 3,  // start with DSE; switch to Devex when DSE work is costly
 };
 
 enum class SimplexMethod : std::uint8_t {
@@ -53,7 +55,13 @@ struct SimplexOptions {
     std::uint64_t max_basis_repairs = 200;
 
     SimplexMethod  method  = SimplexMethod::Auto;
-    SimplexPricing pricing = SimplexPricing::Devex;
+    SimplexPricing pricing = SimplexPricing::Choose;
+
+    // Deterministic dual cost perturbation multiplier. Zero is the measured
+    // production default until the full-suite gate is cleared; 1.0 matches the
+    // scale used by the current HiGHS dual simplex. Perturbations are working
+    // costs only and are always removed before an optimality conclusion.
+    f64 dual_cost_perturbation_multiplier = 0.0;
 
     // Refactor after this many basis updates. Product-form etas are as dense
     // as the FTRAN'd entering columns, so unlike Forrest-Tomlin (HiGHS runs
@@ -70,10 +78,10 @@ struct SimplexOptions {
     f64 refactor_multiplier_limit = 1e6;
 
     // Basis update representation (sor/la/lu.hpp). ProductForm is the
-    // default; ForrestTomlin re-triangularizes L/U in place instead of
-    // growing an eta file, verified against a dense-reconstruction
-    // differential suite (tests/test_lu.cpp) but not yet measured against
-    // ProductForm on Netlib/MIPLIB, so it stays opt-in until that gate runs.
+    // measured default. The true Forrest-Tomlin implementation is verified by
+    // structural and dense-reconstruction differential tests, but its row
+    // etas were denser and its Netlib wall times worse; it therefore remains
+    // an explicit diagnostic/experimental choice.
     la::UpdateMethod update_method = la::UpdateMethod::ProductForm;
     // ForrestTomlin only: force a refactor once a bump grows past this many
     // pivot-steps (0 disables the trigger). See BasisFactor::update_ft().
@@ -114,16 +122,34 @@ struct SimplexOptions {
     // on long degenerate dual runs. Zero disables the refresh.
     int dual_resync_interval = 500;
 
-    // Abort when the engine's merit function goes flat, instead of running to
-    // the iteration or time limit. This is for the Auto dispatcher's short dual
-    // PROBE, whose whole job is to find out cheaply whether the dual is the
-    // right engine. It must stay off for a committed run: dfl001's dual is slow
-    // but genuinely converging, and aborting it there loses the only engine that
-    // solves the instance.
+    // Phase-1 composite objective updates avoid full reduced-cost rebuilds at
+    // most breakpoints.  Reconstruct periodically anyway to bound numerical
+    // drift in the pivotal-row recurrence.  Kept separate from the dual
+    // engine's cadence because their conditioning and per-rebuild costs differ.
+    int primal_phase1_resync_interval = 64;
+
+    // Opt-in primal cold-start crash. It replaces selected row logicals with
+    // structural columns only when the resulting triangular-by-construction
+    // basis strictly reduces the starting primal infeasibility. Kept off
+    // until its full Netlib A/B gate is complete.
+    bool primal_crash = false;
+
+
+    // Diagnostic-only early abort when the dual merit function goes flat.
+    // Auto deliberately does not use it: dfl001 has long flat stretches but is
+    // genuinely converging, and a stopped run cannot be resumed from the public
+    // basis-only warm-start record.
     bool stall_abort = false;
 
     bool presolve = true;
     int  ruiz_iterations = 10;
+    // Enable the presolve implied-slack reduction (zero-cost singleton column
+    // -> bound transfer). Off by default on measurement; see presolve.hpp.
+    bool presolve_implied_slack = false;
+    // Round every Ruiz factor to the nearest power of two, which makes the
+    // scaling exact in floating point (see ruiz_scale). Off by default until
+    // it clears the 93-model gate; see docs/SCALING_20260908.md.
+    bool ruiz_power_of_two = false;
     bool verbose = false;
 };
 
@@ -148,17 +174,105 @@ struct SimplexDiagnostics {
     // pivot-element disagreements (dual_resyncs).
     std::uint64_t dual_rebuilds     = 0;
     std::uint64_t dual_resyncs      = 0;
+    // Number of phase-1 pivots whose new local infeasibility objective
+    // differs from the old one, and the total/max size of that sparse delta.
+    // These counters expose whether an exact incremental objective update can
+    // replace the current full reduced-cost rebuild on every phase-1 pivot.
+    std::uint64_t phase1_cost_change_iterations = 0;
+    std::uint64_t phase1_cost_changes = 0;
+    std::uint64_t phase1_cost_change_max = 0;
+    std::uint64_t primal_btran_sparse = 0;
+    std::uint64_t primal_btran_dense = 0;
+    std::uint64_t primal_btran_support_entries = 0;
+    std::uint64_t phase1_composite_updates = 0;
+    std::uint64_t phase1_composite_sparse = 0;
+    std::uint64_t phase1_composite_dense = 0;
+    std::uint64_t phase1_composite_fallbacks = 0;
+    std::uint64_t phase1_composite_support_entries = 0;
+    f64 phase1_composite_max_abs_error = 0.0;
+    std::uint64_t primal_ftran_dense_switches = 0;
+    std::uint64_t primal_crash_columns = 0;
+    f64 primal_crash_infeasibility_before = 0.0;
+    f64 primal_crash_infeasibility_after = 0.0;
+    std::uint64_t devex_frameworks  = 0;
+    std::uint64_t devex_weight_checks = 0;
+    std::uint64_t dse_weight_checks = 0;
+    std::uint64_t dse_weight_rejections = 0;
+    std::uint64_t dse_to_devex_switches = 0;
+    std::uint64_t dse_accuracy_switches = 0;
+    std::uint64_t dse_stability_switches = 0;
+    std::uint64_t costly_dse_iterations = 0;
+    std::uint64_t dual_paired_ftrans = 0;
+    // Pivotal-row support before and after exact removal of basic columns.
+    // These are work counters, not numerical-density inputs: the controller
+    // deliberately continues to use the full support so pruning cannot alter
+    // its sparse/dense decisions.
+    std::uint64_t dual_pivotal_entries_full = 0;
+    std::uint64_t dual_pivotal_entries_kept = 0;
+    std::uint64_t dual_dantzig_starts = 0;
+    std::uint64_t dual_devex_starts = 0;
+    std::uint64_t dual_dse_starts = 0;
+    f64 dse_log_weight_error = 0.0;
+    std::uint64_t perturbed_costs = 0;
+    std::uint64_t perturbation_cleanups = 0;
+    // Dual working-cost management (Koberstein 2005 §6.2.2.3). cost_shifts
+    // counts every shift applied to a nonbasic working cost: the entering
+    // column's wrong-sign reduced cost zeroed before a pivot, and the phase-2
+    // rebuild repair of one-sided/free columns that replaces phase-1
+    // re-entry. cost_shift_max is the largest absolute shift on any column.
+    // primal_cleanups counts hand-offs to the primal engine after the true
+    // costs were restored and left the basis dual infeasible; its pivots are
+    // primal_cleanup_iterations (included in `iterations`).
+    std::uint64_t cost_shifts = 0;
+    std::uint64_t wrong_sign_entering_shifts = 0;
+    f64 cost_shift_max = 0.0;
+    std::uint64_t primal_cleanups = 0;
+    std::uint64_t primal_cleanup_iterations = 0;
+    // Sum of dual infeasibilities (true costs) at the hand-off to the
+    // primal clean-up; zero when no clean-up was needed.
+    f64 cleanup_dual_infeasibility = 0.0;
+    // Sum of primal infeasibilities of the basis actually handed to the
+    // primal clean-up. At an optimal exit (no primal-infeasible basic
+    // variable) it must be 0: the clean-up then starts in phase 2 from the
+    // position the dual reached. It is legitimately positive only when the
+    // hand-off came from a no-entering-column exit, where the basis is
+    // primal infeasible by construction.
+    f64 cleanup_primal_infeasibility = 0.0;
+    // Dual ratio-test (CHUZC) behaviour: Harris groups visited in total,
+    // stability back-offs to an earlier group, sweeps that passed every
+    // breakpoint with positive slope, and relatively tiny entries excluded.
+    std::uint64_t ratio_groups = 0;
+    std::uint64_t ratio_backoffs = 0;
+    std::uint64_t ratio_exhausted = 0;
+    std::uint64_t ratio_small_pivot_exclusions = 0;
+    // Candidates the dual ratio test put through std::sort, summed over the
+    // run. The O(k) first-group path sorts none; this rising towards
+    // (candidates x iterations) means the row is being sorted again.
+    std::uint64_t ratio_sorted_candidates = 0;
     std::uint64_t warm_starts      = 0;
-    // Work counters are cumulative across Auto probe/fallback stages. The
+    // Work counters are cumulative across Auto's primary/fallback stages. The
     // timing fields below are cumulative too; these counters make a profile
     // useful even when a stage is too short for a stable timer sample.
     std::uint64_t pricing_calls     = 0;
     std::uint64_t solve_calls       = 0;
     std::uint64_t stages            = 0;
-    double probe_ms                 = 0.0;
+    // Auto-dispatch provenance. `warm_starts` is engine-owned and counts only
+    // starts that the engine accepted; these counters describe what the
+    // dispatcher actually requested, so a performance trace can reconstruct
+    // the selected path even when a stage rejects its supplied basis.
+    std::uint64_t primal_stages     = 0;
+    std::uint64_t dual_stages       = 0;
+    std::uint64_t cold_stages       = 0;
+    std::uint64_t basis_restarts    = 0;
     double presolve_ms              = 0.0;
     Index presolve_rows_removed     = 0;
     Index presolve_cols_removed     = 0;
+    Index presolve_singleton_columns_removed = 0;
+    Index presolve_forcing_rows_removed = 0;
+    Index presolve_forcing_columns_fixed = 0;
+    Index presolve_equality_aggregations = 0;
+    Offset presolve_aggregation_fill = 0;
+    std::uint64_t presolve_retries = 0;
 
     // The dual engine's merit function (total primal infeasibility) at the start
     // of the run and the best value it reached. Diagnostic only: it shows at a
@@ -167,10 +281,8 @@ struct SimplexDiagnostics {
     // pilot.ja (0.6s -> 6.6s) without recovering dfl001.
     f64 merit_start = 0.0;
     f64 merit_best  = 0.0;
-    // True when the run ended because its merit function went flat for
-    // kFlatLimit windows (stall_abort). The Auto dispatcher reads this: a
-    // stall means "wrong engine for this instance", while a time-limit exit
-    // with falling merit means "right engine, not enough budget".
+    // True when a diagnostic run ended because its merit function went flat
+    // for kFlatLimit windows (stall_abort).
     bool stalled = false;
     int  final_phase = 1;
 
@@ -239,9 +351,11 @@ namespace detail {
 // regressions can be covered without constructing a giant synthetic LP.
 bool prefer_primal_first(Index rows, Index cols, core::Offset nnz);
 
-// Very large hypersparse models should keep one dual state instead of paying
-// an Auto probe/restart boundary near the time limit.
-bool prefer_long_dual_probe(Index rows, core::Offset nnz);
+// Content-aware complement to the shape rule. It inspects the actual logical
+// starting point and bound classes; unlike a solver probe it is deterministic,
+// O(nnz), and discards no pivots.
+bool prefer_primal_from_model(const model::LpProblem& problem,
+                              f64 primal_feas_tol);
 
 // Model-independent ordering for results produced by Auto's solver stages.
 // A duality gap is an optimality measure only for a primal/dual-feasible pair;

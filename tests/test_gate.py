@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""Regression tests for the merge gate's rule table.
+
+gate.py decides what may land, so the one thing that must not be taken on
+trust is the gate itself. The contract under test:
+
+  * correctness findings (a lost proof, a status change, disagreeing certified
+    objectives, a model that stopped being run) fail the gate and CANNOT be
+    waived by the allow-list, however generous the entry;
+  * the per-model work bar is shifted, so a 12 -> 15 pivot model is not a 25%
+    regression;
+  * a waiver covers exactly what it says it covers, and takes its model out of
+    the aggregates too -- otherwise the accepted regression comes straight back
+    as a G5 failure and the waiver buys nothing;
+  * the aggregate bars stand down on a handful of instances, where a geomean is
+    one model with a louder voice rather than an aggregate;
+  * determinism compares objective BITS, not objectives.
+
+No solver is built or run: every case is a synthetic sweep in a temp dir.
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location(
+    "sor_gate", ROOT / "scripts" / "gate.py")
+assert SPEC is not None and SPEC.loader is not None
+gate = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = gate
+SPEC.loader.exec_module(gate)
+
+runs = gate.runs
+
+
+def record(instance: str, *, status: str = "optimal",
+           proof: str | None = "ProvedOptimalFP", objective: float = 1.0,
+           seconds: float = 1.0, iterations: int = 1000) -> dict:
+    return {"record": "run", "solver": "sor:simplex", "instance": instance,
+            "status": status, "proof": proof, "objective": objective,
+            "seconds": seconds, "wall_s": seconds + 0.01,
+            "iterations": iterations}
+
+
+def steady(n: int, **kw) -> list[dict]:
+    """n unchanging models, so a case about ONE model is not also a case about
+    the aggregate."""
+    return [record(f"steady{i}", **kw) for i in range(n)]
+
+
+class GateCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def write(self, path: Path, records: list[dict]) -> None:
+        lines = [json.dumps({"record": "environment", "commit": "0" * 40,
+                             "solvers": ["sor:simplex"]})]
+        lines += [json.dumps(r) for r in records]
+        path.write_text("\n".join(lines) + "\n")
+
+    def judge(self, base: list[dict], cand: list[dict],
+              allow: dict | None = None, work_bar: float = 1.10,
+              aggregate_bar: float = 1.02,
+              aggregate_min: int = 10) -> tuple[list[str], list[str]]:
+        b, c = self.tmp / "b.jsonl", self.tmp / "c.jsonl"
+        self.write(b, base)
+        self.write(c, cand)
+        rows = runs.compare_rows(
+            runs.load_run(b).results["sor:simplex"],
+            runs.load_run(c).results["sor:simplex"],
+            1.0, 100.0, 1e-9, 1e-6)
+        return gate.evaluate(rows, allow or {}, "pivots", work_bar,
+                             aggregate_bar, aggregate_min)
+
+
+class TestCorrectnessRules(GateCase):
+    def test_identical_sweeps_pass(self):
+        rs = [record("a"), record("b", iterations=2000, seconds=2.0)]
+        failures, waived = self.judge(rs, rs)
+        self.assertEqual(failures, [])
+        self.assertEqual(waived, [])
+
+    def test_lost_proof_fails(self):
+        failures, _ = self.judge(
+            [record("a")], [record("a", status="interrupted", proof=None)])
+        self.assertTrue(any("proof-regression" in f for f in failures),
+                        failures)
+
+    def test_no_allow_list_entry_can_waive_a_lost_proof(self):
+        # The entire reason rule 1 is evaluated separately from rule 2.
+        generous = {"a": {"reason": "we really want this merged",
+                          "max_work_ratio": 1000.0}}
+        failures, _ = self.judge(
+            [record("a")], [record("a", status="interrupted", proof=None)],
+            allow=generous)
+        self.assertTrue(any("proof-regression" in f for f in failures),
+                        failures)
+
+    def test_status_change_fails(self):
+        failures, _ = self.judge(
+            [record("a")], [record("a", status="infeasible", proof=None)])
+        self.assertTrue(
+            any("status-mismatch" in f or "proof-regression" in f
+                for f in failures), failures)
+
+    def test_disagreeing_certified_objectives_fail(self):
+        failures, _ = self.judge([record("a", objective=1.0)],
+                                 [record("a", objective=1.5)])
+        self.assertTrue(any("objective-mismatch" in f for f in failures),
+                        failures)
+
+    def test_a_model_that_stopped_being_run_fails(self):
+        failures, _ = self.judge([record("a"), record("b")], [record("a")])
+        self.assertTrue(any("missing-in-candidate" in f for f in failures),
+                        failures)
+
+    def test_adding_a_model_is_not_a_regression(self):
+        failures, _ = self.judge([record("a")], [record("a"), record("b")])
+        self.assertEqual(failures, [])
+
+    def test_getting_faster_never_fails(self):
+        base = [record(f"m{i}", seconds=2.0, iterations=5000) for i in range(12)]
+        cand = [record(f"m{i}", seconds=0.5, iterations=1000) for i in range(12)]
+        failures, _ = self.judge(base, cand)
+        self.assertEqual(failures, [])
+
+
+class TestWorkBar(GateCase):
+    def test_a_tiny_model_does_not_trip_the_bar(self):
+        # 12 -> 15 pivots is +25% and completely meaningless.
+        base = steady(12) + [record("tiny", iterations=12)]
+        cand = steady(12) + [record("tiny", iterations=15)]
+        failures, _ = self.judge(base, cand)
+        self.assertEqual(failures, [])
+
+    def test_a_real_regression_trips_the_bar(self):
+        base = steady(12) + [record("big", iterations=1000)]
+        cand = steady(12) + [record("big", iterations=1400)]
+        failures, _ = self.judge(base, cand)
+        self.assertTrue(any("pivots 1000 -> 1400" in f for f in failures),
+                        failures)
+
+
+class TestAllowList(GateCase):
+    def setUp(self):
+        super().setUp()
+        self.base = steady(12) + [record("m", iterations=1000, seconds=1.0)]
+        self.cand = steady(12) + [record("m", iterations=1400, seconds=1.4)]
+
+    def test_an_in_bound_waiver_passes_and_is_reported(self):
+        entry = {"m": {"reason": "measured, WS3 owns it", "max_work_ratio": 1.5}}
+        failures, waived = self.judge(self.base, self.cand, allow=entry)
+        self.assertEqual(failures, [])
+        self.assertEqual(len(waived), 1)
+        self.assertIn("WS3 owns it", waived[0])
+
+    def test_a_waiver_does_not_cover_more_than_it_says(self):
+        entry = {"m": {"reason": "stale bound", "max_work_ratio": 1.05}}
+        failures, _ = self.judge(self.base, self.cand, allow=entry)
+        self.assertTrue(
+            any("over its own allow-list bound" in f for f in failures),
+            failures)
+
+    def test_a_waiver_with_no_bound_waives_outright(self):
+        failures, waived = self.judge(
+            self.base, self.cand, allow={"m": {"reason": "known, tracked"}})
+        self.assertEqual(failures, [])
+        self.assertEqual(len(waived), 1)
+
+    def test_a_waived_model_leaves_the_aggregates(self):
+        # Otherwise the waiver buys nothing: the accepted regression returns as
+        # a G5 failure and the only way to merge is to widen the aggregate bar
+        # for every other model too.
+        base = steady(12) + [record("m", iterations=1000, seconds=1.0)]
+        cand = steady(12) + [record("m", iterations=9000, seconds=9.0)]
+        failures, _ = self.judge(base, cand)
+        self.assertTrue(failures, "unwaived, the outlier must fail something")
+
+        entry = {"m": {"reason": "WS3 owns this one, tracked in the plan"}}
+        failures, waived = self.judge(base, cand, allow=entry)
+        self.assertEqual(failures, [])
+        self.assertEqual(len(waived), 1)
+
+    def test_an_entry_without_a_reason_is_rejected(self):
+        path = self.tmp / "gate-allow.json"
+        original = gate.allow_path
+        gate.allow_path = lambda: path
+        self.addCleanup(lambda: setattr(gate, "allow_path", original))
+
+        path.write_text(json.dumps({"netlib": {"m": {"max_work_ratio": 2.0}}}))
+        with self.assertRaises(SystemExit):
+            gate.load_allow("netlib", None)
+
+        path.write_text(json.dumps({"netlib": {"m": {"reason": "ok"}}}))
+        self.assertEqual(gate.load_allow("netlib", None)["m"]["reason"], "ok")
+        self.assertEqual(gate.load_allow("miplib-small", None), {})
+
+    def test_the_committed_allow_file_parses(self):
+        # It ships with the repo; a typo in it would fail every gate run.
+        for suite, tag in (("netlib", None), ("netlib", "dual"),
+                           ("miplib-small", None)):
+            self.assertIsInstance(gate.load_allow(suite, tag), dict)
+
+
+class TestAggregateBars(GateCase):
+    def test_an_across_the_board_slowdown_fails_g2(self):
+        base = [record(f"m{i}", seconds=1.0) for i in range(12)]
+        cand = [record(f"m{i}", seconds=1.11) for i in range(12)]
+        failures, _ = self.judge(base, cand)
+        self.assertTrue(any("G2 geometric time ratio" in f for f in failures),
+                        failures)
+
+    def test_a_pivot_rise_under_the_per_model_bar_still_fails_g5(self):
+        base = [record(f"m{i}", iterations=10000) for i in range(12)]
+        cand = [record(f"m{i}", iterations=10800) for i in range(12)]
+        failures, _ = self.judge(base, cand)
+        self.assertFalse(any("pivots 10000 -> 10800" in f for f in failures),
+                         "each model is individually under the per-model bar")
+        self.assertTrue(any("G5 geometric pivots ratio" in f for f in failures),
+                        failures)
+
+    def test_the_bars_stand_down_on_a_handful_of_instances(self):
+        base = [record(f"m{i}", seconds=1.0) for i in range(3)]
+        cand = [record(f"m{i}", seconds=1.5) for i in range(3)]
+        self.assertEqual(self.judge(base, cand)[0], [])
+        self.assertTrue(
+            any("G2" in f for f in self.judge(base, cand, aggregate_min=1)[0]))
+
+
+class TestReferenceRule(GateCase):
+    """Rule 4. Rules 2 and 3 compare SOR against SOR, so a change that costs
+    time without moving a pivot is invisible to them. This is the rule that
+    sees it, and it needs an external fixed point to see it against."""
+
+    def refs(self, **kw):
+        return {k: gate.runs.compare.Result(solver="highs", instance=k,
+                                            status="optimal", seconds=v)
+                for k, v in kw.items()}
+
+    def judge_ref(self, base, cand, reference, allow=None, g2_bar=1.05,
+                  time_bar=1.15, work_slack=0.05, min_seconds=0.05,
+                  recorded_g2=None):
+        b, c = self.tmp / "b.jsonl", self.tmp / "c.jsonl"
+        self.write(b, base)
+        self.write(c, cand)
+        rows = runs.compare_rows(
+            runs.load_run(b).results["sor:simplex"],
+            runs.load_run(c).results["sor:simplex"],
+            1.0, 100.0, 1e-9, 1e-6)
+        return gate.evaluate_reference(rows, reference, allow or {}, g2_bar,
+                                       time_bar, work_slack, min_seconds,
+                                       recorded_g2)
+
+    def test_g2_regression_against_the_recorded_ratio_fails(self):
+        base = [record(f"m{i}", seconds=1.0) for i in range(6)]
+        cand = [record(f"m{i}", seconds=1.5) for i in range(6)]
+        ref = self.refs(**{f"m{i}": 1.0 for i in range(6)})
+        # Recorded at 1.0x; now 1.5x, far over the 5% regression bar.
+        failures, _ = self.judge_ref(base, cand, ref, recorded_g2=1.0)
+        self.assertTrue(any("G2 against the HiGHS reference" in f
+                            for f in failures), failures)
+
+    def test_being_slower_than_highs_is_not_itself_a_failure(self):
+        # SOR is allowed to be slower than HiGHS; it is not allowed to get
+        # slower than it was. Same 1.5x, but that is what was recorded.
+        base = [record(f"m{i}", seconds=1.5) for i in range(6)]
+        cand = [record(f"m{i}", seconds=1.5) for i in range(6)]
+        ref = self.refs(**{f"m{i}": 1.0 for i in range(6)})
+        failures, _ = self.judge_ref(base, cand, ref, recorded_g2=1.5)
+        self.assertEqual(failures, [])
+
+    def test_no_recorded_ratio_makes_only_the_aggregate_informational(self):
+        # A baseline accepted before rule 4 existed has no G2 stamp. The
+        # AGGREGATE half then has nothing to compare against and says so; the
+        # per-model half does not depend on it and still applies, so the models
+        # here sit under the reference-time floor to isolate the aggregate.
+        base = [record(f"m{i}", seconds=0.002) for i in range(6)]
+        cand = [record(f"m{i}", seconds=0.018) for i in range(6)]
+        ref = self.refs(**{f"m{i}": 0.001 for i in range(6)})
+        failures, notes = self.judge_ref(base, cand, ref, recorded_g2=None)
+        self.assertEqual(failures, [])
+        self.assertTrue(any("no G2 recorded" in n for n in notes), notes)
+
+        # ...and with a stamp, the same sweep fails on the aggregate.
+        failures, _ = self.judge_ref(base, cand, ref, recorded_g2=2.0)
+        self.assertTrue(any("G2 against the HiGHS reference" in f
+                            for f in failures), failures)
+
+    def test_per_pivot_cost_regression_is_caught(self):
+        # Time up 40%, pivots unchanged: rule 2 sees nothing, rule 4 must.
+        base = [record("m", seconds=1.0, iterations=1000)]
+        cand = [record("m", seconds=1.4, iterations=1000)]
+        failures, _ = self.judge_ref(base, cand, self.refs(m=0.5),
+                                     recorded_g2=10.0)
+        self.assertTrue(any("per-pivot cost regression" in f
+                            for f in failures), failures)
+
+    def test_a_model_whose_work_moved_is_left_to_rule_2(self):
+        base = [record("m", seconds=1.0, iterations=1000)]
+        cand = [record("m", seconds=1.4, iterations=1400)]
+        failures, _ = self.judge_ref(base, cand, self.refs(m=0.5),
+                                     recorded_g2=10.0)
+        self.assertEqual(failures, [])
+
+    def test_models_the_reference_solves_quickly_are_exempt(self):
+        # Below the floor a 40% time ratio is timer noise, not a finding.
+        base = [record("m", seconds=0.002, iterations=1000)]
+        cand = [record("m", seconds=0.003, iterations=1000)]
+        failures, _ = self.judge_ref(base, cand, self.refs(m=0.001),
+                                     recorded_g2=10.0)
+        self.assertEqual(failures, [])
+
+    def test_a_waiver_must_carry_a_bucket_profile(self):
+        base = [record("m", seconds=1.0, iterations=1000)]
+        cand = [record("m", seconds=1.4, iterations=1000)]
+        ref = self.refs(m=0.5)
+
+        vague = {"m": {"reason": "known, we will look at it"}}
+        failures, _ = self.judge_ref(base, cand, ref, allow=vague,
+                                     recorded_g2=10.0)
+        self.assertTrue(any("no bucket profile" in f for f in failures),
+                        failures)
+
+        profiled = {"m": {"reason": "WS4 owns it: BTRAN 250 ms of 400 ms, "
+                                    "factorization 90 ms"}}
+        failures, notes = self.judge_ref(base, cand, ref, allow=profiled,
+                                         recorded_g2=10.0)
+        self.assertEqual(failures, [])
+        self.assertTrue(any("WS4 owns it" in n for n in notes), notes)
+
+    def test_the_committed_reference_loads(self):
+        path = gate.default_reference("netlib")
+        self.assertIsNotNone(path, "netlib HiGHS reference should be committed")
+        ref = gate.load_reference(path, "highs")
+        self.assertGreaterEqual(len(ref), 90)
+        self.assertTrue(all(r.seconds is not None for r in ref.values()))
+
+
+class TestDeterminism(GateCase):
+    def load_pair(self, left: list[dict], right: list[dict]):
+        a, b = self.tmp / "d1.jsonl", self.tmp / "d2.jsonl"
+        self.write(a, left)
+        self.write(b, right)
+        return runs.load_run(a), runs.load_run(b)
+
+    def test_identical_sweeps_are_deterministic(self):
+        a, b = self.load_pair([record("m")], [record("m")])
+        self.assertEqual(
+            gate.check_determinism(a, b, "sor:simplex", "pivots"), [])
+
+    def test_one_ulp_of_objective_drift_is_caught(self):
+        a, b = self.load_pair([record("m", objective=1.0)],
+                              [record("m", objective=1.0 + 2.0 ** -52)])
+        out = gate.check_determinism(a, b, "sor:simplex", "pivots")
+        self.assertTrue(any("objective bits" in f for f in out), out)
+
+    def test_a_pivot_difference_is_caught(self):
+        a, b = self.load_pair([record("m", iterations=100)],
+                              [record("m", iterations=101)])
+        out = gate.check_determinism(a, b, "sor:simplex", "pivots")
+        self.assertTrue(any("pivots 100 vs 101" in f for f in out), out)
+
+
+if __name__ == "__main__":
+    unittest.main()

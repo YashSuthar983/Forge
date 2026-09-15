@@ -46,6 +46,7 @@
 #include "sor/core/result.hpp"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace sor::la {
@@ -154,6 +155,13 @@ public:
                                    const std::vector<Index>& seed_rows,
                                    std::vector<Index>& support) const;
 
+    // Dense two-RHS FTRAN. Both vectors are transformed by the same factor in
+    // one traversal of L, U, and the update files. This is mathematically
+    // identical to two consecutive ftran() calls (and preserves each RHS's
+    // arithmetic order), but avoids fetching every sparse-factor index twice.
+    // If both references name the same vector it performs one ordinary solve.
+    void ftran_pair(std::vector<f64>& a, std::vector<f64>& b) const;
+
     // d (indexed by basis slot) <- B^-T d (indexed by row). Size m.
     void btran(std::vector<f64>& d) const;
 
@@ -193,8 +201,15 @@ public:
     // if alpha[p] is too small, or if the bump's own elimination cannot find
     // an acceptable pivot for some column even after row pivoting (a bump
     // that is itself near-singular); either way the caller must refactorize.
+    // `alpha_support` is an optional over-approximation of alpha's nonzero
+    // SLOT positions -- exactly what ftran_with_support() just returned to the
+    // caller. Supplying it replaces a full scan of alpha (a random gather
+    // through piv_slot_, and on a hypersparse basis most of the update's cost)
+    // with a pass over the support alone. Duplicates and zeros are tolerated;
+    // null means "scan everything", which is always correct but slower.
     bool update_ft(Index p, const std::vector<f64>& alpha,
-                   const LuOptions& opts, f64 min_pivot = 1e-11);
+                   const LuOptions& opts, f64 min_pivot = 1e-11,
+                   const std::vector<Index>* alpha_support = nullptr);
 
     // Collective FT (Huangfu & Hall 2015 Phase 2 in docs/SIH26119_PS_ALIGNMENT.md
     // §5 item 2): folds every PENDING product-form eta (from update(), not
@@ -230,7 +245,16 @@ public:
                         Index bump_width_max = 0, f64 work_ratio_max = 0.0) const;
 
     Index dimension()  const noexcept { return m_; }
-    Index n_updates()  const noexcept { return static_cast<Index>(eta_p_.size()); }
+    // Pending updates in EITHER file: product-form etas plus Forrest-Tomlin row
+    // etas. The refactorization triggers read this, so it has to see whichever
+    // representation is live.
+    Index n_updates()  const noexcept {
+        return static_cast<Index>(eta_p_.size() + r_pos_.size());
+    }
+    // The two files separately. Diagnostics and tests need to tell them apart;
+    // the refactorization policy deliberately does not.
+    Index n_product_form_etas() const noexcept { return static_cast<Index>(eta_p_.size()); }
+    Index n_row_etas() const noexcept { return static_cast<Index>(r_pos_.size()); }
     Offset eta_nnz()   const;
 
     // Cumulative triangular-solve work (nnz actually touched: a hypersparse
@@ -246,9 +270,32 @@ public:
     bool  is_valid()   const noexcept { return valid_; }
     const LuStats& stats() const noexcept { return stats_; }
 
+    // Full internal consistency check. Exists for the test suite: the
+    // Forrest-Tomlin update mutates six interlocking structures (U by row, U by
+    // column, the elimination order and its inverse, the diagonal, and the
+    // row-eta file), and a bug in any one of them shows up as a wrong solve
+    // many updates later, where it is very hard to localise. This asserts every
+    // invariant directly, so a test can call it after EVERY operation and fail
+    // on the operation that actually broke something.
+    //
+    // Checks: piv_row_/piv_slot_ are permutations and rpos_/cpos_ invert them;
+    // uord_/upos_ are mutual inverses; U is triangular with respect to the
+    // elimination order; the row store and column store hold exactly the same
+    // entries with the same values; no row or column repeats an index; every
+    // segment stays inside its capacity and no two segments overlap; L is
+    // strictly lower triangular in its own order; row etas are in range and
+    // never carry their own pivot position. `why` receives a description of
+    // the first violation found. O(nnz), so it is far too slow for the solve
+    // path and is never called there.
+    bool check_invariants(std::string* why = nullptr) const;
+
 private:
     void solve_lower(std::vector<f64>& v) const;      // L z = v, unit diagonal
     void solve_upper(std::vector<f64>& v) const;      // U w = v
+    void solve_lower_pair(std::vector<f64>& a,
+                          std::vector<f64>& b) const;
+    void solve_upper_pair(std::vector<f64>& a,
+                          std::vector<f64>& b) const;
     void solve_upper_t(std::vector<f64>& v) const;    // U' z = v
     void solve_lower_t(std::vector<f64>& v) const;    // L' w = v, unit diagonal
 
@@ -270,6 +317,37 @@ private:
                     const std::vector<Index>* seed_slots) const;
 
     void build_col_patterns();
+
+    // ---- Forrest-Tomlin helpers -------------------------------------------
+    // Row/column edits on U's two mirrored stores. Each pair keeps the other
+    // consistent; callers use them so that no code outside these four has to
+    // know about capacities, relocation or dead space.
+    void u_row_append(Index row, Index col, f64 val);
+    void u_col_append(Index col, Index row, f64 val);
+    void u_row_erase(Index row, Index col);    // no-op if absent
+    void u_col_erase(Index col, Index row);    // no-op if absent
+
+    // Move position `p` to the END of U's elimination order, shifting the
+    // positions after it one step earlier. Sets u_reordered_.
+    void u_order_move_to_back(Index p);
+
+    // Rebuild both U mirrors packed. Contents are preserved exactly; only the
+    // storage layout changes, so no solve can observe it.
+    void compact_u_storage();
+
+    // Sort a reach set into U's elimination order. While u_reordered_ is false
+    // that is the index order and this is the plain sort the hypersparse
+    // kernels always did; afterwards it is a sort on upos_.
+    void sort_by_elimination_order(std::vector<Index>& v) const;
+    void sort_by_index_order(std::vector<Index>& v) const;
+
+    // Row etas, in position coordinates. `touched` (optional) collects the
+    // positions each pass may have turned nonzero, which is what a seeded
+    // sparse solve needs in order to extend its seed.
+    void apply_row_etas_ftran(std::vector<f64>& v,
+                              std::vector<Index>* touched) const;
+    void apply_row_etas_btran(std::vector<f64>& v,
+                              std::vector<Index>* touched) const;
 
     // Forrest-Tomlin: dense Gauss elimination with partial (row-only) pivoting
     // over the (m-p_step)x(m-p_step) bump matrix `bm` (row-major, bm[a*w+b]).
@@ -326,10 +404,70 @@ private:
     // [u_off_[k], u_off_[k] + u_len_[k]) in u_idx_/u_val_, indices in pivot
     // coordinates. The diagonal U_kk is the implied last entry: row k holds
     // its OFF-diagonal columns only (piv_val_ carries the diagonal).
+    //
+    // u_cap_[k] is the room reserved for row k, so update_ft() can APPEND to a
+    // row in place. A row that outgrows its capacity is relocated to the end of
+    // u_idx_/u_val_ with fresh slack, leaving dead space behind; see
+    // u_dead_nnz_.
     std::vector<Offset> u_off_;
     std::vector<Index>  u_len_;
+    std::vector<Index>  u_cap_;
     std::vector<Index>  u_idx_;
     std::vector<f64>    u_val_;
+    Offset u_dead_nnz_ = 0;   // storage abandoned by row relocation
+
+    // ---- Forrest-Tomlin state (unused while update_method is ProductForm) --
+    //
+    // U's ELIMINATION ORDER, decoupled from the position numbering. Position k
+    // still means "pivot row piv_row_[k], basis slot piv_slot_[k]" for all
+    // time; what an FT update changes is only WHEN position k is eliminated.
+    // uord_[t] is the position eliminated at step t and upos_ is its inverse,
+    // so U's triangularity condition is upos_[column] > upos_[row] rather than
+    // column > row.
+    //
+    // This is what lets L stay untouched by an update, which is the whole point
+    // of Forrest-Tomlin: L and U are two independent sequences of operations
+    // over the same coordinates, so re-ordering one does not disturb the other.
+    //
+    // u_reordered_ stays false until the first update_ft(), and every U routine
+    // keeps its original index-order fast path while it is false. The
+    // ProductForm path therefore runs exactly the code it ran before, with no
+    // indirection added.
+    std::vector<Index> uord_, upos_;
+    bool u_reordered_ = false;
+
+    // U by COLUMN, with values. The reach-set DFS needs the pattern; the
+    // update needs the values too, to form L^-1 a_q = U * alpha in O(nnz)
+    // instead of searching each row for the column it wants. Same
+    // offset/length/capacity discipline as the row store above.
+    std::vector<Offset> u_cstart_;
+    std::vector<Index>  u_clen_, u_ccap_;
+    std::vector<Index>  u_crow_;
+    std::vector<f64>    u_cval_;
+    Offset u_cdead_nnz_ = 0;
+
+    // Row-eta file R. Update t eliminated the sub-diagonal part of row
+    // r_pos_[t] using the rows below it; r_idx_/r_val_ over
+    // [r_start_[t], r_start_[t+1]) hold the multipliers v (positions and
+    // values), and v[r_pos_[t]] is excluded because it is always zero.
+    //
+    //   FTRAN, oldest first:  work[p] -= sum_j v[j] * work[j]
+    //   BTRAN, newest first:  work[j] -= v[j] * work[p]   for every j in v
+    //
+    // B_k = L * M_1^-1 * ... * M_k^-1 * U_k with M_t = I - e_{p_t} v_t^T, so
+    // B_k^-1 = U_k^-1 M_k ... M_1 L^-1 and B_k^-T = L^-T M_1^T ... M_k^T U_k^-T.
+    std::vector<Index>  r_pos_;
+    std::vector<Offset> r_start_;
+    std::vector<Index>  r_idx_;
+    std::vector<f64>    r_val_;
+
+    // update_ft() scratch, kept as members so an update costs no allocation.
+    std::vector<f64>   ft_atilde_, ft_v_;
+    std::vector<Index> ft_support_, ft_vsupport_, ft_seed_;
+    std::vector<std::uint32_t> ft_stamp_;   // support membership, by generation
+    std::uint32_t ft_gen_ = 0;
+    std::vector<Index> ft_move_idx_;        // relocation staging (see u_row_append)
+    std::vector<f64>   ft_move_val_;
 
     // L multipliers, by pivot order, indices in pivot coordinates, strictly
     // greater than the pivot index. Unit diagonal is implicit. Frozen between
@@ -339,12 +477,8 @@ private:
     std::vector<Index>  l_idx_;
     std::vector<f64>    l_val_;
 
-    // Column patterns for the reach-set DFS, compressed by counting sort.
-    // Rebuilt by build_col_patterns(), which factorize() calls once and
-    // update_ft() calls again after every re-triangularization (product-form
-    // update() never touches U/L, so it never needs a rebuild).
-    std::vector<Offset> u_col_start_;
-    std::vector<Index>  u_col_row_;
+    // L's column pattern for the reach-set DFS, compressed by counting sort.
+    // Built once by build_col_patterns(); no update path touches L.
     std::vector<Offset> l_col_start_;
     std::vector<Index>  l_col_row_;
 
@@ -359,7 +493,8 @@ private:
     Offset u_live_nnz_ = 0;     // nnz actually referenced by live rows
     Offset u_alloc_nnz_ = 0;    // live + dead (refactor trigger)
 
-    mutable std::vector<f64> work_;   // scratch, size m
+    mutable std::vector<f64> work_;        // primary solve scratch, size m
+    mutable std::vector<f64> pair_work_;   // second dense FTRAN RHS, size m
     mutable std::vector<char> mark_;                // DFS marks, size n
     mutable std::vector<Index> dfs_stack_, reach_, order_, seed_;  // DFS scratch
     // Slot-space support stamps for ftran_with_support's partial-write eta
@@ -396,6 +531,10 @@ private:
     // the next seeded call must pay one full clear before it can trust it).
     mutable std::vector<Index> work_dirty_;
     mutable bool work_all_dirty_ = true;
+    bool force_comparison_sort_ = false;  // diagnostic A/B hook, set at factorize
+    // Positions the row-eta passes turned nonzero, folded into work_dirty_ so a
+    // seeded solve still knows exactly what it must clear.
+    mutable std::vector<Index> row_eta_touched_;
     Index dense_below_ = 0;          // reach larger than this -> dense solve
     LuStats stats_{};
 };

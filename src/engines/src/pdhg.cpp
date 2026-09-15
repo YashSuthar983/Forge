@@ -35,7 +35,20 @@ inline f64 mul_zero_safe(f64 a, f64 b) {
 
 }  // namespace
 
-RuizScaling ruiz_scale(model::LpProblem& p, int iterations) {
+// Nearest power of two, geometrically: x = m * 2^e with m in [0.5, 1), so the
+// two candidates are 2^(e-1) and 2^e, and 2^(e-1) is the closer one in ratio
+// exactly when 2m <= 1/m, i.e. m <= 1/sqrt(2). Returns 1.0 for anything that
+// is not a positive finite number, so a degenerate factor cannot poison the
+// scaling.
+static f64 nearest_power_of_two(f64 x) {
+    if (!(x > 0.0) || !std::isfinite(x)) return 1.0;
+    int e = 0;
+    const f64 m = std::frexp(x, &e);
+    return std::ldexp(1.0, m <= 0.7071067811865476 ? e - 1 : e);
+}
+
+RuizScaling ruiz_scale(model::LpProblem& p, int iterations,
+                       bool power_of_two) {
     const auto nr = static_cast<std::size_t>(p.n_rows());
     const auto nc = static_cast<std::size_t>(p.n_cols());
 
@@ -62,6 +75,14 @@ RuizScaling ruiz_scale(model::LpProblem& p, int iterations) {
             if (rmax[r] > 0.0) dr[r] = 1.0 / std::sqrt(rmax[r]);
         for (std::size_t j = 0; j < nc; ++j)
             if (cmax[j] > 0.0) dc[j] = 1.0 / std::sqrt(cmax[j]);
+        if (power_of_two) {
+            // Rounded per pass, not once at the end: the next pass then
+            // equilibrates against the coefficients this one actually
+            // produced. Products of powers of two are powers of two, so the
+            // accumulated row_scale/col_scale stay exact too.
+            for (f64& d : dr) d = nearest_power_of_two(d);
+            for (f64& d : dc) d = nearest_power_of_two(d);
+        }
 
         for (std::size_t r = 0; r < nr; ++r) {
             for (core::Offset k = rp[r]; k < rp[r + 1]; ++k) {

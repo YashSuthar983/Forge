@@ -100,7 +100,7 @@ void test_gmi_separates_and_is_valid() {
     CHECK(activity_lp < cut.row_lo - 1e-9);
 
     // Applying it and re-solving proves the integer optimum directly.
-    const auto cut_lp = sor::search::apply_cuts(lp, cuts);
+    const auto cut_lp = sor::search::apply_cuts(lp, cuts, sor::search::CutOptions{});
     sor::engines::SimplexDiagnostics sd2;
     const auto raw2 = sor::engines::solve_simplex(cut_lp, lp_opts, sd2, nullptr);
     CHECK(raw2.proposed_status == Status::Optimal);
@@ -164,6 +164,36 @@ sor::search::CutRow lower_cut(std::vector<sor::core::Index> cols,
     return cut;
 }
 
+// The penalty scheme is still implemented and still selected by
+// pool_parallel_hard_filter=false; it is simply not the default. Covering it
+// separately keeps the non-default branch from rotting unnoticed.
+void test_cut_pool_parallel_penalty_branch() {
+    sor::search::CutOptions opts;
+    opts.max_cuts_per_round = 2;
+    opts.pool_max_age = 1;
+    opts.pool_parallelism_max = 0.99;
+    opts.pool_efficacy_min = 1e-9;
+    opts.pool_parallel_hard_filter = false;   // the non-default branch
+    sor::search::CutDiagnostics diag;
+    sor::search::CutPool pool(opts);
+
+    // The pair that is actually near-parallel is the pure x0 row against the
+    // {x0, x1} row; the x1 row is orthogonal to both and is what a diverse
+    // batch keeps. A pool holding only the last two has nothing near-parallel
+    // in it at all -- their cosine is 0.01, under pool_parallelism_penalty_min.
+    pool.add({lower_cut({0}, {1.0}, 1.5, "x0_row")}, diag);
+    pool.add({lower_cut({0, 1}, {1.0, 0.01}, 1.6, "near_parallel"),
+              lower_cut({1}, {1.0}, 1.0, "orthogonal")}, diag);
+    const auto selected = pool.select_violated({0.0, 0.0}, diag);
+    CHECK(selected.size() == 2);
+    CHECK(selected[0].name == "near_parallel");
+    CHECK(selected[1].name == "orthogonal");
+    // Scored down rather than removed: the same diverse batch comes out, by a
+    // different mechanism, and nothing was rejected outright.
+    CHECK(diag.pool_penalized_parallel >= 1);
+    CHECK(diag.pool_rejected_parallel == 0);
+}
+
 void test_cut_pool_management() {
     sor::search::CutOptions opts;
     opts.max_cuts_per_round = 2;
@@ -191,7 +221,13 @@ void test_cut_pool_management() {
     CHECK(selected.size() == 2);
     CHECK(selected[0].name == "near_parallel");
     CHECK(selected[1].name == "orthogonal");
+    // The DEFAULT mechanism is the hard filter, not the penalty. cuts.hpp
+    // records why: the penalty is what Turner et al. (2023) 2.2.2 recommend,
+    // and swapping to it cost a proof on miplib-easy, so `pool_parallel_hard_
+    // filter` stays true and the near-parallel row is REJECTED outright rather
+    // than scored down. Assert the mechanism the tree actually ships.
     CHECK(diag.pool_rejected_parallel == 1);
+    CHECK(diag.pool_penalized_parallel == 0);
     CHECK(pool.active_size() == 2);
 
     // The unselected parallel row expires, while active fingerprints survive
@@ -209,5 +245,6 @@ int main() {
     test_gmi_fixture_via_solve_milp();
     test_cuts_do_not_change_knapsack_answer();
     test_cut_pool_management();
+    test_cut_pool_parallel_penalty_branch();
     return sor::test::finish("test_cuts");
 }

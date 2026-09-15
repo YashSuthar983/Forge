@@ -13,12 +13,17 @@ bool residuals_within_tolerance(const ProofEvidence& ev) {
            ev.max_dual_violation <= ev.dual_feas_tol;
 }
 
+bool lp_optimality_within_tolerance(const ProofEvidence& ev) {
+    return residuals_within_tolerance(ev) &&
+           std::isfinite(ev.gap_rel) && ev.gap_rel <= ev.gap_tol;
+}
+
 // The highest level the evidence actually supports.
 ProofLevel supported_level(const ProofEvidence& ev) {
     if (ev.claimed_level >= ProofLevel::ProvedOptimalFP) {
         // A basis is what makes an f64 optimality proof meaningful; a
         // first-order point without crossover does not have one.
-        if (!ev.has_basis || !residuals_within_tolerance(ev))
+        if (!ev.has_basis || !lp_optimality_within_tolerance(ev))
             return ProofLevel::FeasibleWithGap;
         if (ev.vipr_verified)      return ProofLevel::ProvedOptimalCertified;
         if (ev.rational_verified)  return ProofLevel::ProvedOptimalExact;
@@ -83,10 +88,13 @@ SolveResult finalize_result(RawResult raw, const ProofEvidence& ev) {
             r.downgrade_reason =
                 "Optimal rejected: evidence supports only " +
                 std::string(core::to_string(r.proof));
-        } else if (!ev.checker_passed) {
+        } else if (!ev.checker_passed || !std::isfinite(r.objective) ||
+                   (r.proof >= ProofLevel::ProvedOptimalFP &&
+                    !std::isfinite(r.dual_bound))) {
             r.status = Status::NumericalFailure;
-            r.downgrade_reason =
-                "Optimal rejected: independent checker did not pass";
+            r.downgrade_reason = !ev.checker_passed
+                ? "Optimal rejected: independent checker did not pass"
+                : "Optimal rejected: objective or dual bound is not finite";
         }
     }
     return r;

@@ -33,22 +33,109 @@ void usage() {
         "  --q-diag LIST    comma-separated diagonal of Q (if not using .qps)\n"
         "  --backend NAME   cpu (default) | vulkan | julia_gpu\n"
         "  --method NAME    auto | primal | dual   (simplex and MILP node LPs)\n"
+        "  --pricing NAME   choose | dantzig | devex | dse  (simplex pricing)\n"
         "  --basis-update NAME  product | ft       (simplex basis updates)\n"
         "  --collective-ft  fold pending product updates into L/U at cleanup\n"
         "  --refactor-interval N  maximum basis updates between refactors\n"
         "  --refactor-eta-ratio R refactor when eta nnz exceeds R*factor nnz\n"
         "  --refactor-work-ratio R refactor when solve work exceeds R*factor nnz\n"
         "  --dual-resync-interval N rebuild dual/reduced costs every N pivots (0=off)\n"
+        "  --dual-cost-perturbation M deterministic dual perturbation multiplier\n"
+        "  --[no-]primal-crash  feasibility-reducing crash (simplex CLI default: on)\n"
         "  --max-iter N     iteration / node limit\n"
         "  --tol T          feasibility tolerance\n"
         "  --time-limit S   wall-clock limit in seconds\n"
         "  --no-scaling     skip Ruiz equilibration\n"
+        "  --pow2-scaling   round Ruiz factors to powers of two (exact scaling)\n"
         "  --no-presolve    skip presolve (simplex/milp)\n"
+        "  --implied-slack  presolve: drop zero-cost singleton columns as slacks\n"
         "  --lattice-reform  opt-in AHL lattice reform for pure integer equalities\n"
+        "  --no-probing     skip MILP root probing (conflict graph, implied bounds)\n"
+        "  --no-feasjump    skip the Feasibility Jump primal heuristic\n"
+        "  --no-sub-mip     skip the bandit-scheduled LNS portfolio\n"
+        "  --heuristic-budget F  share of the time limit the heuristic layer may use\n"
+        "  --clique-cuts    opt-in clique cut separation in the root cut loop\n"
+        "  --no-vub-cuts    skip implied-bound (variable-bound) cut separation\n"
+        "  --cover-cuts     opt-in lifted knapsack cover cut separation\n"
+        "  --mir-cuts       opt-in mixed-integer rounding cut separation\n"
+        "  --no-aggregation skip MIR row aggregation (single-row bases only)\n"
+        "  --cut-nnz-budget F   nonzeros added per cut round, as a multiple of n (0=off)\n"
+        "  --cut-max-density F  reject cuts denser than this fraction of n (>1=off)\n"
+        "  --cut-parallel-penalty F  score penalty for parallel cuts (0=off)\n"
+        "  --cut-extra-scores F  weight of the sparsity and low-lock score terms\n"
+        "  --no-conflict-prop  skip conflict-graph propagation at nodes\n"
         "  --verbose        iteration / node log\n"
         "  --hpr-vanilla | --hpr-full\n"
         "  --solution-out PATH   write a plain-text solution file for sor_check\n",
         stderr);
+}
+
+// ---------------------------------------------------------------------------
+// Numeric option parsing.
+//
+// Every numeric flag used to go straight through strtod/strtoull with a null
+// end pointer, which accepts far too much in silence: "abc" parses as 0,
+// "-5" as a huge unsigned, and "nan"/"inf" as themselves. A mistyped flag
+// therefore produced a DIFFERENT RUN instead of an error -- `--tol abc` ran at
+// tolerance exactly 0, `--max-iter -5` ran with an effectively infinite cap,
+// and both exited 0 as though nothing was wrong. These parse the WHOLE token,
+// reject non-finite values, and enforce each option's own admissible range.
+[[noreturn]] void bad_value(const char* what, const std::string& got,
+                            const std::string& expected) {
+    std::fprintf(stderr, "error: %s expects %s, got '%s'\n", what,
+                 expected.c_str(), got.c_str());
+    std::exit(2);
+}
+
+// std::to_string(0.0) is "0.000000", which reads badly in an error message.
+std::string compact(double v) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%g", v);
+    return buf;
+}
+
+std::string range_text(double lo, double hi, bool lo_open) {
+    std::string s = "a finite number ";
+    s += lo_open ? "greater than " : "at least ";
+    s += compact(lo);
+    if (hi < std::numeric_limits<double>::max()) s += " and at most " + compact(hi);
+    return s;
+}
+
+double parse_real(const std::string& text, const char* what, double lo,
+                  double hi = std::numeric_limits<double>::max(),
+                  bool lo_open = false) {
+    std::size_t used = 0;
+    double v = 0.0;
+    try {
+        v = std::stod(text, &used);
+    } catch (const std::exception&) {
+        used = 0;
+    }
+    if (used != text.size() || text.empty() || !std::isfinite(v))
+        bad_value(what, text, range_text(lo, hi, lo_open));
+    if (lo_open ? !(v > lo) : !(v >= lo)) bad_value(what, text, range_text(lo, hi, lo_open));
+    if (!(v <= hi)) bad_value(what, text, range_text(lo, hi, lo_open));
+    return v;
+}
+
+// A leading '-' is rejected before stoull sees it: stoull WRAPS a negative
+// value into a huge positive one rather than failing.
+unsigned long long parse_uint(const std::string& text, const char* what,
+                              unsigned long long lo, unsigned long long hi) {
+    const std::string expected = "an integer from " + std::to_string(lo) +
+                                 " to " + std::to_string(hi);
+    if (text.empty() || text.find('-') != std::string::npos)
+        bad_value(what, text, expected);
+    std::size_t used = 0;
+    unsigned long long v = 0;
+    try {
+        v = std::stoull(text, &used);
+    } catch (const std::exception&) {
+        used = 0;
+    }
+    if (used != text.size() || v < lo || v > hi) bad_value(what, text, expected);
+    return v;
 }
 
 // No-op when `path` is empty (the common case: --solution-out wasn't given).
@@ -113,7 +200,25 @@ int main(int argc, char** argv) {
     bool mps_format_forced = false;
     bool tol_given = false;
     bool max_iter_given = false;
+    bool primal_crash_given = false;
     bool lattice_reform = false;
+    // MILP conflict-graph switches. Three independent consumers of one root
+    // probing pass, kept separately switchable so a benchmark run can attribute
+    // a change to the reduction, the cuts, or the node propagation.
+    bool probing = true;
+    bool feasibility_jump = true;
+    bool sub_mip_lns = true;
+    double heuristic_budget = -1.0;   // <0 keeps the library default
+    bool clique_cuts = false;   // opt-in: see BabOptions::clique_cuts
+    bool implied_bound_cuts = true;
+    bool lifted_cover_cuts = false;   // opt-in: see BabOptions
+    bool mir_cuts = false;
+    bool mir_aggregate = true;
+    double cut_nnz_budget = -1.0;    // <0 keeps the library default
+    double cut_max_density = -1.0;
+    double cut_par_penalty = -1.0;
+    double cut_extra_scores = -1.0;
+    bool conflict_propagation = true;
     double tol = 0.0;
 
     for (int i = 1; i < argc; ++i) {
@@ -129,18 +234,21 @@ int main(int argc, char** argv) {
         else if (a == "--engine")   engine_name  = next("--engine");
         else if (a == "--q-diag")   q_diag_arg   = next("--q-diag");
         else if (a == "--max-iter") {
-            const auto n = std::strtoull(next("--max-iter").c_str(), nullptr, 10);
+            const auto n = parse_uint(next("--max-iter"), "--max-iter", 1,
+                                      std::numeric_limits<std::uint64_t>::max());
             pdhg_opts.max_iterations = n;
             hpr_opts.max_iterations  = n;
             sx_opts.max_iterations   = n;
             max_iter_given = true;
         }
         else if (a == "--tol") {
-            tol = std::strtod(next("--tol").c_str(), nullptr);
+            tol = parse_real(next("--tol"), "--tol", 0.0,
+                             std::numeric_limits<double>::max(), true);
             tol_given = true;
         }
         else if (a == "--time-limit") {
-            const double t = std::strtod(next("--time-limit").c_str(), nullptr);
+            const double t = parse_real(next("--time-limit"), "--time-limit", 0.0,
+                                        std::numeric_limits<double>::max(), true);
             sx_opts.time_limit_s = t;
             hpr_opts.time_limit_s = t;
             pdhg_opts.time_limit_s = t;
@@ -164,6 +272,22 @@ int main(int argc, char** argv) {
             else if (m == "dual")   sx_opts.method = sor::engines::SimplexMethod::Dual;
             else { std::fprintf(stderr, "error: unknown method '%s'\n", m.c_str()); return 2; }
         }
+        else if (a == "--pricing") {
+            const std::string pricing = next("--pricing");
+            if (pricing == "choose")
+                sx_opts.pricing = sor::engines::SimplexPricing::Choose;
+            else if (pricing == "dantzig")
+                sx_opts.pricing = sor::engines::SimplexPricing::Dantzig;
+            else if (pricing == "devex")
+                sx_opts.pricing = sor::engines::SimplexPricing::Devex;
+            else if (pricing == "dse")
+                sx_opts.pricing = sor::engines::SimplexPricing::DSE;
+            else {
+                std::fprintf(stderr, "error: unknown simplex pricing '%s'\n",
+                             pricing.c_str());
+                return 2;
+            }
+        }
         else if (a == "--basis-update") {
             const std::string method = next("--basis-update");
             if (method == "product")
@@ -177,24 +301,59 @@ int main(int argc, char** argv) {
         }
         else if (a == "--collective-ft") sx_opts.collective_ft = true;
         else if (a == "--refactor-interval")
-            sx_opts.refactor_interval =
-                static_cast<int>(std::strtol(next("--refactor-interval").c_str(), nullptr, 10));
+            sx_opts.refactor_interval = static_cast<int>(parse_uint(
+                next("--refactor-interval"), "--refactor-interval", 0,
+                static_cast<unsigned long long>(std::numeric_limits<int>::max())));
         else if (a == "--refactor-eta-ratio")
             sx_opts.refactor_eta_ratio =
-                std::strtod(next("--refactor-eta-ratio").c_str(), nullptr);
+                parse_real(next("--refactor-eta-ratio"), "--refactor-eta-ratio", 0.0);
         else if (a == "--refactor-work-ratio")
             sx_opts.refactor_work_ratio =
-                std::strtod(next("--refactor-work-ratio").c_str(), nullptr);
+                parse_real(next("--refactor-work-ratio"), "--refactor-work-ratio", 0.0);
         else if (a == "--dual-resync-interval")
-            sx_opts.dual_resync_interval =
-                static_cast<int>(std::strtol(next("--dual-resync-interval").c_str(), nullptr, 10));
+            sx_opts.dual_resync_interval = static_cast<int>(parse_uint(
+                next("--dual-resync-interval"), "--dual-resync-interval", 0,
+                static_cast<unsigned long long>(std::numeric_limits<int>::max())));
+        else if (a == "--dual-cost-perturbation")
+            sx_opts.dual_cost_perturbation_multiplier = parse_real(
+                next("--dual-cost-perturbation"), "--dual-cost-perturbation", 0.0);
+        else if (a == "--primal-crash") {
+            sx_opts.primal_crash = true;
+            primal_crash_given = true;
+        }
+        else if (a == "--no-primal-crash") {
+            sx_opts.primal_crash = false;
+            primal_crash_given = true;
+        }
+        else if (a == "--pow2-scaling") sx_opts.ruiz_power_of_two = true;
         else if (a == "--no-scaling") {
             sx_opts.ruiz_iterations = 0;
             pdhg_opts.ruiz_iterations = 0;
             hpr_opts.ruiz_iterations = 0;
         }
         else if (a == "--no-presolve") sx_opts.presolve = false;
+        else if (a == "--implied-slack") sx_opts.presolve_implied_slack = true;
         else if (a == "--lattice-reform") lattice_reform = true;
+        else if (a == "--no-probing") probing = false;
+        else if (a == "--no-feasjump") feasibility_jump = false;
+        else if (a == "--no-sub-mip") sub_mip_lns = false;
+        else if (a == "--heuristic-budget")
+            heuristic_budget = parse_real(next("--heuristic-budget"),
+                                         "--heuristic-budget", 0.0, 1.0);
+        else if (a == "--clique-cuts") clique_cuts = true;
+        else if (a == "--no-vub-cuts") implied_bound_cuts = false;
+        else if (a == "--cover-cuts") lifted_cover_cuts = true;
+        else if (a == "--mir-cuts") mir_cuts = true;
+        else if (a == "--no-aggregation") mir_aggregate = false;
+        else if (a == "--cut-nnz-budget")
+            cut_nnz_budget = parse_real(next("--cut-nnz-budget"), "--cut-nnz-budget", 0.0);
+        else if (a == "--cut-max-density")
+            cut_max_density = parse_real(next("--cut-max-density"), "--cut-max-density", 0.0);
+        else if (a == "--cut-extra-scores")
+            cut_extra_scores = parse_real(next("--cut-extra-scores"), "--cut-extra-scores", 0.0);
+        else if (a == "--cut-parallel-penalty")
+            cut_par_penalty = parse_real(next("--cut-parallel-penalty"), "--cut-parallel-penalty", 0.0);
+        else if (a == "--no-conflict-prop") conflict_propagation = false;
         else if (a == "--fixed-mps") { mps_opts.fixed_format = true; mps_format_forced = true; }
         else if (a == "--free-mps")  { mps_opts.fixed_format = false; mps_format_forced = true; }
         else if (a == "--verbose") {
@@ -230,6 +389,24 @@ int main(int argc, char** argv) {
                      engine_name.c_str());
         return 3;
     }
+    // A backend that is merely UNAVAILABLE warns and falls back to cpu further
+    // down -- that is deliberate, since vulkan/julia_gpu depend on the machine.
+    // A backend NAME that does not exist is a different thing, and it used to
+    // be accepted in total silence: the simplex path returns before any backend
+    // is constructed, so `--backend abacus` simply did nothing.
+    if (backend_name != "cpu" && backend_name != "vulkan" &&
+        backend_name != "julia_gpu") {
+        std::fprintf(stderr,
+                     "error: unknown backend '%s' (have cpu|vulkan|julia_gpu)\n",
+                     backend_name.c_str());
+        return 2;
+    }
+    // The crash has an independent 93/93 Netlib proof gate and improves the
+    // LP CLI's aggregate pivot count. Keep SimplexOptions' library default off:
+    // MILP owns its node-LP policy separately and must not change merely
+    // because the standalone LP default did.
+    if (engine_name == "simplex" && !primal_crash_given)
+        sx_opts.primal_crash = true;
     if (tol_given) {
         pdhg_opts.primal_tol = pdhg_opts.dual_tol = tol;
         hpr_opts.primal_tol = hpr_opts.dual_tol = hpr_opts.gap_tol = tol;
@@ -258,7 +435,9 @@ int main(int argc, char** argv) {
                         start, comma == std::string::npos ? std::string::npos
                                                           : comma - start);
                     if (!tok.empty())
-                        qp.q_diag.push_back(std::strtod(tok.c_str(), nullptr));
+                        qp.q_diag.push_back(parse_real(
+                            tok, "--q-diag",
+                            -std::numeric_limits<double>::max()));
                     if (comma == std::string::npos) break;
                     start = comma + 1;
                 }
@@ -334,6 +513,27 @@ int main(int argc, char** argv) {
             sor::search::BabOptions bab;
             bab.lp = sx_opts;
             bab.verbose = sx_opts.verbose;
+            bab.probing = probing;
+            bab.feasibility_jump = feasibility_jump;
+            bab.sub_mip_lns = sub_mip_lns;
+            if (heuristic_budget >= 0.0) {
+                bab.heuristic_budget_frac = heuristic_budget;
+                bab.heuristic_budget_frac_no_incumbent =
+                    std::max(heuristic_budget, 0.80);
+            }
+            bab.clique_cuts = clique_cuts;
+            bab.implied_bound_cuts = implied_bound_cuts;
+            bab.lifted_cover_cuts = lifted_cover_cuts;
+            bab.mir_cuts = mir_cuts;
+            bab.mir.aggregate = mir_aggregate;
+            if (cut_nnz_budget >= 0.0) bab.cut.pool_nnz_budget_factor = cut_nnz_budget;
+            if (cut_max_density >= 0.0) bab.cut.pool_max_density = cut_max_density;
+            if (cut_par_penalty >= 0.0) bab.cut.pool_parallelism_penalty = cut_par_penalty;
+            if (cut_extra_scores >= 0.0) {
+                bab.cut.pool_weight_sparsity = cut_extra_scores;
+                bab.cut.pool_weight_low_locks = cut_extra_scores;
+            }
+            bab.conflict_propagation = conflict_propagation;
             // --max-iter is the public MILP node limit.  A node LP must not
             // inherit that value as its own pivot cap: doing so interrupted
             // the schedule root relaxation at 5000 pivots and left B&B with
@@ -385,6 +585,15 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(diag.lp_solves));
             std::printf("lp fallbacks:      %llu\n",
                         static_cast<unsigned long long>(diag.lp_fallbacks));
+            std::printf("node LP:            %llu iterations in %.1f ms "
+                        "(%.1f iters/node, %.3f ms/node)\n",
+                        static_cast<unsigned long long>(diag.lp_iterations),
+                        diag.lp_ms,
+                        diag.nodes ? double(diag.lp_iterations) / double(diag.nodes) : 0.0,
+                        diag.nodes ? diag.lp_ms / double(diag.nodes) : 0.0);
+            if (std::isfinite(diag.root_bound_before_cuts))
+                std::printf("root bound:        %.10e -> %.10e after cuts\n",
+                            diag.root_bound_before_cuts, diag.root_bound_after_cuts);
             std::printf("integer row roundings: %llu\n",
                         static_cast<unsigned long long>(diag.integer_row_roundings));
             std::printf("binary cover cuts: %llu\n",
@@ -392,6 +601,76 @@ int main(int argc, char** argv) {
             std::printf("GMI cuts:          %llu in %d rounds\n",
                         static_cast<unsigned long long>(diag.gmi_cuts_added),
                         diag.cut_rounds);
+            std::printf("LNS (bandit):      %llu hits / %llu built / %llu attempts, "
+                        "%llu child nodes, %llu budget blocks (%.1f ms)\n",
+                        static_cast<unsigned long long>(diag.lns.hits),
+                        static_cast<unsigned long long>(diag.lns.built),
+                        static_cast<unsigned long long>(diag.lns.attempts),
+                        static_cast<unsigned long long>(diag.sub_mip_nodes),
+                        static_cast<unsigned long long>(diag.lns.budget_blocks),
+                        diag.sub_mip_ms);
+            for (const auto& a : diag.lns.arms) {
+                if (a.calls == 0) continue;
+                std::printf("  arm %-12s calls %-5llu hits %-4llu "
+                            "mean reward %.3f  fixing rate %.2f  %.2fs\n",
+                            sor::search::to_string(a.kind),
+                            static_cast<unsigned long long>(a.calls),
+                            static_cast<unsigned long long>(a.hits),
+                            a.calls ? a.reward_sum / double(a.calls) : 0.0,
+                            a.fixing_rate, a.seconds);
+            }
+            std::printf("heuristics:        %.1f ms total, %llu budget blocks\n",
+                        diag.heuristic_ms + diag.feasjump_ms + diag.sub_mip_ms,
+                        static_cast<unsigned long long>(diag.heuristic_budget_blocks));
+            std::printf("feasibility jump:  %llu attempts, %llu hits, %llu moves, "
+                        "%llu reweights, %llu restarts, best %zu violated rows "
+                        "(%.1f ms)\n",
+                        static_cast<unsigned long long>(diag.feasjump_attempts),
+                        static_cast<unsigned long long>(diag.feasjump_hits),
+                        static_cast<unsigned long long>(diag.feasjump_moves),
+                        static_cast<unsigned long long>(diag.feasjump_weight_updates),
+                        static_cast<unsigned long long>(diag.feasjump_restarts),
+                        diag.feasjump_best_violated_rows,
+                        diag.feasjump_ms);
+            std::printf("probing:           %llu probes, %llu fixings, "
+                        "%llu implications, %llu bound tightenings%s (%.1f ms)\n",
+                        static_cast<unsigned long long>(diag.conflict.probes),
+                        static_cast<unsigned long long>(diag.conflict.probe_fixings),
+                        static_cast<unsigned long long>(diag.conflict.probe_implications),
+                        static_cast<unsigned long long>(diag.conflict.probe_tightenings),
+                        diag.conflict.probing_truncated ? " [truncated]" : "",
+                        diag.conflict.probe_ms);
+            std::printf("conflict graph:    %llu row cliques, %llu edges\n",
+                        static_cast<unsigned long long>(diag.conflict.row_cliques),
+                        static_cast<unsigned long long>(diag.conflict.edges));
+            std::printf("cut loop:          %.1f ms of the %.0f s budget\n",
+                        diag.cut_loop_ms, bab.time_limit_s);
+            std::printf("MIR cuts:          %llu of %llu candidates added; "
+                        "%llu bases, rejected %llu frac / %llu dyn / %llu unviolated\n",
+                        static_cast<unsigned long long>(diag.mir_cuts_added),
+                        static_cast<unsigned long long>(diag.mir_candidates),
+                        static_cast<unsigned long long>(diag.mir.bases_built),
+                        static_cast<unsigned long long>(diag.mir.rejected_fractionality),
+                        static_cast<unsigned long long>(diag.mir.rejected_dynamism),
+                        static_cast<unsigned long long>(diag.mir.rejected_not_violated));
+            std::printf("lifted covers:     %llu of %llu candidates added; "
+                        "%llu covers from %llu knapsacks, %llu lifted coefs\n",
+                        static_cast<unsigned long long>(diag.lifted_cover_cuts_added),
+                        static_cast<unsigned long long>(diag.lifted_cover_candidates),
+                        static_cast<unsigned long long>(diag.cover.covers_found),
+                        static_cast<unsigned long long>(diag.cover.knapsacks_built),
+                        static_cast<unsigned long long>(diag.cover.lifted_coefficients));
+            std::printf("implied bounds:    %llu recorded; %llu of %llu VUB "
+                        "cut candidates added\n",
+                        static_cast<unsigned long long>(diag.conflict.implied_bounds),
+                        static_cast<unsigned long long>(diag.implied_bound_cuts_added),
+                        static_cast<unsigned long long>(diag.implied_bound_cut_candidates));
+            std::printf("clique cuts:       %llu of %llu candidates added; "
+                        "node propagation %llu tightenings, %llu prunes\n",
+                        static_cast<unsigned long long>(diag.clique_cuts_added),
+                        static_cast<unsigned long long>(diag.clique_cut_candidates),
+                        static_cast<unsigned long long>(diag.conflict_prop_tightenings),
+                        static_cast<unsigned long long>(diag.conflict_prop_prunes));
             std::printf("cut pool:          %llu inserted, %llu duplicate, "
                         "%llu dominated, %llu parallel-rejected, %llu aged, "
                         "%llu evicted\n",
@@ -459,6 +738,20 @@ int main(int argc, char** argv) {
             std::printf("  CSR->CSC         %10.3f\n", diag.csc_ms);
             std::printf("  preparation      %10.3f\n", diag.preprocessing_ms);
             std::printf("  presolve         %10.3f\n", diag.presolve_ms);
+            std::printf("    reductions     %10d rows / %d cols\n",
+                        static_cast<int>(diag.presolve_rows_removed),
+                        static_cast<int>(diag.presolve_cols_removed));
+            std::printf("    singleton cols %10d\n",
+                        static_cast<int>(
+                            diag.presolve_singleton_columns_removed));
+            std::printf("    forcing rows  %10d  (%d columns fixed)\n",
+                        static_cast<int>(diag.presolve_forcing_rows_removed),
+                        static_cast<int>(diag.presolve_forcing_columns_fixed));
+            std::printf("    aggregations  %10d  (%lld positive fill)\n",
+                        static_cast<int>(diag.presolve_equality_aggregations),
+                        static_cast<long long>(diag.presolve_aggregation_fill));
+            std::printf("    retries       %10llu\n",
+                        static_cast<unsigned long long>(diag.presolve_retries));
             std::printf("  factorization    %10.3f\n", diag.factor_ms);
             std::printf("  pricing          %10.3f\n", diag.price_ms);
             std::printf("  triangular solve %10.3f\n", diag.solve_ms);
@@ -474,6 +767,86 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(diag.refactorizations),
                         static_cast<unsigned long long>(diag.collective_ft_collapses),
                         static_cast<unsigned long long>(diag.collective_ft_skips));
+            std::printf("  phase restarts   %10llu  (%llu dual resyncs)\n",
+                        static_cast<unsigned long long>(diag.phase_restarts),
+                        static_cast<unsigned long long>(diag.dual_resyncs));
+            std::printf("  phase1 cost delta %9llu / %llu changed, max %llu\n",
+                        static_cast<unsigned long long>(
+                            diag.phase1_cost_change_iterations),
+                        static_cast<unsigned long long>(diag.phase1_cost_changes),
+                        static_cast<unsigned long long>(diag.phase1_cost_change_max));
+            std::printf("  primal BTRAN     %10llu / %llu sparse, avg support %llu\n",
+                        static_cast<unsigned long long>(diag.primal_btran_sparse),
+                        static_cast<unsigned long long>(
+                            diag.primal_btran_sparse + diag.primal_btran_dense),
+                        static_cast<unsigned long long>(
+                            diag.primal_btran_sparse
+                                ? diag.primal_btran_support_entries /
+                                      diag.primal_btran_sparse
+                                : 0));
+            std::printf("  phase1 composite %10llu  (%llu sparse / %llu dense / %llu fallback), avg support %llu\n",
+                        static_cast<unsigned long long>(
+                            diag.phase1_composite_updates),
+                        static_cast<unsigned long long>(
+                            diag.phase1_composite_sparse),
+                        static_cast<unsigned long long>(
+                            diag.phase1_composite_dense),
+                        static_cast<unsigned long long>(
+                            diag.phase1_composite_fallbacks),
+                        static_cast<unsigned long long>(
+                            diag.phase1_composite_sparse
+                                ? diag.phase1_composite_support_entries /
+                                      diag.phase1_composite_sparse
+                                : 0));
+            std::printf("  composite error %11.3g\n",
+                        diag.phase1_composite_max_abs_error);
+            std::printf("  Devex frameworks %10llu  (%llu exact checks)\n",
+                        static_cast<unsigned long long>(diag.devex_frameworks),
+                        static_cast<unsigned long long>(diag.devex_weight_checks));
+            std::printf("  DSE weight checks %10llu  (%llu rejected rows)\n",
+                        static_cast<unsigned long long>(diag.dse_weight_checks),
+                        static_cast<unsigned long long>(diag.dse_weight_rejections));
+            std::printf("  DSE->Devex       %10llu  (%llu accuracy, %llu stability, %llu costly DSE iters)\n",
+                        static_cast<unsigned long long>(diag.dse_to_devex_switches),
+                        static_cast<unsigned long long>(diag.dse_accuracy_switches),
+                        static_cast<unsigned long long>(diag.dse_stability_switches),
+                        static_cast<unsigned long long>(diag.costly_dse_iterations));
+            std::printf("  DSE log error    %10.3g\n", diag.dse_log_weight_error);
+            std::printf("  paired FTRAN     %10llu\n",
+                        static_cast<unsigned long long>(diag.dual_paired_ftrans));
+            std::printf("  pivotal support  %10llu -> %llu entries\n",
+                        static_cast<unsigned long long>(
+                            diag.dual_pivotal_entries_full),
+                        static_cast<unsigned long long>(
+                            diag.dual_pivotal_entries_kept));
+            std::printf("  dual pricing init D:%llu V:%llu S:%llu\n",
+                        static_cast<unsigned long long>(diag.dual_dantzig_starts),
+                        static_cast<unsigned long long>(diag.dual_devex_starts),
+                        static_cast<unsigned long long>(diag.dual_dse_starts));
+            std::printf("  cost perturb     %10llu  (%llu cleanups)\n",
+                        static_cast<unsigned long long>(diag.perturbed_costs),
+                        static_cast<unsigned long long>(diag.perturbation_cleanups));
+            std::printf("  cost shifts      %10llu  (%llu wrong-sign entering, max %.3e)\n",
+                        static_cast<unsigned long long>(diag.cost_shifts),
+                        static_cast<unsigned long long>(
+                            diag.wrong_sign_entering_shifts),
+                        diag.cost_shift_max);
+            std::printf("  primal cleanup   %10llu  (%llu pivots, handed dual "
+                        "infeas %.3e / primal infeas %.3e)\n",
+                        static_cast<unsigned long long>(diag.primal_cleanups),
+                        static_cast<unsigned long long>(
+                            diag.primal_cleanup_iterations),
+                        diag.cleanup_dual_infeasibility,
+                        diag.cleanup_primal_infeasibility);
+            std::printf("  ratio sorted     %10llu candidates\n",
+                        static_cast<unsigned long long>(
+                            diag.ratio_sorted_candidates));
+            std::printf("  dual ratio test  %llu groups, %llu back-offs, %llu exhausted, %llu tiny excluded\n",
+                        static_cast<unsigned long long>(diag.ratio_groups),
+                        static_cast<unsigned long long>(diag.ratio_backoffs),
+                        static_cast<unsigned long long>(diag.ratio_exhausted),
+                        static_cast<unsigned long long>(
+                            diag.ratio_small_pivot_exclusions));
             std::printf("  simplex loop     %10.3f\n", diag.loop_ms);
             std::printf("  flip batches     %10.3f  (%llu batches)\n", diag.flip_ms,
                         static_cast<unsigned long long>(diag.flip_batches));
@@ -486,9 +859,21 @@ int main(int argc, char** argv) {
                             diag.alpha_sparse_iters
                                 ? diag.alpha_support_entries / diag.alpha_sparse_iters
                                 : 0));
+            std::printf("  primal FTRAN switches %6llu\n",
+                        static_cast<unsigned long long>(
+                            diag.primal_ftran_dense_switches));
+            std::printf("  primal crash     %10llu  (infeas %.6g -> %.6g)\n",
+                        static_cast<unsigned long long>(diag.primal_crash_columns),
+                        diag.primal_crash_infeasibility_before,
+                        diag.primal_crash_infeasibility_after);
             std::printf("  auto stages/builds %8llu / %llu\n",
                         static_cast<unsigned long long>(diag.stages),
                         static_cast<unsigned long long>(diag.preprocessing_builds));
+            std::printf("  stage path       P:%llu D:%llu cold:%llu basis-restart:%llu\n",
+                        static_cast<unsigned long long>(diag.primal_stages),
+                        static_cast<unsigned long long>(diag.dual_stages),
+                        static_cast<unsigned long long>(diag.cold_stages),
+                        static_cast<unsigned long long>(diag.basis_restarts));
             return exit_code_for(r.status);
         }
 

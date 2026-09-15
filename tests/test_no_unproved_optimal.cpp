@@ -3,6 +3,8 @@
 #include "sor/certify/finalize.hpp"
 #include "test_helpers.hpp"
 
+#include <limits>
+
 using sor::certify::finalize_result;
 using sor::certify::ProofEvidence;
 using sor::certify::RawResult;
@@ -16,6 +18,7 @@ RawResult claim_optimal() {
     r.proposed_status = Status::Optimal;
     r.proposed_level  = ProofLevel::ProvedOptimalFP;
     r.objective       = 42.0;
+    r.dual_bound      = 42.0;
     r.engine          = "pdhg";
     return r;
 }
@@ -102,6 +105,56 @@ int main() {
         CHECK(r.proof == ProofLevel::FeasibleOnly);
         CHECK(sor::core::human_line(r.status, r.proof) ==
               "feasible (no dual bound - first-order method)");
+    }
+
+    // 8. LP optimality needs a finite, closed duality gap at the final gate,
+    // even if an engine incorrectly labels its own evidence as proved.
+    {
+        ProofEvidence ev = good_evidence();
+        ev.gap_rel = std::numeric_limits<double>::infinity();
+        CHECK(finalize_result(claim_optimal(), ev).status != Status::Optimal);
+        ev.gap_rel = std::numeric_limits<double>::quiet_NaN();
+        CHECK(finalize_result(claim_optimal(), ev).status != Status::Optimal);
+        ev.gap_rel = 10.0 * ev.gap_tol;
+        CHECK(finalize_result(claim_optimal(), ev).status != Status::Optimal);
+    }
+
+    // 9. Finite residual metadata cannot launder a NaN objective or dual
+    // bound into a reportable optimum.
+    {
+        RawResult raw = claim_optimal();
+        raw.objective = std::numeric_limits<double>::quiet_NaN();
+        CHECK(finalize_result(std::move(raw), good_evidence()).status ==
+              Status::NumericalFailure);
+        raw = claim_optimal();
+        raw.dual_bound = std::numeric_limits<double>::infinity();
+        CHECK(finalize_result(std::move(raw), good_evidence()).status ==
+              Status::NumericalFailure);
+    }
+
+    // 10. Infeasibility rays are retained only after the independent
+    // violation check; all other statuses and failed checks clear them.
+    {
+        RawResult raw;
+        raw.proposed_status = Status::Infeasible;
+        raw.ray = {1.0, -2.0};
+        ProofEvidence ev;
+        ev.ray_violation = 0.0;
+        auto accepted = finalize_result(std::move(raw), ev);
+        CHECK(accepted.ray_certified);
+        CHECK(accepted.ray.size() == 2);
+
+        raw.proposed_status = Status::Infeasible;
+        raw.ray = {1.0};
+        ev.ray_violation = std::numeric_limits<double>::infinity();
+        auto rejected = finalize_result(std::move(raw), ev);
+        CHECK(!rejected.ray_certified);
+        CHECK(rejected.ray.empty());
+
+        raw.proposed_status = Status::Feasible;
+        raw.ray = {1.0};
+        ev.ray_violation = 0.0;
+        CHECK(finalize_result(std::move(raw), ev).ray.empty());
     }
 
     return sor::test::finish("test_no_unproved_optimal");
