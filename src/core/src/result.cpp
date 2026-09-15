@@ -33,6 +33,18 @@ std::string_view to_string(ProofLevel p) noexcept {
     return "Unknown";
 }
 
+std::string_view to_string(LpStrategy s) noexcept {
+    switch (s) {
+        case LpStrategy::Auto:          return "auto";
+        case LpStrategy::Simplex:       return "simplex";
+        case LpStrategy::PrimalSimplex: return "primal";
+        case LpStrategy::DualSimplex:   return "dual";
+        case LpStrategy::Hpr:           return "hpr";
+        case LpStrategy::Pdhg:          return "pdhg";
+    }
+    return "unknown";
+}
+
 std::string_view human_line(Status s, ProofLevel p) noexcept {
     if (s == Status::Feasible && p == ProofLevel::FeasibleOnly)
         return "feasible (no dual bound - first-order method)";

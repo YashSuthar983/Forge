@@ -2,8 +2,7 @@
 //
 // Exercises every KernelBackend method on fixed, seeded inputs and compares a
 // candidate backend against the CPU reference. test_backend_parity.cpp uses it
-// for CPU-vs-CPU (a self-consistency and API check); test_julia_gpu_parity.cpp
-// uses the same harness for JuliaGpuBackend-vs-CPU.
+// for CPU-vs-CPU (a self-consistency and API check).
 //
 // docs/architecture.md §3.3: "A CUDA kernel that disagrees with the CPU
 // reference fails the build."
