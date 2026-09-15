@@ -1,12 +1,14 @@
-// SOR — lightweight LP presolve (Andersen & Andersen 1995 subset).
+// SOR — LP presolve with a chronological postsolve journal.
 //
-// LAYER L3. Reversible reductions with postsolve recovery for the solution
-// vector. Proof steps (C6) are not emitted yet — this is presolve v1 for speed.
+// LAYER L3. Reversible reductions recover primal/dual solutions on the original
+// model. Proof steps (C6) are not emitted from presolve itself.
 #pragma once
 
+#include "sor/core/result.hpp"
 #include "sor/model/lp.hpp"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace sor::presolve {
@@ -16,6 +18,14 @@ using core::Index;
 using core::Offset;
 
 struct PresolveStats {
+    Index original_rows = 0;
+    Index original_cols = 0;
+    Offset original_nnz = 0;
+    Index reduced_rows = 0;
+    Index reduced_cols = 0;
+    Offset reduced_nnz = 0;
+    Index passes = 0;
+
     Index rows_removed    = 0;
     Index cols_fixed      = 0;
     Index cols_removed    = 0;
@@ -25,7 +35,44 @@ struct PresolveStats {
     Index forcing_columns_fixed = 0;
     Index equality_aggregations = 0;
     Offset aggregation_fill = 0;
+    Index dual_fixes = 0;
+    Index doubleton_substitutions = 0;
+    Index dominated_columns_removed = 0;
+    Index duplicate_rows_merged = 0;
+    Index duplicate_columns_merged = 0;
+
+    double elapsed_ms = 0.0;
 };
+
+struct PresolveOptions {
+    bool enabled = true;
+    bool implied_slack = false;
+    // Queue-driven v2 rules (dual fix, duplicates, …). Off by default so
+    // presolve_lp() stays bit-identical to the immutable fixed-point kernel.
+    bool live_reductions = false;
+    // Sub-rules apply only when live_reductions is true. Aggressive ones
+    // default off: implied bounds can box former semi-bounded slacks into a
+    // state where doubleton then deletes them, and parallel/dominated merges
+    // still need broader dual-ray coverage before they are production-safe.
+    bool implied_bounds = false;
+    bool dominated_columns = false;
+    bool parallel_rows = false;
+    bool parallel_columns = false;
+    int max_passes = 64;
+    f64 feasibility_tol = 1e-7;
+    f64 stability_tol_scale = 1e-9;
+    Offset max_substitution_fill = 512;
+};
+
+enum class PresolveStatus : std::uint8_t {
+    Reduced = 0,
+    Solved,
+    Infeasible,
+    Unbounded,
+    NumericalFailure,
+};
+
+const char* to_string(PresolveStatus s);
 
 struct BoundChange {
     Index col = -1;
@@ -37,23 +84,23 @@ struct BoundChange {
     f64 new_hi = 0.0;
 };
 
-// Dual recovery must undo row-based reductions in the exact reverse order in
-// which presolve applied them. Separate per-reduction stacks are insufficient:
-// a later recovered row multiplier can change the reduced cost of a column
-// handled by an earlier, different reduction kind.
 enum class DualRecoveryKind : std::uint8_t {
     EqualitySingletonFix,
     SingletonColumnElimination,
     EqualityAggregation,
     BoundTightening,
     ForcingRow,
+    DualFix,
+    DoubletonEquality,
+    DominatedColumn,
+    ParallelRowMerge,
+    ParallelColumnMerge,
 };
 
 struct DualRecoveryStep {
     DualRecoveryKind kind = DualRecoveryKind::EqualitySingletonFix;
     Index row = -1;
 
-    // Singleton/bound-tightening payload.
     Index col = -1;
     f64 coeff = 0.0;
     f64 old_lo = 0.0;
@@ -62,38 +109,15 @@ struct DualRecoveryStep {
     f64 new_hi = 0.0;
     Index record = -1;
 
-    // Column-stationarity state at the instant an equality singleton fixes a
-    // column or an inequality singleton tightens its bounds. Earlier removed
-    // rows have not yet been restored during reverse replay, so recomputing
-    // against the original matrix is not equivalent to this transformed
-    // system. Store the objective and every OTHER live row coefficient.
     f64 stage_cost = 0.0;
     std::vector<Index> other_rows;
     std::vector<f64> other_row_coefficients;
 
-    // Forcing-row payload. at_max=true means the row lower bound equals its
-    // maximum activity; false means its upper bound equals minimum activity.
     bool at_max = false;
     std::vector<Index> columns;
     std::vector<f64> coefficients;
 };
 
-// Reversible elimination of a column that occurs in one equality row. The
-// eliminated variable is recovered from that original row after all later
-// eliminations have been undone. `dual_value` is the row multiplier in the
-// transformed system at the moment of elimination. Dual postsolve must replay
-// this value, rather than recomputing from the original matrix before earlier
-// eliminated rows have themselves been restored.
-//
-// Two proof-complete variants exist:
-//   * row_removed=true  — the column's bounds were redundant over the other
-//     variables' full range (implied-free). The equality disappears with the
-//     column.
-//   * row_removed=false — the column's bounds were load-bearing. They are
-//     transferred onto the remaining activity as a ranged row (Andersen &
-//     Andersen 1995 singleton substitution). The row stays; only the column
-//     disappears. Basis lifting must not reinstall the eliminated column as
-//     basic for a row that still exists in the reduced problem.
 struct SingletonColumnElimination {
     Index row = -1;
     Index col = -1;
@@ -105,14 +129,6 @@ struct SingletonColumnElimination {
     std::vector<f64> other_coeffs;
 };
 
-// Reversible substitution of a column through an equality that may also
-// occur in other live rows. The equation and row-operation multipliers are
-// captured in the state in which the transformation was applied. Primal
-// recovery uses the equation; dual recovery uses
-//
-//   y_row = dual_value - sum_h row_multipliers[h] * y_h,
-//
-// which is the exact transpose of A_h <- A_h - multiplier_h * A_row.
 struct EqualityAggregation {
     Index row = -1;
     Index col = -1;
@@ -125,55 +141,109 @@ struct EqualityAggregation {
     std::vector<f64> row_multipliers;
 };
 
-// Maps original column j -> fixed value (when fixed) or new column index.
-//
-// The ROW maps exist so a basis on the reduced problem can be lifted back to
-// the original index space. Without them a caller receiving a SimplexBasis has
-// no way to tell which original row a basis slot belongs to, and silently mixes
-// reduced-space indices with a postsolved (original-space) x.
+struct DoubletonEqualitySubstitution {
+    Index row = -1;
+    Index elim_col = -1;
+    Index keep_col = -1;
+    f64 elim_coeff = 0.0;
+    f64 keep_coeff = 0.0;
+    f64 rhs = 0.0;
+    f64 dual_value = 0.0;
+    std::vector<Index> other_cols;
+    std::vector<f64> other_coeffs;
+};
+
 struct PresolveMap {
     model::LpProblem problem;
-    std::vector<Index> orig_to_new;   // -1 if fixed
+    std::vector<Index> orig_to_new;
     std::vector<f64>   fixed_value;
     std::vector<Index> new_to_orig;
 
-    std::vector<Index> row_orig_to_new;   // -1 if the row was removed
+    std::vector<Index> row_orig_to_new;
     std::vector<Index> row_new_to_orig;
 
-    // Retained as a direct diagnostic view of implied singleton-row bound
-    // tightenings. The authoritative replay order is recovery_steps.
     std::vector<BoundChange> bound_changes;
-
-    // Global chronological journal for every row multiplier that postsolve
-    // may need to reconstruct. Replayed back-to-front.
     std::vector<DualRecoveryStep> recovery_steps;
-
-    // Equality rows/columns removed by the proof-complete singleton-column
-    // rule, in elimination order. Primal recovery runs in reverse order.
     std::vector<SingletonColumnElimination> singleton_columns;
-
-    // General equality substitutions run after the lightweight immutable-CSR
-    // fixed point. They are replayed backwards before singleton_columns.
     std::vector<EqualityAggregation> equality_aggregations;
+    std::vector<DoubletonEqualitySubstitution> doubleton_equalities;
 
     PresolveStats stats;
 };
 
-// Reductions: fixed/empty columns, redundant/empty rows, singleton-row bound
-// tightening, proof-complete singleton-column equality elimination (implied-
-// free deletion or Andersen bound-transfer to a ranged row), exact multi-
-// entry forcing rows, and guarded equality aggregation.
-// `implied_slack` enables the zero-cost singleton-column bound transfer (the
-// row_removed=false variant above). It is OFF by default on measurement, not
-// on principle: it is sound and it cuts the suite's geometric pivot count by
-// 4% (seba 397 -> 101), but it converts equality rows into inequalities, whose
-// logicals are ratio-test candidates where a fixed logical was skipped. That
-// lengthens the dual trajectory on the models with the most such rows --
-// dfl001 19,623 -> 23,674 pivots and pilot 7,587 -> 8,650 -- and dfl001
-// dominates the suite's total wall. See docs/IMPLIED_SLACK_20260909.md.
+struct PresolveOutcome {
+    PresolveStatus status = PresolveStatus::Reduced;
+    PresolveMap map;
+    Index witness_row = -1;
+    Index witness_col = -1;
+    std::string reason;
+
+    bool reduced() const noexcept {
+        return status == PresolveStatus::Reduced ||
+               status == PresolveStatus::Solved;
+    }
+
+    const PresolveStats& stats() const noexcept { return map.stats; }
+};
+
+PresolveOutcome presolve(const model::LpProblem& in,
+                         const PresolveOptions& opts = {});
+
 PresolveMap presolve_lp(const model::LpProblem& in, bool implied_slack = false);
 
-// Lift a solution on the presolved problem back to the original columns.
 std::vector<f64> postsolve(const PresolveMap& map, const std::vector<f64>& x_reduced);
+
+// Mirrors sor::engines::NonbasicStatus so presolve stays independent of L4.
+enum class PostsolveNonbasicStatus : std::uint8_t {
+    Basic = 0,
+    AtLower,
+    AtUpper,
+    AtZeroFree,
+};
+
+struct PostsolveBasis {
+    Index n_struct = 0;
+    std::vector<Index> basic;
+    std::vector<PostsolveNonbasicStatus> status;
+};
+
+struct PresolveReducedSolve {
+    std::vector<f64> x;
+    std::vector<f64> y;
+    PostsolveBasis basis;
+    bool has_basis = false;
+};
+
+struct PresolveRecoveryOptions {
+    f64 primal_feas_tol = 1e-7;
+    f64 dual_feas_tol = 1e-7;
+    f64 gap_tol = 1e-9;
+};
+
+struct PresolveRecoveryResult {
+    core::RawResult raw;
+    PostsolveBasis basis;
+    core::ProofEvidence evidence;
+    bool validated = false;
+    std::string failure_reason;
+};
+
+// Lift a reduced-space candidate to the original model and validate against it.
+PresolveRecoveryResult recover_solution(
+    const model::LpProblem& original,
+    const PresolveMap& map,
+    const PresolveReducedSolve& reduced,
+    const PresolveRecoveryOptions& opts = {});
+
+core::PrimalRay recover_primal_ray(const model::LpProblem& original,
+                                   const PresolveMap& map,
+                                   const core::PrimalRay& reduced,
+                                   f64 tolerance = 1e-7);
+
+core::DualFarkasRay recover_dual_farkas_ray(
+    const model::LpProblem& original,
+    const PresolveMap& map,
+    const core::DualFarkasRay& reduced,
+    f64 tolerance = 1e-7);
 
 }  // namespace sor::presolve

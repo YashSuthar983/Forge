@@ -49,7 +49,10 @@ struct PdhgOptions {
     std::uint64_t check_every    = 200;    // residual evaluation interval
     f64 primal_tol = 1e-6;
     f64 dual_tol   = 1e-6;
+    f64 gap_tol    = 1e-6;
     int ruiz_iterations   = 10;
+    bool use_pock_chambolle = true;
+    f64 pock_chambolle_alpha = 1.0;
     int power_iterations  = 30;
     f64 step_safety       = 0.9;           // tau*sigma*||A||^2 <= safety^2
     bool verbose = false;
@@ -89,6 +92,11 @@ struct RuizScaling {
 // production simplex codes for exactly this trade.
 RuizScaling ruiz_scale(model::LpProblem& p, int iterations,
                        bool power_of_two = false);
+
+// One diagonal Pock--Chambolle pass composed onto an existing scaling.
+// alpha=1 gives inverse-square-root row/column l1 scaling.
+void pock_chambolle_scale(model::LpProblem& p, RuizScaling& accumulated,
+                          f64 alpha = 1.0);
 
 // Solves and returns a RawResult. The caller must pass it through
 // certify::finalize_result to obtain a reportable SolveResult. This engine

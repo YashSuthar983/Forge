@@ -1,5 +1,11 @@
 #include "sor/presolve/presolve.hpp"
 
+#include "live_matrix.hpp"
+
+#include <chrono>
+#include <stdexcept>
+#include <string>
+
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
@@ -17,10 +23,47 @@ inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 
 }  // namespace
 
-PresolveMap presolve_lp(const model::LpProblem& in, bool implied_slack) {
+namespace {
+
+// The whole of presolve, with the outcome it reached. presolve() and the
+// presolve_lp() compatibility wrapper are thin shells over this.
+PresolveMap run_presolve(const model::LpProblem& in,
+                         const PresolveOptions& options,
+                         PresolveStatus& status,
+                         Index& witness_row, Index& witness_col,
+                         std::string& reason) {
+    using PresolveClock = std::chrono::steady_clock;
+    const auto presolve_t0 = PresolveClock::now();
+    const bool implied_slack = options.implied_slack;
+    status = PresolveStatus::Reduced;
+    witness_row = -1;
+    witness_col = -1;
+
     PresolveMap out;
     out.stats = PresolveStats{};
     out.problem = in;
+    out.stats.original_rows = in.n_rows();
+    out.stats.original_cols = in.n_cols();
+    out.stats.original_nnz  = in.nnz();
+
+    if (!options.enabled) {
+        // "Disabled" must still be a valid, postsolvable map, so a caller does
+        // not need a second code path for it: identity maps, empty journal.
+        const Index mm = in.n_rows(), nn = in.n_cols();
+        out.orig_to_new.resize(sz(nn));
+        out.new_to_orig.resize(sz(nn));
+        out.fixed_value.assign(sz(nn), 0.0);
+        for (Index j = 0; j < nn; ++j) { out.orig_to_new[sz(j)] = j; out.new_to_orig[sz(j)] = j; }
+        out.row_orig_to_new.resize(sz(mm));
+        out.row_new_to_orig.resize(sz(mm));
+        for (Index i = 0; i < mm; ++i) { out.row_orig_to_new[sz(i)] = i; out.row_new_to_orig[sz(i)] = i; }
+        out.stats.reduced_rows = mm;
+        out.stats.reduced_cols = nn;
+        out.stats.reduced_nnz  = in.nnz();
+        out.stats.elapsed_ms = std::chrono::duration<double, std::milli>(
+            PresolveClock::now() - presolve_t0).count();
+        return out;
+    }
 
     const Index m = in.n_rows();
     const Index n = in.n_cols();
@@ -69,8 +112,9 @@ PresolveMap presolve_lp(const model::LpProblem& in, bool implied_slack) {
     };
 
     bool changed = true;
-    for (int pass = 0; pass < 64 && changed; ++pass) {
+    for (int pass = 0; pass < options.max_passes && changed; ++pass) {
         changed = false;
+        ++out.stats.passes;
 
         // Fixed columns (lo == hi).
         for (Index j = 0; j < n; ++j) {
@@ -114,7 +158,14 @@ PresolveMap presolve_lp(const model::LpProblem& in, bool implied_slack) {
                 else if (work_hi[sz(j)] < model::kInf) v = work_hi[sz(j)];
                 else v = 0.0;
             } else {
-                continue;
+                status = PresolveStatus::Unbounded;
+                witness_col = j;
+                reason = "empty column " + std::to_string(j) +
+                         " improves the objective toward an infinite bound";
+                out.stats.elapsed_ms =
+                    std::chrono::duration<double, std::milli>(
+                        PresolveClock::now() - presolve_t0).count();
+                return out;
             }
             col_live[sz(j)] = 0;
             fixed[sz(j)] = v;
@@ -137,8 +188,20 @@ PresolveMap presolve_lp(const model::LpProblem& in, bool implied_slack) {
                 }
                 activity += in.A.vals[sz(k)] * fixed[sz(j)];
             }
-            if (!has_live &&
-                in.row_lo[sz(i)] <= activity && activity <= in.row_hi[sz(i)]) {
+            if (!has_live) {
+                const f64 scale = 1.0 + std::fabs(activity);
+                const f64 tol = options.feasibility_tol * scale;
+                if (activity < in.row_lo[sz(i)] - tol ||
+                    activity > in.row_hi[sz(i)] + tol) {
+                    status = PresolveStatus::Infeasible;
+                    witness_row = i;
+                    reason = "empty row " + std::to_string(i) +
+                             " has activity outside its bounds";
+                    out.stats.elapsed_ms =
+                        std::chrono::duration<double, std::milli>(
+                            PresolveClock::now() - presolve_t0).count();
+                    return out;
+                }
                 row_live[sz(i)] = 0;
                 ++out.stats.rows_removed;
                 changed = true;
@@ -427,7 +490,20 @@ PresolveMap presolve_lp(const model::LpProblem& in, bool implied_slack) {
             if (in.row_lo[sz(i)] == in.row_hi[sz(i)]) {
                 const f64 rhs = in.row_lo[sz(i)] - shift;
                 const f64 v = rhs / a;
-                if (v < clo - 1e-12 || v > chi + 1e-12) continue;
+                const f64 feasibility_band = options.feasibility_tol *
+                    (1.0 + std::max(std::fabs(v),
+                                    std::max(std::fabs(clo), std::fabs(chi))));
+                if (v < clo - feasibility_band || v > chi + feasibility_band) {
+                    status = PresolveStatus::Infeasible;
+                    witness_row = i;
+                    witness_col = col;
+                    reason = "singleton equality fixes column " +
+                             std::to_string(col) + " outside its bounds";
+                    out.stats.elapsed_ms =
+                        std::chrono::duration<double, std::milli>(
+                            PresolveClock::now() - presolve_t0).count();
+                    return out;
+                }
                 if (clo == chi) continue;
                 col_live[sz(col)] = 0;
                 fixed[sz(col)] = v;
@@ -459,8 +535,18 @@ PresolveMap presolve_lp(const model::LpProblem& in, bool implied_slack) {
             }
             const f64 new_lo = std::max(clo, implied_lo);
             const f64 new_hi = std::min(chi, implied_hi);
-            if (new_lo > new_hi + 1e-12 * (1.0 + std::max(std::fabs(new_lo), std::fabs(new_hi))))
-                continue;
+            if (new_lo > new_hi + options.feasibility_tol *
+                    (1.0 + std::max(std::fabs(new_lo), std::fabs(new_hi)))) {
+                status = PresolveStatus::Infeasible;
+                witness_row = i;
+                witness_col = col;
+                reason = "singleton row tightens column " +
+                         std::to_string(col) + " to an empty interval";
+                out.stats.elapsed_ms =
+                    std::chrono::duration<double, std::milli>(
+                        PresolveClock::now() - presolve_t0).count();
+                return out;
+            }
             if (new_lo != clo || new_hi != chi) {
                 work_lo[sz(col)] = new_lo;
                 work_hi[sz(col)] = new_hi;
@@ -482,6 +568,36 @@ PresolveMap presolve_lp(const model::LpProblem& in, bool implied_slack) {
             }
         }
     }
+    goto post_fixed_point;
+
+post_fixed_point:
+    detail::LiveMatrix live;
+    if (options.live_reductions) {
+        if (status == PresolveStatus::Reduced &&
+            !detail::run_live_presolve_passes(
+                in, options, out, status, witness_row, witness_col, reason,
+                row_live, col_live, work_lo, work_hi, work_cost, fixed,
+                work_obj_offset, live)) {
+            out.stats.elapsed_ms = std::chrono::duration<double, std::milli>(
+                PresolveClock::now() - presolve_t0).count();
+            return out;
+        }
+        if (status != PresolveStatus::Reduced) {
+            out.stats.elapsed_ms = std::chrono::duration<double, std::milli>(
+                PresolveClock::now() - presolve_t0).count();
+            return out;
+        }
+    } else {
+        live.build(in, options, out, status, witness_row, witness_col, reason,
+                   row_live, col_live, work_lo, work_hi, work_cost, fixed,
+                   work_obj_offset);
+        row_live = std::move(live.row_active);
+        col_live = std::move(live.col_active);
+        work_lo = std::move(live.col_lo);
+        work_hi = std::move(live.col_hi);
+        work_cost = std::move(live.cost);
+        fixed = std::move(live.fixed);
+    }
 
     // ------------------------------------------------------------------
     // Guarded equality aggregation
@@ -499,32 +615,30 @@ PresolveMap presolve_lp(const model::LpProblem& in, bool implied_slack) {
     // The pivot variable is accepted only when this equation's full activity
     // interval proves its current bounds redundant. Integer columns are left
     // untouched because this presolver is also used for MILP relaxations.
-    using SparseRow = std::map<Index, f64>;
-    std::vector<SparseRow> mutable_rows(sz(m));
-    std::vector<std::set<Index>> column_rows(sz(n));
-    std::vector<f64> mutable_row_lo = in.row_lo;
-    std::vector<f64> mutable_row_hi = in.row_hi;
+    // A row is ONE allocation, not one per entry.
+    //
+    // These were std::map<Index,f64> and std::set<Index>. Measured 2026-09-10
+    // on Netlib-93: presolve costs ~101-117 ns per nonzero on the models that
+    // aggregate nothing, and 800-1600 ns per nonzero on the ones that aggregate
+    // heavily (greenbea 983 aggregations, 1590 ns/nnz; dfl001 2263, 922) -- an
+    // 8-15x penalty that is entirely red-black-tree node allocation and pointer
+    // chasing. That matters because presolve is 13-59% of the total solve on
+    // the SMALL models (recipe 52%, seba 59%, sc50b 38%), and the small models
+    // are what the geometric mean and the win rate are made of.
+    //
+    // Sorted vectors, not hash maps, deliberately: every ordered traversal here
+    // feeds a decision about WHICH reduction to apply next, so preserving the
+    // iteration order keeps the reduced problem bit-identical to v1's.
+    using SparseRow = detail::FlatMap;
+    std::vector<SparseRow>& mutable_rows = live.rows;
+    std::vector<detail::FlatSet>& column_rows = live.col_rows;
+    std::vector<f64>& mutable_row_lo = live.row_lo;
+    std::vector<f64>& mutable_row_hi = live.row_hi;
     Offset mutable_nnz = 0;
     for (Index i = 0; i < m; ++i) {
         if (!row_live[sz(i)]) continue;
-        f64 shift = 0.0;
-        for (Offset k = in.A.pattern.row_ptr()[sz(i)];
-             k < in.A.pattern.row_ptr()[sz(i) + 1]; ++k) {
-            const Index j = in.A.pattern.col_idx()[sz(k)];
-            const f64 a = in.A.vals[sz(k)];
-            if (!col_live[sz(j)]) {
-                shift += a * fixed[sz(j)];
-                continue;
-            }
-            const f64 value = mutable_rows[sz(i)][j] + a;
-            if (value == 0.0) mutable_rows[sz(i)].erase(j);
-            else              mutable_rows[sz(i)][j] = value;
-        }
-        mutable_row_lo[sz(i)] -= shift;
-        mutable_row_hi[sz(i)] -= shift;
         for (const auto& [j, a] : mutable_rows[sz(i)]) {
             if (a == 0.0) continue;
-            column_rows[sz(j)].insert(i);
             ++mutable_nnz;
         }
     }
@@ -1026,7 +1140,79 @@ PresolveMap presolve_lp(const model::LpProblem& in, bool implied_slack) {
     red.A = sparse::from_triplets(new_i, new_n, rows, cols, vals);
 
     out.problem = std::move(red);
+
+    // ------------------------------------------------------------------
+    // Terminal outcomes
+    // ------------------------------------------------------------------
+    // v1 never reported these: it could tighten a column's bounds past each
+    // other, or empty a row's feasible interval, and still hand back a
+    // "reduced" problem for an engine to rediscover the contradiction. The
+    // checks are on the TRANSFORMED state, which is where a contradiction
+    // manufactured by tightening actually appears.
+    const f64 tol = options.feasibility_tol;
+    for (Index j = 0; j < n && status == PresolveStatus::Reduced; ++j) {
+        if (!col_live[sz(j)] && out.orig_to_new[sz(j)] >= 0) continue;
+        const f64 lo = work_lo[sz(j)], hi = work_hi[sz(j)];
+        if (lo > hi + tol * (1.0 + std::fabs(lo))) {
+            status = PresolveStatus::Infeasible;
+            witness_col = j;
+            reason = "column " + std::to_string(j) + " bounds crossed: lo " +
+                     std::to_string(lo) + " > hi " + std::to_string(hi);
+        }
+    }
+    for (Index i = 0; i < m && status == PresolveStatus::Reduced; ++i) {
+        if (!row_live[sz(i)]) continue;
+        const f64 lo = in.row_lo[sz(i)], hi = in.row_hi[sz(i)];
+        if (lo > hi + tol * (1.0 + std::fabs(lo))) {
+            status = PresolveStatus::Infeasible;
+            witness_row = i;
+            reason = "row " + std::to_string(i) + " has an empty interval";
+        }
+    }
+    // Every column fixed and every row discharged: there is nothing left for an
+    // engine to do, and postsolve() alone produces the answer.
+    if (status == PresolveStatus::Reduced && out.problem.n_cols() == 0 &&
+        out.problem.n_rows() == 0) {
+        status = PresolveStatus::Solved;
+        reason = "presolve fixed every column";
+    }
+
+    out.stats.reduced_rows = out.problem.n_rows();
+    out.stats.reduced_cols = out.problem.n_cols();
+    out.stats.reduced_nnz  = out.problem.nnz();
+    out.stats.elapsed_ms = std::chrono::duration<double, std::milli>(
+        PresolveClock::now() - presolve_t0).count();
     return out;
+}
+
+}  // namespace
+
+const char* to_string(PresolveStatus s) {
+    switch (s) {
+        case PresolveStatus::Reduced:          return "Reduced";
+        case PresolveStatus::Solved:           return "Solved";
+        case PresolveStatus::Infeasible:       return "Infeasible";
+        case PresolveStatus::Unbounded:        return "Unbounded";
+        case PresolveStatus::NumericalFailure: return "NumericalFailure";
+    }
+    return "?";
+}
+
+PresolveOutcome presolve(const model::LpProblem& in,
+                         const PresolveOptions& opts) {
+    PresolveOutcome outcome;
+    outcome.map = run_presolve(in, opts, outcome.status, outcome.witness_row,
+                               outcome.witness_col, outcome.reason);
+    return outcome;
+}
+
+PresolveMap presolve_lp(const model::LpProblem& in, bool implied_slack) {
+    PresolveOptions opts;
+    opts.implied_slack = implied_slack;
+    PresolveStatus status = PresolveStatus::Reduced;
+    Index wr = -1, wc = -1;
+    std::string reason;
+    return run_presolve(in, opts, status, wr, wc, reason);
 }
 
 std::vector<f64> postsolve(const PresolveMap& map, const std::vector<f64>& x_reduced) {
@@ -1037,6 +1223,20 @@ std::vector<f64> postsolve(const PresolveMap& map, const std::vector<f64>& x_red
         const Index nj = map.orig_to_new[sz(j)];
         if (nj < 0 || nj >= n_red) x[sz(j)] = map.fixed_value[sz(j)];
         else                       x[sz(j)] = x_reduced[sz(nj)];
+    }
+    for (std::size_t t = map.doubleton_equalities.size(); t-- > 0;) {
+        const auto& rec = map.doubleton_equalities[t];
+        if (rec.elim_col < 0 || rec.elim_col >= n || rec.elim_coeff == 0.0)
+            continue;
+        f64 residual = rec.rhs;
+        if (rec.keep_col >= 0 && rec.keep_col < n)
+            residual -= rec.keep_coeff * x[sz(rec.keep_col)];
+        for (std::size_t k = 0; k < rec.other_cols.size(); ++k) {
+            const Index j = rec.other_cols[k];
+            if (j >= 0 && j < n)
+                residual -= rec.other_coeffs[k] * x[sz(j)];
+        }
+        x[sz(rec.elim_col)] = residual / rec.elim_coeff;
     }
     for (std::size_t t = map.equality_aggregations.size(); t-- > 0;) {
         const auto& rec = map.equality_aggregations[t];

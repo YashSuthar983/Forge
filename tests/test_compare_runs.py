@@ -139,6 +139,49 @@ class LoadTests(unittest.TestCase):
         self.assertEqual(last.results["sor:simplex"]["a.mps"].seconds, 2.0)
         self.assertEqual(first.results["sor:simplex"]["a.mps"].seconds, 9.0)
 
+    def test_claim_metadata_round_trips_without_empty_final_segment(self) -> None:
+        records = [
+            {"record": "preflight", "claim_role": "preflight",
+             "status": "PASS"},
+            env_record(commit="feedface"),
+            run_record("a.mps"),
+            {"record": "aggregate", **{
+                k: v for k, v in run_record("a.mps").items()
+                if k != "record"}},
+            {"record": "postflight", "claim_role": "postflight",
+             "status": "PASS"},
+            {"record": "independent_check", "status": "PASS"},
+            {"record": "baseline_eligibility", "status": "PASS",
+             "eligible": True},
+            {"record": "performance", "status": "FAIL", "public": False},
+            {"record": "gate", "claim_role": "gate", "status": "PASS"},
+        ]
+        with JsonlFile(records) as p:
+            run = cr.load_run(p)
+        self.assertEqual(run.segments, 1)
+        self.assertEqual(run.environment["commit"], "feedface")
+        self.assertEqual(run.results["sor:simplex"]["a.mps"].seconds, 1.0)
+        self.assertEqual([m["record"] for m in run.metadata],
+                         ["preflight", "postflight", "independent_check",
+                          "baseline_eligibility", "performance", "gate"])
+
+    def test_rerun_selected_aggregate_replaces_superseded_original(self) -> None:
+        initial = run_record("a.mps", seconds=9.0)
+        initial["record"] = "aggregate"
+        initial.update(claim_superseded=True, claim_selected=False,
+                       claim_source="initial")
+        replacement = run_record("a.mps", seconds=2.0)
+        replacement["record"] = "aggregate"
+        replacement.update(claim_superseded=False, claim_selected=True,
+                           claim_source="rerun")
+        with JsonlFile([env_record(), initial,
+                        {"record": "rerun", "status": "PASS"},
+                        replacement]) as p:
+            run = cr.load_run(p)
+        selected = run.results["sor:simplex"]["a.mps"]
+        self.assertEqual(selected.seconds, 2.0)
+        self.assertEqual(selected.claim_source, "rerun")
+
     def test_file_without_an_environment_record_is_one_sweep(self) -> None:
         with JsonlFile([run_record("a.mps")]) as p:
             run = cr.load_run(p)

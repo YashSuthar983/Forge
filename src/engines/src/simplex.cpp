@@ -46,6 +46,103 @@ inline std::size_t sz(Offset i) { return static_cast<std::size_t>(i); }
 // same thing in a comparison table.
 constexpr f64 kAtBound = 1e-9;
 
+// Exact indexed max-heap for primal reduced-cost pricing.  The tie key is the
+// live nonbasic-list position, preserving the former exhaustive scan's first
+// maximum even when remove_nonbasic() swaps the tail into a vacated slot.
+class IndexedPricingHeap {
+public:
+    explicit IndexedPricingHeap(Index size = 0)
+        : position_(sz(size), -1), score_(sz(size), 0.0),
+          tie_(sz(size), -1) {}
+
+    void clear() {
+        heap_.clear();
+        std::fill(position_.begin(), position_.end(), -1);
+        std::fill(score_.begin(), score_.end(), 0.0);
+        std::fill(tie_.begin(), tie_.end(), -1);
+    }
+
+    void update(Index column, f64 score, Index tie) {
+        if (column < 0 || sz(column) >= position_.size()) return;
+        const Index old_position = position_[sz(column)];
+        if (!(score > 0.0) || std::isnan(score) || tie < 0) {
+            if (old_position >= 0) erase_at(old_position);
+            score_[sz(column)] = 0.0;
+            tie_[sz(column)] = -1;
+            return;
+        }
+        score_[sz(column)] = score;
+        tie_[sz(column)] = tie;
+        if (old_position < 0) {
+            position_[sz(column)] = static_cast<Index>(heap_.size());
+            heap_.push_back(column);
+            sift_up(static_cast<Index>(heap_.size() - 1));
+            return;
+        }
+        sift_up(old_position);
+        sift_down(position_[sz(column)]);
+    }
+
+    Index top() const { return heap_.empty() ? -1 : heap_.front(); }
+    std::size_t size() const { return heap_.size(); }
+
+private:
+    bool higher(Index lhs, Index rhs) const {
+        const f64 a = score_[sz(lhs)], b = score_[sz(rhs)];
+        return a > b || (a == b && tie_[sz(lhs)] < tie_[sz(rhs)]);
+    }
+
+    void swap_positions(Index a, Index b) {
+        if (a == b) return;
+        std::swap(heap_[sz(a)], heap_[sz(b)]);
+        position_[sz(heap_[sz(a)])] = a;
+        position_[sz(heap_[sz(b)])] = b;
+    }
+
+    void sift_up(Index at) {
+        while (at > 0) {
+            const Index parent = (at - 1) / 2;
+            if (!higher(heap_[sz(at)], heap_[sz(parent)])) break;
+            swap_positions(at, parent);
+            at = parent;
+        }
+    }
+
+    void sift_down(Index at) {
+        const Index count = static_cast<Index>(heap_.size());
+        for (;;) {
+            Index best = at;
+            const Index left = 2 * at + 1;
+            const Index right = left + 1;
+            if (left < count && higher(heap_[sz(left)], heap_[sz(best)]))
+                best = left;
+            if (right < count && higher(heap_[sz(right)], heap_[sz(best)]))
+                best = right;
+            if (best == at) return;
+            swap_positions(at, best);
+            at = best;
+        }
+    }
+
+    void erase_at(Index at) {
+        const Index erased = heap_[sz(at)];
+        const Index last = heap_.back();
+        heap_[sz(at)] = last;
+        position_[sz(last)] = at;
+        heap_.pop_back();
+        position_[sz(erased)] = -1;
+        if (sz(at) < heap_.size()) {
+            sift_up(at);
+            sift_down(position_[sz(last)]);
+        }
+    }
+
+    std::vector<Index> heap_;
+    std::vector<Index> position_;
+    std::vector<f64> score_;
+    std::vector<Index> tie_;
+};
+
 void rematerialize_original(const model::LpProblem& original,
                             core::RawResult& raw,
                             SimplexDiagnostics& diag,
@@ -198,6 +295,12 @@ void accumulate_work(SimplexDiagnostics& total,
     total.phase1_composite_max_abs_error = std::max(
         total.phase1_composite_max_abs_error,
         stage.phase1_composite_max_abs_error);
+    total.primal_price_heap_rebuilds += stage.primal_price_heap_rebuilds;
+    total.primal_price_heap_updates += stage.primal_price_heap_updates;
+    total.primal_price_full_scans += stage.primal_price_full_scans;
+    total.primal_price_columns_scored += stage.primal_price_columns_scored;
+    total.primal_price_heap_max_size = std::max(
+        total.primal_price_heap_max_size, stage.primal_price_heap_max_size);
     total.primal_ftran_dense_switches += stage.primal_ftran_dense_switches;
     total.primal_crash_columns += stage.primal_crash_columns;
     total.primal_crash_infeasibility_before +=
@@ -256,6 +359,17 @@ void accumulate_work(SimplexDiagnostics& total,
     total.preprocessing_ms  += stage.preprocessing_ms;
     total.factor_ms         += stage.factor_ms;
     total.price_ms          += stage.price_ms;
+    total.chuzr_ms          += stage.chuzr_ms;
+    total.chuzr_calls       += stage.chuzr_calls;
+    total.chuzr_rows_scanned += stage.chuzr_rows_scanned;
+    total.chuzr_heap_rebuilds += stage.chuzr_heap_rebuilds;
+    total.chuzr_heap_updates += stage.chuzr_heap_updates;
+    total.chuzr_full_scans += stage.chuzr_full_scans;
+    total.chuzr_heap_max_size = std::max(total.chuzr_heap_max_size,
+                                          stage.chuzr_heap_max_size);
+    total.prow_price_ms     += stage.prow_price_ms;
+    total.prow_price_calls  += stage.prow_price_calls;
+    total.prow_entries_scanned += stage.prow_entries_scanned;
     total.solve_ms          += stage.solve_ms;
     total.ftran_ms          += stage.ftran_ms;
     total.btran_ms          += stage.btran_ms;
@@ -303,6 +417,11 @@ void install_work_totals(SimplexDiagnostics& chosen,
         total.phase1_composite_support_entries;
     chosen.phase1_composite_max_abs_error =
         total.phase1_composite_max_abs_error;
+    chosen.primal_price_heap_rebuilds = total.primal_price_heap_rebuilds;
+    chosen.primal_price_heap_updates = total.primal_price_heap_updates;
+    chosen.primal_price_full_scans = total.primal_price_full_scans;
+    chosen.primal_price_columns_scored = total.primal_price_columns_scored;
+    chosen.primal_price_heap_max_size = total.primal_price_heap_max_size;
     chosen.primal_ftran_dense_switches = total.primal_ftran_dense_switches;
     chosen.primal_crash_columns = total.primal_crash_columns;
     chosen.primal_crash_infeasibility_before =
@@ -361,6 +480,16 @@ void install_work_totals(SimplexDiagnostics& chosen,
     chosen.preprocessing_ms   = total.preprocessing_ms;
     chosen.factor_ms          = total.factor_ms;
     chosen.price_ms           = total.price_ms;
+    chosen.chuzr_ms           = total.chuzr_ms;
+    chosen.chuzr_calls        = total.chuzr_calls;
+    chosen.chuzr_rows_scanned = total.chuzr_rows_scanned;
+    chosen.chuzr_heap_rebuilds = total.chuzr_heap_rebuilds;
+    chosen.chuzr_heap_updates = total.chuzr_heap_updates;
+    chosen.chuzr_full_scans = total.chuzr_full_scans;
+    chosen.chuzr_heap_max_size = total.chuzr_heap_max_size;
+    chosen.prow_price_ms      = total.prow_price_ms;
+    chosen.prow_price_calls   = total.prow_price_calls;
+    chosen.prow_entries_scanned = total.prow_entries_scanned;
     chosen.solve_ms           = total.solve_ms;
     chosen.ftran_ms           = total.ftran_ms;
     chosen.btran_ms           = total.btran_ms;
@@ -383,51 +512,42 @@ void accumulate_simplex_work(SimplexDiagnostics& total,
     accumulate_work(total, stage);
 }
 
-bool detail::prefer_primal_first(Index rows, Index cols, Offset nnz) {
-    if (rows <= 0 || cols <= 0) return false;
-    const auto urows = static_cast<std::uint64_t>(rows);
-    const auto ucols = static_cast<std::uint64_t>(cols);
-    const double density = static_cast<double>(nnz) /
-                           (static_cast<double>(rows) * cols);
-
-    // Wide sparse bases such as woodw are primal-friendly. Dense blending
-    // models are too, but only while the aspect ratio remains moderate. A
-    // dense AND extremely wide matrix is a different regime: on Netlib fit2d
-    // (25 x 10500), primal scans all 10500 columns for 8912 pivots while dual
-    // proves optimality in 219. Do not let density alone suppress that route.
-    const bool wide_sparse =
-        ucols > 6ull * urows && (rows > 700 || cols < 4000);
-    constexpr std::uint64_t kMaxDensePrimalAspect = 64;
-    const bool moderately_wide_dense =
-        density >= 0.25 && ucols >= urows &&
-        ucols <= kMaxDensePrimalAspect * urows;
-    return wide_sparse || moderately_wide_dense;
-}
-
-bool detail::prefer_primal_from_model(const model::LpProblem& problem,
-                                      f64 primal_feas_tol) {
+RouteFeatures detail::route_features(const model::LpProblem& problem,
+                                     f64 primal_feas_tol) {
+    RouteFeatures f;
     const Index rows = problem.n_rows();
     const Index cols = problem.n_cols();
-    if (rows <= 0 || cols <= 0) return false;
+    f.rows = rows;
+    f.cols = cols;
+    f.nnz = problem.nnz();
+    if (rows <= 0 || cols <= 0) return f;
+
+    f.density = static_cast<double>(f.nnz) /
+                (static_cast<double>(rows) * static_cast<double>(cols));
+    f.aspect = static_cast<double>(cols) / static_cast<double>(rows);
+    f.row_degree = static_cast<double>(f.nnz) / static_cast<double>(rows);
+    f.col_degree = static_cast<double>(f.nnz) / static_cast<double>(cols);
 
     std::vector<f64> x(sz(cols), 0.0);
-    std::uint64_t free_cols = 0;
-    std::uint64_t boxed_cols = 0;
-    std::uint64_t objective_nnz = 0;
-    std::uint64_t objective_free_cols = 0;
+    std::uint64_t boxed_cols = 0, fixed_cols = 0, objective_nnz = 0;
     for (Index j = 0; j < cols; ++j) {
         const f64 lo = problem.col_lo[sz(j)];
         const f64 hi = problem.col_hi[sz(j)];
         const bool lo_finite = lo > -kInf;
         const bool hi_finite = hi < kInf;
-        if (!lo_finite && !hi_finite) ++free_cols;
-        if (lo_finite && hi_finite) ++boxed_cols;
-        if (problem.c[sz(j)] != 0.0) ++objective_nnz;
-        if (!lo_finite && !hi_finite && problem.c[sz(j)] != 0.0)
-            ++objective_free_cols;
+        const bool has_cost = problem.c[sz(j)] != 0.0;
+        if (!lo_finite && !hi_finite) {
+            ++f.free_cols;
+            if (has_cost) ++f.objective_free_cols;
+        }
+        if (lo_finite && hi_finite) {
+            ++boxed_cols;
+            if (lo == hi) ++fixed_cols;
+        }
+        if (has_cost) ++objective_nnz;
 
-        // This is exactly the dual engine's cold-start parking rule at the
-        // all-logical basis (pi == 0), evaluated on the minimization model.
+        // Exactly the dual engine's cold-start parking rule at the all-logical
+        // basis (pi == 0), evaluated on the minimization model.
         if (lo_finite && hi_finite)
             x[sz(j)] = problem.c[sz(j)] >= 0.0 ? lo : hi;
         else if (lo_finite)
@@ -439,72 +559,57 @@ bool detail::prefer_primal_from_model(const model::LpProblem& problem,
     const auto& rp = problem.A.pattern.row_ptr();
     const auto& ci = problem.A.pattern.col_idx();
     const auto& av = problem.A.vals;
-    std::uint64_t equality_rows = 0;
-    std::uint64_t col_degree_at_most_two = 0;
-    std::vector<Index> col_degree(sz(cols), 0);
-    bool logical_point_feasible = true;
+    std::uint64_t equality_rows = 0, ranged_rows = 0, free_rows = 0;
+    std::vector<Index> degree(sz(cols), 0);
+    f64 max_abs = 0.0, min_abs = kInf;
+    f.logical_point_feasible = true;
     for (Index i = 0; i < rows; ++i) {
         const f64 lo = problem.row_lo[sz(i)];
         const f64 hi = problem.row_hi[sz(i)];
-        if (lo > -kInf && hi < kInf && lo == hi) ++equality_rows;
+        const bool lo_finite = lo > -kInf;
+        const bool hi_finite = hi < kInf;
+        if (lo_finite && hi_finite) {
+            if (lo == hi) ++equality_rows;
+            else          ++ranged_rows;
+        } else if (!lo_finite && !hi_finite) {
+            ++free_rows;
+        }
         long double activity = 0.0L;
         for (Offset k = rp[sz(i)]; k < rp[sz(i + 1)]; ++k) {
             const Index j = ci[sz(k)];
-            ++col_degree[sz(j)];
-            activity += static_cast<long double>(av[sz(k)]) * x[sz(j)];
+            ++degree[sz(j)];
+            const f64 a = av[sz(k)];
+            activity += static_cast<long double>(a) * x[sz(j)];
+            const f64 mag = std::fabs(a);
+            if (mag > 0.0) {
+                if (mag > max_abs) max_abs = mag;
+                if (mag < min_abs) min_abs = mag;
+            }
         }
         const long double scale = 1.0L + std::fabs(activity);
         const long double tol = static_cast<long double>(primal_feas_tol) * scale;
-        if ((lo > -kInf && activity < static_cast<long double>(lo) - tol) ||
-            (hi <  kInf && activity > static_cast<long double>(hi) + tol))
-            logical_point_feasible = false;
+        if ((lo_finite && activity < static_cast<long double>(lo) - tol) ||
+            (hi_finite && activity > static_cast<long double>(hi) + tol))
+            f.logical_point_feasible = false;
     }
-    for (const Index degree : col_degree)
-        if (degree <= 2) ++col_degree_at_most_two;
 
-    const double free_fraction = static_cast<double>(free_cols) / cols;
-    const double boxed_fraction = static_cast<double>(boxed_cols) / cols;
-    const double objective_fraction = static_cast<double>(objective_nnz) / cols;
-    const double equality_fraction = static_cast<double>(equality_rows) / rows;
-    const double singleton_fraction =
-        static_cast<double>(col_degree_at_most_two) / cols;
-    const double row_degree = static_cast<double>(problem.nnz()) / rows;
-    const double aspect = static_cast<double>(cols) / rows;
+    std::uint64_t degree_at_most_two = 0;
+    for (const Index d : degree)
+        if (d <= 2) ++degree_at_most_two;
 
-    // If the logical-basis point already satisfies every row, primal starts
-    // directly in phase 2. Starting dual can only add work on a wide model.
-    if (logical_point_feasible && cols > rows) return true;
-
-    // Free columns with a sparse objective are a structural dual-phase-1
-    // obstruction: their reduced costs cannot be repaired by a bound flip.
-    // The pilot/perold family has this signature and is consistently cheaper
-    // in primal. This is a bound-class fact, not an instance-name exception.
-    if (aspect > 1.0 && free_fraction >= 0.01 &&
-        objective_fraction <= 0.05)
-        return true;
-
-    // Large equality networks are not uniformly primal-friendly.  A boxed
-    // network strongly favours primal; otherwise the measured obstruction is
-    // an objective-bearing free column, whose dual equality cannot be repaired
-    // by a bound flip.  This distinction separates GREENBEA (no such column:
-    // dual 4807 pivots) from GREENBEB (one: dual repeatedly restarts phase 1)
-    // after the actual presolve path.  Excluding singleton-dominated matrices
-    // preserves fit1p's fast dual route.
-    const bool equality_phase1_risk =
-        boxed_fraction >= 0.90 || (rows >= 1000 && objective_free_cols > 0);
-    if (equality_phase1_risk && aspect <= 3.0 &&
-        equality_fraction >= 0.90 &&
-        row_degree >= 10.0 && singleton_fraction <= 0.75)
-        return true;
-
-    // Sparse-objective, substantially boxed planning models (the large pilot
-    // regime) likewise force long dual phase-1 work. Keep the size floor: on
-    // tiny models dispatch overhead is irrelevant and dual often wins.
-    if (rows >= 800 && aspect <= 3.0 && boxed_fraction >= 0.20 &&
-        (objective_fraction <= 0.02 || row_degree >= 20.0))
-        return true;
-
-    return false;
+    const auto dcols = static_cast<double>(cols);
+    const auto drows = static_cast<double>(rows);
+    f.free_fraction      = static_cast<double>(f.free_cols) / dcols;
+    f.boxed_fraction     = static_cast<double>(boxed_cols) / dcols;
+    f.fixed_fraction     = static_cast<double>(fixed_cols) / dcols;
+    f.objective_fraction = static_cast<double>(objective_nnz) / dcols;
+    f.singleton_fraction = static_cast<double>(degree_at_most_two) / dcols;
+    f.equality_fraction  = static_cast<double>(equality_rows) / drows;
+    f.ranged_fraction    = static_cast<double>(ranged_rows) / drows;
+    f.free_row_fraction  = static_cast<double>(free_rows) / drows;
+    if (max_abs > 0.0 && min_abs < kInf && min_abs > 0.0)
+        f.coefficient_spread = std::log10(max_abs / min_abs);
+    return f;
 }
 
 bool detail::prefer_simplex_candidate(const core::RawResult& candidate,
@@ -709,6 +814,14 @@ core::RawResult solve_primal_simplex_prepared(
         std::getenv("SOR_PRIMAL_PHASE1_FULL_REBUILD") != nullptr;
     const bool verify_phase1_composite =
         std::getenv("SOR_PRIMAL_VERIFY_COMPOSITE") != nullptr;
+    const bool force_primal_full_scan =
+        std::getenv("SOR_PRIMAL_FULLSCAN") != nullptr;
+#ifdef NDEBUG
+    const bool verify_primal_heap =
+        std::getenv("SOR_PRIMAL_VERIFY_HEAP") != nullptr;
+#else
+    const bool verify_primal_heap = true;
+#endif
     Clock::time_point t_part{};
     const bool use_devex = (opts.pricing != SimplexPricing::Dantzig);
 
@@ -852,6 +965,11 @@ core::RawResult solve_primal_simplex_prepared(
     // row.  In selection order the structural block is therefore lower
     // triangular with a stable nonzero diagonal.  No speculative singular
     // basis, factor repair, or external solver algorithm is involved.
+    std::vector<Index> crash_basis_save;
+    std::vector<Index> crash_slot_save;
+    std::vector<NonbasicStatus> crash_st_save;
+    std::vector<f64> crash_value_save;
+    bool crash_snapshot_valid = false;
     if (!warm_installed && opts.primal_crash && m > 0 && ns > 0) {
         const auto& rp = p.A.pattern.row_ptr();
         const auto& ci = p.A.pattern.col_idx();
@@ -883,6 +1001,14 @@ core::RawResult solve_primal_simplex_prepared(
         };
 
         diag.primal_crash_infeasibility_before = total_violation();
+        // Snapshot the all-logical start so a crash that does not improve
+        // total merit (or that later fails factorization) can be refused.
+        crash_basis_save = basis;
+        crash_slot_save = slot_of;
+        crash_st_save = st;
+        crash_value_save = value;
+        crash_snapshot_valid = true;
+        const std::vector<f64> crash_activity_save = activity;
         std::vector<Index> order(sz(m));
         for (Index i = 0; i < m; ++i) order[sz(i)] = i;
         std::stable_sort(order.begin(), order.end(), [&](Index a, Index b) {
@@ -971,6 +1097,21 @@ core::RawResult solve_primal_simplex_prepared(
             ++diag.primal_crash_columns;
         }
         diag.primal_crash_infeasibility_after = total_violation();
+        // Refuse the whole crash if total primal infeasibility did not
+        // strictly improve. Per-column gains can sum to a non-improvement
+        // once claimed-row interactions are accounted for at the end.
+        if (!(diag.primal_crash_infeasibility_after <
+              diag.primal_crash_infeasibility_before -
+                  1e-12 * (1.0 + diag.primal_crash_infeasibility_before))) {
+            basis = crash_basis_save;
+            slot_of = crash_slot_save;
+            st = crash_st_save;
+            value = crash_value_save;
+            activity = crash_activity_save;
+            diag.primal_crash_columns = 0;
+            diag.primal_crash_infeasibility_after =
+                diag.primal_crash_infeasibility_before;
+        }
     }
 
     std::vector<Index> nonbasic;
@@ -1059,56 +1200,62 @@ core::RawResult solve_primal_simplex_prepared(
     std::vector<f64>  redcost(sz(nt), 0.0);
 
     f64 dtol_scale = 1.0;
-    // ---- entering-column candidate list ----------------------------------
-    // The full scan visited every nonbasic column each iteration to find the
-    // argmax improving column. Membership ("the eligibility test passes")
-    // changes only when a column's reduced cost or status changes, and both
-    // change only on the sparse pivotal-row update, on apply_pivot's two
-    // columns, and on full rebuilds -- so the candidate set is maintained
-    // exactly by those hooks and selection iterates O(candidates) instead of
-    // O(nt). Selection recomputes each member's score from the CURRENT
-    // redcost with the full scan's arithmetic, and ties break toward the
-    // SMALLEST nonbasic-list position (the full scan picks the first max in
-    // list order), so the chosen column is bit-identical to the full scan's.
-    std::vector<Index> cand_list;
-    std::vector<Index> cand_pos(sz(nt), -1);
+    // ---- entering-column indexed heap ------------------------------------
+    // Eligibility and score change only on the sparse pivotal-row update,
+    // apply_pivot's two columns, a changed nonbasic-list tie position, or a
+    // full dual rebuild.  Keep both membership and the exact current score in
+    // an indexed heap, so selecting the maximum is O(1) and each affected
+    // column costs O(log n).  The tie key is nonbasic_pos, exactly matching
+    // the old exhaustive list scan.
+    IndexedPricingHeap cand_heap(nt);
     bool cand_all_dirty = true;   // first rebuild happens with the first d rebuild
-    const auto cand_add = [&](Index j) {
-        if (j < 0 || j >= nt || cand_pos[sz(j)] >= 0) return;
-        cand_pos[sz(j)] = static_cast<Index>(cand_list.size());
-        cand_list.push_back(j);
-    };
-    const auto cand_remove = [&](Index j) {
-        if (j < 0 || j >= nt) return;
-        const Index pos = cand_pos[sz(j)];
-        if (pos < 0) return;
-        const Index last = cand_list.back();
-        cand_list[sz(pos)] = last;
-        cand_pos[sz(last)] = pos;
-        cand_list.pop_back();
-        cand_pos[sz(j)] = -1;
-    };
-    const auto cand_eligible = [&](Index j) -> bool {
-        if (st[sz(j)] == NonbasicStatus::Basic) return false;
-        if (lo[sz(j)] == hi[sz(j)]) return false;
+    const auto candidate_score = [&](Index j, int* direction = nullptr) -> f64 {
+        if (j < 0 || j >= nt || st[sz(j)] == NonbasicStatus::Basic ||
+            lo[sz(j)] == hi[sz(j)])
+            return 0.0;
         const f64 dj = redcost[sz(j)];
         const f64 tj = dtol[sz(j)] * dtol_scale;
+        int dir = 0;
+        f64 violation = 0.0;
         switch (st[sz(j)]) {
-            case NonbasicStatus::AtLower:   return dj < -tj;
-            case NonbasicStatus::AtUpper:   return dj > tj;
-            case NonbasicStatus::AtZeroFree: return std::fabs(dj) > tj;
-            default:                        return false;
+            case NonbasicStatus::AtLower:
+                if (dj < -tj) { dir = +1; violation = -dj; }
+                break;
+            case NonbasicStatus::AtUpper:
+                if (dj > tj) { dir = -1; violation = dj; }
+                break;
+            case NonbasicStatus::AtZeroFree:
+                if (std::fabs(dj) > tj) {
+                    dir = dj < 0.0 ? +1 : -1;
+                    violation = std::fabs(dj);
+                }
+                break;
+            default:
+                break;
         }
+        if (dir == 0) return 0.0;
+        if (direction != nullptr) *direction = dir;
+        const f64 den = use_devex && std::isfinite(col_w[sz(j)])
+                            ? col_w[sz(j)]
+                            : ((std::isfinite(colnorm2[sz(j)]) &&
+                                colnorm2[sz(j)] > 0.0)
+                                   ? colnorm2[sz(j)] : 1.0);
+        return violation * violation / std::max(den, 1e-30);
     };
     const auto refresh_cand = [&](Index j) {
-        if (cand_eligible(j)) cand_add(j);
-        else                  cand_remove(j);
+        cand_heap.update(j, candidate_score(j),
+                         j >= 0 && j < nt ? nonbasic_pos[sz(j)] : -1);
+        ++diag.primal_price_heap_updates;
     };
     const auto rebuild_candidates = [&]() {
-        cand_list.clear();
-        std::fill(cand_pos.begin(), cand_pos.end(), -1);
+        cand_heap.clear();
         for (const Index j : nonbasic)
-            if (cand_eligible(j)) cand_add(j);
+            cand_heap.update(j, candidate_score(j), nonbasic_pos[sz(j)]);
+        diag.primal_price_columns_scored += nonbasic.size();
+        ++diag.primal_price_heap_rebuilds;
+        diag.primal_price_heap_max_size = std::max(
+            diag.primal_price_heap_max_size,
+            static_cast<std::uint64_t>(cand_heap.size()));
     };
     std::vector<f64>  prow(sz(nt), 0.0);      // dense accumulator for alpha_r
     std::vector<char> prow_used(sz(nt), 0);
@@ -1164,9 +1311,15 @@ core::RawResult solve_primal_simplex_prepared(
             if (!std::isfinite(w) || w <= 0.0) { bad = true; break; }
             max_w = std::max(max_w, w);
         }
-        if (bad) { reset_weights(); return; }
-        if (max_w > 1e100)
+        if (bad) {
+            reset_weights();
+            cand_all_dirty = true;
+            return;
+        }
+        if (max_w > 1e100) {
             for (f64& w : col_w) w /= max_w;
+            cand_all_dirty = true;
+        }
     };
 
     const auto build_basis_matrix = [&]() {
@@ -1285,6 +1438,21 @@ core::RawResult solve_primal_simplex_prepared(
     };
 
     do_factorize();
+    // A crash basis that required singular repair is not the triangular
+    // construction we claimed. Restore the all-logical start and refactor.
+    if (crash_snapshot_valid && diag.primal_crash_columns > 0 &&
+        diag.basis_repairs > 0) {
+        basis = crash_basis_save;
+        slot_of = crash_slot_save;
+        st = crash_st_save;
+        value = crash_value_save;
+        diag.primal_crash_columns = 0;
+        diag.primal_crash_infeasibility_after =
+            diag.primal_crash_infeasibility_before;
+        rebuild_nonbasic();
+        diag.basis_repairs = 0;
+        do_factorize();
+    }
     if (primal_infeasibility() <= 0.0) phase = 2;
 
     // Step at which basis slot i hits a blocking bound, or +inf. `slack`
@@ -1533,71 +1701,63 @@ core::RawResult solve_primal_simplex_prepared(
             if (time_detail) diag.price_ms += ms_since(t_part);
             d_valid = true;
             rebuild_candidates();
+            cand_all_dirty = false;
             ++diag.dual_rebuilds;
         }
 
-        // ---- entering variable: argmax over the candidate list --------------
-        // Same arithmetic and tie semantics as the former full scan over
-        // `nonbasic`; ties resolve toward the smallest nonbasic-list position
-        // (the scan picked the first max in list order). Stale members (a
-        // status/reduced cost changed without a refresh yet) are skipped by
-        // the dir == 0 guard, exactly as the full scan skipped them.
+        // ---- entering variable: exact indexed maximum ---------------------
         ++diag.pricing_calls;
         if (time_detail) t_part = Clock::now();
         if (cand_all_dirty) {
             rebuild_candidates();
             cand_all_dirty = false;
         }
-        // Debug/profiling hook (P2 trace-diff): SOR_PRIMAL_FULLSCAN forces the
-        // original O(nt) scan; SOR_PRIMAL_TRACE=<file> dumps one line per
-        // committed pivot. Neither affects defaults.
-        static const bool kForceFullScan =
-            std::getenv("SOR_PRIMAL_FULLSCAN") != nullptr;
+        diag.primal_price_heap_max_size = std::max(
+            diag.primal_price_heap_max_size,
+            static_cast<std::uint64_t>(cand_heap.size()));
         Index q = -1;
         int qdir = 0;
-        f64 best = 0.0;
-        Index q_pos = -1;
-        const auto scan_body = [&](auto&& visit) {
-            if (kForceFullScan) {
-                for (const Index j : nonbasic) visit(j);
-            } else {
-                for (const Index j : cand_list) visit(j);
+        const auto exhaustive_enter = [&](bool count_work,
+                                          int* direction) -> Index {
+            f64 best = 0.0;
+            Index selected = -1;
+            int selected_direction = 0;
+            for (const Index j : nonbasic) {
+                int dir = 0;
+                const f64 score = candidate_score(j, &dir);
+                if (score > best) {
+                    best = score;
+                    selected = j;
+                    selected_direction = dir;
+                }
             }
+            if (direction != nullptr) *direction = selected_direction;
+            if (count_work) {
+                diag.primal_price_columns_scored += nonbasic.size();
+                ++diag.primal_price_full_scans;
+            }
+            return selected;
         };
-        scan_body([&](Index j) {
-            if (st[sz(j)] == NonbasicStatus::Basic) return;
-            if (lo[sz(j)] == hi[sz(j)]) return;
-            const f64 dj = redcost[sz(j)];
-            int dir = 0;
-            f64 viol = 0.0;
-            const f64 tj = dtol[sz(j)] * dtol_scale;
-            switch (st[sz(j)]) {
-                case NonbasicStatus::AtLower:
-                    if (dj < -tj) { dir = +1; viol = -dj; }
-                    break;
-                case NonbasicStatus::AtUpper:
-                    if (dj > tj) { dir = -1; viol = dj; }
-                    break;
-                case NonbasicStatus::AtZeroFree:
-                    if (std::fabs(dj) > tj) {
-                        dir = (dj < 0.0) ? +1 : -1;
-                        viol = std::fabs(dj);
-                    }
-                    break;
-                default:
-                    break;
+
+        if (force_primal_full_scan) {
+            q = exhaustive_enter(true, &qdir);
+        } else {
+            q = cand_heap.top();
+            if (q >= 0) (void)candidate_score(q, &qdir);
+        }
+        // Debug builds compare every decision with the old O(n) reference.
+        // Release builds expose the same adversarial oracle explicitly.
+        if (verify_primal_heap && !force_primal_full_scan) {
+            int reference_direction = 0;
+            const Index reference =
+                exhaustive_enter(true, &reference_direction);
+            if (reference != q ||
+                (reference >= 0 && reference_direction != qdir)) {
+                status = core::Status::NumericalFailure;
+                reason = "primal pricing indexed heap disagreed with exhaustive scan";
+                break;
             }
-            if (dir == 0) return;
-            const f64 den = use_devex && std::isfinite(col_w[sz(j)])
-                                ? col_w[sz(j)]
-                                : ((std::isfinite(colnorm2[sz(j)]) && colnorm2[sz(j)] > 0.0)
-                                     ? colnorm2[sz(j)] : 1.0);
-            const f64 score = viol * viol / std::max(den, 1e-30);
-            const Index jpos = nonbasic_pos[sz(j)];
-            if (score > best || (score == best && q >= 0 && jpos < q_pos)) {
-                best = score; q = j; qdir = dir; q_pos = jpos;
-            }
-        });
+        }
         if (time_detail) diag.price_ms += ms_since(t_part);
 
         // ---- termination --------------------------------------------------
@@ -1846,12 +2006,6 @@ core::RawResult solve_primal_simplex_prepared(
                 // picks up -theta_d, since its own pivotal-row entry is 1.
                 redcost[sz(q)] = 0.0;
                 redcost[sz(vl)] = -theta_d;
-                // Reduced costs changed for exactly the pivotal row's
-                // nonbasic support (plus q and vl below): refresh those
-                // memberships so the next selection sees the same candidate
-                // set a full scan would have seen.
-                for (const Index j : prow_idx) refresh_cand(j);
-
                 if (use_devex) {
                     const f64 ap2 = std::max(arq * arq, 1e-30);
                     const f64 wq = col_w[sz(q)];
@@ -1861,6 +2015,10 @@ core::RawResult solve_primal_simplex_prepared(
                         col_w[sz(j)] = std::max({1.0, col_w[sz(j)], (aj * aj / ap2) * wq});
                     }
                 }
+                // Both reduced costs and (under Devex) heap denominators have
+                // now reached their post-pivot values. Refresh each key once,
+                // after both updates, so no stale score can reach the top.
+                for (const Index j : prow_idx) refresh_cand(j);
             } else {
                 d_valid = false;   // full rebuild (and candidate rebuild) next iteration
                 ++diag.dual_resyncs;
@@ -1869,6 +2027,8 @@ core::RawResult solve_primal_simplex_prepared(
 
         const f64 old_leaving_phase1_cost =
             (phase == 1 && leave >= 0) ? cB[sz(leave)] : 0.0;
+        const Index rank_changed_column =
+            (leave >= 0 && !nonbasic.empty()) ? nonbasic.back() : -1;
         const bool was_flip = apply_pivot(
             q, qdir, t, leave, alpha_sparse ? &alpha_support : nullptr);
 
@@ -1923,6 +2083,8 @@ core::RawResult solve_primal_simplex_prepared(
         // status: refresh both candidacies against their post-pivot state.
         refresh_cand(q);
         if (!was_flip && leave >= 0) refresh_cand(vl_refresh);
+        if (!was_flip && rank_changed_column >= 0)
+            refresh_cand(rank_changed_column);
         if (!was_flip) maybe_update_factor(leave, since_refactor);
 
         if (phase1_objective_changed && !force_phase1_full_rebuild) {
@@ -2267,13 +2429,64 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
     const model::LpProblem* work = &problem;
     presolve::PresolveMap pmap;
     bool used_presolve = false;
+    presolve::PresolveStatus presolve_status = presolve::PresolveStatus::Reduced;
+    std::string presolve_reason;
     const auto presolve_t0 = Clock::now();
     if (opts.presolve) {
-        pmap = presolve::presolve_lp(problem, opts.presolve_implied_slack);
-        work = &pmap.problem;
-        used_presolve = true;
+        presolve::PresolveOptions popts;
+        popts.implied_slack = opts.presolve_implied_slack;
+        auto outcome = presolve::presolve(problem, popts);
+        presolve_status = outcome.status;
+        presolve_reason = outcome.reason;
+        pmap = std::move(outcome.map);
+        if (presolve_status == presolve::PresolveStatus::NumericalFailure) {
+            // A rejected transformation is not a model conclusion.  Solve the
+            // untouched original model and retain the reason in diagnostics.
+            work = &problem;
+            used_presolve = false;
+        } else {
+            work = &pmap.problem;
+            used_presolve = true;
+        }
     }
     const double presolve_ms = opts.presolve ? ms_since(presolve_t0) : 0.0;
+    const auto copy_presolve_diag = [&](SimplexDiagnostics& d) {
+        if (!used_presolve) return;
+        d.presolve_rows_removed = pmap.stats.rows_removed;
+        d.presolve_cols_removed = pmap.stats.cols_removed;
+        d.presolve_singleton_columns_removed =
+            pmap.stats.singleton_columns_removed;
+        d.presolve_forcing_rows_removed = pmap.stats.forcing_rows_removed;
+        d.presolve_forcing_columns_fixed = pmap.stats.forcing_columns_fixed;
+        d.presolve_equality_aggregations = pmap.stats.equality_aggregations;
+        d.presolve_aggregation_fill = pmap.stats.aggregation_fill;
+    };
+    if (opts.presolve &&
+        (presolve_status == presolve::PresolveStatus::Infeasible ||
+         presolve_status == presolve::PresolveStatus::Unbounded)) {
+        core::RawResult raw;
+        raw.x.assign(sz(problem.n_cols()), 0.0);
+        raw.y.assign(sz(problem.n_rows()), 0.0);
+        raw.proposed_status =
+            presolve_status == presolve::PresolveStatus::Infeasible
+                ? core::Status::Infeasible : core::Status::Unbounded;
+        // The current journal does not yet reconstruct Farkas/primal rays.
+        // Report the terminal status and witness reason, but do not manufacture
+        // a proof level or certificate that presolve did not produce.
+        raw.proposed_level = core::ProofLevel::None;
+        raw.engine = "simplex_presolve";
+        raw.backend = "cpu";
+        raw.termination_reason = "presolve " +
+            std::string(presolve::to_string(presolve_status)) + ": " +
+            presolve_reason;
+        diag = SimplexDiagnostics{};
+        diag.status = raw.proposed_status;
+        diag.presolve_ms = presolve_ms;
+        diag.total_ms = presolve_ms;
+        copy_presolve_diag(diag);
+        if (out_basis) *out_basis = SimplexBasis{};
+        return raw;
+    }
     // Build the immutable numeric representation once. Auto may run a dual
     // primary engine and a failure fallback; all stages solve the identical
     // transformed model and share this scaling and CSC.
@@ -2288,7 +2501,7 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
     // two most common outcomes (the primary proves it; fallback wins)
     // with no call at all, so out_basis came back empty -- which is what
     // test_basis_wellformed caught.
-    SimplexBasis dual_basis, esc_basis, prim_basis;
+    SimplexBasis dual_basis, esc_basis, prim_basis, reduced_winner_basis;
     SimplexDiagnostics cumulative;
     const auto run = [&](bool dual, const SimplexOptions& o,
                          SimplexBasis* basis,
@@ -2312,98 +2525,11 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
     // and branch-and-bound rather than a visible failure.
     const auto install_basis = [&](const SimplexBasis& b) {
         if (!out_basis) return;
-        if (!used_presolve) { *out_basis = b; return; }
-
-        const Index ns  = problem.n_cols();
-        const Index m   = problem.n_rows();
-        const Index rns = pmap.problem.n_cols();
-        const Index rm  = pmap.problem.n_rows();
-        if (static_cast<Index>(b.basic.size()) != rm ||
-            static_cast<Index>(b.status.size()) != rns + rm) {
-            *out_basis = SimplexBasis{};   // nothing trustworthy to report
+        if (!used_presolve) {
+            *out_basis = b;
             return;
         }
-
-        SimplexBasis outb;
-        outb.n_struct = ns;
-        outb.status.assign(sz(ns + m), NonbasicStatus::AtLower);
-        outb.basic.assign(sz(m), -1);
-
-        // Reduced augmented index -> original augmented index.
-        const auto lift = [&](Index rj) -> Index {
-            if (rj < rns) return pmap.new_to_orig[sz(rj)];
-            return ns + pmap.row_new_to_orig[sz(rj - rns)];
-        };
-
-        for (Index rj = 0; rj < rns + rm; ++rj)
-            outb.status[sz(lift(rj))] = b.status[sz(rj)];
-        for (Index s = 0; s < rm; ++s)
-            outb.basic[sz(pmap.row_new_to_orig[sz(s)])] = lift(b.basic[sz(s)]);
-
-        // A removed row's logical is basic in that row by construction: the row
-        // was dropped precisely because its activity already satisfies it.
-        for (Index i = 0; i < m; ++i) {
-            if (pmap.row_orig_to_new[sz(i)] >= 0) continue;
-            outb.basic[sz(i)] = ns + i;
-            outb.status[sz(ns + i)] = NonbasicStatus::Basic;
-        }
-        // A singleton column eliminated with its equality row is the natural
-        // basic variable for that restored row. Its recovered reduced cost is
-        // exactly zero, whereas naming the row logical basic would disagree
-        // with the nonzero recovered equality multiplier. Bound-transfer
-        // substitutions keep the row in the reduced problem, so the reduced
-        // basis already names a basic for that slot — do not overwrite it.
-        for (const auto& rec : pmap.singleton_columns) {
-            if (rec.row < 0 || rec.row >= m || rec.col < 0 || rec.col >= ns)
-                continue;
-            if (!rec.row_removed || pmap.row_orig_to_new[sz(rec.row)] >= 0)
-                continue;
-            outb.status[sz(ns + rec.row)] = NonbasicStatus::AtLower;
-            outb.basic[sz(rec.row)] = rec.col;
-            outb.status[sz(rec.col)] = NonbasicStatus::Basic;
-        }
-        for (const auto& rec : pmap.equality_aggregations) {
-            if (rec.row < 0 || rec.row >= m || rec.col < 0 || rec.col >= ns)
-                continue;
-            outb.status[sz(ns + rec.row)] = NonbasicStatus::AtLower;
-            outb.basic[sz(rec.row)] = rec.col;
-            outb.status[sz(rec.col)] = NonbasicStatus::Basic;
-        }
-        // A column fixed by a singleton equality can be interior to its
-        // original bounds. Restore it as the basic variable for that removed
-        // row; pretending it is nonbasic at its lower bound creates a basis
-        // whose status array contradicts the recovered primal point.
-        for (const auto& step : pmap.recovery_steps) {
-            if (step.kind != presolve::DualRecoveryKind::EqualitySingletonFix ||
-                step.row < 0 || step.row >= m ||
-                step.col < 0 || step.col >= ns ||
-                pmap.row_orig_to_new[sz(step.row)] >= 0)
-                continue;
-            outb.status[sz(ns + step.row)] = NonbasicStatus::AtLower;
-            outb.basic[sz(step.row)] = step.col;
-            outb.status[sz(step.col)] = NonbasicStatus::Basic;
-        }
-        // Other removed columns are nonbasic at the ORIGINAL bound matching
-        // their recovered fixed value. Empty-objective and forcing reductions
-        // can legitimately choose an upper bound.
-        for (Index j = 0; j < ns; ++j) {
-            if (pmap.orig_to_new[sz(j)] < 0 &&
-                outb.status[sz(j)] != NonbasicStatus::Basic) {
-                const f64 value = pmap.fixed_value[sz(j)];
-                const f64 tol = std::max(opts.primal_feas_tol, 1e-9) *
-                                (1.0 + std::fabs(value));
-                if (problem.col_lo[sz(j)] > -model::kInf &&
-                    value <= problem.col_lo[sz(j)] + tol)
-                    outb.status[sz(j)] = NonbasicStatus::AtLower;
-                else if (problem.col_hi[sz(j)] < model::kInf &&
-                         value >= problem.col_hi[sz(j)] - tol)
-                    outb.status[sz(j)] = NonbasicStatus::AtUpper;
-                else
-                    outb.status[sz(j)] = NonbasicStatus::AtZeroFree;
-            }
-        }
-
-        *out_basis = std::move(outb);
+        reduced_winner_basis = b;
     };
 
 
@@ -2500,102 +2626,68 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         // probe schedule therefore discarded thousands of pivots whenever a
         // model crossed its arbitrary 3000-iteration boundary. A second engine
         // is entered only as a safety fallback after an actual failure.
-        const auto proved = [&](const core::RawResult& r, const SimplexDiagnostics& d) {
-            return r.proposed_status == core::Status::Optimal &&
-                   d.primal_residual <= opts.primal_feas_tol &&
-                   d.dual_residual <= opts.dual_feas_tol &&
-                   d.dual_bound_finite && d.gap_rel <= opts.gap_tol;
-        };
         const auto elapsed = [](Clock::time_point t) {
             return std::chrono::duration<double>(Clock::now() - t).count();
         };
-        const auto t0 = Clock::now();
 
-        // Very wide, sparse models are commonly primal-friendly: the dual
-        // otherwise burns a long-step solve before discovering that primal
-        // finishes almost immediately (woodw/wood1p). Dense bounded
-        // blending models have the same shape for a different reason: their
-        // primal ratio test reaches a feasible basis in far fewer pivots,
-        // while dual updates repeatedly materialize a dense pivotal row.
-        const bool primal_preferred =
-            detail::prefer_primal_first(
-                work->n_rows(), work->n_cols(), work->nnz()) ||
-            detail::prefer_primal_from_model(prepared.pmin,
-                                              opts.primal_feas_tol);
+        // Auto commits to the DUAL engine and keeps primal as a fallback after
+        // an actual failure. There is no structural primal-first classifier
+        // any more.
+        //
+        // The one it replaces claimed a family of models were "structurally
+        // primal": wide-sparse shapes, free columns with a sparse objective,
+        // boxed equality networks, and the large PILOT regime. Re-measured on
+        // 2026-09-10 at 1e-7 against HiGHS, it routed 19 of the 93 Netlib
+        // models to primal and was wrong on 15 of them -- FIT1D 832 pivots
+        // instead of 51, PILOT 8,362 instead of 3,446, CYCLE 908 instead of
+        // 157. Its stated reason was dual phase-1 stalling, which the
+        // artificial-bound subproblem phase 1 removed. Deleting it moved the
+        // suite from G2 0.938 to 0.836 and the win rate from 53.8% to 60.2%.
+        //
+        // PILOT87 is the sole model that still prefers primal (8.8s against
+        // 10.6s). One model is not a rule, and it is 3x HiGHS on either
+        // engine, so it is a hot-path problem rather than a routing one. The
+        // features are reported instead, for the LP Auto layer to fit a route
+        // on with a proper holdout.
+        // Computed here, published after the stages: every `run` below writes
+        // the whole of `diag`, and the fallback path may swap in a different
+        // stage's copy of it wholesale.
+        const RouteFeatures features =
+            detail::route_features(prepared.pmin, opts.primal_feas_tol);
         const SimplexBasis* winner = nullptr;
 
-        if (primal_preferred) {
-            // The shape classifier already says that the primal is the right
-            // engine. The former implementation still spent 256 dual pivots
-            // to confirm that decision, then discarded their basis because a
-            // dual basis is not a primal warm start. Measured after the shared
-            // preprocessing fix, that no-progress probe was 29 ms on wood1p
-            // (89 -> 60 ms when omitted) and 17 ms on woodw (187 -> 170 ms).
-            // Run primal first and keep dual as a certificate cleanup/fallback
-            // only when primal does not prove the model.
+        const auto dual_t0 = Clock::now();
+        raw = run(true, opts, &dual_basis);
+        const auto dual_raw = raw;
+        const auto dual_diag = diag;
+        winner = &dual_basis;
+
+        const bool dual_failed =
+            raw.proposed_status == core::Status::NumericalFailure ||
+            raw.proposed_status == core::Status::Infeasible;
+        const bool time_left = opts.time_limit_s <= 0.0 ||
+            elapsed(dual_t0) < opts.time_limit_s * 0.95;
+        if (dual_failed && time_left) {
             SimplexOptions primal_opts = opts;
             if (opts.time_limit_s > 0.0)
-                primal_opts.time_limit_s = std::max(0.05, opts.time_limit_s * 0.85);
-            raw = run(false, primal_opts, &prim_basis);
-            winner = &prim_basis;
-
-            if (!proved(raw, diag)) {
-                const auto primal_raw = raw;
-                const auto primal_diag = diag;
-                const bool time_left =
-                    opts.time_limit_s <= 0.0 || elapsed(t0) < opts.time_limit_s * 0.95;
-                if (time_left) {
-                    SimplexOptions esc = opts;
-                    if (opts.time_limit_s > 0.0)
-                        esc.time_limit_s = std::max(0.05, opts.time_limit_s - elapsed(t0));
-                    const SimplexBasis* warm = prim_basis.basic.empty() ? nullptr : &prim_basis;
-                    raw = run(true, esc, &esc_basis, warm);
-                    if (detail::prefer_simplex_candidate(raw, diag,
-                                                         primal_raw, primal_diag,
-                                                         opts, problem.maximize)) {
-                        winner = &esc_basis;
-                    } else {
-                        raw = primal_raw;
-                        diag = primal_diag;
-                    }
-                }
-            }
-        } else {
-            const auto dual_t0 = Clock::now();
-            raw = run(true, opts, &dual_basis);
-            const auto dual_raw = raw;
-            const auto dual_diag = diag;
-            winner = &dual_basis;
-
-            const bool dual_failed =
-                raw.proposed_status == core::Status::NumericalFailure ||
-                raw.proposed_status == core::Status::Infeasible;
-            const bool time_left = opts.time_limit_s <= 0.0 ||
-                std::chrono::duration<double>(Clock::now() - dual_t0).count() <
-                    opts.time_limit_s * 0.95;
-            if (dual_failed && time_left) {
-                SimplexOptions primal_opts = opts;
-                if (opts.time_limit_s > 0.0) {
-                    const double spent =
-                        std::chrono::duration<double>(Clock::now() - dual_t0).count();
-                    primal_opts.time_limit_s =
-                        std::max(0.05, opts.time_limit_s - spent);
-                }
-                const SimplexBasis* warm =
-                    (dual_basis.basic.empty() ||
-                     !warm_basis_is_mature(dual_basis, dual_diag))
-                        ? nullptr : &dual_basis;
-                raw = run(false, primal_opts, &prim_basis, warm);
-                if (detail::prefer_simplex_candidate(raw, diag,
-                                                     dual_raw, dual_diag,
-                                                     opts, problem.maximize)) {
-                    winner = &prim_basis;
-                } else {
-                    raw = dual_raw;
-                    diag = dual_diag;
-                }
+                primal_opts.time_limit_s =
+                    std::max(0.05, opts.time_limit_s - elapsed(dual_t0));
+            const SimplexBasis* warm =
+                (dual_basis.basic.empty() ||
+                 !warm_basis_is_mature(dual_basis, dual_diag))
+                    ? nullptr : &dual_basis;
+            raw = run(false, primal_opts, &prim_basis, warm);
+            if (detail::prefer_simplex_candidate(raw, diag,
+                                                 dual_raw, dual_diag,
+                                                 opts, problem.maximize)) {
+                winner = &prim_basis;
+            } else {
+                raw = dual_raw;
+                diag = dual_diag;
             }
         }
+        diag.route_features = features;
+        diag.route_features_valid = true;
         install_basis(*winner);
     }
 
@@ -2607,247 +2699,47 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
     diag.preprocessing_builds += 1;
     diag.presolve_ms = presolve_ms;
     diag.total_ms += presolve_ms;
-    if (used_presolve) {
-        diag.presolve_rows_removed = pmap.stats.rows_removed;
-        diag.presolve_cols_removed = pmap.stats.cols_removed;
-        diag.presolve_singleton_columns_removed =
-            pmap.stats.singleton_columns_removed;
-        diag.presolve_forcing_rows_removed =
-            pmap.stats.forcing_rows_removed;
-        diag.presolve_forcing_columns_fixed =
-            pmap.stats.forcing_columns_fixed;
-        diag.presolve_equality_aggregations =
-            pmap.stats.equality_aggregations;
-        diag.presolve_aggregation_fill = pmap.stats.aggregation_fill;
-    }
+    copy_presolve_diag(diag);
     raw.iterations = diag.iterations;
+    bool presolve_recovery_validated = false;
     if (used_presolve) {
-        raw.x = presolve::postsolve(pmap, raw.x);
-        // Lift the row duals as well. A row dropped by presolve was inactive, so
-        // its multiplier is zero. Without this raw.y keeps the REDUCED length,
-        // rematerialize_original() bails on its size check, and the dual
-        // residual / gap / dual bound it leaves behind still describe the reduced
-        // problem while the objective describes the original one.
-        const Index rm = pmap.problem.n_rows();
-        if (static_cast<Index>(raw.y.size()) == rm &&
-            static_cast<Index>(pmap.row_new_to_orig.size()) == rm) {
-            std::vector<f64> yfull(sz(problem.n_rows()), 0.0);
-            for (Index i = 0; i < rm; ++i)
-                yfull[sz(pmap.row_new_to_orig[sz(i)])] = raw.y[sz(i)];
-            raw.y = std::move(yfull);
+        presolve::PresolveReducedSolve rs;
+        rs.x = raw.x;
+        rs.y = raw.y;
+        if (!reduced_winner_basis.status.empty()) {
+            rs.has_basis = true;
+            rs.basis.n_struct = reduced_winner_basis.n_struct;
+            rs.basis.basic = reduced_winner_basis.basic;
+            rs.basis.status.resize(reduced_winner_basis.status.size());
+            for (std::size_t k = 0; k < reduced_winner_basis.status.size(); ++k)
+                rs.basis.status[k] = static_cast<presolve::PostsolveNonbasicStatus>(
+                    reduced_winner_basis.status[k]);
         }
-        // Replay every row-based dual recovery in one reverse-chronological
-        // stream. Keeping singleton columns, equality fixes, implied-bound
-        // changes, and forcing rows in separate stacks is unsound for
-        // cross-kind cascades: a later recovered row multiplier can alter the
-        // reduced cost an earlier step must fix.
-        if (!pmap.recovery_steps.empty() &&
-            static_cast<Index>(raw.y.size()) == problem.n_rows()) {
-            const auto& rp = problem.A.pattern.row_ptr();
-            const auto& ci = problem.A.pattern.col_idx();
-            const auto& av = problem.A.vals;
-            const Index ns_ = problem.n_cols();
-            const f64 sense_ = problem.maximize ? -1.0 : 1.0;
-            std::vector<f64> ycanon(sz(problem.n_rows()), 0.0);
-            for (Index i = 0; i < problem.n_rows(); ++i)
-                ycanon[sz(i)] = sense_ * raw.y[sz(i)];
-            std::vector<f64> aty(sz(ns_), 0.0);
-            for (Index i = 0; i < problem.n_rows(); ++i) {
-                for (Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
-                    aty[sz(ci[sz(k)])] += av[sz(k)] * ycanon[sz(i)];
-            }
-            const auto add_row_multiplier = [&](Index row, f64 delta) {
-                if (delta == 0.0 || !std::isfinite(delta)) return;
-                ycanon[sz(row)] += delta;
-                for (Offset k = rp[sz(row)]; k < rp[sz(row) + 1]; ++k)
-                    aty[sz(ci[sz(k)])] += av[sz(k)] * delta;
-            };
-            for (std::size_t t = pmap.recovery_steps.size(); t-- > 0;) {
-                const auto& step = pmap.recovery_steps[t];
-                if (step.row < 0 || step.row >= problem.n_rows()) continue;
-
-                if (step.kind == presolve::DualRecoveryKind::SingletonColumnElimination) {
-                    if (step.record < 0 ||
-                        sz(step.record) >= pmap.singleton_columns.size())
-                        continue;
-                    const auto& rec = pmap.singleton_columns[sz(step.record)];
-                    // Only the implied-free variant owns its row's multiplier.
-                    // It deleted the row, so the solve produced no dual for it
-                    // and the eliminated column's stationarity (c_j = a*y_i)
-                    // is the only thing that determines it.
-                    //
-                    // The bound-transfer variant keeps the row, and the solve
-                    // DID produce a dual for it. Overwriting that with
-                    // c_j/a -- which is 0, since the rule only fires on a
-                    // zero-cost column -- would throw away a live multiplier
-                    // and put the recovered y outside the cone of every row
-                    // whose activity is at a transferred bound. The
-                    // eliminated column's own reduced cost falls out of the
-                    // restored matrix as z_j = -a*y_i with no help needed.
-                    if (!rec.row_removed) continue;
-                    const f64 target = sense_ * rec.dual_value;
-                    if (std::isfinite(target))
-                        add_row_multiplier(step.row,
-                                           target - ycanon[sz(step.row)]);
-                    continue;
-                }
-
-                if (step.kind == presolve::DualRecoveryKind::EqualitySingletonFix) {
-                    if (step.col < 0 || step.col >= ns_ || step.coeff == 0.0 ||
-                        step.other_rows.size() !=
-                            step.other_row_coefficients.size())
-                        continue;
-                    f64 target = sense_ * step.stage_cost;
-                    bool valid = std::isfinite(target);
-                    for (std::size_t q = 0; q < step.other_rows.size(); ++q) {
-                        const Index row = step.other_rows[q];
-                        const f64 coefficient = step.other_row_coefficients[q];
-                        if (row < 0 || row >= problem.n_rows() ||
-                            !std::isfinite(coefficient)) {
-                            valid = false;
-                            break;
-                        }
-                        target -= coefficient * ycanon[sz(row)];
-                    }
-                    target /= step.coeff;
-                    if (valid && std::isfinite(target))
-                        add_row_multiplier(step.row,
-                                           target - ycanon[sz(step.row)]);
-                    continue;
-                }
-
-                if (step.kind == presolve::DualRecoveryKind::EqualityAggregation) {
-                    if (step.record < 0 ||
-                        sz(step.record) >= pmap.equality_aggregations.size())
-                        continue;
-                    const auto& rec = pmap.equality_aggregations[sz(step.record)];
-                    if (rec.affected_rows.size() != rec.row_multipliers.size())
-                        continue;
-                    f64 target = sense_ * rec.dual_value;
-                    bool valid = std::isfinite(target);
-                    for (std::size_t q = 0; q < rec.affected_rows.size(); ++q) {
-                        const Index row = rec.affected_rows[q];
-                        if (row < 0 || row >= problem.n_rows() ||
-                            !std::isfinite(rec.row_multipliers[q])) {
-                            valid = false;
-                            break;
-                        }
-                        target -= rec.row_multipliers[q] * ycanon[sz(row)];
-                    }
-                    if (valid)
-                        add_row_multiplier(step.row,
-                                           target - ycanon[sz(step.row)]);
-                    continue;
-                }
-
-                if (step.kind == presolve::DualRecoveryKind::ForcingRow) {
-                    if (step.columns.empty() ||
-                        step.columns.size() != step.coefficients.size())
-                        continue;
-                    f64 target = step.at_max
-                        ? -std::numeric_limits<f64>::infinity()
-                        :  std::numeric_limits<f64>::infinity();
-                    bool valid = true;
-                    for (std::size_t q = 0; q < step.columns.size(); ++q) {
-                        const Index j = step.columns[q];
-                        const f64 a = step.coefficients[q];
-                        if (j < 0 || j >= ns_ || a == 0.0) {
-                            valid = false;
-                            break;
-                        }
-                        const f64 c = sense_ * problem.c[sz(j)];
-                        const f64 threshold = (c - aty[sz(j)]) / a;
-                        if (!std::isfinite(threshold)) {
-                            valid = false;
-                            break;
-                        }
-                        if (step.at_max) target = std::max(target, threshold);
-                        else             target = std::min(target, threshold);
-                    }
-                    if (!valid || !std::isfinite(target)) continue;
-                    const bool equality =
-                        problem.row_lo[sz(step.row)] ==
-                        problem.row_hi[sz(step.row)];
-                    if (!equality) {
-                        // At a lower-active row y>=0; at an upper-active row
-                        // y<=0 in the canonical minimization model.
-                        target = step.at_max ? std::max(0.0, target)
-                                             : std::min(0.0, target);
-                    }
-                    add_row_multiplier(step.row,
-                                       target - ycanon[sz(step.row)]);
-                    continue;
-                }
-
-                if (step.kind != presolve::DualRecoveryKind::BoundTightening)
-                    continue;
-                if (step.col < 0 || step.col >= ns_ || step.coeff == 0.0 ||
-                    step.other_rows.size() !=
-                        step.other_row_coefficients.size())
-                    continue;
-                const f64 xj = raw.x[sz(step.col)];
-                const f64 lo_scale = std::isfinite(step.old_lo)
-                                         ? std::fabs(step.old_lo) : 0.0;
-                const f64 hi_scale = std::isfinite(step.old_hi)
-                                         ? std::fabs(step.old_hi) : 0.0;
-                const f64 tol = std::max(opts.primal_feas_tol, 1e-9) *
-                                (1.0 + std::max(lo_scale, hi_scale));
-                const bool at_lo = std::isfinite(step.old_lo) &&
-                                   xj <= step.old_lo + tol;
-                const bool at_hi = std::isfinite(step.old_hi) &&
-                                   xj >= step.old_hi - tol;
-                if (at_lo && at_hi) continue;  // originally fixed: no sign condition
-                f64 d = sense_ * step.stage_cost;
-                bool valid = std::isfinite(d);
-                for (std::size_t q = 0; q < step.other_rows.size(); ++q) {
-                    const Index row = step.other_rows[q];
-                    const f64 coefficient = step.other_row_coefficients[q];
-                    if (row < 0 || row >= problem.n_rows() ||
-                        !std::isfinite(coefficient)) {
-                        valid = false;
-                        break;
-                    }
-                    d -= coefficient * ycanon[sz(row)];
-                }
-                if (!valid)
-                    continue;
-                if (!std::isfinite(d)) continue;
-                const bool column_dual_feasible =
-                    at_lo ? d >= -opts.dual_feas_tol
-                          : at_hi ? d <= opts.dual_feas_tol
-                                  : std::fabs(d) <= opts.dual_feas_tol;
-                if (column_dual_feasible) continue;
-                long double activity = 0.0L;
-                for (Offset k = rp[sz(step.row)]; k < rp[sz(step.row) + 1]; ++k)
-                    activity += static_cast<long double>(av[sz(k)]) * raw.x[sz(ci[sz(k)])];
-                const f64 act = static_cast<f64>(activity);
-                const bool row_eq = problem.row_lo[sz(step.row)] == problem.row_hi[sz(step.row)];
-                const bool active_lo = problem.row_lo[sz(step.row)] > -model::kInf &&
-                                       act <= problem.row_lo[sz(step.row)] + tol;
-                const bool active_hi = problem.row_hi[sz(step.row)] < model::kInf &&
-                                       act >= problem.row_hi[sz(step.row)] - tol;
-                if (!row_eq && !active_lo && !active_hi) continue;
-                const f64 candidate_y = d / step.coeff;
-                if (!std::isfinite(candidate_y)) continue;
-                if ((!active_hi && candidate_y < -opts.dual_feas_tol) ||
-                    (!active_lo && candidate_y > opts.dual_feas_tol))
-                    continue;
-                add_row_multiplier(step.row,
-                                   candidate_y - ycanon[sz(step.row)]);
-            }
-            for (Index i = 0; i < problem.n_rows(); ++i)
-                raw.y[sz(i)] = sense_ * ycanon[sz(i)];
-        }
+        presolve::PresolveRecoveryOptions ropts;
+        ropts.primal_feas_tol = opts.primal_feas_tol;
+        ropts.dual_feas_tol = opts.dual_feas_tol;
+        ropts.gap_tol = opts.gap_tol;
+        const auto recovered =
+            presolve::recover_solution(problem, pmap, rs, ropts);
+        raw.x = recovered.raw.x;
+        raw.y = recovered.raw.y;
+        raw.objective = recovered.raw.objective;
+        presolve_recovery_validated = recovered.validated;
         rematerialize_original(problem, raw, diag, opts);
         raw.iterations = diag.iterations;
+        if (out_basis && !recovered.basis.status.empty()) {
+            SimplexBasis lifted;
+            lifted.n_struct = recovered.basis.n_struct;
+            lifted.basic = recovered.basis.basic;
+            lifted.status.resize(recovered.basis.status.size());
+            for (std::size_t k = 0; k < recovered.basis.status.size(); ++k)
+                lifted.status[k] = static_cast<NonbasicStatus>(
+                    recovered.basis.status[k]);
+            *out_basis = std::move(lifted);
+        }
 
-        // Presolve currently has a complete primal postsolve but only a
-        // partial dual recovery stack.  Never let that partial lift turn a
-        // valid reduced optimum into an unproved original-space result when
-        // the full solve can still certify it.  Retry the original model
-        // without presolve whenever the lifted candidate fails the same
-        // certificate gate used by finalize_result().
         const bool presolved_proved =
+            presolve_recovery_validated &&
             raw.proposed_status == core::Status::Optimal &&
             diag.primal_residual <= opts.primal_feas_tol &&
             diag.dual_residual <= opts.dual_feas_tol &&

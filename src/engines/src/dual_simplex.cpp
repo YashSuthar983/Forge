@@ -43,6 +43,102 @@ inline std::size_t sz(Offset i) { return static_cast<std::size_t>(i); }
 
 constexpr f64 kAtBound = 1e-9;
 
+// Exact indexed max-heap used by dual CHUZR.  Each basis slot occurs at most
+// once, so changing a basic value, bound, or edge weight is O(log m) and a
+// feasible row is removed outright.  Equal scores use the smaller slot index,
+// matching the exhaustive 0..m scan's first-maximum tie rule.
+class IndexedRowHeap {
+public:
+    explicit IndexedRowHeap(Index size = 0)
+        : position_(sz(size), -1), score_(sz(size), 0.0) {}
+
+    void clear() {
+        heap_.clear();
+        std::fill(position_.begin(), position_.end(), -1);
+        std::fill(score_.begin(), score_.end(), 0.0);
+    }
+
+    void update(Index row, f64 score) {
+        if (row < 0 || sz(row) >= position_.size()) return;
+        const Index old_position = position_[sz(row)];
+        if (!(score > 0.0) || std::isnan(score)) {
+            if (old_position >= 0) erase_at(old_position);
+            score_[sz(row)] = 0.0;
+            return;
+        }
+        score_[sz(row)] = score;
+        if (old_position < 0) {
+            position_[sz(row)] = static_cast<Index>(heap_.size());
+            heap_.push_back(row);
+            sift_up(static_cast<Index>(heap_.size() - 1));
+            return;
+        }
+        sift_up(old_position);
+        sift_down(position_[sz(row)]);
+    }
+
+    Index top() const { return heap_.empty() ? -1 : heap_.front(); }
+    f64 score(Index row) const {
+        return row >= 0 && sz(row) < score_.size() ? score_[sz(row)] : 0.0;
+    }
+    std::size_t size() const { return heap_.size(); }
+
+private:
+    bool higher(Index lhs, Index rhs) const {
+        const f64 a = score_[sz(lhs)], b = score_[sz(rhs)];
+        return a > b || (a == b && lhs < rhs);
+    }
+
+    void swap_positions(Index a, Index b) {
+        if (a == b) return;
+        std::swap(heap_[sz(a)], heap_[sz(b)]);
+        position_[sz(heap_[sz(a)])] = a;
+        position_[sz(heap_[sz(b)])] = b;
+    }
+
+    void sift_up(Index at) {
+        while (at > 0) {
+            const Index parent = (at - 1) / 2;
+            if (!higher(heap_[sz(at)], heap_[sz(parent)])) break;
+            swap_positions(at, parent);
+            at = parent;
+        }
+    }
+
+    void sift_down(Index at) {
+        const Index count = static_cast<Index>(heap_.size());
+        for (;;) {
+            Index best = at;
+            const Index left = 2 * at + 1;
+            const Index right = left + 1;
+            if (left < count && higher(heap_[sz(left)], heap_[sz(best)]))
+                best = left;
+            if (right < count && higher(heap_[sz(right)], heap_[sz(best)]))
+                best = right;
+            if (best == at) return;
+            swap_positions(at, best);
+            at = best;
+        }
+    }
+
+    void erase_at(Index at) {
+        const Index removed = heap_[sz(at)];
+        const Index last_position = static_cast<Index>(heap_.size() - 1);
+        if (at != last_position) swap_positions(at, last_position);
+        heap_.pop_back();
+        position_[sz(removed)] = -1;
+        if (at < static_cast<Index>(heap_.size())) {
+            const Index moved = heap_[sz(at)];
+            sift_up(at);
+            sift_down(position_[sz(moved)]);
+        }
+    }
+
+    std::vector<Index> heap_;
+    std::vector<Index> position_;
+    std::vector<f64> score_;
+};
+
 }  // namespace
 
 core::RawResult solve_dual_simplex_prepared(
@@ -50,6 +146,30 @@ core::RawResult solve_dual_simplex_prepared(
     SimplexDiagnostics& diag, SimplexBasis* out_basis,
     const SimplexBasis* warm) {
     const auto t_all = Clock::now();
+
+    // Fine-grained timers cost one clock read each, and this loop has fourteen
+    // such pairs -- about 28 clock_gettime calls per pivot. On a healthy `tsc`
+    // that is ~800 ns/pivot of pure instrumentation. On a host whose kernel has
+    // demoted the clocksource to `hpet` it is ~40 us/pivot: measured here on
+    // 2026-09-10, hpet cost 1403 ns/call against tsc's 29 ns, which turned a
+    // 0.28 ms model into 0.99 ms and handed HiGHS 30 of the suite's 39 time
+    // wins. HiGHS reads the clock about once per solve, so the tax was ours
+    // alone and no amount of repetition or MAD could see it -- the bias is
+    // perfectly stable.
+    //
+    // solve_primal_simplex_prepared has gated these behind opts.verbose since
+    // it was written (see time_detail there). The dual engine is the DEFAULT
+    // route and never was. Counters stay live unconditionally -- incrementing
+    // an integer is free -- so only the clock READS are gated; --verbose still
+    // produces the full timing breakdown.
+    const bool time_detail = opts.verbose;
+    const auto tick = [time_detail]() {
+        return time_detail ? Clock::now() : Clock::time_point{};
+    };
+    const auto tock = [time_detail](Clock::time_point t) {
+        return time_detail ? ms_since(t) : 0.0;
+    };
+
 
     const auto& pmin = prepared.pmin;
     const auto& p = prepared.scaled;
@@ -277,9 +397,9 @@ core::RawResult solve_dual_simplex_prepared(
     la::SpikeCapture entering_spike;
     const bool want_spike = opts.update_method == la::UpdateMethod::ForrestTomlin;
     const auto do_ftran = [&](std::vector<f64>& v, bool capture = false) {
-        const auto t0 = Clock::now();
+        const auto t0 = tick();
         factor.ftran(v, capture ? &entering_spike : nullptr);
-        const double dt = ms_since(t0);
+        const double dt = tock(t0);
         ++diag.solve_calls;
         ++diag.ftran_calls;
         diag.ftran_ms += dt;
@@ -288,9 +408,9 @@ core::RawResult solve_dual_simplex_prepared(
     const auto do_ftran_pair = [&](std::vector<f64>& a,
                                    std::vector<f64>& b,
                                    bool capture = false) {
-        const auto t0 = Clock::now();
+        const auto t0 = tick();
         factor.ftran_pair(a, b, capture ? &entering_spike : nullptr);
-        const double dt = ms_since(t0);
+        const double dt = tock(t0);
         diag.solve_calls += 2;
         diag.ftran_calls += 2;
         diag.ftran_ms += dt;
@@ -298,9 +418,9 @@ core::RawResult solve_dual_simplex_prepared(
         ++diag.dual_paired_ftrans;
     };
     const auto do_btran = [&](std::vector<f64>& v) {
-        const auto t0 = Clock::now();
+        const auto t0 = tick();
         factor.btran(v);
-        const double dt = ms_since(t0);
+        const double dt = tock(t0);
         ++diag.solve_calls;
         ++diag.btran_calls;
         diag.btran_ms += dt;
@@ -316,10 +436,10 @@ core::RawResult solve_dual_simplex_prepared(
                                      const std::vector<Index>& seed,
                                      std::vector<Index>& support,
                                      bool capture = false) {
-        const auto t0 = Clock::now();
+        const auto t0 = tick();
         const bool sparse = factor.ftran_seeded_with_support(
             v, seed, support, capture ? &entering_spike : nullptr);
-        const double dt = ms_since(t0);
+        const double dt = tock(t0);
         ++diag.solve_calls;
         ++diag.ftran_calls;
         diag.ftran_ms += dt;
@@ -345,9 +465,9 @@ core::RawResult solve_dual_simplex_prepared(
         if (previous_btran_seed >= 0 && previous_btran_seed != seed_slot)
             v[sz(previous_btran_seed)] = 0.0;
         btran_seed[0] = seed_slot;
-        const auto t0 = Clock::now();
+        const auto t0 = tick();
         const bool sparse = factor.btran_seeded_with_support(v, btran_seed, support);
-        const double dt = ms_since(t0);
+        const double dt = tock(t0);
         ++diag.solve_calls;
         ++diag.btran_calls;
         diag.btran_ms += dt;
@@ -376,6 +496,22 @@ core::RawResult solve_dual_simplex_prepared(
     std::vector<f64>    slot_lo(sz(m), 0.0), slot_hi(sz(m), 0.0),
                         slot_ptol(sz(m), 0.0);
     std::vector<f64>    row_w(sz(m), 1.0);
+    IndexedRowHeap leave_heap(m);
+    std::vector<Index> leave_heap_dirty_rows;
+    std::vector<std::uint32_t> leave_heap_dirty_stamp(sz(m), 0);
+    std::uint32_t leave_heap_dirty_generation = 1;
+    bool leave_heap_all_dirty = true;
+    const auto invalidate_leave_heap = [&]() {
+        leave_heap_all_dirty = true;
+        leave_heap_dirty_rows.clear();
+    };
+    const auto mark_leave_row_dirty = [&](Index row) {
+        if (leave_heap_all_dirty || row < 0 || row >= m) return;
+        if (leave_heap_dirty_stamp[sz(row)] == leave_heap_dirty_generation)
+            return;
+        leave_heap_dirty_stamp[sz(row)] = leave_heap_dirty_generation;
+        leave_heap_dirty_rows.push_back(row);
+    };
     // A Devex framework is a FIXED reference set: the variables basic when
     // the framework was created.  Incremental row weights are cheap estimates
     // of the squared pivotal-row norm restricted to this set.  The exact
@@ -495,6 +631,14 @@ core::RawResult solve_dual_simplex_prepared(
     std::FILE* trace_fp = nullptr;
     if (const char* tp = std::getenv("SOR_DUAL_TRACE"))
         trace_fp = std::fopen(tp, "w");
+    const bool force_full_chuzr =
+        std::getenv("SOR_DUAL_FULLSCAN_CHUZR") != nullptr;
+#ifdef NDEBUG
+    const bool verify_chuzr_heap =
+        std::getenv("SOR_DUAL_VERIFY_CHUZR_HEAP") != nullptr;
+#else
+    const bool verify_chuzr_heap = true;
+#endif
     if (trace_fp) {
         // Self-describing, so a trace file read months later does not depend
         // on a matching source tree. dinf/pinf are measured against the bounds
@@ -618,7 +762,7 @@ core::RawResult solve_dual_simplex_prepared(
 
     // alpha_r = rho' [A | -I], visiting only rows where rho is nonzero.
     const auto build_pivotal_row = [&]() {
-        const auto t0 = Clock::now();
+        const auto t0 = tick();
         prow_idx.clear();
         prow_full_size = 0;
         prow_active_only =
@@ -739,13 +883,14 @@ core::RawResult solve_dual_simplex_prepared(
         }
         diag.dual_pivotal_entries_full += prow_full_size;
         diag.dual_pivotal_entries_kept += prow_idx.size();
-        diag.pivotal_row_ms += ms_since(t0);
+        diag.pivotal_row_ms += tock(t0);
     };
 
     const auto reset_devex_framework = [&]() {
         std::fill(devex_reference.begin(), devex_reference.end(), 0);
         for (const Index v : basis) devex_reference[sz(v)] = 1;
         std::fill(row_w.begin(), row_w.end(), 1.0);
+        invalidate_leave_heap();
         devex_framework_iterations = 0;
         ++diag.devex_frameworks;
     };
@@ -772,9 +917,10 @@ core::RawResult solve_dual_simplex_prepared(
         } else {
             std::fill(row_w.begin(), row_w.end(), 1.0);
         }
+        invalidate_leave_heap();
     };
 
-    const auto repair_weights = [&]() {
+    const auto repair_weights = [&]() -> bool {
         bool bad = false;
         f64 max_row = 0.0;
         for (const f64 w : row_w) {
@@ -784,7 +930,11 @@ core::RawResult solve_dual_simplex_prepared(
         // Uniformly rescaling the estimates leaves CHUZR scores unchanged but
         // destroys their relationship to the fixed Devex reference set (and
         // makes the exact accuracy check meaningless). Renew/rebuild instead.
-        if (bad || max_row > 1e100) reset_weights();
+        if (bad || max_row > 1e100) {
+            reset_weights();
+            return true;
+        }
+        return false;
     };
 
     const auto build_basis_matrix = [&]() {
@@ -817,6 +967,7 @@ core::RawResult solve_dual_simplex_prepared(
         }
         do_ftran(rhs);
         xB = rhs;
+        invalidate_leave_heap();
     };
 
     // Incremental xB after nonbasic bound flips (Koberstein 2008,
@@ -828,7 +979,7 @@ core::RawResult solve_dual_simplex_prepared(
     // phase-1 iterations, 12.9s -> under a second of flip maintenance).
     const auto apply_flip_shift = [&](const std::vector<Index>& flipped) {
         if (flipped.empty()) return;
-        const auto flip_t0 = Clock::now();
+        const auto flip_t0 = tick();
         ++diag.flip_batches;
         std::fill(rhs.begin(), rhs.end(), 0.0);
         for (const Index j : flipped) {
@@ -842,7 +993,11 @@ core::RawResult solve_dual_simplex_prepared(
         }
         do_ftran(rhs);
         for (Index i = 0; i < m; ++i) xB[sz(i)] += rhs[sz(i)];
-        diag.flip_ms += ms_since(flip_t0);
+        // This FTRAN currently uses the dense-output interface, so every row
+        // is conservatively invalidated.  Ordinary pivots below retain sparse
+        // support and update only the touched rows.
+        invalidate_leave_heap();
+        diag.flip_ms += tock(flip_t0);
     };
 
     const auto primal_infeasibility = [&]() {
@@ -1323,7 +1478,7 @@ core::RawResult solve_dual_simplex_prepared(
     f64 expand_eps = expand_start;
 
     const auto do_factorize = [&]() {
-        const auto t0 = Clock::now();
+        const auto t0 = tick();
         const auto repairs_before = diag.basis_repairs;
         build_basis_matrix();
         if (!factor.factorize(m, bcp, bri, bvals, lu_opts, &bad_slots, &vacant_rows)) {
@@ -1349,7 +1504,7 @@ core::RawResult solve_dual_simplex_prepared(
             factor.factorize(m, bcp, bri, bvals, lu_opts, &bad_slots, &vacant_rows);
         }
         ++diag.refactorizations;
-        diag.factor_ms += ms_since(t0);
+        diag.factor_ms += tock(t0);
         // A repair moved columns in and out of the basis without going through
         // the pivot path, so the partitioned row store is rebuilt rather than
         // tracked. Repairs are rare and bounded by max_basis_repairs.
@@ -1408,6 +1563,55 @@ core::RawResult solve_dual_simplex_prepared(
     // do_factorize() runs with phase == 2 and therefore already installed
     // phase 1 if this starting basis is dual infeasible. Nothing more to do.
 
+    const auto leave_row_score = [&](Index i, bool* to_lower = nullptr) -> f64 {
+        const f64 x = xB[sz(i)], t = slot_ptol[sz(i)];
+        f64 violation = 0.0;
+        bool lower = true;
+        if (x < slot_lo[sz(i)] - t) {
+            violation = slot_lo[sz(i)] - x;
+        } else if (x > slot_hi[sz(i)] + t) {
+            violation = x - slot_hi[sz(i)];
+            lower = false;
+        } else {
+            return 0.0;
+        }
+        if (to_lower != nullptr) *to_lower = lower;
+        const f64 den = (use_devex && std::isfinite(row_w[sz(i)]))
+                            ? row_w[sz(i)] : 1.0;
+        return violation * violation / std::max(den, 1e-30);
+    };
+
+    const auto refresh_leave_heap = [&]() {
+        if (leave_heap_all_dirty) {
+            leave_heap.clear();
+            for (Index i = 0; i < m; ++i)
+                leave_heap.update(i, leave_row_score(i));
+            diag.chuzr_rows_scanned += static_cast<std::uint64_t>(m);
+            ++diag.chuzr_heap_rebuilds;
+            leave_heap_all_dirty = false;
+            leave_heap_dirty_rows.clear();
+            if (++leave_heap_dirty_generation == 0) {
+                std::fill(leave_heap_dirty_stamp.begin(),
+                          leave_heap_dirty_stamp.end(), 0);
+                leave_heap_dirty_generation = 1;
+            }
+        } else {
+            for (const Index i : leave_heap_dirty_rows)
+                leave_heap.update(i, leave_row_score(i));
+            diag.chuzr_rows_scanned += leave_heap_dirty_rows.size();
+            diag.chuzr_heap_updates += leave_heap_dirty_rows.size();
+            leave_heap_dirty_rows.clear();
+            if (++leave_heap_dirty_generation == 0) {
+                std::fill(leave_heap_dirty_stamp.begin(),
+                          leave_heap_dirty_stamp.end(), 0);
+                leave_heap_dirty_generation = 1;
+            }
+        }
+        diag.chuzr_heap_max_size = std::max(
+            diag.chuzr_heap_max_size,
+            static_cast<std::uint64_t>(leave_heap.size()));
+    };
+
     const auto apply_pivot = [&](Index q, int qdir, f64 t, Index leave) {
         const f64 xp_before = (leave < 0) ? 0.0 : xB[sz(leave)];
         // xB is slot-indexed, alpha is slot-indexed: iterate alpha's
@@ -1417,8 +1621,10 @@ core::RawResult solve_dual_simplex_prepared(
             for (const Index i : alpha_support) {
                 if (alpha[sz(i)] == 0.0) continue;
                 xB[sz(i)] -= static_cast<f64>(qdir) * t * alpha[sz(i)];
+                mark_leave_row_dirty(i);
             }
         } else {
+            invalidate_leave_heap();
             for (Index i = 0; i < m; ++i)
                 xB[sz(i)] -= static_cast<f64>(qdir) * t * alpha[sz(i)];
         }
@@ -1483,6 +1689,7 @@ core::RawResult solve_dual_simplex_prepared(
         pr_deactivate(q);
         refresh_slot_bounds(leave);
         xB[sz(leave)] = q_from + static_cast<f64>(qdir) * t;
+        mark_leave_row_dirty(leave);
 
         if (use_devex) {
             const f64 ap = alpha[sz(leave)];
@@ -1638,7 +1845,7 @@ core::RawResult solve_dual_simplex_prepared(
                                                     opts.refactor_work_ratio,
                                                     opts.refactor_u_nnz_ratio,
                                                     opts.ft_update_limit);
-        const auto update_t0 = Clock::now();
+        const auto update_t0 = tick();
         const bool updated =
             opts.update_method == la::UpdateMethod::ForrestTomlin
                 ? factor.update_ft(leave, alpha, la::LuOptions{}, opts.pivot_tol,
@@ -1646,7 +1853,7 @@ core::RawResult solve_dual_simplex_prepared(
                                    entering_spike.valid ? &entering_spike
                                                         : nullptr)
                 : factor.update(leave, alpha, opts.pivot_tol);
-        diag.basis_update_ms += ms_since(update_t0);
+        diag.basis_update_ms += tock(update_t0);
         ++diag.basis_update_calls;
         const bool wants_refactor = unstable || !updated || eta_full ||
                                      ++since_refactor >= opts.refactor_interval;
@@ -1667,10 +1874,10 @@ core::RawResult solve_dual_simplex_prepared(
             constexpr Index kCollectiveMaxUpdates = 64;
             if (factor.dimension() <= kCollectiveMaxDimension &&
                 factor.n_updates() <= kCollectiveMaxUpdates) {
-                const auto collapse_t0 = Clock::now();
+                const auto collapse_t0 = tick();
                 const bool collapsed = factor.collapse_pending_into_ft(
                     la::LuOptions{}, opts.pivot_tol);
-                diag.basis_update_ms += ms_since(collapse_t0);
+                diag.basis_update_ms += tock(collapse_t0);
                 if (collapsed) {
                     ++diag.collective_ft_collapses;
                     since_refactor = 0;
@@ -1806,48 +2013,58 @@ core::RawResult solve_dual_simplex_prepared(
             // enter_phase1()), which is the whole content of the Koberstein &
             // Suhl method: phase 1 is not a different algorithm, it is this
             // same algorithm on a different bound vector.
-            const auto price_t0 = Clock::now();
+            const auto price_t0 = tick();
 
-            const auto row_viol = [&](Index i, f64& viol, bool& to_lower) -> bool {
-                const f64 x = xB[sz(i)], t = slot_ptol[sz(i)];
-                if (x < slot_lo[sz(i)] - t) {
-                    viol = slot_lo[sz(i)] - x;
-                    to_lower = true;
-                    return true;
-                }
-                if (x > slot_hi[sz(i)] + t) {
-                    viol = x - slot_hi[sz(i)];
-                    to_lower = false;
-                    return true;
-                }
-                return false;
-            };
-
-            f64 best = 0.0;
             bool leave_to_lower = true;
-            const auto consider_row = [&](Index i) {
-                f64 viol = 0.0;
-                bool to_lo = true;
-                if (!row_viol(i, viol, to_lo)) return;
-                const f64 den = (use_devex && std::isfinite(row_w[sz(i)]))
-                                ? row_w[sz(i)] : 1.0;
-                const f64 score = viol * viol / std::max(den, 1e-30);
-                if (score > best) {
-                    best = score;
-                    leave = i;
-                    leave_to_lower = to_lo;
+            const auto exhaustive_leave = [&](bool count_work,
+                                               bool* direction) -> Index {
+                f64 best = 0.0;
+                Index selected = -1;
+                bool selected_to_lower = true;
+                for (Index i = 0; i < m; ++i) {
+                    bool to_lower = true;
+                    const f64 score = leave_row_score(i, &to_lower);
+                    if (score > best) {
+                        best = score;
+                        selected = i;
+                        selected_to_lower = to_lower;
+                    }
                 }
+                if (direction != nullptr) *direction = selected_to_lower;
+                if (count_work) {
+                    diag.chuzr_rows_scanned += static_cast<std::uint64_t>(m);
+                    ++diag.chuzr_full_scans;
+                }
+                return selected;
             };
 
-            // Full scan over the m basis slots. row_viol() is O(1) -- it only
-            // reads xB and two bounds -- so scanning every row costs O(m) and a
-            // candidate list cannot save anything measurable. It can cost
-            // plenty: with a 128-entry list refreshed every 64 iterations the
-            // dual picked stale leaving rows and 25fv47 ended in
-            // NumericalFailure with objective -93825.97 instead of Optimal at
-            // 5501.845888. fit2p also needed 14443 iterations instead of 10457.
-            for (Index i = 0; i < m; ++i) consider_row(i);
-            diag.price_ms += ms_since(price_t0);
+            if (force_full_chuzr) {
+                leave = exhaustive_leave(true, &leave_to_lower);
+            } else {
+                refresh_leave_heap();
+                leave = leave_heap.top();
+                if (leave >= 0)
+                    (void)leave_row_score(leave, &leave_to_lower);
+            }
+
+            // Debug builds validate every heap choice after pivots, flips,
+            // reinversions and phase changes. Release builds can enable the
+            // identical adversarial check with SOR_DUAL_VERIFY_CHUZR_HEAP.
+            if (verify_chuzr_heap && !force_full_chuzr) {
+                bool reference_to_lower = true;
+                const Index reference =
+                    exhaustive_leave(true, &reference_to_lower);
+                if (reference != leave ||
+                    (reference >= 0 && reference_to_lower != leave_to_lower)) {
+                    status = core::Status::NumericalFailure;
+                    reason = "dual CHUZR indexed heap disagreed with exhaustive scan";
+                    break;
+                }
+            }
+            const double chuzr_elapsed = tock(price_t0);
+            diag.price_ms += chuzr_elapsed;
+            diag.chuzr_ms += chuzr_elapsed;
+            ++diag.chuzr_calls;
 
             if (leave < 0) {
                 // Never conclude anything on a factorization carrying pending
@@ -1974,6 +2191,7 @@ core::RawResult solve_dual_simplex_prepared(
                         average_log_low_dse_error,
                         average_log_high_dse_error);
                 row_w[sz(leave)] = std::max(computed_weight, 1e-10);
+                mark_leave_row_dirty(leave);
                 if (!dual_dse_accept_weight(updated_weight, computed_weight)) {
                     ++diag.dse_weight_rejections;
                     // A rejected row proves the propagated weights made an
@@ -2013,7 +2231,7 @@ core::RawResult solve_dual_simplex_prepared(
             // qualify. Reduced costs are read from the maintained redcost[]
             // instead of being recomputed, so this whole block is one sparse
             // row pass rather than a full O(nnz(A)) column sweep.
-            const auto row_price_t0 = Clock::now();
+            const auto row_price_t0 = tick();
             build_pivotal_row();
             avg_pivotal_row_density = dual_update_running_density(
                 avg_pivotal_row_density,
@@ -2062,12 +2280,17 @@ core::RawResult solve_dual_simplex_prepared(
                     add_candidate(j, aj);
                 }
             }
-            diag.price_ms += ms_since(row_price_t0);
+            const double prow_elapsed = tock(row_price_t0);
+            diag.price_ms += prow_elapsed;
+            diag.prow_price_ms += prow_elapsed;
+            ++diag.prow_price_calls;
+            diag.prow_entries_scanned +=
+                static_cast<std::uint64_t>(prow_idx.size());
 
             const Index vl = basis[sz(leave)];
             const f64 target = leave_to_lower ? lo[sz(vl)] : hi[sz(vl)];
             const f64 delta_primal = xB[sz(leave)] - target;
-            const auto ratio_t0 = Clock::now();
+            const auto ratio_t0 = tick();
 
             // Harris two-pass ratio test with bound flipping, in BOTH phases
             // (dual_ratio_test.hpp). In phase 2 the flippable candidates are
@@ -2101,7 +2324,7 @@ core::RawResult solve_dual_simplex_prepared(
             // price_ms as well, so the verbose profile double-counted it and
             // overstated pricing by exactly ratio_test_ms -- which is the
             // number any pricing work would be sized against.
-            diag.ratio_test_ms += ms_since(ratio_t0);
+            diag.ratio_test_ms += tock(ratio_t0);
 
             if (!choice.ok || choice.pivot < 0) {
                 if (since_refactor > 0) { do_factorize(); since_refactor = 0; continue; }
@@ -2168,6 +2391,7 @@ core::RawResult solve_dual_simplex_prepared(
                     devex_framework_iterations, m);
                 row_w[sz(leave)] = std::isfinite(computed_weight)
                                         ? computed_weight : 1.0;
+                mark_leave_row_dirty(leave);
             }
 
             q       = choice.pivot;
@@ -2347,9 +2571,9 @@ core::RawResult solve_dual_simplex_prepared(
         // incrementally (one extra FTRAN), so unlike before there is no
         // O(m)-BTRAN full reset_weights() call needed here every pivot --
         // that was the entire reason exact DSE was capped to m <= 64.
-        const auto pivot_t0 = Clock::now();
+        const auto pivot_t0 = tick();
         const bool was_flip = apply_pivot(q, qdir, t_step, leave);
-        diag.pivot_apply_ms += ms_since(pivot_t0);
+        diag.pivot_apply_ms += tock(pivot_t0);
         // apply_pivot changed q's status (basic, or flipped bound on a
         // bound-flip) and, on a basis change, the leaving variable's status;
         // refresh both phase-1 candidacies against their post-pivot state.

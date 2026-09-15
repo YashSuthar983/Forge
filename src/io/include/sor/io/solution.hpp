@@ -23,6 +23,8 @@ struct SolutionFile {
     std::vector<f64> x;
     std::vector<f64> y;
     std::vector<f64> ray;  // Farkas certificate; empty unless status == Infeasible
+    std::vector<f64> primal_ray;
+    std::vector<f64> dual_farkas_ray;
 };
 
 // Format:
@@ -32,6 +34,8 @@ struct SolutionFile {
 //   x <n> <v0> <v1> ... <v_{n-1}>
 //   y <m> <v0> ... <v_{m-1}>
 //   ray <k> <v0> ... <v_{k-1}>     (k == 0 line still present when empty)
+//   primal_ray <k> ...              (unboundedness certificate)
+//   dual_farkas_ray <k> ...         (infeasibility certificate)
 void write_solution(std::ostream& out, const core::SolveResult& r);
 
 // Throws std::runtime_error on a malformed file (missing field, size

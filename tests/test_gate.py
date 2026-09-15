@@ -20,7 +20,10 @@ No solver is built or run: every case is a synthetic sweep in a temp dir.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import inspect
+import io
 import json
 import sys
 import tempfile
@@ -36,6 +39,14 @@ sys.modules[SPEC.name] = gate
 SPEC.loader.exec_module(gate)
 
 runs = gate.runs
+
+
+class BaselineAcceptanceSafetyTests(unittest.TestCase):
+    def test_force_accept_bypass_does_not_exist(self):
+        self.assertNotIn("force", inspect.signature(gate.accept).parameters)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                gate.main(["--force-accept"])
 
 
 def record(instance: str, *, status: str = "optimal",
@@ -194,11 +205,15 @@ class TestAllowList(GateCase):
         gate.allow_path = lambda: path
         self.addCleanup(lambda: setattr(gate, "allow_path", original))
 
-        path.write_text(json.dumps({"netlib": {"m": {"max_work_ratio": 2.0}}}))
+        path.write_text(json.dumps({"_schema": {"version": 1},
+                                    "netlib": {"m": {"max_work_ratio": 2.0}},
+                                    "miplib-small": {}}))
         with self.assertRaises(SystemExit):
             gate.load_allow("netlib", None)
 
-        path.write_text(json.dumps({"netlib": {"m": {"reason": "ok"}}}))
+        path.write_text(json.dumps({"_schema": {"version": 1},
+                                    "netlib": {"m": {"reason": "ok"}},
+                                    "miplib-small": {}}))
         self.assertEqual(gate.load_allow("netlib", None)["m"]["reason"], "ok")
         self.assertEqual(gate.load_allow("miplib-small", None), {})
 

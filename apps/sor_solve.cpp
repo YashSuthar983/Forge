@@ -5,6 +5,7 @@
 #include "sor/backend/lp_device.hpp"
 #include "sor/certify/finalize.hpp"
 #include "sor/engines/hpr.hpp"
+#include "sor/engines/lp.hpp"
 #include "sor/engines/pdhg.hpp"
 #include "sor/engines/qp.hpp"
 #include "sor/engines/simplex.hpp"
@@ -14,6 +15,8 @@
 #include "sor/search/bab.hpp"
 #include "sor/search/lattice_reform.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -22,6 +25,7 @@
 #include <fstream>
 #include <limits>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 namespace {
@@ -29,7 +33,7 @@ namespace {
 void usage() {
     std::fputs(
         "usage: sor_solve MODEL.mps [options]\n"
-        "  --engine NAME    simplex (default) | pdhg | hpr | milp | qp\n"
+        "  --engine NAME    simplex (default) | auto | primal | dual | pdhg | hpr | milp | qp\n"
         "  --q-diag LIST    comma-separated diagonal of Q (if not using .qps)\n"
         "  --backend NAME   cpu (default) | vulkan | julia_gpu\n"
         "  --method NAME    auto | primal | dual   (simplex and MILP node LPs)\n"
@@ -50,6 +54,14 @@ void usage() {
         "  --no-scaling     skip Ruiz equilibration\n"
         "  --pow2-scaling   round Ruiz factors to powers of two (exact scaling)\n"
         "  --no-presolve    skip presolve (simplex/milp)\n"
+        "  --relax-integrality  read integer columns as continuous\n"
+        "  --small-matrix-value V  drop coefficients with |a| <= V\n"
+        "  --[no-]fo-polish     enable/disable HPR feasibility polishing\n"
+        "  --[no-]fo-certificates enable/disable HPR certificate detection\n"
+        "  --[no-]fo-crossover  enable/disable Auto FO-to-simplex crossover\n"
+        "  --auto-budget-split S  one of 60/25/15, 70/20/10, 80/15/5\n"
+        "  --diagnostics-json PATH  write machine-readable LP diagnostics\n"
+        "  --hpr-restart-off | --hpr-reflection-off | --hpr-weight-off\n"
         "  --implied-slack  presolve: drop zero-cost singleton columns as slacks\n"
         "  --lattice-reform  opt-in AHL lattice reform for pure integer equalities\n"
         "  --no-probing     skip MILP root probing (conflict graph, implied bounds)\n"
@@ -187,6 +199,120 @@ void print_transfer(const sor::backend::TransferStats& s) {
                 static_cast<unsigned long long>(s.calls));
 }
 
+nlohmann::json json_number(double value) {
+    return std::isfinite(value) ? nlohmann::json(value) : nlohmann::json(nullptr);
+}
+
+void write_lp_diagnostics(const std::string& path,
+                          const sor::core::LpDiagnostics& d,
+                          const sor::core::SolveResult& result) {
+    if (path.empty()) return;
+    std::ofstream out(path);
+    if (!out) throw std::runtime_error("could not open diagnostics JSON: " + path);
+
+    nlohmann::json j = {
+        {"requested_strategy", sor::core::to_string(d.requested_strategy)},
+        {"routed_strategy", sor::core::to_string(d.routed_strategy)},
+        {"route_rationale", d.route_rationale},
+        {"rule_table_version", d.rule_table_version},
+        {"training_manifest_hash", d.training_manifest_hash},
+        {"holdout_manifest_hash", d.holdout_manifest_hash},
+        {"auto_promoted", d.auto_promoted},
+        {"rows", d.features.rows},
+        {"cols", d.features.cols},
+        {"nonzeros", d.features.nonzeros},
+        {"density", d.features.density},
+        {"row_degree_mean", d.features.row_degree_mean},
+        {"row_degree_max", d.features.row_degree_max},
+        {"col_degree_mean", d.features.col_degree_mean},
+        {"col_degree_max", d.features.col_degree_max},
+        {"fixed_variables", d.features.fixed_variables},
+        {"boxed_variables", d.features.boxed_variables},
+        {"one_sided_variables", d.features.one_sided_variables},
+        {"free_variables", d.features.free_variables},
+        {"equality_rows", d.features.equality_rows},
+        {"ranged_rows", d.features.ranged_rows},
+        {"one_sided_rows", d.features.one_sided_rows},
+        {"coefficient_spread", json_number(d.features.coefficient_spread)},
+        {"objective_density", d.features.objective_density},
+        {"iterations", d.iterations},
+        {"fo_iterations", d.fo_iterations},
+        {"crossover_iterations", d.crossover_iterations},
+        {"simplex_iterations", d.simplex_iterations},
+        {"global_iteration_limit", d.global_iteration_limit},
+        {"global_time_limit_s", d.global_time_limit_s},
+        {"fo_elapsed_s", d.fo_elapsed_s},
+        {"crossover_elapsed_s", d.crossover_elapsed_s},
+        {"simplex_elapsed_s", d.simplex_elapsed_s},
+        {"polish_attempts", d.polish_attempts},
+        {"polish_iterations", d.polish_iterations},
+        {"fo_epochs_without_decay", d.fo_epochs_without_decay},
+        {"fo_budget_fraction", d.fo_budget_fraction},
+        {"crossover_budget_fraction", d.crossover_budget_fraction},
+        {"simplex_budget_fraction", d.simplex_budget_fraction},
+        {"fo_target_tolerance", d.fo_target_tolerance},
+        {"recovery_target_tolerance", d.recovery_target_tolerance},
+        {"presolve_ms", d.presolve_ms},
+        {"presolve_status", d.presolve_status},
+        {"presolve_reason", d.presolve_reason},
+        {"crossover_attempted", d.crossover_attempted},
+        {"crossover_basis_valid", d.crossover_basis_valid},
+        {"crossover_cold_fallback", d.crossover_cold_fallback},
+        {"elapsed_s", d.elapsed_s},
+        {"status", sor::core::to_string(result.status)},
+        {"proof", sor::core::to_string(result.proof)},
+        {"max_primal_violation", json_number(result.max_primal_violation)},
+        {"max_dual_violation", json_number(result.max_dual_violation)},
+        {"relative_gap", json_number(result.gap_rel)},
+        {"termination_reason", result.termination_reason},
+    };
+    out << j.dump(2) << '\n';
+}
+
+void write_explicit_lp_diagnostics(
+    const std::string& path,
+    sor::core::LpStrategy strategy,
+    const sor::model::LpProblem& problem,
+    const sor::core::SolveResult& result,
+    std::uint64_t fo_iterations,
+    std::uint64_t crossover_iterations,
+    std::uint64_t simplex_iterations,
+    std::uint64_t polish_attempts,
+    std::uint64_t polish_iterations,
+    std::uint64_t global_iteration_limit,
+    double global_time_limit_s,
+    double elapsed_s) {
+    if (path.empty()) return;
+    sor::core::LpDiagnostics d;
+    d.requested_strategy = strategy;
+    d.routed_strategy = strategy;
+    d.features = sor::engines::extract_lp_features(problem);
+    d.route_rationale = "explicit strategy requested";
+    d.rule_table_version = "not-used-explicit-route";
+    d.training_manifest_hash = "not-used-explicit-route";
+    d.holdout_manifest_hash = "not-used-explicit-route";
+    d.auto_promoted = false;
+    d.fo_iterations = fo_iterations;
+    d.crossover_iterations = crossover_iterations;
+    d.simplex_iterations = simplex_iterations;
+    d.polish_attempts = polish_attempts;
+    d.polish_iterations = polish_iterations;
+    d.iterations = fo_iterations + crossover_iterations + simplex_iterations;
+    d.elapsed_s = elapsed_s;
+    d.global_iteration_limit = global_iteration_limit;
+    d.global_time_limit_s = global_time_limit_s;
+    if (strategy == sor::core::LpStrategy::Hpr ||
+        strategy == sor::core::LpStrategy::Pdhg)
+        d.fo_elapsed_s = elapsed_s;
+    else
+        d.simplex_elapsed_s = elapsed_s;
+    d.max_primal_violation = result.max_primal_violation;
+    d.max_dual_violation = result.max_dual_violation;
+    d.gap_rel = result.gap_rel;
+    d.termination_reason = result.termination_reason;
+    write_lp_diagnostics(path, d, result);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -195,6 +321,7 @@ int main(int argc, char** argv) {
     std::string path, backend_name = "cpu", engine_name = "simplex";
     std::string q_diag_arg;
     std::string solution_out;
+    std::string diagnostics_json;
     sor::engines::PdhgOptions pdhg_opts;
     sor::engines::HprOptions hpr_opts;
     sor::engines::SimplexOptions sx_opts;
@@ -204,6 +331,11 @@ int main(int argc, char** argv) {
     bool max_iter_given = false;
     bool primal_crash_given = false;
     bool lattice_reform = false;
+    bool fo_polish = true;
+    bool fo_certificates = true;
+    bool fo_crossover = true;
+    sor::core::LpAutoBudgetSplit auto_budget_split =
+        sor::core::LpAutoBudgetSplit::Fo60Crossover25Simplex15;
     // MILP conflict-graph switches. Three independent consumers of one root
     // probing pass, kept separately switchable so a benchmark run can attribute
     // a change to the reduction, the cuts, or the node propagation.
@@ -342,6 +474,48 @@ int main(int argc, char** argv) {
             hpr_opts.ruiz_iterations = 0;
         }
         else if (a == "--no-presolve") sx_opts.presolve = false;
+        else if (a == "--relax-integrality") mps_opts.relax_integrality = true;
+        else if (a == "--small-matrix-value")
+            mps_opts.small_matrix_value = parse_real(
+                next("--small-matrix-value"), "--small-matrix-value", 0.0);
+        else if (a == "--fo-polish") {
+            fo_polish = true;
+            hpr_opts.use_polishing = true;
+        }
+        else if (a == "--no-fo-polish") {
+            fo_polish = false;
+            hpr_opts.use_polishing = false;
+        }
+        else if (a == "--fo-certificates") {
+            fo_certificates = true;
+            hpr_opts.detect_certificates = true;
+        }
+        else if (a == "--no-fo-certificates") {
+            fo_certificates = false;
+            hpr_opts.detect_certificates = false;
+        }
+        else if (a == "--fo-crossover") fo_crossover = true;
+        else if (a == "--no-fo-crossover") fo_crossover = false;
+        else if (a == "--auto-budget-split") {
+            const std::string split = next("--auto-budget-split");
+            if (split == "60/25/15")
+                auto_budget_split =
+                    sor::core::LpAutoBudgetSplit::Fo60Crossover25Simplex15;
+            else if (split == "70/20/10")
+                auto_budget_split =
+                    sor::core::LpAutoBudgetSplit::Fo70Crossover20Simplex10;
+            else if (split == "80/15/5")
+                auto_budget_split =
+                    sor::core::LpAutoBudgetSplit::Fo80Crossover15Simplex05;
+            else {
+                std::fprintf(stderr,
+                    "error: --auto-budget-split expects 60/25/15, "
+                    "70/20/10, or 80/15/5, got '%s'\n", split.c_str());
+                return 2;
+            }
+        }
+        else if (a == "--diagnostics-json")
+            diagnostics_json = next("--diagnostics-json");
         else if (a == "--implied-slack") sx_opts.presolve_implied_slack = true;
         else if (a == "--lattice-reform") lattice_reform = true;
         else if (a == "--no-probing") probing = false;
@@ -375,12 +549,19 @@ int main(int argc, char** argv) {
             hpr_opts.use_primal_weight = false;
             hpr_opts.use_restart = false;
             hpr_opts.use_halpern = false;
+            hpr_opts.use_reflection = false;
+            hpr_opts.use_adaptive_step = false;
         }
         else if (a == "--hpr-full") {
             hpr_opts.use_primal_weight = true;
             hpr_opts.use_restart = true;
             hpr_opts.use_halpern = true;
+            hpr_opts.use_reflection = true;
+            hpr_opts.use_adaptive_step = true;
         }
+        else if (a == "--hpr-restart-off") hpr_opts.use_restart = false;
+        else if (a == "--hpr-reflection-off") hpr_opts.use_reflection = false;
+        else if (a == "--hpr-weight-off") hpr_opts.use_primal_weight = false;
         else if (a == "--solution-out") solution_out = next("--solution-out");
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else if (!a.empty() && a[0] == '-') {
@@ -391,19 +572,18 @@ int main(int argc, char** argv) {
     }
 
     if (path.empty()) { usage(); return 2; }
-    if (engine_name != "pdhg" && engine_name != "simplex" && engine_name != "hpr" &&
+    if (engine_name != "pdhg" && engine_name != "simplex" && engine_name != "auto" &&
+        engine_name != "primal" && engine_name != "dual" && engine_name != "hpr" &&
         engine_name != "milp" && engine_name != "qp") {
         std::fprintf(stderr,
                      "error: engine '%s' not implemented "
-                     "(have simplex|pdhg|hpr|milp|qp)\n",
+                     "(have simplex|auto|primal|dual|pdhg|hpr|milp|qp)\n",
                      engine_name.c_str());
         return 3;
     }
-    // A backend that is merely UNAVAILABLE warns and falls back to cpu further
-    // down -- that is deliberate, since vulkan/julia_gpu depend on the machine.
-    // A backend NAME that does not exist is a different thing, and it used to
-    // be accepted in total silence: the simplex path returns before any backend
-    // is constructed, so `--backend abacus` simply did nothing.
+    // Availability and algorithmic capabilities are checked by the selected
+    // engine.  An unavailable non-CPU backend is reported as Unsupported; it
+    // must never turn a requested claim run into an unlabelled CPU run.
     if (backend_name != "cpu" && backend_name != "vulkan" &&
         backend_name != "julia_gpu") {
         std::fprintf(stderr,
@@ -415,12 +595,14 @@ int main(int argc, char** argv) {
     // LP CLI's aggregate pivot count. Keep SimplexOptions' library default off:
     // MILP owns its node-LP policy separately and must not change merely
     // because the standalone LP default did.
-    if (engine_name == "simplex" && !primal_crash_given)
+    if ((engine_name == "simplex" || engine_name == "primal" ||
+         engine_name == "dual") && !primal_crash_given)
         sx_opts.primal_crash = true;
     if (tol_given) {
-        pdhg_opts.primal_tol = pdhg_opts.dual_tol = tol;
+        pdhg_opts.primal_tol = pdhg_opts.dual_tol = pdhg_opts.gap_tol = tol;
         hpr_opts.primal_tol = hpr_opts.dual_tol = hpr_opts.gap_tol = tol;
         sx_opts.primal_feas_tol = sx_opts.dual_feas_tol = tol;
+        sx_opts.gap_tol = tol;
     }
 
     try {
@@ -434,7 +616,7 @@ int main(int argc, char** argv) {
                 sor::io::MpsReadReport rep;
                 qp.linear = mps_format_forced
                     ? sor::io::read_mps_file(path, rep, mps_opts)
-                    : sor::io::read_mps_file_auto(path, rep, mps_opts.strict);
+                    : sor::io::read_mps_file_auto(path, rep, mps_opts);
                 for (const auto& w : rep.warnings)
                     std::fprintf(stderr, "warning: %s\n", w.c_str());
                 qp.q_diag.clear();
@@ -502,7 +684,7 @@ int main(int argc, char** argv) {
         sor::io::MpsReadReport rep;
         const auto problem = mps_format_forced
             ? sor::io::read_mps_file(path, rep, mps_opts)
-            : sor::io::read_mps_file_auto(path, rep, mps_opts.strict);
+            : sor::io::read_mps_file_auto(path, rep, mps_opts);
         for (const auto& w : rep.warnings)
             std::fprintf(stderr, "warning: %s\n", w.c_str());
 
@@ -720,17 +902,72 @@ int main(int argc, char** argv) {
             return exit_code_for(r.status);
         }
 
-        if (engine_name == "simplex") {
+        if (engine_name == "auto") {
+            if (rep.n_integer > 0 && !mps_opts.relax_integrality) {
+                std::printf("NOTE:              solving the LP RELAXATION "
+                            "(use --engine milp for branch-and-bound)\n");
+            }
+            sor::core::LpOptions lp_opts;
+            lp_opts.strategy = sor::core::LpStrategy::Auto;
+            lp_opts.max_iterations = max_iter_given ? sx_opts.max_iterations : 0;
+            lp_opts.time_limit_s = sx_opts.time_limit_s;
+            lp_opts.primal_feas_tol = sx_opts.primal_feas_tol;
+            lp_opts.dual_feas_tol = sx_opts.dual_feas_tol;
+            lp_opts.gap_tol = sx_opts.gap_tol;
+            lp_opts.presolve = sx_opts.presolve;
+            lp_opts.presolve_implied_slack = sx_opts.presolve_implied_slack;
+            lp_opts.fo_polish = fo_polish;
+            lp_opts.fo_certificates = fo_certificates;
+            lp_opts.fo_crossover = fo_crossover;
+            lp_opts.auto_budget_split = auto_budget_split;
+            lp_opts.backend = backend_name;
+            sor::core::LpDiagnostics diag;
+            sor::core::ProofEvidence ev;
+            auto raw = sor::engines::solve_lp(problem, lp_opts, diag, &ev);
+            ev = sor::certify::check_lp_result(problem, raw, ev);
+            const auto r = sor::certify::finalize_result(std::move(raw), ev);
+            print_result(r);
+            write_solution_out(solution_out, r);
+            write_lp_diagnostics(diagnostics_json, diag, r);
+            std::printf("route:             %s (%s)\n",
+                        std::string(sor::core::to_string(diag.routed_strategy)).c_str(),
+                        diag.route_rationale.c_str());
+            std::printf("max primal viol:   %.3e\n", r.max_primal_violation);
+            std::printf("dual residual:     %.3e\n", r.max_dual_violation);
+            std::printf("iterations:        %llu (FO %llu, crossover %llu, simplex %llu)\n",
+                        static_cast<unsigned long long>(r.iterations),
+                        static_cast<unsigned long long>(diag.fo_iterations),
+                        static_cast<unsigned long long>(diag.crossover_iterations),
+                        static_cast<unsigned long long>(diag.simplex_iterations));
+            std::printf("termination:       %s\n", r.termination_reason.c_str());
+            return exit_code_for(r.status);
+        }
+
+        if (engine_name == "simplex" || engine_name == "primal" ||
+            engine_name == "dual") {
+            if (engine_name == "primal")
+                sx_opts.method = sor::engines::SimplexMethod::Primal;
+            else if (engine_name == "dual")
+                sx_opts.method = sor::engines::SimplexMethod::Dual;
             if (rep.n_integer > 0) {
                 std::printf("NOTE:              solving the LP RELAXATION "
                             "(use --engine milp for branch-and-bound)\n");
             }
             sor::engines::SimplexDiagnostics diag;
             auto raw = sor::engines::solve_simplex(problem, sx_opts, diag, nullptr);
-            const auto ev = sor::engines::simplex_evidence(diag, sx_opts);
+            auto ev = sor::engines::simplex_evidence(diag, sx_opts);
+            ev = sor::certify::check_lp_result(problem, raw, ev);
             const auto r = sor::certify::finalize_result(std::move(raw), ev);
             print_result(r);
             write_solution_out(solution_out, r);
+            const auto strategy = engine_name == "primal"
+                ? sor::core::LpStrategy::PrimalSimplex
+                : engine_name == "dual" ? sor::core::LpStrategy::DualSimplex
+                                          : sor::core::LpStrategy::Simplex;
+            write_explicit_lp_diagnostics(
+                diagnostics_json, strategy, problem, r, 0, 0,
+                diag.iterations, 0, 0, sx_opts.max_iterations,
+                sx_opts.time_limit_s, diag.total_ms / 1000.0);
             if (diag.dual_bound_finite) {
                 std::printf("dual bound:        %.10e\n", r.dual_bound);
                 std::printf("rel gap:           %.3e\n", r.gap_rel);
@@ -899,22 +1136,108 @@ int main(int argc, char** argv) {
             return exit_code_for(r.status);
         }
 
-        if (engine_name == "hpr") {
+        if (engine_name == "hpr" || engine_name == "pdhg") {
+            // Default explicit FO engines go through solve_lp so they share
+            // Auto's FO presolve probe and recover_solution lift. Ablation
+            // flags that mutate HprOptions/PdhgOptions beyond what LpOptions
+            // can express keep the direct engine path.
+            const sor::engines::HprOptions hpr_defaults{};
+            const bool hpr_ablation =
+                hpr_opts.use_primal_weight != hpr_defaults.use_primal_weight ||
+                hpr_opts.use_restart != hpr_defaults.use_restart ||
+                hpr_opts.use_halpern != hpr_defaults.use_halpern ||
+                hpr_opts.use_reflection != hpr_defaults.use_reflection ||
+                hpr_opts.use_adaptive_step != hpr_defaults.use_adaptive_step;
+            const bool use_solve_lp =
+                engine_name == "pdhg" ||
+                (engine_name == "hpr" && !hpr_ablation);
+
+            if (use_solve_lp) {
+                if (rep.n_integer > 0 && !mps_opts.relax_integrality) {
+                    std::printf("NOTE:              solving the LP RELAXATION "
+                                "(use --engine milp for branch-and-bound)\n");
+                }
+                sor::core::LpOptions lp_opts;
+                lp_opts.strategy = engine_name == "hpr"
+                    ? sor::core::LpStrategy::Hpr
+                    : sor::core::LpStrategy::Pdhg;
+                lp_opts.max_iterations = max_iter_given
+                    ? (engine_name == "hpr" ? hpr_opts.max_iterations
+                                            : pdhg_opts.max_iterations)
+                    : 0;
+                lp_opts.time_limit_s = engine_name == "hpr"
+                    ? hpr_opts.time_limit_s : pdhg_opts.time_limit_s;
+                lp_opts.primal_feas_tol = engine_name == "hpr"
+                    ? hpr_opts.primal_tol : pdhg_opts.primal_tol;
+                lp_opts.dual_feas_tol = engine_name == "hpr"
+                    ? hpr_opts.dual_tol : pdhg_opts.dual_tol;
+                lp_opts.gap_tol = engine_name == "hpr"
+                    ? hpr_opts.gap_tol : pdhg_opts.gap_tol;
+                lp_opts.presolve = sx_opts.presolve;
+                lp_opts.presolve_implied_slack = sx_opts.presolve_implied_slack;
+                lp_opts.fo_polish = fo_polish;
+                lp_opts.fo_certificates = fo_certificates;
+                lp_opts.fo_crossover = fo_crossover;
+                lp_opts.backend = backend_name;
+                sor::core::LpDiagnostics diag;
+                sor::core::ProofEvidence ev;
+                auto raw = sor::engines::solve_lp(problem, lp_opts, diag, &ev);
+                ev = sor::certify::check_lp_result(problem, raw, ev);
+                const auto r = sor::certify::finalize_result(std::move(raw), ev);
+                print_result(r);
+                write_solution_out(solution_out, r);
+                write_lp_diagnostics(diagnostics_json, diag, r);
+                std::printf("backend:           %s\n", backend_name.c_str());
+                if (!diag.presolve_status.empty())
+                    std::printf("presolve:          %s (%s)\n",
+                                diag.presolve_status.c_str(),
+                                diag.presolve_reason.c_str());
+                std::printf("max row violation: %.3e\n", r.max_primal_violation);
+                std::printf("dual residual:     %.3e\n", r.max_dual_violation);
+                std::printf("iterations:        %llu\n",
+                            static_cast<unsigned long long>(r.iterations));
+                std::printf("termination:       %s\n",
+                            r.termination_reason.c_str());
+                std::printf("\ntiming (ms)\n");
+                std::printf("  total            %10.3f\n",
+                            diag.elapsed_s * 1000.0);
+                return exit_code_for(r.status);
+            }
+
             auto dev = sor::backend::make_lp_device(backend_name);
             if (!dev) {
-                std::fprintf(stderr, "warning: LpDevice '%s' unavailable; using cpu\n",
-                             backend_name.c_str());
-                dev = sor::backend::make_cpu_lp_device();
+                sor::core::RawResult raw;
+                raw.proposed_status = sor::core::Status::Unsupported;
+                raw.engine = "hpr";
+                raw.backend = backend_name;
+                raw.termination_reason =
+                    "requested LP device '" + backend_name +
+                    "' is unavailable for HPR";
+                const auto r = sor::certify::finalize_result(
+                    std::move(raw), sor::core::ProofEvidence{});
+                print_result(r);
+                std::printf("termination:       %s\n",
+                            r.termination_reason.c_str());
+                return exit_code_for(r.status);
             }
             std::printf("backend:           %s (accelerated=%s)\n",
                         std::string(dev->name()).c_str(),
                         dev->is_accelerated() ? "yes" : "no");
+            std::printf("NOTE:              HPR ablation flags bypass FO "
+                        "presolve probe; use default --engine hpr for "
+                        "identical-model recovery\n");
             sor::engines::HprDiagnostics diag;
             auto raw = sor::engines::solve_hpr(problem, hpr_opts, *dev, diag);
-            const auto ev = sor::engines::hpr_evidence(diag, hpr_opts);
+            auto ev = sor::engines::hpr_evidence(diag, hpr_opts);
+            ev = sor::certify::check_lp_result(problem, raw, ev);
             const auto r = sor::certify::finalize_result(std::move(raw), ev);
             print_result(r);
             write_solution_out(solution_out, r);
+            write_explicit_lp_diagnostics(
+                diagnostics_json, sor::core::LpStrategy::Hpr, problem, r,
+                r.iterations, 0, 0, diag.polish_attempts,
+                diag.polish_iterations, hpr_opts.max_iterations,
+                hpr_opts.time_limit_s, diag.total_ms / 1000.0);
             std::printf("max row violation: %.3e\n", r.max_primal_violation);
             std::printf("dual residual:     %.3e\n", r.max_dual_violation);
             std::printf("iterations:        %llu\n",
@@ -926,30 +1249,8 @@ int main(int argc, char** argv) {
             return exit_code_for(r.status);
         }
 
-        auto be = sor::backend::make_backend(backend_name);
-        if (!be) {
-            std::fprintf(stderr, "warning: backend '%s' unavailable; using cpu\n",
-                         backend_name.c_str());
-            be = sor::backend::make_cpu_backend();
-        }
-        std::printf("backend:           %s (accelerated=%s)\n",
-                    std::string(be->name()).c_str(),
-                    be->is_accelerated() ? "yes" : "no");
-        sor::engines::PdhgDiagnostics diag;
-        auto raw = sor::engines::solve_pdhg(problem, pdhg_opts, *be, diag);
-        const auto ev = sor::engines::pdhg_evidence(diag, pdhg_opts);
-        const auto r = sor::certify::finalize_result(std::move(raw), ev);
-        print_result(r);
-        write_solution_out(solution_out, r);
-        std::printf("max row violation: %.3e\n", r.max_primal_violation);
-        std::printf("dual residual:     %.3e\n", r.max_dual_violation);
-        std::printf("iterations:        %llu\n",
-                    static_cast<unsigned long long>(r.iterations));
-        std::printf("termination:       %s\n", r.termination_reason.c_str());
-        std::printf("\ntiming (ms)\n");
-        std::printf("  total            %10.3f\n", diag.total_ms);
-        print_transfer(diag.kernel_stats);
-        return exit_code_for(r.status);
+        std::fprintf(stderr, "error: unreachable engine dispatch\n");
+        return 3;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

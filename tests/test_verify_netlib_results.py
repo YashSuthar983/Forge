@@ -396,6 +396,17 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("0 finding(s)", out)
 
+    def test_default_residual_tolerance_is_primary_1e_7(self) -> None:
+        with Fixture() as fx:
+            p = fx.write("r.jsonl", [
+                nested_record("a", {"SOR": sor_result(violation=5e-7),
+                                    "highs": highs_result(1.0)}),
+                nested_record("b", {"SOR": sor_result(),
+                                    "highs": highs_result(1.0)})])
+            code, out, _ = self._run([str(p), "--suite-dir", str(fx.suite)])
+        self.assertEqual(code, 1)
+        self.assertIn("violation-too-large", out)
+
     def test_bad_file_exits_one_and_lists_the_finding(self) -> None:
         with Fixture() as fx:
             p = fx.write("r.jsonl", [

@@ -192,5 +192,28 @@ int main() {
         CHECK(diag.primal_residual > opts.primal_tol);
     }
 
+    // Finite-bound dual contributions survive tolerance handling.  Here the
+    // reduced cost is below dual_tol but its product with the fixed bound is
+    // 50, so zeroing it would create a false duality gap.
+    {
+        model::LpProblem p;
+        p.A = sparse::from_triplets(0, 1, {}, {}, {});
+        p.c = {5e-8};
+        p.col_lo = {1e9};
+        p.col_hi = {1e9};
+        engines::PdhgOptions opts;
+        opts.max_iterations = 1;
+        opts.check_every = 1;
+        opts.primal_tol = 1e-6;
+        opts.dual_tol = 1e-6;
+        opts.gap_tol = 1e-12;
+        engines::PdhgDiagnostics diag;
+        const auto raw = engines::solve_pdhg(p, opts, *be, diag);
+        CHECK(raw.proposed_status == core::Status::Feasible);
+        CHECK_NEAR(raw.objective, 50.0, 1e-14);
+        CHECK_NEAR(raw.dual_bound, 50.0, 1e-14);
+        CHECK(diag.gap_rel <= opts.gap_tol);
+    }
+
     return sor::test::finish("test_pdhg");
 }

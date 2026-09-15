@@ -58,6 +58,7 @@ import argparse
 import datetime as _dt
 import importlib.util
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -80,6 +81,7 @@ def _load(name: str, path: Path):
 
 compare = _load("sor_compare", SCRIPTS / "compare.py")
 runs = _load("sor_compare_runs", SCRIPTS / "compare_runs.py")
+protocol = _load("sor_claim_protocol", SCRIPTS / "claim_protocol.py")
 # read_reference / model_minimizes / check_sound already exist and are already
 # careful (sense from the MODEL, per-entry tolerances for the MIPLIB 3.0 tables
 # that truncate to six significant digits). The gate reuses them rather than
@@ -152,26 +154,47 @@ def load_reference(path: Path, label: str) -> dict:
     return {k: v for k, v in run.results[label].items()}
 
 
-def measure_g2(rows: list, reference: dict) -> float | None:
-    """Geometric mean of candidate/reference time over comparable models."""
-    ratios = []
+def measure_g2(rows: list, reference: dict, time_limit: float = 60.0,
+               shift: float = 1.0) -> float | None:
+    """The PUBLIC metric: SGM(candidate) / SGM(reference).
+
+    This was a geometric mean of per-model ratios. That is a different
+    statistic and it disagreed with the public metric by 50% on Netlib-93
+    (0.8684 against the true 1.4307), because it weights a 0.4 ms model exactly
+    like an 11 s one. The definition now comes from compare.py so this gate and
+    a published report cannot disagree.
+
+    Note this is the only rule in gate.py that looks at HiGHS. Rules 1-3 are
+    internal SOR-vs-SOR regression checks against the pinned baseline and are
+    deliberately kept separate: a change can be a legitimate internal
+    regression while the public claim still holds, and vice versa.
+    """
+    cand_times, ref_times = [], []
     for row in rows:
-        if row.cand is None or not row.comparable:
-            continue
         ref = reference.get(row.instance)
-        if ref is None or not ref.seconds or not row.cand.seconds:
+        if ref is None:
             continue
-        ratios.append(row.cand.seconds / ref.seconds)
-    return runs.geomean(ratios)
+        cand_times.append(compare.par2_seconds(row.cand, time_limit))
+        ref_times.append(compare.par2_seconds(ref, time_limit))
+    if not cand_times:
+        return None
+    cand_sgm = compare.shifted_geomean(cand_times, shift)
+    ref_sgm = compare.shifted_geomean(ref_times, shift)
+    if not ref_sgm:
+        return None
+    return cand_sgm / ref_sgm
 
 
 def recorded_g2_of(path: Path) -> float | None:
-    """The G2-vs-reference stamped into a baseline by its last --accept."""
+    """The public SGM ratio stamped into a baseline by its last --accept."""
     try:
         with path.open() as fh:
             for line in fh:
                 rec = json.loads(line)
                 stamp = rec.get("gate_accept")
+                if rec.get("record") == "gate_accept" and \
+                        isinstance(rec.get("payload"), dict):
+                    stamp = rec["payload"]
                 if isinstance(stamp, dict) and "g2_vs_reference" in stamp:
                     return float(stamp["g2_vs_reference"])
                 break
@@ -180,7 +203,8 @@ def recorded_g2_of(path: Path) -> float | None:
     return None
 
 
-def load_allow(suite: str, tag: str | None) -> dict[str, dict]:
+def load_allow(suite: str, tag: str | None,
+               known_instances: set[str] | None = None) -> dict[str, dict]:
     """Committed per-model waivers for rule 2. Never consulted for rule 1."""
     path = allow_path()
     if not path.exists():
@@ -191,17 +215,31 @@ def load_allow(suite: str, tag: str | None) -> dict[str, dict]:
         raise SystemExit(f"gate: {path}: {e}")
     if not isinstance(doc, dict):
         raise SystemExit(f"gate: {path}: top level must be an object")
+    schema = doc.get("_schema")
+    if not isinstance(schema, dict) or schema.get("version") != 1:
+        raise SystemExit(f"gate: {path}: unsupported or missing schema version")
     key = suite + (f"-{tag}" if tag else "")
-    entries = doc.get(key, {})
+    if key not in doc:
+        raise SystemExit(f"gate: {path}: no entry for known suite {key!r}")
+    entries = doc.get(key)
     if not isinstance(entries, dict):
         raise SystemExit(f"gate: {path}: {key} must be an object")
     for model, entry in entries.items():
-        if not isinstance(entry, dict) or "reason" not in entry:
+        if (not isinstance(entry, dict) or
+                not isinstance(entry.get("reason"), str) or
+                not entry["reason"].strip()):
             raise SystemExit(
-                f"gate: {path}: {key}.{model} needs at least a \"reason\"")
+                f"gate: {path}: {key}.{model} needs a nonempty \"reason\"")
+        unknown = sorted(set(entry) - {"reason", "max_work_ratio"})
+        if unknown:
+            raise SystemExit(
+                f"gate: {path}: {key}.{model} has unknown fields {unknown}")
+        if known_instances is not None and model not in known_instances:
+            raise SystemExit(
+                f"gate: {path}: {key}.{model} is not a known suite instance")
         ratio = entry.get("max_work_ratio")
-        if ratio is not None and not (
-                isinstance(ratio, (int, float)) and ratio > 0):
+        if ratio is not None and not (type(ratio) in (int, float) and
+                                      math.isfinite(ratio) and ratio > 0):
             raise SystemExit(
                 f"gate: {path}: {key}.{model}.max_work_ratio must be positive")
     return entries
@@ -547,18 +585,47 @@ def write_markdown(path: Path, rows: list, summary: dict, base, cand,
     print(f"\nmarkdown: {path}")
 
 
+def refuse_unfit_baseline(candidate: Path) -> list[str]:
+    """Reasons this sweep must not become a committed baseline.
+
+    A baseline is what every later regression is measured against, so it must
+    be REPRODUCIBLE. That means the metadata proving it is reproducible has to
+    be PRESENT -- absence is a refusal, not a pass. An earlier version checked
+    only for explicitly bad values, so a sweep that recorded nothing at all
+    sailed through, which is precisely the sweep you cannot reproduce.
+    """
+    _, problems = protocol.validate_baseline(candidate, require_accept=False)
+    return problems
+
+
 def accept(candidate: Path, baseline: Path, reason: str, suite: str,
            tag: str | None, g2: float | None = None) -> None:
+    """Promote a sweep to the committed baseline.
+
+    The protocol check lives HERE, not at the call sites, because there is more
+    than one call site and a guard that can be reached around is not a guard.
+    """
+    unfit = refuse_unfit_baseline(candidate)
+    if unfit:
+        print("\ngate: refusing to make this sweep a baseline:", file=sys.stderr)
+        for u in unfit:
+            print(f"  - {u}", file=sys.stderr)
+        print("  A baseline defines what 'no regression' means for every later "
+              "run. Re-measure under the claim protocol "
+              "(scripts/claim_run.py).", file=sys.stderr)
+        raise SystemExit(1)
     RESULTS.mkdir(parents=True, exist_ok=True)
+    accepted_utc = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
     payload = {"reason": reason,
                "suite": suite + (f"-{tag}" if tag else ""),
-               "accepted_utc": _dt.datetime.now(_dt.timezone.utc)
-               .isoformat(timespec="seconds")}
+               "accepted_utc": accepted_utc,
+               "baseline_version": accepted_utc,
+               "claim_protocol_version": protocol.PROTOCOL_VERSION}
     # Rule 4 compares the next run against this, so a baseline that moves
     # carries the reference ratio it was accepted at.
     if g2 is not None:
         payload["g2_vs_reference"] = round(float(g2), 6)
-    stamp = {"record": "environment", "gate_accept": payload}
+    stamp = {"record": "gate_accept", "payload": payload}
     text = candidate.read_text()
     # The accept stamp rides in front of the sweep's own environment record,
     # so `head -2` on a baseline shows both why it moved and what produced it.
@@ -621,8 +688,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--iter-shift", type=float, default=100.0,
                     help="shift for pivot ratios, so a 12 -> 15 pivot model "
                          "does not read as a 25%% regression")
-    ap.add_argument("--obj-rel-tol", type=float, default=1e-6)
-    ap.add_argument("--obj-abs-tol", type=float, default=1e-9)
+    ap.add_argument("--obj-rel-tol", type=float, default=1e-7,
+                    help="relative objective agreement, scaled by "
+                         "(1 + |reference objective|). 1e-7 is the public "
+                         "gate; the former 1e-6 default was looser than "
+                         "either solver's own optimality tolerance.")
+    ap.add_argument("--obj-abs-tol", type=float, default=1e-7,
+                    help="claim-facing objective agreement: max(abs_tol, rel_tol*(1+|reference|)). 1e-7 is the public gate; use the named 1e-6 continuity command for the historical lane.")
     ap.add_argument("--top", type=int, default=12)
     ap.add_argument("--determinism", action="store_true",
                     help="also sweep twice and require identical pivots and "
@@ -691,7 +763,9 @@ def main(argv: list[str] | None = None) -> int:
         base_run.results[base_solver], cand_run.results[cand_solver],
         args.sgm_shift, args.iter_shift, args.obj_abs_tol, args.obj_rel_tol)
     summary = runs.summarize(rows, args.sgm_shift)
-    allow = load_allow(args.suite, args.tag)
+    known_instances = {p.name for p in compare.collect_models(
+        [str(models_dir)], None)}
+    allow = load_allow(args.suite, args.tag, known_instances)
     failures, waived = evaluate(rows, allow, work_name, args.work_bar,
                                 args.aggregate_bar,
                                 args.aggregate_min_instances)

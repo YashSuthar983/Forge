@@ -110,11 +110,17 @@ void test_fixture_lp() {
     CHECK(run.diag.cold_stages + run.diag.basis_restarts == run.diag.stages);
 }
 
-void test_auto_primal_first_skips_discarded_dual_probe() {
-    // A deliberately wide, sparse LP exercises Auto's primal-first shape
-    // classifier. The old dispatcher still ran and discarded a 256-iteration
-    // dual probe on this path. A proved primal result must now finish in one
-    // stage while retaining the shared one-build preprocessing invariant.
+void test_auto_commits_to_one_engine_without_a_discarded_probe() {
+    // Auto must reach a proved result in ONE stage, on ONE shared
+    // preprocessing build. Two regressions are fenced off here: the old
+    // dispatcher that ran and then discarded a 256-iteration probe of the
+    // other engine, and the per-stage preprocessing that rebuilt scaling and
+    // CSC for every candidate.
+    //
+    // This LP is deliberately wide and sparse -- the shape the retired
+    // primal-first classifier keyed on. The route no longer depends on shape,
+    // so the assertion is on the dual engine and, more importantly, on the
+    // stage counts, which is what the test was ever really about.
     sor::model::LpProblem lp;
     lp.name = "WIDE_PRIMAL_FIRST";
     lp.A = sor::sparse::from_triplets(1, 8, {0}, {0}, {1.0});
@@ -132,25 +138,85 @@ void test_auto_primal_first_skips_discarded_dual_probe() {
     CHECK(raw.proposed_status == Status::Optimal);
     CHECK_NEAR(raw.objective, -1.0, 1e-9);
     CHECK(diag.stages == 1);
-    CHECK(diag.primal_stages == 1);
-    CHECK(diag.dual_stages == 0);
+    CHECK(diag.primal_stages == 0);
+    CHECK(diag.dual_stages == 1);
     CHECK(diag.cold_stages == 1);
     CHECK(diag.basis_restarts == 0);
     CHECK(diag.preprocessing_builds == 1);
+    // Auto reports the structural summary it would route on, so the LP Auto
+    // layer above can read it without a second pass over the model.
+    CHECK(diag.route_features_valid);
+    CHECK(diag.route_features.rows == 1);
+    CHECK(diag.route_features.cols == 8);
 }
 
-void test_auto_dense_extreme_width_keeps_dual_route() {
-    using sor::engines::detail::prefer_primal_first;
+void test_route_features_describe_the_model() {
+    using sor::engines::detail::route_features;
 
-    // Ordinary wide/sparse and moderately shaped dense models retain the
-    // established primal-first policy.
-    CHECK(prefer_primal_first(244, 2594, 70216));
-    CHECK(prefer_primal_first(100, 200, 6000));
+    // Two rows, four columns, and one nonzero per position we care about:
+    //
+    //   min  x0 - x2          [ 1  2  0  0 ] x  = 3        (equality)
+    //        subject to       [ 0  0  4 100] x <= 5        (upper only)
+    //
+    //   x0 in [0,1] boxed, x1 in [2,2] fixed, x2 free, x3 in [0,inf).
+    sor::model::LpProblem lp;
+    lp.name = "FEATURES";
+    lp.A = sor::sparse::from_triplets(2, 4, {0, 0, 1, 1}, {0, 1, 2, 3},
+                                      {1.0, 2.0, 4.0, 100.0});
+    lp.c = {1.0, 0.0, -1.0, 0.0};
+    lp.row_lo = {3.0, -sor::model::kInf};
+    lp.row_hi = {3.0, 5.0};
+    lp.col_lo = {0.0, 2.0, -sor::model::kInf, 0.0};
+    lp.col_hi = {1.0, 2.0, sor::model::kInf, sor::model::kInf};
+    lp.is_integer.assign(4, false);
 
-    // Netlib fit2d's regime must reach the committed dual route. Density used to
-    // route it to primal: 8912 pivots / ~2.6 s versus 219 / ~0.19 s in dual.
-    CHECK(!prefer_primal_first(25, 10500, 130000));
+    const auto f = route_features(lp, 1e-7);
+    CHECK(f.rows == 2);
+    CHECK(f.cols == 4);
+    CHECK(f.nnz == 4);
+    CHECK_NEAR(f.density, 0.5, 1e-12);
+    CHECK_NEAR(f.aspect, 2.0, 1e-12);
+    CHECK_NEAR(f.row_degree, 2.0, 1e-12);
+    CHECK_NEAR(f.col_degree, 1.0, 1e-12);
 
+    // x2 alone is free, and it carries a cost.
+    CHECK(f.free_cols == 1);
+    CHECK(f.objective_free_cols == 1);
+    CHECK_NEAR(f.free_fraction, 0.25, 1e-12);
+    // x0 and x1 have both bounds finite; x1 alone is fixed.
+    CHECK_NEAR(f.boxed_fraction, 0.5, 1e-12);
+    CHECK_NEAR(f.fixed_fraction, 0.25, 1e-12);
+    // x0 and x2 carry a cost.
+    CHECK_NEAR(f.objective_fraction, 0.5, 1e-12);
+    // Row 0 is an equality; row 1 has only an upper bound, so it is neither
+    // ranged nor free.
+    CHECK_NEAR(f.equality_fraction, 0.5, 1e-12);
+    CHECK_NEAR(f.ranged_fraction, 0.0, 1e-12);
+    CHECK_NEAR(f.free_row_fraction, 0.0, 1e-12);
+    // Every column has degree 1.
+    CHECK_NEAR(f.singleton_fraction, 1.0, 1e-12);
+    // log10(100 / 1).
+    CHECK_NEAR(f.coefficient_spread, 2.0, 1e-12);
+
+    // The cold parking point is x = (0, 2, ., 0) -- x2 is free and parks at 0.
+    // Row 0 reads 1*0 + 2*2 = 4 != 3, so the logical point is infeasible.
+    CHECK(!f.logical_point_feasible);
+
+    // Relaxing that equality to cover the parking activity flips the flag, and
+    // nothing else about the model changes.
+    lp.row_lo[0] = 4.0;
+    lp.row_hi[0] = 4.0;
+    const auto g = route_features(lp, 1e-7);
+    CHECK(g.logical_point_feasible);
+    CHECK_NEAR(g.equality_fraction, 0.5, 1e-12);
+
+    // An empty model must not divide by zero.
+    sor::model::LpProblem empty;
+    empty.A = sor::sparse::from_triplets(0, 0, {}, {}, {});
+    const auto z = route_features(empty, 1e-7);
+    CHECK(z.rows == 0);
+    CHECK(z.cols == 0);
+    CHECK_NEAR(z.density, 0.0, 1e-12);
 }
 
 void test_dual_periodic_resync_is_not_tied_to_verbose() {
@@ -403,6 +469,7 @@ ENDATA
 // SOR_DUAL_FILTER_ACTIVE_PIVOTAL forces the unpartitioned scan with the same
 // keep filter, which is the reference implementation for this.
 void test_partitioned_price_matches_full_scan_on_random_bases() {
+    ScopedEnvironment verify_heap("SOR_DUAL_VERIFY_CHUZR_HEAP", "1");
     std::mt19937 rng(20260909u);
     std::uniform_real_distribution<double> unit(0.0, 1.0);
     int compared = 0;
@@ -1812,12 +1879,35 @@ void test_primal_crash_rejects_an_unstable_or_out_of_bounds_pivot() {
     CHECK_NEAR(bounded.diag.primal_crash_infeasibility_after, 1.0, 1e-12);
 }
 
+void test_simplex_consumes_terminal_presolve_outcome() {
+    sor::model::LpProblem lp;
+    lp.name = "PRESOLVE_EMPTY_UNBOUNDED";
+    lp.A = sor::sparse::from_triplets(1, 1, {}, {}, {});
+    lp.c = {-1.0};
+    lp.row_lo = {-sor::model::kInf};
+    lp.row_hi = {sor::model::kInf};
+    lp.col_lo = {0.0};
+    lp.col_hi = {sor::model::kInf};
+
+    SimplexOptions opts;
+    opts.presolve = true;
+    SimplexDiagnostics diag;
+    SimplexBasis basis;
+    const auto raw = sor::engines::solve_simplex(lp, opts, diag, &basis);
+    CHECK(raw.proposed_status == Status::Unbounded);
+    CHECK(raw.proposed_level == ProofLevel::None);
+    CHECK(raw.engine == "simplex_presolve");
+    CHECK(raw.termination_reason.find("empty column") != std::string::npos);
+    CHECK(diag.status == Status::Unbounded);
+    CHECK(basis.basic.empty());
+}
+
 }  // namespace
 
 int main() {
     test_fixture_lp();
-    test_auto_primal_first_skips_discarded_dual_probe();
-    test_auto_dense_extreme_width_keeps_dual_route();
+    test_auto_commits_to_one_engine_without_a_discarded_probe();
+    test_route_features_describe_the_model();
     test_dual_periodic_resync_is_not_tied_to_verbose();
     test_pruned_basic_pivotal_entries_match_full_path();
     test_pruned_fixed_pivotal_entries_match_retained_path();
@@ -1858,5 +1948,6 @@ int main() {
     test_primal_crash_rejects_a_net_harmful_pivot();
     test_primal_crash_rejects_columns_that_destroy_triangularity();
     test_primal_crash_rejects_an_unstable_or_out_of_bounds_pivot();
+    test_simplex_consumes_terminal_presolve_outcome();
     return sor::test::finish("test_simplex");
 }

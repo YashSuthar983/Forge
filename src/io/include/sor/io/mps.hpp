@@ -20,6 +20,19 @@ struct MpsReadOptions {
     bool fixed_format = false;
     // Fail instead of warning when an unrecognised section appears.
     bool strict = false;
+
+    // Drop matrix coefficients with |a| <= small_matrix_value, and report how
+    // many were dropped. A benchmark that compares two solvers must give both
+    // the same matrix: the external oracle discards coefficients at or below
+    // its own 1e-9 threshold, so a SOR that keeps them is not solving the same
+    // model. Set to 0.0 to keep every coefficient the file contains.
+    core::f64 small_matrix_value = 0.0;
+
+    // Read the model as a continuous LP: keep the columns and bounds but
+    // discard integrality. This is how a MIPLIB root LP relaxation is formed,
+    // and it must happen at READ time from the ORIGINAL file -- never from a
+    // model some other solver rewrote.
+    bool relax_integrality = false;
 };
 
 struct MpsReadReport {
@@ -28,6 +41,13 @@ struct MpsReadReport {
     bool had_ranges = false;
     bool had_objsense_max = false;
     bool used_fixed_format = false;   // set by read_mps_auto on fallback
+    bool used_gzip = false;           // input was a gzip stream
+    bool relaxed_integrality = false; // integrality was present and discarded
+    // Coefficients dropped by MpsReadOptions::small_matrix_value, and the
+    // largest magnitude among them, so a manifest can record exactly what the
+    // threshold removed rather than just that it was enabled.
+    std::size_t small_values_dropped = 0;
+    core::f64 largest_small_value_dropped = 0.0;
     std::vector<std::string> warnings;
 };
 
@@ -42,5 +62,7 @@ model::LpProblem read_mps_file(const std::string& path, MpsReadReport&,
 // Reports which one succeeded via MpsReadReport::used_fixed_format.
 model::LpProblem read_mps_file_auto(const std::string& path, MpsReadReport&,
                                     bool strict = false);
+model::LpProblem read_mps_file_auto(const std::string& path, MpsReadReport&,
+                                    const MpsReadOptions&);
 
 }  // namespace sor::io

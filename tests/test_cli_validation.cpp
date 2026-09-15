@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -129,7 +130,8 @@ void test_strictly_positive_flags_reject_zero_and_negatives() {
 // The nonnegative reals accept 0 (it means "off") but nothing below it.
 void test_nonnegative_real_flags() {
     for (const char* option : {"--refactor-eta-ratio", "--refactor-work-ratio",
-                               "--dual-cost-perturbation"}) {
+                               "--dual-cost-perturbation",
+                               "--small-matrix-value"}) {
         reject(option, "nan");
         reject(option, "inf");
         reject(option, "abc");
@@ -183,7 +185,9 @@ void test_missing_values_at_end_of_argv() {
                                "--refactor-work-ratio", "--dual-resync-interval",
                                "--dual-cost-perturbation", "--engine", "--method",
                                "--pricing", "--basis-update", "--backend",
-                               "--solution-out", "--q-diag"}) {
+                               "--solution-out", "--diagnostics-json",
+                               "--small-matrix-value", "--q-diag",
+                               "--auto-budget-split"}) {
         const Run r = run({solve_exe, model, option});
         ::sor::test::report(r.exit_code != 0, "missing value exits nonzero",
                             __FILE__, __LINE__,
@@ -278,6 +282,89 @@ void test_missing_model_file_is_reported() {
     CHECK(contains(r.output, "no/such/model.mps"));
 }
 
+void test_lp_dispatch_and_diagnostic_flags() {
+    for (const char* engine : {"auto", "primal", "dual"}) {
+        const Run r = run({solve_exe, model, "--engine", engine,
+                           "--no-presolve", "--time-limit", "20"});
+        ::sor::test::report(r.exit_code == 0, "LP engine name is accepted",
+                            __FILE__, __LINE__,
+                            std::string(engine) + " -> " + r.output);
+    }
+
+    for (const char* flag : {"--relax-integrality", "--fo-polish",
+                             "--no-fo-polish", "--fo-certificates",
+                             "--no-fo-certificates", "--fo-crossover",
+                             "--no-fo-crossover"}) {
+        const Run r = run({solve_exe, model, flag, "--no-presolve",
+                           "--time-limit", "20"});
+        ::sor::test::report(r.exit_code == 0, "LP boolean flag is accepted",
+                            __FILE__, __LINE__,
+                            std::string(flag) + " -> " + r.output);
+    }
+
+    for (const char* engine : {"simplex", "auto"}) {
+        const fs::path json = fs::temp_directory_path() /
+            (std::string("sor_cli_") + engine + "_diagnostics.json");
+        const Run r = run({solve_exe, model, "--engine", engine,
+                           "--no-presolve", "--time-limit", "20",
+                           "--diagnostics-json", json.string()});
+        std::ifstream in(json);
+        const bool opened = in.is_open();
+        const std::string payload((std::istreambuf_iterator<char>(in)),
+                                  std::istreambuf_iterator<char>());
+        ::sor::test::report(r.exit_code == 0 && opened,
+                            "diagnostics JSON is written", __FILE__, __LINE__,
+                            std::string(engine) + " -> " + r.output);
+        CHECK(contains(payload, "\"requested_strategy\""));
+        CHECK(contains(payload, "\"rule_table_version\""));
+        CHECK(contains(payload, "\"training_manifest_hash\""));
+        CHECK(contains(payload, "\"holdout_manifest_hash\""));
+        CHECK(contains(payload, "\"fo_target_tolerance\""));
+        CHECK(contains(payload, "\"recovery_target_tolerance\""));
+        CHECK(contains(payload, "\"global_iteration_limit\""));
+        CHECK(contains(payload, "\"global_time_limit_s\""));
+        CHECK(contains(payload, "\"global_time_limit_s\": 20"));
+        CHECK(contains(payload, "\"fo_elapsed_s\""));
+        CHECK(contains(payload, "\"crossover_elapsed_s\""));
+        CHECK(contains(payload, "\"simplex_elapsed_s\""));
+        CHECK(contains(payload, "\"termination_reason\""));
+        std::error_code ec;
+        fs::remove(json, ec);
+    }
+}
+
+void test_unavailable_backends_are_not_silently_replaced() {
+    const Run hpr = run({solve_exe, model, "--engine", "hpr",
+                         "--backend", "julia_gpu"});
+    CHECK(hpr.exit_code != 0);
+    CHECK(contains(hpr.output, "Unsupported"));
+    CHECK(contains(hpr.output, "unavailable for HPR"));
+    CHECK(!contains(hpr.output, "using cpu"));
+
+    const Run pdhg = run({solve_exe, model, "--engine", "pdhg",
+                          "--backend", "vulkan"});
+    CHECK(pdhg.exit_code != 0);
+    CHECK(contains(pdhg.output, "Unsupported"));
+    CHECK(contains(pdhg.output, "unavailable for PDHG"));
+    CHECK(!contains(pdhg.output, "using cpu"));
+}
+
+void test_auto_budget_split_is_a_closed_protocol_set() {
+    for (const char* split : {"60/25/15", "70/20/10", "80/15/5"}) {
+        const Run accepted = run({solve_exe, model, "--engine", "auto",
+                                  "--auto-budget-split", split,
+                                  "--time-limit", "20"});
+        ::sor::test::report(accepted.exit_code == 0,
+                            "approved Auto split is accepted", __FILE__,
+                            __LINE__, split);
+    }
+    const Run rejected = run({solve_exe, model, "--engine", "auto",
+                              "--auto-budget-split", "65/20/15"});
+    CHECK(rejected.exit_code != 0);
+    CHECK(contains(rejected.output, "--auto-budget-split"));
+    CHECK(contains(rejected.output, "65/20/15"));
+}
+
 // sor_check has its own --tol with the same defect.
 void test_sor_check_tolerance_validation() {
     for (const char* value : {"nan", "inf", "abc", "-1", "0", "1e-7xyz"}) {
@@ -346,6 +433,9 @@ int main() {
     test_unknown_option_and_no_arguments();
     test_simplex_cli_crash_default_and_opt_out();
     test_missing_model_file_is_reported();
+    test_lp_dispatch_and_diagnostic_flags();
+    test_unavailable_backends_are_not_silently_replaced();
+    test_auto_budget_split_is_a_closed_protocol_set();
     test_sor_check_tolerance_validation();
 
     std::error_code ec;

@@ -1,0 +1,16 @@
+{
+  "schema": "sor-lp-auto-training-holdout-placeholder-v1",
+  "status": "unavailable-pending-frozen-training-manifest",
+  "note": "Populate via tools/lp_auto_train.py freeze/train/evaluate-holdout after a clean benchmark sweep. Do not invent hashes; replace this file with a versioned manifest once training outcomes exist.",
+  "required_artifacts": [
+    "feature rows JSONL (pre-solve structural features per model id)",
+    "training outcomes JSONL (simplex + per-split auto timings, correctness flags)",
+    "holdout outcomes JSONL (frozen holdout ids only, never mixed into training)",
+    "emitted training artifact JSON (tree, budget split, unpromoted marker)"
+  ],
+  "allowed_budget_splits": ["60/25/15", "70/20/10", "80/15/5"],
+  "holdout_fraction": 0.20,
+  "training_manifest_hash": null,
+  "holdout_manifest_hash": null,
+  "feature_manifest_hash": null
+}

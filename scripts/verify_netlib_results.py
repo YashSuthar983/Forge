@@ -413,9 +413,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--suite-dir", type=Path,
                     default=ROOT / "benchmarks" / "netlib" / "mps",
                     help="directory whose .mps files define the expected suite")
-    ap.add_argument("--obj-rel-tol", type=float, default=1e-6)
-    ap.add_argument("--obj-abs-tol", type=float, default=1e-6)
-    ap.add_argument("--violation-tol", type=float, default=1e-6)
+    ap.add_argument("--obj-rel-tol", type=float, default=1e-7,
+                    help="claim-facing objective agreement: max(abs_tol, rel_tol*(1+|reference|)). 1e-7 is the public gate; use the named 1e-6 continuity command for the historical lane.")
+    ap.add_argument("--obj-abs-tol", type=float, default=1e-7)
+    ap.add_argument("--violation-tol", type=float, default=1e-7)
     ap.add_argument("--no-coverage", action="store_true",
                     help="skip the missing/duplicate/unexpected instance checks")
     ap.add_argument("--live-highs", action="store_true",

@@ -67,9 +67,12 @@ struct SimplexOptions {
     SimplexPricing pricing = SimplexPricing::Choose;
 
     // Deterministic dual cost perturbation multiplier. Zero is the measured
-    // production default until the full-suite gate is cleared; 1.0 matches the
-    // scale used by the current HiGHS dual simplex. Perturbations are working
-    // costs only and are always removed before an optimality conclusion.
+    // production default. When non-zero, perturbations are working costs only
+    // and are always removed before an optimality conclusion. A phase-1-only
+    // variant is intentionally NOT the default: measured Netlib gains from
+    // perturbation are concentrated in phase 2 (e.g. nesm), so gating to
+    // phase 1 would be a no-op on the models that benefit; see
+    // docs/AGENT1_HANDOFF_20260910.md §18.
     f64 dual_cost_perturbation_multiplier = 0.0;
 
     // Refactor after this many basis updates. Product-form etas are as dense
@@ -163,8 +166,10 @@ struct SimplexOptions {
 
     // Opt-in primal cold-start crash. It replaces selected row logicals with
     // structural columns only when the resulting triangular-by-construction
-    // basis strictly reduces the starting primal infeasibility. Kept off
-    // until its full Netlib A/B gate is complete.
+    // basis strictly reduces the starting primal infeasibility AND the first
+    // factorization accepts the basis without singular repair. Kept off as
+    // the library default until its full Netlib A/B gate is complete; the LP
+    // CLI may enable it independently.
     bool primal_crash = false;
 
 
@@ -184,6 +189,54 @@ struct SimplexOptions {
     // it clears the 93-model gate; see docs/SCALING_20260908.md.
     bool ruiz_power_of_two = false;
     bool verbose = false;
+};
+
+// Pre-solve structural summary of the model the engine is about to solve.
+//
+// This is the ONLY input a route may key on: it is O(nnz), deterministic, and
+// costs no pivots, unlike a solver probe. It is computed on the presolved
+// minimization model -- the same one the engines see -- and reported whether or
+// not anything routed on it, so an offline routing table can be refitted from
+// benchmark JSONL without re-deriving these numbers.
+//
+// It replaces the hand-written primal/dual classifier that used to sit here.
+// That classifier sent 19 of the 93 Netlib models to the primal engine and was
+// measurably wrong on 15 of them (2026-09-10, 1e-7): removing it moved the
+// suite from G2 0.938 to 0.836 against HiGHS and the win rate from 53.8% to
+// 60.2%. Only PILOT87 genuinely preferred primal, and one model is not a rule.
+struct RouteFeatures {
+    Index rows = 0;
+    Index cols = 0;
+    core::Offset nnz = 0;
+
+    double density   = 0.0;   // nnz / (rows*cols)
+    double aspect    = 0.0;   // cols / rows
+    double row_degree = 0.0;  // nnz / rows
+    double col_degree = 0.0;  // nnz / cols
+
+    // Bound classes, as fractions of the column count.
+    double free_fraction  = 0.0;   // both bounds infinite
+    double boxed_fraction = 0.0;   // both bounds finite
+    double fixed_fraction = 0.0;   // lo == hi
+
+    // Row senses, as fractions of the row count.
+    double equality_fraction  = 0.0;
+    double ranged_fraction    = 0.0;
+    double free_row_fraction  = 0.0;
+
+    double objective_fraction = 0.0;   // nonzero objective entries / cols
+    double singleton_fraction = 0.0;   // columns of degree <= 2 / cols
+    std::uint64_t free_cols           = 0;
+    std::uint64_t objective_free_cols = 0;
+
+    // log10(max|a| / min|a|) over the nonzeros; 0 when the matrix is empty or
+    // uniform. A wide spread is the scaling-difficulty signal.
+    double coefficient_spread = 0.0;
+
+    // True when the dual engine's cold parking point (each column at its
+    // cost-favourable finite bound) already satisfies every row, so the primal
+    // engine would start directly in phase 2.
+    bool logical_point_feasible = false;
 };
 
 struct SimplexDiagnostics {
@@ -223,6 +276,14 @@ struct SimplexDiagnostics {
     std::uint64_t phase1_composite_fallbacks = 0;
     std::uint64_t phase1_composite_support_entries = 0;
     f64 phase1_composite_max_abs_error = 0.0;
+    // Exact indexed reduced-cost heap shared by primal phases 1 and 2.
+    // columns_scored counts rebuild and explicit exhaustive-reference work;
+    // updates counts sparse post-pivot key refreshes.
+    std::uint64_t primal_price_heap_rebuilds = 0;
+    std::uint64_t primal_price_heap_updates = 0;
+    std::uint64_t primal_price_full_scans = 0;
+    std::uint64_t primal_price_columns_scored = 0;
+    std::uint64_t primal_price_heap_max_size = 0;
     std::uint64_t primal_ftran_dense_switches = 0;
     std::uint64_t primal_crash_columns = 0;
     f64 primal_crash_infeasibility_before = 0.0;
@@ -360,7 +421,33 @@ struct SimplexDiagnostics {
     // feasibility tolerances. This is shared by every Auto stage.
     double preprocessing_ms = 0.0;
     double factor_ms  = 0.0;
+    // Total pricing time. It is the SUM of the two counters below, which
+    // measure entirely different scans and were indistinguishable until
+    // 2026-09-10: on pilot87 "pricing" read 3.0 s of 11.9 s, which invited the
+    // conclusion that the O(m) leaving-row scan was a quarter of the solve.
+    // It is not -- almost all of that is the pivotal-row candidate sweep, and
+    // sizing an optimization against the merged number would have rebuilt the
+    // wrong loop.
     double price_ms   = 0.0;
+    // The dual's CHUZR: one O(m) pass over the basis slots per pivot, scoring
+    // primal infeasibility against the row weights.
+    double chuzr_ms   = 0.0;
+    std::uint64_t chuzr_calls        = 0;
+    // Exact indexed-heap maintenance. rows_scanned counts score evaluations,
+    // not implicit heap comparisons; full_scans is nonzero only for explicit
+    // exhaustive verification/ablation.  A production run should normally
+    // rebuild after factor/phase resynchronization and otherwise update only
+    // rows touched by the FTRAN direction.
+    std::uint64_t chuzr_rows_scanned = 0;
+    std::uint64_t chuzr_heap_rebuilds = 0;
+    std::uint64_t chuzr_heap_updates = 0;
+    std::uint64_t chuzr_full_scans = 0;
+    std::uint64_t chuzr_heap_max_size = 0;
+    // Building the entering-column candidate list from the pivotal row. Its
+    // cost is |support(pivotal row)| per pivot, not m.
+    double prow_price_ms = 0.0;
+    std::uint64_t prow_price_calls   = 0;
+    std::uint64_t prow_entries_scanned = 0;
     double solve_ms   = 0.0;
     double ftran_ms   = 0.0;
     double btran_ms   = 0.0;
@@ -387,19 +474,21 @@ struct SimplexDiagnostics {
     // One for solve_simplex()/direct primal/dual calls. Auto used to report
     // up to four because every stage rebuilt scaling and CSC independently.
     std::uint64_t preprocessing_builds = 0;
+
+    // Structural summary of the presolved model, for the LP Auto layer above
+    // this one. Populated on every Auto solve; left at its defaults when the
+    // caller asked for an explicit engine, since nothing routed.
+    RouteFeatures route_features{};
+    bool route_features_valid = false;
 };
 
 namespace detail {
 
-// Shape-only part of Auto dispatch, exposed so benchmark-derived routing
-// regressions can be covered without constructing a giant synthetic LP.
-bool prefer_primal_first(Index rows, Index cols, core::Offset nnz);
-
-// Content-aware complement to the shape rule. It inspects the actual logical
-// starting point and bound classes; unlike a solver probe it is deterministic,
-// O(nnz), and discards no pivots.
-bool prefer_primal_from_model(const model::LpProblem& problem,
-                              f64 primal_feas_tol);
+// One O(nnz) pass over the model, producing the routing summary above. Exposed
+// so a routing table can be fitted and regression-tested without running a
+// solve, and so the LP Auto layer can read the same numbers Auto used.
+RouteFeatures route_features(const model::LpProblem& problem,
+                             f64 primal_feas_tol);
 
 // Model-independent ordering for results produced by Auto's solver stages.
 // A duality gap is an optimality measure only for a primal/dual-feasible pair;

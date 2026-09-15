@@ -1,5 +1,7 @@
 #include "sor/io/mps.hpp"
 
+#include "sor/io/gzip.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -232,6 +234,13 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
                     if (b.row_kind[static_cast<std::size_t>(slot)] == RowKind::Objective) {
                         if (slot == b.obj_slot) b.obj[static_cast<std::size_t>(j)] += v;
                         // else: an extra free N row -- discarded.
+                    } else if (opt.small_matrix_value > 0.0 &&
+                               std::fabs(v) <= opt.small_matrix_value) {
+                        // Below the agreed threshold. The column still exists;
+                        // only this coefficient is dropped.
+                        ++rep.small_values_dropped;
+                        rep.largest_small_value_dropped =
+                            std::max(rep.largest_small_value_dropped, std::fabs(v));
                     } else {
                         b.tri_r.push_back(b.constraint_index[static_cast<std::size_t>(slot)]);
                         b.tri_c.push_back(j);
@@ -388,27 +397,51 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
         }
     }
 
+    // Integrality is discarded AFTER the model is fully assembled, so the
+    // relaxation differs from the original in exactly one respect and the
+    // report can state whether the file actually carried any.
+    const std::size_t integer_columns = p.n_integer();
+    if (opt.relax_integrality && integer_columns > 0) {
+        p.is_integer.assign(p.is_integer.size(), false);
+        rep.relaxed_integrality = true;
+    }
+
     p.validate();
+
+    if (rep.small_values_dropped > 0)
+        rep.warnings.push_back(
+            "dropped " + std::to_string(rep.small_values_dropped) +
+            " matrix coefficient(s) at or below " +
+            std::to_string(opt.small_matrix_value) + " (largest " +
+            std::to_string(rep.largest_small_value_dropped) + ")");
 
     rep.n_rows = static_cast<std::size_t>(n_rows);
     rep.n_cols = static_cast<std::size_t>(n_cols);
     rep.nnz = p.nnz();
-    rep.n_integer = p.n_integer();
+    // The count the FILE carried, so a relaxation still reports what it relaxed.
+    rep.n_integer = integer_columns;
     rep.had_objsense_max = maximize;
     return p;
 }
 
 model::LpProblem read_mps_file(const std::string& path, MpsReadReport& rep,
                                const MpsReadOptions& opt) {
+    // Gzip is detected from the CONTENT, not the extension: MIPLIB ships
+    // `.mps.gz`, but a corpus unpacked in place keeps that name, and a file
+    // named `.mps` is sometimes compressed.
+    if (file_has_gzip_magic(path)) {
+        std::istringstream in(read_maybe_gzip_file(path));
+        rep.used_gzip = true;
+        return read_mps(in, rep, opt);
+    }
     std::ifstream in(path);
     if (!in) throw std::runtime_error("cannot open MPS file: " + path);
     return read_mps(in, rep, opt);
 }
 
 model::LpProblem read_mps_file_auto(const std::string& path, MpsReadReport& rep,
-                                   bool strict) {
-    MpsReadOptions free_opt;
-    free_opt.strict = strict;
+                                    const MpsReadOptions& opt) {
+    MpsReadOptions free_opt = opt;
     free_opt.fixed_format = false;
     try {
         auto p = read_mps_file(path, rep, free_opt);
@@ -416,8 +449,7 @@ model::LpProblem read_mps_file_auto(const std::string& path, MpsReadReport& rep,
         return p;
     } catch (const std::exception& first_err) {
         MpsReadReport rep2;
-        MpsReadOptions fixed_opt;
-        fixed_opt.strict = strict;
+        MpsReadOptions fixed_opt = opt;
         fixed_opt.fixed_format = true;
         try {
             auto p = read_mps_file(path, rep2, fixed_opt);
@@ -435,6 +467,13 @@ model::LpProblem read_mps_file_auto(const std::string& path, MpsReadReport& rep,
                 first_err.what() + " | fixed: " + second_err.what());
         }
     }
+}
+
+model::LpProblem read_mps_file_auto(const std::string& path, MpsReadReport& rep,
+                                    bool strict) {
+    MpsReadOptions opt;
+    opt.strict = strict;
+    return read_mps_file_auto(path, rep, opt);
 }
 
 }  // namespace sor::io

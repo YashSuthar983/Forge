@@ -98,6 +98,8 @@ void write_solution(std::ostream& out, const core::SolveResult& r) {
     write_vec(out, "x", r.x);
     write_vec(out, "y", r.y);
     write_vec(out, "ray", r.ray);
+    write_vec(out, "primal_ray", r.primal_ray.direction);
+    write_vec(out, "dual_farkas_ray", r.dual_farkas_ray.multipliers);
 }
 
 SolutionFile read_solution(std::istream& in) {
@@ -118,6 +120,14 @@ SolutionFile read_solution(std::istream& in) {
     s.x = read_vec(in, "x");
     s.y = read_vec(in, "y");
     s.ray = read_vec(in, "ray");
+    // The final two fields were added in claim protocol v2.  Accepting an old
+    // file remains useful for local diagnostics, but such a file cannot carry
+    // an unboundedness certificate and claim_run never emits the old form.
+    in >> std::ws;
+    if (in.peek() != std::char_traits<char>::eof()) {
+        s.primal_ray = read_vec(in, "primal_ray");
+        s.dual_farkas_ray = read_vec(in, "dual_farkas_ray");
+    }
     return s;
 }
 
