@@ -19,6 +19,7 @@
 // Neither alone is sufficient: (1) passes on a consistent representation of the
 // wrong matrix, (2) passes while a mirror silently rots until the update that
 // finally reads the rotten part.
+#include <cstdlib>
 #include "sor/la/lu.hpp"
 
 #include "test_helpers.hpp"
@@ -189,12 +190,19 @@ void check_solves(const ColMat& b, const BasisFactor& f, const std::string& what
 // Returns false when update_ft declined (the caller then refactorizes, exactly
 // as the engine does).
 bool do_update(BasisFactor& f, ColMat& b, Index p,
-               const std::vector<Index>& rows, const std::vector<f64>& vals) {
+               const std::vector<Index>& rows, const std::vector<f64>& vals,
+               sor::la::SpikeCapture* spike_out = nullptr,
+               bool use_spike = true) {
     std::vector<f64> alpha(static_cast<std::size_t>(b.m), 0.0);
     for (std::size_t t = 0; t < rows.size(); ++t)
         alpha[static_cast<std::size_t>(rows[t])] += vals[t];
-    f.ftran(alpha);                       // alpha := B^-1 a_new, slot-indexed
-    if (!f.update_ft(p, alpha, LuOptions{})) return false;
+    // Capture the exact spike on the way through, exactly as the engine does.
+    sor::la::SpikeCapture local;
+    sor::la::SpikeCapture& spike = spike_out ? *spike_out : local;
+    f.ftran(alpha, &spike);               // alpha := B^-1 a_new, slot-indexed
+    if (!f.update_ft(p, alpha, LuOptions{}, 1e-11, nullptr,
+                     use_spike ? &spike : nullptr))
+        return false;
     b.set_col(p, rows, vals);
     return true;
 }
@@ -419,6 +427,107 @@ void test_storage_growth_and_compaction() {
 // A refused update must leave the factorization EXACTLY as it was -- the caller
 // refactorizes on false, and a partially applied update would silently corrupt
 // the basis it is about to keep using.
+// The spike fix, judged against the thing it replaced.
+//
+// update_ft() used to build the spike as U * alpha from the finished FTRAN
+// result. In exact arithmetic that IS the spike; in floating point it does not
+// cancel to zero, so it produced residue with alpha's density, and every entry
+// of that residue became fill in U (~85% of installed entries on real models).
+// FTRAN now hands over the exact vector it already forms between the row etas
+// and the U solve.
+//
+// Both claims are checked against the old path on the SAME update sequence,
+// because an absolute residual bound would not be a true statement about
+// either: FT accuracy decays with the number of updates since the last
+// factorization and recovers when one happens, which is why solvers refactor.
+void test_spike_capture_beats_recomputed_u_alpha() {
+    for (const Index m : {24, 61}) {
+        std::mt19937 rng(20260909u + static_cast<unsigned>(m));
+        ColMat b = random_basis(m, 0.08, rng);
+
+        // LOCKSTEP. Two factorizations of the SAME basis, one fed the captured
+        // spike and one left to recompute U * alpha, advanced together and only
+        // when both accept the update. Run independently they diverge the
+        // moment one declines a column the other takes -- b would then differ
+        // between them and the residuals would not be comparable at all.
+        BasisFactor f_spike, f_recomputed;
+        CHECK(factorize(f_spike, b));
+        CHECK(factorize(f_recomputed, b));
+
+        f64 worst_spike = 0.0, worst_recomputed = 0.0;
+        long long growth_violations = 0;
+        int applied = 0;
+        std::vector<Index> rows, vals_rows;
+        std::vector<f64> vals;
+
+        for (int step = 0; step < 500; ++step) {
+            // Deterministic stride, as in test_long_update_chain: random
+            // replacement positions walk the basis itself into singularity
+            // after a few hundred columns, which tests the generator rather
+            // than the update.
+            const Index p = static_cast<Index>((step * 17) % m);
+            gen_column(m, step, rng, rows, vals);
+
+            std::vector<f64> alpha_s(static_cast<std::size_t>(m), 0.0);
+            for (std::size_t t = 0; t < rows.size(); ++t)
+                alpha_s[static_cast<std::size_t>(rows[t])] += vals[t];
+            std::vector<f64> alpha_r = alpha_s;
+
+            sor::la::SpikeCapture spike;
+            f_spike.ftran(alpha_s, &spike);
+            f_recomputed.ftran(alpha_r);
+
+            const sor::core::Offset u_before = f_spike.u_nnz();
+            BasisFactor try_s = f_spike, try_r = f_recomputed;
+            const bool ok_s =
+                try_s.update_ft(p, alpha_s, LuOptions{}, 1e-11, nullptr, &spike);
+            const bool ok_r =
+                try_r.update_ft(p, alpha_r, LuOptions{}, 1e-11, nullptr, nullptr);
+            if (!ok_s || !ok_r) continue;   // keep both bases identical
+
+            f_spike = std::move(try_s);
+            f_recomputed = std::move(try_r);
+            b.set_col(p, rows, vals);
+            ++applied;
+
+            // The growth bound is the fix's exact claim: an update installs the
+            // spike's nonzeros into one column of U and drops the old one, so U
+            // cannot grow by more than the spike itself (+1 for the diagonal).
+            CHECK(spike.valid);
+            const auto growth = static_cast<long long>(f_spike.u_nnz()) -
+                                static_cast<long long>(u_before);
+            if (growth > static_cast<long long>(spike.pos.size()) + 1)
+                ++growth_violations;
+
+            for (const Index i : {Index(0), Index(m / 2), Index(m - 1)}) {
+                std::vector<f64> e(static_cast<std::size_t>(m), 0.0);
+                e[static_cast<std::size_t>(i)] = 1.0;
+                std::vector<f64> xs = e, xr = e;
+                f_spike.ftran(xs);
+                f_recomputed.ftran(xr);
+                worst_spike = std::max(worst_spike, max_abs_diff(b.apply(xs), e));
+                worst_recomputed =
+                    std::max(worst_recomputed, max_abs_diff(b.apply(xr), e));
+            }
+        }
+
+        CHECK(applied > 300);            // the loop must exercise the path
+        CHECK(growth_violations == 0);
+        ::sor::test::report(f_spike.u_nnz() <= f_recomputed.u_nnz(),
+                            "spike keeps U no denser", __FILE__, __LINE__,
+                            "m=" + std::to_string(m) + " spike " +
+                                std::to_string(f_spike.u_nnz()) +
+                                " vs recomputed " +
+                                std::to_string(f_recomputed.u_nnz()));
+        ::sor::test::report(worst_spike <= worst_recomputed,
+                            "spike no less accurate than U*alpha",
+                            __FILE__, __LINE__,
+                            "m=" + std::to_string(m) + " spike " +
+                                std::to_string(worst_spike) + " vs recomputed " +
+                                std::to_string(worst_recomputed));
+    }
+}
+
 void test_refusal_leaves_factorization_untouched() {
     std::mt19937 rng(77u);
     const Index m = 30;
@@ -777,6 +886,7 @@ int main() {
     test_sparse_and_dense_paths_agree_after_updates();
     test_support_variant_matches_plain_ftran();
     test_storage_growth_and_compaction();
+    test_spike_capture_beats_recomputed_u_alpha();
     test_refusal_leaves_factorization_untouched();
     test_replacing_a_column_with_itself();
     test_identity_basis_updates();

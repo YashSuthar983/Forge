@@ -907,16 +907,50 @@ bool BasisFactor::sparse_lower_t(const std::vector<Index>& seed,
 // FTRAN / BTRAN
 // ---------------------------------------------------------------------------
 
-void BasisFactor::ftran(std::vector<f64>& b) const {
-    ftran_impl(b, nullptr, nullptr);
+void BasisFactor::ftran(std::vector<f64>& b, SpikeCapture* spike) const {
+    ftran_impl(b, nullptr, nullptr, spike);
+}
+
+// work_ between the row etas and the U solve IS R_k...R_1 L^-1 a_q, in
+// position coordinates. Record its nonzeros. `have_seed` says seed_ is a valid
+// over-approximation of the support; it is a union and may repeat a position,
+// hence the stamp.
+void BasisFactor::capture_spike(SpikeCapture& out, bool have_seed) const {
+    out.pos.clear();
+    out.val.clear();
+    const auto n = piv_val_.size();
+    if (have_seed) {
+        if (spike_stamp_.size() != n) spike_stamp_.assign(n, 0);
+        if (++spike_gen_ == 0) {
+            std::fill(spike_stamp_.begin(), spike_stamp_.end(), 0);
+            spike_gen_ = 1;
+        }
+        for (const Index k : seed_) {
+            const auto u = sz(k);
+            if (u >= n || spike_stamp_[u] == spike_gen_) continue;
+            spike_stamp_[u] = spike_gen_;
+            if (work_[u] == 0.0) continue;
+            out.pos.push_back(k);
+            out.val.push_back(work_[u]);
+        }
+    } else {
+        for (std::size_t k = 0; k < n; ++k) {
+            if (work_[k] == 0.0) continue;
+            out.pos.push_back(static_cast<Index>(k));
+            out.val.push_back(work_[k]);
+        }
+    }
+    out.valid = true;
 }
 
 void BasisFactor::ftran_pair(std::vector<f64>& a,
-                             std::vector<f64>& b) const {
+                             std::vector<f64>& b,
+                             SpikeCapture* spike_a) const {
     if (&a == &b) {
-        ftran(a);
+        ftran(a, spike_a);
         return;
     }
+    if (spike_a) spike_a->clear();
     if (m_ == 0) return;
     const auto n = piv_val_.size();
     if (a.size() != n || b.size() != n) return;
@@ -950,6 +984,10 @@ void BasisFactor::ftran_pair(std::vector<f64>& a,
         work_[p] -= sa;
         pair_work_[p] -= sb;
     }
+
+    // Same point as the scalar path: L and the row etas applied, U not yet.
+    // This traversal is dense throughout, so there is no seed to read.
+    if (spike_a) capture_spike(*spike_a, /*have_seed=*/false);
 
     solve_upper_pair(work_, pair_work_);
     for (std::size_t k = 0; k < n; ++k) {
@@ -989,14 +1027,16 @@ bool BasisFactor::ftran_with_support(std::vector<f64>& b,
 
 bool BasisFactor::ftran_seeded_with_support(
     std::vector<f64>& b, const std::vector<Index>& seed_rows,
-    std::vector<Index>& support) const {
-    return ftran_impl(b, &support, &seed_rows);
+    std::vector<Index>& support, SpikeCapture* spike) const {
+    return ftran_impl(b, &support, &seed_rows, spike);
 }
 
 bool BasisFactor::ftran_impl(std::vector<f64>& b,
                              std::vector<Index>* support,
-                             const std::vector<Index>* seed_rows) const {
+                             const std::vector<Index>* seed_rows,
+                             SpikeCapture* spike) const {
     if (support) support->clear();
+    if (spike) spike->clear();
     if (m_ == 0) return true;
     const auto n = piv_val_.size();
     bool seed_is_sparse = n >= 64;
@@ -1118,6 +1158,10 @@ bool BasisFactor::ftran_impl(std::vector<f64>& b,
                          row_eta_touched_.end());
         work_since_factor_ += static_cast<Offset>(r_start_.back());
     }
+
+    // The spike is exactly this state: L and the row etas applied, U not yet.
+    // Taken before collect_seed(), which reuses seed_.
+    if (spike) capture_spike(*spike, lower_sparse);
 
     // U-solve (sparse or dense) + scatter.
     sp = false;
@@ -2063,7 +2107,8 @@ bool BasisFactor::eliminate_bump_sparse(
 // first mutation.
 bool BasisFactor::update_ft(Index p, const std::vector<f64>& alpha,
                             const LuOptions& opts, f64 min_pivot,
-                            const std::vector<Index>* alpha_support) {
+                            const std::vector<Index>* alpha_support,
+                            const SpikeCapture* spike) {
     (void)opts;
     if (m_ == 0 || sz(p) >= sz(m_) || alpha.size() < sz(m_)) return false;
     const auto n = piv_val_.size();
@@ -2118,7 +2163,22 @@ bool BasisFactor::update_ft(Index p, const std::vector<f64>& alpha,
             ft_atilde_[sz(u_crow_[t])] += u_cval_[t] * xk;
         }
     };
-    if (alpha_support != nullptr) {
+    if (spike != nullptr && spike->valid) {
+        // The FTRAN that produced `alpha` already formed this exact vector on
+        // its way through, between the row etas and the U solve. Use it. The
+        // U * alpha recomputation below is the same thing in exact arithmetic
+        // and NOT the same thing in floating point: it does not cancel to zero,
+        // so it manufactures residue with alpha's density and every residue
+        // entry becomes fill in U (~85% of installed entries, measured).
+        for (std::size_t t = 0; t < spike->pos.size(); ++t) {
+            const Index k = spike->pos[t];
+            if (k < 0 || sz(k) >= n) continue;
+            const f64 v = spike->val[t];
+            if (v == 0.0) continue;
+            touch(k);
+            ft_atilde_[sz(k)] = v;
+        }
+    } else if (alpha_support != nullptr) {
         for (const Index slot : *alpha_support) {
             if (slot < 0 || sz(slot) >= n) continue;
             const f64 xk = alpha[sz(slot)];
@@ -2217,18 +2277,18 @@ bool BasisFactor::update_ft(Index p, const std::vector<f64>& alpha,
         // the full FTRAN result alpha, and in floating point U * alpha does not
         // cancel to exact zeros, so a residue entry survives the `!= 0.0` test
         // and becomes fill. `tiny` counts entries below 1e-13 of the largest.
-        Offset spike = 0, tiny = 0;
+        Offset spike_nnz = 0, tiny = 0;
         f64 max_atilde = 0.0;
         for (const Index k : ft_support_)
             max_atilde = std::max(max_atilde, std::fabs(ft_atilde_[sz(k)]));
         const f64 cut = 1e-13 * max_atilde;
         for (const Index k : ft_support_) {
             const f64 v = std::fabs(ft_atilde_[sz(k)]);
-            if (v != 0.0) ++spike;
+            if (v != 0.0) ++spike_nnz;
             if (v != 0.0 && v < cut) ++tiny;
         }
         std::fprintf(fp, "F %zu %lld %lld %lld %lld %lld %.6e %lld\n", t2,
-                     static_cast<long long>(spike),
+                     static_cast<long long>(spike_nnz),
                      static_cast<long long>(shift),
                      static_cast<long long>(row_eta),
                      static_cast<long long>(u_live_nnz_),

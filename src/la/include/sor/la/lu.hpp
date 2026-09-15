@@ -94,6 +94,27 @@ struct LuStats {
     f64    largest_multiplier = 0.0;
 };
 
+// The exact Forrest-Tomlin spike, R_k...R_1 L^-1 a_q, in POSITION coordinates.
+//
+// update_ft() needs this vector to install the entering column into U. It used
+// to recompute it as U * alpha from the finished FTRAN result, which is
+// mathematically the same thing and numerically is not: in floating point
+// U * alpha does not cancel to exact zeros, so the result carries rounding
+// residue with the density of alpha rather than the sparsity of the spike, and
+// every residue entry survives the `!= 0.0` test and becomes fill in U.
+// Measured on this tree, ~85% of the entries installed that way were below
+// 1e-13 of the largest (greenbea 86.3%, pilot87 82.5%).
+//
+// FTRAN already forms the exact vector on its way through -- it is the state
+// between the row etas and the U solve -- so it is captured there and handed
+// over, with no drop tolerance and nothing recomputed.
+struct SpikeCapture {
+    std::vector<core::Index> pos;   // position coordinates, distinct
+    std::vector<core::f64>   val;
+    bool valid = false;             // false: caller did not ask, or m == 0
+    void clear() { pos.clear(); val.clear(); valid = false; }
+};
+
 // LU factors of one basis matrix, plus the eta file of subsequent updates.
 //
 // Convention: `B` is m x m; its column j is basis slot j (NOT a variable
@@ -124,7 +145,7 @@ public:
     // Hypersparse: when b has few nonzeros the triangular solves run on the
     // REACH SET of those nonzeros (Hall & McKinnon 2005) instead of sweeping
     // all of L and U. Dense inputs take the dense path automatically.
-    void ftran(std::vector<f64>& b) const;
+    void ftran(std::vector<f64>& b, SpikeCapture* spike = nullptr) const;
 
     // Same solve, additionally returning an over-approximation of the
     // nonzero support of the slot-indexed result when the final U solve
@@ -153,14 +174,18 @@ public:
     // reset guarantees the input is zero outside the declared seed.
     bool ftran_seeded_with_support(std::vector<f64>& b,
                                    const std::vector<Index>& seed_rows,
-                                   std::vector<Index>& support) const;
+                                   std::vector<Index>& support,
+                                   SpikeCapture* spike = nullptr) const;
 
     // Dense two-RHS FTRAN. Both vectors are transformed by the same factor in
     // one traversal of L, U, and the update files. This is mathematically
     // identical to two consecutive ftran() calls (and preserves each RHS's
     // arithmetic order), but avoids fetching every sparse-factor index twice.
     // If both references name the same vector it performs one ordinary solve.
-    void ftran_pair(std::vector<f64>& a, std::vector<f64>& b) const;
+    // `spike_a` captures the spike of the FIRST vector only; the dual's
+    // paired call passes the entering column there and DSE's tau second.
+    void ftran_pair(std::vector<f64>& a, std::vector<f64>& b,
+                    SpikeCapture* spike_a = nullptr) const;
 
     // d (indexed by basis slot) <- B^-T d (indexed by row). Size m.
     void btran(std::vector<f64>& d) const;
@@ -207,9 +232,14 @@ public:
     // through piv_slot_, and on a hypersparse basis most of the update's cost)
     // with a pass over the support alone. Duplicates and zeros are tolerated;
     // null means "scan everything", which is always correct but slower.
+    // `spike` is the exact R...L^-1 a_q captured by the FTRAN that produced
+    // `alpha`. When absent (or invalid) the spike is recomputed as U * alpha,
+    // which is the historical behaviour and carries rounding residue into U;
+    // see SpikeCapture.
     bool update_ft(Index p, const std::vector<f64>& alpha,
                    const LuOptions& opts, f64 min_pivot = 1e-11,
-                   const std::vector<Index>* alpha_support = nullptr);
+                   const std::vector<Index>* alpha_support = nullptr,
+                   const SpikeCapture* spike = nullptr);
 
     // Collective FT (Huangfu & Hall 2015 Phase 2 in docs/SIH26119_PS_ALIGNMENT.md
     // §5 item 2): folds every PENDING product-form eta (from update(), not
@@ -256,6 +286,11 @@ public:
     Index n_product_form_etas() const noexcept { return static_cast<Index>(eta_p_.size()); }
     Index n_row_etas() const noexcept { return static_cast<Index>(r_pos_.size()); }
     Offset eta_nnz()   const;
+    // Live nonzeros in U (off-diagonals; the diagonal is implied). The FT
+    // spike fix is judged on this: an update may add at most the spike's own
+    // nonzeros, and installing U * alpha instead added rounding residue with
+    // alpha's density.
+    Offset u_nnz()     const noexcept { return u_live_nnz_; }
 
     // Cumulative triangular-solve work (nnz actually touched: a hypersparse
     // reach-set size, or the dense m when the hypersparse path was skipped)
@@ -312,7 +347,10 @@ private:
     // seed_rows / seed_slots: caller-declared INPUT nonzero positions, or
     // null for the classic self-scanning path.
     bool ftran_impl(std::vector<f64>& b, std::vector<Index>* support,
-                    const std::vector<Index>* seed_rows) const;
+                    const std::vector<Index>* seed_rows,
+                    SpikeCapture* spike = nullptr) const;
+    // Record work_ between the row etas and the U solve -- the exact spike.
+    void capture_spike(SpikeCapture& out, bool have_seed) const;
     bool btran_impl(std::vector<f64>& d, std::vector<Index>* support,
                     const std::vector<Index>* seed_slots) const;
 
@@ -460,6 +498,11 @@ private:
     std::vector<Offset> r_start_;
     std::vector<Index>  r_idx_;
     std::vector<f64>    r_val_;
+
+    // Position-space stamps for capture_spike()'s de-duplication: the seed it
+    // reads is a union (L reach + row-eta touches) and may repeat a position.
+    mutable std::vector<std::uint32_t> spike_stamp_;
+    mutable std::uint32_t spike_gen_ = 0;
 
     // update_ft() scratch, kept as members so an update costs no allocation.
     std::vector<f64>   ft_atilde_, ft_v_;
