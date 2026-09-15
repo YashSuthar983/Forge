@@ -265,9 +265,23 @@ std::string make_equality_knapsack(int n, int rhs) {
 void test_abandoned_node_is_not_a_proof() {
     const std::string mps = make_equality_knapsack(60, 30);
     BabOptions opts;
+    // Isolate the abandoned-node proof regression from Latest defaults
+    // (DynSep / Balans / mip-presolve / symmetry) that can finish or
+    // re-label the root before the 1-iteration LP interrupt fires.
+    opts.policy = sor::search::MilpPolicy::Classical;
     opts.max_nodes = 1000;
     opts.lp.max_iterations = 1;
     opts.lp.presolve = false;
+    opts.cuts_enabled = false;
+    opts.mip_presolve = false;
+    opts.symmetry = false;
+    opts.probing = false;
+    opts.feasibility_jump = true;  // still need an incumbent seed
+    opts.sub_mip_lns = false;
+    opts.balans.enabled = false;
+    opts.kernel_pump.enabled = false;
+    opts.mrens.enabled = false;
+    opts.dynsep.enabled = false;
     auto lp = read_text(mps);
     BabDiagnostics diag;
     auto raw = sor::search::solve_milp(lp, opts, diag);
@@ -284,8 +298,16 @@ void test_abandoned_node_is_not_a_proof() {
     // And the incumbent it did not prove is genuinely not the optimum: the
     // same model, with an LP budget that lets the search finish, does better.
     BabOptions full;
+    full.policy = sor::search::MilpPolicy::Classical;
     full.max_nodes = 1000;
     full.lp.presolve = false;
+    full.cuts_enabled = false;
+    full.mip_presolve = false;
+    full.symmetry = false;
+    full.balans.enabled = false;
+    full.kernel_pump.enabled = false;
+    full.mrens.enabled = false;
+    full.dynsep.enabled = false;
     BabDiagnostics fdiag;
     auto fraw = sor::search::solve_milp(read_text(mps), full, fdiag);
     const auto fr = sor::certify::finalize_result(

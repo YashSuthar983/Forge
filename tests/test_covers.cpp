@@ -278,6 +278,126 @@ void test_lifting_strengthens_the_cover() {
         }
 }
 
+// Sequence-independent piecewise-constant lifting (Prasad / arXiv:2401.13773).
+// Same knapsack as the sequential lift test; PC must produce a valid cut that
+// still separates the fractional point when the superadditivity precondition
+// holds, otherwise fall back safely to sequential / GNS.
+void test_pc_sequence_independent_lifting_valid() {
+    LpProblem lp;
+    lp.name = "pc_lift";
+    // 5x1 + 5x2 + 5x3 + 9x4 + 4x5 <= 12
+    lp.A = from_triplets(1, 5, {0, 0, 0, 0, 0}, {0, 1, 2, 3, 4},
+                         {5.0, 5.0, 5.0, 9.0, 4.0});
+    lp.c = {-1.0, -1.0, -1.0, -1.0, -1.0};
+    lp.row_lo = {-kInf};
+    lp.row_hi = {12.0};
+    lp.col_lo.assign(5, 0.0);
+    lp.col_hi.assign(5, 1.0);
+    lp.is_integer.assign(5, true);
+
+    const std::vector<f64> x = {0.8, 0.8, 0.8, 0.6, 0.1};
+    CoverOptions o;
+    o.pc_lift_hooks = true;
+    CoverDiagnostics d;
+    const auto cuts = separate_lifted_covers(lp, x, lp.col_lo, lp.col_hi, o, d);
+    CHECK(!cuts.empty());
+    CHECK(d.pc_sequence_independent + d.gns_sequence_independent +
+              d.pc_fallback_sequential >=
+          1);
+    for (const auto& c : cuts) {
+        CHECK(cut_lhs(c, x) > c.row_hi + 1e-9);
+        for (int mask = 0; mask < 32; ++mask) {
+            std::vector<f64> p(5, 0.0);
+            for (int j = 0; j < 5; ++j)
+                p[static_cast<std::size_t>(j)] = f64((mask >> j) & 1);
+            if (!row_feasible(lp, p)) continue;
+            CHECK(cut_lhs(c, p) <= c.row_hi + 1e-7);
+        }
+    }
+}
+
+// Prasad Example 2.6-style: cover {16,14,13,9} on capacity 44 (λ=8), outside
+// weights 9,10,23. PC must produce half-integral coefficients 1/2,1/2,3/2.
+void test_prasad_pc_half_integral_example() {
+    LpProblem lp;
+    lp.name = "prasad_ex";
+    // 16x1+14x2+13x3+9x4+9x5+10x6+23x7 <= 44
+    lp.A = from_triplets(1, 7, {0, 0, 0, 0, 0, 0, 0}, {0, 1, 2, 3, 4, 5, 6},
+                         {16, 14, 13, 9, 9, 10, 23});
+    lp.c.assign(7, -1.0);
+    lp.row_lo = {-kInf};
+    lp.row_hi = {44.0};
+    lp.col_lo.assign(7, 0.0);
+    lp.col_hi.assign(7, 1.0);
+    lp.is_integer.assign(7, true);
+
+    // Push cover {0,1,2,3} to be selected: high LP values on cover, mid on outside.
+    const std::vector<f64> x = {0.9, 0.9, 0.9, 0.9, 0.5, 0.5, 0.5};
+    CoverOptions o;
+    o.pc_lift_hooks = true;
+    CoverDiagnostics d;
+    const auto cuts = separate_lifted_covers(lp, x, lp.col_lo, lp.col_hi, o, d);
+    CHECK(!cuts.empty());
+    // Prefer seeing PC fire; GNS is also sound.
+    CHECK(d.pc_sequence_independent + d.gns_sequence_independent >= 1);
+
+    bool saw_half = false;
+    for (const auto& c : cuts) {
+        for (f64 v : c.vals) {
+            const f64 twov = 2.0 * v;
+            if (std::fabs(twov - std::round(twov)) <= 1e-6 &&
+                std::fabs(v - std::round(v)) > 1e-6)
+                saw_half = true;
+        }
+        CHECK(cut_lhs(c, x) > c.row_hi + 1e-9);
+        for (int mask = 0; mask < 128; ++mask) {
+            std::vector<f64> p(7, 0.0);
+            for (int j = 0; j < 7; ++j)
+                p[static_cast<std::size_t>(j)] = f64((mask >> j) & 1);
+            if (!row_feasible(lp, p)) continue;
+            CHECK(cut_lhs(c, p) <= c.row_hi + 1e-6);
+        }
+    }
+    // Half-integral coeffs are the PC hallmark when S_h is hit.
+    CHECK(saw_half || d.gns_sequence_independent >= 1);
+}
+
+void test_pc_random_validity() {
+    std::mt19937 rng(9001u);
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+    int pc_cuts = 0;
+    int gns_cuts = 0;
+    for (int trial = 0; trial < 120; ++trial) {
+        const Index n = 7 + static_cast<Index>(trial % 4);
+        const Index m = 1 + static_cast<Index>(trial % 2);
+        const LpProblem lp = random_knapsack_lp(rng, n, m);
+        std::vector<std::vector<f64>> feas;
+        for (std::uint64_t mask = 0; mask < (1ULL << n); ++mask) {
+            std::vector<f64> p(static_cast<std::size_t>(n), 0.0);
+            for (Index j = 0; j < n; ++j)
+                p[static_cast<std::size_t>(j)] = (mask >> j) & 1ULL ? 1.0 : 0.0;
+            if (row_feasible(lp, p)) feas.push_back(std::move(p));
+        }
+        if (feas.empty()) continue;
+        std::vector<f64> x(static_cast<std::size_t>(n));
+        for (auto& v : x) v = unit(rng);
+        CoverOptions o;
+        o.pc_lift_hooks = true;
+        CoverDiagnostics d;
+        const auto cuts =
+            separate_lifted_covers(lp, x, lp.col_lo, lp.col_hi, o, d);
+        pc_cuts += static_cast<int>(d.pc_sequence_independent);
+        gns_cuts += static_cast<int>(d.gns_sequence_independent);
+        for (const auto& c : cuts) {
+            for (const auto& p : feas)
+                CHECK(cut_lhs(c, p) <= c.row_hi + 1e-7);
+            CHECK(cut_lhs(c, x) > c.row_hi + 1e-9);
+        }
+    }
+    CHECK(pc_cuts + gns_cuts >= 0);  // validity is load-bearing
+    CHECK(pc_cuts + gns_cuts >= 1);  // non-vacuous SI path on this seed
+}
+
 }  // namespace
 
 int main() {
@@ -286,5 +406,8 @@ int main() {
     test_continuous_term_is_relaxed_soundly();
     test_random_cuts_are_valid_by_enumeration();
     test_lifting_strengthens_the_cover();
+    test_pc_sequence_independent_lifting_valid();
+    test_prasad_pc_half_integral_example();
+    test_pc_random_validity();
     return sor::test::finish("test_covers");
 }

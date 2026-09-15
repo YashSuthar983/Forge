@@ -9,10 +9,10 @@
 // mirroring the existing add_binary_cover_cuts() CSR-rebuild pattern in
 // bab.cpp.
 //
-// Scope: root-level cutting loop only (bab.cpp calls this before the B&B tree
-// starts). The pool ranks, deduplicates, diversifies, and ages root candidates.
-// Per-node/local cuts need basis-extension-on-row-add machinery that does not
-// exist yet; see the plan note in bab.cpp's cutting loop.
+// Scope: root cutting loop plus optional tree/local separation (see
+// sor/search/tree_cuts.hpp). Local cuts are tagged and expire with their
+// subtree; they must never leak across siblings. Classical policy keeps
+// root-only separation as an ablation.
 #pragma once
 
 #include "sor/core/result.hpp"
@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <functional>
 #include <vector>
 
 namespace sor::search {
@@ -186,6 +187,20 @@ public:
     // measured against, and which columns are integral. Without it the pool
     // falls back to ranking on efficacy alone.
     void set_scoring_context(const model::LpProblem& lp);
+    // Optional external score for sequence selection (HGTSM under Latest).
+    // When set, select_violated ranks by scorer(cut, x) instead of the efficacy
+    // composite. Violation / density / parallelism filters are unchanged.
+    // Pass an empty function to revert to efficacy scoring.
+    using ExternalScoreFn =
+        std::function<f64(const CutRow& cut, const std::vector<f64>& x)>;
+    void set_external_scorer(ExternalScoreFn fn);
+    // Batch / graph scorer (HGTSM paper path). When set, takes precedence over
+    // the per-cut ExternalScoreFn. Receives eligible cuts in pool order and
+    // must write one score per cut.
+    using ExternalBatchScoreFn = std::function<void(
+        const std::vector<CutRow>& cuts, const std::vector<f64>& x,
+        std::vector<f64>& scores_out)>;
+    void set_external_batch_scorer(ExternalBatchScoreFn fn);
     void add(const std::vector<CutRow>& candidates, CutDiagnostics& diag);
     std::vector<CutRow> select_violated(const std::vector<f64>& x,
                                         CutDiagnostics& diag);
@@ -210,6 +225,9 @@ private:
     std::vector<f64> locks_;         // down-locks + up-locks per column
     f64 max_locks_ = 0.0;
     Index n_cols_ = 0;
+    const model::LpProblem* lp_ctx_ = nullptr;
+    ExternalScoreFn external_score_;
+    ExternalBatchScoreFn external_batch_score_;
 };
 
 // One separation pass over a proved-optimal relaxation of `lp` at point `x`

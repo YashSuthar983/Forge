@@ -1,24 +1,43 @@
 // SOR — branch-and-cut MILP search (PS initial focus).
 //
 // LAYER L5. Uses the LP simplex engine at each node, with root GMI/cover cuts,
-// cut-pool management, propagation, reliability branching, incumbent
-// heuristics, and best-bound or bounded-plunging node selection. This remains
-// an early solver stack: separation is root-only and many cut families and
-// conflict-learning facilities are not implemented yet.
+// cut-pool management, propagation, reliability branching / sparse-SB (under
+// milp.policy=latest), incumbent heuristics, and best-bound or bounded-plunging
+// node selection. Default product path is milp.policy=latest; classical control
+// (plain RB, efficacy-only cuts, root-only sep) is ablation-only.
 #pragma once
 
 #include "sor/core/result.hpp"
 #include "sor/engines/simplex.hpp"
 #include "sor/model/lp.hpp"
 #include "sor/search/conflict.hpp"
+#include "sor/search/conflict_cut.hpp"
 #include "sor/search/covers.hpp"
 #include "sor/search/cuts.hpp"
-#include "sor/search/mir.hpp"
+#include "sor/search/dynsep.hpp"
+#include "sor/search/hgtsm.hpp"
+#include "sor/search/l2sep.hpp"
 #include "sor/search/feasjump.hpp"
+#include "sor/search/flowcover.hpp"
+#include "sor/search/balans.hpp"
+#include "sor/search/kernel_pump.hpp"
 #include "sor/search/lns.hpp"
+#include "sor/search/lifted_branch.hpp"
+#include "sor/search/milp_policy.hpp"
+#include "sor/search/mip_presolve.hpp"
+#include "sor/search/mir.hpp"
+#include "sor/search/mrens.hpp"
+#include "sor/search/planbb.hpp"
+#include "sor/search/sc_milp_branch.hpp"
+#include "sor/search/sparse_sb.hpp"
+#include "sor/search/symmetry.hpp"
+#include "sor/search/prop_trail.hpp"
+#include "sor/search/tree_cuts.hpp"
+#include "sor/search/zerohalf.hpp"
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sor::search {
@@ -26,7 +45,82 @@ namespace sor::search {
 using core::f64;
 using core::Index;
 
+// Latest-only branching learners (WP-H). Classical ignores these and keeps RB.
+enum class BranchStrategy : std::uint8_t {
+    Auto = 0,      // sparse-SB if model else SC/Lifted heuristics else RB
+    SparseSb = 1,
+    ScMilp = 2,
+    Lifted = 3,
+    PlanBb = 4,
+};
+
+inline const char* branch_strategy_name(BranchStrategy s) noexcept {
+    switch (s) {
+    case BranchStrategy::Auto: return "auto";
+    case BranchStrategy::SparseSb: return "sparse-sb";
+    case BranchStrategy::ScMilp: return "sc-milp";
+    case BranchStrategy::Lifted: return "lifted";
+    case BranchStrategy::PlanBb: return "planbb";
+    }
+    return "auto";
+}
+
+inline bool parse_branch_strategy(std::string_view s, BranchStrategy& out) {
+    auto lower = [](char c) {
+        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    };
+    std::string t;
+    t.reserve(s.size());
+    for (char c : s) t.push_back(lower(c));
+    if (t == "auto" || t == "default") {
+        out = BranchStrategy::Auto;
+        return true;
+    }
+    if (t == "sparse-sb" || t == "sparsesb" || t == "sparse_sb" || t == "sb") {
+        out = BranchStrategy::SparseSb;
+        return true;
+    }
+    if (t == "sc-milp" || t == "scmilp" || t == "sc_milp") {
+        out = BranchStrategy::ScMilp;
+        return true;
+    }
+    if (t == "lifted" || t == "lifted-branch" || t == "lifted_branch") {
+        out = BranchStrategy::Lifted;
+        return true;
+    }
+    if (t == "planbb" || t == "plan-bb" || t == "plan_bb" || t == "planb&b") {
+        out = BranchStrategy::PlanBb;
+        return true;
+    }
+    return false;
+}
+
 struct BabOptions {
+    // Product default = latest improved (sparse-SB, DynSep/GCS, Mexi, Balans…).
+    // Classical is debug/ablation only.
+    MilpPolicy policy = kDefaultMilpPolicy;
+    // Selectable Latest branching policy. Classical ignores this field.
+    BranchStrategy branch_strategy = BranchStrategy::Auto;
+    SparseSbOptions sparse_sb;
+    ScMilpOptions sc_milp;
+    // Offline training sinks (WP-H). When non-null and the matching
+    // collect_labels flag is set, samples gathered during strong-branch
+    // probes are appended here after the solve so tools like sor_milp_train
+    // can fit models without re-parsing the tree.
+    SparseSbCollector* sparse_sb_collect_out = nullptr;
+    ScMilpCollector* sc_milp_collect_out = nullptr;
+    LiftedSbCollector* lifted_collect_out = nullptr;
+    DynSepCollector* dynsep_collect_out = nullptr;
+    PlanBbCollector* planbb_collect_out = nullptr;
+    HgtsmCollector* hgtsm_collect_out = nullptr;
+    GcsCollector* gcs_collect_out = nullptr;
+    LiftedBranchOptions lifted;
+    PlanBbOptions planbb;
+    TreeCutOptions tree_cut;
+    ConflictCutOptions conflict_cut;
+    DynSepOptions dynsep;
+    L2SepOptions l2sep;
+    HgtsmOptions hgtsm;
     std::uint64_t max_nodes = 100000;
     double time_limit_s = 0.0;
     f64 int_tol = 1e-6;
@@ -60,6 +154,17 @@ struct BabOptions {
     // within a handful of calls.
     bool sub_mip_lns = true;
     LnsOptions lns;
+    // Balans bandit-ALNS (IJCAI 2025). Under milp.policy=latest this replaces
+    // the classical AlnsScheduler as the primary primal controller. Classical
+    // keeps `lns` / AlnsScheduler unchanged.
+    BalansOptions balans;
+    // Kernel Pump (Assunção et al., MPC 2026) — FP-class, incumbent only.
+    KernelPumpOptions kernel_pump;
+    // MRENS (arXiv:2408.00718) — multi-reference RENS box builder.
+    MrensOptions mrens;
+    // BTBS-LNS-v1 / CL-TLNS-v1 destroy arms (Balans meta-arms under Latest).
+    BtbsOptions btbs;
+    ClTlnsOptions cl_tlns;
     // Recursion guard. solve_milp() sets this on the child; a child never runs
     // LNS of its own, so the nesting is exactly one level deep and the budgets
     // in LnsOptions bound the total cost.
@@ -131,10 +236,9 @@ struct BabOptions {
     int strong_branch_candidates = 6;
     std::uint64_t strong_branch_nodes = 128;
     double strong_branch_time_s = 0.02;
-    // Branch-and-Cut: a root-node cutting loop (solve LP, separate Gomory
-    // Mixed-Integer cuts from the optimal tableau, manage candidates in a
-    // bounded efficacy/orthogonality pool, reoptimize) runs before the tree.
-    // See sor/search/cuts.hpp; this does not yet cut at non-root nodes.
+    // Branch-and-Cut: root GMI loop, plus (under policy=latest) tree/local
+    // separation on a depth schedule — see TreeCutOptions / tree_cuts.hpp.
+    // Classical keeps root-only separation.
     bool cuts_enabled = true;
     CutOptions cut;
     // NOTE: a gap gate on the root cutting loop was tried here and REMOVED.
@@ -159,6 +263,15 @@ struct BabOptions {
     // is what made the A/B attribution in the benchmark runs possible.
     bool probing = true;
     ProbingOptions probe;
+    // WP-F: Wang–Chen–Dai dual-fix⊕probing, clique probing, GF2, components,
+    // TU/network implied-int, OBBT-lite, multi-round restart. Runs once at
+    // MILP root entry before B&C.
+    bool mip_presolve = true;
+    MipPresolveOptions mip_pre;
+    // WP-G: color-refinement orbits + AMO orbital fixing + Reflection-complete
+    // + Folding-complete (disable via sym.reflection / sym.folding).
+    bool symmetry = true;
+    SymmetryOptions sym;
     // Separate clique cuts in the root cutting loop alongside the Gomory
     // separator. Clique cuts need no tableau and no basis -- only the LP point
     // -- so they are not subject to the basis-space restrictions the GMI path
@@ -206,6 +319,12 @@ struct BabOptions {
     // for unsoundness -- see that header for what is done differently.
     bool mir_cuts = false;
     MirOptions mir;
+    // Zero-half / flow-cover: engines for DynSep. Static force-on defaults
+    // false (measurement-gated); under policy=latest DynSep may schedule them.
+    bool zerohalf_cuts = false;
+    ZeroHalfOptions zerohalf;
+    bool flow_cover_cuts = false;
+    FlowCoverOptions flowcover;
     // Separate implied-bound (variable-bound) cuts from the probing record.
     // Independent of clique_cuts: the two families come from the same probing
     // pass but behave very differently on the node LP.
@@ -235,6 +354,9 @@ struct BabOptions {
     bool verbose = false;
 
     // Node LP options (dual preferred for bound changes).
+    // WP-J policy hook: lp.update_method selects product-form vs Forrest–Tomlin
+    // basis updates (engines already expose both; hypersparse FTRAN/BTRAN is
+    // always on inside the factor). CLI: --basis-update product|ft.
     engines::SimplexOptions lp;
 };
 
@@ -242,6 +364,10 @@ struct BabDiagnostics {
     std::uint64_t nodes = 0;
     std::uint64_t lp_solves = 0;
     std::uint64_t lp_fallbacks = 0;
+    // WP-J: node LPs that supplied a parent SimplexBasis to dual warm-start,
+    // and how many of those the engine actually accepted (sd.warm_starts).
+    std::uint64_t warm_start_attempts = 0;
+    std::uint64_t warm_start_hits = 0;
     // Simplex iterations summed over every node relaxation, plus the wall time
     // spent inside them. Nodes-per-second alone cannot distinguish "the tree is
     // huge" from "each node relaxation is expensive", and those have opposite
@@ -252,6 +378,29 @@ struct BabDiagnostics {
     std::uint64_t binary_cover_cuts = 0;
     std::uint64_t strong_branch_solves = 0;
     std::uint64_t pseudocost_updates = 0;
+    // Sparse-SB (WP-H2): model picks vs fallback to reliability / fractionality.
+    std::uint64_t sparse_sb_picks = 0;
+    std::uint64_t sparse_sb_fallbacks = 0;
+    std::uint64_t sparse_sb_samples = 0;
+    // SC-MILP / Lifted / PlanB&B (WP-H1/H3/H4) diagnostics.
+    std::uint64_t sc_milp_picks = 0;
+    std::uint64_t sc_milp_fallbacks = 0;
+    std::uint64_t sc_milp_samples = 0;
+    std::uint64_t lifted_picks = 0;
+    std::uint64_t lifted_fallbacks = 0;
+    std::uint64_t lifted_refits = 0;
+    std::uint64_t lifted_samples = 0;
+    std::uint64_t planbb_picks = 0;
+    std::uint64_t planbb_fallbacks = 0;
+    std::uint64_t planbb_lookaheads = 0;
+    std::uint64_t planbb_mcts_sims = 0;
+    std::uint64_t planbb_samples = 0;
+    bool planbb_paper = false;
+    BranchStrategy branch_strategy_resolved = BranchStrategy::Auto;
+    // Which learner last chose a variable ("sparse-sb"|"sc-milp"|"lifted"|
+    // "planbb"|"reliability"|"").
+    std::string last_branch_policy;
+    MilpPolicy policy_used = kDefaultMilpPolicy;
     std::uint64_t integer_feasible = 0;
     std::uint64_t heuristic_hits = 0;
     std::uint64_t lp_repair_attempts = 0;
@@ -275,6 +424,11 @@ struct BabDiagnostics {
     std::uint64_t rens_lp_solves = 0;
     std::uint64_t rens_hits = 0;
     LnsDiagnostics lns;
+    BalansDiagnostics balans;
+    KernelPumpDiagnostics kernel_pump;
+    MrensDiagnostics mrens;
+    BtbsDiagnostics btbs;
+    ClTlnsDiagnostics cl_tlns;
     std::uint64_t sub_mip_nodes = 0;
     double sub_mip_ms = 0.0;
     // Wall time in every heuristic, and how often the ceiling above refused a
@@ -290,6 +444,12 @@ struct BabDiagnostics {
     // extra rows -- and only the second is visible in node counts.
     double cut_loop_ms = 0.0;
     std::uint64_t gmi_cuts_added = 0;
+    std::uint64_t tree_cut_nodes = 0;
+    std::uint64_t tree_local_cuts_added = 0;
+    std::uint64_t gcs_promoted = 0;
+    std::uint64_t gcs_reinjected = 0;
+    std::uint64_t gcs_pool_size = 0;
+    GcsDiagnostics gcs;
     std::uint64_t cut_pool_inserted = 0;
     std::uint64_t cut_pool_duplicates = 0;
     std::uint64_t cut_pool_dominated = 0;
@@ -301,6 +461,9 @@ struct BabDiagnostics {
     std::uint64_t propagation_tightenings = 0;
     std::uint64_t propagation_prunes = 0;
     ConflictDiagnostics conflict;
+    MipPresolveDiagnostics mip_presolve_diag;
+    SymmetryDiagnostics symmetry_diag;
+    bool mip_restart_recommended = false;
     std::uint64_t clique_cut_candidates = 0;
     std::uint64_t clique_cuts_added = 0;
     std::uint64_t implied_bound_cut_candidates = 0;
@@ -311,8 +474,20 @@ struct BabDiagnostics {
     std::uint64_t mir_candidates = 0;
     std::uint64_t mir_cuts_added = 0;
     MirDiagnostics mir;
+    std::uint64_t zerohalf_candidates = 0;
+    std::uint64_t zerohalf_cuts_added = 0;
+    ZeroHalfDiagnostics zerohalf;
+    std::uint64_t flowcover_candidates = 0;
+    std::uint64_t flowcover_cuts_added = 0;
+    FlowCoverDiagnostics flowcover;
+    DynSepDiagnostics dynsep;
+    std::uint64_t dynsep_samples = 0;
+    L2SepDiagnostics l2sep;
+    HgtsmDiagnostics hgtsm;
     std::uint64_t conflict_prop_tightenings = 0;
     std::uint64_t conflict_prop_prunes = 0;
+    ConflictCutDiagnostics conflict_cut_diag;
+    std::uint64_t conflict_cuts_global = 0;
     std::uint64_t plunge_nodes = 0;
     f64 incumbent = core::kPosInf;
     f64 dual_bound = core::kNaN;

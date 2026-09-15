@@ -11,6 +11,7 @@
 
 #include "sor/core/result.hpp"
 #include "sor/model/lp.hpp"
+#include "sor/search/prop_trail.hpp"
 
 #include <cstdint>
 #include <vector>
@@ -24,6 +25,8 @@ struct PropagateResult {
     bool feasible = true;      // false: some variable's [lo,hi] went empty
     std::uint64_t tightened = 0;  // number of individual bound tightenings applied
     int rounds = 0;
+    Index conflict_var = -1;
+    Index conflict_row = -1;
 };
 
 // Tightens col_lo/col_hi IN PLACE (both size lp.n_cols()) using lp's rows and
@@ -41,5 +44,14 @@ PropagateResult propagate_bounds(const model::LpProblem& lp,
                                  std::vector<f64>& col_hi,
                                  f64 tol = 1e-9,
                                  int max_rounds = 10);
+
+// Same as propagate_bounds; when `trail` is non-null, records Row reasons.
+PropagateResult propagate_bounds_trail(const model::LpProblem& lp,
+                                       std::vector<f64>& col_lo,
+                                       std::vector<f64>& col_hi,
+                                       PropTrail* trail,
+                                       int depth,
+                                       f64 tol = 1e-9,
+                                       int max_rounds = 10);
 
 }  // namespace sor::search

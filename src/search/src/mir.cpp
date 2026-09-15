@@ -114,11 +114,14 @@ bool row_as_base(const model::LpProblem& lp, Index row, f64 sign, BaseRow& out) 
 }
 
 // Runs the MIR derivation on one base row, sweeping the c-MIR scalings, and
-// appends any violated cut it finds.
+// appends any accepted cut it finds. When require_violation is false (conflict
+// reason reduction), a valid MIR inequality is kept even if the reference
+// point is not strongly violated.
 void try_mir_on_base(const model::LpProblem& lp, const BaseRow& base,
                      const std::vector<f64>& x, const std::vector<f64>& lo,
                      const std::vector<f64>& hi, const MirOptions& opts,
-                     MirDiagnostics& diag, std::vector<CutRow>& cuts) {
+                     bool require_violation, MirDiagnostics& diag,
+                     std::vector<CutRow>& cuts) {
     // Scalings: 1, and 1/|a_j| over the base's integer coefficients.
     std::vector<f64> deltas;
     deltas.push_back(1.0);
@@ -174,12 +177,12 @@ void try_mir_on_base(const model::LpProblem& lp, const BaseRow& base,
             amax = std::max(amax, std::fabs(back));
             amin = std::min(amin, std::fabs(back));
         }
-        if (!ok || cut.cols.size() < 2) continue;
+        if (!ok || cut.cols.empty()) continue;
         if (amin > 0.0 && amax / amin > opts.max_dynamism) {
             ++diag.rejected_dynamism;
             continue;
         }
-        if (lhs_at_x <= fl + opts.violation_min) {
+        if (require_violation && lhs_at_x <= fl + opts.violation_min) {
             ++diag.rejected_not_violated;
             continue;
         }
@@ -219,7 +222,7 @@ std::vector<CutRow> separate_mir(const model::LpProblem& lp,
         for (const f64 sign : {1.0, -1.0}) {
             if (static_cast<int>(cuts.size()) >= opts.max_cuts) break;
             if (!row_as_base(lp, i, sign, base)) continue;
-            try_mir_on_base(lp, base, x, col_lo, col_hi, opts, diag, cuts);
+            try_mir_on_base(lp, base, x, col_lo, col_hi, opts, true, diag, cuts);
         }
     }
     if (!opts.aggregate || static_cast<int>(cuts.size()) >= opts.max_cuts)
@@ -344,7 +347,8 @@ std::vector<CutRow> separate_mir(const model::LpProblem& lp,
                     }
                 if (agg.cols.size() >= 2 && agg.cols.size() <= opts.max_row_len) {
                     ++diag.aggregations;
-                    try_mir_on_base(lp, agg, x, col_lo, col_hi, opts, diag, cuts);
+                    try_mir_on_base(lp, agg, x, col_lo, col_hi, opts, true, diag,
+                                    cuts);
                 }
             }
 
@@ -352,6 +356,53 @@ std::vector<CutRow> separate_mir(const model::LpProblem& lp,
         }
     }
     return cuts;
+}
+
+bool apply_cmir_geq(const model::LpProblem& lp,
+                    const std::vector<Index>& cols,
+                    const std::vector<f64>& vals,
+                    f64 rhs_geq,
+                    const std::vector<f64>& x,
+                    const std::vector<f64>& col_lo,
+                    const std::vector<f64>& col_hi,
+                    const MirOptions& opts,
+                    bool require_violation,
+                    std::vector<Index>& out_cols,
+                    std::vector<f64>& out_vals,
+                    f64& out_rhs_geq,
+                    MirDiagnostics& diag) {
+    out_cols.clear();
+    out_vals.clear();
+    out_rhs_geq = 0.0;
+    if (cols.size() != vals.size() || cols.empty()) return false;
+
+    // >= form → <= base for the shared Marchand–Wolsey machinery.
+    BaseRow base;
+    base.cols = cols;
+    base.vals.resize(vals.size());
+    for (std::size_t q = 0; q < vals.size(); ++q) base.vals[q] = -vals[q];
+    base.rhs = -rhs_geq;
+
+    MirOptions local = opts;
+    local.max_cuts = 1;
+    local.aggregate = false;
+    std::vector<CutRow> cuts;
+    try_mir_on_base(lp, base, x, col_lo, col_hi, local, require_violation, diag,
+                    cuts);
+    if (cuts.empty()) return false;
+
+    // Cut is <= row_hi; convert back to >=.
+    const CutRow& c = cuts[0];
+    out_cols = c.cols;
+    out_vals.resize(c.vals.size());
+    for (std::size_t q = 0; q < c.vals.size(); ++q) out_vals[q] = -c.vals[q];
+    if (std::isfinite(c.row_hi))
+        out_rhs_geq = -c.row_hi;
+    else if (std::isfinite(c.row_lo))
+        out_rhs_geq = c.row_lo;
+    else
+        return false;
+    return !out_cols.empty();
 }
 
 }  // namespace sor::search

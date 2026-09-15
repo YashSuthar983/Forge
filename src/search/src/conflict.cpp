@@ -1,5 +1,6 @@
 #include "sor/search/conflict.hpp"
 
+#include "sor/search/mip_presolve.hpp"
 #include "sor/search/propagate.hpp"
 
 #include <algorithm>
@@ -269,13 +270,34 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
 
             lo0 = col_lo; hi0 = col_hi;
             lo0[sz(j)] = 0.0; hi0[sz(j)] = 0.0;
-            const auto r0 = propagate_bounds(lp, lo0, hi0, opts.tol,
-                                             opts.probe_propagation_rounds);
+            auto r0 = propagate_bounds(lp, lo0, hi0, opts.tol,
+                                       opts.probe_propagation_rounds);
             lo1 = col_lo; hi1 = col_hi;
             lo1[sz(j)] = 1.0; hi1[sz(j)] = 1.0;
-            const auto r1 = propagate_bounds(lp, lo1, hi1, opts.tol,
-                                             opts.probe_propagation_rounds);
+            auto r1 = propagate_bounds(lp, lo1, hi1, opts.tol,
+                                       opts.probe_propagation_rounds);
             diag.probes += 2;
+
+            // Snapshot binary pins from FBBT only — dual-fix pins with
+            // zero objective must not become conflict implications
+            // (Wang–Chen–Dai §2.3 inconsistency).
+            std::vector<f64> pin_lo0 = lo0, pin_hi0 = hi0;
+            std::vector<f64> pin_lo1 = lo1, pin_hi1 = hi1;
+
+            if (opts.dual_fix_in_probing) {
+                if (r0.feasible) {
+                    const auto d0 = apply_dual_fixing(
+                        lp, lo0, hi0, opts.tol, opts.dual_fix_probe_rounds,
+                        /*zero_cost_ok=*/true);
+                    if (d0.infeasible) r0.feasible = false;
+                }
+                if (r1.feasible) {
+                    const auto d1 = apply_dual_fixing(
+                        lp, lo1, hi1, opts.tol, opts.dual_fix_probe_rounds,
+                        /*zero_cost_ok=*/true);
+                    if (d1.infeasible) r1.feasible = false;
+                }
+            }
 
             if (!r0.feasible && !r1.feasible) {
                 diag.infeasible = true;
@@ -356,14 +378,26 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
                 // Implications. A binary that both sides leave free tells us
                 // nothing; one that a side pins yields a conflict edge between
                 // the probe literal and the OPPOSITE of the pinned value.
+                // Dual-only pins with zero objective are excluded (2607.10767
+                // §2.3): stacking them across probes can wipe all optima.
                 if (k == j || !out.is_binary(k)) continue;
                 if (col_hi[sz(k)] - col_lo[sz(k)] < 0.5) continue;
-                if (hi0[sz(k)] - lo0[sz(k)] < 0.5) {
+                const f64 ck = lp.maximize ? -lp.c[sz(k)] : lp.c[sz(k)];
+                const bool weak_dual_ok = std::fabs(ck) > opts.tol;
+                auto allow_pin = [&](const std::vector<f64>& lo,
+                                    const std::vector<f64>& hi,
+                                    const std::vector<f64>& plo,
+                                    const std::vector<f64>& phi) {
+                    if (hi[sz(k)] - lo[sz(k)] >= 0.5) return false;
+                    if (phi[sz(k)] - plo[sz(k)] < 0.5) return true;  // FBBT
+                    return weak_dual_ok;
+                };
+                if (allow_pin(lo0, hi0, pin_lo0, pin_hi0)) {
                     const int w = lo0[sz(k)] > 0.5 ? 1 : 0;
                     if (out.add_edge(lit_of(j, 0), lit_of(k, 1 - w)))
                         ++diag.probe_implications;
                 }
-                if (hi1[sz(k)] - lo1[sz(k)] < 0.5) {
+                if (allow_pin(lo1, hi1, pin_lo1, pin_hi1)) {
                     const int w = lo1[sz(k)] > 0.5 ? 1 : 0;
                     if (out.add_edge(lit_of(j, 1), lit_of(k, 1 - w)))
                         ++diag.probe_implications;

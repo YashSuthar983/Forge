@@ -113,6 +113,12 @@ void test_gmi_fixture_via_solve_milp() {
     BabOptions opts;
     opts.max_nodes = 1000;
     opts.cuts_enabled = true;
+    // Isolate the cut loop from newer root reductions that already prove
+    // this one-row fixture before GMI runs (integral-row rounding / MIP
+    // presolve / symmetry).
+    opts.integer_row_rounding = false;
+    opts.mip_presolve = false;
+    opts.symmetry = false;
     BabDiagnostics diag;
     auto raw = sor::search::solve_milp(lp, opts, diag);
     const auto ev = sor::search::milp_evidence(diag, opts);

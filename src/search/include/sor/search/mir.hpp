@@ -111,4 +111,31 @@ std::vector<CutRow> separate_mir(const model::LpProblem& lp,
                                  const MirOptions& opts,
                                  MirDiagnostics& diag);
 
+// Shared cMIR primitive for Mexi conflict reason reduction (arXiv:2410.15110
+// §4.2 / §7) and Marchand–Wolsey separation.
+//
+// Math (Def. 3 paper form, applied after bound substitution onto [lo,hi]):
+//   Given sum_j a_j x_j + sum_k g_k y_k >= b with x integer >=0, y>=0 after
+//   shifting, let f = b - floor(b). The MIR inequality is valid for the
+//   integer hull; we emit it as a >= cut in the original variable space.
+//
+// `require_violation`: if true, only return a cut violated at `x` (separator
+// mode). Conflict analysis passes false so a valid strengthening of the
+// reason is accepted even when the local vertex is already cut off weakly.
+//
+// Returns false if no useful MIR cut (bad fractionality, dynamism, or empty).
+bool apply_cmir_geq(const model::LpProblem& lp,
+                    const std::vector<Index>& cols,
+                    const std::vector<f64>& vals,
+                    f64 rhs_geq,
+                    const std::vector<f64>& x,
+                    const std::vector<f64>& col_lo,
+                    const std::vector<f64>& col_hi,
+                    const MirOptions& opts,
+                    bool require_violation,
+                    std::vector<Index>& out_cols,
+                    std::vector<f64>& out_vals,
+                    f64& out_rhs_geq,
+                    MirDiagnostics& diag);
+
 }  // namespace sor::search

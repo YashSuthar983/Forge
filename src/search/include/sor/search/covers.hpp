@@ -8,6 +8,9 @@
 //     inequality and the lifting function it is strengthened by.
 //   Kaparis & Letchford, "Separation algorithms for 0-1 knapsack polytopes",
 //     Math. Prog. 124, 2010 — the separation problem's structure.
+//   Prasad / IJCAI 2025 (arXiv:2401.13773) — sequence-independent
+//     piecewise-constant (PC) lifting g₀ and GNS g_{1/ρ₁}; enabled via
+//     pc_lift_hooks.
 //
 // WHY THIS EXISTS. bab.cpp's add_binary_cover_cuts() is a cover separator in
 // name only, and each of its three limitations is severe:
@@ -22,11 +25,6 @@
 //   * it emits UNLIFTED covers. `sum_{j in C} x_j <= |C| - 1` is valid but
 //     usually far from facet-defining, and lifting the variables outside the
 //     cover is what makes the family competitive.
-//
-// Measured motivation: on assign1-5-8, 256 of those cover cuts plus 275 Gomory
-// cuts close 6.1% of the integrality gap. Across the wider set the mean gap
-// closed at the root is around 20%, and nothing in the MILP stack proves an
-// instance of benchmarks/miplib-small inside 30 s.
 //
 // Everything here is a cut for the ORIGINAL model: the knapsack it works on is
 // a relaxation of one row (non-binary terms are moved to the right-hand side at
@@ -61,6 +59,15 @@ struct CoverOptions {
     // Skip lifting a row whose knapsack has more items than this; the DP is
     // O(items * value_cap).
     std::size_t max_lift_items = 512;
+    // PC / GNS sequence-independent lifting (Prasad et al. IJCAI 2025 /
+    // arXiv:2401.13773). When true:
+    //   * try PC g₀ when μ₁−λ ≥ ρ₁ (half-integral coeffs on S_h);
+    //   * try GNS g_{1/ρ₁} (always superadditive);
+    //   * keep the stronger of the two at the LP point; fall back to sequential
+    //     up-lifting if both fail the validity DP.
+    // DynSep / Latest cover arm may enable this. Default off for Classical.
+    bool pc_lift_hooks = false;
+    f64 pc_fix_tol = 1e-6;
 };
 
 struct CoverDiagnostics {
@@ -71,6 +78,10 @@ struct CoverDiagnostics {
     std::uint64_t lifted_coefficients = 0;
     std::uint64_t rejected_not_violated = 0;
     std::uint64_t rejected_unbounded_term = 0;
+    std::uint64_t pc_projections = 0;
+    std::uint64_t pc_sequence_independent = 0;
+    std::uint64_t gns_sequence_independent = 0;
+    std::uint64_t pc_fallback_sequential = 0;
 };
 
 // Separates violated lifted cover inequalities from the rows of `lp` at the
