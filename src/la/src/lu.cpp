@@ -1694,11 +1694,18 @@ Offset BasisFactor::eta_nnz() const {
 // 300-update chain and no refactorization at all, the residual grows
 // 2e-13 -> 8e-12 -> 8e-10 -> 9e-8 -> 1e-6 -> 4e-4, roughly a decade per 45
 // updates, where product form over the identical sequence stays at 1e-8.
-// That is inherent to the method, not a defect in this implementation, and it
-// is why n_updates()/eta_nnz() count row etas: they are what the interval and
-// ratio triggers below actually see on an FT run.
+// The decay is inherent to the method. What is NOT inherent, and was the
+// defect here, is the cadence: the eta-nnz and update-count triggers were
+// calibrated for product-form etas, and FT row etas are ~12x sparser, so those
+// triggers fire about ten times less often on an FT run and the update_limit
+// ceiling never binds at all. FT therefore ran hundreds of updates past the
+// point where its accuracy was gone -- d2q06c interrupted at 171k pivots with
+// a DSE log error of 0.29 and a cost shift of 6.3e+47. u_nnz_ratio and
+// ft_update_limit below are the FT-specific cadence that fixes that; they are
+// checked only once a row eta exists, so the product-form path is untouched.
 bool BasisFactor::needs_refactor(int update_limit, f64 eta_nnz_ratio,
-                                 Index bump_width_max, f64 work_ratio_max) const {
+                                 Index bump_width_max, f64 work_ratio_max,
+                                 f64 u_nnz_ratio, int ft_update_limit) const {
     if (update_limit > 0 && static_cast<int>(n_updates()) >= update_limit)
         return true;
     if (eta_nnz_ratio > 0.0 && stats_.factor_nnz > 0) {
@@ -1706,6 +1713,18 @@ bool BasisFactor::needs_refactor(int update_limit, f64 eta_nnz_ratio,
         if (static_cast<f64>(eta_nnz()) > limit) return true;
     }
     if (bump_width_max > 0 && bump_width_ > bump_width_max) return true;
+    // Forrest-Tomlin cadence: U's growth, and a plain count of row etas. Both
+    // apply only once update_ft() has actually run, so the product-form path
+    // is untouched by them.
+    if (!r_pos_.empty()) {
+        if (u_nnz_ratio > 0.0 && stats_.factor_nnz > 0 &&
+            static_cast<f64>(u_live_nnz_) >
+                u_nnz_ratio * static_cast<f64>(stats_.factor_nnz))
+            return true;
+        if (ft_update_limit > 0 &&
+            static_cast<int>(r_pos_.size()) >= ft_update_limit)
+            return true;
+    }
     if (work_ratio_max > 0.0 && stats_.factor_nnz > 0) {
         const f64 limit = work_ratio_max * static_cast<f64>(stats_.factor_nnz);
         if (static_cast<f64>(work_since_factor_) > limit) return true;

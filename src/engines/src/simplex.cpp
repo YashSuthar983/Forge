@@ -237,6 +237,8 @@ void accumulate_work(SimplexDiagnostics& total,
     total.ratio_exhausted += stage.ratio_exhausted;
     total.ratio_small_pivot_exclusions += stage.ratio_small_pivot_exclusions;
     total.ratio_sorted_candidates += stage.ratio_sorted_candidates;
+    total.numerical_trouble_refactors += stage.numerical_trouble_refactors;
+    total.refused_cost_shifts += stage.refused_cost_shifts;
     total.alpha_sparse_iters += stage.alpha_sparse_iters;
     total.alpha_dense_iters += stage.alpha_dense_iters;
     total.alpha_support_entries += stage.alpha_support_entries;
@@ -332,6 +334,8 @@ void install_work_totals(SimplexDiagnostics& chosen,
     chosen.ratio_exhausted = total.ratio_exhausted;
     chosen.ratio_small_pivot_exclusions = total.ratio_small_pivot_exclusions;
     chosen.ratio_sorted_candidates = total.ratio_sorted_candidates;
+    chosen.numerical_trouble_refactors = total.numerical_trouble_refactors;
+    chosen.refused_cost_shifts = total.refused_cost_shifts;
     chosen.alpha_sparse_iters = total.alpha_sparse_iters;
     chosen.alpha_dense_iters = total.alpha_dense_iters;
     chosen.alpha_support_entries = total.alpha_support_entries;
@@ -1372,7 +1376,9 @@ core::RawResult solve_primal_simplex_prepared(
         const bool eta_full = factor.needs_refactor(opts.refactor_interval,
                                                     opts.refactor_eta_ratio,
                                                     opts.bump_width_max,
-                                                    opts.refactor_work_ratio);
+                                                    opts.refactor_work_ratio,
+                                                    opts.refactor_u_nnz_ratio,
+                                                    opts.ft_update_limit);
         const auto update_t0 = Clock::now();
         const bool updated =
             opts.update_method == la::UpdateMethod::ForrestTomlin

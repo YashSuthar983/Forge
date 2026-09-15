@@ -987,8 +987,24 @@ core::RawResult solve_dual_simplex_prepared(
     // together with the perturbation before any conclusion about the model.
     std::vector<f64> cost_shift(sz(nt), 0.0);
     bool costs_shifted = false;
-    const auto shift_cost = [&](Index j, f64 delta) {
-        if (delta == 0.0 || !std::isfinite(delta)) return;
+    // Returns whether the shift was applied. A shift exists to zero a reduced
+    // cost that is on the wrong side of zero by a ROUNDING margin; its
+    // magnitude is therefore |d_j|, and a large one means d_j itself is wrong,
+    // not that the column needs a large correction. Measured over Netlib on
+    // the product-form path, the healthy tail of accepted shifts ends around
+    // 5.6e-07, with a handful of outliers (boeing1 1.8e-03, 80bau3b 2.1e-01,
+    // capri 3.9, greenbea 5.0e+02) -- and on the Forrest-Tomlin path d2q06c
+    // reached 6.3e+47 before being interrupted. Anything past the bound is a
+    // symptom of a broken factorization, so it is refused and reported as
+    // numerical trouble instead of being written into the working costs.
+    const auto shift_cost = [&](Index j, f64 delta) -> bool {
+        if (delta == 0.0 || !std::isfinite(delta)) return false;
+        const f64 bound = 1e3 * opts.dual_feas_tol *
+                          std::max(1.0, std::fabs(cost[sz(j)]));
+        if (std::fabs(delta) > bound) {
+            ++diag.refused_cost_shifts;
+            return false;
+        }
         if (trace_fp)
             std::fprintf(trace_fp, "S %d %.17g %.17g\n", static_cast<int>(j),
                          static_cast<double>(delta),
@@ -1000,6 +1016,7 @@ core::RawResult solve_dual_simplex_prepared(
         ++diag.cost_shifts;
         diag.cost_shift_max =
             std::max(diag.cost_shift_max, std::fabs(cost_shift[sz(j)]));
+        return true;
     };
 
     // Put the model's own costs back (perturbation and shifts alike) and
@@ -1593,7 +1610,9 @@ core::RawResult solve_dual_simplex_prepared(
         const bool eta_full = factor.needs_refactor(opts.refactor_interval,
                                                     opts.refactor_eta_ratio,
                                                     opts.bump_width_max,
-                                                    opts.refactor_work_ratio);
+                                                    opts.refactor_work_ratio,
+                                                    opts.refactor_u_nnz_ratio,
+                                                    opts.ft_update_limit);
         const auto update_t0 = Clock::now();
         const bool updated =
             opts.update_method == la::UpdateMethod::ForrestTomlin
@@ -2157,8 +2176,17 @@ core::RawResult solve_dual_simplex_prepared(
                     opts.dual_feas_tol;
             if (choice.enter_wrong_sign && choice.d_enter != 0.0 &&
                 wrong_sign_is_harmful) {
-                shift_cost(q, -choice.d_enter);
-                ++diag.wrong_sign_entering_shifts;
+                if (shift_cost(q, -choice.d_enter)) {
+                    ++diag.wrong_sign_entering_shifts;
+                } else if (since_refactor > 0) {
+                    // Too large to be a rounding correction: the reduced cost
+                    // itself is wrong. Rebuild exactly and redo the iteration
+                    // rather than writing the damage into the working costs.
+                    do_factorize();
+                    since_refactor = 0;
+                    ++diag.numerical_trouble_refactors;
+                    continue;
+                }
             }
             d_enter = redcost[sz(q)];
             // The passed flips live in the ratio-test workspace, not in the
@@ -2251,6 +2279,28 @@ core::RawResult solve_dual_simplex_prepared(
                 status = core::Status::NumericalFailure;
                 reason = "dual pivot element vanished after FTRAN";
                 break;
+            }
+
+            // Numerical-trouble trigger. alpha_rq has just been computed twice
+            // by two different routes -- as a dot product of rho against
+            // column q while building the pivotal row, and as entry r of
+            // B^-1 a_q by FTRAN. They are one number, so a gap between them is
+            // accumulated error in the factorization, which is precisely what
+            // an eta-count or nnz trigger cannot see. Only worth acting on
+            // when the factorization is not already fresh; otherwise there is
+            // nothing left to refactor away and the pivot proceeds (the
+            // vanishing-pivot guard above is the hard failure).
+            if (opts.numerical_trouble_tol > 0.0 && since_refactor > 0) {
+                const f64 a_row = choice.alpha_enter;
+                const f64 gap = std::fabs(a_row - ap);
+                const f64 scale = std::max(std::max(std::fabs(a_row),
+                                                    std::fabs(ap)), 1e-300);
+                if (gap / scale > opts.numerical_trouble_tol) {
+                    do_factorize();
+                    since_refactor = 0;
+                    ++diag.numerical_trouble_refactors;
+                    continue;                   // redo the iteration exactly
+                }
             }
 
             const f64 denom = -static_cast<f64>(qdir) * ap;
