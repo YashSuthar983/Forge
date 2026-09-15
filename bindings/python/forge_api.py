@@ -3,9 +3,10 @@
 
 Part of the project (not the web demo).
 
-  python3 -m python.forge_api --one-shot
   python3 scripts/forge_repl.py
-  from python.forge_api import solve, check, show   # if PYTHONPATH=forge root
+  python3 scripts/forge_repl.py --one-shot
+  PYTHONPATH=bindings python3 -m python.forge_api --one-shot
+  from python.forge_api import solve, check, show   # with PYTHONPATH=bindings
 """
 from __future__ import annotations
 
@@ -14,7 +15,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+# bindings/python/forge_api.py → parents[2] is the forge repo root.
+ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "demo_out"
 OUT.mkdir(exist_ok=True)
 

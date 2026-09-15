@@ -20,8 +20,6 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "" FORCE)
 endif()
 
-option(FORGE_ENABLE_JULIA_GPU
-       "Build the EXPERIMENTAL Julia GPU sidecar backend (prototype only)" OFF)
 option(FORGE_ENABLE_VULKAN
        "Build the Vulkan compute LpDevice (AMD/NVIDIA/Intel)" ON)
 option(FORGE_WARNINGS_AS_ERRORS "Treat warnings as errors" ON)
@@ -94,4 +92,4 @@ enable_testing()
 add_subdirectory(tests)
 
 message(STATUS "FORGE ${PROJECT_VERSION}  build=${CMAKE_BUILD_TYPE}  "
-               "julia_gpu=${FORGE_ENABLE_JULIA_GPU}  vulkan=${FORGE_ENABLE_VULKAN}")
+               "vulkan=${FORGE_ENABLE_VULKAN}")

@@ -88,8 +88,3 @@ target_compile_definitions(test_cli_validation PRIVATE
   FORGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
   FORGE_BINARY_DIR="${CMAKE_BINARY_DIR}")
 add_dependencies(test_cli_validation forge_solve forge_check)
-
-if(FORGE_ENABLE_JULIA_GPU)
-  forge_add_test(test_julia_gpu_parity forge_backend)
-  set_tests_properties(test_julia_gpu_parity PROPERTIES SKIP_RETURN_CODE 77)
-endif()

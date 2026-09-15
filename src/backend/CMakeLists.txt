@@ -34,10 +34,6 @@ if(FORGE_ENABLE_VULKAN)
 else()
   list(APPEND FORGE_BACKEND_SOURCES src/vulkan_stub.cpp)
 endif()
-if(FORGE_ENABLE_JULIA_GPU)
-  list(APPEND FORGE_BACKEND_SOURCES src/julia_gpu_backend.cpp)
-endif()
-
 add_library(forge_backend ${FORGE_BACKEND_SOURCES})
 add_library(forge::backend ALIAS forge_backend)
 target_include_directories(forge_backend PUBLIC include)
@@ -49,10 +45,4 @@ if(FORGE_ENABLE_VULKAN)
   target_compile_definitions(forge_backend PRIVATE
     FORGE_SHADER_DIR=\"${FORGE_SHADER_BINARY_DIR}\")
   add_dependencies(forge_backend forge_shaders)
-endif()
-if(FORGE_ENABLE_JULIA_GPU)
-  target_compile_definitions(forge_backend PUBLIC FORGE_ENABLE_JULIA_GPU=1)
-  # CMAKE_SOURCE_DIR (not CURRENT): the Julia project lives at the repo root.
-  target_compile_definitions(forge_backend PRIVATE
-    FORGE_JULIA_PROJECT_DIR=\"${CMAKE_SOURCE_DIR}/tools/julia_gpu\")
 endif()

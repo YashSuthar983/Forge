@@ -1,6 +1,6 @@
 // CPU-vs-CPU parity: verifies the harness itself, the batched-vs-single
 // agreement, and that transfer accounting is populated. The same harness is
-// reused by test_julia_gpu_parity against the real candidate backend.
+// against a candidate KernelBackend.
 #include "parity_harness.hpp"
 
 int main() {

@@ -9,8 +9,9 @@ for d in core sparse model io backend engines la presolve certify search; do
   INC="$INC -I src/$d/include"
 done
 for p in fo_probe fo_probe2 dualbnd; do
+  # -lz required: forge_io gzip inflate uses system zlib (see dependency_ledger.md).
   g++ -O2 -std=c++20 $INC "tools/fo_diag/$p.cpp" -o "$B/$p" \
     -L "$B" -lforge_engines -lforge_presolve -lforge_io -lforge_model -lforge_backend \
-    -lforge_la_cpu -lforge_sparse -lforge_certify -lforge_core -lvulkan
+    -lforge_la_cpu -lforge_sparse -lforge_certify -lforge_core -lvulkan -lz
   echo "built $B/$p"
 done
