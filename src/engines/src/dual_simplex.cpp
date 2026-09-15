@@ -519,6 +519,95 @@ core::RawResult solve_dual_simplex_prepared(
     const auto& aci = p.A.pattern.col_idx();
     const auto& avl = p.A.vals;
 
+    // ---- nonbasic-partitioned row store -----------------------------------
+    // The pivotal row only ever keeps ACTIVE columns (nonbasic and not
+    // permanently fixed), yet the plain CSR walk visits every entry of every
+    // touched row and throws roughly half away: dfl001 touched 191.6M entries
+    // to keep 100.2M. So keep a permuted copy of A in which each row's active
+    // entries sit in a contiguous prefix.
+    //
+    // A basis change moves exactly two columns across the boundary (the
+    // entering one leaves the active set, the leaving one joins it unless it
+    // is permanently fixed), and each move is O(1) per entry of that column:
+    // swap the entry with the one at the boundary and step the boundary. The
+    // permutation is therefore maintained, never rebuilt, except when a
+    // singular-basis repair changes the basis wholesale.
+    //
+    // Entry ids are the ORIGINAL CSR indices, so pr_slot/pr_at are inverses of
+    // each other and the column lists below are built once.
+    std::vector<Index>  pr_act(sz(m), 0);        // end of row i's active prefix
+    std::vector<Index>  pr_col(aci.size(), 0);
+    std::vector<f64>    pr_val(avl.size(), 0.0);
+    std::vector<Offset> pr_slot(aci.size(), 0);  // entry id -> position
+    std::vector<Offset> pr_at(aci.size(), 0);    // position -> entry id
+    std::vector<Index>  pr_row(aci.size(), 0);   // entry id -> row
+    std::vector<Offset> pr_cstart(sz(ns) + 1, 0);
+    std::vector<Offset> pr_centry(aci.size(), 0);
+    {
+        for (Index i = 0; i < m; ++i)
+            for (Offset k = arp[sz(i)]; k < arp[sz(i) + 1]; ++k) {
+                pr_row[sz(k)] = i;
+                ++pr_cstart[sz(aci[sz(k)]) + 1];
+            }
+        for (Index j = 0; j < ns; ++j) pr_cstart[sz(j) + 1] += pr_cstart[sz(j)];
+        std::vector<Offset> fill = pr_cstart;
+        for (Offset k = 0; k < static_cast<Offset>(aci.size()); ++k)
+            pr_centry[sz(fill[sz(aci[sz(k)])]++)] = k;
+    }
+    const auto pr_swap = [&](Offset a, Offset b) {
+        if (a == b) return;
+        std::swap(pr_col[sz(a)], pr_col[sz(b)]);
+        std::swap(pr_val[sz(a)], pr_val[sz(b)]);
+        const Offset ea = pr_at[sz(a)], eb = pr_at[sz(b)];
+        pr_at[sz(a)] = eb; pr_at[sz(b)] = ea;
+        pr_slot[sz(eb)] = a; pr_slot[sz(ea)] = b;
+    };
+    // Column j joins the active prefix of each of its rows.
+    const auto pr_activate = [&](Index j) {
+        if (j < 0 || j >= ns) return;
+        for (Offset t = pr_cstart[sz(j)]; t < pr_cstart[sz(j) + 1]; ++t) {
+            const Offset k = pr_centry[sz(t)];
+            const Index i = pr_row[sz(k)];
+            const Offset pos = pr_slot[sz(k)];
+            const Offset b = arp[sz(i)] + pr_act[sz(i)];
+            if (pos < b) continue;                  // already active
+            pr_swap(pos, b);
+            ++pr_act[sz(i)];
+        }
+    };
+    const auto pr_deactivate = [&](Index j) {
+        if (j < 0 || j >= ns) return;
+        for (Offset t = pr_cstart[sz(j)]; t < pr_cstart[sz(j) + 1]; ++t) {
+            const Offset k = pr_centry[sz(t)];
+            const Index i = pr_row[sz(k)];
+            const Offset pos = pr_slot[sz(k)];
+            const Offset b = arp[sz(i)] + pr_act[sz(i)];
+            if (pos >= b) continue;                 // already inactive
+            pr_swap(pos, b - 1);
+            --pr_act[sz(i)];
+        }
+    };
+    // Rebuild from pivotal_active. Used once at start-up and after a
+    // singular-basis repair, both O(nnz).
+    const auto pr_rebuild = [&]() {
+        for (Index i = 0; i < m; ++i) {
+            Offset w = arp[sz(i)];
+            for (Offset k = arp[sz(i)]; k < arp[sz(i) + 1]; ++k)
+                if (pivotal_active[sz(aci[sz(k)])] != 0) {
+                    pr_col[sz(w)] = aci[sz(k)]; pr_val[sz(w)] = avl[sz(k)];
+                    pr_at[sz(w)] = k; pr_slot[sz(k)] = w; ++w;
+                }
+            pr_act[sz(i)] = static_cast<Index>(w - arp[sz(i)]);
+            for (Offset k = arp[sz(i)]; k < arp[sz(i) + 1]; ++k)
+                if (pivotal_active[sz(aci[sz(k)])] == 0) {
+                    pr_col[sz(w)] = aci[sz(k)]; pr_val[sz(w)] = avl[sz(k)];
+                    pr_at[sz(w)] = k; pr_slot[sz(k)] = w; ++w;
+                }
+        }
+    };
+    bool partition_stale = false;
+    pr_rebuild();
+
     // alpha_r = rho' [A | -I], visiting only rows where rho is nonzero.
     const auto build_pivotal_row = [&]() {
         const auto t0 = Clock::now();
@@ -532,6 +621,44 @@ core::RawResult solve_dual_simplex_prepared(
             std::fill(prow_stamp.begin(), prow_stamp.end(), 0);
             prow_generation = 1;
         }
+        // Active-only pricing reads the partitioned prefix, so it never touches
+        // an entry it would discard. `prow_full_size` then counts the columns
+        // actually visited rather than every column in the row -- which is the
+        // point, and is also what feeds avg_pivotal_row_density and therefore
+        // the DSE cost controller. That is a deliberate behaviour change, not
+        // an accident; see the report.
+        const auto add_rho_row_active = [&](Index i) {
+            const f64 r = rho[sz(i)];
+            if (r == 0.0) return;
+            const Offset beg = arp[sz(i)];
+            const Offset end = beg + pr_act[sz(i)];
+            for (Offset pos = beg; pos < end; ++pos) {
+                const Index j = pr_col[sz(pos)];
+                if (prow_stamp[sz(j)] != prow_generation) {
+                    prow_stamp[sz(j)] = prow_generation;
+                    ++prow_full_size;
+                    prow_kept[sz(j)] = 1;
+                    prow[sz(j)] = r * pr_val[sz(pos)];
+                    prow_idx.push_back(j);
+                } else {
+                    prow[sz(j)] += r * pr_val[sz(pos)];
+                }
+            }
+            // The row's own logical is the identity part of [A | -I]. A basic
+            // one is discarded by every consumer, and prow[] is only ever read
+            // through prow_idx, so writing it is pure cost. On dfl001 that one
+            // write per touched row was 45M of the 145M entries touched.
+            // The row's own logical is the identity part of [A | -I]. A basic
+            // one is discarded by every consumer, and prow[] is only ever read
+            // through prow_idx, so writing it is pure cost. On dfl001 that one
+            // write per touched row was 45M of the 145M entries touched.
+            const Index jl = ns + i;
+            if (pivotal_active[sz(jl)] != 0) {
+                prow[sz(jl)] = -r;
+                ++prow_full_size;
+                prow_idx.push_back(jl);
+            }
+        };
         const auto add_rho_row = [&](Index i) {
             const f64 r = rho[sz(i)];
             if (r == 0.0) return;
@@ -577,7 +704,13 @@ core::RawResult solve_dual_simplex_prepared(
             if (keep_logical)
                 prow_idx.push_back(jl);
         };
-        if (rho_is_sparse) {
+        if (prow_active_only) {
+            if (rho_is_sparse) {
+                for (const Index i : rho_support) add_rho_row_active(i);
+            } else {
+                for (Index i = 0; i < m; ++i) add_rho_row_active(i);
+            }
+        } else if (rho_is_sparse) {
             for (const Index i : rho_support) add_rho_row(i);
         } else {
             for (Index i = 0; i < m; ++i) add_rho_row(i);
@@ -1170,6 +1303,7 @@ core::RawResult solve_dual_simplex_prepared(
                 pivotal_active[sz(oldv)] = static_cast<std::uint8_t>(
                     permanently_fixed[sz(oldv)] == 0);
                 pivotal_active[sz(newv)] = 0;
+                partition_stale = true;
                 ++diag.basis_repairs;
             }
             build_basis_matrix();
@@ -1177,6 +1311,10 @@ core::RawResult solve_dual_simplex_prepared(
         }
         ++diag.refactorizations;
         diag.factor_ms += ms_since(t0);
+        // A repair moved columns in and out of the basis without going through
+        // the pivot path, so the partitioned row store is rebuilt rather than
+        // tracked. Repairs are rare and bounded by max_basis_repairs.
+        if (partition_stale) { pr_rebuild(); partition_stale = false; }
         // Covers both the first factorization and any singular-basis repair
         // above, which is the only other place basis[] changes wholesale.
         sync_slot_bounds();
@@ -1300,6 +1438,10 @@ core::RawResult solve_dual_simplex_prepared(
         pivotal_active[sz(vl)] = static_cast<std::uint8_t>(
             permanently_fixed[sz(vl)] == 0);
         pivotal_active[sz(q)] = 0;
+        // Keep the partitioned row store in step: two columns cross the
+        // active boundary per pivot, each in O(1) per entry of that column.
+        if (pivotal_active[sz(vl)] != 0) pr_activate(vl);
+        pr_deactivate(q);
         refresh_slot_bounds(leave);
         xB[sz(leave)] = q_from + static_cast<f64>(qdir) * t;
 

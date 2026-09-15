@@ -17,6 +17,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -198,7 +199,14 @@ void test_pruned_basic_pivotal_entries_match_full_path() {
     CHECK(full.diag.dual_pivotal_entries_full > 0);
     CHECK(full.diag.dual_pivotal_entries_kept ==
           full.diag.dual_pivotal_entries_full);
-    CHECK(pruned.diag.dual_pivotal_entries_kept <
+    // The active-only path reads a nonbasic-partitioned copy of A, so it no
+    // longer VISITS the entries it would discard -- touched and kept coincide
+    // on it. The saving is therefore expressed against the retained path,
+    // which is the stronger statement: strictly fewer entries touched, for the
+    // same trajectory asserted below.
+    CHECK(pruned.diag.dual_pivotal_entries_full <
+          full.diag.dual_pivotal_entries_full);
+    CHECK(pruned.diag.dual_pivotal_entries_kept <=
           pruned.diag.dual_pivotal_entries_full);
     CHECK(accumulated.diag.dual_pivotal_entries_kept ==
           pruned.diag.dual_pivotal_entries_kept);
@@ -382,6 +390,94 @@ ENDATA
     // Neither engine runs a phase-1 pivot on this model.
     CHECK(diag.phase1_iterations == 0);
     CHECK(diag.primal_cleanup_iterations <= 4);
+}
+
+// Partitioned vs full row PRICE, over many random bases.
+//
+// The pivotal row is now assembled from a nonbasic-partitioned copy of A whose
+// permutation is maintained incrementally across pivots. An incremental
+// permutation is exactly the kind of thing that is right for a hundred pivots
+// and wrong on the hundred-and-first, and a wrong pivotal row does not
+// necessarily produce a wrong ANSWER -- it produces a different, still-optimal
+// trajectory. So compare trajectories, not objectives:
+// SOR_DUAL_FILTER_ACTIVE_PIVOTAL forces the unpartitioned scan with the same
+// keep filter, which is the reference implementation for this.
+void test_partitioned_price_matches_full_scan_on_random_bases() {
+    std::mt19937 rng(20260909u);
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+    int compared = 0;
+
+    for (int trial = 0; trial < 60; ++trial) {
+        const Index rows = 4 + static_cast<Index>(rng() % 14);
+        const Index cols = rows + static_cast<Index>(rng() % 18);
+        std::vector<Index> ri, ci;
+        std::vector<f64> vv;
+        for (Index i = 0; i < rows; ++i)
+            for (Index j = 0; j < cols; ++j)
+                if (rng() % 100 < 35) {
+                    ri.push_back(i); ci.push_back(j);
+                    vv.push_back(std::round((4.0 * unit(rng) - 2.0) * 4.0) / 4.0);
+                }
+        if (ri.empty()) continue;
+
+        sor::model::LpProblem p;
+        p.A = sor::sparse::from_triplets(rows, cols, ri, ci, vv);
+        p.c.resize(static_cast<std::size_t>(cols));
+        p.col_lo.assign(static_cast<std::size_t>(cols), 0.0);
+        p.col_hi.assign(static_cast<std::size_t>(cols), 0.0);
+        for (Index j = 0; j < cols; ++j) {
+            const auto u = static_cast<std::size_t>(j);
+            p.c[u] = std::round((2.0 * unit(rng) - 1.0) * 8.0) / 4.0;
+            // Mix bound classes: the partition only holds columns that are
+            // nonbasic AND not permanently fixed, so fixed and boxed columns
+            // are the interesting ones.
+            switch (rng() % 4) {
+                case 0: p.col_hi[u] = sor::model::kInf; break;      // one-sided
+                case 1: p.col_hi[u] = 1.0 + 3.0 * unit(rng); break; // boxed
+                case 2: p.col_hi[u] = 0.0; break;                   // fixed
+                default: p.col_hi[u] = 2.0; break;
+            }
+        }
+        p.row_lo.assign(static_cast<std::size_t>(rows), 0.0);
+        p.row_hi.assign(static_cast<std::size_t>(rows), 0.0);
+        for (Index i = 0; i < rows; ++i) {
+            const auto u = static_cast<std::size_t>(i);
+            p.row_lo[u] = -1.0 - 4.0 * unit(rng);
+            p.row_hi[u] = (rng() % 3 == 0) ? p.row_lo[u] : 1.0 + 4.0 * unit(rng);
+        }
+
+        SimplexOptions opts;
+        opts.method = sor::engines::SimplexMethod::Dual;
+        opts.presolve = false;
+
+        SimplexDiagnostics part_diag, full_diag;
+        SimplexBasis part_basis, full_basis;
+        auto part_raw = sor::engines::solve_simplex(p, opts, part_diag, &part_basis);
+        SimplexDiagnostics fd;
+        SimplexBasis fb;
+        {
+            ScopedEnvironment filter("SOR_DUAL_FILTER_ACTIVE_PIVOTAL", "1");
+            full_diag = fd;
+            auto full_raw = sor::engines::solve_simplex(p, opts, full_diag, &full_basis);
+            CHECK(part_raw.proposed_status == full_raw.proposed_status);
+            if (part_raw.proposed_status == Status::Optimal) {
+                CHECK(part_raw.objective == full_raw.objective);   // bitwise
+                CHECK(part_raw.x == full_raw.x);
+                CHECK(part_raw.y == full_raw.y);
+            }
+        }
+        CHECK(part_diag.iterations == full_diag.iterations);
+        CHECK(part_basis.basic == full_basis.basic);
+        CHECK(part_basis.status == full_basis.status);
+        // The partitioned path must touch no more than the filtered scan, and
+        // on anything non-trivial strictly less.
+        CHECK(part_diag.dual_pivotal_entries_kept ==
+              full_diag.dual_pivotal_entries_kept);
+        CHECK(part_diag.dual_pivotal_entries_full <=
+              full_diag.dual_pivotal_entries_full);
+        ++compared;
+    }
+    CHECK(compared > 40);
 }
 
 void test_auto_candidate_order_uses_feasibility_before_gap() {
@@ -1679,6 +1775,7 @@ int main() {
     test_pruned_fixed_pivotal_entries_match_retained_path();
     test_dual_cost_perturbation_cleans_before_optimality();
     test_dual_cleanup_hands_over_a_primal_feasible_basis();
+    test_partitioned_price_matches_full_scan_on_random_bases();
     test_auto_candidate_order_uses_feasibility_before_gap();
     test_basis_wellformed();
     test_features_mps_agrees_with_model();
