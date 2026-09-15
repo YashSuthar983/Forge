@@ -1,12 +1,14 @@
-// SOR — lightweight LP presolve (Andersen & Andersen 1995 subset).
+// SOR — LP presolve with a chronological postsolve journal.
 //
-// LAYER L3. Reversible reductions with postsolve recovery for the solution
-// vector. Proof steps (C6) are not emitted yet — this is presolve v1 for speed.
+// LAYER L3. Reversible reductions recover primal/dual solutions on the original
+// model. Proof steps (C6) are not emitted from presolve itself.
 #pragma once
 
+#include "sor/core/result.hpp"
 #include "sor/model/lp.hpp"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace sor::presolve {
@@ -16,11 +18,61 @@ using core::Index;
 using core::Offset;
 
 struct PresolveStats {
+    Index original_rows = 0;
+    Index original_cols = 0;
+    Offset original_nnz = 0;
+    Index reduced_rows = 0;
+    Index reduced_cols = 0;
+    Offset reduced_nnz = 0;
+    Index passes = 0;
+
     Index rows_removed    = 0;
     Index cols_fixed      = 0;
     Index cols_removed    = 0;
     Index bounds_tightened = 0;
+    Index singleton_columns_removed = 0;
+    Index forcing_rows_removed = 0;
+    Index forcing_columns_fixed = 0;
+    Index equality_aggregations = 0;
+    Offset aggregation_fill = 0;
+    Index dual_fixes = 0;
+    Index doubleton_substitutions = 0;
+    Index dominated_columns_removed = 0;
+    Index duplicate_rows_merged = 0;
+    Index duplicate_columns_merged = 0;
+
+    double elapsed_ms = 0.0;
 };
+
+struct PresolveOptions {
+    bool enabled = true;
+    bool implied_slack = false;
+    // Queue-driven v2 rules (dual fix, duplicates, …). Off by default so
+    // presolve_lp() stays bit-identical to the immutable fixed-point kernel.
+    bool live_reductions = false;
+    // Sub-rules apply only when live_reductions is true. Aggressive ones
+    // default off: implied bounds can box former semi-bounded slacks into a
+    // state where doubleton then deletes them, and parallel/dominated merges
+    // still need broader dual-ray coverage before they are production-safe.
+    bool implied_bounds = false;
+    bool dominated_columns = false;
+    bool parallel_rows = false;
+    bool parallel_columns = false;
+    int max_passes = 64;
+    f64 feasibility_tol = 1e-7;
+    f64 stability_tol_scale = 1e-9;
+    Offset max_substitution_fill = 512;
+};
+
+enum class PresolveStatus : std::uint8_t {
+    Reduced = 0,
+    Solved,
+    Infeasible,
+    Unbounded,
+    NumericalFailure,
+};
+
+const char* to_string(PresolveStatus s);
 
 struct BoundChange {
     Index col = -1;
@@ -32,46 +84,166 @@ struct BoundChange {
     f64 new_hi = 0.0;
 };
 
-// Maps original column j -> fixed value (when fixed) or new column index.
-//
-// The ROW maps exist so a basis on the reduced problem can be lifted back to
-// the original index space. Without them a caller receiving a SimplexBasis has
-// no way to tell which original row a basis slot belongs to, and silently mixes
-// reduced-space indices with a postsolved (original-space) x.
+enum class DualRecoveryKind : std::uint8_t {
+    EqualitySingletonFix,
+    SingletonColumnElimination,
+    EqualityAggregation,
+    BoundTightening,
+    ForcingRow,
+    DualFix,
+    DoubletonEquality,
+    DominatedColumn,
+    ParallelRowMerge,
+    ParallelColumnMerge,
+};
+
+struct DualRecoveryStep {
+    DualRecoveryKind kind = DualRecoveryKind::EqualitySingletonFix;
+    Index row = -1;
+
+    Index col = -1;
+    f64 coeff = 0.0;
+    f64 old_lo = 0.0;
+    f64 old_hi = 0.0;
+    f64 new_lo = 0.0;
+    f64 new_hi = 0.0;
+    Index record = -1;
+
+    f64 stage_cost = 0.0;
+    std::vector<Index> other_rows;
+    std::vector<f64> other_row_coefficients;
+
+    bool at_max = false;
+    std::vector<Index> columns;
+    std::vector<f64> coefficients;
+};
+
+struct SingletonColumnElimination {
+    Index row = -1;
+    Index col = -1;
+    f64 coeff = 0.0;
+    f64 rhs = 0.0;
+    f64 dual_value = 0.0;
+    bool row_removed = true;
+    std::vector<Index> other_cols;
+    std::vector<f64> other_coeffs;
+};
+
+struct EqualityAggregation {
+    Index row = -1;
+    Index col = -1;
+    f64 coeff = 0.0;
+    f64 rhs = 0.0;
+    f64 dual_value = 0.0;
+    std::vector<Index> other_cols;
+    std::vector<f64> other_coeffs;
+    std::vector<Index> affected_rows;
+    std::vector<f64> row_multipliers;
+};
+
+struct DoubletonEqualitySubstitution {
+    Index row = -1;
+    Index elim_col = -1;
+    Index keep_col = -1;
+    f64 elim_coeff = 0.0;
+    f64 keep_coeff = 0.0;
+    f64 rhs = 0.0;
+    f64 dual_value = 0.0;
+    std::vector<Index> other_cols;
+    std::vector<f64> other_coeffs;
+};
+
 struct PresolveMap {
     model::LpProblem problem;
-    std::vector<Index> orig_to_new;   // -1 if fixed
+    std::vector<Index> orig_to_new;
     std::vector<f64>   fixed_value;
     std::vector<Index> new_to_orig;
 
-    std::vector<Index> row_orig_to_new;   // -1 if the row was removed
+    std::vector<Index> row_orig_to_new;
     std::vector<Index> row_new_to_orig;
 
-    // Equality-singleton dual recovery (see presolve.cpp): triples
-    // (eq_row_[t], eq_col_[t], eq_coeff_[t]) recorded in the order the fixes
-    // were made. A column fixed by an equality singleton row sits at an
-    // INTERIOR point of its own bounds, so the certificate's complementarity
-    // check demands reduced cost ~0 for it; the postsolve dual recovery sets
-    // the row's multiplier to exactly that end. Reverse chronological order
-    // matters: a later fix's row can contain an earlier fixed column, so
-    // applying corrections last-to-first sees final multipliers everywhere
-    // they enter.
-    std::vector<Index> eq_row_;
-    std::vector<Index> eq_col_;
-    std::vector<f64>   eq_coeff_;
-
-    // Implied singleton-column bound tightenings. They are retained for
-    // diagnostics and future dual recovery; postsolve does not need to move
-    // x because tightening never changes the original variable coordinates.
     std::vector<BoundChange> bound_changes;
+    std::vector<DualRecoveryStep> recovery_steps;
+    std::vector<SingletonColumnElimination> singleton_columns;
+    std::vector<EqualityAggregation> equality_aggregations;
+    std::vector<DoubletonEqualitySubstitution> doubleton_equalities;
 
     PresolveStats stats;
 };
 
-// Reductions: fixed columns, singleton row/column fixes, and empty rows.
-PresolveMap presolve_lp(const model::LpProblem& in);
+struct PresolveOutcome {
+    PresolveStatus status = PresolveStatus::Reduced;
+    PresolveMap map;
+    Index witness_row = -1;
+    Index witness_col = -1;
+    std::string reason;
 
-// Lift a solution on the presolved problem back to the original columns.
+    bool reduced() const noexcept {
+        return status == PresolveStatus::Reduced ||
+               status == PresolveStatus::Solved;
+    }
+
+    const PresolveStats& stats() const noexcept { return map.stats; }
+};
+
+PresolveOutcome presolve(const model::LpProblem& in,
+                         const PresolveOptions& opts = {});
+
+PresolveMap presolve_lp(const model::LpProblem& in, bool implied_slack = false);
+
 std::vector<f64> postsolve(const PresolveMap& map, const std::vector<f64>& x_reduced);
+
+// Mirrors sor::engines::NonbasicStatus so presolve stays independent of L4.
+enum class PostsolveNonbasicStatus : std::uint8_t {
+    Basic = 0,
+    AtLower,
+    AtUpper,
+    AtZeroFree,
+};
+
+struct PostsolveBasis {
+    Index n_struct = 0;
+    std::vector<Index> basic;
+    std::vector<PostsolveNonbasicStatus> status;
+};
+
+struct PresolveReducedSolve {
+    std::vector<f64> x;
+    std::vector<f64> y;
+    PostsolveBasis basis;
+    bool has_basis = false;
+};
+
+struct PresolveRecoveryOptions {
+    f64 primal_feas_tol = 1e-7;
+    f64 dual_feas_tol = 1e-7;
+    f64 gap_tol = 1e-9;
+};
+
+struct PresolveRecoveryResult {
+    core::RawResult raw;
+    PostsolveBasis basis;
+    core::ProofEvidence evidence;
+    bool validated = false;
+    std::string failure_reason;
+};
+
+// Lift a reduced-space candidate to the original model and validate against it.
+PresolveRecoveryResult recover_solution(
+    const model::LpProblem& original,
+    const PresolveMap& map,
+    const PresolveReducedSolve& reduced,
+    const PresolveRecoveryOptions& opts = {});
+
+core::PrimalRay recover_primal_ray(const model::LpProblem& original,
+                                   const PresolveMap& map,
+                                   const core::PrimalRay& reduced,
+                                   f64 tolerance = 1e-7);
+
+core::DualFarkasRay recover_dual_farkas_ray(
+    const model::LpProblem& original,
+    const PresolveMap& map,
+    const core::DualFarkasRay& reduced,
+    f64 tolerance = 1e-7);
 
 }  // namespace sor::presolve

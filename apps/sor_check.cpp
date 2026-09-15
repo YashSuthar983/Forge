@@ -9,9 +9,11 @@
 //
 // LAYER L8.
 #include "sor/engines/farkas.hpp"
+#include "sor/certify/finalize.hpp"
 #include "sor/io/mps.hpp"
 #include "sor/io/solution.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -24,6 +26,8 @@ namespace {
 void usage() {
     std::fputs(
         "usage: sor_check MODEL.mps SOLUTION.sol [--tol T]\n"
+        "                 [--relax-integrality] [--small-matrix-value V]\n"
+        "                 [--fixed-mps|--free-mps]\n"
         "  SOLUTION.sol is written by `sor_solve ... --solution-out FILE`.\n"
         "  Exit 0: the claim independently verifies. Exit 1: it does not.\n",
         stderr);
@@ -46,11 +50,54 @@ int main(int argc, char** argv) {
 
     std::string model_path, solution_path;
     double tol = 1e-7;
+    sor::io::MpsReadOptions mps_opts;
+    bool mps_format_forced = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--tol") {
-            if (i + 1 >= argc) { usage(); return 2; }
-            tol = std::strtod(argv[++i], nullptr);
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "error: --tol needs a value\n");
+                return 2;
+            }
+            // strtod with a null end pointer accepts "abc" as 0 and takes
+            // "nan"/"inf" at face value, so a mistyped tolerance silently
+            // changed what the checker accepts instead of failing.
+            const std::string text = argv[++i];
+            std::size_t used = 0;
+            try { tol = std::stod(text, &used); } catch (const std::exception&) { used = 0; }
+            if (used != text.size() || !std::isfinite(tol) || !(tol > 0.0)) {
+                std::fprintf(stderr,
+                             "error: --tol expects a finite number greater than 0, "
+                             "got '%s'\n", text.c_str());
+                return 2;
+            }
+        } else if (a == "--relax-integrality") {
+            mps_opts.relax_integrality = true;
+        } else if (a == "--small-matrix-value") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "error: --small-matrix-value needs a value\n");
+                return 2;
+            }
+            const std::string text = argv[++i];
+            std::size_t used = 0;
+            try {
+                mps_opts.small_matrix_value = std::stod(text, &used);
+            } catch (const std::exception&) {
+                used = 0;
+            }
+            if (used != text.size() || !std::isfinite(mps_opts.small_matrix_value) ||
+                !(mps_opts.small_matrix_value > 0.0)) {
+                std::fprintf(stderr,
+                             "error: --small-matrix-value expects a finite number "
+                             "greater than 0, got '%s'\n", text.c_str());
+                return 2;
+            }
+        } else if (a == "--fixed-mps") {
+            mps_opts.fixed_format = true;
+            mps_format_forced = true;
+        } else if (a == "--free-mps") {
+            mps_opts.fixed_format = false;
+            mps_format_forced = true;
         } else if (a == "-h" || a == "--help") {
             usage();
             return 0;
@@ -67,7 +114,9 @@ int main(int argc, char** argv) {
 
     try {
         sor::io::MpsReadReport rep;
-        const auto lp = sor::io::read_mps_file_auto(model_path, rep);
+        const auto lp = mps_format_forced
+                            ? sor::io::read_mps_file(model_path, rep, mps_opts)
+                            : sor::io::read_mps_file_auto(model_path, rep, mps_opts);
         for (const auto& w : rep.warnings)
             std::fprintf(stderr, "warning: %s\n", w.c_str());
 
@@ -110,36 +159,64 @@ int main(int argc, char** argv) {
                 ok &= (obj_err <= tol)
                           ? pass("objective (recomputed)", obj_err, tol)
                           : fail("objective (recomputed)", obj_err, tol);
-                // Optimal additionally claims a proof; this checker has no
-                // independent way to re-derive dual optimality without a
-                // basis (which is exactly the state this binary refuses to
-                // trust), so an Optimal claim's PROOF is not re-verified
-                // here -- only that the point itself is genuinely feasible
-                // and the stated objective matches it. That is the honest
-                // scope of a checker that never touches solver internals.
+                if (sol.status == sor::core::Status::Optimal) {
+                    sor::core::RawResult raw;
+                    raw.proposed_status = sol.status;
+                    raw.proposed_level = sol.proof;
+                    raw.objective = sol.objective;
+                    raw.x = sol.x;
+                    raw.y = sol.y;
+                    const auto ev = sor::certify::check_lp_point(
+                        lp, raw, tol, tol, tol, true);
+                    ok &= (ev.max_dual_violation <= tol)
+                              ? pass("dual/reduced costs",
+                                     ev.max_dual_violation, tol)
+                              : fail("dual/reduced costs",
+                                     ev.max_dual_violation, tol);
+                    ok &= (ev.gap_rel <= tol)
+                              ? pass("primal-dual gap", ev.gap_rel, tol)
+                              : fail("primal-dual gap", ev.gap_rel, tol);
+                }
                 break;
             }
             case sor::core::Status::Infeasible: {
-                if (sol.ray.empty()) {
-                    std::printf(
-                        "no certificate: status=Infeasible but no ray was recorded "
-                        "(honest gap, not a failure -- nothing to verify)\n");
+                const auto& ray = sol.dual_farkas_ray.empty()
+                                      ? sol.ray : sol.dual_farkas_ray;
+                if (ray.empty()) {
+                    std::printf("FAIL  status=Infeasible but no Farkas "
+                                "certificate was recorded\n");
+                    ok = false;
                     break;
                 }
-                const double v = sor::engines::farkas_violation(lp, sol.ray);
-                if (!std::isfinite(v)) {
-                    ok = fail("farkas certificate", v, tol);
-                } else {
-                    ok &= (v <= tol) ? pass("farkas certificate", v, tol)
-                                     : fail("farkas certificate", v, tol);
+                const auto cert = sor::certify::check_dual_farkas_ray(lp, ray, tol);
+                ok &= cert.certified
+                          ? pass("farkas certificate",
+                                 cert.max_homogeneous_residual, tol)
+                          : fail("farkas certificate",
+                                 cert.max_homogeneous_residual, tol);
+                break;
+            }
+            case sor::core::Status::Unbounded: {
+                if (sol.primal_ray.empty()) {
+                    std::printf("FAIL  status=Unbounded but no primal ray was "
+                                "recorded\n");
+                    ok = false;
+                    break;
                 }
+                const auto cert = sor::certify::check_primal_ray(
+                    lp, sol.primal_ray, tol);
+                ok &= cert.certified
+                          ? pass("primal ray", std::max(cert.max_row_residual,
+                                                       cert.max_bound_sign_residual), tol)
+                          : fail("primal ray", std::max(cert.max_row_residual,
+                                                       cert.max_bound_sign_residual), tol);
                 break;
             }
             default:
                 std::printf(
-                    "no independent check implemented for status=%s "
-                    "(honest gap, not a failure)\n",
+                    "FAIL  no independent check implemented for status=%s\n",
                     std::string(sor::core::to_string(sol.status)).c_str());
+                ok = false;
                 break;
         }
 

@@ -41,4 +41,10 @@ core::RawResult solve_dual_simplex_prepared(
     SimplexDiagnostics& diag, SimplexBasis* out_basis,
     const SimplexBasis* warm);
 
+// Add one stage's work counters and timers into `total` (and count a stage).
+// Shared by the Auto dispatcher and by the dual engine's primal clean-up so a
+// hand-off never loses pivots or timings from the profile.
+void accumulate_simplex_work(SimplexDiagnostics& total,
+                             const SimplexDiagnostics& stage);
+
 }  // namespace sor::engines

@@ -50,6 +50,54 @@ int main() {
         }
     }
 
+    // ---- power-of-two Ruiz factors must be EXACT ----------------------------
+    // The whole reason to accept a coarser equilibration is that a factor of
+    // 2^k changes only an exponent: every scaled coefficient keeps the
+    // mantissa of the original, and unscaling recovers it bit for bit. An
+    // "almost exact" version of this would be pointless, so the test compares
+    // bits, not tolerances.
+    {
+        auto p = load_test_lp();
+        const auto before = p.A.vals;
+        auto q = p;
+        const auto s = engines::ruiz_scale(q, 10, /*power_of_two=*/true);
+
+        const auto is_power_of_two = [](core::f64 v) {
+            int e = 0;
+            return v > 0.0 && std::isfinite(v) && std::frexp(v, &e) == 0.5;
+        };
+        for (auto v : s.row_scale) CHECK(is_power_of_two(v));
+        for (auto v : s.col_scale) CHECK(is_power_of_two(v));
+
+        const auto& rp = q.A.pattern.row_ptr();
+        const auto& ci = q.A.pattern.col_idx();
+        for (core::Index r = 0; r < q.n_rows(); ++r) {
+            for (auto k = rp[static_cast<std::size_t>(r)];
+                 k < rp[static_cast<std::size_t>(r) + 1]; ++k) {
+                const auto kk = static_cast<std::size_t>(k);
+                const auto j = static_cast<std::size_t>(ci[kk]);
+                const core::f64 factor =
+                    s.row_scale[static_cast<std::size_t>(r)] * s.col_scale[j];
+                // Exact product, and exactly reversible.
+                CHECK(q.A.vals[kk] == before[kk] * factor);
+                CHECK(q.A.vals[kk] / factor == before[kk]);
+                // Same mantissa: only the exponent moved.
+                int e_before = 0, e_after = 0;
+                CHECK(std::frexp(before[kk], &e_before) ==
+                      std::frexp(q.A.vals[kk], &e_after));
+            }
+        }
+
+        // The default path is NOT power-of-two, or the option would be a no-op
+        // and this test would be vacuous.
+        auto plain = p;
+        const auto sp = engines::ruiz_scale(plain, 10);
+        bool any_non_pow2 = false;
+        for (auto v : sp.row_scale) any_non_pow2 |= !is_power_of_two(v);
+        for (auto v : sp.col_scale) any_non_pow2 |= !is_power_of_two(v);
+        CHECK(any_non_pow2);
+    }
+
     // ---- PDHG must approach the known optimum ----
     {
         const auto p = load_test_lp();
@@ -142,6 +190,29 @@ int main() {
         // claim a feasible point either.
         CHECK(res.status != core::Status::Optimal);
         CHECK(diag.primal_residual > opts.primal_tol);
+    }
+
+    // Finite-bound dual contributions survive tolerance handling.  Here the
+    // reduced cost is below dual_tol but its product with the fixed bound is
+    // 50, so zeroing it would create a false duality gap.
+    {
+        model::LpProblem p;
+        p.A = sparse::from_triplets(0, 1, {}, {}, {});
+        p.c = {5e-8};
+        p.col_lo = {1e9};
+        p.col_hi = {1e9};
+        engines::PdhgOptions opts;
+        opts.max_iterations = 1;
+        opts.check_every = 1;
+        opts.primal_tol = 1e-6;
+        opts.dual_tol = 1e-6;
+        opts.gap_tol = 1e-12;
+        engines::PdhgDiagnostics diag;
+        const auto raw = engines::solve_pdhg(p, opts, *be, diag);
+        CHECK(raw.proposed_status == core::Status::Feasible);
+        CHECK_NEAR(raw.objective, 50.0, 1e-14);
+        CHECK_NEAR(raw.dual_bound, 50.0, 1e-14);
+        CHECK(diag.gap_rel <= opts.gap_tol);
     }
 
     return sor::test::finish("test_pdhg");

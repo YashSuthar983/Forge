@@ -7,12 +7,14 @@ namespace {
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 inline std::size_t sz(core::Offset i) { return static_cast<std::size_t>(i); }
 constexpr f64 kInf = model::kInf;
-}  // namespace
 
-PropagateResult propagate_bounds(const model::LpProblem& lp,
-                                 std::vector<f64>& col_lo,
-                                 std::vector<f64>& col_hi,
-                                 f64 tol, int max_rounds) {
+PropagateResult propagate_bounds_impl(const model::LpProblem& lp,
+                                      std::vector<f64>& col_lo,
+                                      std::vector<f64>& col_hi,
+                                      PropTrail* trail,
+                                      int depth,
+                                      f64 tol,
+                                      int max_rounds) {
     PropagateResult res;
     const Index m = lp.n_rows();
     const Index n = lp.n_cols();
@@ -34,13 +36,6 @@ PropagateResult propagate_bounds(const model::LpProblem& lp,
 
             const core::Offset beg = rp[sz(i)], end = rp[sz(i) + 1];
 
-            // Row activity range [min_act, max_act], accumulated in ONE
-            // O(row_length) pass. A term whose own bound is infinite on a
-            // side is NOT added to that side's finite sum -- instead it's
-            // counted (inf_count) and remembered (culprit, valid only when
-            // count==1) so the second pass below can tell, per variable,
-            // whether removing THAT variable's own term is enough to make
-            // the residual finite again.
             f64 min_finite = 0.0, max_finite = 0.0;
             int min_inf_count = 0, max_inf_count = 0;
             Index min_culprit = -1, max_culprit = -1;
@@ -56,9 +51,6 @@ PropagateResult propagate_bounds(const model::LpProblem& lp,
                 else { ++max_inf_count; max_culprit = j; }
             }
 
-            // Second O(row_length) pass: each variable's residual (the row
-            // activity range with its OWN term removed) is derived from the
-            // aggregates above, never by re-summing the other terms.
             for (core::Offset kk = beg; kk < end; ++kk) {
                 const Index j = ci[sz(kk)];
                 const f64 aj = av[sz(kk)];
@@ -71,10 +63,10 @@ PropagateResult propagate_bounds(const model::LpProblem& lp,
                     rmin = min_finite - aj * own;
                     rmin_finite = true;
                 } else if (min_inf_count == 1 && min_culprit == j) {
-                    rmin = min_finite;  // j's own (infinite) term was never added
+                    rmin = min_finite;
                     rmin_finite = true;
                 } else {
-                    rmin_finite = false;  // an infinite contributor survives removing j
+                    rmin_finite = false;
                 }
                 if (max_inf_count == 0) {
                     const f64 own = (aj > 0.0) ? col_hi[sz(j)] : col_lo[sz(j)];
@@ -88,8 +80,6 @@ PropagateResult propagate_bounds(const model::LpProblem& lp,
                 }
 
                 f64 new_lo = -kInf, new_hi = kInf;
-                // a_j*x_j + [rmin, rmax] in [row_lo, row_hi]
-                //   => a_j*x_j <= row_hi - rmin   and   a_j*x_j >= row_lo - rmax
                 if (aj > 0.0) {
                     if (std::isfinite(row_hi) && rmin_finite) new_hi = (row_hi - rmin) / aj;
                     if (std::isfinite(row_lo) && rmax_finite) new_lo = (row_lo - rmax) / aj;
@@ -104,17 +94,27 @@ PropagateResult propagate_bounds(const model::LpProblem& lp,
                 }
 
                 if (new_lo > col_lo[sz(j)] + tol) {
+                    if (trail) {
+                        trail->push(j, BoundDir::Lower, new_lo, col_lo[sz(j)],
+                                    ReasonKind::Row, i, depth);
+                    }
                     col_lo[sz(j)] = new_lo;
                     ++res.tightened;
                     changed_this_round = true;
                 }
                 if (new_hi < col_hi[sz(j)] - tol) {
+                    if (trail) {
+                        trail->push(j, BoundDir::Upper, new_hi, col_hi[sz(j)],
+                                    ReasonKind::Row, i, depth);
+                    }
                     col_hi[sz(j)] = new_hi;
                     ++res.tightened;
                     changed_this_round = true;
                 }
                 if (col_lo[sz(j)] > col_hi[sz(j)] + tol) {
                     res.feasible = false;
+                    res.conflict_var = j;
+                    res.conflict_row = i;
                     return res;
                 }
             }
@@ -123,6 +123,26 @@ PropagateResult propagate_bounds(const model::LpProblem& lp,
         if (!changed_this_round) break;
     }
     return res;
+}
+
+}  // namespace
+
+PropagateResult propagate_bounds(const model::LpProblem& lp,
+                                 std::vector<f64>& col_lo,
+                                 std::vector<f64>& col_hi,
+                                 f64 tol, int max_rounds) {
+    return propagate_bounds_impl(lp, col_lo, col_hi, nullptr, 0, tol, max_rounds);
+}
+
+PropagateResult propagate_bounds_trail(const model::LpProblem& lp,
+                                       std::vector<f64>& col_lo,
+                                       std::vector<f64>& col_hi,
+                                       PropTrail* trail,
+                                       int depth,
+                                       f64 tol,
+                                       int max_rounds) {
+    return propagate_bounds_impl(lp, col_lo, col_hi, trail, depth, tol,
+                                 max_rounds);
 }
 
 }  // namespace sor::search

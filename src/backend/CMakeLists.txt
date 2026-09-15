@@ -34,10 +34,6 @@ if(SOR_ENABLE_VULKAN)
 else()
   list(APPEND SOR_BACKEND_SOURCES src/vulkan_stub.cpp)
 endif()
-if(SOR_ENABLE_JULIA_GPU)
-  list(APPEND SOR_BACKEND_SOURCES src/julia_gpu_backend.cpp)
-endif()
-
 add_library(sor_backend ${SOR_BACKEND_SOURCES})
 add_library(sor::backend ALIAS sor_backend)
 target_include_directories(sor_backend PUBLIC include)
@@ -49,10 +45,4 @@ if(SOR_ENABLE_VULKAN)
   target_compile_definitions(sor_backend PRIVATE
     SOR_SHADER_DIR=\"${SOR_SHADER_BINARY_DIR}\")
   add_dependencies(sor_backend sor_shaders)
-endif()
-if(SOR_ENABLE_JULIA_GPU)
-  target_compile_definitions(sor_backend PUBLIC SOR_ENABLE_JULIA_GPU=1)
-  # CMAKE_SOURCE_DIR (not CURRENT): the Julia project lives at the repo root.
-  target_compile_definitions(sor_backend PRIVATE
-    SOR_JULIA_PROJECT_DIR=\"${CMAKE_SOURCE_DIR}/tools/julia_gpu\")
 endif()

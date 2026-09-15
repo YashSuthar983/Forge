@@ -45,6 +45,7 @@ void test_round_trip_infeasible_with_ray() {
     r.x = {2.0, 2.0};
     r.y = {0.0};
     r.ray = {1.0};
+    r.dual_farkas_ray.multipliers = {1.0};
 
     std::ostringstream out;
     sor::io::write_solution(out, r);
@@ -54,6 +55,23 @@ void test_round_trip_infeasible_with_ray() {
     CHECK(s.status == Status::Infeasible);
     CHECK(s.ray.size() == 1);
     CHECK_NEAR(s.ray[0], 1.0, 1e-15);
+    CHECK(s.dual_farkas_ray.size() == 1);
+    CHECK_NEAR(s.dual_farkas_ray[0], 1.0, 1e-15);
+}
+
+void test_round_trip_unbounded_with_primal_ray() {
+    SolveResult r;
+    r.status = Status::Unbounded;
+    r.proof = ProofLevel::BoundOnly;
+    r.primal_ray.direction = {2.0, -1.0};
+
+    std::ostringstream out;
+    sor::io::write_solution(out, r);
+    std::istringstream in(out.str());
+    const auto s = sor::io::read_solution(in);
+    CHECK(s.primal_ray.size() == 2);
+    CHECK_NEAR(s.primal_ray[0], 2.0, 1e-15);
+    CHECK_NEAR(s.primal_ray[1], -1.0, 1e-15);
 }
 
 void test_round_trip_empty_vectors() {
@@ -87,6 +105,7 @@ void test_malformed_file_throws() {
 int main() {
     test_round_trip_optimal();
     test_round_trip_infeasible_with_ray();
+    test_round_trip_unbounded_with_primal_ray();
     test_round_trip_empty_vectors();
     test_malformed_file_throws();
     return sor::test::finish("test_solution_io");

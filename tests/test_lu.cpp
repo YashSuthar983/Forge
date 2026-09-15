@@ -10,7 +10,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <random>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -23,6 +25,31 @@ using sor::la::LuOptions;
 namespace {
 
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
+
+class ScopedEnvironment {
+public:
+    ScopedEnvironment(const char* name, const char* value) : name_(name) {
+        if (const char* old = std::getenv(name)) {
+            had_old_ = true;
+            old_ = old;
+        }
+        if (value) ::setenv(name, value, 1);
+        else ::unsetenv(name);
+    }
+
+    ~ScopedEnvironment() {
+        if (had_old_) ::setenv(name_.c_str(), old_.c_str(), 1);
+        else ::unsetenv(name_.c_str());
+    }
+
+    ScopedEnvironment(const ScopedEnvironment&) = delete;
+    ScopedEnvironment& operator=(const ScopedEnvironment&) = delete;
+
+private:
+    std::string name_;
+    std::string old_;
+    bool had_old_ = false;
+};
 
 // A basis matrix held column-wise, exactly as BasisFactor::factorize takes it.
 struct ColMat {
@@ -85,6 +112,30 @@ f64 max_abs_diff(const std::vector<f64>& a, const std::vector<f64>& b) {
         d = std::max(d, std::fabs(a[i] - b[i]));
     return d;
 }
+
+void check_ftran_pair_matches_separate(const BasisFactor& f,
+                                       const std::vector<f64>& rhs_a,
+                                       const std::vector<f64>& rhs_b,
+                                       const std::string& what,
+                                       const char* file, int line) {
+    auto separate_a = rhs_a;
+    auto separate_b = rhs_b;
+    f.ftran(separate_a);
+    f.ftran(separate_b);
+
+    auto paired_a = rhs_a;
+    auto paired_b = rhs_b;
+    f.ftran_pair(paired_a, paired_b);
+
+    ::sor::test::report(paired_a == separate_a, "ftran_pair first RHS", file, line,
+                        what + " err " +
+                            std::to_string(max_abs_diff(paired_a, separate_a)));
+    ::sor::test::report(paired_b == separate_b, "ftran_pair second RHS", file, line,
+                        what + " err " +
+                            std::to_string(max_abs_diff(paired_b, separate_b)));
+}
+#define CHECK_FTRAN_PAIR(f, a, b, what) \
+    check_ftran_pair_matches_separate((f), (a), (b), (what), __FILE__, __LINE__)
 
 // Random sparse matrix with a guaranteed nonsingular structure: a permuted
 // diagonal with a strong diagonal, plus off-diagonal clutter. Without the
@@ -189,6 +240,79 @@ void test_random_solves() {
             check_solves(b, f, ("random m=" + std::to_string(m)).c_str(), 1e-8);
         }
     }
+}
+
+void test_ftran_pair_fresh_factorization_and_zero_rhs() {
+    std::mt19937 rng(20260907u);
+    constexpr Index m = 47;
+    const ColMat b = random_basis(m, 0.08, rng);
+    BasisFactor f;
+    CHECK(f.factorize(m, b.col_ptr, b.row_idx, b.vals, LuOptions{}));
+
+    std::vector<f64> dense_a(static_cast<std::size_t>(m));
+    std::vector<f64> sparse_b(static_cast<std::size_t>(m), 0.0);
+    for (Index i = 0; i < m; ++i)
+        dense_a[sz(i)] = static_cast<f64>((i * 17) % 23 - 11) / 7.0;
+    sparse_b[3] = -2.5;
+    sparse_b[31] = 0.75;
+    CHECK_FTRAN_PAIR(f, dense_a, sparse_b, "fresh factorization");
+
+    // Exercise both lanes with a zero RHS.  In addition to matching two
+    // separate solves exactly, this catches accidental cross-lane reuse in a
+    // paired triangular kernel.
+    const std::vector<f64> zero(static_cast<std::size_t>(m), 0.0);
+    CHECK_FTRAN_PAIR(f, zero, dense_a, "zero first RHS");
+    CHECK_FTRAN_PAIR(f, sparse_b, zero, "zero second RHS");
+
+    // The public contract explicitly permits aliasing and defines it as one
+    // ordinary solve, rather than applying B^-1 twice to the same vector.
+    auto alias_reference = dense_a;
+    f.ftran(alias_reference);
+    auto aliased = dense_a;
+    f.ftran_pair(aliased, aliased);
+    CHECK(aliased == alias_reference);
+}
+
+void test_ftran_pair_after_product_form_updates() {
+    std::mt19937 rng(20260908u);
+    constexpr Index m = 43;
+    ColMat b = random_basis(m, 0.06, rng);
+    BasisFactor f;
+    CHECK(f.factorize(m, b.col_ptr, b.row_idx, b.vals, LuOptions{}));
+    std::uniform_real_distribution<f64> val(-2.0, 2.0);
+
+    for (int step = 0; step < 16; ++step) {
+        std::vector<Index> rows;
+        std::vector<f64> vals;
+        const int stride = 4 + step % 5;
+        for (Index i = 0; i < m; ++i) {
+            if (i % stride != step % stride) continue;
+            rows.push_back(i);
+            vals.push_back(val(rng));
+        }
+        vals[0] += vals[0] >= 0.0 ? 6.0 : -6.0;
+
+        std::vector<f64> alpha(static_cast<std::size_t>(m), 0.0);
+        for (std::size_t t = 0; t < rows.size(); ++t)
+            alpha[sz(rows[t])] = vals[t];
+        f.ftran(alpha);
+
+        Index p = 0;
+        for (Index i = 1; i < m; ++i)
+            if (std::fabs(alpha[sz(i)]) > std::fabs(alpha[sz(p)])) p = i;
+        CHECK(f.update(p, alpha));
+        b.set_col(p, rows, vals);
+
+        std::vector<f64> rhs_a(static_cast<std::size_t>(m));
+        std::vector<f64> rhs_b(static_cast<std::size_t>(m), 0.0);
+        for (Index i = 0; i < m; ++i)
+            rhs_a[sz(i)] = static_cast<f64>(((i + step) * 11) % 29 - 14) / 9.0;
+        rhs_b[sz((step * 7) % m)] = 1.0 + 0.125 * step;
+        rhs_b[sz((step * 13 + 5) % m)] -= 0.5;
+        CHECK_FTRAN_PAIR(f, rhs_a, rhs_b,
+                         "product-form update " + std::to_string(step + 1));
+    }
+    CHECK(f.n_product_form_etas() >= 16);
 }
 
 // The MPF / Forrest–Tomlin-style update must agree with factorizing the updated
@@ -505,6 +629,163 @@ void test_hypersparse_unit_rhs() {
     }
 }
 
+void test_moderately_dense_reach_keeps_exact_order_and_support() {
+    // Twenty of 128 identity positions stay below the sparse solve's 25%
+    // admission gate but above the adaptive ordering path's 12.5% cutoff.
+    // This therefore covers the linear mark-scan ordering branch in all four
+    // triangular orientations without relying on timing to prove it ran.
+    constexpr Index m = 128;
+    ColMat identity;
+    identity.m = m;
+    for (Index j = 0; j < m; ++j) {
+        identity.row_idx.push_back(j);
+        identity.vals.push_back(1.0);
+        identity.col_ptr.push_back(static_cast<Offset>(identity.row_idx.size()));
+    }
+    std::vector<f64> rhs(sz(m), 0.0);
+    std::vector<Index> expected;
+    for (Index k = 0; k < 20; ++k) {
+        const Index i = 3 + 5 * k;
+        rhs[sz(i)] = (k & 1) ? -0.5 : 2.0;
+        expected.push_back(i);
+    }
+
+    struct SparseSolves {
+        std::vector<f64> ftran;
+        std::vector<Index> ftran_support;
+        std::vector<f64> btran;
+        std::vector<Index> btran_support;
+    };
+    const auto solve_both = [&](const char* force_comparison) {
+        // The flag is sampled by factorize(), so each factor owns one of the
+        // two implementations even after this scope restores the process
+        // environment.
+        ScopedEnvironment flag("SOR_LU_COMPARISON_SORT", force_comparison);
+        BasisFactor f;
+        CHECK(f.factorize(m, identity.col_ptr, identity.row_idx, identity.vals,
+                          LuOptions{}));
+        SparseSolves out;
+        out.ftran = rhs;
+        CHECK(f.ftran_with_support(out.ftran, out.ftran_support));
+        out.btran = rhs;
+        CHECK(f.btran_with_support(out.btran, out.btran_support));
+        return out;
+    };
+
+    const auto linear_scan = solve_both(nullptr);
+    const auto comparison_sort = solve_both("1");
+    CHECK(linear_scan.ftran == rhs);
+    CHECK(linear_scan.btran == rhs);
+    CHECK(linear_scan.ftran_support == expected);
+    CHECK(linear_scan.btran_support == expected);
+    CHECK(linear_scan.ftran == comparison_sort.ftran);
+    CHECK(linear_scan.btran == comparison_sort.btran);
+    CHECK(linear_scan.ftran_support == comparison_sort.ftran_support);
+    CHECK(linear_scan.btran_support == comparison_sort.btran_support);
+}
+
+// Seeded BTRAN is a partial-write API: production reuses rho, clearing only
+// the previous output support and the previous unit-input slot.  That contract
+// is easy to satisfy for one call and easy to break on the next one, especially
+// because product-form etas can write pivot slots that are neither the input
+// seed nor part of the final output.  Exercise the exact reuse pattern across
+// all eta implementations: no etas, the <8 plain reverse scan, and the >=8
+// firing set.  A fresh full BTRAN is the independent oracle for every call.
+void test_seeded_btran_reuse_across_eta_paths() {
+    constexpr Index m = 128;  // sparse kernels are enabled only at m >= 64
+    ColMat b;
+    b.m = m;
+    for (Index j = 0; j < m; ++j) {
+        b.row_idx.push_back(j);
+        b.vals.push_back(1.0);
+        b.col_ptr.push_back(static_cast<Offset>(b.row_idx.size()));
+    }
+
+    BasisFactor f;
+    CHECK(f.factorize(m, b.col_ptr, b.row_idx, b.vals, LuOptions{}));
+
+    std::vector<f64> reused(static_cast<std::size_t>(m), 0.0);
+    std::vector<Index> previous_support;
+    Index previous_seed = -1;
+    bool previous_was_sparse = false;
+    int sparse_calls = 0;
+
+    const auto check_one = [&](Index seed, Index extra_zero,
+                               const std::string& where) {
+        // This is the engine's reset discipline.  A dense fallback overwrote
+        // every entry, so it requires a full clear; a sparse call promises
+        // that these two small sets contain every possibly-live old value.
+        if (previous_was_sparse) {
+            for (const Index i : previous_support) reused[sz(i)] = 0.0;
+            if (previous_seed >= 0 && previous_seed != seed)
+                reused[sz(previous_seed)] = 0.0;
+        } else {
+            std::fill(reused.begin(), reused.end(), 0.0);
+        }
+        reused[sz(seed)] = 1.0;
+
+        std::vector<f64> reference(static_cast<std::size_t>(m), 0.0);
+        reference[sz(seed)] = 1.0;
+        f.btran(reference);
+
+        // Duplicates and declared zeros are legal over-approximations and
+        // exercise the seeded permutation's de-duplication path.
+        const std::vector<Index> declared{seed, seed, extra_zero};
+        std::vector<Index> support;
+        const bool sparse =
+            f.btran_seeded_with_support(reused, declared, support);
+        sparse_calls += sparse ? 1 : 0;
+
+        ::sor::test::report(max_abs_diff(reused, reference) <= 1e-13,
+                            "seeded BTRAN equals full BTRAN", __FILE__,
+                            __LINE__, where);
+        if (sparse) {
+            CHECK(std::is_sorted(support.begin(), support.end()));
+            CHECK(std::adjacent_find(support.begin(), support.end()) ==
+                  support.end());
+            std::vector<char> present(static_cast<std::size_t>(m), 0);
+            for (const Index i : support) present[sz(i)] = 1;
+            for (Index i = 0; i < m; ++i)
+                CHECK((reused[sz(i)] != 0.0) ==
+                      static_cast<bool>(present[sz(i)]));
+        }
+
+        previous_support = support;
+        previous_seed = seed;
+        previous_was_sparse = sparse;
+    };
+
+    // Empty eta file, including immediate reuse of the same input slot.
+    check_one(5, 97, "cold seed 5");
+    check_one(5, 61, "cold repeated seed 5");
+    check_one(41, 11, "cold changed seed 41");
+
+    for (Index step = 0; step < 12; ++step) {
+        const Index p = (7 + 11 * step) % m;
+        Index q = (3 + 17 * step) % m;
+        if (q == p) q = (q + 1) % m;
+
+        // A sparse, well-conditioned elementary update.  q is read by the
+        // eta and p is written, so a unit seed at q forces the eta path to do
+        // real work rather than merely traverse an empty firing set.
+        std::vector<f64> alpha(static_cast<std::size_t>(m), 0.0);
+        alpha[sz(p)] = 1.0 + 0.01 * static_cast<f64>(step + 1);
+        alpha[sz(q)] = (step & 1) ? -0.125 : 0.125;
+        CHECK(f.update(p, alpha));
+        CHECK(f.n_updates() == step + 1);
+
+        const std::string stage = "after eta " + std::to_string(step + 1);
+        check_one(q, (q + 53) % m, stage + " firing seed");
+        check_one(q, (q + 79) % m, stage + " repeated seed");
+        check_one((q + 31) % m, p, stage + " unrelated seed");
+    }
+
+    // The chosen identity factors and sparse etas must actually keep us in
+    // the partial-write path; otherwise the stale-state assertions above
+    // would only test the dense fallback.
+    CHECK(sparse_calls == 39);
+}
+
 // Forrest-Tomlin update, exactly the differential methodology as
 // test_product_form_update() above but through update_ft()'s dense bump
 // re-triangularization instead of an eta -- dense reconstruction, checked
@@ -714,7 +995,10 @@ void test_collective_ft_transparent() {
     const bool collapsed = f.collapse_pending_into_ft(LuOptions{});
     ::sor::test::report(collapsed, "collective collapse succeeded", __FILE__, __LINE__,
                         "n_updates_after=" + std::to_string(f.n_updates()));
-    if (collapsed) CHECK(f.n_updates() == 0);
+    // What collapse empties is the PRODUCT-FORM file; it converts those etas
+    // into Forrest-Tomlin row etas, which n_updates() also counts so that the
+    // refactorization triggers can see them.
+    if (collapsed) CHECK(f.n_product_form_etas() == 0);
 
     for (Index i = 0; i < m; ++i) {
         std::vector<f64> e(sz(m), 0.0);
@@ -748,8 +1032,12 @@ void test_collective_ft_noop_when_nothing_pending() {
 int main() {
     test_identity_basis();
     test_random_solves();
+    test_ftran_pair_fresh_factorization_and_zero_rhs();
+    test_ftran_pair_after_product_form_updates();
     test_product_form_update();
     test_hypersparse_unit_rhs();
+    test_moderately_dense_reach_keeps_exact_order_and_support();
+    test_seeded_btran_reuse_across_eta_paths();
     test_bucket_not_truncated_by_early_exit();
     test_singular_reported();
     test_zero_column();

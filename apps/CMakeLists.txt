@@ -6,7 +6,7 @@ add_executable(sor_gen sor_gen.cpp)
 target_link_libraries(sor_gen PRIVATE sor_io sor_flags)
 
 add_executable(sor_check sor_check.cpp)
-target_link_libraries(sor_check PRIVATE sor_io sor_engines sor_flags)
+target_link_libraries(sor_check PRIVATE sor_io sor_engines sor_certify sor_flags)
 
 add_executable(sor_ext_demo sor_ext_demo.cpp)
 target_link_libraries(sor_ext_demo PRIVATE sor_search sor_certify sor_flags)

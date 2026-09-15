@@ -64,5 +64,29 @@ int main() {
         CHECK(r1.x == r2.x);
     }
 
+    // A small reduced cost on a large finite bound is not numerical zero in
+    // the dual objective.  Dropping it would manufacture a gap of 50.
+    {
+        model::LpProblem p;
+        p.A = sparse::from_triplets(0, 1, {}, {}, {});
+        p.c = {5e-8};
+        p.col_lo = {1e9};
+        p.col_hi = {1e9};
+        engines::HprOptions opts;
+        opts.max_iterations = 1;
+        opts.check_every = 1;
+        opts.primal_tol = 1e-6;
+        opts.dual_tol = 1e-6;
+        opts.gap_tol = 1e-12;
+        opts.use_polishing = false;
+        opts.detect_certificates = false;
+        engines::HprDiagnostics diag;
+        auto raw = engines::solve_hpr(p, opts, *dev, diag);
+        CHECK(raw.proposed_status == core::Status::Feasible);
+        CHECK_NEAR(raw.objective, 50.0, 1e-14);
+        CHECK_NEAR(raw.dual_bound, 50.0, 1e-14);
+        CHECK(diag.gap_rel <= opts.gap_tol);
+    }
+
     return sor::test::finish("test_hpr");
 }

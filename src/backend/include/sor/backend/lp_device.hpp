@@ -44,9 +44,22 @@ struct ScaledLp {
 struct StepParams {
     f64 tau   = 1.0;           // primal step
     f64 sigma = 1.0;           // dual step
-    f64 beta  = 0.0;           // Halpern mix; if >0, device uses 1/(epoch_step+2)
+    f64 beta  = 0.0;           // deprecated; beta_k is epoch-derived
+    f64 primal_weight = 1.0;   // metric: w||dx||^2 + ||dy||^2/w
+    f64 primal_feas_tol = 1e-7; // original-space active-bound threshold
+    f64 dual_feas_tol = 1e-7;  // original-space numerical-zero threshold
+    f64 reflection_gamma = 1.0;
     bool update_average = true;
     bool use_halpern = false;  // per-step β_k = 1/(k+2) toward anchor
+    bool use_reflection = true; // Halpern acts on (1+gamma)T(z)-gamma*z
+};
+
+struct LpDeviceCapabilities {
+    bool reflected_operator = false;
+    bool fixed_point_restart = false;
+    bool warm_start = false;
+    bool certificate_directions = false;
+    bool transactional_step = false;
 };
 
 enum class RestartPoint : std::uint8_t {
@@ -61,6 +74,8 @@ struct LpSolution {
     std::vector<f64> y;
     std::vector<f64> x_avg;
     std::vector<f64> y_avg;
+    std::vector<f64> primal_ray;       // scaled column direction candidate
+    std::vector<f64> dual_farkas_ray;  // scaled row multiplier candidate
 };
 
 class LpDevice {
@@ -69,6 +84,7 @@ public:
 
     virtual std::string_view name() const = 0;      // "cpu" | "vulkan" | "cuda"
     virtual bool is_accelerated() const = 0;
+    virtual LpDeviceCapabilities capabilities() const { return {}; }
 
     // ---- one upload, once per solve ----
     virtual void upload(const ScaledLp&) = 0;
@@ -85,7 +101,15 @@ public:
         f64 gap_rel    = 0.0;
         f64 dx_norm    = 0.0;   // ‖Δx‖₂ last step — primal-weight controller
         f64 dy_norm    = 0.0;
-        f64 restart_metric = 0.0;  // normalized duality gap
+        f64 epoch_dx_norm = 0.0;
+        f64 epoch_dy_norm = 0.0;
+        f64 restart_metric = 0.0;  // weighted fixed-point residual ||z-T(z)||_w
+        f64 operator_lhs = 0.0;    // 2 |<A dx,dy>|
+        f64 operator_rhs = 0.0;    // ||dx||^2/tau + ||dy||^2/sigma
+        f64 primal_ray_residual = core::kPosInf;
+        f64 primal_ray_objective = core::kNaN;
+        f64 dual_ray_residual = core::kPosInf;
+        f64 dual_ray_contradiction = 0.0;
         bool dual_bound_finite = false;
     };
     virtual Kkt reduce_kkt() = 0;
@@ -96,6 +120,17 @@ public:
 
     // Seed x from a feasible-for-bounds start (0 clamped to box); y = 0.
     virtual void init_zero() = 0;
+
+    // Optional device-resident warm start, in scaled coordinates.  Devices
+    // that do not advertise `warm_start` must return false without mutation.
+    virtual bool init_iterate(const std::vector<f64>&,
+                              const std::vector<f64>&) { return false; }
+
+    // Adaptive-step line search is transactional at host synchronization
+    // boundaries. The controller snapshots before a fused chunk and restores
+    // it if any step in that chunk violates the operator inequality.
+    virtual bool snapshot_step_checkpoint() { return false; }
+    virtual bool restore_step_checkpoint() { return false; }
 
     // ---- once, at the end ----
     virtual void download(LpSolution&) = 0;
