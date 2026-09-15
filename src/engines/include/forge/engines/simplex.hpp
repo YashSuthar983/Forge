@@ -282,6 +282,12 @@ struct SimplexDiagnostics {
     // run. The O(k) first-group path sorts none; this rising towards
     // (candidates x iterations) means the row is being sorted again.
     std::uint64_t ratio_sorted_candidates = 0;
+    // Pivotal-row BTRAN density. The row-wise PRICE scatter is the right
+    // traversal only while rho is sparse; a column-wise pass over the nonbasic
+    // CSC would be better once it is not, so this says how often that is.
+    std::uint64_t rho_sparse_iters = 0;
+    std::uint64_t rho_dense_iters = 0;
+    std::uint64_t rho_support_entries = 0;
     // Refactorizations forced because the pivotal row and the FTRAN column
     // disagreed about alpha_rq, and shifts refused for being implausibly
     // large. Both are numerical-trouble signals rather than policy.

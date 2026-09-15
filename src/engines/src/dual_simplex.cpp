@@ -712,7 +712,21 @@ core::RawResult solve_dual_simplex_prepared(
             if (keep_logical)
                 prow_idx.push_back(jl);
         };
+        // A column-wise price for dense rho was built and REMOVED on
+        // measurement; see docs/PERFORMANCE_REPORT_20260908.md. Two findings
+        // killed it. It lost outright at the BTRAN's own sparse/dense gate
+        // (dfl001 pivotal rows 1.87 -> 3.30 s) because that gate is 25% of m,
+        // not a density: those iterations are only 46.5% nonzero on dfl001,
+        // 76.9% on pilot87, 53.5% on 25fv47, so a large share of every column
+        // read is a row where rho is zero. And gating it on the TRUE density
+        // costs an O(m) scan per dense iteration -- 92M operations on dfl001 --
+        // which is itself a bigger regression than the switch could repay.
         if (prow_active_only) {
+
+            // rho_support is only valid when the BTRAN reported sparse; a
+            // dense rho must be walked over every row. Collapsing these two
+            // into the sparse one built the pivotal row from a stale support
+            // and cost dfl001 19,623 -> 350,446 pivots.
             if (rho_is_sparse) {
                 for (const Index i : rho_support) add_rho_row_active(i);
             } else {
@@ -1918,6 +1932,12 @@ core::RawResult solve_dual_simplex_prepared(
             }
             rho[sz(leave)] = 1.0;
             rho_is_sparse = do_btran_seeded(rho, leave, rho_support);
+            if (rho_is_sparse) {
+                ++diag.rho_sparse_iters;
+                diag.rho_support_entries += rho_support.size();
+            } else {
+                ++diag.rho_dense_iters;
+            }
 
             if (dse_active) {
                 // Validate the weight used by CHUZR against the exact norm of

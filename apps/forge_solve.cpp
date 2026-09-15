@@ -853,6 +853,13 @@ int main(int argc, char** argv) {
                             diag.numerical_trouble_refactors),
                         static_cast<unsigned long long>(
                             diag.refused_cost_shifts));
+            std::printf("  rho density      %llu sparse / %llu dense, avg support %llu\n",
+                        static_cast<unsigned long long>(diag.rho_sparse_iters),
+                        static_cast<unsigned long long>(diag.rho_dense_iters),
+                        static_cast<unsigned long long>(
+                            diag.rho_sparse_iters
+                                ? diag.rho_support_entries / diag.rho_sparse_iters
+                                : 0));
             std::printf("  ratio sorted     %10llu candidates\n",
                         static_cast<unsigned long long>(
                             diag.ratio_sorted_candidates));
