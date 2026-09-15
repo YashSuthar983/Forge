@@ -3625,6 +3625,12 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     std::string reason = "node limit";
     bool stopped_early = false;
     bool all_lp_proven = true;
+    // The bound of a node that was POPPED and then abandoned without pushing
+    // its children. Such a node's subtree is represented in neither `open` nor
+    // `plunge_stack`, so draining those two is not by itself a global bound --
+    // this is what has to be folded in to keep it one. It stays at +inf while
+    // no node has been abandoned, which makes the std::min below a no-op.
+    f64 abandoned_bound = std::numeric_limits<f64>::infinity();
     while (!open.empty() || !plunge_stack.empty()) {
         if (diag.nodes >= opts.max_nodes) {
             reason = "node limit (" + std::to_string(opts.max_nodes) + ")";
@@ -3832,6 +3838,10 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             (!lp_point_feasible || timed_out())) {
             reason = timed_out() ? "time limit" : "node LP interrupted";
             stopped_early = true;
+            // This node still carries its PARENT's proved bound (it is only
+            // overwritten below, once its own LP is certified), which is a
+            // sound lower bound for the subtree being walked away from.
+            abandoned_bound = std::min(abandoned_bound, node.bound);
             break;
         }
         const bool node_lp_proved = relaxation_proved(lp_raw, sd, lp_opts);
@@ -3840,6 +3850,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             if (!lp_point_feasible) {
                 reason = "node LP unproved";
                 stopped_early = true;
+                abandoned_bound = std::min(abandoned_bound, node.bound);
                 break;
             }
         }
@@ -4688,8 +4699,23 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     // Otherwise, for minimize, take the min LP bound among remaining open nodes
     // (and consider proved if gap small).
     f64 dual_bound_min = std::numeric_limits<f64>::infinity();
+    // Seeding with the incumbent is sound -- the explored part of the tree
+    // cannot hold anything better than the best point found in it -- but ONLY
+    // once every unexplored region is represented below. It is not, if a node
+    // was popped and abandoned: that subtree is in neither container, and the
+    // seed then survives every std::min and reports itself as the global
+    // bound. With the containers empty, which the time limit expiring inside
+    // the root node's own LP produces exactly, the gap comes out 0 and
+    // gap_proved turns a timeout into ProvedGlobalEpsilon. Measured on `pg` at
+    // a 60 s limit: incumbent 7250 certified optimal, against a published
+    // optimum of -8674.34 and this solver's own feasible point at -8192.85.
+    //
+    // So the fix is not to drop the seed -- that would cost the legitimate
+    // early exits the gap tolerance exists for -- but to fold in the one
+    // region the drains cannot see.
     if (have_incumbent)
         dual_bound_min = std::min(dual_bound_min, sense * best_incumbent);
+    dual_bound_min = std::min(dual_bound_min, abandoned_bound);
     // Drain open and the plunge stack for the actual global bound
     // (destructive OK at end). Nodes retain their parent's proved LP bound
     // until they are processed, and every node lives in exactly one of these
