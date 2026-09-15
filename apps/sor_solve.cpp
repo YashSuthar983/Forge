@@ -15,8 +15,6 @@
 #include "sor/search/bab.hpp"
 #include "sor/search/lattice_reform.hpp"
 
-#include <nlohmann/json.hpp>
-
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -60,7 +58,6 @@ void usage() {
         "  --[no-]fo-certificates enable/disable HPR certificate detection\n"
         "  --[no-]fo-crossover  enable/disable Auto FO-to-simplex crossover\n"
         "  --auto-budget-split S  one of 60/25/15, 70/20/10, 80/15/5\n"
-        "  --diagnostics-json PATH  write machine-readable LP diagnostics\n"
         "  --hpr-restart-off | --hpr-reflection-off | --hpr-weight-off\n"
         "  --implied-slack  presolve: drop zero-cost singleton columns as slacks\n"
         "  --lattice-reform  opt-in AHL lattice reform for pure integer equalities\n"
@@ -255,120 +252,6 @@ void print_transfer(const sor::backend::TransferStats& s) {
                 static_cast<unsigned long long>(s.calls));
 }
 
-nlohmann::json json_number(double value) {
-    return std::isfinite(value) ? nlohmann::json(value) : nlohmann::json(nullptr);
-}
-
-void write_lp_diagnostics(const std::string& path,
-                          const sor::core::LpDiagnostics& d,
-                          const sor::core::SolveResult& result) {
-    if (path.empty()) return;
-    std::ofstream out(path);
-    if (!out) throw std::runtime_error("could not open diagnostics JSON: " + path);
-
-    nlohmann::json j = {
-        {"requested_strategy", sor::core::to_string(d.requested_strategy)},
-        {"routed_strategy", sor::core::to_string(d.routed_strategy)},
-        {"route_rationale", d.route_rationale},
-        {"rule_table_version", d.rule_table_version},
-        {"training_manifest_hash", d.training_manifest_hash},
-        {"holdout_manifest_hash", d.holdout_manifest_hash},
-        {"auto_promoted", d.auto_promoted},
-        {"rows", d.features.rows},
-        {"cols", d.features.cols},
-        {"nonzeros", d.features.nonzeros},
-        {"density", d.features.density},
-        {"row_degree_mean", d.features.row_degree_mean},
-        {"row_degree_max", d.features.row_degree_max},
-        {"col_degree_mean", d.features.col_degree_mean},
-        {"col_degree_max", d.features.col_degree_max},
-        {"fixed_variables", d.features.fixed_variables},
-        {"boxed_variables", d.features.boxed_variables},
-        {"one_sided_variables", d.features.one_sided_variables},
-        {"free_variables", d.features.free_variables},
-        {"equality_rows", d.features.equality_rows},
-        {"ranged_rows", d.features.ranged_rows},
-        {"one_sided_rows", d.features.one_sided_rows},
-        {"coefficient_spread", json_number(d.features.coefficient_spread)},
-        {"objective_density", d.features.objective_density},
-        {"iterations", d.iterations},
-        {"fo_iterations", d.fo_iterations},
-        {"crossover_iterations", d.crossover_iterations},
-        {"simplex_iterations", d.simplex_iterations},
-        {"global_iteration_limit", d.global_iteration_limit},
-        {"global_time_limit_s", d.global_time_limit_s},
-        {"fo_elapsed_s", d.fo_elapsed_s},
-        {"crossover_elapsed_s", d.crossover_elapsed_s},
-        {"simplex_elapsed_s", d.simplex_elapsed_s},
-        {"polish_attempts", d.polish_attempts},
-        {"polish_iterations", d.polish_iterations},
-        {"fo_epochs_without_decay", d.fo_epochs_without_decay},
-        {"fo_budget_fraction", d.fo_budget_fraction},
-        {"crossover_budget_fraction", d.crossover_budget_fraction},
-        {"simplex_budget_fraction", d.simplex_budget_fraction},
-        {"fo_target_tolerance", d.fo_target_tolerance},
-        {"recovery_target_tolerance", d.recovery_target_tolerance},
-        {"presolve_ms", d.presolve_ms},
-        {"presolve_status", d.presolve_status},
-        {"presolve_reason", d.presolve_reason},
-        {"crossover_attempted", d.crossover_attempted},
-        {"crossover_basis_valid", d.crossover_basis_valid},
-        {"crossover_cold_fallback", d.crossover_cold_fallback},
-        {"elapsed_s", d.elapsed_s},
-        {"status", sor::core::to_string(result.status)},
-        {"proof", sor::core::to_string(result.proof)},
-        {"max_primal_violation", json_number(result.max_primal_violation)},
-        {"max_dual_violation", json_number(result.max_dual_violation)},
-        {"relative_gap", json_number(result.gap_rel)},
-        {"termination_reason", result.termination_reason},
-    };
-    out << j.dump(2) << '\n';
-}
-
-void write_explicit_lp_diagnostics(
-    const std::string& path,
-    sor::core::LpStrategy strategy,
-    const sor::model::LpProblem& problem,
-    const sor::core::SolveResult& result,
-    std::uint64_t fo_iterations,
-    std::uint64_t crossover_iterations,
-    std::uint64_t simplex_iterations,
-    std::uint64_t polish_attempts,
-    std::uint64_t polish_iterations,
-    std::uint64_t global_iteration_limit,
-    double global_time_limit_s,
-    double elapsed_s) {
-    if (path.empty()) return;
-    sor::core::LpDiagnostics d;
-    d.requested_strategy = strategy;
-    d.routed_strategy = strategy;
-    d.features = sor::engines::extract_lp_features(problem);
-    d.route_rationale = "explicit strategy requested";
-    d.rule_table_version = "not-used-explicit-route";
-    d.training_manifest_hash = "not-used-explicit-route";
-    d.holdout_manifest_hash = "not-used-explicit-route";
-    d.auto_promoted = false;
-    d.fo_iterations = fo_iterations;
-    d.crossover_iterations = crossover_iterations;
-    d.simplex_iterations = simplex_iterations;
-    d.polish_attempts = polish_attempts;
-    d.polish_iterations = polish_iterations;
-    d.iterations = fo_iterations + crossover_iterations + simplex_iterations;
-    d.elapsed_s = elapsed_s;
-    d.global_iteration_limit = global_iteration_limit;
-    d.global_time_limit_s = global_time_limit_s;
-    if (strategy == sor::core::LpStrategy::Hpr ||
-        strategy == sor::core::LpStrategy::Pdhg)
-        d.fo_elapsed_s = elapsed_s;
-    else
-        d.simplex_elapsed_s = elapsed_s;
-    d.max_primal_violation = result.max_primal_violation;
-    d.max_dual_violation = result.max_dual_violation;
-    d.gap_rel = result.gap_rel;
-    d.termination_reason = result.termination_reason;
-    write_lp_diagnostics(path, d, result);
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -377,7 +260,6 @@ int main(int argc, char** argv) {
     std::string path, backend_name = "cpu", engine_name = "simplex";
     std::string q_diag_arg;
     std::string solution_out;
-    std::string diagnostics_json;
     sor::engines::PdhgOptions pdhg_opts;
     sor::engines::HprOptions hpr_opts;
     sor::engines::SimplexOptions sx_opts;
@@ -624,8 +506,6 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
-        else if (a == "--diagnostics-json")
-            diagnostics_json = next("--diagnostics-json");
         else if (a == "--implied-slack") sx_opts.presolve_implied_slack = true;
         else if (a == "--lattice-reform") lattice_reform = true;
         else if (a == "--no-probing") probing = false;
@@ -1352,7 +1232,6 @@ int main(int argc, char** argv) {
             const auto r = sor::certify::finalize_result(std::move(raw), ev);
             print_result(r);
             write_solution_out(solution_out, r);
-            write_lp_diagnostics(diagnostics_json, diag, r);
             std::printf("route:             %s (%s)\n",
                         std::string(sor::core::to_string(diag.routed_strategy)).c_str(),
                         diag.route_rationale.c_str());
@@ -1384,14 +1263,6 @@ int main(int argc, char** argv) {
             const auto r = sor::certify::finalize_result(std::move(raw), ev);
             print_result(r);
             write_solution_out(solution_out, r);
-            const auto strategy = engine_name == "primal"
-                ? sor::core::LpStrategy::PrimalSimplex
-                : engine_name == "dual" ? sor::core::LpStrategy::DualSimplex
-                                          : sor::core::LpStrategy::Simplex;
-            write_explicit_lp_diagnostics(
-                diagnostics_json, strategy, problem, r, 0, 0,
-                diag.iterations, 0, 0, sx_opts.max_iterations,
-                sx_opts.time_limit_s, diag.total_ms / 1000.0);
             if (diag.dual_bound_finite) {
                 std::printf("dual bound:        %.10e\n", r.dual_bound);
                 std::printf("rel gap:           %.3e\n", r.gap_rel);
@@ -1610,7 +1481,6 @@ int main(int argc, char** argv) {
                 const auto r = sor::certify::finalize_result(std::move(raw), ev);
                 print_result(r);
                 write_solution_out(solution_out, r);
-                write_lp_diagnostics(diagnostics_json, diag, r);
                 std::printf("backend:           %s\n", backend_name.c_str());
                 if (!diag.presolve_status.empty())
                     std::printf("presolve:          %s (%s)\n",
@@ -1657,11 +1527,6 @@ int main(int argc, char** argv) {
             const auto r = sor::certify::finalize_result(std::move(raw), ev);
             print_result(r);
             write_solution_out(solution_out, r);
-            write_explicit_lp_diagnostics(
-                diagnostics_json, sor::core::LpStrategy::Hpr, problem, r,
-                r.iterations, 0, 0, diag.polish_attempts,
-                diag.polish_iterations, hpr_opts.max_iterations,
-                hpr_opts.time_limit_s, diag.total_ms / 1000.0);
             std::printf("max row violation: %.3e\n", r.max_primal_violation);
             std::printf("dual residual:     %.3e\n", r.max_dual_violation);
             std::printf("iterations:        %llu\n",

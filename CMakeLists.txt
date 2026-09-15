@@ -63,10 +63,6 @@ target_compile_options(sor_flags INTERFACE
   $<$<AND:$<CXX_COMPILER_ID:GNU,Clang>,$<BOOL:${SOR_WARNINGS_AS_ERRORS}>>:-Werror>
 )
 
-# Header-only JSON (nlohmann). Not a solver dependency — see dependency_ledger.md.
-add_library(sor_json INTERFACE)
-add_library(sor::json ALIAS sor_json)
-target_include_directories(sor_json INTERFACE ${CMAKE_SOURCE_DIR}/third_party)
 
 # ---------------------------------------------------------------------------
 # Library modules, in layer order. A module may only link strictly lower

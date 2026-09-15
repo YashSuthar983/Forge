@@ -1,10 +1,6 @@
 add_executable(sor_solve sor_solve.cpp)
 target_link_libraries(sor_solve PRIVATE
-  sor_io sor_engines sor_search sor_certify sor_backend sor_json sor_flags)
-
-add_executable(sor_milp_train sor_milp_train.cpp)
-target_link_libraries(sor_milp_train PRIVATE
-  sor_io sor_engines sor_search sor_flags)
+  sor_io sor_engines sor_search sor_certify sor_backend sor_flags)
 
 add_executable(sor_gen sor_gen.cpp)
 target_link_libraries(sor_gen PRIVATE sor_io sor_flags)

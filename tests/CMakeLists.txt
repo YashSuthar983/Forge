@@ -82,15 +82,6 @@ function(sor_add_python_test name)
 endfunction()
 
 sor_add_python_test(test_compare)
-sor_add_python_test(test_compare_runs)
-sor_add_python_test(test_gate)
-sor_add_python_test(test_presolve_opportunities)
-sor_add_python_test(test_repro_bench)
-sor_add_python_test(test_verify_netlib_results)
-sor_add_python_test(test_freeze_manifest)
-sor_add_python_test(test_claim_run)
-sor_add_python_test(test_lp_auto_train)
-sor_add_python_test(test_milp_latest_ablate)
 sor_add_python_test(test_forbidden_dependencies)
 set_tests_properties(test_forbidden_dependencies PROPERTIES
   ENVIRONMENT

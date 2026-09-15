@@ -185,7 +185,7 @@ void test_missing_values_at_end_of_argv() {
                                "--refactor-work-ratio", "--dual-resync-interval",
                                "--dual-cost-perturbation", "--engine", "--method",
                                "--pricing", "--basis-update", "--backend",
-                               "--solution-out", "--diagnostics-json",
+                               "--solution-out",
                                "--small-matrix-value", "--q-diag",
                                "--auto-budget-split"}) {
         const Run r = run({solve_exe, model, option});
@@ -302,35 +302,6 @@ void test_lp_dispatch_and_diagnostic_flags() {
                             std::string(flag) + " -> " + r.output);
     }
 
-    for (const char* engine : {"simplex", "auto"}) {
-        const fs::path json = fs::temp_directory_path() /
-            (std::string("sor_cli_") + engine + "_diagnostics.json");
-        const Run r = run({solve_exe, model, "--engine", engine,
-                           "--no-presolve", "--time-limit", "20",
-                           "--diagnostics-json", json.string()});
-        std::ifstream in(json);
-        const bool opened = in.is_open();
-        const std::string payload((std::istreambuf_iterator<char>(in)),
-                                  std::istreambuf_iterator<char>());
-        ::sor::test::report(r.exit_code == 0 && opened,
-                            "diagnostics JSON is written", __FILE__, __LINE__,
-                            std::string(engine) + " -> " + r.output);
-        CHECK(contains(payload, "\"requested_strategy\""));
-        CHECK(contains(payload, "\"rule_table_version\""));
-        CHECK(contains(payload, "\"training_manifest_hash\""));
-        CHECK(contains(payload, "\"holdout_manifest_hash\""));
-        CHECK(contains(payload, "\"fo_target_tolerance\""));
-        CHECK(contains(payload, "\"recovery_target_tolerance\""));
-        CHECK(contains(payload, "\"global_iteration_limit\""));
-        CHECK(contains(payload, "\"global_time_limit_s\""));
-        CHECK(contains(payload, "\"global_time_limit_s\": 20"));
-        CHECK(contains(payload, "\"fo_elapsed_s\""));
-        CHECK(contains(payload, "\"crossover_elapsed_s\""));
-        CHECK(contains(payload, "\"simplex_elapsed_s\""));
-        CHECK(contains(payload, "\"termination_reason\""));
-        std::error_code ec;
-        fs::remove(json, ec);
-    }
 }
 
 void test_unavailable_backends_are_not_silently_replaced() {
