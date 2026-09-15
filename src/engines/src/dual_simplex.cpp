@@ -1593,9 +1593,20 @@ core::RawResult solve_dual_simplex_prepared(
                         row_w[sz(i)] = std::max(row_w[sz(i)], candidate);
                 });
             }
+            // w_r <- w_r / alpha_rq^2 for BOTH rules, but the floor of 1 is a
+            // DEVEX convention: Devex reference weights are >= 1 by
+            // construction. A DSE weight is ||(B^-1)_r,:||^2 and is perfectly
+            // entitled to be smaller than 1 on a well-scaled basis, so
+            // clamping it there biased the leaving row's weight upward and the
+            // bias then propagated through every later update that reads it.
             const f64 leaving_w = wr / ap2;
-            row_w[sz(leave)] = std::isfinite(leaving_w)
-                                  ? std::max(1.0, leaving_w) : 1.0;
+            if (dse_active) {
+                row_w[sz(leave)] = std::isfinite(leaving_w)
+                                       ? std::max(leaving_w, 1e-10) : 1.0;
+            } else {
+                row_w[sz(leave)] = std::isfinite(leaving_w)
+                                       ? std::max(1.0, leaving_w) : 1.0;
+            }
         }
         return false;
     };
