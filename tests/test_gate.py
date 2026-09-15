@@ -345,6 +345,86 @@ class TestReferenceRule(GateCase):
                         "rule 1's reference half needs objectives in the sweep")
 
 
+class TestKnownOptima(GateCase):
+    """Rule 1 against the published optimum. This is the only rule that says
+    anything about the miplib-small instances that never finish -- 39 of 40 at
+    a 30 s limit -- because it needs no proof, only an answer."""
+
+    MPS = ("NAME          T\nROWS\n N  COST\n L  R1\nCOLUMNS\n"
+           "    MARK0000  'MARKER'                 'INTORG'\n"
+           "    X1        COST      -5             R1        4\n"
+           "    MARK0001  'MARKER'                 'INTEND'\n"
+           "RHS\n    RHS       R1        5\n"
+           "BOUNDS\n UI BND       X1        1\nENDATA\n")
+
+    def models_dir(self, optimum: str = "-5.0") -> Path:
+        d = self.tmp / "suite" / "mps"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "t.mps").write_text(self.MPS)
+        (d.parent / "reference.csv").write_text(
+            f"# name,optimum\nt,{optimum}\n")
+        return d
+
+    def judge_opt(self, cand: list[dict], models_dir: Path, tol: float = 1e-6):
+        b, c = self.tmp / "b.jsonl", self.tmp / "c.jsonl"
+        self.write(b, cand)
+        self.write(c, cand)
+        rows = runs.compare_rows(
+            runs.load_run(b).results["sor:simplex"],
+            runs.load_run(c).results["sor:simplex"], 1.0, 100.0, 1e-9, tol)
+        return gate.evaluate_known_optima(rows, models_dir, tol)
+
+    def test_a_certified_wrong_optimum_fails(self):
+        # pg.mps: ProvedGlobalEpsilon at 7250 against a published -8674.34,
+        # because the time limit expired inside the root node's LP.
+        failures, _ = self.judge_opt(
+            [record("t.mps", objective=7250.0)], self.models_dir("-8674.342607"))
+        self.assertTrue(any("claimed Optimal" in f for f in failures), failures)
+        self.assertTrue(any("no allow-list entry can waive" in f
+                            for f in failures), failures)
+
+    def test_an_incumbent_better_than_the_optimum_fails(self):
+        # Needs no proof at all -- this is the half that covers the instances
+        # that stop at the time limit.
+        failures, _ = self.judge_opt(
+            [record("t.mps", status="feasible", proof="FeasibleWithGap",
+                    objective=-9.0)], self.models_dir("-5.0"))
+        self.assertTrue(any("beats published optimum" in f for f in failures),
+                        failures)
+
+    def test_a_dual_bound_past_the_optimum_fails(self):
+        rec = record("t.mps", status="feasible", proof="FeasibleWithGap",
+                     objective=-4.0)
+        rec["dual_bound"] = -3.0   # minimizing: a lower bound above the optimum
+        failures, _ = self.judge_opt([rec], self.models_dir("-5.0"))
+        self.assertTrue(any("crossed past optimum" in f for f in failures),
+                        failures)
+
+    def test_a_sound_time_limited_run_passes(self):
+        rec = record("t.mps", status="feasible", proof="FeasibleWithGap",
+                     objective=-4.0)
+        rec["dual_bound"] = -7.0
+        failures, notes = self.judge_opt([rec], self.models_dir("-5.0"))
+        self.assertEqual(failures, [])
+        self.assertTrue(any("1 model(s), 0 unsound" in n for n in notes), notes)
+
+    def test_a_suite_without_reference_csv_is_not_judged(self):
+        d = self.tmp / "bare" / "mps"
+        d.mkdir(parents=True)
+        (d / "t.mps").write_text(self.MPS)
+        failures, notes = self.judge_opt([record("t.mps", objective=7250.0)], d)
+        self.assertEqual(failures, [])
+        self.assertTrue(any("no reference.csv" in n for n in notes), notes)
+
+    def test_the_committed_milp_references_load(self):
+        for suite in ("miplib-small", "miplib-easy"):
+            path = ROOT / "benchmarks" / suite / "reference.csv"
+            if not path.exists():
+                continue
+            ref = gate.miplib.read_reference(path)
+            self.assertGreater(len(ref), 0, suite)
+
+
 class TestReferenceObjectives(GateCase):
     """Rule 1, second half. Everything else here compares SOR to SOR, so an
     answer that is wrong in BOTH sweeps reads as "no differences"."""

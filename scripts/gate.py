@@ -15,12 +15,16 @@ number, one at a time, days later.
 
 WHAT IT ENFORCES, in order of severity:
 
-    1. Correctness, in two halves. Against the BASELINE: a model certified
-       there must still be certified, its status must not change, and two
-       certified objectives must agree. Against the REFERENCE: a certified
-       objective must also agree with the external solver's. The second half
-       exists because the first is blind to an answer that is wrong in both
-       sweeps -- see evaluate_reference_objectives(). Neither can ever be
+    1. Correctness, in three halves (the arithmetic is not the point). Against
+       the BASELINE: a model certified there must still be certified, its
+       status must not change, and two certified objectives must agree.
+       Against the REFERENCE: a certified objective must also agree with the
+       external solver's -- see evaluate_reference_objectives(). Against the
+       PUBLISHED OPTIMUM, where a suite commits one: incumbent, dual bound and
+       status must bracket it -- see evaluate_known_optima(), which is the only
+       rule that says anything at all about the 39 of 40 miplib-small
+       instances that never finish. The last two exist because the first is
+       blind to an answer that is wrong in both sweeps. None can ever be
        waived: there is no allow-list entry for a lost proof or a wrong number.
     2. Per-model work. No model may take more than +10% pivots (MILP: nodes)
        against the baseline unless benchmarks/results/gate-allow.json carries
@@ -76,6 +80,11 @@ def _load(name: str, path: Path):
 
 compare = _load("sor_compare", SCRIPTS / "compare.py")
 runs = _load("sor_compare_runs", SCRIPTS / "compare_runs.py")
+# read_reference / model_minimizes / check_sound already exist and are already
+# careful (sense from the MODEL, per-entry tolerances for the MIPLIB 3.0 tables
+# that truncate to six significant digits). The gate reuses them rather than
+# growing a second, subtly different copy.
+miplib = _load("sor_miplib_eval", SCRIPTS / "miplib_eval.py")
 
 
 # --------------------------------------------------------------------------
@@ -307,6 +316,62 @@ def evaluate_reference(rows: list, reference: dict, allow: dict[str, dict],
                          "BTRAN/ratio/update ms)")
         else:
             notes.append(detail + f" -- {entry['reason']}")
+    return failures, notes
+
+
+def evaluate_known_optima(rows: list, models_dir: Path, tol: float
+                          ) -> tuple[list[str], list[str]]:
+    """Rule 1 for the MILP suites, against the published optimum.
+
+    The netlib half of rule 1 has an external oracle because a committed HiGHS
+    sweep exists. The MILP suites have something better sitting unused next to
+    their models -- benchmarks/<suite>/reference.csv, the MIPLIB `=opt=`
+    values -- and it does not need a timing run to be trustworthy.
+
+    It also protects far more than a proof check can. On miplib-small at 30 s
+    exactly ONE instance of 40 is certified, so gating by proof alone leaves 39
+    unexamined; every one of them still has an incumbent and a dual bound that
+    must bracket the published optimum. check_sound() tests all three
+    impossibilities: an incumbent better than the optimum, a dual bound past it
+    on the bounding side, and Infeasible on an instance that has a solution.
+
+    This is what caught `pg`: certified ProvedGlobalEpsilon at 7250 against a
+    published optimum of -8674.34, because the time limit expired inside the
+    root node's LP and the abandoned subtree left the dual bound seeded at the
+    incumbent. Unwaivable, like the rest of rule 1.
+    """
+    failures: list[str] = []
+    notes: list[str] = []
+    ref = miplib.read_reference(models_dir.parent / "reference.csv")
+    if not ref:
+        notes.append(f"no reference.csv beside {models_dir}, so the "
+                     f"published-optimum half of rule 1 is not enforced")
+        return failures, notes
+    checked = 0
+    for row in rows:
+        if row.cand is None:
+            continue
+        name = row.instance
+        stem = name[:-4] if name.endswith(".mps") else name
+        entry = ref.get(stem)
+        if entry is None:
+            continue
+        checked += 1
+        # check_sound() tests `status == "Optimal"` exactly, so normalise here
+        # rather than depend on how a given sweep spelled it -- the whole point
+        # of this rule is that it fires on a claim of optimality.
+        status = "Optimal" if compare.is_optimal(row.cand) else row.cand.status
+        rec = {"status": status, "objective": row.cand.objective,
+               "dual_bound": getattr(row.cand, "dual_bound", None)}
+        msg = miplib.check_sound(
+            rec, entry, tol, miplib.model_minimizes(models_dir / name))
+        if msg:
+            failures.append(
+                f"{name}: {msg} [status={row.cand.status} "
+                f"proof={row.cand.proof or '-'}] -- unsound against the "
+                f"published optimum, which no allow-list entry can waive")
+    notes.append(f"checked against published optima: {checked} model(s), "
+                 f"{len(failures)} unsound")
     return failures, notes
 
 
@@ -631,6 +696,13 @@ def main(argv: list[str] | None = None) -> int:
                                 args.aggregate_bar,
                                 args.aggregate_min_instances)
 
+    # Rule 1 against the published optimum, where one is committed next to the
+    # models. Runs before the reference block because it needs no sweep, no
+    # timing and no baseline -- only the answer and the literature.
+    optima_failures, optima_notes = evaluate_known_optima(
+        rows, models_dir, args.obj_rel_tol)
+    failures += optima_failures
+
     reference_path = args.reference or default_reference(args.suite)
     reference_notes: list[str] = []
     measured_g2: float | None = None
@@ -667,6 +739,8 @@ def main(argv: list[str] | None = None) -> int:
     scored = comparable - len(waived)
     print(f"\ncoverage: {comparable} of {total} instance(s) certified on both "
           f"sides; the per-model and aggregate rules apply to those only")
+    for n in optima_notes:
+        print(f"  {n}")
     if total and comparable * 2 < total:
         print(f"warning: fewer than half the instances are comparable. On a "
               f"time-limited suite this gate mostly checks that nothing "
