@@ -15,9 +15,13 @@ number, one at a time, days later.
 
 WHAT IT ENFORCES, in order of severity:
 
-    1. Correctness. A model certified in the baseline must still be certified.
-       Status must not change, and two certified objectives must agree. These
-       can never be waived: there is no allow-list entry for a lost proof.
+    1. Correctness, in two halves. Against the BASELINE: a model certified
+       there must still be certified, its status must not change, and two
+       certified objectives must agree. Against the REFERENCE: a certified
+       objective must also agree with the external solver's. The second half
+       exists because the first is blind to an answer that is wrong in both
+       sweeps -- see evaluate_reference_objectives(). Neither can ever be
+       waived: there is no allow-list entry for a lost proof or a wrong number.
     2. Per-model work. No model may take more than +10% pivots (MILP: nodes)
        against the baseline unless benchmarks/results/gate-allow.json carries
        an entry for it, with a ratio bound and a written reason.
@@ -303,6 +307,51 @@ def evaluate_reference(rows: list, reference: dict, allow: dict[str, dict],
                          "BTRAN/ratio/update ms)")
         else:
             notes.append(detail + f" -- {entry['reason']}")
+    return failures, notes
+
+
+def evaluate_reference_objectives(rows: list, reference: dict,
+                                  obj_abs_tol: float, obj_rel_tol: float
+                                  ) -> tuple[list[str], list[str]]:
+    """Rule 1's second half: is the answer right, not merely unchanged?
+
+    Every other rule in this file compares SOR against SOR. That makes one
+    whole class of defect invisible: an answer that is wrong in the baseline
+    AND in the candidate reads as "no differences", and the gate goes green
+    forever. It is not hypothetical. At --tol 1e-6 the forced-dual path
+    returned pilot.mps as -557.48163926 with proof ProvedOptimalFP, against
+    HiGHS's -557.4897292744 -- a 1.5e-05 relative error, certified, on a
+    baseline every gate run had called clean.
+
+    An optimal objective is unique even where the optimal vertex is not, so a
+    disagreement here is a defect in one of the two solvers and not a matter of
+    taste. Unwaivable, like the rest of rule 1: gate-allow.json is about how
+    much WORK a model may cost, never about what answer it may return.
+    """
+    failures: list[str] = []
+    notes: list[str] = []
+    checked = 0
+    for row in rows:
+        if row.cand is None or not compare.is_certified_success(row.cand):
+            continue
+        ref = reference.get(row.instance)
+        if ref is None or not compare.is_certified_success(ref):
+            continue
+        if ref.objective is None or row.cand.objective is None:
+            continue
+        checked += 1
+        if compare.objectives_agree(row.cand.objective, ref.objective,
+                                    obj_abs_tol, obj_rel_tol):
+            continue
+        denom = max(abs(row.cand.objective), abs(ref.objective), 1.0)
+        rel = abs(row.cand.objective - ref.objective) / denom
+        failures.append(
+            f"{row.instance}: certified objective {row.cand.objective!r} "
+            f"({row.cand.proof or '-'}) disagrees with the reference "
+            f"{ref.objective!r} by {rel:.2e} relative -- a certified wrong "
+            f"answer, which no allow-list entry can waive")
+    notes.append(f"objectives checked against the reference: {checked} "
+                 f"model(s), {len(failures)} disagreement(s)")
     return failures, notes
 
 
@@ -596,11 +645,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         ref = load_reference(reference_path, args.reference_solver)
         measured_g2 = measure_g2(rows, ref)
-        rf, reference_notes = evaluate_reference(
+        of, obj_notes = evaluate_reference_objectives(
+            rows, ref, args.obj_abs_tol, args.obj_rel_tol)
+        rf, time_notes = evaluate_reference(
             rows, ref, allow, args.reference_g2_bar,
             args.reference_model_time_bar, args.reference_work_slack,
             args.reference_min_seconds, recorded_g2_of(baseline))
-        failures += rf
+        failures += of + rf
+        reference_notes = obj_notes + time_notes
         print(f"\nreference: {reference_path.name} "
               f"({args.reference_solver}, {len(ref)} models)")
         for n in reference_notes:

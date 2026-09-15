@@ -341,6 +341,72 @@ class TestReferenceRule(GateCase):
         ref = gate.load_reference(path, "highs")
         self.assertGreaterEqual(len(ref), 90)
         self.assertTrue(all(r.seconds is not None for r in ref.values()))
+        self.assertTrue(all(r.objective is not None for r in ref.values()),
+                        "rule 1's reference half needs objectives in the sweep")
+
+
+class TestReferenceObjectives(GateCase):
+    """Rule 1, second half. Everything else here compares SOR to SOR, so an
+    answer that is wrong in BOTH sweeps reads as "no differences"."""
+
+    def refs(self, **kw):
+        return {k: gate.runs.compare.Result(
+            solver="highs", instance=k, status="optimal", objective=v,
+            seconds=1.0) for k, v in kw.items()}
+
+    def judge_obj(self, cand, reference, abs_tol=1e-9, rel_tol=1e-6):
+        b, c = self.tmp / "b.jsonl", self.tmp / "c.jsonl"
+        self.write(b, cand)
+        self.write(c, cand)
+        rows = runs.compare_rows(
+            runs.load_run(b).results["sor:simplex"],
+            runs.load_run(c).results["sor:simplex"],
+            1.0, 100.0, abs_tol, rel_tol)
+        return gate.evaluate_reference_objectives(rows, reference,
+                                                  abs_tol, rel_tol)
+
+    def test_an_answer_wrong_in_both_sweeps_is_caught(self):
+        # pilot.mps, forced dual, --tol 1e-6: certified ProvedOptimalFP at
+        # -557.48163926 against HiGHS's -557.4897292744. Identical in the
+        # baseline and the candidate, so every other rule called it clean.
+        cand = [record("pilot.mps", objective=-557.48163926)]
+        failures, _ = self.judge_obj(
+            cand, self.refs(**{"pilot.mps": -557.4897292744025}))
+        self.assertTrue(any("certified wrong answer" in f for f in failures),
+                        failures)
+        self.assertTrue(any("1.45e-05 relative" in f for f in failures),
+                        failures)
+
+    def test_agreement_within_tolerance_passes(self):
+        # The same model at --tol 1e-7, which is what HiGHS itself uses.
+        cand = [record("pilot.mps", objective=-557.48972928)]
+        failures, notes = self.judge_obj(
+            cand, self.refs(**{"pilot.mps": -557.4897292744025}))
+        self.assertEqual(failures, [])
+        self.assertTrue(any("1 model(s), 0 disagreement" in n for n in notes),
+                        notes)
+
+    def test_an_uncertified_candidate_is_not_judged_on_its_objective(self):
+        # A run that hit the time limit has no claim to defend.
+        cand = [record("m", status="interrupted", proof=None, objective=0.0)]
+        failures, _ = self.judge_obj(cand, self.refs(m=-557.0))
+        self.assertEqual(failures, [])
+
+    def test_a_reference_that_did_not_solve_is_not_an_oracle(self):
+        cand = [record("m", objective=1.0)]
+        ref = {"m": gate.runs.compare.Result(
+            solver="highs", instance="m", status="TimeLimit",
+            objective=999.0, seconds=1.0)}
+        failures, _ = self.judge_obj(cand, ref)
+        self.assertEqual(failures, [])
+
+    def test_no_allow_list_entry_can_waive_a_wrong_answer(self):
+        # evaluate_reference_objectives takes no allow-list at all: the
+        # signature is the guarantee, so this test is about the signature.
+        import inspect
+        params = inspect.signature(
+            gate.evaluate_reference_objectives).parameters
+        self.assertNotIn("allow", params)
 
 
 class TestDeterminism(GateCase):
