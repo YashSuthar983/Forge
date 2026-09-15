@@ -54,6 +54,15 @@ struct SimplexOptions {
 
     std::uint64_t max_basis_repairs = 200;
 
+    // Numerical-trouble trigger. Every dual pivot has the SAME number
+    // available twice: alpha_rq from the pivotal row (PRICE, a dot product
+    // against rho) and alpha_q[r] from the entering column's FTRAN. They are
+    // one quantity computed two ways, so any disagreement between them is
+    // accumulated error in the factorization -- the one thing an eta-count or
+    // nnz trigger cannot see. Beyond this relative gap, refactorize and redo
+    // the iteration. 0 disables.
+    f64 numerical_trouble_tol = 1e-7;
+
     SimplexMethod  method  = SimplexMethod::Auto;
     SimplexPricing pricing = SimplexPricing::Choose;
 
@@ -64,8 +73,17 @@ struct SimplexOptions {
     f64 dual_cost_perturbation_multiplier = 0.0;
 
     // Refactor after this many basis updates. Product-form etas are as dense
-    // as the FTRAN'd entering columns, so unlike Forrest-Tomlin (HiGHS runs
-    // thousands of updates) the file must be recycled quickly.
+    // as the FTRAN'd entering columns, so the file has to be recycled on the
+    // eta-nnz trigger below long before this ceiling is reached.
+    //
+    // This is a CEILING, not the FT cadence. It used to say Forrest-Tomlin can
+    // run thousands of updates between refactorizations; measured on this tree
+    // it cannot -- FT accuracy decays roughly a decade per 45 updates
+    // (see needs_refactor()), and 5000 never binds on an FT run because row
+    // etas are ~12x sparser than product-form ones and the eta-nnz trigger
+    // fires ~10x less often. That combination is what left d2q06c interrupted
+    // at 171k pivots with a 6.3e+47 cost shift. FT has its own cadence in
+    // refactor_u_nnz_ratio / ft_update_limit below.
     int refactor_interval = 5000;
     // Also refactor when update nnz exceeds this fraction of factor nnz (0
     // disables). The classical product-form break-even is ~1.0: solve cost
@@ -93,6 +111,21 @@ struct SimplexOptions {
     // EITHER update representation. 0 disables it (default: unmeasured
     // against Netlib/MIPLIB, so off until it has a gate to clear).
     f64 refactor_work_ratio = 0.0;
+    // Forrest-Tomlin refactorization cadence. The eta-nnz trigger above is
+    // calibrated for product-form etas and cannot serve FT, whose row etas are
+    // ~12x sparser: it fires about ten times less often, refactor_interval
+    // never binds, and FT accuracy decays roughly a decade per 45 updates. See
+    // docs/PERFORMANCE_REPORT_20260908.md. Inert on the product-form path.
+    // Chosen by sweeping {50, 100, 200} x {1.5, 2, 3} on d2q06c, pilot87,
+    // dfl001, greenbea and 25fv47 by pivots and DSE log error. Every setting
+    // removed the non-convergence outright; 50 gives the lowest pivot total of
+    // the three limits and is the only one where all three ratios agree, i.e.
+    // the count binds and the density trigger is a safety net rather than the
+    // policy. It also sits inside the measured decay rate of about a decade
+    // per 45 updates. DSE log error at 50: d2q06c 1.0e-06, dfl001 1.1e-09,
+    // greenbea 4.7e-06, 25fv47 7.1e-07 (pilot87 0.258 remains, and is P4b).
+    f64 refactor_u_nnz_ratio = 2.0;
+    int ft_update_limit = 50;
     // Collective FT (Huangfu & Hall 2015 Phase 2, item 2 of
     // docs/SIH26119_PS_ALIGNMENT.md §5): when the product-form eta file hits
     // refactor_eta_ratio, try BasisFactor::collapse_pending_into_ft() (fold
@@ -249,6 +282,11 @@ struct SimplexDiagnostics {
     // run. The O(k) first-group path sorts none; this rising towards
     // (candidates x iterations) means the row is being sorted again.
     std::uint64_t ratio_sorted_candidates = 0;
+    // Refactorizations forced because the pivotal row and the FTRAN column
+    // disagreed about alpha_rq, and shifts refused for being implausibly
+    // large. Both are numerical-trouble signals rather than policy.
+    std::uint64_t numerical_trouble_refactors = 0;
+    std::uint64_t refused_cost_shifts = 0;
     std::uint64_t warm_starts      = 0;
     // Work counters are cumulative across Auto's primary/fallback stages. The
     // timing fields below are cumulative too; these counters make a profile

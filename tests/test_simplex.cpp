@@ -480,6 +480,54 @@ void test_partitioned_price_matches_full_scan_on_random_bases() {
     CHECK(compared > 40);
 }
 
+// The numerical-trouble trigger, and the cost-shift bound that shares its
+// response. Both exist because an eta-count or nnz trigger cannot see
+// accumulated error in the factorization -- only a disagreement between two
+// computations of the same number can.
+void test_numerical_trouble_trigger_and_shift_bound() {
+    SimplexOptions opts;
+    opts.method = sor::engines::SimplexMethod::Dual;
+    opts.presolve = false;
+
+    // A well-conditioned model must not trip either guard. If it did, the
+    // trigger would be refactorizing on healthy arithmetic and the shift bound
+    // would be refusing legitimate corrections.
+    {
+        const auto run = solve_text(sor::test::kTestLpMps, opts);
+        CHECK(run.r.status == Status::Optimal);
+        CHECK(run.r.proof == ProofLevel::ProvedOptimalFP);
+        CHECK(run.diag.numerical_trouble_refactors == 0);
+        CHECK(run.diag.refused_cost_shifts == 0);
+    }
+
+    // ...and the trigger must be reachable at all: disabling it is the only
+    // difference, so a run with it off has to agree on the answer.
+    {
+        SimplexOptions off = opts;
+        off.numerical_trouble_tol = 0.0;
+        const auto a = solve_text(sor::test::kTestLpMps, opts);
+        const auto b = solve_text(sor::test::kTestLpMps, off);
+        CHECK(a.r.objective == b.r.objective);
+        CHECK(a.diag.iterations == b.diag.iterations);
+    }
+
+    // A model that does shift: the bound scales with dual_feas_tol, so
+    // tightening the tolerance by six orders of magnitude must refuse at least
+    // as many shifts as the default does, and must still prove.
+    {
+        SimplexOptions shifty = opts;
+        shifty.dual_cost_perturbation_multiplier = 1.0;
+        const auto loose = solve_text(sor::test::kTestLpMps, shifty);
+        SimplexOptions tight = shifty;
+        tight.dual_feas_tol = 1e-12;
+        const auto strict = solve_text(sor::test::kTestLpMps, tight);
+        CHECK(loose.r.status == Status::Optimal);
+        CHECK(strict.r.status == Status::Optimal);
+        CHECK(strict.diag.refused_cost_shifts >=
+              loose.diag.refused_cost_shifts);
+    }
+}
+
 void test_auto_candidate_order_uses_feasibility_before_gap() {
     SimplexOptions opts;
     sor::core::RawResult early, later;
@@ -1776,6 +1824,7 @@ int main() {
     test_dual_cost_perturbation_cleans_before_optimality();
     test_dual_cleanup_hands_over_a_primal_feasible_basis();
     test_partitioned_price_matches_full_scan_on_random_bases();
+    test_numerical_trouble_trigger_and_shift_bound();
     test_auto_candidate_order_uses_feasibility_before_gap();
     test_basis_wellformed();
     test_features_mps_agrees_with_model();

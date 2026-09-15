@@ -271,8 +271,15 @@ public:
     // that accessor's comment. The work trigger applies to EITHER update
     // representation, unlike the other two (eta ratio is product-form-only,
     // bump width is Forrest-Tomlin-only).
+    // `u_nnz_ratio` and `ft_update_limit` are the Forrest-Tomlin cadence.
+    // The eta-nnz trigger cannot serve FT: its row etas are ~12x sparser than
+    // product-form etas, so the same ratio fires about ten times less often and
+    // the update_limit ceiling of 5000 never binds -- while FT accuracy decays
+    // roughly a decade per 45 updates. Left at 0 they are inert.
     bool needs_refactor(int update_limit, f64 eta_nnz_ratio,
-                        Index bump_width_max = 0, f64 work_ratio_max = 0.0) const;
+                        Index bump_width_max = 0, f64 work_ratio_max = 0.0,
+                        f64 u_nnz_ratio = 0.0,
+                        int ft_update_limit = 0) const;
 
     Index dimension()  const noexcept { return m_; }
     // Pending updates in EITHER file: product-form etas plus Forrest-Tomlin row

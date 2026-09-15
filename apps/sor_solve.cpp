@@ -39,6 +39,8 @@ void usage() {
         "  --refactor-interval N  maximum basis updates between refactors\n"
         "  --refactor-eta-ratio R refactor when eta nnz exceeds R*factor nnz\n"
         "  --refactor-work-ratio R refactor when solve work exceeds R*factor nnz\n"
+        "  --refactor-u-nnz-ratio R  FT: refactor when nnz(U) exceeds R*factor nnz\n"
+        "  --ft-update-limit N       FT: refactor after N row etas\n"
         "  --dual-resync-interval N rebuild dual/reduced costs every N pivots (0=off)\n"
         "  --dual-cost-perturbation M deterministic dual perturbation multiplier\n"
         "  --[no-]primal-crash  feasibility-reducing crash (simplex CLI default: on)\n"
@@ -310,6 +312,14 @@ int main(int argc, char** argv) {
         else if (a == "--refactor-work-ratio")
             sx_opts.refactor_work_ratio =
                 parse_real(next("--refactor-work-ratio"), "--refactor-work-ratio", 0.0);
+        else if (a == "--refactor-u-nnz-ratio")
+            sx_opts.refactor_u_nnz_ratio =
+                parse_real(next("--refactor-u-nnz-ratio"),
+                           "--refactor-u-nnz-ratio", 0.0);
+        else if (a == "--ft-update-limit")
+            sx_opts.ft_update_limit = static_cast<int>(parse_uint(
+                next("--ft-update-limit"), "--ft-update-limit", 0,
+                static_cast<unsigned long long>(std::numeric_limits<int>::max())));
         else if (a == "--dual-resync-interval")
             sx_opts.dual_resync_interval = static_cast<int>(parse_uint(
                 next("--dual-resync-interval"), "--dual-resync-interval", 0,
@@ -838,6 +848,11 @@ int main(int argc, char** argv) {
                             diag.primal_cleanup_iterations),
                         diag.cleanup_dual_infeasibility,
                         diag.cleanup_primal_infeasibility);
+            std::printf("  trouble refactor %10llu  (%llu shifts refused)\n",
+                        static_cast<unsigned long long>(
+                            diag.numerical_trouble_refactors),
+                        static_cast<unsigned long long>(
+                            diag.refused_cost_shifts));
             std::printf("  ratio sorted     %10llu candidates\n",
                         static_cast<unsigned long long>(
                             diag.ratio_sorted_candidates));
