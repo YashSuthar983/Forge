@@ -271,9 +271,14 @@ core::RawResult solve_dual_simplex_prepared(
 
     // ---- 5. factorization ------------------------------------------------
     BasisFactor factor;
-    const auto do_ftran = [&](std::vector<f64>& v) {
+    // The entering column's exact Forrest-Tomlin spike, captured by whichever
+    // FTRAN produced alpha and handed to update_ft(). Only filled when the FT
+    // representation is live; the product-form path never asks for it.
+    la::SpikeCapture entering_spike;
+    const bool want_spike = opts.update_method == la::UpdateMethod::ForrestTomlin;
+    const auto do_ftran = [&](std::vector<f64>& v, bool capture = false) {
         const auto t0 = Clock::now();
-        factor.ftran(v);
+        factor.ftran(v, capture ? &entering_spike : nullptr);
         const double dt = ms_since(t0);
         ++diag.solve_calls;
         ++diag.ftran_calls;
@@ -281,9 +286,10 @@ core::RawResult solve_dual_simplex_prepared(
         diag.solve_ms += dt;
     };
     const auto do_ftran_pair = [&](std::vector<f64>& a,
-                                   std::vector<f64>& b) {
+                                   std::vector<f64>& b,
+                                   bool capture = false) {
         const auto t0 = Clock::now();
-        factor.ftran_pair(a, b);
+        factor.ftran_pair(a, b, capture ? &entering_spike : nullptr);
         const double dt = ms_since(t0);
         diag.solve_calls += 2;
         diag.ftran_calls += 2;
@@ -308,9 +314,11 @@ core::RawResult solve_dual_simplex_prepared(
     std::vector<Index> ftran_seed;
     const auto do_ftran_seeded = [&](std::vector<f64>& v,
                                      const std::vector<Index>& seed,
-                                     std::vector<Index>& support) {
+                                     std::vector<Index>& support,
+                                     bool capture = false) {
         const auto t0 = Clock::now();
-        const bool sparse = factor.ftran_seeded_with_support(v, seed, support);
+        const bool sparse = factor.ftran_seeded_with_support(
+            v, seed, support, capture ? &entering_spike : nullptr);
         const double dt = ms_since(t0);
         ++diag.solve_calls;
         ++diag.ftran_calls;
@@ -1590,7 +1598,9 @@ core::RawResult solve_dual_simplex_prepared(
         const bool updated =
             opts.update_method == la::UpdateMethod::ForrestTomlin
                 ? factor.update_ft(leave, alpha, la::LuOptions{}, opts.pivot_tol,
-                                   alpha_is_sparse ? &alpha_support : nullptr)
+                                   alpha_is_sparse ? &alpha_support : nullptr,
+                                   entering_spike.valid ? &entering_spike
+                                                        : nullptr)
                 : factor.update(leave, alpha, opts.pivot_tol);
         diag.basis_update_ms += ms_since(update_t0);
         ++diag.basis_update_calls;
@@ -2200,15 +2210,16 @@ core::RawResult solve_dual_simplex_prepared(
                 } else {
                     std::copy(rho.begin(), rho.end(), tau.begin());
                 }
-                do_ftran_pair(alpha, tau);
+                do_ftran_pair(alpha, tau, want_spike);
                 alpha_is_sparse = false;
                 tau_is_sparse = false;
                 dse_tau_precomputed = true;
             } else if (alpha_sparse_enabled) {
-                alpha_is_sparse = do_ftran_seeded(alpha, ftran_seed, alpha_support);
+                alpha_is_sparse =
+                    do_ftran_seeded(alpha, ftran_seed, alpha_support, want_spike);
             } else {
                 alpha_is_sparse = false;
-                do_ftran(alpha);
+                do_ftran(alpha, want_spike);
             }
             if (alpha_is_sparse) {
                 ++diag.alpha_sparse_iters;
