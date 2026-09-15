@@ -2,6 +2,10 @@ add_executable(forge_solve forge_solve.cpp)
 target_link_libraries(forge_solve PRIVATE
   forge_io forge_engines forge_search forge_certify forge_backend forge_json forge_flags)
 
+add_executable(forge_milp_train forge_milp_train.cpp)
+target_link_libraries(forge_milp_train PRIVATE
+  forge_io forge_engines forge_search forge_flags)
+
 add_executable(forge_gen forge_gen.cpp)
 target_link_libraries(forge_gen PRIVATE forge_io forge_flags)
 

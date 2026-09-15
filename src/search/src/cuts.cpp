@@ -110,6 +110,15 @@ void CutPool::add(const std::vector<CutRow>& candidates,
         if (!canonicalize(incoming.cut) ||
             !normalized_le(incoming.cut, incoming.unit_vals, incoming.rhs_unit))
             continue;
+        // Reject cuts whose support is outside the scoring context (stale
+        // after a column remap / empty context with absurd indices).
+        if (n_cols_ > 0) {
+            bool oob = false;
+            for (const Index j : incoming.cut.cols) {
+                if (j < 0 || j >= n_cols_) { oob = true; break; }
+            }
+            if (oob) continue;
+        }
 
         bool reject = false;
         for (auto it = entries_.begin(); it != entries_.end();) {
@@ -163,6 +172,7 @@ void CutPool::add(const std::vector<CutRow>& candidates,
 }
 
 void CutPool::set_scoring_context(const model::LpProblem& lp) {
+    lp_ctx_ = &lp;
     is_integer_ = lp.is_integer;
     n_cols_ = lp.n_cols();
 
@@ -201,6 +211,14 @@ void CutPool::set_scoring_context(const model::LpProblem& lp) {
         obj_unit_[j] = lp.c[j] / norm;
 }
 
+void CutPool::set_external_scorer(ExternalScoreFn fn) {
+    external_score_ = std::move(fn);
+}
+
+void CutPool::set_external_batch_scorer(ExternalBatchScoreFn fn) {
+    external_batch_score_ = std::move(fn);
+}
+
 std::vector<CutRow> CutPool::select_violated(const std::vector<f64>& x,
                                              CutDiagnostics& diag) {
     if (opts_.max_cuts_per_round <= 0) return {};
@@ -232,54 +250,85 @@ std::vector<CutRow> CutPool::select_violated(const std::vector<f64>& x,
     // the parallelism penalty are measured against an unknown scale and mean
     // nothing. This is not cosmetic -- an unnormalised efficacy of 1.5 shrugs
     // off a 0.5 penalty that is meant to be decisive.
+    //
+    // HGTSM (Latest): batch graph/sequence scorer takes precedence; else
+    // per-cut external scorer; else efficacy composite. Violation gate above
+    // still rejects invalid / non-cutting rows; density and parallelism
+    // filters below stay.
+    const bool use_batch = static_cast<bool>(external_batch_score_);
+    const bool use_ext = !use_batch && static_cast<bool>(external_score_);
+    if (use_batch && !order.empty()) {
+        std::vector<CutRow> batch;
+        batch.reserve(order.size());
+        for (const std::size_t i : order) batch.push_back(entries_[i].cut);
+        std::vector<f64> batch_scores;
+        external_batch_score_(batch, x, batch_scores);
+        if (batch_scores.size() == order.size()) {
+            for (std::size_t k = 0; k < order.size(); ++k)
+                entries_[order[k]].last_score = batch_scores[k];
+        } else {
+            // Malformed batch — fall back to efficacy so selection still runs.
+            for (const std::size_t i : order) {
+                auto& entry = entries_[i];
+                entry.last_score =
+                    max_eff > 0.0 ? entry.last_efficacy / max_eff : 0.0;
+            }
+        }
+    } else {
     for (const std::size_t i : order) {
         auto& entry = entries_[i];
-        f64 score = max_eff > 0.0 ? entry.last_efficacy / max_eff : 0.0;
-        // unit_vals is already the cut normalised to unit length, so the
-        // objective term is a plain dot product and lands in [0, 1], as does
-        // the integer-support fraction.
-        if (!obj_unit_.empty()) {
-            f64 dot = 0.0;
-            for (std::size_t k = 0; k < entry.cut.cols.size(); ++k) {
-                const Index j = entry.cut.cols[k];
-                if (j >= 0 && sz(j) < obj_unit_.size())
-                    dot += entry.unit_vals[k] * obj_unit_[sz(j)];
+        f64 score = 0.0;
+        if (use_ext) {
+            score = external_score_(entry.cut, x);
+        } else {
+            score = max_eff > 0.0 ? entry.last_efficacy / max_eff : 0.0;
+            // unit_vals is already the cut normalised to unit length, so the
+            // objective term is a plain dot product and lands in [0, 1], as does
+            // the integer-support fraction.
+            if (!obj_unit_.empty()) {
+                f64 dot = 0.0;
+                for (std::size_t k = 0; k < entry.cut.cols.size(); ++k) {
+                    const Index j = entry.cut.cols[k];
+                    if (j >= 0 && sz(j) < obj_unit_.size())
+                        dot += entry.unit_vals[k] * obj_unit_[sz(j)];
+                }
+                score += opts_.pool_weight_objective_parallelism * std::fabs(dot);
             }
-            score += opts_.pool_weight_objective_parallelism * std::fabs(dot);
-        }
-        if (!is_integer_.empty() && !entry.cut.cols.empty()) {
-            std::size_t ints = 0;
-            for (const Index j : entry.cut.cols)
-                if (j >= 0 && sz(j) < is_integer_.size() && is_integer_[sz(j)])
-                    ++ints;
-            score += opts_.pool_weight_integer_support *
-                     (static_cast<f64>(ints) /
-                      static_cast<f64>(entry.cut.cols.size()));
-        }
-        if (n_cols_ > 0) {
-            // Sparsity score (Turner et al. 2.1.3): a linear ramp rewarding
-            // sparse cuts, reaching zero at `pool_sparsity_end_density`. A
-            // dense cut is paid for on every node LP that follows it, so
-            // density is a cost the violation alone does not price.
-            const f64 density = static_cast<f64>(entry.cut.cols.size()) /
-                                static_cast<f64>(n_cols_);
-            const f64 end = std::max(1e-9, opts_.pool_sparsity_end_density);
-            score += opts_.pool_weight_sparsity *
-                     std::max(0.0, 1.0 - density / end);
-        }
-        if (max_locks_ > 0.0 && !entry.cut.cols.empty()) {
-            // Lock score, COMPLEMENTED (Turner et al. 2.1.2): a cut on columns
-            // that few other rows already constrain is more likely to add
-            // something the relaxation does not already know.
-            f64 sum = 0.0;
-            for (const Index j : entry.cut.cols)
-                if (j >= 0 && sz(j) < locks_.size()) sum += locks_[sz(j)];
-            const f64 mean = sum / static_cast<f64>(entry.cut.cols.size());
-            score += opts_.pool_weight_low_locks *
-                     std::max(0.0, 1.0 - mean / max_locks_);
+            if (!is_integer_.empty() && !entry.cut.cols.empty()) {
+                std::size_t ints = 0;
+                for (const Index j : entry.cut.cols)
+                    if (j >= 0 && sz(j) < is_integer_.size() && is_integer_[sz(j)])
+                        ++ints;
+                score += opts_.pool_weight_integer_support *
+                         (static_cast<f64>(ints) /
+                          static_cast<f64>(entry.cut.cols.size()));
+            }
+            if (n_cols_ > 0) {
+                // Sparsity score (Turner et al. 2.1.3): a linear ramp rewarding
+                // sparse cuts, reaching zero at `pool_sparsity_end_density`. A
+                // dense cut is paid for on every node LP that follows it, so
+                // density is a cost the violation alone does not price.
+                const f64 density = static_cast<f64>(entry.cut.cols.size()) /
+                                    static_cast<f64>(n_cols_);
+                const f64 end = std::max(1e-9, opts_.pool_sparsity_end_density);
+                score += opts_.pool_weight_sparsity *
+                         std::max(0.0, 1.0 - density / end);
+            }
+            if (max_locks_ > 0.0 && !entry.cut.cols.empty()) {
+                // Lock score, COMPLEMENTED (Turner et al. 2.1.2): a cut on columns
+                // that few other rows already constrain is more likely to add
+                // something the relaxation does not already know.
+                f64 sum = 0.0;
+                for (const Index j : entry.cut.cols)
+                    if (j >= 0 && sz(j) < locks_.size()) sum += locks_[sz(j)];
+                const f64 mean = sum / static_cast<f64>(entry.cut.cols.size());
+                score += opts_.pool_weight_low_locks *
+                         std::max(0.0, 1.0 - mean / max_locks_);
+            }
         }
         entry.last_score = score;
     }
+    }  // !use_batch
     // Density filter, applied BEFORE selection (Turner et al. 2.2.1): a cut
     // denser than the threshold is removed outright, because its cost lands on
     // every subsequent node LP whatever its score says.
@@ -576,22 +625,34 @@ f64 max_row_parallelism(const model::LpProblem& lp,
     if (!(cn > 0.0)) return 0.0;
     cn = std::sqrt(cn);
 
-    std::vector<f64> dense(sz(lp.n_cols()), 0.0);
+    const Index n = lp.n_cols();
+    if (cut.cols.size() != cut.vals.size()) return 0.0;
+    for (const Index j : cut.cols)
+        if (j < 0 || j >= n) return 0.0;
+
+    std::vector<f64> dense(sz(n), 0.0);
     for (std::size_t k = 0; k < cut.cols.size(); ++k)
         dense[sz(cut.cols[k])] = cut.vals[k];
 
     std::vector<char> seen;
     std::vector<Index> touched;
     seen.assign(sz(lp.n_rows()), 0);
-    for (const Index j : cut.cols)
+    for (const Index j : cut.cols) {
+        if (sz(j) >= col_rows.size()) continue;
         for (const Index i : col_rows[sz(j)])
-            if (!seen[sz(i)]) { seen[sz(i)] = 1; touched.push_back(i); }
+            if (i >= 0 && i < lp.n_rows() && !seen[sz(i)]) {
+                seen[sz(i)] = 1;
+                touched.push_back(i);
+            }
+    }
 
     f64 best = 0.0;
     for (const Index i : touched) {
         f64 dot = 0.0, rn = 0.0;
         for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
-            dot += av[sz(k)] * dense[sz(ci[sz(k)])];
+            const Index cj = ci[sz(k)];
+            if (cj < 0 || cj >= n) continue;
+            dot += av[sz(k)] * dense[sz(cj)];
             rn += av[sz(k)] * av[sz(k)];
         }
         if (!(rn > 0.0)) continue;
@@ -658,32 +719,57 @@ model::LpProblem apply_cuts(const model::LpProblem& lp,
             vals.push_back(av[sz(k)]);
         }
 
-    std::vector<const CutRow*> appended;
-    appended.reserve(cuts.size());
+    // Pending appends are not yet in `lp.A` / `out.row_*`. shape_of may point
+    // either at an existing model row (< m) or at a pending slot (>= m). Merging
+    // into a pending slot must tighten that CutRow's bounds — never index `rp`.
+    std::vector<CutRow> pending;
+    pending.reserve(cuts.size());
+    auto cut_cols_in_range = [&](const CutRow& cut) -> bool {
+        if (cut.cols.size() != cut.vals.size()) return false;
+        for (const Index j : cut.cols)
+            if (j < 0 || j >= n) return false;
+        return true;
+    };
     for (const auto& cut : cuts) {
+        if (!cut_cols_in_range(cut)) continue;
         f64 cs = 0.0;
         const std::string key = row_signature(cut.cols, cut.vals, cs);
         const auto it = key.empty() ? shape_of.end() : shape_of.find(key);
         if (it != shape_of.end() && cs != 0.0) {
-            // Existing row i constrains (row_scale/cs) times the same form as
-            // the cut. Map the cut's bounds into the row's scaling -- which
-            // FLIPS them when the ratio is negative -- and keep the tighter
-            // side of each. This is exactly the conjunction of the two
-            // constraints, so no valid point is lost and none is admitted.
+            // Existing/pending row constrains (row_scale/cs) times the same
+            // form as the cut. Map cut bounds into that scaling — FLIP when
+            // the ratio is negative — and keep the tighter side of each.
             const Index i = it->second;
             f64 rsc = 0.0;
-            rcols.clear();
-            rvals.clear();
-            for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
-                rcols.push_back(ci[sz(k)]);
-                rvals.push_back(av[sz(k)]);
+            if (i < m) {
+                rcols.clear();
+                rvals.clear();
+                for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+                    rcols.push_back(ci[sz(k)]);
+                    rvals.push_back(av[sz(k)]);
+                }
+                row_signature(rcols, rvals, rsc);
+            } else {
+                const std::size_t q = static_cast<std::size_t>(i - m);
+                if (q >= pending.size()) continue;
+                row_signature(pending[q].cols, pending[q].vals, rsc);
             }
-            row_signature(rcols, rvals, rsc);
+            if (rsc == 0.0) continue;
             const f64 ratio = rsc / cs;
             f64 lo = cut.row_lo * ratio, hi = cut.row_hi * ratio;
             if (ratio < 0.0) std::swap(lo, hi);
-            if (std::isfinite(lo)) out.row_lo[sz(i)] = std::max(out.row_lo[sz(i)], lo);
-            if (std::isfinite(hi)) out.row_hi[sz(i)] = std::min(out.row_hi[sz(i)], hi);
+            if (i < m) {
+                if (std::isfinite(lo))
+                    out.row_lo[sz(i)] = std::max(out.row_lo[sz(i)], lo);
+                if (std::isfinite(hi))
+                    out.row_hi[sz(i)] = std::min(out.row_hi[sz(i)], hi);
+            } else {
+                CutRow& dest = pending[static_cast<std::size_t>(i - m)];
+                if (std::isfinite(lo))
+                    dest.row_lo = std::max(dest.row_lo, lo);
+                if (std::isfinite(hi))
+                    dest.row_hi = std::min(dest.row_hi, hi);
+            }
             continue;
         }
         // Near-parallel to an existing row: not exactly proportional, so the
@@ -691,27 +777,32 @@ model::LpProblem apply_cuts(const model::LpProblem& lp,
         // buys almost no new direction while contributing near-dependence.
         if (max_row_parallelism(lp, col_rows, cut) > opts.parallel_to_row_max)
             continue;
-        appended.push_back(&cut);
-        if (!key.empty()) shape_of.emplace(key, m + static_cast<Index>(appended.size()) - 1);
+        pending.push_back(cut);
+        if (!key.empty())
+            shape_of.emplace(key, m + static_cast<Index>(pending.size()) - 1);
     }
 
-    if (appended.empty()) return out;
-    for (std::size_t q = 0; q < appended.size(); ++q) {
+    if (pending.empty()) return out;
+    for (std::size_t q = 0; q < pending.size(); ++q) {
         const Index r = m + static_cast<Index>(q);
-        for (std::size_t t = 0; t < appended[q]->cols.size(); ++t) {
+        for (std::size_t t = 0; t < pending[q].cols.size(); ++t) {
             rows.push_back(r);
-            cols.push_back(appended[q]->cols[t]);
-            vals.push_back(appended[q]->vals[t]);
+            cols.push_back(pending[q].cols[t]);
+            vals.push_back(pending[q].vals[t]);
         }
-        out.row_lo.push_back(appended[q]->row_lo);
-        out.row_hi.push_back(appended[q]->row_hi);
+        out.row_lo.push_back(pending[q].row_lo);
+        out.row_hi.push_back(pending[q].row_hi);
     }
-    out.A = sparse::from_triplets(m + static_cast<Index>(appended.size()), n,
+    out.A = sparse::from_triplets(m + static_cast<Index>(pending.size()), n,
                                   rows, cols, vals);
-    out.row_names.resize(sz(m) + appended.size());
-    for (std::size_t q = 0; q < appended.size(); ++q) {
-        out.row_names[sz(m) + q] = appended[q]->name.empty()
-            ? ("CUT_" + std::to_string(q)) : appended[q]->name;
+    // Only materialize names when the source already had them, or when we
+    // need labels for the new cuts; keep vector length == n_rows().
+    if (!out.row_names.empty() || !pending.empty()) {
+        out.row_names.resize(sz(m) + pending.size());
+        for (std::size_t q = 0; q < pending.size(); ++q) {
+            out.row_names[sz(m) + q] = pending[q].name.empty()
+                ? ("CUT_" + std::to_string(q)) : pending[q].name;
+        }
     }
     return out;
 }

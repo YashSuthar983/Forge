@@ -1112,7 +1112,10 @@ post_fixed_point:
         red.col_lo[sz(nj)] = work_lo[sz(oj)];
         red.col_hi[sz(nj)] = work_hi[sz(oj)];
         if (!in.is_integer.empty()) red.is_integer[sz(nj)] = in.is_integer[sz(oj)];
-        if (!in.col_names.empty()) red.col_names.push_back(in.col_names[sz(oj)]);
+        if (!in.col_names.empty() && sz(oj) < in.col_names.size())
+            red.col_names.push_back(in.col_names[sz(oj)]);
+        else if (!in.col_names.empty())
+            red.col_names.emplace_back();
     }
     for (Index i = 0; i < m; ++i) {
         if (row_map[sz(i)] < 0) continue;
@@ -1121,7 +1124,10 @@ post_fixed_point:
         // been applied to the mutable row state above.
         red.row_lo[sz(ni)] = mutable_row_lo[sz(i)];
         red.row_hi[sz(ni)] = mutable_row_hi[sz(i)];
-        if (!in.row_names.empty()) red.row_names.push_back(in.row_names[sz(i)]);
+        if (!in.row_names.empty() && sz(i) < in.row_names.size())
+            red.row_names.push_back(in.row_names[sz(i)]);
+        else if (!in.row_names.empty())
+            red.row_names.emplace_back();
     }
 
     std::vector<Index> rows, cols;

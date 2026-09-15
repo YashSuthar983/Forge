@@ -85,6 +85,14 @@ struct ImpliedBound {
 
 struct ProbingOptions {
     bool enabled = true;
+    // Wang–Chen–Dai dual-fix-in-probing combo (WP-F / mip_presolve.hpp):
+    // after FBBT on each probe side, re-count locks on non-redundant rows and
+    // dual-fix. Off by default so conflict-graph callers that require every
+    // feasible point to survive (tests/test_conflict.cpp) are unchanged;
+    // run_mip_presolve enables it when MipPresolveOptions::dual_fix_in_probing.
+    // Zero-cost dual pins do not create conflict implications.
+    bool dual_fix_in_probing = false;
+    int dual_fix_probe_rounds = 2;
     // Probing is quadratic-ish in practice (one propagation sweep per literal),
     // so it is budgeted three ways: by model size, by candidate count, and by
     // wall clock. Any of them tripping degrades probing to "did less", never to
