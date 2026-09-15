@@ -1693,7 +1693,7 @@ std::FILE* const g_lu_update_log = [] {
     std::FILE* f = std::fopen(path, "w");
     if (f)
         std::fputs("# kind update spike_nnz bump_width delta_nnz u_nnz "
-                   "factor_nnz\n", f);
+                   "factor_nnz max_atilde tiny_nnz\n", f);
     return f;
 }();
 inline std::FILE* lu_update_log() { return g_lu_update_log; }
@@ -2211,17 +2211,30 @@ bool BasisFactor::update_ft(Index p, const std::vector<f64>& alpha,
         const std::size_t t2 = r_pos_.size() - 1;
         const Offset row_eta =
             r_start_[t2 + 1] - (t2 == 0 ? 0 : r_start_[t2]);
-        // spike nnz = nonzeros of the entering column in position coordinates,
-        // which is what a product-form eta would have stored for this pivot.
-        Offset spike = 0;
+        // spike nnz = nonzeros of atilde = U * alpha, which is what gets
+        // installed into U. The question the extra columns answer is whether
+        // those are REAL nonzeros or rounding residue: atilde is formed from
+        // the full FTRAN result alpha, and in floating point U * alpha does not
+        // cancel to exact zeros, so a residue entry survives the `!= 0.0` test
+        // and becomes fill. `tiny` counts entries below 1e-13 of the largest.
+        Offset spike = 0, tiny = 0;
+        f64 max_atilde = 0.0;
         for (const Index k : ft_support_)
-            if (ft_atilde_[sz(k)] != 0.0) ++spike;
-        std::fprintf(fp, "F %zu %lld %lld %lld %lld %lld\n", t2,
+            max_atilde = std::max(max_atilde, std::fabs(ft_atilde_[sz(k)]));
+        const f64 cut = 1e-13 * max_atilde;
+        for (const Index k : ft_support_) {
+            const f64 v = std::fabs(ft_atilde_[sz(k)]);
+            if (v != 0.0) ++spike;
+            if (v != 0.0 && v < cut) ++tiny;
+        }
+        std::fprintf(fp, "F %zu %lld %lld %lld %lld %lld %.6e %lld\n", t2,
                      static_cast<long long>(spike),
                      static_cast<long long>(shift),
                      static_cast<long long>(row_eta),
                      static_cast<long long>(u_live_nnz_),
-                     static_cast<long long>(stats_.factor_nnz));
+                     static_cast<long long>(stats_.factor_nnz),
+                     static_cast<double>(max_atilde),
+                     static_cast<long long>(tiny));
     }
 
     // Storage housekeeping. Relocation leaves holes; once they outweigh the
