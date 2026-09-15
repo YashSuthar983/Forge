@@ -63,10 +63,6 @@ target_compile_options(forge_flags INTERFACE
   $<$<AND:$<CXX_COMPILER_ID:GNU,Clang>,$<BOOL:${FORGE_WARNINGS_AS_ERRORS}>>:-Werror>
 )
 
-# Header-only JSON (nlohmann). Not a solver dependency — see dependency_ledger.md.
-add_library(forge_json INTERFACE)
-add_library(forge::json ALIAS forge_json)
-target_include_directories(forge_json INTERFACE ${CMAKE_SOURCE_DIR}/third_party)
 
 # ---------------------------------------------------------------------------
 # Library modules, in layer order. A module may only link strictly lower

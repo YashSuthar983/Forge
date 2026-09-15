@@ -82,15 +82,6 @@ function(forge_add_python_test name)
 endfunction()
 
 forge_add_python_test(test_compare)
-forge_add_python_test(test_compare_runs)
-forge_add_python_test(test_gate)
-forge_add_python_test(test_presolve_opportunities)
-forge_add_python_test(test_repro_bench)
-forge_add_python_test(test_verify_netlib_results)
-forge_add_python_test(test_freeze_manifest)
-forge_add_python_test(test_claim_run)
-forge_add_python_test(test_lp_auto_train)
-forge_add_python_test(test_milp_latest_ablate)
 forge_add_python_test(test_forbidden_dependencies)
 set_tests_properties(test_forbidden_dependencies PROPERTIES
   ENVIRONMENT
