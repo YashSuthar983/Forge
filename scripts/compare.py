@@ -53,6 +53,7 @@ _PAT = {
     "status":  re.compile(r"^status:\s+(\S+)", re.M),
     "proof":   re.compile(r"^proof_level:\s+(\S+)", re.M),
     "obj":     re.compile(r"^objective:\s+(\S+)", re.M),
+    "dual":    re.compile(r"^dual bound:\s+(\S+)", re.M),
     "viol":    re.compile(r"^max (?:primal viol|row violation):\s+(\S+)", re.M),
     "iters":   re.compile(r"^iterations:\s+(\d+)", re.M),
     "solve_ms": re.compile(r"^  total\s+(\S+)", re.M),
@@ -65,6 +66,10 @@ class Result:
     instance: str
     status: str = "notrun"
     objective: float | None = None
+    # The MILP suites' half of gate rule 1 needs this: a dual bound past the
+    # published optimum on the bounding side means the search pruned a region
+    # that contained the optimum, which no proof or incumbent check can see.
+    dual_bound: float | None = None
     seconds: float | None = None      # solver-internal where available
     wall_s: float | None = None       # full process wall
     iterations: int | None = None
@@ -165,6 +170,7 @@ def run_sor(model: Path, engine: str, backend: str, time_limit: float,
         m = _PAT["proof"].search(out)
         r.proof = m.group(1) if m else None
         r.objective = _num(out, "obj")
+        r.dual_bound = _num(out, "dual")
         r.violation = _num(out, "viol")
         it = _num(out, "iters")
         r.iterations = int(it) if it is not None else None
