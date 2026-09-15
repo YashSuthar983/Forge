@@ -117,9 +117,13 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
 //                every continuous column fixed) contains no violating point;
 //                the cut is valid for every integer-feasible point.
 //   Unverified — the box is too large to enumerate or a continuous column is
-//                free; no conclusion. The caller decides via derivation trust
-//                (Mexi cuts derive from global rows only; nogoods derive from
-//                nodes proven infeasible under their full branch path).
+//                free; no conclusion.
+// Apply policy (bab.cpp): MEXI cuts may only enter the global LP when
+// Verified — derivation trust produced false Optimal proofs on gen-ip002
+// (unbounded-bound coefficient tightening leaked +inf into the rhs) and
+// markshare1 (local-bound cMIR applied globally; Optimal 19 vs MIPLIB opt 1),
+// 2026-09-14 census. NOGOODS may apply Unverified: their assignment
+// exclusion is sound by induction (see try_apply_validated_global_cut).
 enum class CutValidity : std::uint8_t {
     Refuted = 0,
     Verified = 1,
@@ -146,7 +150,11 @@ CutValidity conflict_cut_check_general(const model::LpProblem& lp,
 
 // Assignment nogood from Branch trail entries (binary only):
 //   sum_{j fixed 0} x_j + sum_{j fixed 1} (1 - x_j) >= 1
-// Returns nullopt if fewer than one branched binary.
+// SOUND ONLY when every Branch entry on the trail sits on a globally-binary
+// column: general-integer branch bounds (x >= 2, x <= 5) shape the node box
+// in ways a 0/1 assignment row cannot express, so the excluded set would
+// contain points the node never ruled out. Returns nullopt on any such
+// trail (and when fewer than one branched binary exists).
 std::optional<CutRow> build_nogood_from_branch_trail(const PropTrail& trail,
                                                      const model::LpProblem& lp,
                                                      f64 tol = 1e-9);

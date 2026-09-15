@@ -233,18 +233,61 @@ std::vector<Orbit> detect_permutation_orbits(const model::LpProblem& lp,
     const int cap = opts.color_refinement_max_iters > 0
                         ? opts.color_refinement_max_iters
                         : 64;
+
+    // Column-major adjacency with duplicate (row, col) entries summed,
+    // built ONCE. The previous code rescanned the entire matrix per column
+    // per round — O(n * m * nnz_row) ≈ 9e9 ops on schedule_milp_huge
+    // (67200 cols x 34272 rows) and ran for hours past --time-limit before
+    // the first node LP. Same signatures, linear cost (2026-09-14).
+    const std::size_t nnz = av.size();
+    std::vector<core::Offset> cptr(sz(n) + 1, 0);
+    for (std::size_t k = 0; k < nnz; ++k) ++cptr[sz(ci[k]) + 1];
+    for (Index j = 0; j < n; ++j) cptr[sz(j) + 1] += cptr[sz(j)];
+    std::vector<std::pair<Index, f64>> cent(nnz);
+    {
+        std::vector<core::Offset> fill(cptr.begin(), cptr.end() - 1);
+        for (Index i = 0; i < m; ++i) {
+            for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+                const core::Offset p = fill[sz(ci[sz(k)])]++;
+                cent[sz(p)] = {i, av[sz(k)]};
+            }
+        }
+        // Sort each column's slice by row and merge duplicates (summed),
+        // compacting left-to-right — safe because columns only shrink.
+        std::vector<core::Offset> nstart(sz(n) + 1, 0);
+        core::Offset total = 0;
+        for (Index j = 0; j < n; ++j) {
+            const core::Offset b = cptr[sz(j)], e = cptr[sz(j) + 1];
+            std::sort(cent.begin() + sz(b), cent.begin() + sz(e));
+            core::Offset w = b;
+            for (core::Offset k = b; k < e; ++k) {
+                if (w > b && cent[sz(w - 1)].first == cent[sz(k)].first) {
+                    cent[sz(w - 1)].second += cent[sz(k)].second;
+                    continue;
+                }
+                cent[sz(w++)] = cent[sz(k)];
+            }
+            if (total != b)
+                std::move(cent.begin() + sz(b), cent.begin() + sz(w),
+                          cent.begin() + sz(total));
+            nstart[sz(j)] = total;
+            total += w - b;
+        }
+        nstart[sz(n)] = total;
+        cptr = std::move(nstart);
+    }
+
     for (int it = 0; it < cap; ++it) {
         ++iters;
         std::vector<std::uint64_t> vnew = vcol, rnew = rcol;
         for (Index j = 0; j < n; ++j) {
             std::vector<std::uint64_t> sig;
             sig.reserve(8);
-            for (Index i = 0; i < m; ++i) {
-                f64 a = 0.0;
-                for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
-                    if (ci[sz(k)] == j) a += av[sz(k)];
+            for (core::Offset k = cptr[sz(j)]; k < cptr[sz(j) + 1]; ++k) {
+                const f64 a = cent[sz(k)].second;
                 if (std::fabs(a) <= opts.tol) continue;
-                sig.push_back(mix64(rcol[sz(i)] ^ hash_f64(a)));
+                sig.push_back(mix64(rcol[sz(cent[sz(k)].first)] ^
+                                    hash_f64(a)));
             }
             std::sort(sig.begin(), sig.end());
             std::uint64_t h = vcol[sz(j)];

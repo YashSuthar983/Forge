@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <optional>
 #include <vector>
@@ -194,11 +195,22 @@ GeqConstraint add_geq(const GeqConstraint& a, f64 sa,
     GeqConstraint out;
     out.rhs = sa * a.rhs + sb * b.rhs;
     for (const auto& p : acc) {
+        if (!std::isfinite(p.second)) continue;  // inf*0-style NaN guard
         if (std::fabs(p.second) <= 1e-12) continue;
         out.cols.push_back(p.first);
         out.vals.push_back(p.second);
     }
     return out;
+}
+
+// True iff every coefficient and the rhs are finite and of sane magnitude.
+// Resolution / tightening must never propagate non-finite values: gen-ip002
+// (2026-09-14) showed inf/NaN leaking into learned cuts and poisoning duals.
+bool geq_finite(const GeqConstraint& c) {
+    if (!std::isfinite(c.rhs) || std::fabs(c.rhs) > 1e12) return false;
+    for (f64 v : c.vals)
+        if (!std::isfinite(v) || std::fabs(v) > 1e9) return false;
+    return true;
 }
 
 bool resolve_geq(GeqConstraint& learn, const GeqConstraint& reason, Index var,
@@ -212,7 +224,9 @@ bool resolve_geq(GeqConstraint& learn, const GeqConstraint& reason, Index var,
     // is not a valid implication and can cut off feasible MIP points.
     if (lr * cr > 0.0) return false;
     const f64 mult = lr / cr;  // strictly negative
-    learn = add_geq(learn, 1.0, reason, -mult);
+    GeqConstraint out = add_geq(learn, 1.0, reason, -mult);
+    if (!geq_finite(out)) return false;  // non-finite resolvent: refuse
+    learn = std::move(out);
     return true;
 }
 
@@ -228,13 +242,20 @@ void compact_geq(GeqConstraint& c, f64 tol) {
 }
 
 // Definition 1 (Brearley / Mexi): tighten integer coeffs using global bounds.
+// Sound only when every bound the substitution touches is FINITE: with an
+// unbounded side the (a - btilde) * bound adjustment diverges and the
+// "tightened" row stops being implied (gen-ip002 P0, 2026-09-14). Columns
+// without a finite needed bound are simply not tightened — capping is an
+// optional strengthening, skipping it is always sound.
 void apply_coef_tightening(GeqConstraint& c,
                            const model::LpProblem& lp,
                            f64 tol) {
     const f64 actmin = min_activity_geq(c, lp.col_lo, lp.col_hi);
+    if (!std::isfinite(actmin)) return;
     if (!(actmin < c.rhs - tol)) return;
+    if (!std::isfinite(c.rhs)) return;
     const f64 btilde = c.rhs - actmin;
-    if (btilde <= tol) return;
+    if (!(btilde > tol)) return;
 
     f64 rhs_adj = 0.0;
     for (std::size_t k = 0; k < c.cols.size(); ++k) {
@@ -244,6 +265,7 @@ void apply_coef_tightening(GeqConstraint& c,
         if (a > tol) {
             const f64 ell = lp.col_lo[sz(j)];
             if (a > btilde + tol) {
+                if (!std::isfinite(ell)) continue;  // unbounded below: skip
                 rhs_adj += (a - btilde) * ell;
                 c.vals[k] = btilde;
             }
@@ -251,11 +273,13 @@ void apply_coef_tightening(GeqConstraint& c,
             const f64 u = lp.col_hi[sz(j)];
             const f64 ap = -a;
             if (ap > btilde + tol) {
+                if (!std::isfinite(u)) continue;  // unbounded above: skip
                 rhs_adj += (ap - btilde) * (-u);
                 c.vals[k] = -btilde;
             }
         }
     }
+    if (!std::isfinite(rhs_adj)) return;  // belt and braces: refuse divergence
     c.rhs -= rhs_adj;
 }
 
@@ -273,6 +297,11 @@ bool weaken_var(GeqConstraint& reason, Index s,
         const f64 ell = lp.col_lo[sz(s)];
         const f64 u = lp.col_hi[sz(s)];
         const f64 m = std::max(a * u, a * ell);
+        // An unbounded side makes the sound weakening value divergent; the
+        // old code subtracted +-inf and produced a vacuous (-inf rhs)
+        // constraint. Refuse instead — the caller picks another variable or
+        // stops, which is always sound.
+        if (!std::isfinite(m)) return false;
         reason.rhs -= m;
         reason.vals[k] = 0.0;
         compact_geq(reason, tol);
@@ -325,7 +354,11 @@ GeqConstraint coef_tighten_reduce(const GeqConstraint& reason_in,
             if (geq_infeasible(tmp, lo, hi, tol)) return reason;
             break;
         }
-        weaken_var(reason, xs, lp, tol);
+        if (!weaken_var(reason, xs, lp, tol)) {
+            // No sound weakening for this variable (unbounded side): stop
+            // rather than produce a vacuous or divergent reason.
+            break;
+        }
         apply_coef_tightening(reason, lp, tol);
     }
     return reason;
@@ -412,22 +445,30 @@ bool cmir_prop2_binary(GeqConstraint reason,
     return !out.cols.empty();
 }
 
+// General cMIR on the reason. Validity (2026-09-14 P0 fix): the Marchand–
+// Wolsey bound substitution must use GLOBAL bounds — substituting at LOCAL
+// (node) bounds yields a cut valid only inside that subtree, and applying it
+// to global_lp cut off feasible points in sibling subtrees (markshare1
+// claimed Optimal 19 vs MIPLIB opt 1). The vertex x must be finite as well;
+// with an unbounded support column no activity-max vertex exists, so the
+// reduction is refused rather than fed ±inf into the MIR formula (gen-ip002).
 bool apply_general_cmir(const GeqConstraint& reason,
                         const model::LpProblem& lp,
-                        const std::vector<f64>& lo,
-                        const std::vector<f64>& hi,
                         f64 tol,
                         GeqConstraint& out) {
+    const std::vector<f64>& glo = lp.col_lo;
+    const std::vector<f64>& ghi = lp.col_hi;
     std::vector<f64> x(static_cast<std::size_t>(lp.n_cols()), 0.0);
-    // Local activity-max vertex (fractional corners for integers).
     for (Index j = 0; j < lp.n_cols(); ++j) {
         const f64 a = coeff_at(reason, j);
-        if (a >= 0.0)
-            x[sz(j)] = hi[sz(j)];
-        else
-            x[sz(j)] = lo[sz(j)];
-        if (!std::isfinite(x[sz(j)]))
-            x[sz(j)] = 0.5 * (lo[sz(j)] + hi[sz(j)]);
+        const f64 bound = (a >= 0.0) ? ghi[sz(j)] : glo[sz(j)];
+        if (std::fabs(a) <= tol || !std::isfinite(bound)) {
+            // Free/unbounded side on a support column: no finite vertex.
+            if (std::fabs(a) > tol) return false;
+            x[sz(j)] = std::isfinite(glo[sz(j)]) ? glo[sz(j)] : 0.0;
+            continue;
+        }
+        x[sz(j)] = bound;
     }
     MirOptions mo;
     mo.enabled = true;
@@ -439,13 +480,17 @@ bool apply_general_cmir(const GeqConstraint& reason,
     std::vector<Index> ocols;
     std::vector<f64> ovals;
     f64 orhs = 0.0;
-    if (!apply_cmir_geq(lp, reason.cols, reason.vals, reason.rhs, x, lo, hi, mo,
-                        /*require_violation=*/false, ocols, ovals, orhs, md))
+    if (!apply_cmir_geq(lp, reason.cols, reason.vals, reason.rhs, x, glo, ghi,
+                        mo, /*require_violation=*/false, ocols, ovals, orhs,
+                        md))
         return false;
+    // Non-finite cMIR output is refused outright (fail-closed).
+    if (!std::isfinite(orhs) || std::fabs(orhs) > 1e12) return false;
+    for (f64 v : ovals)
+        if (!std::isfinite(v) || std::fabs(v) > 1e9) return false;
     out.cols = std::move(ocols);
     out.vals = std::move(ovals);
     out.rhs = orhs;
-    (void)tol;
     return !out.cols.empty();
 }
 
@@ -539,14 +584,14 @@ ReduceResult reduce_mixed_binary(GeqConstraint reason,
             ++diag.cmir_applied;
             return res;
         }
-        if (apply_general_cmir(res.reason, lp, lo, hi, tol, mir)) {
+        if (apply_general_cmir(res.reason, lp, tol, mir)) {
             res.reason = std::move(mir);
             ++diag.cmir_applied;
             return res;
         }
     } else if (use_cmir) {
         GeqConstraint mir;
-        if (apply_general_cmir(res.reason, lp, lo, hi, tol, mir)) {
+        if (apply_general_cmir(res.reason, lp, tol, mir)) {
             // Keep if resolvent with mir stays infeasible or improves.
             GeqConstraint trial = conflict;
             if (resolve_geq(trial, mir, xr, tol) &&
@@ -771,8 +816,7 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
                 GeqConstraint mir;
                 if (cmir_prop2_binary(reason, e.var, *ctx.lp, *ctx.col_lo,
                                       *ctx.col_hi, opts.tol, mir) ||
-                    apply_general_cmir(reason, *ctx.lp, *ctx.col_lo,
-                                       *ctx.col_hi, opts.tol, mir)) {
+                    apply_general_cmir(reason, *ctx.lp, opts.tol, mir)) {
                     reason = std::move(mir);
                     ++diag.cmir_applied;
                 }
@@ -924,6 +968,7 @@ CutValidity conflict_cut_check_general(const model::LpProblem& lp,
     std::vector<Index> ints;
     std::vector<int> lo_i, hi_i;
     std::size_t product = 1;
+    std::size_t n_integer_cols = 0;
     for (Index j = 0; j < n; ++j) {
         if (lp.is_integer.empty() || !lp.is_integer[sz(j)]) {
             // A free continuous column puts points outside any enumeration:
@@ -932,11 +977,31 @@ CutValidity conflict_cut_check_general(const model::LpProblem& lp,
                 return CutValidity::Unverified;
             continue;
         }
-        const int lj = static_cast<int>(std::ceil(lp.col_lo[sz(j)] - tol));
-        const int uj = static_cast<int>(std::floor(lp.col_hi[sz(j)] + tol));
-        if (uj < lj) continue;
+        ++n_integer_cols;
+        const f64 lo = lp.col_lo[sz(j)];
+        const f64 hi = lp.col_hi[sz(j)];
+        // Unbounded / non-finite domains cannot be cast through int safely
+        // (floor(+inf) → UB) and must not be skipped: older code did
+        // `int uj = (int)floor(hi)` then `if (uj < lj) continue`, which
+        // dropped every free integer column and returned Verified on an
+        // empty sweep — false Optimal on gen-ip002 (2026-09-14).
+        if (!std::isfinite(lo) || !std::isfinite(hi))
+            return CutValidity::Unverified;
+        if (hi - lo > static_cast<f64>(max_points) + 1.0)
+            return CutValidity::Unverified;
+        const f64 lj_f = std::ceil(lo - tol);
+        const f64 uj_f = std::floor(hi + tol);
+        if (!std::isfinite(lj_f) || !std::isfinite(uj_f))
+            return CutValidity::Unverified;
+        if (uj_f < lj_f) continue;
+        // Stay inside int range before casting.
+        if (lj_f < static_cast<f64>(std::numeric_limits<int>::min()) ||
+            uj_f > static_cast<f64>(std::numeric_limits<int>::max()))
+            return CutValidity::Unverified;
+        const int lj = static_cast<int>(lj_f);
+        const int uj = static_cast<int>(uj_f);
         const std::size_t span = static_cast<std::size_t>(uj - lj + 1);
-        if (product > max_points / std::max<std::size_t>(span, 1)) {
+        if (span == 0 || product > max_points / std::max<std::size_t>(span, 1)) {
             if (enumerated) *enumerated = false;
             return CutValidity::Unverified;
         }
@@ -944,6 +1009,14 @@ CutValidity conflict_cut_check_general(const model::LpProblem& lp,
         ints.push_back(j);
         lo_i.push_back(lj);
         hi_i.push_back(uj);
+    }
+    // Every integer column must appear in the sweep. Skipped empty domains
+    // (uj < lj) with no other ints would otherwise vacuously "verify".
+    if (n_integer_cols > 0 && ints.size() != n_integer_cols)
+        return CutValidity::Unverified;
+    if (ints.empty()) {
+        // No integer columns: nothing to certify for a MIP cut.
+        return CutValidity::Unverified;
     }
     if (enumerated) *enumerated = true;
 
@@ -1001,15 +1074,24 @@ std::optional<CutRow> build_nogood_from_branch_trail(const PropTrail& trail,
     for (const auto& e : trail.entries()) {
         if (e.kind != ReasonKind::Branch) continue;
         if (e.var < 0 || e.var >= n) continue;
-        if (lp.is_integer.empty() || !lp.is_integer[sz(e.var)]) continue;
-        // Binary only (global box [0,1]).
+        // SOUNDNESS (2026-09-14): the nogood may only exclude the branch
+        // ASSIGNMENT if that assignment fully represents the node's box.
+        // A branch on a non-binary column (general integer x >= 2, x <= 5,
+        // or any continuous branching) constrains the box in ways a 0/1
+        // assignment row cannot express; skipping such entries (the old
+        // behavior) excluded points the node never ruled out -> invalid
+        // global cut on mixed models. Refuse instead.
+        if (lp.is_integer.empty() || !lp.is_integer[sz(e.var)]) return
+            std::nullopt;
         if (lp.col_lo[sz(e.var)] < -tol || lp.col_hi[sz(e.var)] > 1.0 + tol)
-            continue;
+            return std::nullopt;
         // Branch to 1: raise lower bound to 1. Branch to 0: drop upper to 0.
         if (e.dir == BoundDir::Lower && e.new_bound >= 1.0 - tol)
             assign[sz(e.var)] = 1;
         else if (e.dir == BoundDir::Upper && e.new_bound <= tol)
             assign[sz(e.var)] = 0;
+        else
+            return std::nullopt;  // partial bound (should not happen on bins)
     }
     CutRow row;
     row.name = "nogood";

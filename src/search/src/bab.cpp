@@ -4135,19 +4135,31 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             if (!as_nogood) ++diag.conflict_cut_diag.aborted;
             return false;
         }
-        // Defense-in-depth gate, fail-closed on REFUTATION only:
+        // Defense-in-depth gate, fail-closed on REFUTATION for both
+        // families, Verified-only for the MEXI path:
         //   Refuted   -> a feasible point violating the cut was exhibited;
-        //                reject outright.
+        //                reject outright (either family).
         //   Verified  -> the full integer box was enumerated and the cut
-        //                holds; accept.
-        //   Unverified-> the box cannot be enumerated (free continuous
-        //                columns, too many integer points). Accept on
-        //                derivation trust: Mexi cuts are analyzed against
-        //                GLOBAL rows only (flugpl fix) and nogoods come from
-        //                nodes proven infeasible under their full branch
-        //                path. Those derivations carry the soundness; the
-        //                checkers exist to catch derivation bugs whenever a
-        //                witness is reachable inside the sweep budget.
+        //                holds; accept (either family).
+        //   Unverified-> MEXI cuts: REJECT. Derivation trust produced false
+        //                Optimal proofs on gen-ip002 (∞-bound coefficient
+        //                tightening leaked +inf into the rhs; dual closed on
+        //                a bad incumbent) and markshare1 (local-bound cMIR
+        //                cuts, valid only in-subtree, applied globally;
+        //                claimed Optimal 19 vs MIPLIB opt 1). The derivation
+        //                bugs are now fixed at the source, but Verified-only
+        //                stays: no enumeration, no global apply.
+        //                NOGOODS: APPLY on derivation soundness. An
+        //                assignment nogood is valid by induction: the node
+        //                was pruned under global rows (valid) + local cuts
+        //                (subtree-valid, and every point with the branch
+        //                assignment lies in the subtree) + previously
+        //                applied cuts (Verified-Mexi or nogood — all
+        //                globally valid by the same induction) + sound
+        //                propagation (row-implied bounds). build_nogood_
+        //                from_branch_trail refuses trails that are not
+        //                fully binary-representable, so the excluded set is
+        //                exactly the node's box.
         const CutValidity vb = conflict_cut_check_binary(
             global_lp, learned, conflict_cut_opts.tol);
         const CutValidity vg =
@@ -4157,6 +4169,11 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                                              conflict_cut_opts.tol);
         if (vb == CutValidity::Refuted || vg == CutValidity::Refuted) {
             if (!as_nogood) ++diag.conflict_cut_diag.aborted;
+            return false;
+        }
+        if (!as_nogood && vb != CutValidity::Verified &&
+            vg != CutValidity::Verified) {
+            ++diag.conflict_cut_diag.aborted;
             return false;
         }
         global_lp = apply_cuts(global_lp, {learned}, opts.cut);

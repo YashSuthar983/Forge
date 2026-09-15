@@ -198,6 +198,26 @@ void test_validity_check_tri_state() {
     invalid.row_hi = 0.5;  // (1,0) violates
     CHECK(sor::search::conflict_cut_check_binary(b2, invalid) ==
           CutValidity::Refuted);
+
+    // Unbounded integer domains must NOT vacuously Verify (gen-ip002 P0:
+    // floor(+inf)→int UB previously skipped every free int column).
+    {
+        sor::model::LpProblem ub;
+        ub.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
+        ub.row_lo = {-sor::model::kInf};
+        ub.row_hi = {5.0};
+        ub.c = {1.0, 1.0};
+        ub.col_lo = {0.0, 0.0};
+        ub.col_hi = {sor::model::kInf, sor::model::kInf};
+        ub.is_integer = {true, true};
+        sor::search::CutRow c;
+        c.cols = {0, 1};
+        c.vals = {1.0, 1.0};
+        c.row_lo = -sor::model::kInf;
+        c.row_hi = 0.0;
+        CHECK(sor::search::conflict_cut_check_general(ub, c) ==
+              CutValidity::Unverified);
+    }
 }
 
 void test_near_empty_cut_refused() {
@@ -207,6 +227,42 @@ void test_near_empty_cut_refused() {
     zeros.cols = {0, 1};
     zeros.vals = {0.0, 0.0};
     CHECK(sor::search::conflict_cut_near_empty(zeros));
+}
+
+// Nogoods must refuse trails that branch on non-binary columns: the node
+// box under x >= 2 (general int) cannot be expressed as a 0/1 assignment,
+// and the old code silently skipped such entries, producing an invalid
+// global cut on mixed models (2026-09-14 review).
+void test_nogood_refuses_mixed_trail() {
+    // x1 binary, x2 general integer in [0, 10], x1 + x2 <= 0.
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
+    lp.row_lo = {-sor::model::kInf};
+    lp.row_hi = {0.0};
+    lp.c = {1.0, 1.0};
+    lp.col_lo = {0.0, 0.0};
+    lp.col_hi = {1.0, 10.0};
+    lp.is_integer = {true, true};
+
+    sor::search::PropTrail trail;
+    // Binary branch x1 = 1 ...
+    trail.push(0, sor::search::BoundDir::Lower, 1.0, 0.0,
+               sor::search::ReasonKind::Branch, -1, 1);
+    // ... plus a general-integer branch x2 >= 2 (mixed trail).
+    trail.push(1, sor::search::BoundDir::Lower, 2.0, 0.0,
+               sor::search::ReasonKind::Branch, -1, 2);
+    const auto ng =
+        sor::search::build_nogood_from_branch_trail(trail, lp, 1e-9);
+    CHECK(!ng.has_value());
+
+    // Pure-binary trail on the same model still yields a nogood.
+    sor::search::PropTrail bin_trail;
+    bin_trail.push(0, sor::search::BoundDir::Lower, 1.0, 0.0,
+                   sor::search::ReasonKind::Branch, -1, 1);
+    const auto ng2 =
+        sor::search::build_nogood_from_branch_trail(bin_trail, lp, 1e-9);
+    CHECK(ng2.has_value());
+    CHECK(ng2->cols.size() == 1);
 }
 
 // Tiny general-integer conflict: 2x + 2y <= 3 with x,y in {0,1,2}.
@@ -618,6 +674,91 @@ void test_enigma_latest_not_false_infeasible() {
     }
 }
 
+void test_gen_ip002_latest_not_false_optimal() {
+    // P0 (2026-09-14): Unverified Mexi cuts on global_lp falsely closed the
+    // tree at incumbent ~-4746 while HiGHS holds feasible ~-4772 (min).
+    const char* candidates[] = {
+        "benchmarks/miplib-easy/mps/gen-ip002.mps",
+        "../benchmarks/miplib-easy/mps/gen-ip002.mps",
+        "sor/benchmarks/miplib-easy/mps/gen-ip002.mps",
+    };
+    const char* path = nullptr;
+    for (const char* c : candidates) {
+        std::ifstream in(c);
+        if (in) {
+            path = c;
+            break;
+        }
+    }
+    if (!path) {
+        ::sor::test::report(true, "gen-ip002: skipped (no mps)", __FILE__,
+                            __LINE__);
+        return;
+    }
+    sor::io::MpsReadReport rep;
+    auto lp = sor::io::read_mps_file(path, rep);
+    BabOptions opts;
+    opts.policy = MilpPolicy::Latest;
+    opts.time_limit_s = 25.0;
+    BabDiagnostics diag;
+    auto raw = sor::search::solve_milp(lp, opts, diag);
+    const auto ev = sor::search::milp_evidence(diag, opts);
+    const auto r = sor::certify::finalize_result(std::move(raw), ev);
+    // HiGHS 60s incumbent; any Optimal claim at a worse (higher) obj is false.
+    constexpr double kHighsIncumbent = -4772.258675;
+    constexpr double kTol = 1e-3;
+    if (r.status == Status::Optimal || diag.globally_proved) {
+        CHECK(std::isfinite(diag.incumbent));
+        CHECK(diag.incumbent <= kHighsIncumbent + kTol);
+        CHECK(std::isfinite(diag.dual_bound));
+        CHECK(diag.dual_bound <= kHighsIncumbent + kTol);
+    } else {
+        CHECK(r.status != Status::Optimal);
+        CHECK(!diag.globally_proved);
+        if (std::isfinite(diag.dual_bound))
+            CHECK(diag.dual_bound <= kHighsIncumbent + kTol);
+    }
+}
+
+void test_markshare1_latest_not_false_optimal() {
+    // P0 (2026-09-14): conflict+nogood Unverified cuts claimed Optimal 19;
+    // MIPLIB verified optimum is 1.
+    const char* candidates[] = {
+        "benchmarks/miplib-easy/mps/markshare1.mps",
+        "../benchmarks/miplib-easy/mps/markshare1.mps",
+        "sor/benchmarks/miplib-easy/mps/markshare1.mps",
+    };
+    const char* path = nullptr;
+    for (const char* c : candidates) {
+        std::ifstream in(c);
+        if (in) {
+            path = c;
+            break;
+        }
+    }
+    if (!path) {
+        ::sor::test::report(true, "markshare1: skipped (no mps)", __FILE__,
+                            __LINE__);
+        return;
+    }
+    sor::io::MpsReadReport rep;
+    auto lp = sor::io::read_mps_file(path, rep);
+    BabOptions opts;
+    opts.policy = MilpPolicy::Latest;
+    opts.time_limit_s = 20.0;
+    BabDiagnostics diag;
+    auto raw = sor::search::solve_milp(lp, opts, diag);
+    const auto ev = sor::search::milp_evidence(diag, opts);
+    const auto r = sor::certify::finalize_result(std::move(raw), ev);
+    constexpr double kTrueOpt = 1.0;
+    constexpr double kTol = 1e-5;
+    CHECK(r.status != Status::Optimal);
+    CHECK(!diag.globally_proved);
+    // Dual must never sit above the true optimum on a minimization instance.
+    if (std::isfinite(diag.dual_bound))
+        CHECK(diag.dual_bound <= kTrueOpt + kTol);
+}
+
 }  // namespace
 
 int main() {
@@ -626,6 +767,7 @@ int main() {
     test_latest_bab_learns_global_conflict_cut();
     test_classical_default_off();
     test_nogood_from_branch_trail_valid();
+    test_nogood_refuses_mixed_trail();
     test_validity_check_tri_state();
     test_near_empty_cut_refused();
     test_general_integer_conflict_safe();
@@ -638,5 +780,7 @@ int main() {
     test_nogood_cap_zero_disables_learning();
     test_flugpl_latest_dual_not_above_opt();
     test_enigma_latest_not_false_infeasible();
+    test_gen_ip002_latest_not_false_optimal();
+    test_markshare1_latest_not_false_optimal();
     return sor::test::finish("test_conflict_cut");
 }
