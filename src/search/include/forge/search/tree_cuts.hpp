@@ -40,12 +40,12 @@ struct TreeCutOptions {
     // Default on for Latest; Classical forces off in apply_policy_tree_cuts().
     bool enabled = true;
     // Separate at every node with depth <= always_depth.
-    int always_depth = 2;
+    int always_depth = 1;
     // Deeper nodes: separate when depth % every_k == 0 (every_k <= 0 disables).
-    int every_k = 8;
+    int every_k = 12;
     // Skip separation when the dual bound has stalled this many nodes.
     std::uint64_t stall_skip_nodes = 4000;
-    int max_cuts_per_node = 5;
+    int max_cuts_per_node = 3;
     int max_rounds_per_node = 1;
     // --- GCS ---------------------------------------------------------------
     bool gcs_enabled = true;

@@ -38,9 +38,8 @@ int test_initial_pricing_content_boundaries() {
     expect(DualInitialPricingStrategy::DSE, 512, 512, 2047, 0);
     expect(DualInitialPricingStrategy::DSE, 512, 511, 2048, 0);
 
-    // Wide boxed regime: aspect is strict; degree and boxed fraction include
-    // their exact boundaries.
-    expect(DualInitialPricingStrategy::Dantzig, 512, 2049, 10240, 1025);
+    // Wide boxed models retain DSE; bounds alone do not justify Dantzig.
+    expect(DualInitialPricingStrategy::DSE, 512, 2049, 10240, 1025);
     expect(DualInitialPricingStrategy::DSE, 512, 2048, 10240, 1024);
     expect(DualInitialPricingStrategy::DSE, 512, 2049, 10239, 1025);
     expect(DualInitialPricingStrategy::DSE, 512, 2049, 10240, 1024);

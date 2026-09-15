@@ -121,6 +121,15 @@ struct BabOptions {
     DynSepOptions dynsep;
     L2SepOptions l2sep;
     HgtsmOptions hgtsm;
+    // Tree restarts (Latest only): after a significant incumbent jump, if
+    // search stalls for tree_restart_node_gap nodes without further improve,
+    // clear the open set once, rebuild the root under current global cuts /
+    // root bounds, and apply reduced-cost fixing from a certified root LP.
+    // Classical ignores these fields. Incumbent and global cuts are kept.
+    bool tree_restart = true;
+    std::uint64_t tree_restart_node_gap = 5000;
+    int tree_restart_max = 1;  // cap restarts per solve (default one)
+    f64 tree_restart_improve_rel = 1e-3;  // "significant" incumbent jump
     std::uint64_t max_nodes = 100000;
     double time_limit_s = 0.0;
     f64 int_tol = 1e-6;
@@ -177,6 +186,10 @@ struct BabOptions {
     // second spent there is a second the tree does not get, and the tree is
     // what closes the gap.
     double heuristic_budget_frac = 0.45;
+    // When an incumbent exists and the relative gap is already small, prefer
+    // tree search over Balans/KP (HiGHS-easy proofs). Measured squeeze 2026-09-13.
+    double heuristic_budget_frac_proof = 0.08;
+    f64 heuristic_proof_gap = 0.15;
     // The same ceiling before any incumbent exists. Deliberately much looser:
     // with nothing in hand the tree cannot prune and the heuristics are the
     // only route to a solution at all.
@@ -434,7 +447,9 @@ struct BabDiagnostics {
     // Wall time in every heuristic, and how often the ceiling above refused a
     // heuristic that would otherwise have run.
     double heuristic_ms = 0.0;
-    std::uint64_t heuristic_budget_blocks = 0;
+    std::uint64_t heuristic_budget_blocks = 0;  // denial events
+    // Sum of intended budgets (ms) for heuristic calls skipped by the ceiling.
+    double heuristic_budget_blocked_ms = 0.0;
     std::uint64_t integer_neighborhood_attempts = 0;
     std::uint64_t integer_neighborhood_trials = 0;
     std::uint64_t integer_neighborhood_hits = 0;
@@ -488,6 +503,8 @@ struct BabDiagnostics {
     std::uint64_t conflict_prop_prunes = 0;
     ConflictCutDiagnostics conflict_cut_diag;
     std::uint64_t conflict_cuts_global = 0;
+    std::uint64_t nogood_cuts_global = 0;
+    std::uint64_t tree_restarts = 0;
     std::uint64_t plunge_nodes = 0;
     f64 incumbent = core::kPosInf;
     f64 dual_bound = core::kNaN;

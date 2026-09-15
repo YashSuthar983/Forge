@@ -36,7 +36,7 @@ Vulkan `LpDevice` builds by default (`-DFORGE_ENABLE_VULKAN=ON`). CUDA is a stub
 | Markowitz LU, hypersparse FTRAN/BTRAN, FT opt-in | `forge_la_cpu` |
 | Presolve v1, Ruiz scaling | `forge_presolve` / engines |
 | HPR on CPU/Vulkan; vanilla PDHG | `hpr.cpp` / `pdhg.cpp` |
-| MILP root B&C | `forge_search` |
+| MILP B&B (Latest: learned branch/cuts/LNS) | `forge_search` |
 | Convex QP | `qp.cpp` |
 | `Optimal` only via `finalize_result` | `forge_certify` |
 | Independent checker | `cli/forge_check.cpp` |

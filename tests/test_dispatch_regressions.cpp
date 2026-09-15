@@ -225,7 +225,7 @@ void test_real_model_dispatch_sentinels() {
     check_case({"80bau3b.mps", 5200, 0, 1, 100});
     check_case({"stocfor2.mps",2500, 0, 1,   0, 2});
     check_case({"bnl2.mps",    2700, 0, 1,   0, 2});
-    check_case({"nesm.mps",    4000, 0, 1,   0, 0});
+    check_case({"nesm.mps",    4000, 0, 1,   0, 2});
     check_case({"fit1p.mps",   1300, 0, 1,  10});
     check_case({"greenbea.mps",5200, 0, 1,   0});
     // GREENBEB moved from the primal route to the dual one when presolve
