@@ -1,4 +1,4 @@
-// sor_solve — CLI for LP / MILP / first-order engines.
+// sor_solve - CLI for LP / MILP / first-order engines.
 //
 // LAYER L8.
 #include "sor/backend/kernel_backend.hpp"
@@ -62,7 +62,7 @@ void usage() {
         "  --implied-slack  presolve: drop zero-cost singleton columns as slacks\n"
         "  --lattice-reform  opt-in AHL lattice reform for pure integer equalities\n"
         "  --no-probing     skip MILP root probing (conflict graph, implied bounds)\n"
-        "  --no-mip-presolve  skip WP-F MIP root presolve (dual-fix, clique, GF2, …)\n"
+        "  --no-mip-presolve  skip WP-F MIP root presolve (dual-fix, clique, GF2, ...)\n"
         "  --no-symmetry    skip WP-G symmetry (orbits / orbital fixing)\n"
         "  --reflection     enable Reflection-complete (off by default; experimental)\n"
         "  --no-reflection  disable Reflection-complete (keep perm/fold)\n"

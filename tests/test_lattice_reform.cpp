@@ -1,6 +1,6 @@
 // Lattice reformulation unit tests: tiny Ax=b systems, LLL invariants via
 // exact A·Q=0 / A·x0=b checks, the restriction protocol (a restricted run
-// may only contribute an incumbent — never a terminal status), and optional
+// may only contribute an incumbent - never a terminal status), and optional
 // markshare smoke (if present).
 #include "sor/certify/finalize.hpp"
 #include "sor/io/mps.hpp"
@@ -121,7 +121,7 @@ void test_tiny_feasible() {
 }
 
 void test_tiny_infeasible() {
-    // 2 x0 = 1, binary — no integer solution (kernel dim 0: reform must be
+    // 2 x0 = 1, binary - no integer solution (kernel dim 0: reform must be
     // refused, and the plain solve must prove Infeasible).
     auto lp = make_eq_binary({{2}}, {1}, {1});
     auto map = try_lattice_reform(lp);
@@ -138,7 +138,7 @@ void test_tiny_infeasible() {
 }
 
 void test_paper_knapsack_kernel() {
-    // Aardal–Wolsey Example 3 (single-row): a = (12223,...,85569).
+    // Aardal-Wolsey Example 3 (single-row): a = (12223,...,85569).
     // RHS = a[0] → solution e0 = (1,0,0,0,0).
     const std::vector<double> a = {12223, 12224, 36674, 61119, 85569};
     const double rhs = a[0];
@@ -167,7 +167,7 @@ void test_paper_knapsack_kernel() {
 }
 
 void test_tiny_market_split_optimal() {
-    // 2 equalities, 6 binary — market-split shape, small enough for B&B.
+    // 2 equalities, 6 binary - market-split shape, small enough for B&B.
     // Known feasible: x = (1,1,0,0,0,1) → sum=3, weighted=1+2+32=35.
     auto lp = make_eq_binary({{1, 1, 1, 1, 1, 1}, {1, 2, 4, 8, 16, 32}},
                              {3, 35}, {0, 0, 0, 0, 0, 0});
@@ -195,7 +195,7 @@ void test_tiny_market_split_optimal() {
 // Regression 1 (wrong proved optimum): forced-zero continuous restriction.
 // min x0 + 10 x1 + 20 x2 s.t. x0 + x1 + x2 = 1, x0 continuous [0,inf),
 // x1,x2 binary. True optimum: x0=1 → 1. The restricted problem (x0=0)
-// proves Optimal 10 — that answer must NEVER ship; the original must be
+// proves Optimal 10 - that answer must NEVER ship; the original must be
 // re-solved and report 1.
 void test_restriction_optimum_falls_back() {
     auto lp = make_mixed_lp({{0.0, sor::model::kInf, false}, {0.0, 1.0, true}, {0.0, 1.0, true}},
@@ -227,7 +227,7 @@ void test_restriction_optimum_falls_back() {
 // Regression 2 (false proved Infeasible): forced-zero restriction makes the
 // integer system bounds-infeasible while the original is feasible via the
 // continuous column. min x0 + 10 x1 + 20 x2 s.t. x0 + x1 + 2 x2 = 5.
-// Restricted (x0=0): max x1+2x2 = 3 < 5 → "Infeasible" — must not ship.
+// Restricted (x0=0): max x1+2x2 = 3 < 5 → "Infeasible" - must not ship.
 // True optimum: x0=5 → 5.
 void test_restriction_infeasible_falls_back() {
     auto lp = make_mixed_lp({{0.0, sor::model::kInf, false}, {0.0, 1.0, true}, {0.0, 1.0, true}},
@@ -417,7 +417,7 @@ void test_markshare_smoke() {
                         __FILE__, __LINE__);
 
     BabOptions bab;
-    bab.time_limit_s = 5;   // smoke only — full markshare close needs stronger MIP
+    bab.time_limit_s = 5;   // smoke only - full markshare close needs stronger MIP
     bab.max_nodes = 20000;
     bab.cuts_enabled = false;
     auto out = solve_milp_lattice(lp, bab, true);

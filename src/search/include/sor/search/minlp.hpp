@@ -1,4 +1,4 @@
-// SOR — finite-domain convex bound-constrained MINLP prototype.
+// SOR - finite-domain convex bound-constrained MINLP prototype.
 #pragma once
 
 #include "sor/engines/nlp.hpp"

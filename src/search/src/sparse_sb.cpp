@@ -249,7 +249,7 @@ SparseSbModel fit_sparse_sb_ranking(const std::vector<SparseSbSample>& samples,
         }
     }
     if (pairs.empty()) {
-        // Degenerate labels — fall back to lasso path.
+        // Degenerate labels - fall back to lasso path.
         SparseSbFitOptions alt = opts;
         alt.loss = SparseSbLoss::Lasso;
         return fit_sparse_sb_lasso(samples, alt);

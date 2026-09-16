@@ -1,4 +1,4 @@
-// SOR — binary conflict graph, root probing, and clique cuts.
+// SOR - binary conflict graph, root probing, and clique cuts.
 //
 // LAYER L5 (search), sibling of cuts.hpp/propagate.hpp. Three related pieces
 // that all rest on the same object, the CONFLICT GRAPH over binary literals:
@@ -85,7 +85,7 @@ struct ImpliedBound {
 
 struct ProbingOptions {
     bool enabled = true;
-    // Wang–Chen–Dai dual-fix-in-probing combo (WP-F / mip_presolve.hpp):
+    // Wang-Chen-Dai dual-fix-in-probing combo (WP-F / mip_presolve.hpp):
     // after FBBT on each probe side, re-count locks on non-redundant rows and
     // dual-fix. Off by default so conflict-graph callers that require every
     // feasible point to survive (tests/test_conflict.cpp) are unchanged;

@@ -1,4 +1,4 @@
-// SOR — Kernel Pump: kernel-search decomposition of Feasibility Pump for
+// SOR - Kernel Pump: kernel-search decomposition of Feasibility Pump for
 // binary MILPs (Assunção, Urrutia & Santos, MPC 2026,
 // DOI:10.1007/s12532-026-00333-2). Clean-room from paper abstract / algorithm
 // description; no SCIP/HiGHS/Gurobi/CBC or KP GitHub source was read.
@@ -91,7 +91,7 @@ bool feasibility_pump_restricted(const model::LpProblem& mip,
                                  std::vector<f64>& x_out,
                                  KernelPumpDiagnostics& diag);
 
-// Full Kernel Pump. Heuristic only — caller must re-validate against the
+// Full Kernel Pump. Heuristic only - caller must re-validate against the
 // original model before accepting an incumbent.
 bool kernel_pump(const model::LpProblem& mip,
                  const std::vector<f64>& x_lp,

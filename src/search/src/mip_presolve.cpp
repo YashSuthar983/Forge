@@ -177,7 +177,7 @@ CliqueProbeDiagnostics apply_clique_probing(const model::LpProblem& lp,
             diag.truncated = true;
             break;
         }
-        // Collect positive literals (x_j = 1) only — AMO on the true side.
+        // Collect positive literals (x_j = 1) only - AMO on the true side.
         std::vector<Index> bins;
         bins.reserve(c.lits.size());
         for (Index lit : c.lits) {

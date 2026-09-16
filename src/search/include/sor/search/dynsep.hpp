@@ -1,4 +1,4 @@
-// SOR — DynSep paper-complete separator configuration (WP-E1 / NeurIPS 2025).
+// SOR - DynSep paper-complete separator configuration (WP-E1 / NeurIPS 2025).
 //
 // DynSep (Ye et al., NeurIPS 2025): dynamic RL separator configuration on an
 // *incremental triplet graph* (vars / cons / separator nodes). The paper encodes
@@ -7,12 +7,12 @@
 // rounds and (ii) per-separator activation ∈ {-1,0,+1}.
 //
 // This file is a clean-room, CPU-only deployment of that control surface:
-//   • Heterogeneous MPNN (2–3 layers, mean agg, ReLU) over a compact
+//   - Heterogeneous MPNN (2-3 layers, mean agg, ReLU) over a compact
 //     bipartite/tripartite round graph: problem(+delta) nodes ↔ separator nodes.
-//   • Policy heads: multi-label separator on/off + per-family budget scales.
-//   • Online/offline imitation (logistic / CE) from efficacy/bound labels;
+//   - Policy heads: multi-label separator on/off + per-family budget scales.
+//   - Online/offline imitation (logistic / CE) from efficacy/bound labels;
 //     weights in dense float vectors, SOR_DYNSEP save/load.
-//   • UCB1 bandit remains Classical / missing-model fallback
+//   - UCB1 bandit remains Classical / missing-model fallback
 //     (`dynsep.backend = Gnn | Ucb | Auto`).
 //
 // Paper deltas still open (documented, not blockers for product path):
@@ -118,7 +118,7 @@ struct DynSepOptions {
     // DynSep can surface GF(2) aggregates and SI-lifted flow covers.
     int budget_zerohalf = 60;
     int budget_flowcover = 60;
-    // Optional arms (MIR/cover/…) only near the root — tree DynSep stays GMI/IB.
+    // Optional arms (MIR/cover/...) only near the root - tree DynSep stays GMI/IB.
     int max_depth_optional = 1;
     ZeroHalfOptions zerohalf;
     FlowCoverOptions flowcover;

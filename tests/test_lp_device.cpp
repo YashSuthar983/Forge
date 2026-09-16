@@ -65,7 +65,7 @@ int main() {
     // CUDA always nullptr here.
     CHECK(backend::make_cuda_lp_device() == nullptr);
 
-    // Vulkan may or may not be present — must not crash.
+    // Vulkan may or may not be present - must not crash.
     auto vk = backend::make_vulkan_lp_device();
     if (vk) {
         CHECK(vk->is_accelerated());

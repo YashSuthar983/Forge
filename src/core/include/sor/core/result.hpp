@@ -1,4 +1,4 @@
-// SOR — core scalar types, solve statuses, the proof ladder, and result records.
+// SOR - core scalar types, solve statuses, the proof ladder, and result records.
 //
 // LAYER L0. Depends on nothing but the standard library.
 //

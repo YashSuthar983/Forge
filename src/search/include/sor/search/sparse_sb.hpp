@@ -1,4 +1,4 @@
-// SOR — sparse linear / quadratic strong-branching score predictor
+// SOR - sparse linear / quadratic strong-branching score predictor
 // (Bayramoğlu, Nemhauser & Sahinidis, arXiv:2604.00094) + ranking spirit
 // from Khalil et al. 2016 (ranking SVM over branching features).
 //

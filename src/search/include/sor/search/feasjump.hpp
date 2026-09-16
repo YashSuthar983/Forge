@@ -1,8 +1,8 @@
-// SOR — Feasibility Jump: an LP-free primal heuristic for MILP.
+// SOR - Feasibility Jump: an LP-free primal heuristic for MILP.
 //
 // LAYER L5 (search), sibling of bab.hpp. Implementation spec:
 //   Luteberget & Sandvik, "Feasibility Jump: an LP-free Lagrangian MIP
-//   heuristic", Mathematical Programming Computation 15, 2023 — the method
+//   heuristic", Mathematical Programming Computation 15, 2023 - the method
 //   that won the MIP 2022 Computational Competition.
 //
 // WHY THIS EXISTS HERE. Every other primal heuristic in bab.cpp starts from an

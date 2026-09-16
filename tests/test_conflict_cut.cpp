@@ -132,7 +132,7 @@ void test_classical_default_off() {
 void test_nogood_from_branch_trail_valid() {
     auto lp = read_text(kPairInfeas);
     sor::search::PropTrail trail;
-    // x1=1, x2=1 — classic infeasible assignment under CAP.
+    // x1=1, x2=1 - classic infeasible assignment under CAP.
     trail.push(0, sor::search::BoundDir::Lower, 1.0, 0.0,
                sor::search::ReasonKind::Branch, -1, 1);
     trail.push(1, sor::search::BoundDir::Lower, 1.0, 0.0,
@@ -395,7 +395,7 @@ void test_safe_limited_skips_cmir_on_nonbinary() {
 // Paper Example 2 / Fig. 2 mixed-binary skeleton (reconstructed):
 // binaries x1,x2,x3; continuous y1∈[0,1], y2∈[-1,1].
 // Local: x2=0 ⇒ y2≤0 (C4), y2≥0 & x3=0 (C5), y1≤3/4 (C1), x1≥1 (C2),
-// C3 infeasible. Analysis must either learn a valid cut or abort — never
+// C3 infeasible. Analysis must either learn a valid cut or abort - never
 // emit an inequality violated by a feasible MBP point.
 void test_mixed_binary_example2_safe() {
     sor::model::LpProblem lp;
@@ -479,7 +479,7 @@ void test_paper_mode_default() {
 
 // 2x1 + 2x2 + 2x3 = 3 with binaries: the LP relaxation sits at the fractional
 // point (1/2,1/2,1/2) so the tree must branch, and every integer leaf is
-// infeasible (the row can only sum to 0, 2, 4 or 6) — branches like
+// infeasible (the row can only sum to 0, 2, 4 or 6) - branches like
 // x1=0,x2=0 (forcing 2x3=3 > 1) are the canonical nogood source.
 const char* kNogoodModel = R"(NAME          NOGOOD
 ROWS
@@ -555,7 +555,7 @@ void test_nogood_cap_zero_disables_learning() {
 }
 
 void test_local_cut_row_aborts_global_learn() {
-    // Conflict on a row past n_global_rows must abort — never promote a
+    // Conflict on a row past n_global_rows must abort - never promote a
     // node-local GMI/MIR into a global conflict cut.
     auto lp = read_text(kPairInfeas);
     std::vector<sor::core::f64> lo = {1.0, 1.0};

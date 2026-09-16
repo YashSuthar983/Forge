@@ -505,7 +505,7 @@ int main() {
     // Neither bounded variable in x+y=1 is implied-free over [0,2]^2, so
     // aggregation (which still requires an implied-free pivot) must decline.
     // Bound-transfer singleton substitution may still remove one column and
-    // keep a ranged image of its bounds — that is a different, sound rule.
+    // keep a ranged image of its bounds - that is a different, sound rule.
     {
         LpProblem p;
         p.A = sor::sparse::from_triplets(

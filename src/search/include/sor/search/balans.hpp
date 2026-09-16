@@ -1,4 +1,4 @@
-// SOR — Balans: online multi-armed bandit ALNS for MILP primal search
+// SOR - Balans: online multi-armed bandit ALNS for MILP primal search
 // (Kilinc-Karzan et al., IJCAI 2025). Clean-room: papers + own code.
 //
 // LAYER L5. Decision-only: selects which neighborhood / meta-heuristic arm to

@@ -1,10 +1,10 @@
-// SOR — LpDevice: device-resident first-order seam.
+// SOR - LpDevice: device-resident first-order seam.
 //
 // LAYER L1.
 //
 // Replaces the per-op KernelBackend as the FO engine's contract. The device owns
 // iterates; the host asks for work and receives scalars. There is deliberately
-// no operator[] and no host() — host addressability cannot be depended on.
+// no operator[] and no host() - host addressability cannot be depended on.
 // See docs/architecture.md §3.2 (LpDevice / HPR path).
 #pragma once
 
@@ -99,7 +99,7 @@ public:
         f64 primal_obj = 0.0;   // scaled, minimize sense
         f64 dual_obj   = 0.0;
         f64 gap_rel    = 0.0;
-        f64 dx_norm    = 0.0;   // ‖Δx‖₂ last step — primal-weight controller
+        f64 dx_norm    = 0.0;   // ‖Δx‖₂ last step - primal-weight controller
         f64 dy_norm    = 0.0;
         f64 epoch_dx_norm = 0.0;
         f64 epoch_dy_norm = 0.0;

@@ -157,7 +157,7 @@ void append_sbc_rows(model::LpProblem& lp,
     }
 }
 
-// Weisfeiler–Leman-style color refinement on a node list with adjacency
+// Weisfeiler-Leman-style color refinement on a node list with adjacency
 // signatures (neighbor_color, edge_tag) multisets.
 void refine_colors(std::vector<std::uint64_t>& color,
                    const std::vector<std::vector<std::pair<Index, std::uint64_t>>>&
@@ -236,7 +236,7 @@ std::vector<Orbit> detect_permutation_orbits(const model::LpProblem& lp,
 
     // Column-major adjacency with duplicate (row, col) entries summed,
     // built ONCE. The previous code rescanned the entire matrix per column
-    // per round — O(n * m * nnz_row) ≈ 9e9 ops on schedule_milp_huge
+    // per round - O(n * m * nnz_row) ≈ 9e9 ops on schedule_milp_huge
     // (67200 cols x 34272 rows) and ran for hours past --time-limit before
     // the first node LP. Same signatures, linear cost (2026-09-14).
     const std::size_t nnz = av.size();
@@ -253,7 +253,7 @@ std::vector<Orbit> detect_permutation_orbits(const model::LpProblem& lp,
             }
         }
         // Sort each column's slice by row and merge duplicates (summed),
-        // compacting left-to-right — safe because columns only shrink.
+        // compacting left-to-right - safe because columns only shrink.
         std::vector<core::Offset> nstart(sz(n) + 1, 0);
         core::Offset total = 0;
         for (Index j = 0; j < n; ++j) {
@@ -680,7 +680,7 @@ std::uint64_t apply_reflection_symmetry(model::LpProblem& lp,
             (global_ok ? " global=1" : " global=0") +
             " signed_iters=" + std::to_string(diag.signed_color_iters);
         if (!diag.reflection_applied) {
-            // Detected but no root reduction — still report complete path.
+            // Detected but no root reduction - still report complete path.
             diag.reflection_status += " (detected; no root reduction)";
         }
     }
@@ -746,7 +746,7 @@ std::uint64_t apply_folding_symmetry(model::LpProblem& lp,
             for (Index j : o.cols) {
                 if (std::fabs(col_hi[sz(j)] - col_lo[sz(j)]) <= tol &&
                     col_lo[sz(j)] > tol)
-                    return false;  // partial fix — folding moot / unsafe
+                    return false;  // partial fix - folding moot / unsafe
                 if (col_lo[sz(j)] > 0.5 && all_bin) return false;
                 if (col_hi[sz(j)] < 0.5 && all_bin &&
                     col_hi[sz(j)] + tol < 1.0)

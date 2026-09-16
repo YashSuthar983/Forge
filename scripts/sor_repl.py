@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SOR Python REPL — project entry point.
+"""SOR Python REPL - project entry point.
 
   cd /home/yash/Desktop/Sih/sor
   python3 scripts/sor_repl.py

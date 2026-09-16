@@ -1,4 +1,4 @@
-// SOR — first-order to simplex crossover.
+// SOR - first-order to simplex crossover.
 #pragma once
 
 #include "sor/engines/simplex.hpp"

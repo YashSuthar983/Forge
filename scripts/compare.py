@@ -258,7 +258,7 @@ def run_sor(model: Path, engine: str, backend: str, time_limit: float,
 
 
 # --------------------------------------------------------------------------
-# External baselines — separate processes / independent packages only.
+# External baselines - separate processes / independent packages only.
 # --------------------------------------------------------------------------
 def _set_option(h, name: str, value) -> None:
     """Set a HiGHS option, recording rather than swallowing a rejection.
@@ -349,7 +349,7 @@ def highs_worker(model: Path, time_limit: float, tol: float = 1e-7,
             r.iterations = int(h.getInfo().simplex_iteration_count)
         except Exception:
             pass
-    except Exception as e:  # noqa: BLE001 — a baseline crash must not kill the sweep
+    except Exception as e:  # noqa: BLE001 - a baseline crash must not kill the sweep
         r.status = "crash"
         r.error = f"{type(e).__name__}: {e}"
     if _HIGHS_OPTION_NOTES and not r.error:

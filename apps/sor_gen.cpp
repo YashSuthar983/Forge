@@ -1,4 +1,4 @@
-// sor_gen — seeded industrial instance generators (PS demo cases).
+// sor_gen - seeded industrial instance generators (PS demo cases).
 //
 //   sor_gen blend    --seed 42 --crudes 4 --products 3 -o blend.mps
 //   sor_gen schedule --seed 7  --periods 6 --units 2 -o schedule.mps

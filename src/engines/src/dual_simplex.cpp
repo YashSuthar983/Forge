@@ -2484,7 +2484,7 @@ core::RawResult solve_dual_simplex_prepared(
                 apply_flip_shift(ratio_ws.flips);
             }
 
-            // Reset, scatter, solve with support, stale-seed cleanup — the
+            // Reset, scatter, solve with support, stale-seed cleanup - the
             // same discipline as the phase-1 site above.
             if (alpha_is_sparse) {
                 for (const Index i : alpha_support) alpha[sz(i)] = 0.0;

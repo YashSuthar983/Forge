@@ -216,7 +216,7 @@ void test_reflection_orbital_fixing_with_amo() {
     // Complementary AMO-style: x + (1-y) structure via x - y <= 0 and packing.
     // Use twin AMO + force reflection gens empty; instead test fixing via cg
     // on a true complementary conflicting pair: x + y <= 1 with a_x=-a_y? 
-    // Simpler: packing twin with reflection self disabled — use pair where
+    // Simpler: packing twin with reflection self disabled - use pair where
     // columns negate AND they conflict.
     LpProblem lp;
     lp.name = "refl_amo";

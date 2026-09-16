@@ -1,10 +1,10 @@
-// SOR — Mixed-Integer Rounding (MIR) cuts.
+// SOR - Mixed-Integer Rounding (MIR) cuts.
 //
 // LAYER L5 (search), sibling of cuts.hpp/covers.hpp. Implementation spec:
 //   Nemhauser & Wolsey, "A recursive procedure to generate all cuts for 0-1
-//     mixed integer programs", Math. Prog. 46, 1990 — the MIR inequality.
+//     mixed integer programs", Math. Prog. 46, 1990 - the MIR inequality.
 //   Marchand & Wolsey, "Aggregation and mixed integer rounding to solve MIPs",
-//     Oper. Res. 49(3), 2001 — bound substitution and the complemented-MIR
+//     Oper. Res. 49(3), 2001 - bound substitution and the complemented-MIR
 //     (c-MIR) scaling heuristic used below.
 //
 // THE HISTORY THAT SHAPES THIS FILE. A previous MIR attempt in this codebase
@@ -112,7 +112,7 @@ std::vector<CutRow> separate_mir(const model::LpProblem& lp,
                                  MirDiagnostics& diag);
 
 // Shared cMIR primitive for Mexi conflict reason reduction (arXiv:2410.15110
-// §4.2 / §7) and Marchand–Wolsey separation.
+// §4.2 / §7) and Marchand-Wolsey separation.
 //
 // Math (Def. 3 paper form, applied after bound substitution onto [lo,hi]):
 //   Given sum_j a_j x_j + sum_k g_k y_k >= b with x integer >=0, y>=0 after

@@ -1,4 +1,4 @@
-// Slice 0 — milp.policy + feature export APIs.
+// Slice 0 - milp.policy + feature export APIs.
 #include "sor/io/mps.hpp"
 #include "sor/search/bab.hpp"
 #include "sor/search/features.hpp"

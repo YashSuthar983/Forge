@@ -1,4 +1,4 @@
-// SOR — MIP root presolve depth (WP-F): Wang–Chen–Dai dual-fix⊕probing,
+// SOR - MIP root presolve depth (WP-F): Wang-Chen-Dai dual-fix⊕probing,
 // clique probing strengthen, GF2, disconnected components, TU/network
 // implied-int, OBBT-lite / FBBT deepen, multi-round restart with conflict
 // graph rebuild.
@@ -29,7 +29,7 @@ using core::Index;
 struct MipPresolveOptions {
     bool enabled = true;
     // Classic dual fixing + lock recount after FBBT on each probe side
-    // (Wang–Chen–Dai Algorithm 1 spirit). Wired into build_conflict_graph via
+    // (Wang-Chen-Dai Algorithm 1 spirit). Wired into build_conflict_graph via
     // ProbingOptions::dual_fix_in_probing.
     bool dual_fixing = true;
     bool dual_fix_in_probing = true;

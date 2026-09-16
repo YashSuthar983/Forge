@@ -1,4 +1,4 @@
-// SOR — finite-domain convex diagonal MIQP prototype.
+// SOR - finite-domain convex diagonal MIQP prototype.
 #pragma once
 
 #include "sor/core/result.hpp"

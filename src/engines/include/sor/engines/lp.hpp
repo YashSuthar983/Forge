@@ -1,4 +1,4 @@
-// SOR — serial top-level LP dispatcher.
+// SOR - serial top-level LP dispatcher.
 #pragma once
 
 #include "sor/core/result.hpp"

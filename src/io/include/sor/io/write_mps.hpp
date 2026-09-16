@@ -1,4 +1,4 @@
-// SOR — write an LpProblem as free-format MPS.
+// SOR - write an LpProblem as free-format MPS.
 #pragma once
 
 #include "sor/model/lp.hpp"

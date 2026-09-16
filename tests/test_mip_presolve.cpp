@@ -1,4 +1,4 @@
-// WP-F: MIP root presolve — dual fixing, clique probing, OBBT-lite, GF2,
+// WP-F: MIP root presolve - dual fixing, clique probing, OBBT-lite, GF2,
 // components, implied-int, full restart loop.
 #include "sor/engines/simplex.hpp"
 #include "sor/search/bab.hpp"
@@ -71,7 +71,7 @@ LpProblem wide_int_model() {
     return lp;
 }
 
-// Two independent AMO cliques — disconnected multi-column components.
+// Two independent AMO cliques - disconnected multi-column components.
 LpProblem two_components_model() {
     LpProblem lp;
     lp.name = "two_comp";

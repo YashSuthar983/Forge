@@ -41,7 +41,7 @@ inline bool fix_at(NeighborhoodProblem& out, Index j, f64 v, f64 int_tol) {
 }
 
 // Alg. 1 spirit: repeatedly shrink [lo,hi] halfway toward p when the bit
-// says "reliable". Does not invent new dual bounds — only restricts the
+// says "reliable". Does not invent new dual bounds - only restricts the
 // sub-MIP box relative to the node box already given.
 void binarized_tighten(f64& lo, f64& hi, f64 p, int bits, f64 int_tol) {
     if (!(hi > lo + int_tol) || bits <= 0) return;

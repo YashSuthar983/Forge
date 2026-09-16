@@ -143,7 +143,7 @@ ComponentPresolveDiagnostics apply_component_presolve(
 
         // Dual fixing using only this component's rows: build a view by
         // temporarily treating other rows as redundant via a local LP copy
-        // with those rows dropped — cheaper: call apply_dual_fixing on a
+        // with those rows dropped - cheaper: call apply_dual_fixing on a
         // shallow clone that zeros out foreign rows' bounds to ±inf.
         model::LpProblem sub = lp;
         for (Index i = 0; i < m; ++i) {
