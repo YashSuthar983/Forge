@@ -1,4 +1,4 @@
-// SOR — the KernelBackend contract.
+// SOR - the KernelBackend contract.
 //
 // LAYER L1. CPU provides the reference implementation.
 //

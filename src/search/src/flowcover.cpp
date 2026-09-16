@@ -78,7 +78,7 @@ bool vub_from_pair(f64 ay, f64 ax, f64 rhs, f64 tol, f64& u_out) {
     f64 c = ax / ay;
     f64 r = rhs / ay;
     if (ay < 0.0) {
-        // Flipped by dividing by negative: inequality sense reverses — reject
+        // Flipped by dividing by negative: inequality sense reverses - reject
         // here; caller tries the ≥ form separately.
         return false;
     }
@@ -204,7 +204,7 @@ void collect_vubs(const model::LpProblem& lp, const std::vector<f64>& lo,
     // Bound-inferred: continuous y with finite ub U and a binary x that appears
     // with y in some row with opposite-sign coupling (already covered by
     // projection). Additionally, if y has finite ub and there is an explicit
-    // singleton row y ≤ 0 when some binary is 0 — skip (needs implications).
+    // singleton row y ≤ 0 when some binary is 0 - skip (needs implications).
 }
 
 bool build_flow_from_row(
@@ -394,7 +394,7 @@ std::vector<CutRow> separate_flow_covers(const model::LpProblem& lp,
                     if (lifted >= opts.max_lift_arcs) break;
                     const auto& a = arcs[idx];
                     const f64 beta = gu_si_beta(a.u, m1, lambda, opts.tol);
-                    // Skip vacuous (β ≈ 0 and we still add y — only add when
+                    // Skip vacuous (β ≈ 0 and we still add y - only add when
                     // the pair can strengthen violation).
                     // Include y with α=1 and binary with β (≤ 0).
                     const f64 contrib =

@@ -1,8 +1,8 @@
-// SOR — L2Sep instance-aware separator configuration (WP-E2).
+// SOR - L2Sep instance-aware separator configuration (WP-E2).
 //
 // L2Sep (arXiv:2311.05650 spirit): map a compact feature vector from the root
 // LP / model stats (+ optional SeparatorState) to DynSepOptions allow_* flags
-// and per-family budgets. Clean-room sparse linear / logistic over features —
+// and per-family budgets. Clean-room sparse linear / logistic over features -
 // not the paper's full learned policy. Applied once at the root under
 // milp.policy=latest; optionally re-applied mid-tree. Classical ignores.
 #pragma once

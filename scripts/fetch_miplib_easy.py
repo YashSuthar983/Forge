@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # (name, preferred source). Sources: "2017" = miplib.zib.de WebData,
 # "miplib3" = miplib2010.zib.de MIPLIB 3.0 archive.
-# Curated for a from-scratch B&B demo — not a MIPLIB-2017 leaderboard claim.
+# Curated for a from-scratch B&B demo - not a MIPLIB-2017 leaderboard claim.
 EASY: list[tuple[str, str]] = [
     ("flugpl", "2017"),
     ("gt2", "2017"),

@@ -1,11 +1,11 @@
-// SOR — formulation symmetry (WP-G), paper-complete:
+// SOR - formulation symmetry (WP-G), paper-complete:
 //   Reflection (Hojny arXiv:2405.08379) + Folding (van der Hulst arXiv:2603.12136).
 //
 // LAYER L5. Clean-room:
-//   • Signed-permutation / reflection detection via colored SDG + own color
-//     refinement (Hojny §§3–4 compact encoding). No nauty/bliss.
-//   • Orbitopal / lex SBCs + reflection orbital fixing for binary groups.
-//   • Folding = DRCR-style dimension reduction on color-refinement orbits
+//   - Signed-permutation / reflection detection via colored SDG + own color
+//     refinement (Hojny §§3-4 compact encoding). No nauty/bliss.
+//   - Orbitopal / lex SBCs + reflection orbital fixing for binary groups.
+//   - Folding = DRCR-style dimension reduction on color-refinement orbits
 //     (identical-parallel binary/integer + continuous equitable sum folds)
 //     with mandatory lift back to original space.
 #pragma once
@@ -28,7 +28,7 @@ struct SymmetryOptions {
     // Color-refinement rounds (0 = until fixpoint or max_iters).
     int color_refinement_max_iters = 64;
     // Orbital fixing on binary orbits that are pairwise conflicting in `cg`
-    // (AMO). Never applied to non-clique orbits — that would cut optima.
+    // (AMO). Never applied to non-clique orbits - that would cut optima.
     bool orbital_fixing = true;
     // Reflection-complete: signed SDG detection + orbitopal/lex SBCs +
     // reflection orbital fixing. Default OFF until SBCs are validated on

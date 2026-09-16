@@ -2,7 +2,7 @@
 """CPU vs Vulkan crossover study on the synthetic LP ladder.
 
 Times transfer-inclusive HPR solves. The sizes where the GPU loses are the
-honest half of the result — Netlib sits entirely below the expected crossover.
+honest half of the result - Netlib sits entirely below the expected crossover.
 """
 from __future__ import annotations
 
@@ -137,10 +137,10 @@ def main() -> int:
     for r in rows:
         cpu, vk = r.get("cpu", {}), r.get("vulkan", {})
         sp = r.get("speedup_gpu_over_cpu")
-        sp_s = f"{sp:.2f}×" if sp else "—"
+        sp_s = f"{sp:.2f}×" if sp else "-"
         rd = r.get("obj_rel_diff")
-        rd_s = f"{rd:.2e}" if rd is not None else "—"
-        nnz = cpu.get("nnz") or vk.get("nnz") or "—"
+        rd_s = f"{rd:.2e}" if rd is not None else "-"
+        nnz = cpu.get("nnz") or vk.get("nnz") or "-"
         lines.append(
             f"| {r['instance']} | {nnz} | "
             f"{cpu.get('wall_s', float('nan')):.3f}s | "

@@ -311,7 +311,7 @@ def _apply_bound(m: _Model, line: str) -> None:
 def to_mps(model: _Model, name: str = "TEXTLP") -> str:
     cols = sorted(model.vars)
     # default bounds: 0 <= x  (unless free/set)
-    # Free MPS has no maximize bit — we negate COST and tag sense for the UI.
+    # Free MPS has no maximize bit - we negate COST and tag sense for the UI.
     sense_tag = "MAXIMIZE" if model.maximize else "MINIMIZE"
     lines = [
         f"NAME          {name}",

@@ -1,19 +1,19 @@
-// SOR — Mexi et al. cut-based conflict analysis (WP-B, arXiv:2410.15110).
+// SOR - Mexi et al. cut-based conflict analysis (WP-B, arXiv:2410.15110).
 //
 // Clean-room from the paper (NOT a port of SCIP conflict_resolution.c):
-//   Algorithm 1 — reverse/earliest infeasible state walk, reduce, resolve,
+//   Algorithm 1 - reverse/earliest infeasible state walk, reduce, resolve,
 //                 strengthen, stop at FUIP (asserting) or global ⊥.
-//   Algorithm 2 — coefficient-tightening reduction (weaken + coefTight).
-//   §4.2        — cMIR reduction (Prop. 2 binary; Marchand–Wolsey general).
-//   Algorithm 3 — mixed-binary: resolve non-relaxable continuous vars from the
+//   Algorithm 2 - coefficient-tightening reduction (weaken + coefTight).
+//   §4.2        - cMIR reduction (Prop. 2 binary; Marchand-Wolsey general).
+//   Algorithm 3 - mixed-binary: resolve non-relaxable continuous vars from the
 //                 reason via full trail history, then binary reduce.
-//   §7          — general integers: attempt resolve / cMIR heuristic; ABORT
-//                 (nullopt) if resolvent is not locally infeasible — never emit
+//   §7          - general integers: attempt resolve / cMIR heuristic; ABORT
+//                 (nullopt) if resolvent is not locally infeasible - never emit
 //                 an invalid global cut / never force false Infeasible.
 //
 // Modes:
-//   Paper       — full coverage above (Latest product default).
-//   SafeLimited — conservative subset: abort on continuous reasons; skip cMIR
+//   Paper       - full coverage above (Latest product default).
+//   SafeLimited - conservative subset: abort on continuous reasons; skip cMIR
 //                 when the reason is not pure binary (legacy / debugging).
 #pragma once
 
@@ -56,7 +56,7 @@ struct ConflictCutOptions {
     // leaves them on (no trail analysis, no LP stall).
     bool nogood_cuts = true;
     int max_nogood_cuts = 24;
-    // Prefer cMIR reduction (Prop. 2 / general Marchand–Wolsey) before / with
+    // Prefer cMIR reduction (Prop. 2 / general Marchand-Wolsey) before / with
     // the coefficient-tightening loop.
     bool use_cmirror = true;
     // Allow general-integer reasons (§7). When false, non-binary integer
@@ -94,7 +94,7 @@ struct ConflictAnalysisContext {
     const PropTrail* trail = nullptr;
     Index conflict_var = -1;
     Index conflict_row = -1;
-    // Rows with index >= n_global_rows are node-local cuts (tree GMI/MIR/…).
+    // Rows with index >= n_global_rows are node-local cuts (tree GMI/MIR/...).
     // Those inequalities may depend on local bounds and must never seed a
     // *global* conflict cut. <0 means "all rows of lp are treated as global".
     Index n_global_rows = -1;
@@ -111,15 +111,15 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
 
 // Outcome of a cut validity check. The checkers are fail-closed: they never
 // CLAIM validity they did not verify.
-//   Refuted    — a point feasible for `lp` (rows + bounds) that violates the
+//   Refuted    - a point feasible for `lp` (rows + bounds) that violates the
 //                cut was exhibited; the cut is invalid for this model.
-//   Verified   — the complete integer box (all integer columns enumerated,
+//   Verified   - the complete integer box (all integer columns enumerated,
 //                every continuous column fixed) contains no violating point;
 //                the cut is valid for every integer-feasible point.
-//   Unverified — the box is too large to enumerate or a continuous column is
+//   Unverified - the box is too large to enumerate or a continuous column is
 //                free; no conclusion.
 // Apply policy (bab.cpp): MEXI cuts may only enter the global LP when
-// Verified — derivation trust produced false Optimal proofs on gen-ip002
+// Verified - derivation trust produced false Optimal proofs on gen-ip002
 // (unbounded-bound coefficient tightening leaked +inf into the rhs) and
 // markshare1 (local-bound cMIR applied globally; Optimal 19 vs MIPLIB opt 1),
 // 2026-09-14 census. NOGOODS may apply Unverified: their assignment
@@ -163,7 +163,7 @@ std::optional<CutRow> build_nogood_from_branch_trail(const PropTrail& trail,
 bool conflict_cut_near_empty(const CutRow& cut, f64 tol = 1e-12);
 
 inline void apply_conflict_cut_policy(MilpPolicy policy, ConflictCutOptions& o) {
-    // Classical ablation: all conflict-derived learning off — Mexi analysis
+    // Classical ablation: all conflict-derived learning off - Mexi analysis
     // AND branch-trail nogoods. Latest keeps the struct defaults (enabled /
     // nogood_cuts = true) subject to CLI --no-conflict-cut / --no-nogood-cuts.
     if (policy == MilpPolicy::Classical) {

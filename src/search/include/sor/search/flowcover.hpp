@@ -1,6 +1,6 @@
-// SOR — single-node flow-cover cut separator.
+// SOR - single-node flow-cover cut separator.
 //
-// Clean-room Padberg–Van Roy–Wolsey / Gu–Nemhauser–Savelsbergh flow covers:
+// Clean-room Padberg-Van Roy-Wolsey / Gu-Nemhauser-Savelsbergh flow covers:
 //
 //   ∑_{j ∈ N} y_j  ≤  b ,   0 ≤ y_j ≤ u_j x_j ,   x_j ∈ {0,1}.
 //

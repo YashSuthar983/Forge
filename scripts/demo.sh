@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SOR SIH26119 — CLI film track (no Julia).
+# SOR SIH26119 - CLI film track (no Julia).
 # Usage:
 #   ./scripts/demo.sh              # full track
 #   ./scripts/demo.sh blend        # one beat
@@ -42,7 +42,7 @@ run_check() {
   local model="${1:-$EX/crude_blending/blend_s42.mps}"
   local sol="${2:-$OUT/blend.sol}"
   if [[ ! -f "$sol" ]]; then
-    echo "no solution yet — running blend first"
+    echo "no solution yet - running blend first"
     run_blend
   fi
   echo "INPUT:  model=$model  sol=$sol"
@@ -70,7 +70,7 @@ run_milp() {
 }
 
 run_hpr_cpu() {
-  banner "5a. HPR first-order (CPU)  — FO ≠ proved Optimal"
+  banner "5a. HPR first-order (CPU)  - FO ≠ proved Optimal"
   echo "INPUT:  $EX/sparse500.mps"
   echo "OPTS:   --engine hpr --backend cpu --max-iter 50000 --time-limit 15"
   "$BIN/sor_solve" "$EX/sparse500.mps" \
@@ -80,7 +80,7 @@ run_hpr_cpu() {
 }
 
 run_hpr_vulkan() {
-  banner "5b. HPR first-order (Vulkan GPU)  — transfer-inclusive timing"
+  banner "5b. HPR first-order (Vulkan GPU)  - transfer-inclusive timing"
   echo "INPUT:  $EX/sparse500.mps"
   echo "OPTS:   --engine hpr --backend vulkan --max-iter 50000 --time-limit 30"
   echo "LOOK:   host->device / device->host lines"
@@ -112,7 +112,7 @@ run_gen() {
 
 usage() {
   cat <<EOF
-SOR demo CLI — film track
+SOR demo CLI - film track
 
   $0 all          full video track
   $0 blend        Blend LP + write .sol
@@ -146,14 +146,14 @@ case "$cmd" in
     run_qp
     run_milp
     run_hpr_cpu
-    # Vulkan may be slow/unavailable — still film if present
+    # Vulkan may be slow/unavailable - still film if present
     if "$BIN/sor_solve" "$EX/testlp.mps" --engine hpr --backend vulkan --max-iter 10 --time-limit 5 >/dev/null 2>&1; then
       run_hpr_vulkan
     else
-      echo "(skip hpr-vulkan — backend not available)"
+      echo "(skip hpr-vulkan - backend not available)"
     fi
     run_cleanroom
-    banner "DONE — logs + .sol files in $OUT"
+    banner "DONE - logs + .sol files in $OUT"
     ls -la "$OUT"
     ;;
   *)

@@ -68,7 +68,7 @@ BOUNDS
 ENDATA
 )";
 
-// x1 + x2 <= 1, x1 >= 1, x2 >= 1, binary — infeasible
+// x1 + x2 <= 1, x1 >= 1, x2 >= 1, binary - infeasible
 const char* kInfeasMip = R"(NAME          INFEASMIP
 ROWS
  N  COST

@@ -39,7 +39,7 @@ void test_policy_gates() {
 void test_builtin_prior_binary_sparse() {
     LpProblem lp;
     lp.name = "bin";
-    // 4 binary vars, 1 knapsack row — sparse binary.
+    // 4 binary vars, 1 knapsack row - sparse binary.
     lp.A = from_triplets(1, 4, {0, 0, 0, 0}, {0, 1, 2, 3}, {2.0, 3.0, 4.0, 5.0});
     lp.c = {-1.0, -1.0, -1.0, -1.0};
     lp.row_lo = {-kInf};

@@ -1,12 +1,12 @@
-// SOR — HGTSM paper-complete cut sequence scoring (arXiv:2410.03112).
+// SOR - HGTSM paper-complete cut sequence scoring (arXiv:2410.03112).
 //
 // Clean-room Heterogeneous-Graph-Transformer Sequence Model:
-//   • Encode LP + candidates as a heterogeneous tripartite graph
+//   - Encode LP + candidates as a heterogeneous tripartite graph
 //     (Vars / Cons / Cuts) via features::build_tripartite_snapshot.
-//   • Type-specific message passing (HGT-lite) over six directed edge types.
-//   • Permutation-invariant sequence head (Transformer-lite or GRU) over cut
-//     embeddings — no positional encodings (paper §3.4).
-//   • Higher-level ratio head (mean-pooled cuts → keep fraction).
+//   - Type-specific message passing (HGT-lite) over six directed edge types.
+//   - Permutation-invariant sequence head (Transformer-lite or GRU) over cut
+//     embeddings - no positional encodings (paper §3.4).
+//   - Higher-level ratio head (mean-pooled cuts → keep fraction).
 //
 // When a graph model is loaded it is the default scorer for CutPool under
 // milp.policy=latest. The linear joint scorer remains the fallback (unloaded
@@ -184,7 +184,7 @@ inline void apply_hgtsm_policy(MilpPolicy policy, HgtsmOptions& o) {
     if (policy == MilpPolicy::Classical) o.enabled = false;
 }
 
-// LP-state side of the heterogeneous pair (depth, frac, gap proxy, …).
+// LP-state side of the heterogeneous pair (depth, frac, gap proxy, ...).
 void fill_hgtsm_lp_state(Index n_cols, Index n_int, Index n_frac,
                          f64 mean_frac, f64 gap_rel, int depth,
                          std::size_t pool_size, f64 last_bound_gain,
@@ -215,7 +215,7 @@ bool save_hgtsm_model(const std::string& path, const HgtsmModel& model);
 bool load_hgtsm_model(const std::string& path, HgtsmModel& model);
 
 // Greedy sequence order over already-scored candidates (indices into a score
-// vector). Ties broken by index. Does not mutate cuts — CutPool owns filters.
+// vector). Ties broken by index. Does not mutate cuts - CutPool owns filters.
 std::vector<std::size_t> hgtsm_sequence_order(const std::vector<f64>& scores,
                                               int max_keep);
 

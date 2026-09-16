@@ -1,4 +1,4 @@
-// SOR — propagation reason trail (WP-A). Records bound changes for Mexi-style
+// SOR - propagation reason trail (WP-A). Records bound changes for Mexi-style
 // reverse walk; does not affect dual bounds by itself.
 #pragma once
 

@@ -1,4 +1,4 @@
-// Flow-cover cut validity tests — VUB projection + SI lifting.
+// Flow-cover cut validity tests - VUB projection + SI lifting.
 #include "sor/search/flowcover.hpp"
 #include "sor/sparse/csr.hpp"
 
@@ -71,7 +71,7 @@ bool cut_ok_lp_max_binaries(const LpProblem& lp, const CutRow& c,
         for (std::size_t b = 0; b < bins.size(); ++b)
             p[static_cast<std::size_t>(bins[b])] =
                 f64((code >> b) & 1ull);
-        // Set continuous cols to upper if their linked binary is 1, else 0 —
+        // Set continuous cols to upper if their linked binary is 1, else 0 -
         // using column bounds (VUB-feasible extreme).
         for (Index j = 0; j < lp.n_cols(); ++j) {
             if (!lp.is_integer.empty() &&

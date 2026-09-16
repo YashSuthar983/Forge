@@ -1,4 +1,4 @@
-// SOR — the only function permitted to write Status::Optimal.
+// SOR - the only function permitted to write Status::Optimal.
 //
 // LAYER L7. Links ONLY sor_core. It must never gain an engine dependency:
 // the point of this module is that the claim-gate is independent of whatever

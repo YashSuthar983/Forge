@@ -315,7 +315,7 @@ void test_ftran_pair_after_product_form_updates() {
     CHECK(f.n_product_form_etas() >= 16);
 }
 
-// The MPF / Forrest–Tomlin-style update must agree with factorizing the updated
+// The MPF / Forrest-Tomlin-style update must agree with factorizing the updated
 // matrix from scratch. This is the check that catches a wrong T application
 // order, which is otherwise invisible for a single update and only diverges
 // after several.

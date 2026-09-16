@@ -1,4 +1,4 @@
-// SOR — branch-and-cut MILP search (PS initial focus).
+// SOR - branch-and-cut MILP search (PS initial focus).
 //
 // LAYER L5. Uses the LP simplex engine at each node, with root GMI/cover cuts,
 // cut-pool management, propagation, reliability branching / sparse-SB (under
@@ -105,7 +105,7 @@ inline engines::SimplexOptions default_node_lp_options() {
 }
 
 struct BabOptions {
-    // Product default = latest improved (sparse-SB, DynSep/GCS, Mexi, Balans…).
+    // Product default = latest improved (sparse-SB, DynSep/GCS, Mexi, Balans...).
     // Classical is debug/ablation only.
     MilpPolicy policy = kDefaultMilpPolicy;
     // Selectable Latest branching policy. Classical ignores this field.
@@ -175,9 +175,9 @@ struct BabOptions {
     // the classical AlnsScheduler as the primary primal controller. Classical
     // keeps `lns` / AlnsScheduler unchanged.
     BalansOptions balans;
-    // Kernel Pump (Assunção et al., MPC 2026) — FP-class, incumbent only.
+    // Kernel Pump (Assunção et al., MPC 2026) - FP-class, incumbent only.
     KernelPumpOptions kernel_pump;
-    // MRENS (arXiv:2408.00718) — multi-reference RENS box builder.
+    // MRENS (arXiv:2408.00718) - multi-reference RENS box builder.
     MrensOptions mrens;
     // BTBS-LNS-v1 / CL-TLNS-v1 destroy arms (Balans meta-arms under Latest).
     BtbsOptions btbs;
@@ -258,7 +258,7 @@ struct BabOptions {
     std::uint64_t strong_branch_nodes = 128;
     double strong_branch_time_s = 0.02;
     // Branch-and-Cut: root GMI loop, plus (under policy=latest) tree/local
-    // separation on a depth schedule — see TreeCutOptions / tree_cuts.hpp.
+    // separation on a depth schedule - see TreeCutOptions / tree_cuts.hpp.
     // Classical keeps root-only separation.
     bool cuts_enabled = true;
     CutOptions cut;
@@ -284,7 +284,7 @@ struct BabOptions {
     // is what made the A/B attribution in the benchmark runs possible.
     bool probing = true;
     ProbingOptions probe;
-    // WP-F: Wang–Chen–Dai dual-fix⊕probing, clique probing, GF2, components,
+    // WP-F: Wang-Chen-Dai dual-fix⊕probing, clique probing, GF2, components,
     // TU/network implied-int, OBBT-lite, multi-round restart. Runs once at
     // MILP root entry before B&C.
     bool mip_presolve = true;
@@ -375,7 +375,7 @@ struct BabOptions {
     bool verbose = false;
 
     // Node LP options (dual preferred for bound changes).
-    // WP-J policy hook: lp.update_method selects product-form vs Forrest–Tomlin
+    // WP-J policy hook: lp.update_method selects product-form vs Forrest-Tomlin
     // basis updates (engines already expose both; hypersparse FTRAN/BTRAN is
     // always on inside the factor). CLI: --basis-update product|ft.
     //

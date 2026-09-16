@@ -245,7 +245,7 @@ void compact_geq(GeqConstraint& c, f64 tol) {
 // Sound only when every bound the substitution touches is FINITE: with an
 // unbounded side the (a - btilde) * bound adjustment diverges and the
 // "tightened" row stops being implied (gen-ip002 P0, 2026-09-14). Columns
-// without a finite needed bound are simply not tightened — capping is an
+// without a finite needed bound are simply not tightened - capping is an
 // optional strengthening, skipping it is always sound.
 void apply_coef_tightening(GeqConstraint& c,
                            const model::LpProblem& lp,
@@ -299,7 +299,7 @@ bool weaken_var(GeqConstraint& reason, Index s,
         const f64 m = std::max(a * u, a * ell);
         // An unbounded side makes the sound weakening value divergent; the
         // old code subtracted +-inf and produced a vacuous (-inf rhs)
-        // constraint. Refuse instead — the caller picks another variable or
+        // constraint. Refuse instead - the caller picks another variable or
         // stops, which is always sound.
         if (!std::isfinite(m)) return false;
         reason.rhs -= m;
@@ -445,8 +445,8 @@ bool cmir_prop2_binary(GeqConstraint reason,
     return !out.cols.empty();
 }
 
-// General cMIR on the reason. Validity (2026-09-14 P0 fix): the Marchand–
-// Wolsey bound substitution must use GLOBAL bounds — substituting at LOCAL
+// General cMIR on the reason. Validity (2026-09-14 P0 fix): the Marchand-
+// Wolsey bound substitution must use GLOBAL bounds - substituting at LOCAL
 // (node) bounds yields a cut valid only inside that subtree, and applying it
 // to global_lp cut off feasible points in sibling subtrees (markshare1
 // claimed Optimal 19 vs MIPLIB opt 1). The vertex x must be finite as well;
@@ -600,7 +600,7 @@ ReduceResult reduce_mixed_binary(GeqConstraint reason,
                 ++diag.cmir_applied;
                 return res;
             }
-            // §7: do NOT keep a cMIR that failed the local-resolvent check —
+            // §7: do NOT keep a cMIR that failed the local-resolvent check -
             // an over-strengthened reason can still leave Clearn locally
             // infeasible while cutting off globally feasible points.
         }
@@ -984,7 +984,7 @@ CutValidity conflict_cut_check_general(const model::LpProblem& lp,
         // (floor(+inf) → UB) and must not be skipped: older code did
         // `int uj = (int)floor(hi)` then `if (uj < lj) continue`, which
         // dropped every free integer column and returned Verified on an
-        // empty sweep — false Optimal on gen-ip002 (2026-09-14).
+        // empty sweep - false Optimal on gen-ip002 (2026-09-14).
         if (!std::isfinite(lo) || !std::isfinite(hi))
             return CutValidity::Unverified;
         if (hi - lo > static_cast<f64>(max_points) + 1.0)

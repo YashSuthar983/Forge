@@ -150,7 +150,7 @@ Gf2PresolveDiagnostics apply_gf2_presolve(const model::LpProblem& lp,
         std::vector<Index> col_to_v(sz(n), -1);
         for (Index t = 0; t < nv; ++t) col_to_v[sz(vars[sz(t)])] = t;
 
-        // Bitsets as uint64 limbs — nv may exceed 64; use vector<uint64_t> per row.
+        // Bitsets as uint64 limbs - nv may exceed 64; use vector<uint64_t> per row.
         const Index nlimbs = (nv + 63) / 64;
         auto bit_get = [&](const std::vector<std::uint64_t>& row, Index v) {
             return (row[sz(v >> 6)] >> (v & 63)) & 1ULL;

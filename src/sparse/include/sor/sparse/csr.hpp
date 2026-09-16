@@ -1,4 +1,4 @@
-// SOR — sparse CSR pattern and matrix.
+// SOR - sparse CSR pattern and matrix.
 //
 // LAYER L1. Depends only on sor_core.
 //

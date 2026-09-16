@@ -1,4 +1,4 @@
-// SOR — Vulkan LpDevice. Device-resident HPR steps; KKT currently reduced on
+// SOR - Vulkan LpDevice. Device-resident HPR steps; KKT currently reduced on
 // host after a single D2H of the averages (charged to TransferStats). Hot-path
 // hpr_steps does zero host sync of vectors.
 #include "sor/backend/lp_device.hpp"

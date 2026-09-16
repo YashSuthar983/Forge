@@ -1,4 +1,4 @@
-// SOR — plain-text solution file: sor_solve's --solution-out format, read
+// SOR - plain-text solution file: sor_solve's --solution-out format, read
 // back by sor_check (the independent checker, item 30 of the SIH26119
 // checklist). Deliberately dumb (one field per line, whitespace-separated
 // vectors) so a from-scratch reader has nothing subtle to get wrong -- the

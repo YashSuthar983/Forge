@@ -1,4 +1,4 @@
-// SOR — LP presolve with a chronological postsolve journal.
+// SOR - LP presolve with a chronological postsolve journal.
 //
 // LAYER L3. Reversible reductions recover primal/dual solutions on the original
 // model. Proof steps (C6) are not emitted from presolve itself.
@@ -47,7 +47,7 @@ struct PresolveStats {
 struct PresolveOptions {
     bool enabled = true;
     bool implied_slack = false;
-    // Queue-driven v2 rules (dual fix, duplicates, …). Off by default so
+    // Queue-driven v2 rules (dual fix, duplicates, ...). Off by default so
     // presolve_lp() stays bit-identical to the immutable fixed-point kernel.
     bool live_reductions = false;
     // Sub-rules apply only when live_reductions is true. Aggressive ones

@@ -1,4 +1,4 @@
-// SOR — disconnected-component MIP root reductions (WP-F).
+// SOR - disconnected-component MIP root reductions (WP-F).
 //
 // Columns are connected when they share a constraint with nonzero coefficient.
 // Independent components can be tightened separately (dual-fix + FBBT, and

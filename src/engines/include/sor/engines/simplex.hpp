@@ -1,5 +1,5 @@
-// SOR — bounded-variable revised simplex (primal + dual; Harris; Devex;
-// Forrest–Tomlin; EXPAND). solve_simplex() optionally presolves, then
+// SOR - bounded-variable revised simplex (primal + dual; Harris; Devex;
+// Forrest-Tomlin; EXPAND). solve_simplex() optionally presolves, then
 // dispatches Dual / Primal / Auto (dual first, primal fallback).
 #pragma once
 

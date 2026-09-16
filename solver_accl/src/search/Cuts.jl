@@ -1,6 +1,6 @@
 module SorCuts
 
-# Port of sor/sor_search/src/cuts.cpp — Gomory mixed-integer separator.
+# Port of sor/sor_search/src/cuts.cpp - Gomory mixed-integer separator.
 # 1-based tableau indices: structural columns 1:n, slack of row i is n+i.
 
 using ..SorCore: Index, kNaN

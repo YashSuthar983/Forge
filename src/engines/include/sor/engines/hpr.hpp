@@ -1,4 +1,4 @@
-// SOR — restarted Halpern PDHG (HPR) first-order LP engine.
+// SOR - restarted Halpern PDHG (HPR) first-order LP engine.
 //
 // LAYER L4.
 //

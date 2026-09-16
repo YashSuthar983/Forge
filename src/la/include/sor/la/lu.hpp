@@ -1,4 +1,4 @@
-// SOR — sparse LU factorization of a simplex basis, with FTRAN/BTRAN and
+// SOR - sparse LU factorization of a simplex basis, with FTRAN/BTRAN and
 // hypersparse (reach-set) triangular solves plus a product-form update file.
 //
 // LAYER L1. Depends on sor_sparse (sibling) and sor_core.
@@ -392,42 +392,6 @@ private:
     void apply_row_etas_btran(std::vector<f64>& v,
                               std::vector<Index>* touched) const;
 
-    // Forrest-Tomlin: dense Gauss elimination with partial (row-only) pivoting
-    // over the (m-p_step)x(m-p_step) bump matrix `bm` (row-major, bm[a*w+b]).
-    // On success, fills `piv` (the bump-local row permutation: bump-local row
-    // index -> final pivot-step offset from p_step, i.e. piv[a] = final
-    // offset of original bump row a) plus the new diagonal, U row entries,
-    // and L multipliers for the bump, one inner vector per new pivot-step
-    // offset. Returns false if no acceptable pivot exists for some column
-    // even after row swaps (near-singular bump).
-    bool eliminate_bump(std::vector<f64>& bm, Index width,
-                        const LuOptions& opts,
-                        std::vector<Index>& piv,
-                        std::vector<f64>& new_diag,
-                        std::vector<std::vector<Index>>& new_u_idx,
-                        std::vector<std::vector<f64>>& new_u_val,
-                        std::vector<std::vector<Index>>& new_l_idx,
-                        std::vector<std::vector<f64>>& new_l_val) const;
-
-    // Same contract and same mathematical algorithm as eliminate_bump()
-    // (partial row-pivoting Gauss elimination) but on a SPARSE row
-    // representation instead of a dense width*width array -- the dense
-    // version costs O(width^3) regardless of actual fill, which measured
-    // catastrophically (25-227x slower than product-form on real Netlib
-    // instances) once bump width grows past a few dozen. brow_cols/brow_vals
-    // are per-bump-local-row (col, val) pairs, SORTED ascending by column;
-    // update_ft() assembles them (bump assembly + the old-bump-L strip) the
-    // same way it used to build the dense `bm`, just sparsely.
-    bool eliminate_bump_sparse(std::vector<std::vector<Index>>& brow_cols,
-                               std::vector<std::vector<f64>>& brow_vals,
-                               Index width, const LuOptions& opts,
-                               std::vector<Index>& piv,
-                               std::vector<f64>& new_diag,
-                               std::vector<std::vector<Index>>& new_u_idx,
-                               std::vector<std::vector<f64>>& new_u_val,
-                               std::vector<std::vector<Index>>& new_l_idx,
-                               std::vector<std::vector<f64>>& new_l_val) const;
-
     Index m_ = 0;
     bool valid_ = false;
     Index bump_width_ = 0;  // current_bump_width(); 0 until update_ft() runs
@@ -555,7 +519,7 @@ private:
     // slice). Maintained by update() (append), factorize() and
     // collapse_pending_into_ft() (clear). Lets btran_impl process only the
     // etas that can fire on a sparse input instead of scanning every eta
-    // slice unconditionally — output is bit-identical because a skipped eta
+    // slice unconditionally - output is bit-identical because a skipped eta
     // is an exact no-op (all its reads are zero).
     std::vector<std::vector<Index>> rev_;  // size m (slot space)
     // Firing-set worklist membership stamps for btran_impl (fresh generation

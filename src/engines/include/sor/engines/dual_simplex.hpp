@@ -1,4 +1,4 @@
-// SOR — bounded-variable dual revised simplex (augmented [A|-I]; Harris;
+// SOR - bounded-variable dual revised simplex (augmented [A|-I]; Harris;
 // Devex; EXPAND). Shares SimplexOptions / SimplexDiagnostics / SimplexBasis
 // with the primal engine. Evidence is engines::simplex_evidence().
 #pragma once

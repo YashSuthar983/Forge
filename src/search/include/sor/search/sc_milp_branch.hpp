@@ -1,4 +1,4 @@
-// SOR — SC-MILP-style stratified contrastive branching scores
+// SOR - SC-MILP-style stratified contrastive branching scores
 // (arXiv:2511.21107 clean-room, CPU linear/MLP-lite).
 //
 // Paper spirit: (1) stratified node grouping, (2) dynamic stratified contrastive

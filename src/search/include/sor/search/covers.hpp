@@ -1,14 +1,14 @@
-// SOR — lifted knapsack cover cuts.
+// SOR - lifted knapsack cover cuts.
 //
 // LAYER L5 (search), sibling of cuts.hpp. Implementation spec:
 //   Gu, Nemhauser & Savelsbergh, "Lifted cover inequalities for 0-1 integer
-//     programs: computation", INFORMS J. Computing 10(4), 1998 — sequential
+//     programs: computation", INFORMS J. Computing 10(4), 1998 - sequential
 //     up-lifting and the separation heuristic.
-//   Balas, "Facets of the knapsack polytope", Math. Prog. 8, 1975 — the cover
+//   Balas, "Facets of the knapsack polytope", Math. Prog. 8, 1975 - the cover
 //     inequality and the lifting function it is strengthened by.
 //   Kaparis & Letchford, "Separation algorithms for 0-1 knapsack polytopes",
-//     Math. Prog. 124, 2010 — the separation problem's structure.
-//   Prasad / IJCAI 2025 (arXiv:2401.13773) — sequence-independent
+//     Math. Prog. 124, 2010 - the separation problem's structure.
+//   Prasad / IJCAI 2025 (arXiv:2401.13773) - sequence-independent
 //     piecewise-constant (PC) lifting g₀ and GNS g_{1/ρ₁}; enabled via
 //     pc_lift_hooks.
 //

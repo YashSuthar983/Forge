@@ -14,7 +14,7 @@ fi
 export SOR_EXAMPLES="${SOR_EXAMPLES:-$ROOT/examples}"
 
 if [[ -z "${SOR_BIN_DIR:-}" || ! -x "$SOR_BIN_DIR/sor_solve" ]]; then
-  echo "error: sor_solve not found — build SOR first (cmake -S . -B build && cmake --build build -j)" >&2
+  echo "error: sor_solve not found - build SOR first (cmake -S . -B build && cmake --build build -j)" >&2
   exit 1
 fi
 
