@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FORGE Python REPL — project entry point.
+"""FORGE Python REPL - project entry point.
 
   cd .
   python3 scripts/forge_repl.py

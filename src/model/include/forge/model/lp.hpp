@@ -1,4 +1,4 @@
-// FORGE — minimal LP problem in the canonical two-sided form used throughout.
+// FORGE - minimal LP problem in the canonical two-sided form used throughout.
 //
 // LAYER L2.
 //

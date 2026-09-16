@@ -1,4 +1,4 @@
-// FORGE — restarted Halpern PDHG (HPR) first-order LP engine.
+// FORGE - restarted Halpern PDHG (HPR) first-order LP engine.
 //
 // LAYER L4.
 //

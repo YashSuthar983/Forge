@@ -1,4 +1,4 @@
-// Slice 6 — SC-MILP stratified branching scores (arXiv:2511.21107 clean-room).
+// Slice 6 - SC-MILP stratified branching scores (arXiv:2511.21107 clean-room).
 #include "forge/io/mps.hpp"
 #include "forge/search/bab.hpp"
 #include "forge/search/features.hpp"

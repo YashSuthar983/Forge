@@ -267,7 +267,7 @@ std::vector<CutRow> CutPool::select_violated(const std::vector<f64>& x,
             for (std::size_t k = 0; k < order.size(); ++k)
                 entries_[order[k]].last_score = batch_scores[k];
         } else {
-            // Malformed batch — fall back to efficacy so selection still runs.
+            // Malformed batch - fall back to efficacy so selection still runs.
             for (const std::size_t i : order) {
                 auto& entry = entries_[i];
                 entry.last_score =
@@ -721,7 +721,7 @@ model::LpProblem apply_cuts(const model::LpProblem& lp,
 
     // Pending appends are not yet in `lp.A` / `out.row_*`. shape_of may point
     // either at an existing model row (< m) or at a pending slot (>= m). Merging
-    // into a pending slot must tighten that CutRow's bounds — never index `rp`.
+    // into a pending slot must tighten that CutRow's bounds - never index `rp`.
     std::vector<CutRow> pending;
     pending.reserve(cuts.size());
     auto cut_cols_in_range = [&](const CutRow& cut) -> bool {
@@ -737,8 +737,8 @@ model::LpProblem apply_cuts(const model::LpProblem& lp,
         const auto it = key.empty() ? shape_of.end() : shape_of.find(key);
         if (it != shape_of.end() && cs != 0.0) {
             // Existing/pending row constrains (row_scale/cs) times the same
-            // form as the cut. Map cut bounds into that scaling — FLIP when
-            // the ratio is negative — and keep the tighter side of each.
+            // form as the cut. Map cut bounds into that scaling - FLIP when
+            // the ratio is negative - and keep the tighter side of each.
             const Index i = it->second;
             f64 rsc = 0.0;
             if (i < m) {

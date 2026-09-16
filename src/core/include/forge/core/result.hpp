@@ -1,4 +1,4 @@
-// FORGE — core scalar types, solve statuses, the proof ladder, and result records.
+// FORGE - core scalar types, solve statuses, the proof ladder, and result records.
 //
 // LAYER L0. Depends on nothing but the standard library.
 //

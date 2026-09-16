@@ -1,4 +1,4 @@
-// FORGE — finite-domain convex diagonal MIQP prototype.
+// FORGE - finite-domain convex diagonal MIQP prototype.
 #pragma once
 
 #include "forge/core/result.hpp"

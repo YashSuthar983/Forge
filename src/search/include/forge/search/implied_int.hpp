@@ -1,4 +1,4 @@
-// FORGE — TU / network / consecutive-ones implied integrality (WP-F).
+// FORGE - TU / network / consecutive-ones implied integrality (WP-F).
 //
 // Extends the narrow equality ±1 rule: when a continuous column lives only in
 // a totally-unimodular equality subsystem with integer data (network incidence

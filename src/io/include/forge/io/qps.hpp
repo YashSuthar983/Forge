@@ -1,6 +1,6 @@
-// FORGE — QPS reader (MPS + QUADOBJ/QMATRIX/QSECTION).
+// FORGE - QPS reader (MPS + QUADOBJ/QMATRIX/QSECTION).
 //
-// LAYER L2 — does not depend on engines. The CLI maps this into engines::QpProblem.
+// LAYER L2 - does not depend on engines. The CLI maps this into engines::QpProblem.
 #pragma once
 
 #include "forge/io/mps.hpp"

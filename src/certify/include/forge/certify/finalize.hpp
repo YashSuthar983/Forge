@@ -1,4 +1,4 @@
-// FORGE — the only function permitted to write Status::Optimal.
+// FORGE - the only function permitted to write Status::Optimal.
 //
 // LAYER L7. Links ONLY forge_core. It must never gain an engine dependency:
 // the point of this module is that the claim-gate is independent of whatever

@@ -1,4 +1,4 @@
-// FORGE — smooth bound-constrained nonlinear optimization prototype.
+// FORGE - smooth bound-constrained nonlinear optimization prototype.
 //
 // The objective and gradient are supplied as callbacks. The current engine
 // supports minimization with variable bounds and no nonlinear/linear rows.

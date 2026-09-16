@@ -1,4 +1,4 @@
-// FORGE — the KernelBackend contract.
+// FORGE - the KernelBackend contract.
 //
 // LAYER L1. CPU provides the reference implementation.
 //

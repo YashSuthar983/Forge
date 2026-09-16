@@ -42,10 +42,10 @@ LpProblem network_flow_model() {
 }
 
 // Consecutive ones: two equalities over one continuous [0,3]:
-//   x = 1, x = 1 (same var twice would be redundant) — use two vars:
+//   x = 1, x = 1 (same var twice would be redundant) - use two vars:
 //   x + y = 1, y + z = 1 with x,z integer, y continuous → y implied by ±1.
 // Pure C1 block: three eqs, two continuous with identity-like C1.
-//   r0: x = 2, r1: x = 2  — single col consecutive ones of length 2.
+//   r0: x = 2, r1: x = 2  - single col consecutive ones of length 2.
 LpProblem c1_model() {
     LpProblem lp;
     lp.name = "c1";

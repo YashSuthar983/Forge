@@ -1,4 +1,4 @@
-// Slice 1 — sparse SB branching (arXiv:2604.00094 clean-room).
+// Slice 1 - sparse SB branching (arXiv:2604.00094 clean-room).
 #include "forge/io/mps.hpp"
 #include "forge/search/bab.hpp"
 #include "forge/search/features.hpp"

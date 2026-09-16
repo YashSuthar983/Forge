@@ -1,4 +1,4 @@
-// FORGE — minimal Vulkan compute context (instance, device, queue, allocator).
+// FORGE - minimal Vulkan compute context (instance, device, queue, allocator).
 #pragma once
 
 #include <cstdint>

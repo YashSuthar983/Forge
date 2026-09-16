@@ -1,6 +1,6 @@
-// FORGE — CPU LpDevice: fused first-order kernels (reference implementation).
+// FORGE - CPU LpDevice: fused first-order kernels (reference implementation).
 //
-// LAYER L1. Same shape the Vulkan backend implements — one algorithm, two
+// LAYER L1. Same shape the Vulkan backend implements - one algorithm, two
 // devices. Gather-form SpMV via CSC; no host addressability exposed.
 #include "forge/backend/lp_device.hpp"
 

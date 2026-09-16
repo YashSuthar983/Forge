@@ -1,4 +1,4 @@
-// FORGE — convex quadratic programming.
+// FORGE - convex quadratic programming.
 //
 // Native form:
 //   min 1/2 x'Qx + c'x + offset

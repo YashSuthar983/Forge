@@ -1,6 +1,6 @@
 # Glue over SparseLU for the C++ BasisFactor surface used by revised simplex.
 # Included into SorSimplex (which already `using ..SparseLU`). Product-form
-# updates only; Forrest–Tomlin / work-since-factor triggers are no-ops until
+# updates only; Forrest-Tomlin / work-since-factor triggers are no-ops until
 # SparseLU grows those fields.
 
 lu_dimension(bf::SparseBasisFactor) = bf.m

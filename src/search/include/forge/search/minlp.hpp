@@ -1,4 +1,4 @@
-// FORGE — finite-domain convex bound-constrained MINLP prototype.
+// FORGE - finite-domain convex bound-constrained MINLP prototype.
 #pragma once
 
 #include "forge/engines/nlp.hpp"

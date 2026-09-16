@@ -162,7 +162,7 @@ void test_gnn_model_changes_decisions() {
     model.gnn.b_on = -2.0;
     model.gnn.W_on.assign(static_cast<std::size_t>(model.gnn.emb_dim), 0.0);
     // After projection, push on-logits via b_on per-family by hacking sep
-    // bias after a dummy forward isn't easy — instead fit imitation labels.
+    // bias after a dummy forward isn't easy - instead fit imitation labels.
     DynSepCollector col;
     col.max_samples = 100;
     for (int t = 0; t < 20; ++t) {

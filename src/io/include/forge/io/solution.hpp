@@ -1,4 +1,4 @@
-// FORGE — plain-text solution file: forge_solve's --solution-out format, read
+// FORGE - plain-text solution file: forge_solve's --solution-out format, read
 // back by forge_check (the independent checker, 
 // item 30 of the product checklist). Deliberately dumb (one field per line, whitespace-separated
 // vectors) so a from-scratch reader has nothing subtle to get wrong -- the

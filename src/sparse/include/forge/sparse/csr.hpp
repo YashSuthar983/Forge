@@ -1,4 +1,4 @@
-// FORGE — sparse CSR pattern and matrix.
+// FORGE - sparse CSR pattern and matrix.
 //
 // LAYER L1. Depends only on forge_core.
 //

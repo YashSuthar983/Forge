@@ -1,6 +1,6 @@
 # Bounded-variable dual revised simplex (augmented [A|-I]; Harris; Devex/DSE;
 # EXPAND; BFRT). Included into SorSimplex. Port of dual_simplex.cpp (1-based).
-# Vulkan/CUDA backends and Forrest–Tomlin updates are not ported.
+# Vulkan/CUDA backends and Forrest-Tomlin updates are not ported.
 
 function solve_dual_simplex(problem::LpProblem, opts::SimplexOptions,
                             diag::SimplexDiagnostics,

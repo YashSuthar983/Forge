@@ -376,7 +376,7 @@ bool apply_cmir_geq(const model::LpProblem& lp,
     out_rhs_geq = 0.0;
     if (cols.size() != vals.size() || cols.empty()) return false;
 
-    // >= form → <= base for the shared Marchand–Wolsey machinery.
+    // >= form → <= base for the shared Marchand-Wolsey machinery.
     BaseRow base;
     base.cols = cols;
     base.vals.resize(vals.size());

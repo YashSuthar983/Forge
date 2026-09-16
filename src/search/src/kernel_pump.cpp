@@ -340,7 +340,7 @@ bool kernel_pump(const model::LpProblem& mip,
     diag.buckets = kb.buckets.size();
 
     // Optional kernel refinement (paper §3.1.1): min sum of out-of-kernel
-    // binaries s.t. LP feasibility — add any positive ones into the kernel.
+    // binaries s.t. LP feasibility - add any positive ones into the kernel.
     if (opts.refine_kernel && opts.time_limit_s > 0.2) {
         std::vector<char> in_k(static_cast<std::size_t>(mip.n_cols()), 0);
         for (Index j : kb.kernel) in_k[sz(j)] = 1;

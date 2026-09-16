@@ -1,9 +1,9 @@
-// FORGE — Lifted Branching (Renard–Louveaux–Fortz EJOR 2026 clean-room).
+// FORGE - Lifted Branching (Renard-Louveaux-Fortz EJOR 2026 clean-room).
 //
 // Iteratively improves an imitation expert from strong-branch / lifted scores.
 // Features: Gasse-style variable + aggregated constraint lifts
 // (LiftedFeatureVec). Expert is a sparse/ ranking linear model over lifted
-// features. Cold start falls back to RB / sparse-SB. Variable choice only —
+// features. Cold start falls back to RB / sparse-SB. Variable choice only -
 // never writes dual bounds.
 #pragma once
 

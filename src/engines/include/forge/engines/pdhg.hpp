@@ -1,4 +1,4 @@
-// FORGE — PDHG first-order LP engine (prototype).
+// FORGE - PDHG first-order LP engine (prototype).
 //
 // LAYER L4.
 //

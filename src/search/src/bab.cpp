@@ -3073,7 +3073,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     // Small short-budget instances keep DynSep ON but under a structural
     // light-arm clamp (measured 2026-09-14, gt2/lseu: MIR/cover arms stalled
     // dual proofs). L2Sep still runs first and sets its own allow/budget
-    // priors; this clamp then OVERRIDES the optional arms — it is a
+    // priors; this clamp then OVERRIDES the optional arms - it is a
     // structural rule keyed on (n_cols, time limit), not an L2Sep decision.
     if (milp_policy_is_latest(opts.policy) && dynsep_opts.enabled &&
         problem.n_cols() <= 400 && opts.time_limit_s > 0.0 &&
@@ -3102,7 +3102,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     (void)infer_implied_integers(mip);
 
     // Latest branching learners (WP-H). Classical ignores them entirely.
-    // Heuristic variable choice only — never writes dual bounds.
+    // Heuristic variable choice only - never writes dual bounds.
     SparseSbModel sparse_sb_model;
     SparseSbCollector sparse_sb_collector;
     sparse_sb_collector.max_samples = opts.sparse_sb.collect_max_samples;
@@ -3177,7 +3177,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         if (opts.branch_strategy != BranchStrategy::Auto)
             return opts.branch_strategy;
         // Auto: SC-MILP when available (enigma-scale proofs). Sparse-SB only
-        // on larger models — cold Sparse-SB hurt dense binaries. Tiny models
+        // on larger models - cold Sparse-SB hurt dense binaries. Tiny models
         // without SC fall through to reliability (BranchStrategy::Auto).
         if (sc_milp_want &&
             (sc_milp_model.loaded || sc_milp_opts.use_heuristic_without_model))
@@ -3200,7 +3200,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         sc_milp_want && opts.sc_milp.collect_labels;
 
     if (mip.n_integer() == 0) {
-        // Pure LP — just call simplex. The raw result carries the LP's own
+        // Pure LP - just call simplex. The raw result carries the LP's own
         // proposed status, but the MILP evidence machinery reads THIS diag,
         // so it must reflect what actually happened: a certified relaxation
         // of a tree with a single (root) node is exactly the "tree
@@ -3269,7 +3269,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     // True once a root relaxation (cut loop or root node LP) has been
     // CERTIFIED optimal with a finite objective. Every node LP is a
     // restriction of the root box, so this implies no descendant can be
-    // unbounded — which is what makes an InfeasibleOrUnbounded node status
+    // unbounded - which is what makes an InfeasibleOrUnbounded node status
     // trustworthy as "infeasible" for nogood learning below.
     bool root_relaxation_bounded = false;
     std::uint64_t tightened_row_bounds = 0;
@@ -3288,7 +3288,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     //
     // Conflict-graph consumers (cuts, node prop) still read `conflict_graph`.
     // Dual fixing may drop suboptimal feasible points while retaining ≥1
-    // optimum — that is intentional for the mip_presolve path only.
+    // optimum - that is intentional for the mip_presolve path only.
     ConflictGraph conflict_graph;
     std::vector<f64> root_lo = search_problem.col_lo,
                      root_hi = search_problem.col_hi;
@@ -4154,7 +4154,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         //                was pruned under global rows (valid) + local cuts
         //                (subtree-valid, and every point with the branch
         //                assignment lies in the subtree) + previously
-        //                applied cuts (Verified-Mexi or nogood — all
+        //                applied cuts (Verified-Mexi or nogood - all
         //                globally valid by the same induction) + sound
         //                propagation (row-implied bounds). build_nogood_
         //                from_branch_trail refuses trails that are not
@@ -6082,7 +6082,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         }
 
         // Tree / local separation (WP-C + DynSep). Generators scheduled by
-        // DynSep-v1; cuts from a node tableau with local bounds are LOCAL —
+        // DynSep-v1; cuts from a node tableau with local bounds are LOCAL -
         // tagged, inherited by children, never visible to siblings.
         std::vector<ManagedCut> new_locals;
         const std::uint64_t since_dual =

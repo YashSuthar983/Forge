@@ -33,7 +33,7 @@ void write_body(std::ostream& out, const model::LpProblem& p) {
         if (lo == hi) kind = 'E';
         else if (lo > -model::kInf && hi >= model::kInf) kind = 'G';
         else if (lo <= -model::kInf && hi < model::kInf) kind = 'L';
-        else kind = 'E';  // ranged: emit as E with mid — writer keeps lo/hi via RHS+RANGES later; use L/G prefer
+        else kind = 'E';  // ranged: emit as E with mid - writer keeps lo/hi via RHS+RANGES later; use L/G prefer
         // Two-sided with finite lo and hi: emit as E only if equal; else L and rely on RANGES.
         if (lo > -model::kInf && hi < model::kInf && lo != hi) kind = 'L';
         out << " " << kind << "  " << name_or(p.row_names, i, "R") << "\n";

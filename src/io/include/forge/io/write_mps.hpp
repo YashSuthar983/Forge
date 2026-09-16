@@ -1,4 +1,4 @@
-// FORGE — write an LpProblem as free-format MPS.
+// FORGE - write an LpProblem as free-format MPS.
 #pragma once
 
 #include "forge/model/lp.hpp"
