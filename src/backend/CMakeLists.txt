@@ -28,7 +28,8 @@ endif()
 set(SOR_BACKEND_SOURCES
   src/cpu_backend.cpp
   src/backend_factory.cpp
-  src/cpu_lp_device.cpp)
+  src/cpu_lp_device.cpp
+  src/lp_device_batch.cpp)
 if(SOR_ENABLE_VULKAN)
   list(APPEND SOR_BACKEND_SOURCES src/vulkan/vk_context.cpp src/vulkan/vk_lp_device.cpp)
 else()
