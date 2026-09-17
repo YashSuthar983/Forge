@@ -22,10 +22,114 @@ inline f64 clamp_to(f64 v, f64 lo, f64 hi) {
 
 constexpr f64 kInf = std::numeric_limits<f64>::infinity();
 
+struct SlotState {
+    std::vector<f64> col_lo, col_hi, row_lo, row_hi;
+    std::vector<f64> c;  // empty → use device shared c_ on load
+    std::vector<f64> x, y, xbar, Aty, Ax;
+    std::vector<f64> x_avg, y_avg, x_anchor, y_anchor;
+    std::vector<f64> x_fixed, y_fixed;
+    std::vector<f64> Ax_current, Ax_fixed, Ax_anchor;
+    std::vector<f64> checkpoint_x, checkpoint_y, checkpoint_Ax;
+    std::vector<f64> checkpoint_x_avg, checkpoint_y_avg;
+    std::vector<f64> last_x_delta, last_y_delta;
+    std::vector<f64> primal_ray, dual_ray;
+    std::uint64_t avg_count = 0;
+    std::uint64_t epoch_step = 0;
+    std::uint64_t checkpoint_avg_count = 0;
+    std::uint64_t checkpoint_epoch_step = 0;
+    bool checkpoint_valid = false;
+    f64 last_dx = 0.0;
+    f64 last_dy = 0.0;
+    f64 last_operator_lhs = 0.0;
+    f64 last_operator_rhs = 0.0;
+    f64 last_operator_ratio = 0.0;
+};
+
+void apply_overlay(const LpBoundOverlay& overlay, std::size_t nc, std::size_t nr,
+                   const std::vector<f64>& shared_row_lo,
+                   const std::vector<f64>& shared_row_hi,
+                   const std::vector<f64>& shared_c, SlotState& slot) {
+    if (overlay.col_lo.size() != nc || overlay.col_hi.size() != nc)
+        throw std::invalid_argument("CpuLpDevice: bound overlay column size mismatch");
+    slot.col_lo = overlay.col_lo;
+    slot.col_hi = overlay.col_hi;
+    if (overlay.row_lo.empty() && overlay.row_hi.empty()) {
+        slot.row_lo = shared_row_lo;
+        slot.row_hi = shared_row_hi;
+    } else {
+        if (overlay.row_lo.size() != nr || overlay.row_hi.size() != nr)
+            throw std::invalid_argument("CpuLpDevice: bound overlay row size mismatch");
+        slot.row_lo = overlay.row_lo;
+        slot.row_hi = overlay.row_hi;
+    }
+    if (overlay.c.empty()) {
+        slot.c = shared_c;
+    } else {
+        if (overlay.c.size() != nc)
+            throw std::invalid_argument("CpuLpDevice: objective overlay size mismatch");
+        slot.c = overlay.c;
+    }
+}
+
+void apply_overlay_active(const LpBoundOverlay& overlay, std::size_t nc, std::size_t nr,
+                          const std::vector<f64>& shared_row_lo,
+                          const std::vector<f64>& shared_row_hi,
+                          const std::vector<f64>& shared_c,
+                          std::vector<f64>& col_lo, std::vector<f64>& col_hi,
+                          std::vector<f64>& row_lo, std::vector<f64>& row_hi,
+                          std::vector<f64>& c) {
+    SlotState scratch;
+    apply_overlay(overlay, nc, nr, shared_row_lo, shared_row_hi, shared_c, scratch);
+    col_lo = std::move(scratch.col_lo);
+    col_hi = std::move(scratch.col_hi);
+    row_lo = std::move(scratch.row_lo);
+    row_hi = std::move(scratch.row_hi);
+    c = std::move(scratch.c);
+}
+
+void allocate_slot_vectors(SlotState& s, std::size_t nr, std::size_t nc) {
+    s.x.assign(nc, 0.0);
+    s.y.assign(nr, 0.0);
+    s.xbar.assign(nc, 0.0);
+    s.Aty.assign(nc, 0.0);
+    s.Ax.assign(nr, 0.0);
+    s.x_avg.assign(nc, 0.0);
+    s.y_avg.assign(nr, 0.0);
+    s.x_anchor.assign(nc, 0.0);
+    s.y_anchor.assign(nr, 0.0);
+    s.x_fixed.assign(nc, 0.0);
+    s.y_fixed.assign(nr, 0.0);
+    s.Ax_current.assign(nr, 0.0);
+    s.Ax_fixed.assign(nr, 0.0);
+    s.Ax_anchor.assign(nr, 0.0);
+    s.checkpoint_x.assign(nc, 0.0);
+    s.checkpoint_y.assign(nr, 0.0);
+    s.checkpoint_Ax.assign(nr, 0.0);
+    s.checkpoint_x_avg.assign(nc, 0.0);
+    s.checkpoint_y_avg.assign(nr, 0.0);
+    s.last_x_delta.assign(nc, 0.0);
+    s.last_y_delta.assign(nr, 0.0);
+    s.primal_ray.assign(nc, 0.0);
+    s.dual_ray.assign(nr, 0.0);
+    s.avg_count = 0;
+    s.epoch_step = 0;
+    s.checkpoint_avg_count = 0;
+    s.checkpoint_epoch_step = 0;
+    s.checkpoint_valid = false;
+    s.last_dx = 0.0;
+    s.last_dy = 0.0;
+    s.last_operator_lhs = 0.0;
+    s.last_operator_rhs = 0.0;
+    s.last_operator_ratio = 0.0;
+}
+
 class CpuLpDevice final : public LpDevice {
 public:
     std::string_view name() const override { return "cpu"; }
     bool is_accelerated() const override { return false; }
+    std::uint32_t batch_size() const override {
+        return static_cast<std::uint32_t>(batch_size_);
+    }
     LpDeviceCapabilities capabilities() const override {
         return {true, true, true, true, true};
     }
@@ -82,7 +186,88 @@ public:
         last_operator_rhs_ = 0.0;
         last_operator_ratio_ = 0.0;
         checkpoint_valid_ = false;
+        batch_size_ = 1;
+        batch_slots_.clear();
         uploaded_ = true;
+    }
+
+    void bind_bounds_batch(std::uint32_t batch_size,
+                           const std::vector<LpBoundOverlay>& bounds) override {
+        require_uploaded();
+        if (bounds.size() != batch_size)
+            throw std::invalid_argument("CpuLpDevice: bounds size != batch_size");
+        if (batch_size == 0)
+            throw std::invalid_argument("CpuLpDevice: batch_size must be positive");
+
+        std::uint64_t bound_bytes = 0;
+        // Capture shared row bounds / c from the last upload before overlays
+        // overwrite the active buffers.
+        const std::vector<f64> shared_row_lo = row_lo_;
+        const std::vector<f64> shared_row_hi = row_hi_;
+        const std::vector<f64> shared_c = c_;
+
+        if (batch_size == 1) {
+            apply_overlay_active(bounds[0], nc_, nr_, shared_row_lo, shared_row_hi,
+                                 shared_c, col_lo_, col_hi_, row_lo_, row_hi_, c_);
+            batch_size_ = 1;
+            batch_slots_.clear();
+            bound_bytes = (col_lo_.size() + col_hi_.size() + row_lo_.size() +
+                           row_hi_.size() + c_.size()) *
+                          sizeof(f64);
+        } else {
+            batch_size_ = batch_size;
+            batch_slots_.resize(batch_size);
+            for (std::uint32_t s = 0; s < batch_size; ++s) {
+                apply_overlay(bounds[s], nc_, nr_, shared_row_lo, shared_row_hi,
+                              shared_c, batch_slots_[s]);
+                allocate_slot_vectors(batch_slots_[s], nr_, nc_);
+                bound_bytes += (batch_slots_[s].col_lo.size() +
+                                batch_slots_[s].col_hi.size() +
+                                batch_slots_[s].row_lo.size() +
+                                batch_slots_[s].row_hi.size() +
+                                batch_slots_[s].c.size()) *
+                               sizeof(f64);
+            }
+            load_slot_to_active(0);
+        }
+        stats_.h2d_bytes += bound_bytes;
+        ++stats_.calls;
+    }
+
+    void init_zero_batched() override {
+        if (batch_size_ == 1) {
+            init_zero();
+            return;
+        }
+        for (std::uint32_t s = 0; s < batch_size_; ++s) {
+            load_slot_to_active(s);
+            init_zero();
+            save_active_to_slot(s);
+        }
+    }
+
+    void hpr_steps_batched(std::uint32_t k, const StepParams& p) override {
+        if (batch_size_ == 1) {
+            hpr_steps(k, p);
+            return;
+        }
+        for (std::uint32_t s = 0; s < batch_size_; ++s) {
+            load_slot_to_active(s);
+            hpr_steps(k, p);
+            save_active_to_slot(s);
+        }
+    }
+
+    std::vector<Kkt> reduce_kkt_batched() override {
+        if (batch_size_ == 1) return {reduce_kkt()};
+        std::vector<Kkt> out;
+        out.reserve(batch_size_);
+        for (std::uint32_t s = 0; s < batch_size_; ++s) {
+            load_slot_to_active(s);
+            out.push_back(reduce_kkt());
+            save_active_to_slot(s);
+        }
+        return out;
     }
 
     void init_zero() override {
@@ -428,6 +613,90 @@ private:
         if (!uploaded_) throw std::logic_error("CpuLpDevice: upload() required");
     }
 
+    void load_slot_to_active(std::uint32_t slot) {
+        const SlotState& s = batch_slots_[slot];
+        col_lo_ = s.col_lo;
+        col_hi_ = s.col_hi;
+        row_lo_ = s.row_lo;
+        row_hi_ = s.row_hi;
+        if (!s.c.empty()) c_ = s.c;
+        x_ = s.x;
+        y_ = s.y;
+        xbar_ = s.xbar;
+        Aty_ = s.Aty;
+        Ax_ = s.Ax;
+        x_avg_ = s.x_avg;
+        y_avg_ = s.y_avg;
+        x_anchor_ = s.x_anchor;
+        y_anchor_ = s.y_anchor;
+        x_fixed_ = s.x_fixed;
+        y_fixed_ = s.y_fixed;
+        Ax_current_ = s.Ax_current;
+        Ax_fixed_ = s.Ax_fixed;
+        Ax_anchor_ = s.Ax_anchor;
+        checkpoint_x_ = s.checkpoint_x;
+        checkpoint_y_ = s.checkpoint_y;
+        checkpoint_Ax_ = s.checkpoint_Ax;
+        checkpoint_x_avg_ = s.checkpoint_x_avg;
+        checkpoint_y_avg_ = s.checkpoint_y_avg;
+        last_x_delta_ = s.last_x_delta;
+        last_y_delta_ = s.last_y_delta;
+        primal_ray_ = s.primal_ray;
+        dual_ray_ = s.dual_ray;
+        avg_count_ = s.avg_count;
+        epoch_step_ = s.epoch_step;
+        checkpoint_avg_count_ = s.checkpoint_avg_count;
+        checkpoint_epoch_step_ = s.checkpoint_epoch_step;
+        checkpoint_valid_ = s.checkpoint_valid;
+        last_dx_ = s.last_dx;
+        last_dy_ = s.last_dy;
+        last_operator_lhs_ = s.last_operator_lhs;
+        last_operator_rhs_ = s.last_operator_rhs;
+        last_operator_ratio_ = s.last_operator_ratio;
+    }
+
+    void save_active_to_slot(std::uint32_t slot) {
+        SlotState& s = batch_slots_[slot];
+        s.col_lo = col_lo_;
+        s.col_hi = col_hi_;
+        s.row_lo = row_lo_;
+        s.row_hi = row_hi_;
+        s.c = c_;
+        s.x = x_;
+        s.y = y_;
+        s.xbar = xbar_;
+        s.Aty = Aty_;
+        s.Ax = Ax_;
+        s.x_avg = x_avg_;
+        s.y_avg = y_avg_;
+        s.x_anchor = x_anchor_;
+        s.y_anchor = y_anchor_;
+        s.x_fixed = x_fixed_;
+        s.y_fixed = y_fixed_;
+        s.Ax_current = Ax_current_;
+        s.Ax_fixed = Ax_fixed_;
+        s.Ax_anchor = Ax_anchor_;
+        s.checkpoint_x = checkpoint_x_;
+        s.checkpoint_y = checkpoint_y_;
+        s.checkpoint_Ax = checkpoint_Ax_;
+        s.checkpoint_x_avg = checkpoint_x_avg_;
+        s.checkpoint_y_avg = checkpoint_y_avg_;
+        s.last_x_delta = last_x_delta_;
+        s.last_y_delta = last_y_delta_;
+        s.primal_ray = primal_ray_;
+        s.dual_ray = dual_ray_;
+        s.avg_count = avg_count_;
+        s.epoch_step = epoch_step_;
+        s.checkpoint_avg_count = checkpoint_avg_count_;
+        s.checkpoint_epoch_step = checkpoint_epoch_step_;
+        s.checkpoint_valid = checkpoint_valid_;
+        s.last_dx = last_dx_;
+        s.last_dy = last_dy_;
+        s.last_operator_lhs = last_operator_lhs_;
+        s.last_operator_rhs = last_operator_rhs_;
+        s.last_operator_ratio = last_operator_ratio_;
+    }
+
     void spmv_csr(const f64* x, f64* y) const {
         const auto& rp = A_csr_.pattern.row_ptr();
         const auto& ci = A_csr_.pattern.col_idx();
@@ -598,6 +867,8 @@ private:
     }
 
     bool uploaded_ = false;
+    std::uint32_t batch_size_ = 1;
+    std::vector<SlotState> batch_slots_;
     std::size_t nr_ = 0, nc_ = 0;
     sparse::CsrMatrix A_csr_;
     sparse::CscMatrix A_csc_;

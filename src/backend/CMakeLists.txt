@@ -28,7 +28,8 @@ endif()
 set(FORGE_BACKEND_SOURCES
   src/cpu_backend.cpp
   src/backend_factory.cpp
-  src/cpu_lp_device.cpp)
+  src/cpu_lp_device.cpp
+  src/lp_device_batch.cpp)
 if(FORGE_ENABLE_VULKAN)
   list(APPEND FORGE_BACKEND_SOURCES src/vulkan/vk_context.cpp src/vulkan/vk_lp_device.cpp)
 else()
