@@ -95,6 +95,15 @@ inline bool parse_branch_strategy(std::string_view s, BranchStrategy& out) {
     return false;
 }
 
+// Defaults for a B&B node LP. Split out so the one field that deliberately
+// differs from the standalone-LP defaults has a name and a single definition
+// (sor_solve consults it when deciding whether the CLI may override it).
+inline engines::SimplexOptions default_node_lp_options() {
+    engines::SimplexOptions o;
+    o.update_method = la::UpdateMethod::ProductForm;
+    return o;
+}
+
 struct BabOptions {
     // Product default = latest improved (sparse-SB, DynSep/GCS, Mexi, Balans…).
     // Classical is debug/ablation only.
@@ -370,7 +379,17 @@ struct BabOptions {
     // WP-J policy hook: lp.update_method selects product-form vs Forrest–Tomlin
     // basis updates (engines already expose both; hypersparse FTRAN/BTRAN is
     // always on inside the factor). CLI: --basis-update product|ft.
-    engines::SimplexOptions lp;
+    //
+    // This deliberately does NOT follow the standalone-LP default, which moved
+    // to Forrest-Tomlin on 2026-09-17. FT wins on one long solve, where a
+    // hundred-plus updates amortise its costlier update and its sparser etas
+    // pay off; a B&B node LP is the opposite shape -- warm-started, five to
+    // fifteen pivots, then done -- so ft_update_limit never binds and only the
+    // per-pivot cost lands. Measured on the 11 proving miplib-easy models
+    // (2 paired reps, 60 s): FT both-proved SGM +22.4%, sum of medians +29.3%,
+    // with lseu +210% and mod010 +104%. Product form stays the node-LP default
+    // until something measures otherwise.
+    engines::SimplexOptions lp = default_node_lp_options();
 };
 
 struct BabDiagnostics {

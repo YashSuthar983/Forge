@@ -98,12 +98,20 @@ struct SimplexOptions {
     // trigger while leaving ordinary pivots on the cheap update path.
     f64 refactor_multiplier_limit = 1e6;
 
-    // Basis update representation (sor/la/lu.hpp). ProductForm is the
-    // measured default. The true Forrest-Tomlin implementation is verified by
-    // structural and dense-reconstruction differential tests, but its row
-    // etas were denser and its Netlib wall times worse; it therefore remains
-    // an explicit diagnostic/experimental choice.
-    la::UpdateMethod update_method = la::UpdateMethod::ProductForm;
+    // Basis update representation (sor/la/lu.hpp). Forrest-Tomlin is the
+    // measured default as of 2026-09-17.
+    //
+    // FT lost to product form for as long as it ran at ft_update_limit = 50:
+    // refactorizing every 50 row etas threw away the representation while it
+    // was still cheap, and on pilot87 that cost 30% over product form. Raising
+    // the limit to 200 inverts the result. Netlib-93, pinned, 3 reps, against
+    // the same HiGHS reference: shifted SGM (+1 s, the public gate's shift)
+    // 1.449x -> 1.249x HiGHS, sum of medians 29.97 s -> 22.38 s, 93/93 Optimal
+    // with no objective mismatch. It wins on the whole slow tail at once --
+    // dfl001 0.67x, pilot87 0.77x, fit2p 0.65x, pilot 0.66x, d2q06c 0.80x,
+    // grow22 0.55x -- against regressions that are all under 30 ms of absolute
+    // wall (worst: sctap2 9 -> 16 ms, nesm 146 -> 172 ms).
+    la::UpdateMethod update_method = la::UpdateMethod::ForrestTomlin;
     // ForrestTomlin only: force a refactor once a bump grows past this many
     // pivot-steps (0 disables the trigger). See BasisFactor::update_ft().
     Index bump_width_max = 0;
@@ -128,7 +136,16 @@ struct SimplexOptions {
     // per 45 updates. DSE log error at 50: d2q06c 1.0e-06, dfl001 1.1e-09,
     // greenbea 4.7e-06, 25fv47 7.1e-07 (pilot87 0.258 remains, and is P4b).
     f64 refactor_u_nnz_ratio = 2.0;
-    int ft_update_limit = 50;
+    // Re-swept 2026-09-17 on wall time (the 50 above was chosen on pivot count
+    // and DSE log error, with FT off by default so the wall cost of the extra
+    // factorizations never entered the decision). Sum over the seven slowest
+    // Netlib models, relative to product form: limit 100 -> 0.82x,
+    // **200 -> 0.72x**, 400 -> 0.79x, 800 -> 0.80x, 2000 -> 0.80x. A clear
+    // interior optimum: below it the refactorizations dominate, above it the
+    // accumulated row etas do. pilot87 is the model that moves most (0.95x at
+    // 100, 0.76x at 200) and is also the one whose DSE log error the old
+    // comment flagged, so re-check that pair together if this is retuned.
+    int ft_update_limit = 200;
     // Collective FT (Huangfu & Hall 2015 Phase 2, item 2 of
     // docs/SIH26119_PS_ALIGNMENT.md §5): when the product-form eta file hits
     // refactor_eta_ratio, try BasisFactor::collapse_pending_into_ft() (fold
