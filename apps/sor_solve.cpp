@@ -331,6 +331,7 @@ int main(int argc, char** argv) {
     std::string gcs_model;
     bool gcs_heuristic = false;
     int gcs_reinject = -1;
+    bool basis_update_explicit = false;
     std::string milp_policy = "latest";
     std::string branch_strategy = "auto";
     std::string sparse_sb_model;
@@ -416,6 +417,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--basis-update") {
             const std::string method = next("--basis-update");
+            basis_update_explicit = true;
             if (method == "product")
                 sx_opts.update_method = sor::la::UpdateMethod::ProductForm;
             else if (method == "ft")
@@ -780,6 +782,13 @@ int main(int argc, char** argv) {
             }
             sor::search::BabOptions bab;
             bab.lp = sx_opts;
+            // Node LPs keep their own default representation unless the user
+            // asked for one explicitly: the standalone-LP default is
+            // Forrest-Tomlin, which is a large regression on short
+            // warm-started node LPs. See search::default_node_lp_options().
+            if (!basis_update_explicit)
+                bab.lp.update_method =
+                    sor::search::default_node_lp_options().update_method;
             bab.verbose = sx_opts.verbose;
             if (!sor::search::parse_milp_policy(milp_policy, bab.policy)) {
                 std::fprintf(stderr,

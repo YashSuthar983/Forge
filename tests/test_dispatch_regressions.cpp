@@ -290,10 +290,18 @@ void test_primal_phase1_rebuilds_only_when_objective_changes() {
 
 void test_primal_phase1_composite_sparse_and_dense_paths() {
     const auto check = [](const char* file, bool expect_sparse,
-                          bool expect_dense) {
+                          bool expect_dense,
+                          sor::la::UpdateMethod update) {
         const auto problem = load(file);
         SimplexOptions opts;
         opts.method = sor::engines::SimplexMethod::Primal;
+        // The sparse/dense expectations below characterise the composite BTRAN
+        // against a FIXED basis representation: which side of the support
+        // gate a given model lands on is a property of the update method, not
+        // of the composite update under test. Pinning it here keeps this a
+        // test of the two paths rather than a test of whatever the default
+        // happens to be (the default moved to Forrest-Tomlin on 2026-09-17).
+        opts.update_method = update;
         opts.presolve = false;
         opts.primal_feas_tol = 1e-6;
         opts.dual_feas_tol = 1e-6;
@@ -320,8 +328,18 @@ void test_primal_phase1_composite_sparse_and_dense_paths() {
     // AGG changes basic phase-1 coefficients and its composite BTRAN remains
     // hypersparse. SCAGR7 forces the same exact update through the dense
     // fallback, so both sides of the support-density gate stay covered.
-    check("agg.mps", true, false);
-    check("scagr7.mps", false, true);
+    using sor::la::UpdateMethod;
+    check("agg.mps", true, false, UpdateMethod::ProductForm);
+    check("scagr7.mps", false, true, UpdateMethod::ProductForm);
+    // Same two models under the shipped default (Forrest-Tomlin). agg stays
+    // hypersparse; scagr7 no longer reaches the dense fallback at all -- FT's
+    // row etas leave its composite BTRAN inside the support gate (measured:
+    // sparse=2, dense=0, against product form's sparse=0, dense=1). The dense
+    // side of the gate is therefore covered by the product-form arm above,
+    // which is why that arm pins the method explicitly rather than following
+    // the default.
+    check("agg.mps", true, false, UpdateMethod::ForrestTomlin);
+    check("scagr7.mps", true, false, UpdateMethod::ForrestTomlin);
 }
 
 }  // namespace

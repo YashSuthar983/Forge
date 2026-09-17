@@ -173,7 +173,15 @@ def build_sor_command(model: Path, engine: str, backend: str,
     if method is not None and eng in ("simplex", "milp"):
         cmd += ["--method", method]
     if eng in ("simplex", "milp"):
-        cmd += ["--basis-update", basis_update, "--pricing", pricing]
+        # "default" means: do not pass the flag at all, so the run measures
+        # whatever the engine ships as its default basis representation. The
+        # harness used to hard-code "product" here, which silently pinned every
+        # gate run to product form and would have hidden the 2026-09-17 switch
+        # of the LP default to Forrest-Tomlin. Pass product/ft explicitly to
+        # force one.
+        if basis_update not in (None, "default"):
+            cmd += ["--basis-update", basis_update]
+        cmd += ["--pricing", pricing]
         if dual_cost_perturbation > 0.0:
             cmd += ["--dual-cost-perturbation",
                     str(dual_cost_perturbation)]
@@ -186,7 +194,7 @@ def build_sor_command(model: Path, engine: str, backend: str,
 
 def run_sor(model: Path, engine: str, backend: str, time_limit: float,
             tol: float, exe: Path, label: str, method: str | None = None,
-            basis_update: str = "product", max_iter: int | None = None,
+            basis_update: str = "default", max_iter: int | None = None,
             cpu: int | None = None, pricing: str = "choose",
             dual_cost_perturbation: float = 0.0,
             sor_extra: list[str] | None = None,
@@ -579,7 +587,7 @@ def run_gurobi(model: Path, time_limit: float, label: str) -> Result:
 
 def dispatch(spec: str, model: Path, time_limit: float, tol: float,
              exe: Path, method: str | None = None,
-             basis_update: str = "product", max_iter: int | None = None,
+             basis_update: str = "default", max_iter: int | None = None,
              cpu: int | None = None, pricing: str = "choose",
              dual_cost_perturbation: float = 0.0,
              sor_extra: list[str] | None = None,
@@ -1348,7 +1356,10 @@ def build_parser() -> argparse.ArgumentParser:
                     default="choose", help="simplex pricing strategy")
     ap.add_argument("--dual-cost-perturbation", type=float, default=0.0,
                     help="experimental dual-simplex cost perturbation multiplier")
-    ap.add_argument("--basis-update", choices=("product", "ft"), default="product")
+    ap.add_argument("--basis-update", choices=("default", "product", "ft"),
+                    default="default",
+                    help="default: let the solver choose (recorded as such); "
+                         "product/ft force one representation")
     ap.add_argument("--max-iter", type=int, default=None,
                     help="explicit solver iteration/node cap")
     ap.add_argument("--warmups", type=int, default=0)
