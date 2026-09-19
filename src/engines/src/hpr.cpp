@@ -441,13 +441,14 @@ backend::ScaledLp build_scaled_lp(model::LpProblem& p, int ruiz_iterations,
 }
 
 core::RawResult solve_hpr(const model::LpProblem& problem,
-                          const HprOptions& opts,
+                          const HprOptions& opts_in,
                           backend::LpDevice& device,
                           HprDiagnostics& diag) {
     const auto t_all = Clock::now();
     diag = HprDiagnostics{};
     device.reset_stats();
 
+    HprOptions opts = opts_in;
     core::RawResult raw;
     raw.engine = "hpr";
     raw.backend = std::string(device.name());
@@ -480,22 +481,15 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
         return raw;
     }
     if (opts.detect_certificates && !caps.certificate_directions) {
-        raw.proposed_status = core::Status::Unsupported;
-        raw.termination_reason =
-            "selected LP device does not provide certificate directions";
-        diag.status = raw.proposed_status;
-        diag.termination_reason = raw.termination_reason;
-        diag.total_ms = ms_since(t_all);
-        return raw;
+        // Certificates are best-effort on FO. Vulkan (and any device that has
+        // not yet shipped ray candidates) must still be allowed to iterate -
+        // refusing the whole solve made `--backend vulkan` a hard Unsupported
+        // even after E1-E5 parity landed on the hot path.
+        opts.detect_certificates = false;
     }
     if (opts.use_adaptive_step && !caps.transactional_step) {
-        raw.proposed_status = core::Status::Unsupported;
-        raw.termination_reason =
-            "selected LP device does not support transactional adaptive steps";
-        diag.status = raw.proposed_status;
-        diag.termination_reason = raw.termination_reason;
-        diag.total_ms = ms_since(t_all);
-        return raw;
+        // Adaptive η needs snapshot/restore; without it keep a fixed step.
+        opts.use_adaptive_step = false;
     }
 
     model::LpProblem p = problem;

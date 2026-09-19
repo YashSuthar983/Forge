@@ -59,6 +59,13 @@ struct FlowCoverDiagnostics {
     std::uint64_t vubs_found = 0;
     std::uint64_t vubs_projected = 0;
     std::uint64_t si_lifted_arcs = 0;
+    // Arcs refused lifting because u + beta > 0 would have added slack the
+    // fixed rhs never paid for. Non-zero means the guard is doing work.
+    std::uint64_t rejected_unsafe_lift = 0;
+    // Continuous columns refused as flow arcs because their lower bound is
+    // negative (or unbounded below), which the 0 <= y <= u*x derivation
+    // forbids.
+    std::uint64_t rejected_negative_flow = 0;
 };
 
 // Separates violated flow-cover cuts from `lp` at `x` under [col_lo, col_hi].

@@ -4,9 +4,11 @@
 
 #include "test_helpers.hpp"
 
+#include <limits>
 #include <vector>
 
 using sor::model::LpProblem;
+using sor::model::kInf;
 using sor::sparse::from_triplets;
 
 namespace {
@@ -41,9 +43,6 @@ LpProblem network_flow_model() {
     return lp;
 }
 
-// Consecutive ones: two equalities over one continuous [0,3]:
-//   x = 1, x = 1 (same var twice would be redundant) - use two vars:
-//   x + y = 1, y + z = 1 with x,z integer, y continuous → y implied by ±1.
 // Pure C1 block: three eqs, two continuous with identity-like C1.
 //   r0: x = 2, r1: x = 2  - single col consecutive ones of length 2.
 LpProblem c1_model() {
@@ -56,6 +55,37 @@ LpProblem c1_model() {
     lp.row_lo = {2.0, 2.0};
     lp.row_hi = {2.0, 2.0};
     lp.A = from_triplets(2, 1, {0, 1}, {0, 0}, {1.0, 1.0});
+    return lp;
+}
+
+// Example 1.4 / Corollary 3.3 (paper §3.1): z implied by integer x,y via ≤ rows.
+LpProblem dual_rational_model() {
+    LpProblem lp;
+    lp.name = "dual_rational";
+    lp.c = {10.0, 10.0, 1.0};
+    lp.col_lo = {0.0, 0.0, 0.0};
+    lp.col_hi = {10.0, 10.0, 10.0};
+    lp.is_integer = {true, true, false};
+    lp.row_lo = {-kInf, -kInf, 0.0};
+    lp.row_hi = {4.0, 3.0, kInf};
+    // 3x + 2y + z <= 4; x + 3y - z <= 3; z >= 0
+    lp.A = from_triplets(
+        3, 3, {0, 0, 0, 1, 1, 1, 2}, {0, 1, 2, 0, 1, 2, 2},
+        {3.0, 2.0, 1.0, 1.0, 3.0, -1.0, 1.0});
+    return lp;
+}
+
+// Two parallel network arcs (continuous) in one ≤ row - Algorithm 1 column pass.
+LpProblem tu_network_pair_model() {
+    LpProblem lp;
+    lp.name = "tu_network_pair";
+    lp.c = {1.0, 1.0};
+    lp.col_lo = {0.0, 0.0};
+    lp.col_hi = {5.0, 5.0};
+    lp.is_integer = {false, false};
+    lp.row_lo = {-kInf};
+    lp.row_hi = {2.0};
+    lp.A = from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
     return lp;
 }
 
@@ -91,11 +121,38 @@ void test_c1_marks() {
     CHECK(lp.is_integer[0]);
 }
 
+void test_dual_rational_marks_z() {
+    auto lp = dual_rational_model();
+    sor::search::ImpliedIntOptions o;
+    o.equality_pm1 = false;
+    o.network = false;
+    o.consecutive_ones = false;
+    o.tu_network_block = false;
+    const auto d = sor::search::infer_implied_integers_ex(lp, o);
+    CHECK(d.dual_rational >= 1);
+    CHECK(lp.is_integer[2]);
+}
+
+void test_tu_network_block_pair() {
+    auto lp = tu_network_pair_model();
+    sor::search::ImpliedIntOptions o;
+    o.equality_pm1 = false;
+    o.network = false;
+    o.consecutive_ones = false;
+    o.dual_rational = false;
+    const auto d = sor::search::infer_implied_integers_ex(lp, o);
+    CHECK(d.tu_network_block >= 2);
+    CHECK(lp.is_integer[0]);
+    CHECK(lp.is_integer[1]);
+}
+
 }  // namespace
 
 int main() {
     test_equality_pm1();
     test_network_marks_flow();
     test_c1_marks();
+    test_dual_rational_marks_z();
+    test_tu_network_block_pair();
     return sor::test::finish("test_implied_int");
 }

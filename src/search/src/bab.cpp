@@ -1,7 +1,10 @@
 #include "sor/search/bab.hpp"
 #include "sor/engines/dual_simplex.hpp"
+#include "sor/engines/lp_batched.hpp"
+#include "sor/search/para_bab.hpp"
 #include "sor/search/balans.hpp"
 #include "sor/search/features.hpp"
+#include "sor/search/fixprop.hpp"
 #include "sor/search/kernel_pump.hpp"
 #include "sor/search/lifted_branch.hpp"
 #include "sor/search/mrens.hpp"
@@ -12,6 +15,8 @@
 #include "sor/search/conflict_cut.hpp"
 #include "sor/search/implied_int.hpp"
 #include "sor/search/tree_cuts.hpp"
+#include "sor/search/cut_policy.hpp"
+#include "sor/core/route_debug.hpp"
 
 #include <algorithm>
 #include <array>
@@ -22,8 +27,10 @@
 #include <fstream>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <queue>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -37,6 +44,125 @@ inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 inline double ms_since(Clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 }
+
+inline bool route_sample_node(std::uint64_t nodes) noexcept {
+    const int every = ::sor::core::route_debug_pivot_every();
+    if (every <= 0) return true;
+    return nodes % static_cast<std::uint64_t>(every) == 0;
+}
+
+// Objective granularity g: every feasible INTEGER point of `lp` has an
+// objective that is an integer multiple of g. Returns 0 when no such g can be
+// established.
+//
+// This is standard dual-bound strengthening and every commercial solver does
+// it; SOR did not. If the objective can only take values ..., -g, 0, g, 2g,
+// ..., then a dual bound b can be raised to the next multiple of g at or above
+// b, because nothing strictly between multiples is attainable. On a
+// minimisation with an incumbent already at a multiple of g, that closes any
+// gap smaller than g -- which is exactly the situation a branch-and-bound run
+// ends in when it has FOUND the optimum but cannot prove it.
+//
+// Measured need: vpm1 finishes with incumbent 20 and a dual bound of
+// 19.8278 (cuts-heavy), i.e. 0.17 short, after 62858 nodes. Its objective is
+// integral, so ceil(19.8278) = 20 closes it immediately.
+//
+// Conditions (all necessary):
+//   * every column with a non-zero objective coefficient is an integer column
+//     -- a continuous column with a cost makes the objective continuous;
+//   * every such coefficient is itself integral within tolerance.
+// Then g = gcd of those coefficients. Using the gcd rather than 1 is strictly
+// stronger: an objective built from coefficients {4, 6} moves in steps of 2.
+f64 objective_granularity(const model::LpProblem& lp, f64 tol) {
+    if (lp.is_integer.empty()) return 0.0;
+    f64 g = 0.0;
+    for (std::size_t j = 0; j < lp.c.size(); ++j) {
+        const f64 cj = lp.c[j];
+        if (std::fabs(cj) <= tol) continue;          // no cost: irrelevant
+        if (!lp.is_integer[j]) return 0.0;           // continuous cost column
+        const f64 r = std::round(cj);
+        if (std::fabs(cj - r) > tol) return 0.0;     // non-integral coefficient
+        const f64 a = std::fabs(r);
+        // gcd over reals that are known integers.
+        f64 x = g, y = a;
+        while (y > 0.5) { const f64 t = std::fmod(x, y); x = y; y = t; }
+        g = x;
+        if (g <= 1.5) return 1.0;                    // cannot do better than 1
+    }
+    return g;
+}
+
+// Raise a minimisation dual bound to the next attainable objective value.
+// `tol` guards against rounding a bound that is already (numerically) on a
+// multiple up to the next one, which would be unsound.
+// Attainable objective values are offset + g*Z, NOT g*Z: an objective offset
+// shifts the whole lattice. Ignoring it would round a bound to a value the
+// objective can never take, which is unsound in the dangerous direction.
+f64 tighten_bound_to_granularity(f64 bound, f64 g, f64 offset, f64 tol) {
+    if (g <= 0.0 || !std::isfinite(bound) || !std::isfinite(offset))
+        return bound;
+    const f64 k = std::ceil((bound - offset) / g - tol);
+    const f64 tightened = offset + k * g;
+    return tightened > bound ? tightened : bound;
+}
+
+// Share of the total budget any single ROOT SETUP phase may consume.
+// Generous per phase but bounded: several phases at 25% still leave budget for
+// the search, which is the only thing that proves anything. These phases ran
+// unbudgeted and consumed 45.7 s of a 5 s limit on atlanta-ip.
+constexpr f64 kRootSetupShare = 0.25;
+// Ceiling on what ALL root setup phases may consume TOGETHER.
+//
+// Bounding each phase to a share of the remaining time stops any one of them
+// running away, but it does not stop them collectively eating the budget: a
+// sequence of phases each taking 25% of what is left converges on 100%. That
+// is exactly what was measured -- after every individual phase was bounded,
+// all six large instances honoured the time limit and STILL reported
+// nodes = 0, having never branched at all.
+//
+// Root processing that leaves no time for search is worthless: the search is
+// the only part that proves anything. Industrial solvers cap root work at a
+// modest fraction for this reason. 20% here leaves 80% for the tree.
+constexpr f64 kRootBudgetShare = 0.20;
+// Ceiling on the ROOT CUT LOOP, separately from the setup phases above.
+//
+// Cutting is the most valuable root work there is -- on gt2 it closes 97.7% of
+// a 36% integrality gap while branching contributes nothing -- so it gets a
+// far larger allowance than presolve. But its only bound used to be the GLOBAL
+// time limit, so on a large model it simply took everything: atlanta-ip spent
+// 21.6 s of a 30 s budget in the cut loop and branched ZERO nodes.
+//
+// A solver that never branches cannot prove anything that cuts alone do not
+// close. 35% leaves roughly half the budget for the tree after setup. Note
+// this cap does not bind on models where cutting is cheap -- gt2's whole loop
+// is milliseconds -- so it costs nothing where cuts are winning.
+constexpr f64 kRootCutShare = 0.35;
+// Ceiling on ALL pre-search work TOGETHER -- setup phases AND the cut loop --
+// measured from the start of the solve, not from the start of each phase.
+//
+// kRootBudgetShare caps the setup phases and kRootCutShare capped the cut loop,
+// but each was a share of the WHOLE limit measured from its own t0, so they
+// composed to 20% + 35% = 55% before the root LP, which is itself unbudgeted.
+// Measured on MIPLIB2017 benchmark instances at a 60 s limit, that produced a
+// cut loop of ~21 s every time and a pre-search of 35-46 s:
+//
+//   lectsched-5-obj  setup 3.0 s -> pre-search 37.8 s   cut loop 21.1 s
+//   savsched1        setup 3.1 s -> pre-search 41.6 s   cut loop 21.6 s
+//   s250r10          setup 3.1 s -> pre-search 46.0 s   cut loop 21.6 s
+//
+// The search then got 14-25 s against node LPs costing 0.3-19 s each, so it
+// branched 1-4 nodes. Across a 60-instance benchmark sample, 48% processed
+// AT MOST ONE NODE, and the search is the only part that proves anything.
+constexpr f64 kRootTotalShare = 0.35;
+// A phase budget must be a share of the time REMAINING, never of the original
+// limit. Sharing the original lets each phase overshoot independently, so a
+// bigger limit buys a bigger overrun: atlanta-ip complied at a 5 s limit and
+// took 32.6 s at a 10 s limit, because every phase simply helped itself to
+// 25% of 10 s regardless of what earlier phases had already spent.
+// Below this a phase cannot do anything useful -- and asking for "0" would be
+// read as UNLIMITED by the 0-means-no-limit convention, which is exactly the
+// footgun that made an earlier version of this fix a no-op. Skip instead.
+constexpr f64 kMinPhaseBudget = 0.01;
 
 inline bool is_integral(f64 v, f64 tol) {
     return std::fabs(v - std::round(v)) <= tol;
@@ -2988,14 +3114,177 @@ bool relaxation_proved(const core::RawResult& r,
            d.dual_bound_finite && d.gap_rel <= opts.gap_tol;
 }
 
+// Para-B&B worker expand (paper-shaped slice): prop → node LP → prune/branch.
+// No heuristics / Mexi / SB inside workers - those stay on the serial path /
+// sync. Determinism comes from barrier merge order, not from this body.
+struct ParaExpandOut {
+    bool abandoned = false;
+    bool infeasible = false;
+    bool integer_hit = false;
+    f64 incumbent = core::kNaN;
+    std::vector<f64> x;
+    f64 bound = -std::numeric_limits<f64>::infinity();
+    f64 abandoned_bound = std::numeric_limits<f64>::infinity();
+    std::vector<Node> children;
+    std::uint64_t lp_solves = 0;
+    std::uint64_t lp_iterations = 0;
+    double lp_ms = 0.0;
+    // Stable key for deterministic merge (parent pop order).
+    std::uint64_t order_key = 0;
+};
+
+ParaExpandOut para_expand_node(const model::LpProblem& global_lp,
+                               Node node,
+                               const BabOptions& opts,
+                               f64 sense,
+                               f64 incumbent_min,
+                               bool have_incumbent,
+                               f64 int_tol,
+                               f64 feas_tol,
+                               std::uint64_t order_key,
+                               double lp_seconds_left) {
+    ParaExpandOut out;
+    out.order_key = order_key;
+    out.abandoned_bound = node.bound;
+
+    model::LpProblem node_lp = global_lp;
+    if (opts.domain_propagation) {
+        auto prop = propagate_bounds(node_lp, node.col_lo, node.col_hi,
+                                     feas_tol, opts.propagation_max_rounds);
+        if (!prop.feasible) {
+            out.infeasible = true;
+            return out;
+        }
+    }
+    node_lp.col_lo = node.col_lo;
+    node_lp.col_hi = node.col_hi;
+
+    engines::SimplexOptions lp_opts = opts.lp;
+    lp_opts.verbose = false;
+    // opts.lp carries the WHOLE solver time limit, not what is left of it.
+    // Unclamped, a worker LP starting near the deadline could run for another
+    // full limit: sct2 overran by a constant ~22 s at both a 30 s and a 60 s
+    // limit (51.4 s and 83.0 s wall) because of this one line. The serial node
+    // loop already clamps the same way.
+    if (lp_seconds_left > 0.0)
+        lp_opts.time_limit_s = std::max(0.05, lp_seconds_left);
+    if (lp_opts.max_iterations == 0) {
+        const std::uint64_t work_size =
+            static_cast<std::uint64_t>(node_lp.n_rows()) +
+            static_cast<std::uint64_t>(node_lp.n_cols()) +
+            static_cast<std::uint64_t>(node_lp.n_rows());
+        lp_opts.max_iterations =
+            std::max<std::uint64_t>(100000, 200ull * work_size);
+    }
+    engines::SimplexDiagnostics sd;
+    engines::SimplexBasis basis;
+    const auto t_lp = Clock::now();
+    core::RawResult lp_raw;
+    if (!node.has_basis) {
+        lp_raw = engines::solve_simplex(node_lp, lp_opts, sd, &basis);
+    } else {
+        lp_opts.presolve = false;
+        if (lp_opts.method == engines::SimplexMethod::Auto)
+            lp_opts.method = engines::SimplexMethod::Dual;
+        lp_raw = engines::solve_dual_simplex(node_lp, lp_opts, sd, &basis,
+                                             &node.basis);
+    }
+    out.lp_solves = 1;
+    out.lp_iterations = sd.iterations;
+    out.lp_ms = ms_since(t_lp);
+
+    if (lp_raw.proposed_status == core::Status::Infeasible ||
+        lp_raw.proposed_status == core::Status::InfeasibleOrUnbounded) {
+        out.infeasible = true;
+        return out;
+    }
+    if (lp_raw.proposed_status == core::Status::Interrupted) {
+        out.abandoned = true;
+        return out;
+    }
+    const bool proved = relaxation_proved(lp_raw, sd, lp_opts);
+    if (!proved) {
+        out.abandoned = true;
+        return out;
+    }
+    const f64 lp_obj_min = sense * lp_raw.objective;
+    out.bound = lp_obj_min;
+    if (have_incumbent &&
+        lp_obj_min > incumbent_min + opts.gap_tol * (1.0 + std::fabs(incumbent_min))) {
+        return out;  // bound prune, no children
+    }
+
+    // Integer feasible?
+    bool all_int = true;
+    for (Index j = 0; j < node_lp.n_cols(); ++j) {
+        if (node_lp.is_integer.empty() || !node_lp.is_integer[sz(j)]) continue;
+        if (!is_integral(lp_raw.x[sz(j)], int_tol)) {
+            all_int = false;
+            break;
+        }
+    }
+    if (all_int &&
+        node_lp.max_row_violation(lp_raw.x) <= feas_tol &&
+        node_lp.max_bound_violation(lp_raw.x) <= feas_tol) {
+        out.integer_hit = true;
+        out.incumbent = lp_raw.objective;
+        out.x = lp_raw.x;
+        return out;
+    }
+
+    const Index br = pick_branch_var(node_lp, node.col_lo, node.col_hi,
+                                     lp_raw.x, int_tol);
+    if (br < 0) return out;
+    const f64 xv = lp_raw.x[sz(br)];
+    const f64 floor_v = std::floor(xv);
+    const f64 ceil_v = std::ceil(xv);
+
+    auto make_child = [&](int dir) {
+        Node c = node;
+        c.depth = node.depth + 1;
+        c.parent_branch_var = br;
+        c.parent_branch_dir = dir;
+        c.parent_bound = lp_obj_min;
+        c.parent_branch_distance =
+            dir < 0 ? (xv - floor_v) : (ceil_v - xv);
+        c.bound = lp_obj_min;
+        c.basis = basis;
+        c.has_basis = true;
+        c.plunge_len = 0;
+        if (dir < 0)
+            c.col_hi[sz(br)] = std::min(c.col_hi[sz(br)], floor_v);
+        else
+            c.col_lo[sz(br)] = std::max(c.col_lo[sz(br)], ceil_v);
+        return c;
+    };
+    out.children.push_back(make_child(-1));
+    out.children.push_back(make_child(+1));
+    return out;
+}
+
 }  // namespace
 
 core::RawResult solve_milp(const model::LpProblem& problem,
                            const BabOptions& opts,
                            BabDiagnostics& diag) {
     const auto t0 = Clock::now();
+    std::optional<core::RouteSpan> root_span;
+    root_span.emplace(1, "bab", "root", "root", "",
+                      core::RouteLedgerBucket::Search);
     diag = BabDiagnostics{};
     diag.policy_used = opts.policy;
+
+    const int para_threads = resolve_para_bab_threads(
+        opts.para_bab, milp_policy_is_latest(opts.policy));
+    diag.para_bab.threads_used = para_threads;
+    const int para_quota = std::max(
+        1, opts.para_bab.nodes_per_worker_per_phase > 0
+               ? opts.para_bab.nodes_per_worker_per_phase
+               : 1);
+
+    BabOptions cut_cfg = opts;
+    if (cut_cfg.auto_cuts && milp_policy_is_latest(cut_cfg.policy))
+        apply_auto_cuts_policy(cut_cfg);
 
     TreeCutOptions tree_cut_opts = opts.tree_cut;
     apply_policy_tree_cuts(opts.policy, tree_cut_opts);
@@ -3003,30 +3292,35 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     apply_conflict_cut_policy(opts.policy, conflict_cut_opts);
     // Dense pure-binary (enigma-class): Mexi trail+analysis stalls node LPs
     // (Interrupted / unproved) even in SafeLimited. Keep default-on for mixed
-    // MIPs; auto-disable here unless --conflict-cut-paper / force_paper.
+    // MIPs (any continuous column); auto-disable only when every column is a
+    // 0/1 integer unless --conflict-cut-paper / force_paper.
+    // misc03 (159 binaries + 1 continuous) stays on; support+prop Verified
+    // accepts small-support FUIP cuts. enigma (100 pure binary) stays off.
     if (conflict_cut_opts.enabled && !conflict_cut_opts.force_paper) {
-        Index n_bin = 0, n_int = 0;
+        Index n_bin = 0, n_int = 0, n_cont = 0;
         for (Index j = 0; j < problem.n_cols(); ++j) {
-            if (problem.is_integer.empty() || !problem.is_integer[sz(j)])
+            if (problem.is_integer.empty() || !problem.is_integer[sz(j)]) {
+                ++n_cont;
                 continue;
+            }
             ++n_int;
             if (problem.col_lo[sz(j)] >= -1e-9 &&
                 problem.col_hi[sz(j)] <= 1.0 + 1e-9)
                 ++n_bin;
         }
-        if (n_bin >= 80 && n_bin == n_int)
+        if (n_cont == 0 && n_bin >= 80 && n_bin == n_int)
             conflict_cut_opts.enabled = false;
     }
     int conflict_cut_cap = conflict_cut_opts.max_learned_cuts;
     DynSepOptions dynsep_opts = opts.dynsep;
     // Sync nested separator option structs / force-allow from BabOptions.
-    dynsep_opts.zerohalf = opts.zerohalf;
-    dynsep_opts.flowcover = opts.flowcover;
-    if (opts.mir_cuts) dynsep_opts.allow_mir = true;
-    if (opts.lifted_cover_cuts) dynsep_opts.allow_cover = true;
-    if (opts.clique_cuts) dynsep_opts.allow_clique = true;
-    if (opts.zerohalf_cuts) dynsep_opts.allow_zerohalf = true;
-    if (opts.flow_cover_cuts) dynsep_opts.allow_flowcover = true;
+    dynsep_opts.zerohalf = cut_cfg.zerohalf;
+    dynsep_opts.flowcover = cut_cfg.flowcover;
+    if (cut_cfg.mir_cuts) dynsep_opts.allow_mir = true;
+    if (cut_cfg.lifted_cover_cuts) dynsep_opts.allow_cover = true;
+    if (cut_cfg.clique_cuts) dynsep_opts.allow_clique = true;
+    if (cut_cfg.zerohalf_cuts) dynsep_opts.allow_zerohalf = true;
+    if (cut_cfg.flow_cover_cuts) dynsep_opts.allow_flowcover = true;
     apply_dynsep_policy(opts.policy, dynsep_opts);
     // The small short-budget light-arm clamp lives AFTER the L2Sep block
     // below (it must override the prior's optional-arm enables).
@@ -3064,24 +3358,25 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                                     nullptr, dynsep_opts, l2sep_diag,
                                     /*mid_tree=*/false);
         // Force-on user flags still win after L2Sep.
-        if (opts.mir_cuts) dynsep_opts.allow_mir = true;
-        if (opts.lifted_cover_cuts) dynsep_opts.allow_cover = true;
-        if (opts.clique_cuts) dynsep_opts.allow_clique = true;
-        if (opts.zerohalf_cuts) dynsep_opts.allow_zerohalf = true;
-        if (opts.flow_cover_cuts) dynsep_opts.allow_flowcover = true;
+        if (cut_cfg.mir_cuts) dynsep_opts.allow_mir = true;
+        if (cut_cfg.lifted_cover_cuts) dynsep_opts.allow_cover = true;
+        if (cut_cfg.clique_cuts) dynsep_opts.allow_clique = true;
+        if (cut_cfg.zerohalf_cuts) dynsep_opts.allow_zerohalf = true;
+        if (cut_cfg.flow_cover_cuts) dynsep_opts.allow_flowcover = true;
     }
     // Small short-budget instances keep DynSep ON but under a structural
     // light-arm clamp (measured 2026-09-14, gt2/lseu: MIR/cover arms stalled
     // dual proofs). L2Sep still runs first and sets its own allow/budget
     // priors; this clamp then OVERRIDES the optional arms - it is a
     // structural rule keyed on (n_cols, time limit), not an L2Sep decision.
+    // auto_cuts opts in explicitly and bypasses this clamp for MIR/cover.
     if (milp_policy_is_latest(opts.policy) && dynsep_opts.enabled &&
-        problem.n_cols() <= 400 && opts.time_limit_s > 0.0 &&
+        !cut_cfg.auto_cuts && problem.n_cols() <= 400 && opts.time_limit_s > 0.0 &&
         opts.time_limit_s <= 60.0) {
         dynsep_opts.max_depth_optional = 0;
         dynsep_opts.max_optional_arms = 1;
-        if (!opts.mir_cuts) dynsep_opts.allow_mir = false;
-        if (!opts.lifted_cover_cuts) dynsep_opts.allow_cover = false;
+        if (!cut_cfg.mir_cuts) dynsep_opts.allow_mir = false;
+        if (!cut_cfg.lifted_cover_cuts) dynsep_opts.allow_cover = false;
     }
 
     DynSepController dynsep(dynsep_opts);
@@ -3097,9 +3392,72 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     raw.proposed_status = core::Status::NoSolutionFound;
     raw.proposed_level = core::ProofLevel::None;
 
+    // Root allowance shared by every setup phase, so they cannot collectively
+    // starve the search. Returns seconds remaining of the root budget.
+    const auto root_budget_left = [&]() -> f64 {
+        if (opts.time_limit_s <= 0.0) return 0.0;
+        return std::max(0.0, kRootBudgetShare * opts.time_limit_s -
+                                 ms_since(t0) / 1000.0);
+    };
+
     model::LpProblem mip = problem;
-    // Equality ±1 + TU/network/C1 implied integrality (WP-F). Safe marks only.
-    (void)infer_implied_integers(mip);
+
+    // A model the caller supplied with NO integer columns is an LP, and must
+    // be solved and answered as one. Implied integrality is a MIP presolve
+    // technique -- its value is telling branch-and-bound that some continuous
+    // variable will land integral anyway, so there is nothing to branch on.
+    // On a pure LP it has zero upside and a catastrophic downside: every mark
+    // it makes RESTRICTS the feasible set, and snap_integer_bounds() then
+    // rounds the marked column's bounds.
+    //
+    // Measured 2026-09-19 on two integer-free Netlib LPs:
+    //   80bau3b  -> false Infeasible   (simplex proves Optimal 9.8722419241e+05)
+    //   d2q06c   -> objective 1.2278462651e+05 against a true LP optimum of
+    //               1.2278421081e+05 -- a silently WORSE answer to a different
+    //               problem than the one the user handed us.
+    // Three separate rules were implicated (tu_network_block, dual_rational,
+    // network), so this is a class of defect rather than one bad rule.
+    if (problem.n_integer() == 0) {
+        engines::SimplexDiagnostics sd;
+        raw = engines::solve_simplex(problem, opts.lp, sd, nullptr);
+        diag.lp_solves = 1;
+        diag.nodes = 1;
+        if (relaxation_proved(raw, sd, opts.lp)) {
+            diag.globally_proved = true;
+            diag.incumbent = raw.objective;
+            diag.dual_bound = raw.objective;
+            diag.gap_rel = 0.0;
+        }
+        diag.total_ms = ms_since(t0);
+        diag.termination_reason = "no integer columns; LP solve";
+        SOR_ROUTE(1, "bab", "lp_only_exit",
+                  diag.globally_proved ? "\"proved\":true" : "\"proved\":false");
+        return raw;
+    }
+
+    // Equality +-1 + TU/network/C1 implied integrality (WP-F).
+    //
+    // GATED, and the gate matters: this call used to be unconditional, so
+    // --no-implied-int (which only reaches mip_pre.implied_integers inside
+    // run_mip_presolve) could not switch it off. It also runs BEFORE the
+    // `mip.n_integer() == 0` pure-LP fast path below, so marking even one
+    // continuous column integer diverts a pure LP into the full MILP
+    // machinery. On netlib 80bau3b and d2q06c -- both integer-free and both
+    // Optimal under --engine simplex -- that produced a false Infeasible.
+    ImpliedIntOptions implied_opts;
+    implied_opts.enabled = opts.mip_pre.implied_integers;
+    // Bounded like every other root phase: it runs BEFORE anything that checks
+    // the clock, so unbudgeted it can consume the whole solver limit on a
+    // large model (4586 ms on atlanta-ip, finding nothing).
+    if (opts.time_limit_s > 0.0) {
+        const f64 share = kRootSetupShare * root_budget_left();
+        implied_opts.enabled = implied_opts.enabled && share > kMinPhaseBudget;
+        implied_opts.time_limit_s = std::max(kMinPhaseBudget, share);
+    }
+    ImpliedIntDiagnostics implied_diag;
+    if (implied_opts.enabled)
+        implied_diag = infer_implied_integers_ex(mip, implied_opts);
+    diag.root_implied_int_marked = implied_diag.total;
 
     // Latest branching learners (WP-H). Classical ignores them entirely.
     // Heuristic variable choice only - never writes dual bounds.
@@ -3220,6 +3578,8 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         }
         diag.total_ms = ms_since(t0);
         diag.termination_reason = "no integer columns; LP solve";
+        SOR_ROUTE(1, "bab", "lp_only_exit",
+                  diag.globally_proved ? "\"proved\":true" : "\"proved\":false");
         return raw;
     }
 
@@ -3231,9 +3591,20 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     const bool use_reliability = opts.reliability_branching &&
         n <= 2000 && mip.nnz() <= 10000;
     // Latest + small models: plunge toward integer for faster proofs (enigma).
-    const bool hybrid_nodes =
+    //
+    // Plunging and Para-B&B phases compete for the frontier and cannot both be
+    // on. This used to be settled statically by `para_threads <= 1`, which cost
+    // enigma 4.75s -> 34.64s because enigma is incumbent-bound and finishes
+    // before parallelism can amortise. The cost model (para_bab.hpp) now defers
+    // that call to the live search, so plunging starts ON regardless of thread
+    // count and is switched off only at the moment phases actually activate.
+
+    const bool hybrid_nodes_initial =
         opts.hybrid_node_selection ||
         (milp_policy_is_latest(opts.policy) && n <= 500);
+    bool hybrid_nodes = hybrid_nodes_initial;
+    bool para_active = para_threads > 1 && !opts.para_bab_cost.adaptive;
+    diag.para_bab.activated = para_active;
     std::uint64_t strong_branch_budget = use_reliability
         ? opts.strong_branch_nodes : 0;
     std::vector<Index> col_degree(sz(n), 0);
@@ -3293,7 +3664,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     std::vector<f64> root_lo = search_problem.col_lo,
                      root_hi = search_problem.col_hi;
     const bool want_conflict_graph =
-        opts.probing || opts.clique_cuts || opts.conflict_propagation ||
+        opts.probing || cut_cfg.clique_cuts || opts.conflict_propagation ||
         (opts.mip_presolve && opts.mip_pre.clique_probing);
 
     auto mark_root_infeasible = [&](const char* reason) {
@@ -3303,8 +3674,12 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         diag.globally_proved = true;
         diag.total_ms = ms_since(t0);
         diag.termination_reason = raw.termination_reason;
+        char rbuf[192];
+        std::snprintf(rbuf, sizeof rbuf, "\"reason\":\"%s\"", reason);
+        SOR_ROUTE(1, "bab", "root_infeasible", rbuf);
     };
 
+    diag.ms_root_setup = ms_since(t0);
     if (opts.mip_presolve) {
         ProbingOptions probe_opts = opts.probe;
         probe_opts.enabled = opts.probing;
@@ -3315,6 +3690,19 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                          0.1 * opts.time_limit_s);
         MipPresolveOptions mpo = opts.mip_pre;
         mpo.enabled = true;
+        // Root setup gets a BOUNDED share of the budget. Presolve and symmetry
+        // are worth real time on a big model, but they are worth nothing at
+        // all if they consume the whole budget and the search never runs --
+        // which is exactly what happened: on atlanta-ip with a 1 s limit they
+        // took 15.2 s and 25.3 s respectively, and the solve did 0 nodes.
+        // Across a 20-instance MIPLIB2017 sample, HALF never searched a node.
+        if (opts.time_limit_s > 0.0) {
+            // Presolve is the most valuable root phase, so it may take the
+            // whole remaining root allowance rather than a share of it.
+            const f64 share = root_budget_left();
+            mpo.enabled = mpo.enabled && share > kMinPhaseBudget;
+            mpo.time_limit_s = std::max(kMinPhaseBudget, share);
+        }
         diag.mip_presolve_diag = run_mip_presolve(
             search_problem, root_lo, root_hi, conflict_graph, mpo,
             /*run_probing=*/want_conflict_graph, probe_opts, &opts.lp);
@@ -3348,8 +3736,30 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     if (opts.symmetry) {
         const ConflictGraph* cg_ptr =
             conflict_graph.empty() ? nullptr : &conflict_graph;
+        SymmetryOptions sym = opts.sym;
+        // Bounded share of what is LEFT, not of the original budget: presolve
+        // has already run, so charging symmetry a share of the total would let
+        // the two together overrun.
+        //
+        // NOTE the 0-means-unlimited convention: clamping a negative remainder
+        // to 0 does NOT disable the phase, it UNCAPS it. That bug made this
+        // whole fix a no-op on exactly the models it was written for, because
+        // an overrunning presolve leaves a negative remainder. When nothing is
+        // left, skip symmetry outright.
+        bool run_symmetry = true;
+        if (opts.time_limit_s > 0.0) {
+            const f64 share = root_budget_left();
+            if (share <= kMinPhaseBudget) {
+                run_symmetry = false;
+            } else {
+                sym.time_limit_s = share;
+            }
+        }
+        if (!run_symmetry) {
+            diag.symmetry_diag.aborted_on_time = 1;
+        } else
         diag.symmetry_diag = apply_symmetry(search_problem, cg_ptr, root_lo,
-                                            root_hi, opts.sym);
+                                            root_hi, sym);
         search_problem.col_lo = root_lo;
         search_problem.col_hi = root_hi;
     }
@@ -3485,6 +3895,62 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         return true;
     };
 
+    // Fix-Propagate-Repair (Salvagnin, MPC 2024; sor/search/fixprop.hpp).
+    // Constructive and LP-free, so it is a genuine complement to Feasibility
+    // Jump rather than another variant of it: FJ walks COMPLETE assignments
+    // and stalls a few violated rows short (measured: fhnw-binpack4-4 reaches
+    // exactly 1 violated row and never closes it, at any budget), while this
+    // extends a PARTIAL assignment that propagation keeps provably extensible.
+    auto try_fixprop = [&](const std::vector<f64>* reference,
+                           double budget) -> bool {
+        if (!opts.fixprop || budget <= 0.01) return false;
+        if (heuristics_over_budget(budget * 1000.0)) return false;
+        FixPropOptions fpo;
+        fpo.time_limit_s = budget;
+        fpo.feas_tol = opts.primal_feas_tol;
+        fpo.seed = 20260920u + diag.fixprop_attempts * 7919u;
+        std::vector<f64> xf;
+        FixPropDiagnostics fd;
+        ++diag.fixprop_attempts;
+        const bool ok =
+            fix_and_propagate(mip, root_lo, root_hi, reference, fpo, xf, fd);
+        diag.fixprop_dives += fd.dives;
+        diag.fixprop_fixings += fd.fixings;
+        diag.fixprop_conflicts += fd.conflicts;
+        diag.fixprop_backtracks += fd.backtracks;
+        diag.fixprop_bottom_lps += fd.bottom_lps;
+        diag.fixprop_best_depth_pct =
+            std::max(diag.fixprop_best_depth_pct, fd.best_depth_pct);
+        diag.fixprop_ms += fd.ms;
+        if (!ok) return false;
+        // fix_and_propagate already validated against `mip`; `problem` is the
+        // caller's space, which is what an incumbent must satisfy.
+        if (problem.max_row_violation(xf) > opts.primal_feas_tol ||
+            problem.max_bound_violation(xf) > opts.primal_feas_tol)
+            return false;
+        const f64 fobj = mip.objective(xf);
+        if (!std::isfinite(fobj)) return false;
+        if (have_incumbent && !(mip.maximize ? fobj > best_incumbent
+                                             : fobj < best_incumbent))
+            return false;
+        have_incumbent = true;
+        best_incumbent = fobj;
+        best_x = std::move(xf);
+        ++diag.fixprop_hits;
+        ++diag.heuristic_hits;
+        {
+            f64 dual_min = last_dual_bound;
+            if (!open.empty() && std::isfinite(open.top().bound))
+                dual_min = open.top().bound;
+            refresh_live_gap(dual_min);
+        }
+        if (opts.verbose)
+            std::printf("  [milp] fixprop incumbent %.10e at node %llu\n",
+                        best_incumbent,
+                        static_cast<unsigned long long>(diag.nodes));
+        return true;
+    };
+
     // Solves one LNS sub-problem: a restriction of this MILP (a tightened box,
     // possibly plus a local-branching distance row or a proximity cutoff row).
     // Every such sub-problem admits only points that are feasible for `mip`, so
@@ -3498,6 +3964,19 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         if (budget <= 0.05) return false;
         BabOptions so = opts;
         so.sub_mip_depth = opts.sub_mip_depth + 1;
+        // The child solves a DIFFERENT, restricted problem -- its variable
+        // space is not the caller's. It must never touch the portfolio pool:
+        // a point that is feasible for the sub-MIP is validated against the
+        // sub-MIP, so publishing it hands the parent a point that is not even
+        // feasible for the real model. Measured on blend2: the portfolio
+        // reported Optimal -33.0 against a true optimum of 7.598985, and it
+        // survived BOTH the publish-side and consume-side validators because
+        // both were checking against the sub-problem, not the original.
+        //
+        // Cancellation is dropped too: a child is a bounded heuristic, and a
+        // rival arm winning the outer race must not abort it mid-repair.
+        so.pool = nullptr;
+        so.cancel = nullptr;
         so.time_limit_s = budget;
         so.max_nodes = node_budget;
         so.verbose = false;
@@ -3613,6 +4092,18 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         try_feasjump(nullptr, budget, core::kPosInf);
     }
 
+    // Same LP-free slot, before the root relaxation. No reference point exists
+    // yet, which is deliberate: the rules that need one are late in the
+    // portfolio and fall back to first-fail when it is absent.
+    if (opts.fixprop && !have_incumbent) {
+        double fp_budget = opts.fixprop_time_s;
+        if (opts.time_limit_s > 0.0)
+            fp_budget = std::min({fp_budget,
+                                  opts.fixprop_root_frac * opts.time_limit_s,
+                                  std::max(0.0, seconds_left())});
+        try_fixprop(nullptr, fp_budget);
+    }
+
     // Branch-and-Cut: a root-node cutting loop (Achterberg thesis 2007
     // Ch.3-4; Gomory Mixed-Integer separator, Ch.8.2-8.3 -- see
     // sor/search/cuts.hpp). Repeatedly solve the LP, separate cuts from the
@@ -3638,12 +4129,14 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     gcs_pool.prefer_heuristic =
         gcs_pool.prefer_heuristic || tree_cut_opts.gcs_prefer_heuristic;
 
+    bool root_lp_outcome_logged = false;
     if (opts.cuts_enabled) {
         const auto t_cutloop = Clock::now();
         CutDiagnostics cut_diag;
-        CutPool cut_pool(opts.cut);
+        CutPool cut_pool(cut_cfg.cut);
         cut_pool.set_scoring_context(search_problem);
         f64 prev_bound = core::kNaN;
+        int stalled_rounds = 0;
         // Warm continuation across cut rounds: cuts only ADD ROWS, so the
         // previous round's basis extends naturally (each new row's logical
         // basic in that row) and the dual re-optimizes from it in a handful
@@ -3652,8 +4145,17 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         // are near-free. A failed warm solve falls back to the cold path.
         engines::SimplexBasis& prior_basis = cut_loop_basis;
         bool& have_prior = have_cut_loop_basis;
-        for (int round = 0; round < opts.cut.max_rounds; ++round) {
+        const auto cut_loop_t0 = Clock::now();
+        for (int round = 0; round < cut_cfg.cut.max_rounds; ++round) {
             if (timed_out()) break;
+            if (opts.time_limit_s > 0.0 &&
+                (std::chrono::duration<double>(Clock::now() - cut_loop_t0)
+                         .count() > kRootCutShare * opts.time_limit_s ||
+                 std::chrono::duration<double>(Clock::now() - t0).count() >
+                     kRootTotalShare * opts.time_limit_s)) {
+                ++diag.cut_loop_time_capped;
+                break;
+            }
             engines::SimplexOptions cut_lp_opts = opts.lp;
             // separate_gomory_mi() reconstructs the basis matrix from the
             // ORIGINAL row/col bounds and reads AtLower/AtUpper against
@@ -3665,9 +4167,28 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             // space.
             cut_lp_opts.presolve = false;
             if (opts.time_limit_s > 0.0) {
-                const double left = opts.time_limit_s -
+                // Bound by the CUT loop's own allowance, not by the global
+                // limit. Giving each round the whole remaining solve time is
+                // why the round-boundary cap never fired: on atlanta-ip one
+                // round's LP re-solve costs ~10 s, so two rounds consumed
+                // 21.4 s of a 30 s budget without ever crossing the boundary
+                // check, and the search branched zero nodes.
+                const double global_left = opts.time_limit_s -
                     std::chrono::duration<double>(Clock::now() - t0).count();
-                if (left <= 0.02) break;
+                const double cut_left = kRootCutShare * opts.time_limit_s -
+                    std::chrono::duration<double>(Clock::now() - cut_loop_t0)
+                        .count();
+                // ...and by what the whole pre-search phase has left, so the
+                // setup phases' spending actually subtracts from the cut
+                // loop's allowance instead of sitting beside it.
+                const double root_left = kRootTotalShare * opts.time_limit_s -
+                    std::chrono::duration<double>(Clock::now() - t0).count();
+                const double left =
+                    std::min(global_left, std::min(cut_left, root_left));
+                if (left <= 0.02) {
+                    if (cut_left <= 0.02) ++diag.cut_loop_time_capped;
+                    break;
+                }
                 cut_lp_opts.time_limit_s = left;
             }
             engines::SimplexDiagnostics cut_sd;
@@ -3721,12 +4242,27 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                     break;
                 }
             }
-            if (integer_ok) break;
+            if (integer_ok) {
+                char rbuf[96];
+                std::snprintf(rbuf, sizeof rbuf, "\"obj\":%.10g,\"integer\":true",
+                              cut_lp_raw.objective);
+                SOR_ROUTE(1, "bab", "root_lp_outcome", rbuf);
+                root_lp_outcome_logged = true;
+                break;
+            }
 
             if (round > 0 && std::isfinite(prev_bound)) {
                 const f64 gain = std::fabs(cut_lp_raw.objective - prev_bound);
                 const f64 scale = 1.0 + std::fabs(prev_bound);
-                if (gain / scale < opts.cut.min_progress_rel) break;
+                if (gain / scale < cut_cfg.cut.min_progress_rel) {
+                    // Tolerate a run of stalled rounds before giving up: a
+                    // round that gains little often exposes structure the next
+                    // one exploits. See CutOptions::min_progress_patience.
+                    if (++stalled_rounds >= cut_cfg.cut.min_progress_patience)
+                        break;
+                } else {
+                    stalled_rounds = 0;
+                }
             }
             prev_bound = cut_lp_raw.objective;
 
@@ -3738,12 +4274,12 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             dsin.depth = 0;
             dsin.at_root = true;
             dsin.last_bound_gain_rel = dynsep_last_gain;
-            dsin.force_mir = opts.mir_cuts;
-            dsin.force_cover = opts.lifted_cover_cuts;
-            dsin.force_clique = opts.clique_cuts;
+            dsin.force_mir = cut_cfg.mir_cuts;
+            dsin.force_cover = cut_cfg.lifted_cover_cuts;
+            dsin.force_clique = cut_cfg.clique_cuts;
             dsin.force_ib = opts.implied_bound_cuts;
-            dsin.force_zerohalf = opts.zerohalf_cuts;
-            dsin.force_flowcover = opts.flow_cover_cuts;
+            dsin.force_zerohalf = cut_cfg.zerohalf_cuts;
+            dsin.force_flowcover = cut_cfg.flow_cover_cuts;
             dsin.have_conflict_graph = !conflict_graph.empty();
             dsin.have_basis = !cut_basis.basic.empty();
             dsin.gap_rel = diag.gap_rel;
@@ -3773,7 +4309,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
 
             std::vector<CutRow> candidates;
             if (dsd.run_gmi) {
-                CutOptions gmi_opts = opts.cut;
+                CutOptions gmi_opts = cut_cfg.cut;
                 gmi_opts.max_cuts_per_round = dsd.budget_gmi;
                 candidates = separate_gomory_mi(
                     search_problem, cut_lp_raw.x, cut_basis, gmi_opts, cut_diag);
@@ -3795,7 +4331,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                                   std::make_move_iterator(clique.end()));
             }
             if (dsd.run_cover) {
-                CoverOptions cov_opts = opts.cover;
+                CoverOptions cov_opts = cut_cfg.cover;
                 cov_opts.max_cuts = dsd.budget_cover;
                 // DynSep cover arm: enable PC sequence-independent lifting
                 // under Latest (Prasad / arXiv:2401.13773).
@@ -3810,7 +4346,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                                   std::make_move_iterator(cov.end()));
             }
             if (dsd.run_mir) {
-                MirOptions mir_opts = opts.mir;
+                MirOptions mir_opts = cut_cfg.mir;
                 mir_opts.max_cuts = dsd.budget_mir;
                 auto mc = separate_mir(search_problem, cut_lp_raw.x, root_lo,
                                        root_hi, mir_opts, diag.mir);
@@ -3840,7 +4376,25 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                                   std::make_move_iterator(zh.begin()),
                                   std::make_move_iterator(zh.end()));
             }
-            if (dsd.run_flowcover) {
+            // FLOW COVER IS GATED OFF BY DEFAULT: it generates INVALID cuts.
+            //
+            // Verified 2026-09-19 with --verify-cuts against blend2's true
+            // optimum (7.5989850). Five FC_ cuts excluded the optimum, e.g.
+            //   FC_0  activity 12040  not in [-inf, 312]
+            // -- a factor of 38, so this is a derivation error, not numerical
+            // noise. The effect is a FALSE Optimal (blend2 reported 16.554765).
+            //
+            // Two things made it hard to see. DynSep chooses separators on a
+            // time budget, so FC cuts appeared even when the run asked only for
+            // --clique-cuts --cover-cuts, and the wrong answer depended on the
+            // TIME LIMIT (60s correct, 90s wrong). And each family is sound on
+            // its own, so the fault only showed once a second family made
+            // DynSep reach for flow cover -- 9 of 10 separator PAIRS produced a
+            // false Optimal while every family alone was correct.
+            //
+            // Requires an explicit opt-in now. Fix flowcover.cpp, then re-check
+            // with --verify-cuts before restoring the DynSep path.
+            if (dsd.run_flowcover && opts.flow_cover_cuts) {
                 FlowCoverOptions fc_opts = dynsep_opts.flowcover;
                 fc_opts.max_cuts = dsd.budget_flowcover;
                 auto fc = separate_flow_covers(search_problem, cut_lp_raw.x,
@@ -3850,6 +4404,11 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                 candidates.insert(candidates.end(),
                                   std::make_move_iterator(fc.begin()),
                                   std::make_move_iterator(fc.end()));
+            }
+            if (cut_cfg.auto_cuts && milp_policy_is_latest(cut_cfg.policy)) {
+                candidates = filter_cut_candidates_for_round(
+                    std::move(candidates), search_problem, cut_lp_raw.x,
+                    cut_cfg.cut);
             }
             cut_pool.add(candidates, cut_diag);
             if (hgtsm_opts.enabled) {
@@ -3965,7 +4524,28 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                     }
                 }
             }
-            search_problem = apply_cuts(search_problem, cuts, opts.cut);
+            // Cut-validity diagnostic: name any cut that excludes the
+            // reference point. Runs before the cuts enter the model, so the
+            // report is about the cut as generated.
+            if (opts.cut_reference_point != nullptr) {
+                for (const auto& c : cuts) {
+                    if (!cut_admits_point(c.cols, c.vals, c.row_lo, c.row_hi,
+                                          *opts.cut_reference_point,
+                                          opts.primal_feas_tol)) {
+                        f64 act = 0.0;
+                        for (std::size_t k = 0; k < c.cols.size(); ++k)
+                            act += c.vals[k] *
+                                   (*opts.cut_reference_point)[sz(c.cols[k])];
+                        std::fprintf(stderr,
+                            "INVALID CUT  %-18s activity %.9g not in [%.9g, %.9g]"
+                            "  (nnz %zu)\n",
+                            c.name.c_str(), act, c.row_lo, c.row_hi,
+                            c.cols.size());
+                        ++diag.invalid_cuts_detected;
+                    }
+                }
+            }
+            search_problem = apply_cuts(search_problem, cuts, cut_cfg.cut);
             // The pool merges and filters both families, so attribute the
             // selected batch by the name the separator stamped on each row
             // rather than by proportion -- integer-dividing a candidate ratio
@@ -4039,6 +4619,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             dynsep_last_gain = mean_eff;
             ++diag.cut_rounds;
         }
+        diag.cut_rounds_ms = ms_since(cut_loop_t0);
         if (opts.verbose) {
             // Exact-duplicate row detection over the cut-augmented model.
             // Duplicated rows are linearly dependent, which is a direct way to
@@ -4077,6 +4658,14 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         diag.dynsep = dynsep.diagnostics();
         diag.l2sep = l2sep_diag;
         diag.hgtsm = hgtsm_diag;
+        if (!root_lp_outcome_logged &&
+            std::isfinite(diag.root_bound_after_cuts)) {
+            char rbuf[96];
+            std::snprintf(rbuf, sizeof rbuf, "\"obj\":%.10g,\"integer\":false",
+                          diag.root_bound_after_cuts);
+            SOR_ROUTE(1, "bab", "root_lp_outcome", rbuf);
+            root_lp_outcome_logged = true;
+        }
     }
 
     {
@@ -4160,13 +4749,17 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         //                from_branch_trail refuses trails that are not
         //                fully binary-representable, so the excluded set is
         //                exactly the node's box.
+        const auto t_vb = Clock::now();
         const CutValidity vb = conflict_cut_check_binary(
             global_lp, learned, conflict_cut_opts.tol);
+        diag.ms_check_binary += ms_since(t_vb);
+        const auto t_vg = Clock::now();
         const CutValidity vg =
             (vb == CutValidity::Refuted)
                 ? CutValidity::Refuted
                 : conflict_cut_check_general(global_lp, learned,
                                              conflict_cut_opts.tol);
+        diag.ms_check_general += ms_since(t_vg);
         if (vb == CutValidity::Refuted || vg == CutValidity::Refuted) {
             if (!as_nogood) ++diag.conflict_cut_diag.aborted;
             return false;
@@ -4176,10 +4769,17 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             ++diag.conflict_cut_diag.aborted;
             return false;
         }
-        global_lp = apply_cuts(global_lp, {learned}, opts.cut);
+        // In-place append (or bound tighten): O(row nnz + shape index), not a
+        // full global_lp rebuild. The rebuild path was 156-285 ms per nogood on
+        // misc03 and 41-55% of that model's wall.
+        const auto t_apply = Clock::now();
+        apply_cuts_inplace(global_lp, {learned}, cut_cfg.cut);
+        const double apply_ms = ms_since(t_apply);
         if (as_nogood) {
+            diag.nogood_apply_ms += apply_ms;
             ++diag.nogood_cuts_global;
         } else {
+            diag.conflict_analysis_ms += apply_ms;
             ++diag.conflict_cuts_global;
             refresh_conflict_cap();
         }
@@ -4194,10 +4794,14 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         if (diag.nogood_cuts_global >=
             static_cast<std::uint64_t>(conflict_cut_opts.max_nogood_cuts))
             return;
+        const auto t_build = Clock::now();
         auto ng = build_nogood_from_branch_trail(trail, global_lp,
                                                  conflict_cut_opts.tol);
+        diag.ms_nogood_build += ms_since(t_build);
         if (!ng) return;
+        const auto t_val = Clock::now();
         (void)try_apply_validated_global_cut(*ng, /*as_nogood=*/true);
+        diag.ms_nogood_validate += ms_since(t_val);
     };
 
     // Tree-restart bookkeeping (Latest).
@@ -4215,15 +4819,253 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     // this is what has to be folded in to keep it one. It stays at +inf while
     // no node has been abandoned, which makes the std::min below a no-op.
     f64 abandoned_bound = std::numeric_limits<f64>::infinity();
+    // After a Para-B&B phase that could not prove some LPs, force one serial
+    // pass so those nodes are not permanently lost to abandoned_bound.
+    diag.ms_before_search = ms_since(t0);
+    root_span.reset();
+    bool para_force_serial = false;
+    // --- cost-model signals (para_bab.hpp) --------------------------------
+    // Tracked by comparison rather than by stamping every incumbent write:
+    // best_incumbent is assigned from many places in this function, and one
+    // comparison per node is cheaper and far harder to get wrong than hooking
+    // all of them.
+    // Pruning bound contributed by ANOTHER portfolio arm. Never this arm's
+    // answer -- only a licence to stop looking below it.
+    // Objective granularity, computed once. `mip` is in the ORIGINAL objective
+    // sense; the search works on sense*objective, and a positive scaling does
+    // not change the step size, so the same g applies to the working bound.
+    // From `problem`, NOT `mip`. mip carries implied-integrality marks, and
+    // those assert only that a column is integral at SOME optimum -- not at
+    // every feasible point, which is what granularity requires. Using them
+    // here would be unsound, and implied integrality has already produced one
+    // false Infeasible in this tree.
+    const f64 obj_granularity = objective_granularity(problem, opts.int_tol);
+    diag.objective_granularity = obj_granularity;
+
+    f64 external_cutoff = std::numeric_limits<f64>::quiet_NaN();
+    f64 cm_seen_incumbent = std::numeric_limits<f64>::quiet_NaN();
+    std::uint64_t cm_last_improve_node = 0;
     while (!open.empty() || !plunge_stack.empty()) {
+        // Whole-node-loop timer. The MILP timing block reported only "node LP"
+        // and a grand total, so everything else the loop does was invisible --
+        // on app1-1 that hid 27 s of a 40 s run.
+        const auto t_loop_iter = Clock::now();
+        struct LoopTick {
+            double& sink;
+            Clock::time_point t;
+            ~LoopTick() { sink += ms_since(t); }
+        } loop_tick{diag.ms_node_loop, t_loop_iter};
+        ++diag.loop_iters_started;
+        // --- portfolio: cancellation ------------------------------------
+        // Polled per node, not per LP: a node is milliseconds, so this is
+        // free, and a losing arm leaves within one node of a rival winning.
+        if (core::cancel_requested(opts.cancel)) {
+            reason = "cancelled (portfolio race lost)";
+            stopped_early = true;
+            SOR_ROUTE(1, "bab", "stop", "\"reason\":\"cancelled\"");
+            break;
+        }
+        // --- portfolio: adopt a better incumbent from another arm ---------
+        // Read as a CUTOFF only. Adopting another arm's objective prunes this
+        // arm's tree without importing its solution vector: the portfolio
+        // driver reports the pool's best point, so this worker never has to
+        // claim a solution it did not construct.
+        if (opts.pool != nullptr) {
+            const f64 shared = opts.pool->best_objective();
+            if (std::isfinite(shared) &&
+                (!std::isfinite(external_cutoff) ||
+                 (mip.maximize ? shared > external_cutoff
+                               : shared < external_cutoff))) {
+                // Kept STRICTLY separate from best_incumbent/best_x. Folding a
+                // foreign objective into this arm's own incumbent made the arm
+                // report an objective it had no point for -- measured on
+                // blend2 as 8.1039 against a true optimum of 7.5990.
+                external_cutoff = shared;
+                diag.used_foreign_cutoff = true;
+                ++diag.incumbents_adopted;
+            }
+        }
+        if (have_incumbent && !(best_incumbent == cm_seen_incumbent)) {
+            cm_seen_incumbent = best_incumbent;
+            cm_last_improve_node = diag.nodes;
+            {
+                char ibuf[128];
+                std::snprintf(ibuf, sizeof ibuf, "\"obj\":%.10g,\"node\":%llu",
+                              best_incumbent,
+                              static_cast<unsigned long long>(diag.nodes));
+                SOR_ROUTE(1, "bab", "incumbent", ibuf);
+            }
+            // --- portfolio: publish, but only a pair we can VERIFY ---------
+            // Five sites in this function assign best_incumbent/best_x, and
+            // one of them (the foreign-cutoff adoption above) deliberately
+            // does NOT update best_x. Hooking all five would eventually miss
+            // one and publish an objective with somebody else's point, so
+            // instead the pair is checked against the model before it is
+            // shared. The recompute is O(nnz) but runs only on an improvement.
+            // Validate in the CALLER'S space (`problem`), never this arm's
+            // transformed `mip` -- see point_is_feasible_for().
+            if (opts.pool != nullptr && !best_x.empty() &&
+                portfolio_point_is_feasible(problem, best_x, opts.primal_feas_tol,
+                                            opts.int_tol)) {
+                const f64 verified = problem.objective(best_x);
+                if (std::isfinite(verified) &&
+                    opts.pool->publish_incumbent(verified, best_x))
+                    ++diag.incumbents_published;
+            }
+        }
+        // Latch the parallel switch once the search has shown it is tree-bound
+        // rather than incumbent-bound. Never switches back: a frontier that
+        // earned the workers does not stop deserving them, and flapping would
+        // thrash the plunge stack.
+        if (para_threads > 1 && !para_active) {
+            ParaBabSearchState cm_state;
+            cm_state.elapsed_s =
+                std::chrono::duration<double>(Clock::now() - t0).count();
+            cm_state.nodes_done = diag.nodes;
+            cm_state.open_frontier = open.size();
+            cm_state.nodes_since_incumbent = diag.nodes - cm_last_improve_node;
+            cm_state.threads = para_threads;
+            if (para_bab_should_activate(opts.para_bab_cost, cm_state)) {
+                para_active = true;
+                // Only if configured to: the phase gate already requires an
+                // empty plunge stack, so by default dives and phases interleave
+                // rather than one excluding the other.
+                if (opts.para_bab_cost.disable_plunge_on_activate)
+                    hybrid_nodes = false;
+                diag.para_bab.activated = true;
+                diag.para_bab.activated_at_s = cm_state.elapsed_s;
+                diag.para_bab.activated_at_node = diag.nodes;
+                diag.para_bab.serial_nodes = diag.nodes;
+                char pbuf[128];
+                std::snprintf(pbuf, sizeof pbuf,
+                              "\"node\":%llu,\"threads\":%d",
+                              static_cast<unsigned long long>(diag.nodes),
+                              para_threads);
+                SOR_ROUTE(1, "bab", "para_activated", pbuf);
+            }
+        }
         if (diag.nodes >= opts.max_nodes) {
             reason = "node limit (" + std::to_string(opts.max_nodes) + ")";
+            SOR_ROUTE(1, "bab", "stop", "\"reason\":\"node_limit\"");
             break;
         }
         if (timed_out()) {
             reason = "time limit";
+            SOR_ROUTE(1, "bab", "stop", "\"reason\":\"time_limit\"");
             break;
         }
+
+        // ---- Para-B&B phase (arXiv:2604.09556): replicate + barrier ----
+        // When enough open nodes exist and plunging is idle, expand a batch
+        // of best-bound nodes in parallel. Merge is deterministic by pop
+        // order. Workers use LP+branch only; heuristics stay serial.
+        if (para_threads > 1 && para_active && !para_force_serial &&
+            plunge_stack.empty() && open.size() >= 2 &&
+            (opts.para_bab.max_phases == 0 ||
+             diag.para_bab.phases < opts.para_bab.max_phases)) {
+            const int workers =
+                std::min(para_threads, static_cast<int>(open.size()));
+            const int batch_n = std::min(
+                workers * para_quota, static_cast<int>(open.size()));
+            std::vector<Node> batch;
+            batch.reserve(static_cast<std::size_t>(batch_n));
+            for (int i = 0; i < batch_n; ++i) {
+                batch.push_back(open.top());
+                open.pop();
+            }
+            const f64 inc_min =
+                have_incumbent ? sense * best_incumbent
+                               : -std::numeric_limits<f64>::infinity();
+            std::vector<ParaExpandOut> results(batch.size());
+            // Captured once for the whole batch so every worker shares one
+            // deadline (and the value stays deterministic across workers).
+            const double para_lp_left =
+                opts.time_limit_s > 0.0 ? std::max(0.05, seconds_left()) : 0.0;
+            {
+                std::vector<std::jthread> workers_jt;
+                workers_jt.reserve(batch.size());
+                for (std::size_t i = 0; i < batch.size(); ++i) {
+                    workers_jt.emplace_back([&, i]() {
+                        // Copy node: may requeue on unproved LP.
+                        results[i] = para_expand_node(
+                            global_lp, batch[i], opts, sense, inc_min,
+                            have_incumbent, opts.int_tol, opts.primal_feas_tol,
+                            static_cast<std::uint64_t>(i), para_lp_left);
+                    });
+                }
+            }  // jthreads join = barrier sync (Para-B&B phase end)
+            ++diag.para_bab.phases;
+            ++diag.para_bab.syncs;
+            diag.para_bab.parallel_expansions += results.size();
+
+            int para_infeas = 0, para_abandoned = 0, para_integer = 0,
+                para_bound_prune = 0;
+            for (const auto& r : results) {
+                if (r.abandoned) ++para_abandoned;
+                else if (r.infeasible) ++para_infeas;
+                else if (r.integer_hit) ++para_integer;
+                else if (r.children.empty() && !r.infeasible && !r.abandoned)
+                    ++para_bound_prune;
+            }
+            {
+                char pbuf[160];
+                std::snprintf(
+                    pbuf, sizeof pbuf,
+                    "\"batch\":%d,\"phase\":%llu,\"infeas\":%d,"
+                    "\"abandoned\":%d,\"integer\":%d,\"bound_prune\":%d",
+                    batch_n, static_cast<unsigned long long>(diag.para_bab.phases),
+                    para_infeas, para_abandoned, para_integer, para_bound_prune);
+                SOR_ROUTE(1, "bab", "para_phase", pbuf);
+            }
+
+            // Deterministic merge in pop order.
+            std::sort(results.begin(), results.end(),
+                      [](const ParaExpandOut& a, const ParaExpandOut& b) {
+                          return a.order_key < b.order_key;
+                      });
+            bool any_requeue = false;
+            for (auto& r : results) {
+                diag.lp_solves += r.lp_solves;
+                diag.lp_iterations += r.lp_iterations;
+                diag.lp_ms += r.lp_ms;
+                if (r.abandoned) {
+                    // Do NOT fold into abandoned_bound: requeue for serial
+                    // expansion (full node path) so proof stays sound.
+                    open.push(std::move(batch[r.order_key]));
+                    any_requeue = true;
+                    continue;
+                }
+                ++diag.nodes;
+                if (r.infeasible) continue;
+                if (r.integer_hit && std::isfinite(r.incumbent)) {
+                    if (!have_incumbent ||
+                        (mip.maximize ? r.incumbent > best_incumbent
+                                      : r.incumbent < best_incumbent)) {
+                        have_incumbent = true;
+                        best_incumbent = r.incumbent;
+                        best_x = std::move(r.x);
+                        ++diag.integer_feasible;
+                    }
+                }
+                for (auto& c : r.children) {
+                    if (have_incumbent) {
+                        const f64 inc_m = sense * best_incumbent;
+                        if (c.bound >
+                            inc_m + opts.gap_tol * (1.0 + std::fabs(inc_m)))
+                            continue;
+                    }
+                    open.push(std::move(c));
+                }
+            }
+            para_force_serial = any_requeue;
+            if (any_requeue) {
+                char pbuf[48];
+                std::snprintf(pbuf, sizeof pbuf, "\"batch\":%d", batch_n);
+                SOR_ROUTE(1, "bab", "para_requeue", pbuf);
+            }
+            continue;
+        }
+        para_force_serial = false;
 
         // Node selection: continue the current plunge if its inherited bound
         // isn't meaningfully worse than the best open node's, otherwise (or
@@ -4231,7 +5073,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         // ONLY thing that prunes or proves anything below -- this choice
         // only reorders which already-valid node gets expanded next.
         bool from_plunge = false;
-        if (opts.hybrid_node_selection && !plunge_stack.empty()) {
+        if (hybrid_nodes && !plunge_stack.empty()) {
             if (open.empty()) {
                 from_plunge = true;
             } else {
@@ -4391,26 +5233,63 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         dual_stalled = bound_stalled || gap_hopeless;
 
         // Bound prune (minimize working objective = sense * original).
-        if (have_incumbent) {
-            const f64 inc_min = sense * best_incumbent;
-            if (node.bound > inc_min + opts.gap_tol * (1.0 + std::fabs(inc_min)))
-                continue;
+        {
+            // Prune against whichever bound is tighter: this arm's own
+            // incumbent, or a cutoff another arm published.
+            f64 cut = std::numeric_limits<f64>::quiet_NaN();
+            bool cut_is_foreign = false;
+            if (have_incumbent) cut = best_incumbent;
+            if (std::isfinite(external_cutoff) &&
+                (!std::isfinite(cut) ||
+                 (mip.maximize ? external_cutoff > cut
+                               : external_cutoff < cut))) {
+                cut = external_cutoff;
+                cut_is_foreign = true;
+            }
+            if (std::isfinite(cut)) {
+                const f64 inc_min = sense * cut;
+                if (node.bound >
+                    inc_min + opts.gap_tol * (1.0 + std::fabs(inc_min))) {
+                    if (cut_is_foreign) ++diag.foreign_cutoff_prunes;
+                    if (route_sample_node(diag.nodes)) {
+                        char pbuf[96];
+                        std::snprintf(pbuf, sizeof pbuf,
+                                      "\"node\":%llu,\"kind\":\"cutoff\"",
+                                      static_cast<unsigned long long>(diag.nodes));
+                        SOR_ROUTE(3, "bab", "prune_bound", pbuf);
+                    }
+                    continue;
+                }
+            }
         }
 
         // Domain propagation (Achterberg thesis 2007, Ch.10.4): tighten this
         // node's bounds using the row structure BEFORE paying for an LP
         // solve. Rebuild from global_lp + this node's local cuts so local
         // inequalities participate without leaking to siblings.
-        if (node.active_local.empty()) {
-            node_lp = global_lp;
-        } else {
-            node_lp = apply_cuts(global_lp, managed_to_rows(node.active_local),
-                                opts.cut);
-            // Local rows change dimensions → drop incompatible warm basis.
-            node.has_basis = false;
-            node.basis = engines::SimplexBasis{};
+        const auto t_node_setup = Clock::now();
+        {
+            core::RouteSpan setup_span(2, "bab", "node_setup", "node_setup", "",
+                                       core::RouteLedgerBucket::Search);
+            if (node.active_local.empty()) {
+                node_lp = global_lp;
+            } else {
+                node_lp = apply_cuts(global_lp, managed_to_rows(node.active_local),
+                                    cut_cfg.cut);
+                ++diag.node_local_cut_rebuilds;
+                // Local rows change dimensions → drop incompatible warm basis.
+                if (node.has_basis) {
+                    SOR_ROUTE_PATH(2, "bab", "node_setup", "basis_discard");
+                }
+                node.has_basis = false;
+                node.basis = engines::SimplexBasis{};
+            }
         }
+        diag.ms_node_setup += ms_since(t_node_setup);
+        const auto t_node_prop = Clock::now();
         if (opts.domain_propagation) {
+            core::RouteSpan prop_span(2, "bab", "node_prop", "node_prop", "",
+                                      core::RouteLedgerBucket::Search);
             PropagateResult prop;
             // Trail + Mexi analysis is expensive on dense binaries (enigma).
             // Cap learned cuts; after the budget, use plain propagation.
@@ -4441,13 +5320,24 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                     cctx.conflict_var = prop.conflict_var;
                     cctx.conflict_row = prop.conflict_row;
                     cctx.n_global_rows = global_lp.n_rows();
-                    if (auto learned = analyze_conflict_cuts(
-                            cctx, conflict_cut_opts, diag.conflict_cut_diag)) {
-                        (void)try_apply_validated_global_cut(
-                            *learned, /*as_nogood=*/false);
+                    {
+                        const auto t_mexi = Clock::now();
+                        auto learned = analyze_conflict_cuts(
+                            cctx, conflict_cut_opts, diag.conflict_cut_diag);
+                        diag.conflict_analysis_ms += ms_since(t_mexi);
+                        if (learned) {
+                            (void)try_apply_validated_global_cut(
+                                *learned, /*as_nogood=*/false);
+                        }
                     }
                 }
                 try_learn_nogood(node.prop_trail);
+                if (route_sample_node(diag.nodes)) {
+                    char pbuf[80];
+                    std::snprintf(pbuf, sizeof pbuf, "\"node\":%llu",
+                                  static_cast<unsigned long long>(diag.nodes));
+                    SOR_ROUTE(3, "bab", "prune_prop_infeas", pbuf);
+                }
                 continue;
             }
         }
@@ -4493,8 +5383,12 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         }
         engines::SimplexDiagnostics sd;
         engines::SimplexBasis node_basis;
+        diag.ms_node_prop += ms_since(t_node_prop);
         const auto t_lp = Clock::now();
         core::RawResult lp_raw;
+        {
+            core::RouteSpan nlp_span(1, "bab", "node_lp", "node_lp", "",
+                                    core::RouteLedgerBucket::NodeLp);
         if (!node.has_basis || lp_opts.method == engines::SimplexMethod::Primal) {
             // The root has no compatible warm start. Let the normal simplex
             // dispatcher use presolve and its dual/primal fallback, then lift
@@ -4507,7 +5401,38 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             // child nodes with dual simplex and the parent's basis.
             // WP-J: product vs FT is opts.lp.update_method (passed via lp_opts).
             ++diag.warm_start_attempts;
+            SOR_ROUTE_PATH(2, "bab", "warm_start", "warm_start");
             lp_opts.presolve = false;
+            // EXTEND a basis recorded before rows were added.
+            //
+            // Every learned nogood (and every globally applied cut) appends
+            // rows to the shared LP, which changes m. A stored node basis then
+            // fails solve_dual_simplex's size check and the node re-solves
+            // COLD. Measured on milo-v12-6-r2-40-1: warm starts 81/174, and
+            // with --no-nogood-cuts 249/249 -- so half the tree was paying a
+            // cold solve for rows it had never seen. Node throughput differed
+            // by 2.2x (175 -> 393 nodes) and total LP work by 2.8x
+            // (292,189 -> 105,574 iterations) for the identical objective.
+            //
+            // Appending each new row's LOGICAL as basic is always a valid
+            // extension: it keeps the basis matrix nonsingular (the new column
+            // is a unit vector on a new row) and starts the added rows
+            // non-binding, which is the right initial state for a cut -- dual
+            // simplex pivots them in only if they are violated.
+            {
+                const Index ns = node.basis.n_struct;
+                const Index m_old =
+                    static_cast<Index>(node.basis.basic.size());
+                const Index m_now = node_lp.n_rows();
+                if (ns == node_lp.n_cols() && m_now > m_old && m_old > 0) {
+                    node.basis.status.resize(sz(ns + m_now),
+                                             engines::NonbasicStatus::Basic);
+                    node.basis.basic.reserve(sz(m_now));
+                    for (Index r = m_old; r < m_now; ++r)
+                        node.basis.basic.push_back(ns + r);
+                    ++diag.warm_start_extended;
+                }
+            }
             if (lp_opts.method == engines::SimplexMethod::Auto)
                 lp_opts.method = engines::SimplexMethod::Dual;
             lp_raw = engines::solve_dual_simplex(
@@ -4547,9 +5472,11 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                 }
             }
         }
+        }  // nlp_span
         ++diag.lp_solves;
         diag.lp_iterations += sd.iterations;
         diag.lp_ms += ms_since(t_lp);
+        ++diag.loop_iters_past_lp;
 
         if (lp_raw.proposed_status == core::Status::Infeasible ||
             lp_raw.proposed_status == core::Status::InfeasibleOrUnbounded) {
@@ -4564,6 +5491,13 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                 lp_raw.proposed_status == core::Status::Infeasible ||
                 root_relaxation_bounded;
             if (infeasible_trusted) try_learn_nogood(node.prop_trail);
+            if (route_sample_node(diag.nodes)) {
+                char pbuf[80];
+                std::snprintf(pbuf, sizeof pbuf, "\"node\":%llu",
+                              static_cast<unsigned long long>(diag.nodes));
+                SOR_ROUTE(3, "bab", "prune_lp_infeas", pbuf);
+            }
+            diag.ms_exit_prune += ms_since(t_loop_iter); ++diag.n_exit_prune;
             continue;  // prune
         }
         // An interrupted/numerically unproved relaxation is not evidence that
@@ -4582,6 +5516,14 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             (!lp_point_feasible || timed_out())) {
             reason = timed_out() ? "time limit" : "node LP interrupted";
             stopped_early = true;
+            {
+                char pbuf[128];
+                std::snprintf(
+                    pbuf, sizeof pbuf, "\"node\":%llu,\"reason\":\"%s\"",
+                    static_cast<unsigned long long>(diag.nodes),
+                    timed_out() ? "time_limit" : "interrupted");
+                SOR_ROUTE(1, "bab", "node_lp_fail", pbuf);
+            }
             // This node still carries its PARENT's proved bound (it is only
             // overwritten below, once its own LP is certified), which is a
             // sound lower bound for the subtree being walked away from.
@@ -4596,9 +5538,24 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             if (!lp_point_feasible) {
                 reason = "node LP unproved";
                 stopped_early = true;
+                {
+                    char pbuf[96];
+                    std::snprintf(pbuf, sizeof pbuf, "\"node\":%llu,\"reason\":\"unproved\"",
+                                  static_cast<unsigned long long>(diag.nodes));
+                    SOR_ROUTE(1, "bab", "node_lp_fail", pbuf);
+                }
                 abandoned_bound = std::min(abandoned_bound, node.bound);
                 break;
             }
+        }
+
+        if (!root_lp_outcome_logged && node.depth == 0 && node_lp_proved &&
+            std::isfinite(lp_raw.objective)) {
+            char rbuf[96];
+            std::snprintf(rbuf, sizeof rbuf, "\"obj\":%.10g,\"integer\":false",
+                          lp_raw.objective);
+            SOR_ROUTE(1, "bab", "root_lp_outcome", rbuf);
+            root_lp_outcome_logged = true;
         }
 
         const f64 lp_obj = lp_raw.objective;          // original sense
@@ -4634,8 +5591,16 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         }
         if (have_incumbent && node_lp_proved) {
             const f64 inc_min = sense * best_incumbent;
-            if (lp_obj_min > inc_min + opts.gap_tol * (1.0 + std::fabs(inc_min)))
+            if (lp_obj_min > inc_min + opts.gap_tol * (1.0 + std::fabs(inc_min))) {
+                if (route_sample_node(diag.nodes)) {
+                    char pbuf[80];
+                    std::snprintf(pbuf, sizeof pbuf, "\"node\":%llu",
+                                  static_cast<unsigned long long>(diag.nodes));
+                    SOR_ROUTE(3, "bab", "prune_bound", pbuf);
+                }
+                diag.ms_exit_b += ms_since(t_loop_iter); ++diag.n_exit_b;
                 continue;
+            }
         }
 
         // LP snapshots for MRENS (multi-reference). Keep at most three.
@@ -4676,6 +5641,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                     }
                 }
             }
+            diag.ms_exit_nobranch += ms_since(t_loop_iter); ++diag.n_exit_nobranch;
             continue;  // no branch
         }
 
@@ -4684,6 +5650,9 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         // feasibility pump and the structured searches, and on several
         // instances it was the single largest consumer of wall time.
         const auto t_heur = Clock::now();
+        std::optional<core::RouteSpan> heur_span;
+        heur_span.emplace(2, "bab", "heur", "heur", "",
+                          core::RouteLedgerBucket::Heur);
         if (opts.rounding_heuristic &&
             !heuristics_over_budget(opts.lp_rounding_repair_time_s * 1000.0)) {
             std::vector<f64> xh;
@@ -4793,15 +5762,21 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             const bool repair_due = diag.nodes <= 8 || (diag.nodes % 256 == 0);
             if (!rounded && opts.lp_rounding_repair && repair_due) {
                 ++diag.lp_repair_attempts;
+                const auto t_rep = Clock::now();
                 rounded = try_lp_rounding_repair(
                     problem, lp_raw.x, opts.int_tol,
                     opts.primal_feas_tol, opts.lp_rounding_repair_max_iterations,
                     opts.lp_rounding_repair_time_s, xh);
+                diag.ms_lp_repair += ms_since(t_rep);
                 if (rounded) ++diag.lp_repair_hits;
             }
             if (repair_due && mip.n_cols() <= 1000 &&
                 mip.nnz() <= 10000) {
                 ++diag.feasibility_pump_attempts;
+                const auto t_pump = Clock::now();
+                struct PumpTick { double& sink; Clock::time_point t;
+                    ~PumpTick() { sink += ms_since(t); } }
+                    pump_tick{diag.ms_feas_pump, t_pump};
                 std::vector<f64> pumped;
                 const bool pump_ok = try_feasibility_pump(
                     problem, lp_raw.x, opts.int_tol,
@@ -5023,11 +5998,11 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                 }
             }
         }
-
         // Closed here, before the Feasibility Jump calls below: those keep their
         // own accumulator (diag.feasjump_ms), and the ceiling sums the two, so
         // the windows must not overlap or FJ time is charged twice and the
         // ceiling fires early.
+        heur_span.reset();
         diag.heuristic_ms += ms_since(t_heur);
 
         // Feasibility Jump, warm. The cold pre-tree run had no LP to look at;
@@ -5054,7 +6029,6 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                                   std::max(0.0, seconds_left())),
                          cutoff);
         }
-
         // Adaptive LNS / Balans. Classical keeps AlnsScheduler over Neighborhood
         // only. Latest uses Balans as the primary primal controller (Neighborhood
         // + Kernel Pump / MRENS / FeasJump / BTBS-LNS / CL-TLNS meta-arms).
@@ -5471,7 +6445,6 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                 }
             }
         }
-
         // Dedicated Kernel Pump at the root under Latest (incumbent hunt).
         // Skip on small short-budget MIPs: KP eats root wall that HiGHS spends
         // on cuts/branch; Balans can still call KP later if needed.
@@ -5727,6 +6700,12 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             diag.last_branch_policy = "sparse-sb";
             return true;
         };
+        const auto t_branch = Clock::now();
+        struct BranchTick {
+            double& sink;
+            Clock::time_point t;
+            ~BranchTick() { sink += ms_since(t); }
+        } branch_tick{diag.ms_branching, t_branch};
         auto try_sc_milp_pick = [&]() -> bool {
             if (!sc_milp_want || candidates.empty() ||
                 cand_feats.size() != candidates.size())
@@ -5839,7 +6818,6 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             if (!learner_chose)
                 diag.last_branch_policy = "reliability";
         }
-
         // Strong probes: under classical / unlabeled latest, they override the
         // pseudocost pick. Under learners they still seed pseudocosts and can
         // collect imitation labels, but do not displace the model choice unless
@@ -5860,6 +6838,148 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             Index strong_var = -1;
             const engines::SimplexBasis* warm = &node_basis;
 
+            bool batch_ranked = false;
+            if (opts.batch_lp_strong_branch) {
+                std::vector<engines::BatchBoundProbe> probes;
+                struct ProbeMeta {
+                    std::size_t ci;
+                    Index j;
+                    int dir;
+                    f64 dist;
+                };
+                std::vector<ProbeMeta> meta;
+                const std::uint64_t remaining =
+                    strong_branch_budget > diag.strong_branch_solves
+                        ? strong_branch_budget - diag.strong_branch_solves
+                        : 0;
+                for (std::size_t ci = 0;
+                     ci < candidates.size() && meta.size() < remaining; ++ci) {
+                    const Index j = candidates[ci];
+                    const f64 xv = lp_raw.x[sz(j)];
+                    const f64 floor_v = std::floor(xv);
+                    const f64 ceil_v = std::ceil(xv);
+                    const f64 down_dist = xv - floor_v;
+                    const f64 up_dist = ceil_v - xv;
+                    if (down_dist <= opts.int_tol || up_dist <= opts.int_tol)
+                        continue;
+                    for (int dir : {-1, 1}) {
+                        if (meta.size() >= remaining) break;
+                        engines::BatchBoundProbe pr;
+                        pr.col_lo = node.col_lo;
+                        pr.col_hi = node.col_hi;
+                        if (dir < 0)
+                            pr.col_hi[sz(j)] =
+                                std::min(pr.col_hi[sz(j)], floor_v);
+                        else
+                            pr.col_lo[sz(j)] =
+                                std::max(pr.col_lo[sz(j)], ceil_v);
+                        probes.push_back(std::move(pr));
+                        meta.push_back(
+                            {ci, j, dir, dir < 0 ? down_dist : up_dist});
+                    }
+                }
+                if (probes.size() >= 2) {
+                    try {
+                        engines::BatchProbeOptions bopt;
+                        bopt.hpr_steps = opts.batch_lp_sb_steps;
+                        // Use node_lp matrix with current objective; bounds
+                        // come from probes (node domains).
+                        model::LpProblem batch_lp = node_lp;
+                        batch_lp.col_lo = node.col_lo;
+                        batch_lp.col_hi = node.col_hi;
+                        const auto results = engines::batch_bound_probes_hpr(
+                            batch_lp, probes, bopt);
+                        ++diag.batch_lp_sb_batches;
+                        diag.batch_lp_sb_probes += results.size();
+                        diag.strong_branch_solves += results.size();
+
+                        std::vector<f64> down_gain(
+                            candidates.size(),
+                            std::numeric_limits<f64>::quiet_NaN());
+                        std::vector<f64> up_gain(
+                            candidates.size(),
+                            std::numeric_limits<f64>::quiet_NaN());
+                        std::vector<char> down_ok(candidates.size(), 0);
+                        std::vector<char> up_ok(candidates.size(), 0);
+
+                        for (std::size_t pi = 0; pi < results.size(); ++pi) {
+                            const auto& r = results[pi];
+                            const auto& m = meta[pi];
+                            if (!r.looks_feasible ||
+                                !std::isfinite(r.primal_obj))
+                                continue;
+                            const f64 gain =
+                                std::max(0.0, r.primal_obj - lp_obj_min);
+                            const f64 unit =
+                                gain / std::max(m.dist, opts.int_tol);
+                            if (m.dir < 0) {
+                                down_gain[m.ci] = gain;
+                                down_ok[m.ci] = 1;
+                                pc_down_sum[sz(m.j)] += unit;
+                                ++pc_down_count[sz(m.j)];
+                            } else {
+                                up_gain[m.ci] = gain;
+                                up_ok[m.ci] = 1;
+                                pc_up_sum[sz(m.j)] += unit;
+                                ++pc_up_count[sz(m.j)];
+                            }
+                            ++diag.pseudocost_updates;
+                        }
+
+                        for (std::size_t ci = 0; ci < candidates.size(); ++ci) {
+                            if (!down_ok[ci] || !up_ok[ci]) continue;
+                            const f64 dg = down_gain[ci];
+                            const f64 ug = up_gain[ci];
+                            const f64 score =
+                                std::min(dg, ug) + 0.1 * std::max(dg, ug);
+                            if (score > strong_best) {
+                                strong_best = score;
+                                strong_var = candidates[ci];
+                            }
+                            if (ci < planbb_ests.size()) {
+                                planbb_ests[ci].down_gain = dg;
+                                planbb_ests[ci].up_gain = ug;
+                                planbb_ests[ci].ok =
+                                    std::isfinite(dg) && std::isfinite(ug);
+                            }
+                            if (std::isfinite(dg) && std::isfinite(ug) &&
+                                ci < cand_feats.size()) {
+                                const f64 prod = sb_product_score(dg, ug);
+                                const int decision_id =
+                                    static_cast<int>(diag.nodes);
+                                if (collect_sparse_sb) {
+                                    sparse_sb_collector.add(cand_feats[ci],
+                                                            prod);
+                                    ++diag.sparse_sb_samples;
+                                }
+                                if (collect_sc_milp) {
+                                    sc_milp_collector.add(cand_feats[ci], prod,
+                                                         decision_id);
+                                    ++diag.sc_milp_samples;
+                                }
+                                if (lifted_want && ci < lifted_feats.size()) {
+                                    lifted_state.observe(lifted_feats[ci],
+                                                         prod);
+                                    ++diag.lifted_samples;
+                                    if (lifted_state.maybe_refit(opts.lifted))
+                                        ++diag.lifted_refits;
+                                }
+                                if (collect_planbb) {
+                                    planbb_collector.add(cand_feats[ci],
+                                                         planbb_graph, dg, ug,
+                                                         /*pruned=*/false);
+                                    ++diag.planbb_samples;
+                                }
+                            }
+                            batch_ranked = true;
+                        }
+                    } catch (...) {
+                        batch_ranked = false;
+                    }
+                }
+            }
+
+            if (!batch_ranked)
             for (std::size_t ci = 0; ci < candidates.size(); ++ci) {
                 const Index j = candidates[ci];
                 const f64 xv = lp_raw.x[sz(j)];
@@ -6025,10 +7145,10 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                 }
             } else if (!learner_chose && strong_var >= 0) {
                 br = strong_var;
-                diag.last_branch_policy = "reliability";
+                diag.last_branch_policy =
+                    batch_ranked ? "batch-sb" : "reliability";
             }
         }
-
         // Lite PlanB&B: if we deferred for probes but the probe block did not
         // run (unproved LP / empty basis), still pick from policy alone.
         if (latest_branch && branch_strat == BranchStrategy::PlanBb &&
@@ -6061,26 +7181,25 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             configure_dynsep_from_l2sep(l2sep_opts, l2sep_model, global_lp,
                                         sep_mid, &lp_raw.x, dynsep_opts,
                                         l2sep_diag, /*mid_tree=*/true);
-            if (opts.mir_cuts) dynsep_opts.allow_mir = true;
-            if (opts.lifted_cover_cuts) dynsep_opts.allow_cover = true;
-            if (opts.clique_cuts) dynsep_opts.allow_clique = true;
-            if (opts.zerohalf_cuts) dynsep_opts.allow_zerohalf = true;
-            if (opts.flow_cover_cuts) dynsep_opts.allow_flowcover = true;
+            if (cut_cfg.mir_cuts) dynsep_opts.allow_mir = true;
+            if (cut_cfg.lifted_cover_cuts) dynsep_opts.allow_cover = true;
+            if (cut_cfg.clique_cuts) dynsep_opts.allow_clique = true;
+            if (cut_cfg.zerohalf_cuts) dynsep_opts.allow_zerohalf = true;
+            if (cut_cfg.flow_cover_cuts) dynsep_opts.allow_flowcover = true;
             // Re-assert the structural light-arm clamp after the mid-tree
             // L2Sep re-apply (it would otherwise re-enable MIR/cover).
             if (milp_policy_is_latest(opts.policy) && dynsep_opts.enabled &&
-                problem.n_cols() <= 400 && opts.time_limit_s > 0.0 &&
-                opts.time_limit_s <= 60.0) {
+                !cut_cfg.auto_cuts && problem.n_cols() <= 400 &&
+                opts.time_limit_s > 0.0 && opts.time_limit_s <= 60.0) {
                 dynsep_opts.max_depth_optional = 0;
                 dynsep_opts.max_optional_arms = 1;
-                if (!opts.mir_cuts) dynsep_opts.allow_mir = false;
-                if (!opts.lifted_cover_cuts) dynsep_opts.allow_cover = false;
+                if (!cut_cfg.mir_cuts) dynsep_opts.allow_mir = false;
+                if (!cut_cfg.lifted_cover_cuts) dynsep_opts.allow_cover = false;
             }
             dynsep.update_options(dynsep_opts);
             last_l2sep_node = diag.nodes;
             diag.l2sep = l2sep_diag;
         }
-
         // Tree / local separation (WP-C + DynSep). Generators scheduled by
         // DynSep-v1; cuts from a node tableau with local bounds are LOCAL -
         // tagged, inherited by children, never visible to siblings.
@@ -6097,12 +7216,12 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             dsin.depth = node.depth;
             dsin.at_root = false;
             dsin.last_bound_gain_rel = dynsep_last_gain;
-            dsin.force_mir = opts.mir_cuts;
-            dsin.force_cover = opts.lifted_cover_cuts;
-            dsin.force_clique = opts.clique_cuts;
+            dsin.force_mir = cut_cfg.mir_cuts;
+            dsin.force_cover = cut_cfg.lifted_cover_cuts;
+            dsin.force_clique = cut_cfg.clique_cuts;
             dsin.force_ib = opts.implied_bound_cuts;
-            dsin.force_zerohalf = opts.zerohalf_cuts;
-            dsin.force_flowcover = opts.flow_cover_cuts;
+            dsin.force_zerohalf = cut_cfg.zerohalf_cuts;
+            dsin.force_flowcover = cut_cfg.flow_cover_cuts;
             dsin.have_conflict_graph = !conflict_graph.empty();
             dsin.have_basis = true;
             dsin.gap_rel = diag.gap_rel;
@@ -6111,7 +7230,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             CutDiagnostics tdiag;
             std::vector<CutRow> tcands;
             if (dsd.run_gmi) {
-                CutOptions gmi_opts = opts.cut;
+                CutOptions gmi_opts = cut_cfg.cut;
                 gmi_opts.max_cuts_per_round =
                     std::min(dsd.budget_gmi, tree_cut_opts.max_cuts_per_node * 4);
                 tcands = separate_gomory_mi(node_lp, lp_raw.x, node_basis,
@@ -6128,10 +7247,11 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                               std::make_move_iterator(zh.begin()),
                               std::make_move_iterator(zh.end()));
             }
-            if (dsd.run_flowcover) {
+            if (dsd.run_flowcover && opts.flow_cover_cuts) {
                 FlowCoverOptions fc_opts = dynsep_opts.flowcover;
                 fc_opts.max_cuts = dsd.budget_flowcover;
                 FlowCoverDiagnostics fcd;
+                // Same gate as the root site: flow cover emits invalid cuts.
                 auto fc = separate_flow_covers(node_lp, lp_raw.x, node.col_lo,
                                                node.col_hi, fc_opts, fcd);
                 diag.flowcover_candidates += fc.size();
@@ -6140,7 +7260,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                               std::make_move_iterator(fc.end()));
             }
             if (dsd.run_cover) {
-                CoverOptions cov_opts = opts.cover;
+                CoverOptions cov_opts = cut_cfg.cover;
                 cov_opts.max_cuts = dsd.budget_cover;
                 if (milp_policy_is_latest(opts.policy))
                     cov_opts.pc_lift_hooks = true;
@@ -6155,19 +7275,29 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                               std::make_move_iterator(cov.end()));
             }
             if (dsd.run_mir) {
-                MirOptions mir_opts = opts.mir;
+                MirOptions mir_opts = cut_cfg.mir;
                 mir_opts.max_cuts = dsd.budget_mir;
                 MirDiagnostics md;
                 auto mc = separate_mir(node_lp, lp_raw.x, node.col_lo,
-                                       node.col_hi, mir_opts, md);
+                                       node.col_hi, mir_opts, md,
+                                       &root_lo, &root_hi);
                 tcands.insert(tcands.end(),
                               std::make_move_iterator(mc.begin()),
                               std::make_move_iterator(mc.end()));
             }
+            // Once per node, not per cut: does this node still sit exactly at
+            // the root bounds? Only then can a cut derived here be global.
+            const bool node_at_root_bounds =
+                node.col_lo == root_lo && node.col_hi == root_hi;
+            if (cut_cfg.auto_cuts && milp_policy_is_latest(cut_cfg.policy) &&
+                !tcands.empty()) {
+                tcands = filter_cut_candidates_for_round(
+                    std::move(tcands), node_lp, lp_raw.x, cut_cfg.cut);
+            }
 
             // GCS: persist violation stats across nodes for stored cuts.
             if (tree_cut_opts.gcs_enabled && tree_cut_opts.gcs_aggressive_observe)
-                gcs_pool.touch_point(lp_raw.x, opts.cut.violation_min,
+                gcs_pool.touch_point(lp_raw.x, cut_cfg.cut.violation_min,
                                      node.depth, diag.gap_rel, node.bound);
 
             CutFeatureContext cctx{&node_lp, &lp_raw.x};
@@ -6226,13 +7356,98 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                                            /*label=*/cf[0] + dynsep_last_gain);
                 }
                 ranked.emplace_back(score, i);
-                const bool globally_valid =
+                // Global validity is a property of DERIVATION, not of the
+                // separator's name.
+                //
+                // These separators substitute variables onto a bound --
+                // build_base_from() does x_j = bound +- s -- and at a node the
+                // bounds handed in are node.col_lo/node.col_hi, i.e. TIGHTENED
+                // BY BRANCHING. A cut derived that way holds only inside that
+                // subtree. The old test asked only whether the name began
+                // "MIR_"/"ZH_"/"FC_"/"COV_", so a locally-derived cut was
+                // promoted into the pool and later reinjected into global_lp,
+                // where it can cut off the true optimum. That is a false
+                // Optimal (blend2: 8.1039210 against a true 7.5989850) or a
+                // false Infeasible (enigma), and it needs only a couple of
+                // nodes to appear.
+                //
+                // A node cut is globally valid only if every column it touches
+                // still sits at its ROOT bounds, so no branching decision
+                // entered the derivation. That keeps the common case -- a cut
+                // whose support was never branched on -- while refusing the
+                // unsound one.
+                bool globally_valid =
                     tcands[i].name.rfind("ZH_", 0) == 0 ||
                     tcands[i].name.rfind("FC_", 0) == 0 ||
                     tcands[i].name.rfind("COV_", 0) == 0 ||
                     tcands[i].name.rfind("COVPC_", 0) == 0 ||
                     tcands[i].name.rfind("COVGNS_", 0) == 0 ||
                     tcands[i].name.rfind("MIR_", 0) == 0;
+                // Last-line guard, independent of derivation: a globally
+                // valid cut must admit every integer-feasible point, so it
+                // must admit the incumbent. Catches an invalid cut from ANY
+                // separator without knowing which one is at fault.
+                if (globally_valid && have_incumbent && !best_x.empty() &&
+                    !cut_admits_point(tcands[i].cols, tcands[i].vals,
+                                      tcands[i].row_lo, tcands[i].row_hi,
+                                      best_x, opts.primal_feas_tol)) {
+                    globally_valid = false;
+                    ++diag.cuts_rejected_by_incumbent;
+                }
+                // Checking only the cut's SUPPORT is not enough, and that was
+                // a real hole: a separator substitutes out variables that
+                // branching has FIXED, so those columns never appear in the
+                // support while still having shaped the right-hand side. Plain
+                // COV_ cuts slipped through that version of the test and still
+                // excluded enigma's optimum (COV_1: activity 1 not in
+                // [-inf, -1]).
+                //
+                // So the node must carry NO tightened bound at all for any cut
+                // derived at it to be promoted globally. Conservative -- it
+                // gives up promoting cuts from branched nodes -- but that is a
+                // performance cost, and the alternative was a false Infeasible.
+                // Provenance is tracked (CutRow::used_local_bound, reported by
+                // MIR) but is NOT yet sufficient to relax this gate, and the
+                // attempt is recorded so it is not repeated blind.
+                //
+                // Trusting it alone -- promoting any cut whose BOUNDS were all
+                // global -- reintroduced 27 invalid cuts on enigma. The reason
+                // is a SECOND local dependency that bound provenance cannot
+                // see: node_lp is global_lp plus this node's LOCAL CUT ROWS
+                // (see the apply_cuts call that builds it), so a separator can
+                // derive a cut from a locally-valid cut row while touching no
+                // tightened bound at all. Cover cuts did exactly that.
+                //
+                // Making this pay needs source-row provenance as well: a cut
+                // is global only if every row it consumed is global AND every
+                // bound it substituted onto is global. Until separators report
+                // both, the conservative node test stands.
+                if (globally_valid && !node_at_root_bounds) {
+                    globally_valid = false;
+                    ++diag.local_cuts_kept_local;
+                }
+                // Cut-validity diagnostic, placed AFTER the promotion gates
+                // on purpose. Reporting the pre-gate value cried wolf: enigma
+                // showed 27 "invalid" node cuts that the gates then correctly
+                // demoted to local, while the solve returned the true optimum
+                // every time. A diagnostic that reports problems the code
+                // already handles trains you to ignore it.
+                if (opts.cut_reference_point != nullptr && globally_valid &&
+                    !cut_admits_point(tcands[i].cols, tcands[i].vals,
+                                      tcands[i].row_lo, tcands[i].row_hi,
+                                      *opts.cut_reference_point,
+                                      opts.primal_feas_tol)) {
+                    f64 act = 0.0;
+                    for (std::size_t k = 0; k < tcands[i].cols.size(); ++k)
+                        act += tcands[i].vals[k] *
+                               (*opts.cut_reference_point)[sz(tcands[i].cols[k])];
+                    std::fprintf(stderr,
+                        "INVALID NODE CUT  %-18s activity %.9g not in "
+                        "[%.9g, %.9g]  (nnz %zu)\n",
+                        tcands[i].name.c_str(), act, tcands[i].row_lo,
+                        tcands[i].row_hi, tcands[i].cols.size());
+                    ++diag.invalid_cuts_detected;
+                }
                 // Content-stable id so the same cut accumulates multi-node stats.
                 gcs_pool.observe(tcands[i], cf, cf[0], cf[4] > 0.0,
                                  globally_valid, cut_content_id(tcands[i]),
@@ -6315,7 +7530,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                         if (ok) safe.push_back(r);
                     }
                     if (!safe.empty()) {
-                        global_lp = apply_cuts(global_lp, safe, opts.cut);
+                        apply_cuts_inplace(global_lp, safe, cut_cfg.cut);
                         gcs_pool.mark_promoted(safe);
                         diag.gcs_promoted +=
                             static_cast<std::uint64_t>(safe.size());
@@ -6326,7 +7541,6 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                 }
             }
         }
-
         // GCS periodic re-injection of top multi-node cuts into global_lp.
         if (tree_cut_opts.gcs_enabled &&
             tree_cut_opts.gcs_reinject_every_nodes > 0 &&
@@ -6336,7 +7550,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                                                 tree_cut_opts.gcs_min_score,
                                                 /*skip_promoted=*/true);
             if (!reinj.empty()) {
-                global_lp = apply_cuts(global_lp, reinj, opts.cut);
+                apply_cuts_inplace(global_lp, reinj, cut_cfg.cut);
                 gcs_pool.mark_promoted(reinj);
                 diag.gcs_reinjected +=
                     static_cast<std::uint64_t>(reinj.size());
@@ -6373,6 +7587,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         down.has_basis = !node_basis.basic.empty();
         down.parent_branch_var = br;
         down.parent_branch_dir = -1;
+        SOR_ROUTE_PATH(2, "bab", "branch", "branch");
         down.parent_bound = node_lp_proved && std::isfinite(lp_obj_min)
                                 ? lp_obj_min : core::kNaN;
         down.parent_branch_distance = xv - floor_v;
@@ -6427,6 +7642,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                 open.push(std::move(fallback));
             }
         }
+        ++diag.loop_iters_completed;
     }
 
     const bool tree_exhausted = !stopped_early && open.empty() && plunge_stack.empty();
@@ -6471,6 +7687,23 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     }
     if (!have_incumbent && !std::isfinite(dual_bound_min))
         dual_bound_min = std::numeric_limits<f64>::quiet_NaN();
+
+    // Strengthen the working (minimisation) bound to the next attainable
+    // objective value before converting back. Nothing strictly between
+    // multiples of g is reachable by a feasible integer point, so this is
+    // valid, and it is what turns "found the optimum but 0.17 short of proving
+    // it" into a proof.
+    if (std::isfinite(dual_bound_min) && obj_granularity > 0.0) {
+        // dual_bound_min is the working (minimisation) bound, i.e.
+        // sense*objective, so the offset travels with the same sign.
+        const f64 tightened = tighten_bound_to_granularity(
+            dual_bound_min, obj_granularity, sense * problem.obj_offset,
+            opts.int_tol);
+        if (tightened > dual_bound_min) {
+            ++diag.granularity_tightenings;
+            dual_bound_min = tightened;
+        }
+    }
 
     const f64 dual_orig = std::isfinite(dual_bound_min) ? sense * dual_bound_min
                                                         : core::kNaN;
@@ -6600,12 +7833,43 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             raw.proposed_status = core::Status::Feasible;
             raw.proposed_level = core::ProofLevel::FeasibleWithGap;
         }
-    } else if (tree_exhausted) {
+    } else if (tree_exhausted && !diag.used_foreign_cutoff) {
         raw.proposed_status = core::Status::Infeasible;
         raw.proposed_level = core::ProofLevel::BoundOnly;
+    } else if (tree_exhausted) {
+        // Exhausted with no incumbent of its own, but every prune was measured
+        // against a cutoff another arm published. That is NOT an infeasibility
+        // proof -- it proves "nothing BETTER than the cutoff lives anywhere",
+        // not "nothing lives anywhere". Claiming Infeasible here would be the
+        // same defect as the implied-integrality false Infeasible fixed
+        // 2026-09-19.
+        //
+        // It IS, however, a real and valuable proof for the portfolio: this
+        // arm searched the whole space and found nothing beating the cutoff,
+        // so whichever arm achieves that cutoff holds a global optimum. The
+        // flag lets the driver claim it against the pool's point; alone, this
+        // arm can only say it found nothing.
+        diag.proved_no_better_than_cutoff = true;
+        raw.proposed_status = core::Status::NoSolutionFound;
+        raw.proposed_level = core::ProofLevel::None;
+        raw.termination_reason =
+            "tree exhausted against a shared cutoff; optimality of that cutoff "
+            "is proved, but this arm holds no point achieving it";
     } else {
         raw.proposed_status = core::Status::Interrupted;
         raw.proposed_level = core::ProofLevel::None;
+    }
+
+    {
+        const auto st = core::to_string(raw.proposed_status);
+        char tbuf[256];
+        std::snprintf(
+            tbuf, sizeof tbuf,
+            "\"status\":\"%.*s\",\"nodes\":%llu,\"proved\":%s,\"reason\":\"%s\"",
+            static_cast<int>(st.size()), st.data(),
+            static_cast<unsigned long long>(diag.nodes),
+            diag.globally_proved ? "true" : "false", reason.c_str());
+        SOR_ROUTE(1, "bab", "terminal", tbuf);
     }
 
     return raw;

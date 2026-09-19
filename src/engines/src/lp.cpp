@@ -248,6 +248,37 @@ std::pair<core::RawResult, core::ProofEvidence> lift_reduced_candidate(
     core::ProofEvidence ev = recovered.validated
         ? recovered.evidence
         : independently_checked(original, lifted, producer_ev);
+    // recover_solution builds a fresh RawResult for check_lp_point and never
+    // copies the engine's proposed_level into it, so a validated lift returns
+    // evidence with claimed_level=None even when the reduced solve proved
+    // Optimal at ProvedOptimalFP. That made finalize_result reject an otherwise
+    // perfect HPR→crossover→simplex path ("Optimal rejected: evidence supports
+    // only None") while --no-presolve (no lift) succeeded. Restore the claim
+    // from the reduced raw / producer; never invent a stronger one.
+    if (ev.claimed_level == core::ProofLevel::None) {
+        if (raw.proposed_level != core::ProofLevel::None)
+            ev.claimed_level = raw.proposed_level;
+        else if (producer_ev.claimed_level != core::ProofLevel::None)
+            ev.claimed_level = producer_ev.claimed_level;
+    }
+    if (reduced_basis != nullptr && !reduced_basis->status.empty())
+        ev.has_basis = true;
+    else if (producer_ev.has_basis)
+        ev.has_basis = true;
+    // recover_solution never writes dual_bound; finalize_result then rejects
+    // ProvedOptimalFP with "objective or dual bound is not finite". When the
+    // independent checker closed the gap, the dual bound equals the objective
+    // at the claimed tolerances - publish it. Otherwise keep any finite value
+    // the reduced engine already had.
+    if (!std::isfinite(lifted.dual_bound)) {
+        if (std::isfinite(lifted.objective) &&
+            std::isfinite(ev.gap_rel) && ev.gap_rel <= ev.gap_tol)
+            lifted.dual_bound = lifted.objective;
+        else if (std::isfinite(raw.dual_bound))
+            lifted.dual_bound = raw.dual_bound;
+    }
+    if (!std::isfinite(lifted.objective) && std::isfinite(raw.objective))
+        lifted.objective = raw.objective;
     return {std::move(lifted), ev};
 }
 
@@ -500,7 +531,16 @@ core::RawResult solve_lp(const model::LpProblem& problem,
     if (!device) return unsupported(
         "selected backend is unavailable for HPR", diagnostics, evidence);
     const bool is_auto = options.strategy == LpStrategy::Auto;
-    const double fo_fraction = is_auto ? diagnostics.fo_budget_fraction : 1.0;
+    // Explicit --engine hpr/pdhg used to take fo_fraction=1.0 and then early-
+    // return before crossover (`!is_auto` below). That made `--fo-crossover`
+    // a no-op on the explicit FO path: afiro converged to Feasible in 3200
+    // HPR steps and never handed the point to crossover_to_simplex, so the
+    // FO path could not reach ProvedOptimalFP. When crossover is requested,
+    // reserve the same FO/crossover split Auto uses; otherwise FO may consume
+    // the whole budget.
+    const bool want_crossover = options.fo_crossover;
+    const double fo_fraction =
+        (is_auto || want_crossover) ? diagnostics.fo_budget_fraction : 1.0;
     const double fo_time = remaining_seconds(
         options, start, fo_fraction);
     HprOptions hpr_options;
@@ -532,7 +572,15 @@ core::RawResult solve_lp(const model::LpProblem& problem,
         fo_raw = solve_hpr(work_problem, hpr_options, *device, hpr_diag);
         diagnostics.fo_elapsed_s = elapsed_seconds(fo_start);
         const auto producer_ev = hpr_evidence(hpr_diag, hpr_options);
-        const bool defer_fo_lift = presolve_map != nullptr && is_auto;
+        // Defer the FO lift whenever crossover (or the simplex reserve) will
+        // still run on the reduced model. Explicit --engine hpr used to lift
+        // immediately here; crossover then saw an original-sized x against
+        // work_problem and built no basis (0 pivots), after which the simplex
+        // reserve's postsolve evidence often failed to carry ProvedOptimalFP.
+        // Auto already deferred; do the same whenever we will not return FO
+        // as the final answer.
+        const bool defer_fo_lift =
+            presolve_map != nullptr && (is_auto || want_crossover);
         if (defer_fo_lift) {
             fo_ev = independently_checked(
                 work_problem, fo_raw, producer_ev);
@@ -553,7 +601,14 @@ core::RawResult solve_lp(const model::LpProblem& problem,
     // capability refusal, not an invitation to silently finish on CPU.
     if (fo_raw.proposed_status == core::Status::Unsupported)
         return finish(std::move(fo_raw), fo_ev);
-    if (certified_terminal(fo_raw, fo_ev) || !is_auto) {
+    // Certified infeasible/unbounded ends the LP. Explicit FO without
+    // crossover returns the FO answer. Auto always continues into the
+    // crossover (if enabled) and simplex-reserve stages - that shared budget
+    // accounting is what test_lp_auto pins, and it is how Auto recovers when
+    // FO only reaches Feasible.
+    const bool stop_without_crossover =
+        certified_terminal(fo_raw, fo_ev) || (!is_auto && !want_crossover);
+    if (stop_without_crossover) {
         if (presolve_map != nullptr &&
             candidate_in_reduced_space(work_problem, fo_raw)) {
             const auto lifted = lift_reduced_candidate(

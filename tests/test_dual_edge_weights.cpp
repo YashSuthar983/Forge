@@ -309,6 +309,223 @@ int test_dse_matches_other_pricing_on_larger_lps() {
     return failures;
 }
 
+// The seeded rebuild must be a pure speedup: supplying the seeded BTRAN may
+// change how many rows the solve touches, never a single bit of the resulting
+// weights -- one different bit can change a later CHUZR and therefore the whole
+// pivot sequence. Bitwise equality is the assertion, on a factor that carries
+// product-form etas (where the hypersparse firing path actually runs), and the
+// test also proves it is not vacuous by requiring the sparse route to fire.
+int test_seeded_rebuild_is_bit_identical() {
+    using sor::core::Index;
+    using sor::core::Offset;
+    using sor::core::f64;
+    using sor::la::BasisFactor;
+
+    // Lower-bidiagonal, so B^-T e_i reaches only a short tail of rows: the
+    // regime the hypersparse path is built for.
+    constexpr Index m = 256;
+    std::vector<Offset> cp{0};
+    std::vector<Index> ri;
+    std::vector<f64> bv;
+    for (Index j = 0; j < m; ++j) {
+        ri.push_back(j);
+        bv.push_back(2.0 + 0.03 * static_cast<f64>(j));
+        if (j + 1 < m) {
+            ri.push_back(j + 1);
+            bv.push_back(0.35);
+        }
+        cp.push_back(static_cast<Offset>(ri.size()));
+    }
+
+    BasisFactor factor;
+    if (!factor.factorize(m, cp, ri, bv, sor::la::LuOptions{})) return 1;
+
+    // Append etas so the seeded BTRAN exercises the firing-set path, not just
+    // the eta-free base solve.
+    std::mt19937 rng(4421);
+    std::uniform_real_distribution<f64> dist(-1.0, 1.0);
+    for (int step = 0; step < 12; ++step) {
+        const Index leave = static_cast<Index>((37 * step + 2) % m);
+        // Sparse entering columns keep the etas sparse; dense etas would make
+        // every BTRAN dense and quietly turn this test vacuous.
+        std::vector<f64> alpha(static_cast<std::size_t>(m), 0.0);
+        for (int k = 0; k < 3; ++k)
+            alpha[static_cast<std::size_t>((17 * step + 5 * k) % m)] = dist(rng);
+        factor.ftran(alpha);
+        if (std::fabs(alpha[static_cast<std::size_t>(leave)]) < 0.5)
+            alpha[static_cast<std::size_t>(leave)] +=
+                alpha[static_cast<std::size_t>(leave)] < 0.0 ? -1.0 : 1.0;
+        if (!factor.update(leave, alpha)) return 1;
+    }
+
+    std::vector<f64> dense;
+    if (!sor::engines::rebuild_dual_edge_weights(
+            m, [&](std::vector<f64>& v) { factor.btran(v); }, dense))
+        return 1;
+
+    std::vector<Index> seed(1, 0);
+    std::uint64_t sparse_calls = 0;
+    std::vector<f64> seeded;
+    if (!sor::engines::rebuild_dual_edge_weights(
+            m, [&](std::vector<f64>& v) { factor.btran(v); }, seeded,
+            [&](std::vector<f64>& v, Index slot, std::vector<Index>& support) {
+                seed[0] = slot;
+                const bool sparse =
+                    factor.btran_seeded_with_support(v, seed, support);
+                if (sparse) ++sparse_calls;
+                return sparse;
+            }))
+        return 1;
+
+    int failures = 0;
+    if (dense.size() != seeded.size()) return 1;
+    for (std::size_t i = 0; i < dense.size(); ++i) {
+        // Bitwise, not approximate.
+        if (!(dense[i] == seeded[i])) {
+            std::fprintf(stderr,
+                         "seeded DSE rebuild differs at row %zu: dense=%.17g seeded=%.17g\n",
+                         i, dense[i], seeded[i]);
+            ++failures;
+        }
+    }
+    if (sparse_calls == 0) {
+        std::fprintf(stderr, "seeded DSE rebuild never took the sparse path\n");
+        ++failures;
+    }
+    return failures;
+}
+
+// Carrying DSE weights between solves must be a pure saving: the second solve
+// reaches the same optimum, having skipped the rebuild. The test also pins both
+// guards -- a carrier whose basis does not match the run being started, and a
+// carrier from a different matrix, must both be refused rather than believed.
+int test_dse_weight_carrier() {
+    using sor::core::Index;
+    using sor::core::f64;
+    using sor::model::LpProblem;
+    int failures = 0;
+
+    constexpr Index m = 40;
+    constexpr Index n = m + 15;
+    std::mt19937 rng(20260917);
+    std::uniform_real_distribution<f64> val(0.5, 2.5);
+    std::vector<Index> rows, cols;
+    std::vector<f64> vals;
+    for (Index i = 0; i < m; ++i)
+        for (int off = 0; off < 3; ++off) {
+            rows.push_back(i);
+            cols.push_back((i + off) % n);
+            vals.push_back(val(rng));
+        }
+
+    LpProblem lp;
+    lp.name = "dse_carrier";
+    lp.A = sor::sparse::from_triplets(m, n, rows, cols, vals);
+    lp.c.assign(static_cast<std::size_t>(n), 0.0);
+    for (Index j = 0; j < n; ++j) lp.c[static_cast<std::size_t>(j)] = 1.0 + val(rng);
+    lp.row_lo.assign(static_cast<std::size_t>(m), 1.0);
+    lp.row_hi.assign(static_cast<std::size_t>(m), 40.0);
+    lp.col_lo.assign(static_cast<std::size_t>(n), 0.0);
+    lp.col_hi.assign(static_cast<std::size_t>(n), 15.0);
+
+    sor::engines::SimplexOptions opts;
+    opts.pricing = sor::engines::SimplexPricing::DSE;
+
+    sor::engines::SimplexDiagnostics parent_diag;
+    sor::engines::SimplexBasis parent_basis;
+    sor::engines::DualEdgeWeightCarrier carrier;
+    carrier.matrix = static_cast<const void*>(&lp);   // caller-declared identity
+    const auto parent = sor::engines::solve_dual_simplex(
+        lp, opts, parent_diag, &parent_basis, nullptr, &carrier);
+    if (parent.proposed_status != sor::core::Status::Optimal) return 1;
+    if (carrier.weights.size() != static_cast<std::size_t>(m) ||
+        carrier.basis.size() != static_cast<std::size_t>(m)) {
+        std::fprintf(stderr, "carrier not filled by the parent solve\n");
+        return 1;
+    }
+
+    // Branch: tighten one bound, which changes the LP but not its matrix.
+    LpProblem child = lp;
+    child.col_hi[3] = 2.0;
+
+    const auto solve_child = [&](sor::engines::DualEdgeWeightCarrier* c,
+                                 sor::engines::SimplexDiagnostics& d) {
+        sor::engines::SimplexBasis out;
+        return sor::engines::solve_dual_simplex(child, opts, d, &out,
+                                                &parent_basis, c);
+    };
+
+    sor::engines::SimplexDiagnostics cold_diag;
+    const auto cold = solve_child(nullptr, cold_diag);
+
+    auto warm_carrier = carrier;
+    sor::engines::SimplexDiagnostics warm_diag;
+    const auto warm = solve_child(&warm_carrier, warm_diag);
+
+    if (warm_diag.dse_weight_reuses != 1 || warm_diag.dse_weight_rebuilds != 0) {
+        std::fprintf(stderr, "carried weights not adopted (reuses=%llu rebuilds=%llu)\n",
+                     static_cast<unsigned long long>(warm_diag.dse_weight_reuses),
+                     static_cast<unsigned long long>(warm_diag.dse_weight_rebuilds));
+        ++failures;
+    }
+    if (cold_diag.dse_weight_rebuilds != 1 || cold_diag.dse_weight_reuses != 0) {
+        std::fprintf(stderr, "no-carrier solve did not rebuild (rebuilds=%llu)\n",
+                     static_cast<unsigned long long>(cold_diag.dse_weight_rebuilds));
+        ++failures;
+    }
+    if (cold.proposed_status != warm.proposed_status ||
+        std::fabs(cold.objective - warm.objective) >
+            1e-7 * (1.0 + std::fabs(cold.objective))) {
+        std::fprintf(stderr, "carried-weight solve changed the answer: %.12g vs %.12g\n",
+                     cold.objective, warm.objective);
+        ++failures;
+    }
+
+    // Guard 1: weights that belong to a different basis are refused.
+    auto wrong_basis = carrier;
+    wrong_basis.basis[0] = wrong_basis.basis[0] == 0 ? 1 : 0;
+    sor::engines::SimplexDiagnostics wrong_diag;
+    (void)solve_child(&wrong_basis, wrong_diag);
+    if (wrong_diag.dse_weight_reuses != 0 || wrong_diag.dse_weight_rebuilds != 1) {
+        std::fprintf(stderr, "mismatched basis was not refused\n");
+        ++failures;
+    }
+
+    // Guard 2: a carrier with no declared matrix is never adopted -- clear()
+    // is how a caller invalidates weights after changing the matrix.
+    auto anonymous = carrier;
+    anonymous.matrix = nullptr;
+    sor::engines::SimplexDiagnostics anon_diag;
+    (void)solve_child(&anonymous, anon_diag);
+    if (anon_diag.dse_weight_reuses != 0) {
+        std::fprintf(stderr, "carrier with no matrix token was adopted\n");
+        ++failures;
+    }
+
+    // Guard 3: the engine refuses weights whose shape no longer matches the
+    // problem, even under a token the caller forgot to clear.
+    LpProblem wider = child;
+    wider.c.push_back(1.0);
+    wider.col_lo.push_back(0.0);
+    wider.col_hi.push_back(5.0);
+    {
+        std::vector<Index> r2 = rows, c2 = cols;
+        std::vector<f64> v2 = vals;
+        r2.push_back(0); c2.push_back(n); v2.push_back(1.0);
+        wider.A = sor::sparse::from_triplets(m, n + 1, r2, c2, v2);
+    }
+    auto stale = carrier;
+    sor::engines::SimplexDiagnostics stale_diag;
+    sor::engines::SimplexBasis stale_out;
+    (void)sor::engines::solve_dual_simplex(wider, opts, stale_diag, &stale_out,
+                                           nullptr, &stale);
+    if (stale_diag.dse_weight_reuses != 0) {
+        std::fprintf(stderr, "weights were adopted after the shape changed\n");
+        ++failures;
+    }
+    return failures;
+}
+
 // Algebraic regression for the exact rank-one DSE update. End-to-end LP tests
 // prove that pricing cannot change the answer; this independently proves that
 // the propagated weights after every product-form basis replacement equal a
@@ -405,6 +622,8 @@ int main() {
     failures += test_rebuild_small_fixture();
     failures += test_devex_reference_weight_and_reset_policy();
     failures += test_dse_matches_other_pricing_on_larger_lps();
+    failures += test_seeded_rebuild_is_bit_identical();
+    failures += test_dse_weight_carrier();
     failures += test_incremental_dse_matches_full_rebuild();
     if (failures) std::fprintf(stderr, "%d failure(s)\n", failures);
     return failures ? 1 : 0;
