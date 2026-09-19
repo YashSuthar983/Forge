@@ -114,6 +114,9 @@ void test_simple_cover_is_found_and_violated() {
 
     const std::vector<f64> x = {0.5, 1.0, 1.0};
     CoverOptions o;
+    // Shipped default is OFF (emits invalid cuts, see covers.hpp).
+    // These cases test the lifting itself, so they opt in explicitly.
+    o.sequence_independent_lifting = true;
     CoverDiagnostics d;
     const auto cuts =
         separate_lifted_covers(lp, x, lp.col_lo, lp.col_hi, o, d);
@@ -146,6 +149,9 @@ void test_negative_coefficient_row_is_usable() {
 
     const std::vector<f64> x = {1.0, 1.0, 1.0};
     CoverOptions o;
+    // Shipped default is OFF (emits invalid cuts, see covers.hpp).
+    // These cases test the lifting itself, so they opt in explicitly.
+    o.sequence_independent_lifting = true;
     CoverDiagnostics d;
     const auto cuts = separate_lifted_covers(lp, x, lp.col_lo, lp.col_hi, o, d);
     CHECK(d.knapsacks_built >= 1);   // the row was NOT rejected
@@ -177,6 +183,9 @@ void test_continuous_term_is_relaxed_soundly() {
 
     const std::vector<f64> x = {0.7, 0.7, 0.7, 0.0};
     CoverOptions o;
+    // Shipped default is OFF (emits invalid cuts, see covers.hpp).
+    // These cases test the lifting itself, so they opt in explicitly.
+    o.sequence_independent_lifting = true;
     CoverDiagnostics d;
     const auto cuts = separate_lifted_covers(lp, x, lp.col_lo, lp.col_hi, o, d);
     // Cuts must hold for every integer assignment that is feasible for SOME y.
@@ -220,6 +229,9 @@ void test_random_cuts_are_valid_by_enumeration() {
             std::vector<f64> x(static_cast<std::size_t>(n));
             for (auto& v : x) v = unit(rng);
             CoverOptions o;
+            // Shipped default is OFF (emits invalid cuts, see covers.hpp).
+            // These cases test the lifting itself, so they opt in explicitly.
+            o.sequence_independent_lifting = true;
             CoverDiagnostics d;
             const auto cuts =
                 separate_lifted_covers(lp, x, lp.col_lo, lp.col_hi, o, d);
@@ -258,6 +270,9 @@ void test_lifting_strengthens_the_cover() {
 
     const std::vector<f64> x = {0.8, 0.8, 0.8, 0.6};
     CoverOptions o;
+    // Shipped default is OFF (emits invalid cuts, see covers.hpp).
+    // These cases test the lifting itself, so they opt in explicitly.
+    o.sequence_independent_lifting = true;
     CoverDiagnostics d;
     const auto cuts = separate_lifted_covers(lp, x, lp.col_lo, lp.col_hi, o, d);
     CHECK(!cuts.empty());
@@ -297,6 +312,9 @@ void test_pc_sequence_independent_lifting_valid() {
 
     const std::vector<f64> x = {0.8, 0.8, 0.8, 0.6, 0.1};
     CoverOptions o;
+    // Shipped default is OFF (emits invalid cuts, see covers.hpp).
+    // These cases test the lifting itself, so they opt in explicitly.
+    o.sequence_independent_lifting = true;
     o.pc_lift_hooks = true;
     CoverDiagnostics d;
     const auto cuts = separate_lifted_covers(lp, x, lp.col_lo, lp.col_hi, o, d);
@@ -334,6 +352,9 @@ void test_prasad_pc_half_integral_example() {
     // Push cover {0,1,2,3} to be selected: high LP values on cover, mid on outside.
     const std::vector<f64> x = {0.9, 0.9, 0.9, 0.9, 0.5, 0.5, 0.5};
     CoverOptions o;
+    // Shipped default is OFF (emits invalid cuts, see covers.hpp).
+    // These cases test the lifting itself, so they opt in explicitly.
+    o.sequence_independent_lifting = true;
     o.pc_lift_hooks = true;
     CoverDiagnostics d;
     const auto cuts = separate_lifted_covers(lp, x, lp.col_lo, lp.col_hi, o, d);
@@ -382,6 +403,9 @@ void test_pc_random_validity() {
         std::vector<f64> x(static_cast<std::size_t>(n));
         for (auto& v : x) v = unit(rng);
         CoverOptions o;
+        // Shipped default is OFF (emits invalid cuts, see covers.hpp).
+        // These cases test the lifting itself, so they opt in explicitly.
+        o.sequence_independent_lifting = true;
         o.pc_lift_hooks = true;
         CoverDiagnostics d;
         const auto cuts =

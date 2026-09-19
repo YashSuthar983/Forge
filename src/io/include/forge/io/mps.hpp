@@ -36,6 +36,11 @@ struct MpsReadOptions {
 };
 
 struct MpsReadReport {
+    // Reader self-timing (ms) and line count. See read_mps() for why the
+    // reader measures itself rather than relying on a profiler.
+    double ms_parse = 0.0;
+    double ms_assemble = 0.0;
+    std::size_t lines_read = 0;
     std::size_t n_rows = 0, n_cols = 0, n_integer = 0;
     core::Offset nnz = 0;
     bool had_ranges = false;

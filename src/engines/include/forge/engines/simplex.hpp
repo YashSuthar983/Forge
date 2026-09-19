@@ -307,6 +307,10 @@ struct SimplexDiagnostics {
     std::uint64_t devex_weight_checks = 0;
     std::uint64_t dse_weight_checks = 0;
     std::uint64_t dse_weight_rejections = 0;
+    // Solves that started from a caller-carried weight vector instead of
+    // paying the m-BTRAN rebuild (see DualEdgeWeightCarrier).
+    std::uint64_t dse_weight_reuses = 0;
+    std::uint64_t dse_weight_rebuilds = 0;
     std::uint64_t dse_to_devex_switches = 0;
     std::uint64_t dse_accuracy_switches = 0;
     std::uint64_t dse_stability_switches = 0;

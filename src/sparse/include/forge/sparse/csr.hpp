@@ -40,6 +40,10 @@ public:
     const std::vector<Offset>& row_ptr() const noexcept { return row_ptr_; }
     const std::vector<Index>&  col_idx() const noexcept { return col_idx_; }
 
+    // Append one row. `cols` must already be sorted ascending with no
+    // duplicates, and every index in [0, n_cols_). O(|cols|).
+    void append_row(const std::vector<Index>& cols);
+
     // Throws std::invalid_argument on a malformed pattern. Called on
     // construction so no kernel ever sees an inconsistent pattern.
     void validate() const;
@@ -59,6 +63,11 @@ struct CsrMatrix {
     Index n_rows() const noexcept { return pattern.n_rows(); }
     Index n_cols() const noexcept { return pattern.n_cols(); }
     Offset nnz()   const noexcept { return pattern.nnz(); }
+
+    // Append one row in place. Columns are sorted and duplicates summed, so
+    // callers may pass unsorted cut supports. O(k log k) in the row nnz -
+    // not O(matrix nnz) - which is what makes per-nogood learning affordable.
+    void append_row(std::vector<Index> cols, std::vector<f64> row_vals);
 };
 
 // Build CSR from unordered triplets, summing duplicate (row, col) entries.

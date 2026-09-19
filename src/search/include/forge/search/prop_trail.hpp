@@ -42,6 +42,13 @@ public:
     std::size_t size() const { return entries_.size(); }
     const std::vector<PropTrailEntry>& entries() const { return entries_; }
 
+    // Drop everything pushed after `n`. A backtracking search records
+    // trail.size() before a decision and undoes back to that mark by
+    // restoring each entry's old_bound in reverse order; see fixprop.cpp.
+    void truncate(std::size_t n) {
+        if (n < entries_.size()) entries_.resize(n);
+    }
+
     void push(Index var, BoundDir dir, f64 new_bound, f64 old_bound,
               ReasonKind kind, Index reason_id, int depth);
 

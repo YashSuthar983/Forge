@@ -211,7 +211,8 @@ bool build_flow_from_row(
     const model::LpProblem& lp, Index row, f64 sign, const std::vector<f64>& x,
     const std::vector<f64>& lo, const std::vector<f64>& hi,
     const std::unordered_map<Index, std::pair<Index, f64>>& vub,
-    const FlowCoverOptions& opts, std::vector<FlowArc>& arcs, f64& cap) {
+    const FlowCoverOptions& opts, std::vector<FlowArc>& arcs, f64& cap,
+    FlowCoverDiagnostics& diag) {
     const f64 bound = sign > 0.0 ? lp.row_hi[sz(row)] : -lp.row_lo[sz(row)];
     if (!std::isfinite(bound)) return false;
 
@@ -229,6 +230,32 @@ bool build_flow_from_row(
         if (is_continuous(lp, j) && a > opts.tol) {
             auto it = vub.find(j);
             if (it == vub.end()) continue;
+            // The flow cover inequality rests on 0 <= y <= u*x. A flow
+            // variable with a NEGATIVE lower bound breaks that outright: y can
+            // go below zero, the cover/lambda arithmetic no longer measures
+            // what it claims, and the resulting cut is not valid.
+            //
+            // This was unchecked. Measured on blend2 with --verify-cuts
+            // against the true optimum (7.5989850): 57 invalid FC_ cuts, e.g.
+            // FC_1 activity 12040 against an rhs of 312, and the solve
+            // reported a FALSE Optimal of 16.554765.
+            //
+            // The capacity line below already nods at negative lower bounds
+            // via hi - min(0, lo), but adjusting the CAPACITY is not the same
+            // as shifting the VARIABLE. The proper treatment is to substitute
+            // y' = y - lo >= 0 and carry the shift through cap.
+            //
+            // NOT A VERIFIED FIX EITHER: blend2 still produced 57 invalid cuts
+            // with this guard in place, so its flow arcs were not the problem.
+            // Three theories have now failed on this separator (tolerance
+            // flooring, unsafe lifting, negative flow bounds). The next person
+            // should dump one offending cut and check it term by term against
+            // the source row rather than reason about the derivation -- that
+            // is what finally worked for the cover and node-promotion bugs.
+            if (!std::isfinite(lo[sz(j)]) || lo[sz(j)] < -opts.tol) {
+                ++diag.rejected_negative_flow;
+                continue;
+            }
             FlowArc arc;
             arc.y = j;
             arc.x = it->second.first;
@@ -327,7 +354,7 @@ std::vector<CutRow> separate_flow_covers(const model::LpProblem& lp,
             if (static_cast<int>(cuts.size()) >= opts.max_cuts) break;
             f64 cap = 0.0;
             if (!build_flow_from_row(lp, i, sign, x, col_lo, col_hi, vub, opts,
-                                     arcs, cap))
+                                     arcs, cap, diag))
                 continue;
             ++diag.structures_built;
 
@@ -400,6 +427,33 @@ std::vector<CutRow> separate_flow_covers(const model::LpProblem& lp,
                     const f64 contrib =
                         a.y_val + beta * a.x_val;  // vs 0 if excluded
                     if (contrib <= opts.tol && beta >= -opts.tol) continue;
+                    // VALIDITY GUARD (2026-09-19). The rhs is fixed before this
+                    // loop and never adjusted, so a lifted arc may only be
+                    // added if its term cannot increase the left-hand side
+                    // beyond what the base inequality already allows.
+                    //
+                    // The arc contributes y + beta*x, and the VUB gives
+                    // y <= u*x, so its worst case over x in {0,1} is
+                    // max(0, u + beta). Validity without an rhs change
+                    // therefore needs u + beta <= 0. But gu_si_beta returns
+                    // -u + i*lambda on interval A, so for i >= 1 we get
+                    // u + beta = i*lambda > 0 -- each such arc silently adds
+                    // slack the rhs never paid for.
+                    //
+                    // Measured before this guard, with --verify-cuts against
+                    // blend2's true optimum: FC_0 reached activity 12040
+                    // against an rhs of 312, a factor of 38, and the solve
+                    // reported a FALSE Optimal of 16.554765 (true 7.5989850).
+                    //
+                    // NOT A VERIFIED FIX. u + beta <= 0 is a genuine
+                    // requirement of rhs-free lifting, so the guard is correct
+                    // to have, but blend2 STILL produced 57 invalid FC_ cuts
+                    // with it in place. Flow cover therefore remains default
+                    // OFF. Whatever is wrong is upstream of the lifting.
+                    if (a.u + beta > opts.tol) {
+                        ++diag.rejected_unsafe_lift;
+                        continue;
+                    }
                     push_coef(a.y, 1.0, a.y_val);
                     push_coef(a.x, beta, a.x_val);
                     ++lifted;

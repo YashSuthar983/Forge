@@ -37,12 +37,13 @@ enum class ConflictCutMode : std::uint8_t {
 };
 
 struct ConflictCutOptions {
-    // Default on for Latest. Dense pure-binary MIPs (enigma) auto-select
-    // SafeLimited unless force_paper; Classical forces off via policy.
+    // Default on for Latest. Dense *pure*-binary MIPs (enigma: no continuous,
+    // n_bin≥80) auto-disable Mexi unless force_paper; Classical forces off
+    // via policy. Mixed MIPs (e.g. misc03) stay on.
     bool enabled = true;
-    // Latest default = paper-complete; dense binaries may switch to SafeLimited.
+    // Latest default = paper-complete.
     ConflictCutMode mode = ConflictCutMode::Paper;
-    // When true, keep Paper even on dense pure-binary (--conflict-cut-paper).
+    // When true, keep Mexi even on dense pure-binary (--conflict-cut-paper).
     bool force_paper = false;
     int max_resolve_steps = 64;
     f64 tol = 1e-9;
@@ -130,10 +131,11 @@ enum class CutValidity : std::uint8_t {
     Unverified = 2,
 };
 
-// Binary-box check. Complete (Verified/Refuted) only when every integer
-// column is binary, every continuous column is fixed, and the binary count
-// fits the enumeration budget; otherwise a cheap refutation-only sweep over
-// the cut support runs (sound when it fires, Unverified when it does not).
+// Binary-box check. Complete (Verified/Refuted) when every integer column is
+// binary and every continuous column is fixed: full 2^n enum if n≤16, else
+// support-sized enum + bound-propagation (every violating support assignment
+// must be domain-infeasible). Mixed / free-continuous models get a cheap
+// refutation-only support sweep (sound when it fires, else Unverified).
 CutValidity conflict_cut_check_binary(const model::LpProblem& lp,
                                       const CutRow& cut,
                                       f64 tol = 1e-9);
@@ -159,7 +161,9 @@ std::optional<CutRow> build_nogood_from_branch_trail(const PropTrail& trail,
                                                      const model::LpProblem& lp,
                                                      f64 tol = 1e-9);
 
-// True iff the cut has no usable support (empty / all-near-zero coefs).
+// True iff the cut has no usable content (empty / all-near-zero coefs and no
+// contradictory rhs). Empty support with row_lo > 0 is a global ⊥ proof and
+// is NOT near-empty.
 bool conflict_cut_near_empty(const CutRow& cut, f64 tol = 1e-12);
 
 inline void apply_conflict_cut_policy(MilpPolicy policy, ConflictCutOptions& o) {

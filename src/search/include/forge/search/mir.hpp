@@ -104,12 +104,19 @@ struct MirDiagnostics {
 // [col_lo, col_hi]. Every returned inequality is valid for every point of `lp`
 // that satisfies integrality -- continuous columns included, which is the part
 // the previous attempt got wrong.
+// `root_lo`/`root_hi`, when supplied, are the GLOBAL (root) bounds. Each cut
+// then reports in CutRow::used_local_bound whether its derivation substituted
+// onto a bound that branching had tightened, which is what decides if it may
+// be promoted to the global cut pool. Passing null marks every cut local,
+// which is the safe default.
 std::vector<CutRow> separate_mir(const model::LpProblem& lp,
                                  const std::vector<f64>& x,
                                  const std::vector<f64>& col_lo,
                                  const std::vector<f64>& col_hi,
                                  const MirOptions& opts,
-                                 MirDiagnostics& diag);
+                                 MirDiagnostics& diag,
+                                 const std::vector<f64>* root_lo = nullptr,
+                                 const std::vector<f64>* root_hi = nullptr);
 
 // Shared cMIR primitive for Mexi conflict reason reduction (arXiv:2410.15110
 // §4.2 / §7) and Marchand-Wolsey separation.

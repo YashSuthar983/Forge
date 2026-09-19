@@ -96,6 +96,8 @@ void usage() {
         "  --cut-parallel-penalty F  score penalty for parallel cuts (0=off)\n"
         "  --cut-extra-scores F  weight of the sparsity and low-lock score terms\n"
         "  --milp-policy NAME latest (default) | classical (ablation only)\n"
+        "  --no-fixprop     skip Fix-Propagate-Repair\n"
+        "  --fixprop-time S      wall budget for Fix-Propagate-Repair\n"
         "  --branch-strategy NAME  auto|sparse-sb|sc-milp|lifted|planbb (latest only)\n"
         "  --sparse-sb-model PATH  load sparse-SB branching model (policy=latest)\n"
         "  --sparse-sb-collect    record SB labels during strong-branch probes\n"
@@ -333,6 +335,9 @@ int main(int argc, char** argv) {
     int gcs_reinject = -1;
     bool basis_update_explicit = false;
     std::string milp_policy = "latest";
+    bool fixprop_enabled = true;
+    double fixprop_time_s = 0.0;
+    bool fixprop_time_given = false;
     std::string branch_strategy = "auto";
     std::string sparse_sb_model;
     bool sparse_sb_collect = false;
@@ -591,6 +596,12 @@ int main(int argc, char** argv) {
                 parse_uint(next("--gcs-reinject"), "--gcs-reinject", 0,
                            1000000));
         else if (a == "--milp-policy") milp_policy = next("--milp-policy");
+        else if (a == "--no-fixprop") fixprop_enabled = false;
+        else if (a == "--fixprop-time") {
+            fixprop_time_s = parse_real(next("--fixprop-time"),
+                                        "--fixprop-time", 0.0);
+            fixprop_time_given = true;
+        }
         else if (a == "--branch-strategy")
             branch_strategy = next("--branch-strategy");
         else if (a == "--sparse-sb-model")
@@ -865,6 +876,8 @@ int main(int argc, char** argv) {
                 bab.cut.pool_weight_low_locks = cut_extra_scores;
             }
             bab.conflict_propagation = conflict_propagation;
+            bab.fixprop = fixprop_enabled;
+            if (fixprop_time_given) bab.fixprop_time_s = fixprop_time_s;
             bab.conflict_cut.enabled = conflict_cut;
             // --no-conflict-cut is the conflict-LEARNING family switch:
             // both the Mexi path and branch-trail nogoods go off together.
