@@ -1,10 +1,12 @@
 #include "sor/engines/dual_edge_weights.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <limits>
 
 namespace sor::engines {
+
 
 DualInitialPricingStrategy choose_dual_initial_pricing(
     const core::Index rows,
@@ -33,20 +35,72 @@ DualInitialPricingStrategy choose_dual_initial_pricing(
 bool rebuild_dual_edge_weights(
     const core::Index m,
     const std::function<void(std::vector<core::f64>&)>& btran,
-    std::vector<core::f64>& weights) {
+    std::vector<core::f64>& weights,
+    const SeededUnitBtran& btran_seeded) {
     if (m < 0 || !btran) return false;
     weights.assign(static_cast<std::size_t>(m), 1.0);
     std::vector<core::f64> rhs(static_cast<std::size_t>(m), 0.0);
+    // Seeded path (Koberstein 6.3 / Gilbert-Peierls): every RHS here is a unit
+    // vector, so the solve already knows where its input is nonzero and can
+    // report the reach it wrote. That collapses BOTH O(m) sweeps per row -- the
+    // clear and the norm -- to O(|reach|), leaving only the solve itself. The
+    // support is summed in ASCENDING ROW ORDER so the norm is bit-identical to
+    // the dense scan below: rows outside the reach hold exactly 0.0, and adding
+    // 0.0 is exact, so the two loops accumulate the same values in the same
+    // order. Weights (and therefore every later pivot choice) are unchanged.
+    // One finiteness test at the end rather than two per element: the terms are
+    // all v*v >= 0, so nothing can cancel -- a single inf or NaN anywhere
+    // propagates to the total and is caught there.
+    const auto dense_norm2 = [](const std::vector<core::f64>& v) {
+        core::f64 s = 0.0;
+        for (const core::f64 x : v) s += x * x;
+        return s;
+    };
+    std::vector<core::Index> support;
     for (core::Index i = 0; i < m; ++i) {
-        std::fill(rhs.begin(), rhs.end(), 0.0);
+        // rhs is all-zero here (start of loop, or restored by the tail below).
         rhs[static_cast<std::size_t>(i)] = 1.0;
-        btran(rhs);
-        core::f64 norm2 = 0.0;
-        for (const core::f64 v : rhs) {
-            if (!std::isfinite(v)) return false;
-            norm2 += v * v;
-            if (!std::isfinite(norm2)) return false;
+        bool sparse = false;
+        if (btran_seeded) {
+            // A false return means the seeded call took its own dense path and
+            // has already written every row -- do NOT solve again.
+            sparse = btran_seeded(rhs, i, support);
+        } else {
+            btran(rhs);
         }
+        core::f64 norm2 = 0.0;
+        if (sparse) {
+            // Both summations below are over the same multiset of values in the
+            // same ascending order -- the rows outside the reach hold exactly
+            // 0.0 and adding 0.0 is exact -- so they agree bit for bit and the
+            // choice is purely about cost. Reading the reach in order needs a
+            // sort (k log k); the dense scan is m. Take the cheaper one: the
+            // solve's own sparsity gate admits a reach of up to a quarter of m,
+            // where the sort would otherwise cost more than the scan it saves.
+            const std::size_t k = support.size();
+            const std::size_t log2k =
+                k < 2 ? 1 : static_cast<std::size_t>(std::bit_width(k) - 1);
+            if (k * log2k < static_cast<std::size_t>(m)) {
+                std::sort(support.begin(), support.end());
+                for (const core::Index r : support) {
+                    const core::f64 v = rhs[static_cast<std::size_t>(r)];
+                    norm2 += v * v;
+                }
+            } else {
+                norm2 = dense_norm2(rhs);
+            }
+            // Restore the all-zero precondition for the next unit RHS: the
+            // written reach, plus the seed slot when the solve did not write
+            // it (a zero pivot leaves e_i in place untouched). O(|reach|)
+            // either way -- the dense sum above does not dirty anything else.
+            for (const core::Index r : support)
+                rhs[static_cast<std::size_t>(r)] = 0.0;
+            rhs[static_cast<std::size_t>(i)] = 0.0;
+        } else {
+            norm2 = dense_norm2(rhs);
+            std::fill(rhs.begin(), rhs.end(), 0.0);
+        }
+        if (!std::isfinite(norm2)) return false;
         weights[static_cast<std::size_t>(i)] = std::max(norm2, 1e-300);
     }
     return true;

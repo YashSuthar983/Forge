@@ -1,6 +1,7 @@
 #include "sor/search/conflict_cut.hpp"
 
 #include "sor/search/mir.hpp"
+#include "sor/search/propagate.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -913,17 +914,147 @@ CutValidity conflict_cut_check_binary(const model::LpProblem& lp,
         }
     }
 
+    auto cut_violated_at = [&](const std::vector<f64>& x) -> bool {
+        f64 lhs = 0.0;
+        for (std::size_t t = 0; t < cut.cols.size(); ++t) {
+            const Index j = cut.cols[t];
+            if (j < 0 || j >= n) continue;
+            lhs += cut.vals[t] * x[sz(j)];
+        }
+        if (std::isfinite(cut.row_lo) && lhs + tol < cut.row_lo) return true;
+        if (std::isfinite(cut.row_hi) && lhs > cut.row_hi + tol) return true;
+        return false;
+    };
+
+    // Large pure-binary box: 2^n exceeds the full-enum budget, but FUIP cuts
+    // typically have tiny support. Sound Verified path: every support
+    // assignment that violates the cut must be domain-infeasible under
+    // bound propagation (prop-infeasible ⇒ truly infeasible). If prop
+    // cannot rule a violator out, stay Unverified (fail-closed) unless a
+    // concrete LP-feasible witness refutes.
+    auto verify_large_pure_binary_by_support = [&]() -> CutValidity {
+        std::vector<Index> support;
+        support.reserve(cut.cols.size());
+        for (Index j : cut.cols) {
+            if (j < 0 || j >= n) return CutValidity::Unverified;
+            if (lp.is_integer.empty() || !lp.is_integer[sz(j)])
+                return CutValidity::Unverified;
+            if (lp.col_lo[sz(j)] < -tol || lp.col_hi[sz(j)] > 1.0 + tol)
+                return CutValidity::Unverified;
+            support.push_back(j);
+        }
+        std::sort(support.begin(), support.end());
+        support.erase(std::unique(support.begin(), support.end()),
+                      support.end());
+        // Cap by WORK, not by support size. Each mask costs a full
+        // max_row_violation() + max_bound_violation() pass, i.e. O(nnz), so a
+        // flat 2^16 bound is 1.2e9 operations on an 18k-nnz model -- measured
+        // at ~1 s per learned nogood on app1-1, invisible to every timer.
+        // Same reasoning as the general checker: this is defense-in-depth on
+        // a cut that is sound by construction and it is fail-closed only on
+        // REFUTATION, so a smaller sweep costs refutation power, never
+        // soundness.
+        {
+            const std::size_t nnz_cost =
+                std::max<std::size_t>(static_cast<std::size_t>(lp.nnz()), 1);
+            const std::size_t kEnumWorkCap = 2000000;
+            std::size_t max_support = 0;
+            while (max_support < 16 &&
+                   (static_cast<std::size_t>(1) << (max_support + 1)) <=
+                       kEnumWorkCap / nnz_cost)
+                ++max_support;
+            if (support.size() > max_support) return CutValidity::Unverified;
+        }
+
+        if (support.empty()) {
+            // 0 >= rhs (or 0 <= rhs): check whether any domain-feasible
+            // point exists; if none, the contradiction cut is vacuously
+            // valid for the integer box.
+            std::vector<f64> lo = lp.col_lo, hi = lp.col_hi;
+            const auto pr = propagate_bounds(lp, lo, hi, tol, 32);
+            if (!pr.feasible) return CutValidity::Verified;
+            std::vector<f64> x(static_cast<std::size_t>(n), 0.0);
+            for (Index j = 0; j < n; ++j) {
+                if (lo[sz(j)] == hi[sz(j)]) x[sz(j)] = lo[sz(j)];
+                else if (lo[sz(j)] > 0.0) x[sz(j)] = lo[sz(j)];
+                else if (hi[sz(j)] < 0.0) x[sz(j)] = hi[sz(j)];
+            }
+            if (lp.max_row_violation(x) <= tol &&
+                lp.max_bound_violation(x) <= tol && cut_violated_at(x))
+                return CutValidity::Refuted;
+            return CutValidity::Unverified;
+        }
+
+        const std::size_t ns = support.size();
+        const std::size_t total = static_cast<std::size_t>(1) << ns;
+        for (std::size_t mask = 0; mask < total; ++mask) {
+            std::vector<f64> x(static_cast<std::size_t>(n), 0.0);
+            for (Index j = 0; j < n; ++j) {
+                if (lp.col_lo[sz(j)] == lp.col_hi[sz(j)])
+                    x[sz(j)] = lp.col_lo[sz(j)];
+            }
+            for (std::size_t b = 0; b < ns; ++b)
+                x[sz(support[b])] = static_cast<f64>((mask >> b) & 1);
+            if (!cut_violated_at(x)) continue;
+
+            std::vector<f64> lo = lp.col_lo, hi = lp.col_hi;
+            for (std::size_t b = 0; b < ns; ++b) {
+                const f64 v = static_cast<f64>((mask >> b) & 1);
+                lo[sz(support[b])] = v;
+                hi[sz(support[b])] = v;
+            }
+            const auto pr = propagate_bounds(lp, lo, hi, tol, 32);
+            if (!pr.feasible) continue;  // violator ruled out
+
+            // Prop did not prove empty: try a concrete witness on the
+            // post-prop box (fixed support + lo on free cols).
+            for (Index j = 0; j < n; ++j) {
+                if (lo[sz(j)] == hi[sz(j)]) x[sz(j)] = lo[sz(j)];
+                else x[sz(j)] = lo[sz(j)];
+            }
+            if (lp.max_row_violation(x) <= tol &&
+                lp.max_bound_violation(x) <= tol && cut_violated_at(x))
+                return CutValidity::Refuted;
+            return CutValidity::Unverified;
+        }
+        return CutValidity::Verified;
+    };
+
     // Refutation sweep over a candidate set: points built from enumerated
     // columns with everything else at its fixed value (0 when free) are
     // genuine LP points, so a violating one is a definitive witness. Used
     // for the full binary set when complete, else for the cut support.
+    // One work cap for every exhaustive sweep in this file. Each mask costs a
+    // full max_row_violation() + max_bound_violation() pass, i.e. O(nnz), so
+    // bounding the EXPONENT alone bounds nothing: a flat 2^16 is 1.2e9
+    // operations on an 18k-nnz model. Measured on app1-1 -- 42 nodes, and
+    // 19,126 ms of a 30 s budget inside this one function, attributed to no
+    // timer at all.
+    const std::size_t nnz_cost =
+        std::max<std::size_t>(static_cast<std::size_t>(lp.nnz()), 1);
+    const std::size_t kEnumWorkCap = 2000000;
+    std::size_t max_sweep_bits = 0;
+    while (max_sweep_bits < 16 &&
+           (static_cast<std::size_t>(1) << (max_sweep_bits + 1)) <=
+               kEnumWorkCap / nnz_cost)
+        ++max_sweep_bits;
+
     std::vector<Index> sweep;
     if (complete) {
-        if (bins.size() > 16) return CutValidity::Unverified;  // 2^16 budget
+        if (bins.size() > max_sweep_bits)
+            return verify_large_pure_binary_by_support();
         sweep = bins;
     } else {
-        // Support-only sweep: sound for refutation, not for verification
-        // (columns outside the support sit at 0/fixed, not their whole box).
+        // Mixed MIP / general integers: full-box Verified is impossible, but
+        // FUIP cuts almost always have tiny pure-binary support. The
+        // support+prop path is sound there (every cut-violating support
+        // assignment must be domain-infeasible). Without this, misc03-class
+        // models abort every Mexi cut at Unverified despite valid derivation.
+        {
+            const CutValidity via = verify_large_pure_binary_by_support();
+            if (via != CutValidity::Unverified) return via;
+        }
+        // Support-only sweep: sound for refutation only.
         if (!cut.cols.empty() && cut.cols.size() <= 20) {
             for (Index j : cut.cols) {
                 if (j < 0 || j >= n) continue;
@@ -934,6 +1065,12 @@ CutValidity conflict_cut_check_binary(const model::LpProblem& lp,
         }
         if (sweep.empty()) return CutValidity::Unverified;
     }
+
+    // The support-only sweep allowed 2^20 masks. At O(nnz) per mask that is
+    // 1.9e10 operations on an 18k-nnz model -- the dominant cost of the whole
+    // solve on app1-1 (18,975 ms of 30 s) and invisible to every timer. Same
+    // work cap as the other sweeps in this file.
+    if (sweep.size() > max_sweep_bits) return CutValidity::Unverified;
 
     const std::size_t nb = sweep.size();
     const std::size_t total = static_cast<std::size_t>(1) << nb;
@@ -947,13 +1084,7 @@ CutValidity conflict_cut_check_binary(const model::LpProblem& lp,
             x[sz(sweep[b])] = static_cast<f64>((mask >> b) & 1);
         if (lp.max_row_violation(x) > tol || lp.max_bound_violation(x) > tol)
             continue;
-        f64 lhs = 0.0;
-        for (std::size_t t = 0; t < cut.cols.size(); ++t)
-            lhs += cut.vals[t] * x[sz(cut.cols[t])];
-        if (std::isfinite(cut.row_lo) && lhs + tol < cut.row_lo)
-            return CutValidity::Refuted;
-        if (std::isfinite(cut.row_hi) && lhs > cut.row_hi + tol)
-            return CutValidity::Refuted;
+        if (cut_violated_at(x)) return CutValidity::Refuted;
     }
     return complete ? CutValidity::Verified : CutValidity::Unverified;
 }
@@ -964,6 +1095,28 @@ CutValidity conflict_cut_check_general(const model::LpProblem& lp,
                                        std::size_t max_points,
                                        bool* enumerated) {
     if (enumerated) *enumerated = false;
+    // WORK cap, not just a POINT cap.
+    //
+    // Each enumerated point costs a full pass over the model:
+    // max_row_violation() + max_bound_violation() are O(nnz). Capping the
+    // number of POINTS alone therefore bounds nothing -- on app1-1
+    // (4926 x 2480, 18275 nnz) the default 2^16 points meant 1.2e9
+    // operations, and this check cost 1.4 SECONDS per learned nogood.
+    // Traced end to end: node LP infeasible -> prune -> learn nogood ->
+    // validate here -> 21 nogoods x 1.4 s = 29 s of a 30 s budget, none of it
+    // visible in any timer, while the search branched 44 nodes.
+    //
+    // This is a defense-in-depth check on a cut that is sound by construction
+    // and it is fail-closed only on REFUTATION, so running it on fewer points
+    // costs refutation power, never soundness. Bounding points*nnz keeps it
+    // free on the small models where exhaustive enumeration is genuinely
+    // decisive, and stops it dominating a solve on anything larger.
+    const std::size_t nnz_cost =
+        std::max<std::size_t>(static_cast<std::size_t>(lp.nnz()), 1);
+    const std::size_t kEnumWorkCap = 2000000;   // ~2e7 was still 100+ ms/cut
+    const std::size_t eff_max_points = std::max<std::size_t>(
+        64, std::min(max_points, kEnumWorkCap / nnz_cost));
+
     const Index n = lp.n_cols();
     std::vector<Index> ints;
     std::vector<int> lo_i, hi_i;
@@ -987,7 +1140,7 @@ CutValidity conflict_cut_check_general(const model::LpProblem& lp,
         // empty sweep - false Optimal on gen-ip002 (2026-09-14).
         if (!std::isfinite(lo) || !std::isfinite(hi))
             return CutValidity::Unverified;
-        if (hi - lo > static_cast<f64>(max_points) + 1.0)
+        if (hi - lo > static_cast<f64>(eff_max_points) + 1.0)
             return CutValidity::Unverified;
         const f64 lj_f = std::ceil(lo - tol);
         const f64 uj_f = std::floor(hi + tol);
@@ -1001,7 +1154,7 @@ CutValidity conflict_cut_check_general(const model::LpProblem& lp,
         const int lj = static_cast<int>(lj_f);
         const int uj = static_cast<int>(uj_f);
         const std::size_t span = static_cast<std::size_t>(uj - lj + 1);
-        if (span == 0 || product > max_points / std::max<std::size_t>(span, 1)) {
+        if (span == 0 || product > eff_max_points / std::max<std::size_t>(span, 1)) {
             if (enumerated) *enumerated = false;
             return CutValidity::Unverified;
         }
@@ -1058,10 +1211,13 @@ CutValidity conflict_cut_check_general(const model::LpProblem& lp,
 }
 
 bool conflict_cut_near_empty(const CutRow& cut, f64 tol) {
-    if (cut.cols.empty() || cut.vals.empty()) return true;
     if (cut.cols.size() != cut.vals.size()) return true;
     for (f64 v : cut.vals)
         if (std::fabs(v) > tol) return false;
+    // Empty / all-zero support with a contradictory rhs is a global ⊥
+    // proof (0 >= positive), not "no cut" - allow apply to see it.
+    if (std::isfinite(cut.row_lo) && cut.row_lo > tol) return false;
+    if (std::isfinite(cut.row_hi) && cut.row_hi < -tol) return false;
     return true;
 }
 

@@ -124,7 +124,7 @@ void test_classical_default_off() {
     CHECK(!o.enabled);
     BabOptions latest;
     latest.policy = MilpPolicy::Latest;
-    // Product default: Mexi on again (SafeLimited auto for dense binary).
+    // Product default: Mexi on in struct; bab auto-disables on dense pure-binary.
     CHECK(latest.conflict_cut.enabled);
     CHECK(latest.conflict_cut.mode == ConflictCutMode::Paper);
 }
@@ -227,6 +227,73 @@ void test_near_empty_cut_refused() {
     zeros.cols = {0, 1};
     zeros.vals = {0.0, 0.0};
     CHECK(sor::search::conflict_cut_near_empty(zeros));
+    // Global ⊥ (0 >= 1) is a real conflict cut, not "empty".
+    sor::search::CutRow bot;
+    bot.row_lo = 1.0;
+    CHECK(!sor::search::conflict_cut_near_empty(bot));
+}
+
+void test_large_pure_binary_support_verified() {
+    // 20 binaries with x0 + x1 >= 1. Full 2^20 exceeds the old enum budget;
+    // support+prop verification must still certify the redundant cut.
+    constexpr int n = 20;
+    std::vector<sor::core::Index> rows(2, 0), cols = {0, 1};
+    std::vector<sor::core::f64> vals = {1.0, 1.0};
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(1, n, rows, cols, vals);
+    lp.row_lo = {1.0};
+    lp.row_hi = {sor::model::kInf};
+    lp.c.assign(static_cast<std::size_t>(n), 1.0);
+    lp.col_lo.assign(static_cast<std::size_t>(n), 0.0);
+    lp.col_hi.assign(static_cast<std::size_t>(n), 1.0);
+    lp.is_integer.assign(static_cast<std::size_t>(n), true);
+
+    sor::search::CutRow valid;
+    valid.cols = {0, 1};
+    valid.vals = {1.0, 1.0};
+    valid.row_lo = 1.0;
+    valid.row_hi = sor::model::kInf;
+    CHECK(sor::search::conflict_cut_check_binary(lp, valid) ==
+          CutValidity::Verified);
+
+    // Invalid strengthening: x0 + x1 >= 2 excludes the feasible (1,0).
+    sor::search::CutRow invalid = valid;
+    invalid.row_lo = 2.0;
+    CHECK(sor::search::conflict_cut_check_binary(lp, invalid) ==
+          CutValidity::Refuted);
+}
+
+void test_p0033_latest_learns_mexi_cut() {
+    // p0033: 33 pure binaries - Mexi stays on (n_bin < 80). Before support+prop
+    // verification, every FUIP cut died at Verified-only apply (2^33 budget).
+    const char* candidates[] = {
+        "benchmarks/miplib-easy/mps/p0033.mps",
+        "../benchmarks/miplib-easy/mps/p0033.mps",
+        "sor/benchmarks/miplib-easy/mps/p0033.mps",
+    };
+    const char* path = nullptr;
+    for (const char* c : candidates) {
+        std::ifstream in(c);
+        if (in) {
+            path = c;
+            break;
+        }
+    }
+    if (!path) {
+        ::sor::test::report(true, "p0033: skipped (no mps)", __FILE__, __LINE__);
+        return;
+    }
+    sor::io::MpsReadReport rep;
+    auto lp = sor::io::read_mps_file(path, rep);
+    BabOptions opts;
+    opts.policy = MilpPolicy::Latest;
+    opts.time_limit_s = 15.0;
+    opts.feasibility_jump = false;
+    BabDiagnostics diag;
+    sor::search::solve_milp(lp, opts, diag);
+    CHECK(diag.conflict_cut_diag.attempts >= 1);
+    CHECK(diag.conflict_cut_diag.learned >= 1);
+    CHECK(diag.conflict_cuts_global >= 1);
 }
 
 // Nogoods must refuse trails that branch on non-binary columns: the node
@@ -635,10 +702,44 @@ void test_flugpl_latest_dual_not_above_opt() {
     }
 }
 
+void test_misc03_dense_binary_mexi_auto_off() {
+    // misc03: 159×0-1 + 1 continuous - mixed, so dense pure-binary auto-off
+    // (n_cont==0 && n_bin≥80 && n_bin==n_int) does not fire. Nogoods apply.
+    // Support+prop Verified accepts small binary-support FUIP cuts.
+    const char* candidates[] = {
+        "benchmarks/miplib-easy/mps/misc03.mps",
+        "../benchmarks/miplib-easy/mps/misc03.mps",
+        "sor/benchmarks/miplib-easy/mps/misc03.mps",
+    };
+    const char* path = nullptr;
+    for (const char* c : candidates) {
+        std::ifstream in(c);
+        if (in) {
+            path = c;
+            break;
+        }
+    }
+    if (!path) {
+        ::sor::test::report(true, "misc03: skipped (no mps)", __FILE__, __LINE__);
+        return;
+    }
+    sor::io::MpsReadReport rep;
+    auto lp = sor::io::read_mps_file(path, rep);
+    BabOptions opts;
+    opts.policy = MilpPolicy::Latest;
+    opts.time_limit_s = 8.0;
+    opts.feasibility_jump = false;
+    BabDiagnostics diag;
+    sor::search::solve_milp(lp, opts, diag);
+    CHECK(diag.conflict_cut_diag.attempts >= 1);
+    CHECK(diag.conflict_cuts_global >= 1);
+    CHECK(diag.nogood_cuts_global >= 1);
+}
+
 void test_enigma_latest_not_false_infeasible() {
     // P0 (2026-09-13): Mexi conflict cuts falsely proved ENIGMA Infeasible.
-    // Latest defaults (conflict on + SafeLimited for dense binary) must not
-    // claim Infeasible; HiGHS / Classical Optimal 0.
+    // Latest defaults (dense pure-binary Mexi auto-off in bab) must not claim
+    // Infeasible; HiGHS / Classical Optimal 0.
     const char* candidates[] = {
         "benchmarks/miplib-easy/mps/enigma.mps",
         "../benchmarks/miplib-easy/mps/enigma.mps",
@@ -770,6 +871,7 @@ int main() {
     test_nogood_refuses_mixed_trail();
     test_validity_check_tri_state();
     test_near_empty_cut_refused();
+    test_large_pure_binary_support_verified();
     test_general_integer_conflict_safe();
     test_general_integer_disabled_aborts();
     test_safe_limited_skips_cmir_on_nonbinary();
@@ -779,6 +881,8 @@ int main() {
     test_classical_learns_no_conflict_family();
     test_nogood_cap_zero_disables_learning();
     test_flugpl_latest_dual_not_above_opt();
+    test_misc03_dense_binary_mexi_auto_off();
+    test_p0033_latest_learns_mexi_cut();
     test_enigma_latest_not_false_infeasible();
     test_gen_ip002_latest_not_false_optimal();
     test_markshare1_latest_not_false_optimal();

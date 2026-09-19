@@ -39,5 +39,26 @@ int main() {
         CHECK(m.nnz() == 0);
     }
 
+    // In-place row append must grow CSR without rebuilding prior rows.
+    {
+        auto m = sparse::from_triplets(1, 3, {0, 0}, {0, 2}, {1.0, 2.0});
+        m.append_row({1, 0}, {4.0, 3.0});  // unsorted; sorted to col0, col1
+        CHECK(m.n_rows() == 2);
+        CHECK(m.n_cols() == 3);
+        CHECK(m.nnz() == 4);
+        CHECK(m.pattern.row_ptr()[0] == 0);
+        CHECK(m.pattern.row_ptr()[1] == 2);
+        CHECK(m.pattern.row_ptr()[2] == 4);
+        CHECK(m.pattern.col_idx()[2] == 0);
+        CHECK(m.pattern.col_idx()[3] == 1);
+        CHECK_NEAR(m.vals[2], 3.0, 1e-15);
+        CHECK_NEAR(m.vals[3], 4.0, 1e-15);
+        m.append_row({1, 1}, {1.0, 5.0});  // duplicate col summed
+        CHECK(m.n_rows() == 3);
+        CHECK(m.nnz() == 5);
+        CHECK(m.pattern.col_idx()[4] == 1);
+        CHECK_NEAR(m.vals[4], 6.0, 1e-15);
+    }
+
     return sor::test::finish("test_csr");
 }

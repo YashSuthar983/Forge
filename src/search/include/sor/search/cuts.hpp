@@ -30,7 +30,20 @@ using core::Index;
 
 struct CutOptions {
     int max_rounds = 20;
-    f64 min_progress_rel = 1e-4;   // stop the round loop if bound gain falls below this
+    f64 min_progress_rel = 1e-4;   // a round gaining less than this is "stalled"
+    // Consecutive stalled rounds tolerated before the loop gives up.
+    //
+    // Stopping on the FIRST stalled round is myopic, and measurably so. On
+    // gt2 the default (GMI only) runs 13 rounds for 66 cuts and a root bound
+    // of 20991; enabling MIR made one round gain a lot and the next gain
+    // little, so the loop broke at round 4 with 28 GMI cuts and a WORSE bound
+    // of 20089. Adding valid cuts cannot lower an LP bound -- the loss came
+    // entirely from quitting nine rounds early.
+    //
+    // Cut loops are not monotone in per-round gain: a round that adds little
+    // often exposes structure the next round exploits. Patience is what lets
+    // the loop cross that dip.
+    int min_progress_patience = 3;
     // Reject a cut whose max|coef|/min|coef| exceeds this. 1e6 (the old
     // default) is far too permissive: on rgn.mps (MIPLIB-easy) a GMI cut
     // with dynamism in [1e3, 1e6) made the ROOT node's post-cut LP return
@@ -169,6 +182,24 @@ struct CutRow {
     f64 row_lo = -model::kInf;
     f64 row_hi = model::kInf;
     std::string name;
+
+    // Did this cut's derivation rely on a bound that branching tightened?
+    //
+    // Separators like MIR and lifted covers substitute variables onto a BOUND
+    // (x = bound +- s). At a node those bounds are branch-tightened, so the
+    // resulting cut holds only inside that subtree and must not enter the
+    // global pool. Global validity was previously inferred from the cut's
+    // NAME, which produced false Optimals and a false Infeasible.
+    //
+    // Checking the cut's SUPPORT against root bounds is NOT sufficient: a
+    // separator substitutes out variables that branching has FIXED, so those
+    // columns never appear in the support while still having shaped the rhs.
+    // Only the separator itself knows which bounds it consumed, so it reports
+    // that here.
+    //
+    // DEFAULT true = "assume local", so a separator that has not been taught
+    // to track provenance stays conservative and its node cuts stay local.
+    bool used_local_bound = true;
 };
 
 // A bounded global pool for generated, not-yet-active cuts. Cuts are stored in
@@ -241,8 +272,14 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
                                        const CutOptions& opts,
                                        CutDiagnostics& diag);
 
-// Rebuild `lp` with `cuts` appended as new rows. Mirrors
-// bab.cpp's add_binary_cover_cuts CSR-rebuild pattern.
+// Append accepted cuts as new rows (or tighten an existing row of the same
+// shape). Mutates `lp` in place: CSR grows by push_back, so a single learned
+// nogood costs O(row nnz) rather than a full-matrix rebuild.
+void apply_cuts_inplace(model::LpProblem& lp,
+                        const std::vector<CutRow>& cuts,
+                        const CutOptions& opts);
+
+// Copy-then-inplace convenience for callers that hold a const LP.
 model::LpProblem apply_cuts(const model::LpProblem& lp,
                             const std::vector<CutRow>& cuts,
                             const CutOptions& opts);

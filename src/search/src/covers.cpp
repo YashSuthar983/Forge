@@ -441,10 +441,12 @@ std::vector<CutRow> separate_lifted_covers(const model::LpProblem& lp,
 
                 std::vector<f64> alphas_pc, alphas_gns;
                 f64 score_pc = -1.0, score_gns = -1.0;
-                const bool ok_pc = sequence_independent_lift(
+                bool ok_pc = sequence_independent_lift(
                     cover_w, cap, outside_w, outside_vals, opts.tol, /*PC*/ 0,
                     alphas_pc, score_pc);
-                const bool ok_gns = sequence_independent_lift(
+                ok_pc = ok_pc && opts.sequence_independent_lifting;
+                const bool ok_gns = opts.sequence_independent_lifting &&
+                    sequence_independent_lift(
                     cover_w, cap, outside_w, outside_vals, opts.tol, /*GNS*/ 1,
                     alphas_gns, score_gns);
 

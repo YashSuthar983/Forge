@@ -66,6 +66,21 @@ struct CoverOptions {
     //   * keep the stronger of the two at the LP point; fall back to sequential
     //     up-lifting if both fail the validity DP.
     // DynSep / Latest cover arm may enable this. Default off for Classical.
+    // Sequence-independent lifting (Gu-Nemhauser-Savelsbergh and the PC
+    // variant). DEFAULT OFF: it emits INVALID cuts.
+    //
+    // Verified 2026-09-19 with --verify-cuts against enigma's true optimum (0).
+    // Five node cuts excluded the optimum, e.g.
+    //   COVPC_0   activity 3 not in [-inf, 1]
+    //   COVGNS_0  activity 0 not in [-inf, -0.0470379763]
+    // and the solve then reported a FALSE Infeasible ("tree exhausted with no
+    // integer feasible point") after 256 binary cover cuts. The plain COV_
+    // lifting path on the same runs is clean, so the fault is in the
+    // superadditive lifting function, not in cover separation.
+    //
+    // Enable only alongside --verify-cuts on a model with a known optimum.
+    bool sequence_independent_lifting = false;
+
     bool pc_lift_hooks = false;
     f64 pc_fix_tol = 1e-6;
 };

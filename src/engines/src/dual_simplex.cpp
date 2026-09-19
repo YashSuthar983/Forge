@@ -144,8 +144,24 @@ private:
 core::RawResult solve_dual_simplex_prepared(
     const SimplexPrepared& prepared, const SimplexOptions& opts,
     SimplexDiagnostics& diag, SimplexBasis* out_basis,
-    const SimplexBasis* warm) {
+    const SimplexBasis* warm, DualEdgeWeightCarrier* carrier) {
     const auto t_all = Clock::now();
+
+    // Take the incoming weights and leave the carrier EMPTY: every early exit
+    // (infeasible, limit, primal clean-up hand-off) then reports "no weights"
+    // without having to remember to say so, and only the one normal exit at
+    // the bottom refills it.
+    // (The caller's matrix token and dimensions are left alone -- they describe
+    // the carrier's owner, not this run, and an early exit must not cost the
+    // caller its identity.)
+    std::vector<Index> carried_basis;
+    std::vector<f64> carried_weights;
+    if (carrier != nullptr) {
+        carried_basis = std::move(carrier->basis);
+        carried_weights = std::move(carrier->weights);
+        carrier->basis.clear();
+        carrier->weights.clear();
+    }
 
     // Fine-grained timers cost one clock read each, and this loop has fourteen
     // such pairs -- about 28 clock_gettime calls per pivot. On a healthy `tsc`
@@ -473,6 +489,23 @@ core::RawResult solve_dual_simplex_prepared(
         diag.btran_ms += dt;
         diag.solve_ms += dt;
         previous_btran_seed = seed_slot;
+        return sparse;
+    };
+    // Seeded BTRAN for the exact-DSE weight rebuild. Deliberately does NOT
+    // share `previous_btran_seed` with the pivot loop above: the rebuild owns
+    // a different vector and restores it to all-zero itself, so the two reset
+    // disciplines must not interfere.
+    std::vector<Index> dse_seed(1, 0);
+    const auto dse_rebuild_btran = [&](std::vector<f64>& v, Index seed_slot,
+                                       std::vector<Index>& support) {
+        dse_seed[0] = seed_slot;
+        const auto t0 = tick();
+        const bool sparse = factor.btran_seeded_with_support(v, dse_seed, support);
+        const double dt = tock(t0);
+        ++diag.solve_calls;
+        ++diag.btran_calls;
+        diag.btran_ms += dt;
+        diag.solve_ms += dt;
         return sparse;
     };
     // FTRAN that additionally reports the output support when the solve
@@ -928,8 +961,11 @@ core::RawResult solve_dual_simplex_prepared(
                 }
             if (logical_basis) {
                 std::fill(row_w.begin(), row_w.end(), 1.0);
-            } else if (!rebuild_dual_edge_weights(m, do_btran, row_w)) {
-                std::fill(row_w.begin(), row_w.end(), 1.0);
+            } else {
+                ++diag.dse_weight_rebuilds;
+                if (!rebuild_dual_edge_weights(m, do_btran, row_w,
+                                               dse_rebuild_btran))
+                    std::fill(row_w.begin(), row_w.end(), 1.0);
             }
         } else if (use_devex) {
             reset_devex_framework();
@@ -937,6 +973,34 @@ core::RawResult solve_dual_simplex_prepared(
             std::fill(row_w.begin(), row_w.end(), 1.0);
         }
         invalidate_leave_heap();
+    };
+
+    // Adopt weights the caller carried in from an earlier solve, in place of
+    // the m-BTRAN rebuild. Legal exactly when they describe the basis this run
+    // is actually starting from: w_i = ||B^-T e_i||^2 sees only B, and the
+    // caller's contract already pins the matrix. Anything unexpected -- a
+    // different basis (crash, repair, a non-child node), a size mismatch, a
+    // weight that is not a usable positive number -- declines and the caller
+    // pays the rebuild as before.
+    const auto adopt_carried_weights = [&]() {
+        if (!dse_active) return false;
+        if (carried_weights.size() != sz(m) || carried_basis.size() != sz(m))
+            return false;
+        bool logical_basis = true;
+        for (Index i = 0; i < m; ++i) {
+            if (carried_basis[sz(i)] != basis[sz(i)]) return false;
+            if (basis[sz(i)] != ns + i) logical_basis = false;
+        }
+        // At B = -I every exact weight is 1, which reset_weights() gets for
+        // free and without the drift a carried (repeatedly updated) vector
+        // has accumulated. Decline in favour of the exact answer.
+        if (logical_basis) return false;
+        for (const f64 w : carried_weights)
+            if (!std::isfinite(w) || w <= 0.0) return false;
+        row_w.assign(carried_weights.begin(), carried_weights.end());
+        invalidate_leave_heap();
+        ++diag.dse_weight_reuses;
+        return true;
     };
 
     const auto repair_weights = [&]() -> bool {
@@ -1544,8 +1608,13 @@ core::RawResult solve_dual_simplex_prepared(
         // ||B^-T e_r||^2 from its mandatory BTRAN every pivot. Recomputing all
         // m weights here costs m extra BTRANs per reinversion and was the main
         // reason the first exact-DSE prototype lost despite fewer pivots.
-        if (diag.refactorizations == 1 || diag.basis_repairs != repairs_before)
-            reset_weights();
+        if (diag.refactorizations == 1 || diag.basis_repairs != repairs_before) {
+            // Carried weights describe a basis, not a factorization, so they
+            // survive the reinversion that brought us here; adopt_carried_
+            // weights() re-checks the basis itself, which is what a repair
+            // would have changed.
+            if (!adopt_carried_weights()) reset_weights();
+        }
         expand_eps = expand_start;
         if (phase == 1) {
             // Restore the subproblem's dual-feasibility invariant against the
@@ -2891,6 +2960,16 @@ core::RawResult solve_dual_simplex_prepared(
         out_basis->status = st;
     }
 
+    // Hand this run's weights to the next solve on the same matrix. Only from
+    // here: this is the one exit where `basis` and `row_w` describe the same
+    // final basis, and only while exact DSE is still the live pricing -- a
+    // mid-solve fall back to Devex leaves reference weights in row_w, which
+    // are not ||B^-T e_i||^2 and must not be passed off as such.
+    if (carrier != nullptr && dse_active) {
+        carrier->basis.assign(basis.begin(), basis.end());
+        carrier->weights.assign(row_w.begin(), row_w.end());
+    }
+
     // ---- 9. report -------------------------------------------------------
     core::RawResult raw;
     raw.x = std::move(x);
@@ -2933,10 +3012,32 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
                                    const SimplexOptions& opts,
                                    SimplexDiagnostics& diag,
                                    SimplexBasis* out_basis,
-                                   const SimplexBasis* warm) {
+                                   const SimplexBasis* warm,
+                                   DualEdgeWeightCarrier* weights) {
     const auto t0 = Clock::now();
+    // Dimension check against the problem in hand. The caller owns the matrix
+    // token (see DualEdgeWeightCarrier); this only catches the case where the
+    // shape moved under a token the caller forgot to clear. Scaling needs no
+    // test of its own -- Ruiz reads only A's values, so one matrix always
+    // produces the same scaled basis matrix and therefore the same weights.
+    const auto nnz = static_cast<core::Offset>(problem.A.vals.size());
+    const void* token = weights != nullptr ? weights->matrix : nullptr;
+    if (weights != nullptr &&
+        (token == nullptr || weights->rows != problem.n_rows() ||
+         weights->cols != problem.n_cols() || weights->nnz != nnz)) {
+        weights->basis.clear();
+        weights->weights.clear();
+    }
+
     const auto prepared = prepare_simplex_model(problem, opts);
-    auto raw = solve_dual_simplex_prepared(prepared, opts, diag, out_basis, warm);
+    auto raw = solve_dual_simplex_prepared(prepared, opts, diag, out_basis, warm,
+                                           weights);
+    if (weights != nullptr && !weights->weights.empty()) {
+        weights->matrix = token;
+        weights->rows = problem.n_rows();
+        weights->cols = problem.n_cols();
+        weights->nnz = nnz;
+    }
     diag.scaling_ms = prepared.scaling_ms;
     diag.csc_ms = prepared.csc_ms;
     diag.preprocessing_ms = prepared.total_ms;
