@@ -1,5 +1,5 @@
 add_library(sor_search
-  src/bab.cpp src/cuts.cpp src/propagate.cpp src/conflict.cpp
+  src/binquad.cpp src/bab.cpp src/cuts.cpp src/propagate.cpp src/conflict.cpp
   src/feasjump.cpp src/lns.cpp src/covers.cpp src/mir.cpp
   src/miqp.cpp src/minlp.cpp src/lattice_reform.cpp
   src/features.cpp src/sparse_sb.cpp src/tree_cuts.cpp
@@ -13,4 +13,4 @@ add_library(sor_search
 
 add_library(sor::search ALIAS sor_search)
 target_include_directories(sor_search PUBLIC include)
-target_link_libraries(sor_search PUBLIC sor_engines PRIVATE sor_flags)
+target_link_libraries(sor_search PUBLIC sor_engines sor_io PRIVATE sor_flags)

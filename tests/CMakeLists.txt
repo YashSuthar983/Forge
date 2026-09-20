@@ -5,6 +5,9 @@ function(sor_add_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+sor_add_test(test_qplib               sor_search sor_io)
+target_compile_definitions(test_qplib PRIVATE
+  SOR_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/benchmarks")
 sor_add_test(test_csr                 sor_sparse)
 sor_add_test(test_csc                 sor_sparse)
 sor_add_test(test_lu                  sor_la_cpu)
