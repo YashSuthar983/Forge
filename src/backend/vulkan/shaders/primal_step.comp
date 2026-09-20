@@ -1,26 +1,39 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
 
+// Primal half-step of the HPR fixed-point operator T.
+//
+// This shader deliberately does NOT overwrite x.  The reflected operator
+// (1+gamma)*T(z) - gamma*z needs z itself after T has been applied, so T's
+// image goes to a separate x_fixed buffer and combine.comp forms the new
+// iterate.  Writing x in place here is what made the Vulkan path incapable
+// of reflection.
 layout(local_size_x = 256) in;
 
 layout(push_constant) uniform PC {
     uint n_cols;
+    uint pad;
     double tau;
 } pc;
 
-layout(std430, binding = 0) buffer XBuf { double x[]; };
-layout(std430, binding = 1) readonly buffer CBuf { double c[]; };
-layout(std430, binding = 2) readonly buffer AtyBuf { double aty[]; };
-layout(std430, binding = 3) readonly buffer LoBuf { double lo[]; };
-layout(std430, binding = 4) readonly buffer HiBuf { double hi[]; };
-layout(std430, binding = 5) writeonly buffer XbarBuf { double xbar[]; };
+layout(std430, binding = 0) readonly  buffer XBuf     { double x[]; };
+layout(std430, binding = 1) readonly  buffer CBuf     { double c[]; };
+layout(std430, binding = 2) readonly  buffer AtyBuf   { double aty[]; };
+layout(std430, binding = 3) readonly  buffer LoBuf    { double lo[]; };
+layout(std430, binding = 4) readonly  buffer HiBuf    { double hi[]; };
+layout(std430, binding = 5) writeonly buffer XbarBuf  { double xbar[]; };
+layout(std430, binding = 6) writeonly buffer XfixBuf  { double xfix[]; };
+layout(std430, binding = 7) writeonly buffer Dx2Buf   { double dx2[]; };
 
 void main() {
     uint j = gl_GlobalInvocationID.x;
     if (j >= pc.n_cols) return;
-    double xn = x[j] - pc.tau * (c[j] + aty[j]);
+    double xj = x[j];
+    double xn = xj - pc.tau * (c[j] + aty[j]);
     if (xn < lo[j]) xn = lo[j];
     if (xn > hi[j]) xn = hi[j];
-    xbar[j] = 2.0lf * xn - x[j];
-    x[j] = xn;
+    double d = xn - xj;
+    xfix[j] = xn;
+    xbar[j] = 2.0lf * xn - xj;   // reflection fed to the dual SpMV
+    dx2[j]  = d * d;
 }

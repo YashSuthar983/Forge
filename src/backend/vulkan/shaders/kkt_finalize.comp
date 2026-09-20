@@ -1,0 +1,71 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Folds the per-workgroup KKT partials and the per-step statistics into the
+// EIGHT doubles that are the only thing crossing the bus per convergence
+// check.  Before this existed the device shipped x and y home and reduced on
+// the host: 8000 bytes per check on a 500x500 LP, 2.02 MB over a 50k-iteration
+// solve.  Now it is 64 bytes per check regardless of problem size.
+//
+//   out[0] primal residual        out[4] weighted fixed-point residual
+//   out[1] dual residual          out[5] ||x - x_anchor||
+//   out[2] primal objective       out[6] ||y - y_anchor||
+//   out[3] dual objective, NaN    out[7] max operator ratio over the chunk
+//          when no finite dual
+//          bound exists
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint g_rows;
+    uint g_cols;
+    double weight;   // primal weight w: metric is w||dx||^2 + ||dy||^2/w
+} pc;
+
+layout(std430, binding = 0) readonly buffer PartBuf  { double part[]; };
+layout(std430, binding = 1) readonly buffer StepBuf  { double step[]; };
+layout(std430, binding = 2) writeonly buffer OutBuf  { double outv[]; };
+
+shared double sm[256];
+shared double res[12];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    for (uint s = 0u; s < 12u; ++s) {
+        uint slot = s % 6u;
+        bool is_max = slot < 3u;
+        uint count = (s < 6u) ? pc.g_rows : pc.g_cols;
+        uint base  = (s < 6u) ? 0u : pc.g_rows * 6u;
+        double acc = 0.0lf;
+        for (uint i = t; i < count; i += 256u) {
+            double v = part[base + i * 6u + slot];
+            acc = is_max ? max(acc, v) : acc + v;
+        }
+        sm[t] = acc;
+        memoryBarrierShared();
+        barrier();
+        for (uint k = 128u; k > 0u; k >>= 1) {
+            if (t < k) sm[t] = is_max ? max(sm[t], sm[t + k]) : sm[t] + sm[t + k];
+            memoryBarrierShared();
+            barrier();
+        }
+        if (t == 0u) res[s] = sm[0];
+        memoryBarrierShared();
+        barrier();
+    }
+
+    if (t != 0u) return;
+    double w = pc.weight > 0.0lf ? pc.weight : 1.0lf;
+    bool finite = (res[2] + res[8]) == 0.0lf;
+    // Quiet NaN by bit pattern: a literal 0.0/0.0 is free game for the
+    // optimizer, a bit pattern is not.  The host reads dual_bound_finite
+    // straight off isfinite(out[3]).
+    double nan_d = packDouble2x32(uvec2(0xFFFFFFFFu, 0x7FF80000u));
+    outv[0] = max(res[0], res[6]);
+    outv[1] = max(res[1], res[7]);
+    outv[2] = res[11];
+    outv[3] = finite ? (res[3] + res[9]) : nan_d;
+    outv[4] = sqrt(w * step[0] + step[1] / w);
+    outv[5] = sqrt(res[10]);
+    outv[6] = sqrt(res[4]);
+    outv[7] = step[2];
+}

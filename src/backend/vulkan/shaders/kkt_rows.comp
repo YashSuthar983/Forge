@@ -1,0 +1,102 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Row-space half of the device KKT reduction.
+//
+// Every quantity here is reconstructed in ORIGINAL coordinates (divide row
+// activity by row_scale), because Ruiz scaling must never make termination
+// easier than it is on the model the caller handed us.  This mirrors
+// CpuLpDevice::reduce_kkt term for term; the two are differentially tested.
+//
+// Emits six per-workgroup partials, slot-minor:
+//   0 max  primal row violation            3 sum  dual-bound row term
+//   1 max  dual residual from rows         4 sum  ||y - y_anchor||^2
+//   2 max  "dual bound is not finite" flag 5 unused (0)
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n_rows;
+    uint pad;
+    double primal_tol;
+    double dual_tol;
+} pc;
+
+layout(std430, binding = 0) readonly buffer AxBuf    { double ax[]; };
+layout(std430, binding = 1) readonly buffer YBuf     { double y[]; };
+layout(std430, binding = 2) readonly buffer LoBuf    { double lo[]; };
+layout(std430, binding = 3) readonly buffer HiBuf    { double hi[]; };
+layout(std430, binding = 4) readonly buffer RsBuf    { double row_scale[]; };
+layout(std430, binding = 5) readonly buffer AnchBuf  { double y_anchor[]; };
+layout(std430, binding = 6) writeonly buffer PartBuf { double part[]; };
+
+shared double sm[256];
+
+// No isinf() dependency: true for +/-inf and for NaN, false for every finite
+// double including the largest one.
+bool not_finite(double v) { return !(abs(v) <= 1.7976931348623157e308lf); }
+
+double tree(double v, bool is_max) {
+    uint t = gl_LocalInvocationID.x;
+    barrier();
+    sm[t] = v;
+    memoryBarrierShared();
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (t < s) sm[t] = is_max ? max(sm[t], sm[t + s]) : sm[t] + sm[t + s];
+        memoryBarrierShared();
+        barrier();
+    }
+    return sm[0];
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint base = gl_WorkGroupID.x * 256u;
+    uint i = base + t;
+    bool live = i < pc.n_rows;
+
+    double pres = 0.0lf, dres = 0.0lf, nonfinite = 0.0lf;
+    double dval = 0.0lf, dy2 = 0.0lf;
+
+    if (live) {
+        double a = ax[i];
+        double rs = row_scale[i];
+        if (a < lo[i]) pres = max(pres, (lo[i] - a) / rs);
+        if (a > hi[i]) pres = max(pres, (a - hi[i]) / rs);
+
+        double activity = a / rs;
+        double multiplier = -y[i] * rs;
+        double at_tol = pc.primal_tol * (1.0lf + abs(activity));
+        bool at_lo = !not_finite(lo[i]) && activity <= lo[i] / rs + at_tol;
+        bool at_hi = !not_finite(hi[i]) && activity >= hi[i] / rs - at_tol;
+        if (at_lo && !at_hi)       dres = max(0.0lf, -multiplier);
+        else if (at_hi && !at_lo)  dres = max(0.0lf,  multiplier);
+        else if (!at_lo && !at_hi) dres = abs(multiplier);
+
+        double yi = y[i];
+        double b = (yi >= 0.0lf) ? hi[i] : lo[i];
+        if (not_finite(b)) {
+            if (abs(yi * rs) > pc.dual_tol) nonfinite = 1.0lf;
+        } else {
+            dval = -yi * b;
+        }
+
+        double d = yi - y_anchor[i];
+        dy2 = d * d;
+    }
+
+    double r0 = tree(pres, true);
+    double r1 = tree(dres, true);
+    double r2 = tree(nonfinite, true);
+    double r3 = tree(dval, false);
+    double r4 = tree(dy2, false);
+    if (t == 0u) {
+        uint o = gl_WorkGroupID.x * 6u;
+        part[o + 0u] = r0;
+        part[o + 1u] = r1;
+        part[o + 2u] = r2;
+        part[o + 3u] = r3;
+        part[o + 4u] = r4;
+        part[o + 5u] = 0.0lf;
+    }
+}

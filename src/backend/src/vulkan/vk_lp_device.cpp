@@ -1,6 +1,8 @@
-// SOR — Vulkan LpDevice. Device-resident HPR steps; KKT currently reduced on
-// host after a single D2H of the averages (charged to TransferStats). Hot-path
-// hpr_steps does zero host sync of vectors.
+// SOR — Vulkan LpDevice.  Device-resident HPR steps AND a device-resident KKT
+// reduction: the only thing that crosses the bus inside the solve loop is the
+// eight doubles of LpDevice::Kkt.  hpr_steps(k) still records k iterations
+// into ONE command buffer and submits once, with zero vector synchronization
+// in the hot path.
 #include "sor/backend/lp_device.hpp"
 #include "sor/backend/vulkan/vk_context.hpp"
 
@@ -23,16 +25,23 @@ namespace sor::backend {
 namespace {
 
 constexpr f64 kInf = std::numeric_limits<f64>::infinity();
-constexpr f64 kAtBound = 1e-9;
+constexpr std::uint32_t kGroupSize = 256;
+// Six reduction slots per workgroup: three max-combined, three sum-combined.
+// Must match kkt_rows.comp / kkt_cols.comp / kkt_finalize.comp.
+constexpr std::uint32_t kKktSlots = 6;
+// The eight doubles of a convergence check.  Named here because "<= 64 bytes
+// per check" is a property worth protecting, not an accident.
+constexpr std::uint32_t kKktOutDoubles = 8;
 
 inline f64 clamp_to(f64 v, f64 lo, f64 hi) {
     if (v < lo) return lo;
     if (v > hi) return hi;
     return v;
 }
-inline f64 mul_zero_safe(f64 a, f64 b) {
-    if (a == 0.0) return 0.0;
-    return a * b;
+
+inline std::uint32_t groups_for(std::size_t n) {
+    return std::max<std::uint32_t>(
+        1u, static_cast<std::uint32_t>((n + kGroupSize - 1) / kGroupSize));
 }
 
 struct Buf {
@@ -40,6 +49,14 @@ struct Buf {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize size = 0;
     void* mapped = nullptr;  // host-visible staging only
+};
+
+// One compute kernel: module, set layout, pipeline layout, pipeline.
+struct Pipe {
+    VkShaderModule mod = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
 };
 
 class VulkanLpDevice final : public LpDevice {
@@ -53,6 +70,34 @@ public:
     std::string_view name() const override { return "vulkan"; }
     bool is_accelerated() const override { return true; }
 
+    // Declared to match what is actually implemented below, nothing more.
+    //
+    //   reflected_operator     false -- combine.comp can form
+    //                                   (1+gamma)T(z) - gamma*z, but hpr_steps
+    //                                   still pins gamma to 0 and the
+    //                                   reflected path has not been measured;
+    //                                   the capability stays false until it is.
+    //   fixed_point_restart    true  -- snapshot_anchor(), restart_to() and
+    //                                   the Halpern mix are all here, and
+    //                                   RestartPoint::Current now genuinely
+    //                                   restarts to T(z) rather than doing
+    //                                   nothing.
+    //   warm_start             true  -- init_iterate() below.
+    //   certificate_directions false -- download() populates x/y/averages but
+    //                                   not primal_ray / dual_farkas_ray; ray
+    //                                   tracking is genuinely not implemented.
+    //   transactional_step     true  -- step checkpoints below, and the
+    //                                   operator ratio they gate on is now a
+    //                                   real device-reduced max over the
+    //                                   chunk rather than a hardcoded zero.
+    LpDeviceCapabilities capabilities() const override {
+        return {/*reflected_operator=*/false,
+                /*fixed_point_restart=*/true,
+                /*warm_start=*/true,
+                /*certificate_directions=*/false,
+                /*transactional_step=*/true};
+    }
+
     void upload(const ScaledLp& lp) override {
         destroy_problem_bufs();
         nr_ = static_cast<std::size_t>(lp.n_rows());
@@ -61,15 +106,13 @@ public:
         if (nnz_ > static_cast<std::size_t>(std::numeric_limits<int32_t>::max()))
             throw std::runtime_error("VulkanLpDevice: nnz exceeds int32");
 
-        // Host mirrors for KKT / init / download (engine may call reduce often).
-        c_ = lp.c;
         col_lo_ = lp.col_lo;
         col_hi_ = lp.col_hi;
-        row_lo_ = lp.row_lo;
-        row_hi_ = lp.row_hi;
-        // Keep CSR/CSC on host for KKT SpMV (until GPU reduce lands).
-        A_csr_ = lp.A_csr;
-        A_csc_ = lp.A_csc;
+
+        std::vector<f64> row_scale = lp.row_scale;
+        std::vector<f64> col_scale = lp.col_scale;
+        if (row_scale.size() != nr_) row_scale.assign(nr_, 1.0);
+        if (col_scale.size() != nc_) col_scale.assign(nc_, 1.0);
 
         // Convert offsets to int32 for shaders.
         std::vector<int32_t> row_ptr(nr_ + 1), col_idx(nnz_);
@@ -89,32 +132,61 @@ public:
         b_col_ptr_ = create_device_buffer(col_ptr.data(), byte_size(col_ptr));
         b_row_idx_ = create_device_buffer(row_idx.data(), byte_size(row_idx));
         b_csc_vals_ = create_device_buffer(lp.A_csc.vals.data(), byte_size(lp.A_csc.vals));
-        b_c_ = create_device_buffer(c_.data(), byte_size(c_));
+        b_c_ = create_device_buffer(lp.c.data(), byte_size(lp.c));
         b_col_lo_ = create_device_buffer(col_lo_.data(), byte_size(col_lo_));
         b_col_hi_ = create_device_buffer(col_hi_.data(), byte_size(col_hi_));
-        b_row_lo_ = create_device_buffer(row_lo_.data(), byte_size(row_lo_));
-        b_row_hi_ = create_device_buffer(row_hi_.data(), byte_size(row_hi_));
+        b_row_lo_ = create_device_buffer(lp.row_lo.data(), byte_size(lp.row_lo));
+        b_row_hi_ = create_device_buffer(lp.row_hi.data(), byte_size(lp.row_hi));
+        b_row_scale_ = create_device_buffer(row_scale.data(), byte_size(row_scale));
+        b_col_scale_ = create_device_buffer(col_scale.data(), byte_size(col_scale));
 
-        b_x_ = create_device_buffer_zero(nc_ * sizeof(f64));
-        b_y_ = create_device_buffer_zero(nr_ * sizeof(f64));
-        b_xbar_ = create_device_buffer_zero(nc_ * sizeof(f64));
-        b_Aty_ = create_device_buffer_zero(nc_ * sizeof(f64));
-        b_Ax_ = create_device_buffer_zero(nr_ * sizeof(f64));
-        b_x_avg_ = create_device_buffer_zero(nc_ * sizeof(f64));
-        b_y_avg_ = create_device_buffer_zero(nr_ * sizeof(f64));
-        b_x_anchor_ = create_device_buffer_zero(nc_ * sizeof(f64));
-        b_y_anchor_ = create_device_buffer_zero(nr_ * sizeof(f64));
-        b_x_ckpt_ = create_device_buffer_zero(nc_ * sizeof(f64));
-        b_y_ckpt_ = create_device_buffer_zero(nr_ * sizeof(f64));
-        b_x_avg_ckpt_ = create_device_buffer_zero(nc_ * sizeof(f64));
-        b_y_avg_ckpt_ = create_device_buffer_zero(nr_ * sizeof(f64));
-        ckpt_valid_ = false;
+        const VkDeviceSize nc_bytes = nc_ * sizeof(f64);
+        const VkDeviceSize nr_bytes = nr_ * sizeof(f64);
+        b_x_ = create_device_buffer_zero(nc_bytes);
+        b_y_ = create_device_buffer_zero(nr_bytes);
+        b_xbar_ = create_device_buffer_zero(nc_bytes);
+        b_Aty_ = create_device_buffer_zero(nc_bytes);
+        b_Ax_ = create_device_buffer_zero(nr_bytes);
+        b_x_fix_ = create_device_buffer_zero(nc_bytes);
+        b_y_fix_ = create_device_buffer_zero(nr_bytes);
+        b_Ax_cur_ = create_device_buffer_zero(nr_bytes);
+        b_Ax_fix_ = create_device_buffer_zero(nr_bytes);
+        b_Ax_anchor_ = create_device_buffer_zero(nr_bytes);
+        b_x_avg_ = create_device_buffer_zero(nc_bytes);
+        b_y_avg_ = create_device_buffer_zero(nr_bytes);
+        b_x_anchor_ = create_device_buffer_zero(nc_bytes);
+        b_y_anchor_ = create_device_buffer_zero(nr_bytes);
+        b_x_ckpt_ = create_device_buffer_zero(nc_bytes);
+        b_y_ckpt_ = create_device_buffer_zero(nr_bytes);
+        b_x_avg_ckpt_ = create_device_buffer_zero(nc_bytes);
+        b_y_avg_ckpt_ = create_device_buffer_zero(nr_bytes);
+        b_Ax_cur_ckpt_ = create_device_buffer_zero(nr_bytes);
+        b_dx2_ = create_device_buffer_zero(nc_bytes);
+        b_dy2_ = create_device_buffer_zero(nr_bytes);
+        b_inter_ = create_device_buffer_zero(nr_bytes);
+        b_step_ = create_device_buffer_zero(4 * sizeof(f64));
+
+        g_rows_ = groups_for(nr_);
+        g_cols_ = groups_for(nc_);
+        b_part_ = create_device_buffer_zero(
+            static_cast<VkDeviceSize>(g_rows_ + g_cols_) * kKktSlots * sizeof(f64));
+        b_out_ = create_device_buffer_zero(kKktOutDoubles * sizeof(f64));
+        // Persistent host-visible landing pad for the 64-byte readback: a
+        // fresh allocation per convergence check would cost far more than the
+        // copy it exists to serve.
+        b_out_host_ = create_raw(kKktOutDoubles * sizeof(f64),
+                                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                 true);
 
         x_host_.assign(nc_, 0.0);
         y_host_.assign(nr_, 0.0);
         x_avg_host_.assign(nc_, 0.0);
         y_avg_host_.assign(nr_, 0.0);
         avg_count_ = 0;
+        epoch_step_ = 0;
+        ckpt_valid_ = false;
         uploaded_ = true;
     }
 
@@ -123,227 +195,7 @@ public:
         for (std::size_t j = 0; j < nc_; ++j)
             x_host_[j] = clamp_to(0.0, col_lo_[j], col_hi_[j]);
         std::fill(y_host_.begin(), y_host_.end(), 0.0);
-        x_avg_host_ = x_host_;
-        y_avg_host_ = y_host_;
-        avg_count_ = 1;
-        epoch_step_ = 0;
-        upload_vec(b_x_, x_host_);
-        upload_vec(b_y_, y_host_);
-        upload_vec(b_x_avg_, x_avg_host_);
-        upload_vec(b_y_avg_, y_avg_host_);
-        upload_vec(b_x_anchor_, x_host_);
-        upload_vec(b_y_anchor_, y_host_);
-    }
-
-    void hpr_steps(std::uint32_t k, const StepParams& p) override {
-        require_up();
-        vkResetDescriptorPool(ctx_->device(), ctx_->descriptor_pool(), 0);
-
-        VkDescriptorSet set_csc = alloc_set(dsl_spmv_csc_);
-        write_ssbo(set_csc, 0, b_col_ptr_);
-        write_ssbo(set_csc, 1, b_row_idx_);
-        write_ssbo(set_csc, 2, b_csc_vals_);
-        write_ssbo(set_csc, 3, b_y_);
-        write_ssbo(set_csc, 4, b_Aty_);
-
-        VkDescriptorSet set_csr = alloc_set(dsl_spmv_csr_);
-        write_ssbo(set_csr, 0, b_row_ptr_);
-        write_ssbo(set_csr, 1, b_col_idx_);
-        write_ssbo(set_csr, 2, b_csr_vals_);
-        write_ssbo(set_csr, 3, b_xbar_);
-        write_ssbo(set_csr, 4, b_Ax_);
-
-        VkDescriptorSet set_primal = alloc_set(dsl_primal_);
-        write_ssbo(set_primal, 0, b_x_);
-        write_ssbo(set_primal, 1, b_c_);
-        write_ssbo(set_primal, 2, b_Aty_);
-        write_ssbo(set_primal, 3, b_col_lo_);
-        write_ssbo(set_primal, 4, b_col_hi_);
-        write_ssbo(set_primal, 5, b_xbar_);
-
-        VkDescriptorSet set_dual = alloc_set(dsl_dual_);
-        write_ssbo(set_dual, 0, b_y_);
-        write_ssbo(set_dual, 1, b_Ax_);
-        write_ssbo(set_dual, 2, b_row_lo_);
-        write_ssbo(set_dual, 3, b_row_hi_);
-
-        VkDescriptorSet set_avg_x = alloc_set(dsl_avg_);
-        write_ssbo(set_avg_x, 0, b_x_);
-        write_ssbo(set_avg_x, 1, b_x_avg_);
-        VkDescriptorSet set_avg_y = alloc_set(dsl_avg_);
-        write_ssbo(set_avg_y, 0, b_y_);
-        write_ssbo(set_avg_y, 1, b_y_avg_);
-
-        VkDescriptorSet set_hal_x = VK_NULL_HANDLE, set_hal_y = VK_NULL_HANDLE;
-        if (p.use_halpern) {
-            set_hal_x = alloc_set(dsl_halpern_);
-            write_ssbo(set_hal_x, 0, b_x_);
-            write_ssbo(set_hal_x, 1, b_x_anchor_);
-            set_hal_y = alloc_set(dsl_halpern_);
-            write_ssbo(set_hal_y, 0, b_y_);
-            write_ssbo(set_hal_y, 1, b_y_anchor_);
-        }
-
-        VkCommandBuffer cmd = begin_once();
-        for (std::uint32_t s = 0; s < k; ++s) {
-            PC1 pc_c{static_cast<uint32_t>(nc_), 0};
-            PC1 pc_r{static_cast<uint32_t>(nr_), 0};
-
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_spmv_csc_);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                    layout_spmv_csc_, 0, 1, &set_csc, 0, nullptr);
-            vkCmdPushConstants(cmd, layout_spmv_csc_, VK_SHADER_STAGE_COMPUTE_BIT,
-                               0, sizeof(pc_c), &pc_c);
-            dispatch(cmd, nc_);
-            barrier(cmd);
-
-            alignas(8) struct { uint32_t n; uint32_t pad; double tau; } pc_p{
-                static_cast<uint32_t>(nc_), 0, p.tau};
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_primal_);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                    layout_primal_, 0, 1, &set_primal, 0, nullptr);
-            vkCmdPushConstants(cmd, layout_primal_, VK_SHADER_STAGE_COMPUTE_BIT,
-                               0, sizeof(pc_p), &pc_p);
-            dispatch(cmd, nc_);
-            barrier(cmd);
-
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_spmv_csr_);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                    layout_spmv_csr_, 0, 1, &set_csr, 0, nullptr);
-            vkCmdPushConstants(cmd, layout_spmv_csr_, VK_SHADER_STAGE_COMPUTE_BIT,
-                               0, sizeof(pc_r), &pc_r);
-            dispatch(cmd, nr_);
-            barrier(cmd);
-
-            alignas(8) struct { uint32_t n; uint32_t pad; double sigma; } pc_d{
-                static_cast<uint32_t>(nr_), 0, p.sigma};
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_dual_);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                    layout_dual_, 0, 1, &set_dual, 0, nullptr);
-            vkCmdPushConstants(cmd, layout_dual_, VK_SHADER_STAGE_COMPUTE_BIT,
-                               0, sizeof(pc_d), &pc_d);
-            dispatch(cmd, nr_);
-            barrier(cmd);
-
-            if (p.use_halpern) {
-                const f64 beta = 1.0 / (static_cast<f64>(epoch_step_) + 2.0);
-                alignas(8) struct { uint32_t n; uint32_t pad; double beta; } pc_h{
-                    static_cast<uint32_t>(nc_), 0, beta};
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_halpern_);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                        layout_halpern_, 0, 1, &set_hal_x, 0, nullptr);
-                vkCmdPushConstants(cmd, layout_halpern_, VK_SHADER_STAGE_COMPUTE_BIT,
-                                   0, sizeof(pc_h), &pc_h);
-                dispatch(cmd, nc_);
-                barrier(cmd);
-                pc_h.n = static_cast<uint32_t>(nr_);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                        layout_halpern_, 0, 1, &set_hal_y, 0, nullptr);
-                vkCmdPushConstants(cmd, layout_halpern_, VK_SHADER_STAGE_COMPUTE_BIT,
-                                   0, sizeof(pc_h), &pc_h);
-                dispatch(cmd, nr_);
-                barrier(cmd);
-            }
-
-            if (p.update_average) {
-                ++avg_count_;
-                PCAvg pc_a{static_cast<uint32_t>(nc_), static_cast<uint32_t>(avg_count_)};
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_avg_);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                        layout_avg_, 0, 1, &set_avg_x, 0, nullptr);
-                vkCmdPushConstants(cmd, layout_avg_, VK_SHADER_STAGE_COMPUTE_BIT,
-                                   0, sizeof(pc_a), &pc_a);
-                dispatch(cmd, nc_);
-                barrier(cmd);
-                pc_a.n = static_cast<uint32_t>(nr_);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                        layout_avg_, 0, 1, &set_avg_y, 0, nullptr);
-                vkCmdPushConstants(cmd, layout_avg_, VK_SHADER_STAGE_COMPUTE_BIT,
-                                   0, sizeof(pc_a), &pc_a);
-                dispatch(cmd, nr_);
-                barrier(cmd);
-            }
-            ++epoch_step_;
-            ++stats_.calls;
-        }
-        end_submit_wait(cmd);
-    }
-
-    Kkt reduce_kkt() override {
-        require_up();
-        // Download current iterate only (averages stay on device until download()).
-        download_vec(b_x_, x_host_);
-        download_vec(b_y_, y_host_);
-
-        const f64* xp = x_host_.data();
-        const f64* yp = y_host_.data();
-
-        std::vector<f64> Ax(nr_), Aty(nc_);
-        spmv_csr_host(xp, Ax.data());
-        spmv_csc_host(yp, Aty.data());
-
-        Kkt k{};
-        for (std::size_t i = 0; i < nr_; ++i) {
-            const f64 a = Ax[i];
-            if (a < row_lo_[i]) k.primal_res = std::max(k.primal_res, row_lo_[i] - a);
-            if (a > row_hi_[i]) k.primal_res = std::max(k.primal_res, a - row_hi_[i]);
-        }
-        for (std::size_t j = 0; j < nc_; ++j) {
-            const f64 r = c_[j] + Aty[j];
-            const bool at_lo = (col_lo_[j] > -kInf) && (xp[j] <= col_lo_[j] + kAtBound);
-            const bool at_hi = (col_hi_[j] <  kInf) && (xp[j] >= col_hi_[j] - kAtBound);
-            if (at_lo && !at_hi) k.dual_res = std::max(k.dual_res, std::max(0.0, -r));
-            else if (at_hi && !at_lo) k.dual_res = std::max(k.dual_res, std::max(0.0, r));
-            else if (!at_lo && !at_hi) k.dual_res = std::max(k.dual_res, std::fabs(r));
-            k.primal_obj += c_[j] * xp[j];
-        }
-        bool finite = true;
-        f64 dval = 0.0;
-        for (std::size_t j = 0; j < nc_ && finite; ++j) {
-            const f64 r = c_[j] + Aty[j];
-            const f64 b = (r >= 0.0) ? col_lo_[j] : col_hi_[j];
-            if (r != 0.0 && std::isinf(b)) { finite = false; break; }
-            dval += mul_zero_safe(r, b);
-        }
-        for (std::size_t i = 0; i < nr_ && finite; ++i) {
-            const f64 yi = yp[i];
-            const f64 b = (yi >= 0.0) ? row_hi_[i] : row_lo_[i];
-            if (yi != 0.0 && std::isinf(b)) { finite = false; break; }
-            dval -= mul_zero_safe(yi, b);
-        }
-        k.dual_bound_finite = finite && std::isfinite(dval);
-        k.dual_obj = k.dual_bound_finite ? dval : std::numeric_limits<f64>::quiet_NaN();
-        k.gap_rel = k.dual_bound_finite
-                        ? std::fabs(k.primal_obj - dval) / (1.0 + std::fabs(k.primal_obj))
-                        : std::numeric_limits<f64>::infinity();
-        k.restart_metric = k.gap_rel;
-        // Movement norms: approximate from host mirrors of consecutive reduce.
-        k.dx_norm = 0.0;
-        k.dy_norm = 0.0;
-        return k;
-    }
-
-    // Declared to match what is actually implemented below, nothing more.
-    // Previously this override was absent, so the device inherited the
-    // all-false base default and the HPR engine refused every configuration
-    // with "device does not support ..." -- which is why the Vulkan path had
-    // never executed a single iteration.
-    //
-    //   reflected_operator     false -- hpr_steps ignores use_reflection and
-    //                                   reflection_gamma; not implemented.
-    //   fixed_point_restart    true  -- snapshot_anchor(), restart_to() and
-    //                                   the halpern_mix dispatch are all here.
-    //   warm_start             true  -- init_iterate() below.
-    //   certificate_directions false -- download() populates x/y/averages but
-    //                                   not primal_ray / dual_farkas_ray; ray
-    //                                   tracking is genuinely not implemented.
-    //   transactional_step     true  -- step checkpoints below.
-    LpDeviceCapabilities capabilities() const override {
-        return {/*reflected_operator=*/false,
-                /*fixed_point_restart=*/true,
-                /*warm_start=*/true,
-                /*certificate_directions=*/false,
-                /*transactional_step=*/true};
+        seed_from_host();
     }
 
     // Warm start from a host point. Clamped to the column box on the way in,
@@ -360,15 +212,171 @@ public:
             if (!std::isfinite(y[i])) return false;
             y_host_[i] = y[i];
         }
-        x_avg_host_ = x_host_;
-        y_avg_host_ = y_host_;
-        avg_count_ = 1;
-        epoch_step_ = 0;
-        upload_vec(b_x_, x_host_);
-        upload_vec(b_y_, y_host_);
-        upload_vec(b_x_avg_, x_avg_host_);
-        upload_vec(b_y_avg_, y_avg_host_);
+        seed_from_host();
         return true;
+    }
+
+    void hpr_steps(std::uint32_t k, const StepParams& p) override {
+        require_up();
+        last_primal_tol_ = p.primal_feas_tol;
+        last_dual_tol_ = p.dual_feas_tol;
+        last_weight_ = std::max<f64>(p.primal_weight, 1e-16);
+        vkResetDescriptorPool(ctx_->device(), ctx_->descriptor_pool(), 0);
+
+        VkDescriptorSet set_csc = alloc_set(k_spmv_csc_.dsl);
+        write_ssbos(set_csc, {&b_col_ptr_, &b_row_idx_, &b_csc_vals_, &b_y_, &b_Aty_});
+
+        VkDescriptorSet set_csr = alloc_set(k_spmv_csr_.dsl);
+        write_ssbos(set_csr, {&b_row_ptr_, &b_col_idx_, &b_csr_vals_, &b_xbar_, &b_Ax_});
+
+        VkDescriptorSet set_primal = alloc_set(k_primal_.dsl);
+        write_ssbos(set_primal, {&b_x_, &b_c_, &b_Aty_, &b_col_lo_, &b_col_hi_,
+                                 &b_xbar_, &b_x_fix_, &b_dx2_});
+
+        VkDescriptorSet set_dual = alloc_set(k_dual_.dsl);
+        write_ssbos(set_dual, {&b_y_, &b_Ax_, &b_row_lo_, &b_row_hi_, &b_Ax_cur_,
+                               &b_y_fix_, &b_Ax_fix_, &b_dy2_, &b_inter_});
+
+        VkDescriptorSet set_stats = alloc_set(k_step_reduce_.dsl);
+        write_ssbos(set_stats, {&b_dx2_, &b_dy2_, &b_inter_, &b_step_});
+
+        VkDescriptorSet set_cx = alloc_set(k_combine_.dsl);
+        write_ssbos(set_cx, {&b_x_, &b_x_fix_, &b_x_anchor_});
+        VkDescriptorSet set_cy = alloc_set(k_combine_.dsl);
+        write_ssbos(set_cy, {&b_y_, &b_y_fix_, &b_y_anchor_});
+        // A*x_current is carried through the same combine so the loop never
+        // needs a third SpMV to know it.
+        VkDescriptorSet set_cax = alloc_set(k_combine_.dsl);
+        write_ssbos(set_cax, {&b_Ax_cur_, &b_Ax_fix_, &b_Ax_anchor_});
+
+        VkDescriptorSet set_avg_x = VK_NULL_HANDLE, set_avg_y = VK_NULL_HANDLE;
+        if (p.update_average) {
+            set_avg_x = alloc_set(k_avg_.dsl);
+            write_ssbos(set_avg_x, {&b_x_, &b_x_avg_});
+            set_avg_y = alloc_set(k_avg_.dsl);
+            write_ssbos(set_avg_y, {&b_y_, &b_y_avg_});
+        }
+
+        VkCommandBuffer cmd = begin_once();
+        // The operator ratio in step[2] is a running max over THIS chunk, so
+        // it is zeroed here and not at upload.
+        vkCmdFillBuffer(cmd, b_step_.buffer, 0, b_step_.size, 0);
+        barrier(cmd);
+
+        // Pinned to zero: see capabilities() -- reflected_operator is not yet
+        // declared, so the device must not quietly run a reflected operator.
+        const f64 gamma = 0.0;
+        for (std::uint32_t s = 0; s < k; ++s) {
+            PcN pc_c{static_cast<uint32_t>(nc_), 0};
+            PcN pc_r{static_cast<uint32_t>(nr_), 0};
+
+            record(cmd, k_spmv_csc_, set_csc, &pc_c, sizeof(pc_c), nc_);
+            PcNScalar pc_p{static_cast<uint32_t>(nc_), 0, p.tau};
+            record(cmd, k_primal_, set_primal, &pc_p, sizeof(pc_p), nc_);
+            record(cmd, k_spmv_csr_, set_csr, &pc_r, sizeof(pc_r), nr_);
+            PcNScalar pc_d{static_cast<uint32_t>(nr_), 0, p.sigma};
+            record(cmd, k_dual_, set_dual, &pc_d, sizeof(pc_d), nr_);
+
+            PcStep pc_s{static_cast<uint32_t>(nc_), static_cast<uint32_t>(nr_),
+                        p.tau, p.sigma};
+            record_one_group(cmd, k_step_reduce_, set_stats, &pc_s, sizeof(pc_s));
+
+            // beta = 0 with gamma = 0 makes combine a plain z <- T(z).
+            const f64 beta = p.use_halpern
+                                 ? 1.0 / (static_cast<f64>(epoch_step_) + 2.0)
+                                 : 0.0;
+            PcCombine pc_mx{static_cast<uint32_t>(nc_), 0, beta, gamma};
+            record(cmd, k_combine_, set_cx, &pc_mx, sizeof(pc_mx), nc_);
+            PcCombine pc_my{static_cast<uint32_t>(nr_), 0, beta, gamma};
+            record(cmd, k_combine_, set_cy, &pc_my, sizeof(pc_my), nr_);
+            record(cmd, k_combine_, set_cax, &pc_my, sizeof(pc_my), nr_);
+
+            if (p.update_average) {
+                ++avg_count_;
+                PcAvg pc_a{static_cast<uint32_t>(nc_),
+                           static_cast<uint32_t>(avg_count_)};
+                record(cmd, k_avg_, set_avg_x, &pc_a, sizeof(pc_a), nc_);
+                pc_a.n = static_cast<uint32_t>(nr_);
+                record(cmd, k_avg_, set_avg_y, &pc_a, sizeof(pc_a), nr_);
+            }
+            ++epoch_step_;
+            ++stats_.calls;
+        }
+        end_submit_wait(cmd);
+    }
+
+    // Both SpMVs and both reductions run on device; exactly kKktOutDoubles
+    // doubles come home.  The residuals are reconstructed in ORIGINAL
+    // coordinates inside the shaders (see kkt_rows.comp / kkt_cols.comp),
+    // matching CpuLpDevice term for term -- scaling must not make termination
+    // easier.
+    Kkt reduce_kkt() override {
+        require_up();
+        vkResetDescriptorPool(ctx_->device(), ctx_->descriptor_pool(), 0);
+
+        VkDescriptorSet set_csr = alloc_set(k_spmv_csr_.dsl);
+        write_ssbos(set_csr, {&b_row_ptr_, &b_col_idx_, &b_csr_vals_, &b_x_, &b_Ax_});
+        VkDescriptorSet set_csc = alloc_set(k_spmv_csc_.dsl);
+        write_ssbos(set_csc, {&b_col_ptr_, &b_row_idx_, &b_csc_vals_, &b_y_, &b_Aty_});
+        VkDescriptorSet set_rows = alloc_set(k_kkt_rows_.dsl);
+        write_ssbos(set_rows, {&b_Ax_, &b_y_, &b_row_lo_, &b_row_hi_, &b_row_scale_,
+                               &b_y_anchor_, &b_part_});
+        VkDescriptorSet set_cols = alloc_set(k_kkt_cols_.dsl);
+        write_ssbos(set_cols, {&b_x_, &b_Aty_, &b_c_, &b_col_lo_, &b_col_hi_,
+                               &b_col_scale_, &b_x_anchor_, &b_part_});
+        VkDescriptorSet set_fin = alloc_set(k_kkt_finalize_.dsl);
+        write_ssbos(set_fin, {&b_part_, &b_step_, &b_out_});
+
+        VkCommandBuffer cmd = begin_once();
+        PcN pc_r{static_cast<uint32_t>(nr_), 0};
+        PcN pc_c{static_cast<uint32_t>(nc_), 0};
+        // A*x is recomputed rather than read from the algebraically carried
+        // b_Ax_cur_: the carried copy is good enough for the operator test
+        // inside a chunk, but a termination decision should not rest on
+        // thousands of accumulated updates.
+        record(cmd, k_spmv_csr_, set_csr, &pc_r, sizeof(pc_r), nr_);
+        record(cmd, k_spmv_csc_, set_csc, &pc_c, sizeof(pc_c), nc_);
+        PcKkt pc_kr{static_cast<uint32_t>(nr_), 0, last_primal_tol_, last_dual_tol_};
+        record(cmd, k_kkt_rows_, set_rows, &pc_kr, sizeof(pc_kr), nr_);
+        PcKkt pc_kc{static_cast<uint32_t>(nc_), g_rows_ * kKktSlots,
+                    last_primal_tol_, last_dual_tol_};
+        record(cmd, k_kkt_cols_, set_cols, &pc_kc, sizeof(pc_kc), nc_);
+        PcFinalize pc_f{g_rows_, g_cols_, last_weight_};
+        record_one_group(cmd, k_kkt_finalize_, set_fin, &pc_f, sizeof(pc_f));
+
+        VkBufferCopy cp{0, 0, kKktOutDoubles * sizeof(f64)};
+        vkCmdCopyBuffer(cmd, b_out_.buffer, b_out_host_.buffer, 1, &cp);
+        end_submit_wait(cmd);
+
+        f64 out[kKktOutDoubles];
+        std::memcpy(out, b_out_host_.mapped, sizeof(out));
+        stats_.d2h_bytes += sizeof(out);
+        ++stats_.calls;
+
+        Kkt k{};
+        k.primal_res = out[0];
+        k.dual_res = out[1];
+        k.primal_obj = out[2];
+        k.dual_bound_finite = std::isfinite(out[3]);
+        k.dual_obj = k.dual_bound_finite ? out[3]
+                                         : std::numeric_limits<f64>::quiet_NaN();
+        k.gap_rel = k.dual_bound_finite
+                        ? std::fabs(k.primal_obj - k.dual_obj) /
+                              (1.0 + std::fabs(k.primal_obj))
+                        : kInf;
+        k.restart_metric = out[4];
+        k.epoch_dx_norm = out[5];
+        k.epoch_dy_norm = out[6];
+        // The controller only ever uses the RATIO lhs/rhs and the predicate
+        // lhs > safety*rhs, so shipping the reduced ratio with a unit
+        // denominator is exactly equivalent to shipping both -- and it is what
+        // keeps the per-check payload at eight doubles.
+        k.operator_lhs = out[7];
+        k.operator_rhs = 1.0;
+        // dx_norm/dy_norm are not read by the HPR controller (the weighted
+        // restart metric above carries the same information), so no bus width
+        // is spent on them.
+        return k;
     }
 
     // The adaptive-step controller runs a chunk of fused iterations and rolls
@@ -377,10 +385,11 @@ public:
     // reason this is cheap enough to do around every chunk.
     bool snapshot_step_checkpoint() override {
         require_up();
-        copy_buf(b_x_, b_x_ckpt_, nc_ * sizeof(f64));
-        copy_buf(b_y_, b_y_ckpt_, nr_ * sizeof(f64));
-        copy_buf(b_x_avg_, b_x_avg_ckpt_, nc_ * sizeof(f64));
-        copy_buf(b_y_avg_, b_y_avg_ckpt_, nr_ * sizeof(f64));
+        copy_many({{&b_x_, &b_x_ckpt_, nc_ * sizeof(f64)},
+                   {&b_y_, &b_y_ckpt_, nr_ * sizeof(f64)},
+                   {&b_x_avg_, &b_x_avg_ckpt_, nc_ * sizeof(f64)},
+                   {&b_y_avg_, &b_y_avg_ckpt_, nr_ * sizeof(f64)},
+                   {&b_Ax_cur_, &b_Ax_cur_ckpt_, nr_ * sizeof(f64)}});
         ckpt_avg_count_ = avg_count_;
         ckpt_epoch_step_ = epoch_step_;
         ckpt_valid_ = true;
@@ -390,39 +399,58 @@ public:
     bool restore_step_checkpoint() override {
         require_up();
         if (!ckpt_valid_) return false;
-        copy_buf(b_x_ckpt_, b_x_, nc_ * sizeof(f64));
-        copy_buf(b_y_ckpt_, b_y_, nr_ * sizeof(f64));
-        copy_buf(b_x_avg_ckpt_, b_x_avg_, nc_ * sizeof(f64));
-        copy_buf(b_y_avg_ckpt_, b_y_avg_, nr_ * sizeof(f64));
+        copy_many({{&b_x_ckpt_, &b_x_, nc_ * sizeof(f64)},
+                   {&b_y_ckpt_, &b_y_, nr_ * sizeof(f64)},
+                   {&b_x_avg_ckpt_, &b_x_avg_, nc_ * sizeof(f64)},
+                   {&b_y_avg_ckpt_, &b_y_avg_, nr_ * sizeof(f64)},
+                   {&b_Ax_cur_ckpt_, &b_Ax_cur_, nr_ * sizeof(f64)},
+                   // T(z) is undefined until the next step runs; point it at
+                   // the restored z so a restart_to(Current) between the
+                   // rollback and the next chunk cannot read a stale image.
+                   {&b_x_ckpt_, &b_x_fix_, nc_ * sizeof(f64)},
+                   {&b_y_ckpt_, &b_y_fix_, nr_ * sizeof(f64)},
+                   {&b_Ax_cur_ckpt_, &b_Ax_fix_, nr_ * sizeof(f64)}});
         avg_count_ = ckpt_avg_count_;
         epoch_step_ = ckpt_epoch_step_;
+        ckpt_valid_ = false;
         return true;
     }
 
     void snapshot_anchor() override {
         require_up();
-        copy_buf(b_x_, b_x_anchor_, nc_ * sizeof(f64));
-        copy_buf(b_y_, b_y_anchor_, nr_ * sizeof(f64));
+        copy_many({{&b_x_, &b_x_anchor_, nc_ * sizeof(f64)},
+                   {&b_y_, &b_y_anchor_, nr_ * sizeof(f64)},
+                   {&b_Ax_cur_, &b_Ax_anchor_, nr_ * sizeof(f64)}});
+        // Every new anchor begins a new Halpern epoch.
+        epoch_step_ = 0;
     }
 
     void restart_to(RestartPoint rp) override {
         require_up();
         switch (rp) {
             case RestartPoint::Average:
-                copy_buf(b_x_avg_, b_x_, nc_ * sizeof(f64));
-                copy_buf(b_y_avg_, b_y_, nr_ * sizeof(f64));
+                copy_many({{&b_x_avg_, &b_x_, nc_ * sizeof(f64)},
+                           {&b_y_avg_, &b_y_, nr_ * sizeof(f64)}});
+                recompute_ax_current();
                 break;
             case RestartPoint::Anchor:
-                copy_buf(b_x_anchor_, b_x_, nc_ * sizeof(f64));
-                copy_buf(b_y_anchor_, b_y_, nr_ * sizeof(f64));
+                copy_many({{&b_x_anchor_, &b_x_, nc_ * sizeof(f64)},
+                           {&b_y_anchor_, &b_y_, nr_ * sizeof(f64)},
+                           {&b_Ax_anchor_, &b_Ax_cur_, nr_ * sizeof(f64)}});
                 break;
             case RestartPoint::Current:
+                // The rHPDHG restart point is the current T(z), not the
+                // reflected/Halpern iterate and not the ergodic average.  This
+                // case used to be a no-op here, which silently turned every
+                // engine-requested restart into "keep going from z".
+                copy_many({{&b_x_fix_, &b_x_, nc_ * sizeof(f64)},
+                           {&b_y_fix_, &b_y_, nr_ * sizeof(f64)},
+                           {&b_Ax_fix_, &b_Ax_cur_, nr_ * sizeof(f64)}});
                 break;
         }
-        copy_buf(b_x_, b_x_avg_, nc_ * sizeof(f64));
-        copy_buf(b_y_, b_y_avg_, nr_ * sizeof(f64));
+        copy_many({{&b_x_, &b_x_avg_, nc_ * sizeof(f64)},
+                   {&b_y_, &b_y_avg_, nr_ * sizeof(f64)}});
         avg_count_ = 1;
-        epoch_step_ = 0;
         snapshot_anchor();
     }
 
@@ -436,6 +464,8 @@ public:
         sol.y = y_host_;
         sol.x_avg = x_avg_host_;
         sol.y_avg = y_avg_host_;
+        // primal_ray / dual_farkas_ray are deliberately left untouched: this
+        // device does not advertise certificate_directions.
     }
 
     TransferStats transfer_stats() const override { return stats_; }
@@ -449,6 +479,34 @@ private:
 
     void require_up() const {
         if (!uploaded_) throw std::logic_error("VulkanLpDevice: upload required");
+    }
+
+    // Seeds x/y from the host mirrors and rebuilds every derived quantity the
+    // iteration depends on, so a warm start and a cold start leave the device
+    // in the same class of state.
+    void seed_from_host() {
+        upload_vec(b_x_, x_host_);
+        upload_vec(b_y_, y_host_);
+        x_avg_host_ = x_host_;
+        y_avg_host_ = y_host_;
+        avg_count_ = 1;
+        copy_many({{&b_x_, &b_x_avg_, nc_ * sizeof(f64)},
+                   {&b_y_, &b_y_avg_, nr_ * sizeof(f64)},
+                   {&b_x_, &b_x_fix_, nc_ * sizeof(f64)},
+                   {&b_y_, &b_y_fix_, nr_ * sizeof(f64)}});
+        recompute_ax_current();
+        copy_many({{&b_Ax_cur_, &b_Ax_fix_, nr_ * sizeof(f64)}});
+        snapshot_anchor();
+    }
+
+    void recompute_ax_current() {
+        vkResetDescriptorPool(ctx_->device(), ctx_->descriptor_pool(), 0);
+        VkDescriptorSet set = alloc_set(k_spmv_csr_.dsl);
+        write_ssbos(set, {&b_row_ptr_, &b_col_idx_, &b_csr_vals_, &b_x_, &b_Ax_cur_});
+        VkCommandBuffer cmd = begin_once();
+        PcN pc{static_cast<uint32_t>(nr_), 0};
+        record(cmd, k_spmv_csr_, set, &pc, sizeof(pc), nr_);
+        end_submit_wait(cmd);
     }
 
     std::vector<uint32_t> read_spv(const char* name) {
@@ -465,8 +523,11 @@ private:
         return words;
     }
 
-    VkPipelineLayout make_layout(uint32_t n_bindings, uint32_t push_bytes,
-                                 VkDescriptorSetLayout* out_dsl) {
+    Pipe make_kernel(const char* spv, uint32_t n_bindings, uint32_t push_bytes) {
+        Pipe out;
+        auto words = read_spv(spv);
+        out.mod = ctx_->load_shader_module(words.data(), words.size());
+
         std::vector<VkDescriptorSetLayoutBinding> binds(n_bindings);
         for (uint32_t i = 0; i < n_bindings; ++i) {
             binds[i].binding = i;
@@ -478,11 +539,9 @@ private:
         dlci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         dlci.bindingCount = n_bindings;
         dlci.pBindings = binds.data();
-        VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
-        if (vkCreateDescriptorSetLayout(ctx_->device(), &dlci, nullptr, &dsl) !=
+        if (vkCreateDescriptorSetLayout(ctx_->device(), &dlci, nullptr, &out.dsl) !=
             VK_SUCCESS)
             throw std::runtime_error("vkCreateDescriptorSetLayout");
-        *out_dsl = dsl;
 
         VkPushConstantRange pcr{};
         pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -492,60 +551,37 @@ private:
         VkPipelineLayoutCreateInfo plci{};
         plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         plci.setLayoutCount = 1;
-        plci.pSetLayouts = &dsl;
+        plci.pSetLayouts = &out.dsl;
         plci.pushConstantRangeCount = push_bytes ? 1u : 0u;
         plci.pPushConstantRanges = push_bytes ? &pcr : nullptr;
-        VkPipelineLayout layout = VK_NULL_HANDLE;
-        if (vkCreatePipelineLayout(ctx_->device(), &plci, nullptr, &layout) !=
+        if (vkCreatePipelineLayout(ctx_->device(), &plci, nullptr, &out.layout) !=
             VK_SUCCESS)
             throw std::runtime_error("vkCreatePipelineLayout");
-        return layout;
-    }
 
-    VkPipeline make_pipeline(VkShaderModule mod, VkPipelineLayout layout) {
         VkComputePipelineCreateInfo ci{};
         ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
         ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        ci.stage.module = mod;
+        ci.stage.module = out.mod;
         ci.stage.pName = "main";
-        ci.layout = layout;
-        VkPipeline pipe = VK_NULL_HANDLE;
+        ci.layout = out.layout;
         if (vkCreateComputePipelines(ctx_->device(), VK_NULL_HANDLE, 1, &ci, nullptr,
-                                     &pipe) != VK_SUCCESS)
+                                     &out.pipe) != VK_SUCCESS)
             throw std::runtime_error("vkCreateComputePipelines");
-        return pipe;
+        return out;
     }
 
     void load_pipelines() {
-        auto spmv_csr = read_spv("spmv_csr.spv");
-        auto spmv_csc = read_spv("spmv_csc.spv");
-        auto primal = read_spv("primal_step.spv");
-        auto dual = read_spv("dual_step.spv");
-        auto halpern = read_spv("halpern_mix.spv");
-        auto avg = read_spv("avg_update.spv");
-
-        mod_spmv_csr_ = ctx_->load_shader_module(spmv_csr.data(), spmv_csr.size());
-        mod_spmv_csc_ = ctx_->load_shader_module(spmv_csc.data(), spmv_csc.size());
-        mod_primal_ = ctx_->load_shader_module(primal.data(), primal.size());
-        mod_dual_ = ctx_->load_shader_module(dual.data(), dual.size());
-        mod_halpern_ = ctx_->load_shader_module(halpern.data(), halpern.size());
-        mod_avg_ = ctx_->load_shader_module(avg.data(), avg.size());
-
-        // push: uint (+ pad) [+ double]
-        layout_spmv_csr_ = make_layout(5, 16, &dsl_spmv_csr_);
-        layout_spmv_csc_ = make_layout(5, 16, &dsl_spmv_csc_);
-        layout_primal_ = make_layout(6, 16, &dsl_primal_);  // n + tau
-        layout_dual_ = make_layout(4, 16, &dsl_dual_);
-        layout_halpern_ = make_layout(2, 16, &dsl_halpern_);
-        layout_avg_ = make_layout(2, 16, &dsl_avg_);
-
-        pipe_spmv_csr_ = make_pipeline(mod_spmv_csr_, layout_spmv_csr_);
-        pipe_spmv_csc_ = make_pipeline(mod_spmv_csc_, layout_spmv_csc_);
-        pipe_primal_ = make_pipeline(mod_primal_, layout_primal_);
-        pipe_dual_ = make_pipeline(mod_dual_, layout_dual_);
-        pipe_halpern_ = make_pipeline(mod_halpern_, layout_halpern_);
-        pipe_avg_ = make_pipeline(mod_avg_, layout_avg_);
+        k_spmv_csr_ = make_kernel("spmv_csr.spv", 5, sizeof(PcN));
+        k_spmv_csc_ = make_kernel("spmv_csc.spv", 5, sizeof(PcN));
+        k_primal_ = make_kernel("primal_step.spv", 8, sizeof(PcNScalar));
+        k_dual_ = make_kernel("dual_step.spv", 9, sizeof(PcNScalar));
+        k_combine_ = make_kernel("combine.spv", 3, sizeof(PcCombine));
+        k_avg_ = make_kernel("avg_update.spv", 2, sizeof(PcAvg));
+        k_step_reduce_ = make_kernel("step_reduce.spv", 4, sizeof(PcStep));
+        k_kkt_rows_ = make_kernel("kkt_rows.spv", 7, sizeof(PcKkt));
+        k_kkt_cols_ = make_kernel("kkt_cols.spv", 8, sizeof(PcKkt));
+        k_kkt_finalize_ = make_kernel("kkt_finalize.spv", 3, sizeof(PcFinalize));
     }
 
     Buf create_raw(VkDeviceSize size, VkBufferUsageFlags usage,
@@ -575,12 +611,16 @@ private:
     }
 
     Buf create_device_buffer(const void* data, VkDeviceSize size) {
+        // A zero-length SSBO is not legal; a one-element stub keeps the
+        // descriptor valid for degenerate models (no rows, or no nonzeros).
+        if (size == 0) size = sizeof(f64);
         Buf staging = create_raw(size,
                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                  true);
-        std::memcpy(staging.mapped, data, static_cast<std::size_t>(size));
+        std::memset(staging.mapped, 0, static_cast<std::size_t>(size));
+        if (data) std::memcpy(staging.mapped, data, static_cast<std::size_t>(size));
         Buf device = create_raw(size,
                                 VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -593,13 +633,11 @@ private:
         end_submit_wait(cmd);
         destroy_buf(staging);
         stats_.h2d_bytes += size;
-        stats_.h2d_ms += 0;  // folded into submit
         return device;
     }
 
     Buf create_device_buffer_zero(VkDeviceSize size) {
-        std::vector<std::uint8_t> z(static_cast<std::size_t>(size), 0);
-        return create_device_buffer(z.data(), size);
+        return create_device_buffer(nullptr, size);
     }
 
     void destroy_buf(Buf& b) {
@@ -614,6 +652,7 @@ private:
     }
 
     void upload_vec(Buf& dst, const std::vector<f64>& v) {
+        if (v.empty()) return;
         Buf staging = create_raw(byte_size(v),
                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
@@ -629,6 +668,7 @@ private:
     }
 
     void download_vec(Buf& src, std::vector<f64>& v) {
+        if (v.empty()) return;
         Buf staging = create_raw(byte_size(v),
                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
@@ -643,10 +683,18 @@ private:
         stats_.d2h_bytes += byte_size(v);
     }
 
-    void copy_buf(Buf& src, Buf& dst, VkDeviceSize size) {
+    struct Copy { Buf* src; Buf* dst; VkDeviceSize size; };
+
+    // One command buffer, one submit, one wait for a whole group of device to
+    // device copies.  Restarts and checkpoints used to pay a full
+    // submit/queue-wait each, several times per chunk.
+    void copy_many(std::initializer_list<Copy> copies) {
         VkCommandBuffer cmd = begin_once();
-        VkBufferCopy cp{0, 0, size};
-        vkCmdCopyBuffer(cmd, src.buffer, dst.buffer, 1, &cp);
+        for (const Copy& c : copies) {
+            if (c.size == 0) continue;
+            VkBufferCopy cp{0, 0, c.size};
+            vkCmdCopyBuffer(cmd, c.src->buffer, c.dst->buffer, 1, &cp);
+        }
         end_submit_wait(cmd);
     }
 
@@ -679,17 +727,38 @@ private:
     void barrier(VkCommandBuffer cmd) {
         VkMemoryBarrier mb{};
         mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
-        mb.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+                           VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+                           VK_ACCESS_TRANSFER_READ_BIT;
         vkCmdPipelineBarrier(cmd,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 1, &mb, 0, nullptr, 0, nullptr);
     }
 
-    void dispatch(VkCommandBuffer cmd, std::size_t n) {
-        const uint32_t g = static_cast<uint32_t>((n + 255) / 256);
-        vkCmdDispatch(cmd, std::max(1u, g), 1, 1);
+    void record(VkCommandBuffer cmd, const Pipe& k, VkDescriptorSet set,
+                const void* push, std::size_t push_bytes, std::size_t n) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, k.pipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, k.layout, 0, 1,
+                                &set, 0, nullptr);
+        vkCmdPushConstants(cmd, k.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           static_cast<uint32_t>(push_bytes), push);
+        vkCmdDispatch(cmd, groups_for(n), 1, 1);
+        barrier(cmd);
+    }
+
+    void record_one_group(VkCommandBuffer cmd, const Pipe& k, VkDescriptorSet set,
+                          const void* push, std::size_t push_bytes) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, k.pipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, k.layout, 0, 1,
+                                &set, 0, nullptr);
+        vkCmdPushConstants(cmd, k.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           static_cast<uint32_t>(push_bytes), push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(cmd);
     }
 
     VkDescriptorSet alloc_set(VkDescriptorSetLayout dsl) {
@@ -704,124 +773,105 @@ private:
         return set;
     }
 
-    void write_ssbo(VkDescriptorSet set, uint32_t binding, Buf& b) {
-        VkDescriptorBufferInfo bi{};
-        bi.buffer = b.buffer;
-        bi.offset = 0;
-        bi.range = b.size;
-        VkWriteDescriptorSet w{};
-        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet = set;
-        w.dstBinding = binding;
-        w.descriptorCount = 1;
-        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        w.pBufferInfo = &bi;
-        vkUpdateDescriptorSets(ctx_->device(), 1, &w, 0, nullptr);
+    void write_ssbos(VkDescriptorSet set, std::initializer_list<Buf*> bufs) {
+        std::vector<VkDescriptorBufferInfo> infos(bufs.size());
+        std::vector<VkWriteDescriptorSet> writes(bufs.size());
+        uint32_t i = 0;
+        for (Buf* b : bufs) {
+            infos[i].buffer = b->buffer;
+            infos[i].offset = 0;
+            infos[i].range = b->size;
+            writes[i] = {};
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = set;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &infos[i];
+            ++i;
+        }
+        vkUpdateDescriptorSets(ctx_->device(), static_cast<uint32_t>(writes.size()),
+                               writes.data(), 0, nullptr);
     }
 
-    struct PC1 { uint32_t n; uint32_t pad; };
-    struct PCAvg { uint32_t n; uint32_t count; };
-
-    void spmv_csr_host(const f64* x, f64* y) const {
-        const auto& rp = A_csr_.pattern.row_ptr();
-        const auto& ci = A_csr_.pattern.col_idx();
-        const auto& v = A_csr_.vals;
-        for (std::size_t r = 0; r < nr_; ++r) {
-            f64 acc = 0.0;
-            for (core::Offset k = rp[r]; k < rp[r + 1]; ++k)
-                acc += v[static_cast<std::size_t>(k)] *
-                       x[static_cast<std::size_t>(ci[static_cast<std::size_t>(k)])];
-            y[r] = acc;
-        }
-    }
-    void spmv_csc_host(const f64* x, f64* y) const {
-        const auto& cp = A_csc_.pattern.col_ptr();
-        const auto& ri = A_csc_.pattern.row_idx();
-        const auto& v = A_csc_.vals;
-        for (std::size_t j = 0; j < nc_; ++j) {
-            f64 acc = 0.0;
-            for (core::Offset k = cp[j]; k < cp[j + 1]; ++k)
-                acc += v[static_cast<std::size_t>(k)] *
-                       x[static_cast<std::size_t>(ri[static_cast<std::size_t>(k)])];
-            y[j] = acc;
-        }
-    }
+    // Push-constant blocks.  std430: a double must sit on an 8-byte boundary,
+    // hence the explicit pads.
+    struct PcN { uint32_t n; uint32_t pad; };
+    struct alignas(8) PcNScalar { uint32_t n; uint32_t pad; double v; };
+    struct alignas(8) PcCombine { uint32_t n; uint32_t pad; double beta; double gamma; };
+    struct alignas(8) PcStep { uint32_t nc; uint32_t nr; double tau; double sigma; };
+    struct alignas(8) PcKkt { uint32_t n; uint32_t base; double ptol; double dtol; };
+    struct alignas(8) PcFinalize { uint32_t g_rows; uint32_t g_cols; double weight; };
+    struct PcAvg { uint32_t n; uint32_t count; };
 
     void destroy_problem_bufs() {
         destroy_buf(b_row_ptr_); destroy_buf(b_col_idx_); destroy_buf(b_csr_vals_);
         destroy_buf(b_col_ptr_); destroy_buf(b_row_idx_); destroy_buf(b_csc_vals_);
         destroy_buf(b_c_); destroy_buf(b_col_lo_); destroy_buf(b_col_hi_);
         destroy_buf(b_row_lo_); destroy_buf(b_row_hi_);
+        destroy_buf(b_row_scale_); destroy_buf(b_col_scale_);
         destroy_buf(b_x_); destroy_buf(b_y_); destroy_buf(b_xbar_);
         destroy_buf(b_Aty_); destroy_buf(b_Ax_);
+        destroy_buf(b_x_fix_); destroy_buf(b_y_fix_);
+        destroy_buf(b_Ax_cur_); destroy_buf(b_Ax_fix_); destroy_buf(b_Ax_anchor_);
         destroy_buf(b_x_avg_); destroy_buf(b_y_avg_);
         destroy_buf(b_x_anchor_); destroy_buf(b_y_anchor_);
+        destroy_buf(b_x_ckpt_); destroy_buf(b_y_ckpt_);
+        destroy_buf(b_x_avg_ckpt_); destroy_buf(b_y_avg_ckpt_);
+        destroy_buf(b_Ax_cur_ckpt_);
+        destroy_buf(b_dx2_); destroy_buf(b_dy2_); destroy_buf(b_inter_);
+        destroy_buf(b_step_); destroy_buf(b_part_);
+        destroy_buf(b_out_); destroy_buf(b_out_host_);
+        uploaded_ = false;
     }
 
     void destroy_all() {
         destroy_problem_bufs();
         if (!ctx_) return;
         auto dev = ctx_->device();
-        auto kill_pipe = [&](VkPipeline& p) {
-            if (p) { vkDestroyPipeline(dev, p, nullptr); p = VK_NULL_HANDLE; }
+        auto kill = [&](Pipe& k) {
+            if (k.pipe) { vkDestroyPipeline(dev, k.pipe, nullptr); k.pipe = VK_NULL_HANDLE; }
+            if (k.layout) { vkDestroyPipelineLayout(dev, k.layout, nullptr); k.layout = VK_NULL_HANDLE; }
+            if (k.dsl) { vkDestroyDescriptorSetLayout(dev, k.dsl, nullptr); k.dsl = VK_NULL_HANDLE; }
+            if (k.mod) { vkDestroyShaderModule(dev, k.mod, nullptr); k.mod = VK_NULL_HANDLE; }
         };
-        auto kill_layout = [&](VkPipelineLayout& p) {
-            if (p) { vkDestroyPipelineLayout(dev, p, nullptr); p = VK_NULL_HANDLE; }
-        };
-        auto kill_dsl = [&](VkDescriptorSetLayout& p) {
-            if (p) { vkDestroyDescriptorSetLayout(dev, p, nullptr); p = VK_NULL_HANDLE; }
-        };
-        auto kill_mod = [&](VkShaderModule& p) {
-            if (p) { vkDestroyShaderModule(dev, p, nullptr); p = VK_NULL_HANDLE; }
-        };
-        kill_pipe(pipe_spmv_csr_); kill_pipe(pipe_spmv_csc_);
-        kill_pipe(pipe_primal_); kill_pipe(pipe_dual_);
-        kill_pipe(pipe_halpern_); kill_pipe(pipe_avg_);
-        kill_layout(layout_spmv_csr_); kill_layout(layout_spmv_csc_);
-        kill_layout(layout_primal_); kill_layout(layout_dual_);
-        kill_layout(layout_halpern_); kill_layout(layout_avg_);
-        kill_dsl(dsl_spmv_csr_); kill_dsl(dsl_spmv_csc_);
-        kill_dsl(dsl_primal_); kill_dsl(dsl_dual_);
-        kill_dsl(dsl_halpern_); kill_dsl(dsl_avg_);
-        kill_mod(mod_spmv_csr_); kill_mod(mod_spmv_csc_);
-        kill_mod(mod_primal_); kill_mod(mod_dual_);
-        kill_mod(mod_halpern_); kill_mod(mod_avg_);
+        kill(k_spmv_csr_); kill(k_spmv_csc_); kill(k_primal_); kill(k_dual_);
+        kill(k_combine_); kill(k_avg_); kill(k_step_reduce_);
+        kill(k_kkt_rows_); kill(k_kkt_cols_); kill(k_kkt_finalize_);
     }
 
     std::unique_ptr<vk::Context> ctx_;
     bool uploaded_ = false;
     std::size_t nr_ = 0, nc_ = 0, nnz_ = 0;
+    std::uint32_t g_rows_ = 1, g_cols_ = 1;
     std::uint64_t avg_count_ = 0;
     std::uint64_t epoch_step_ = 0;
     TransferStats stats_{};
 
-    sparse::CsrMatrix A_csr_;
-    sparse::CscMatrix A_csc_;
-    std::vector<f64> c_, col_lo_, col_hi_, row_lo_, row_hi_;
+    // Host mirrors kept only for the box clamp on warm start and for the final
+    // download; no host-side SpMV or KKT evaluation remains.
+    std::vector<f64> col_lo_, col_hi_;
     std::vector<f64> x_host_, y_host_, x_avg_host_, y_avg_host_;
+
+    f64 last_primal_tol_ = 1e-7;
+    f64 last_dual_tol_ = 1e-7;
+    f64 last_weight_ = 1.0;
 
     Buf b_row_ptr_, b_col_idx_, b_csr_vals_;
     Buf b_col_ptr_, b_row_idx_, b_csc_vals_;
     Buf b_c_, b_col_lo_, b_col_hi_, b_row_lo_, b_row_hi_;
+    Buf b_row_scale_, b_col_scale_;
     Buf b_x_, b_y_, b_xbar_, b_Aty_, b_Ax_;
+    Buf b_x_fix_, b_y_fix_, b_Ax_cur_, b_Ax_fix_, b_Ax_anchor_;
     Buf b_x_avg_, b_y_avg_, b_x_anchor_, b_y_anchor_;
-    Buf b_x_ckpt_, b_y_ckpt_, b_x_avg_ckpt_, b_y_avg_ckpt_;
+    Buf b_x_ckpt_, b_y_ckpt_, b_x_avg_ckpt_, b_y_avg_ckpt_, b_Ax_cur_ckpt_;
+    Buf b_dx2_, b_dy2_, b_inter_, b_step_, b_part_, b_out_, b_out_host_;
     std::uint64_t ckpt_avg_count_ = 0;
     std::uint64_t ckpt_epoch_step_ = 0;
     bool ckpt_valid_ = false;
 
-    VkShaderModule mod_spmv_csr_ = VK_NULL_HANDLE, mod_spmv_csc_ = VK_NULL_HANDLE;
-    VkShaderModule mod_primal_ = VK_NULL_HANDLE, mod_dual_ = VK_NULL_HANDLE;
-    VkShaderModule mod_halpern_ = VK_NULL_HANDLE, mod_avg_ = VK_NULL_HANDLE;
-    VkDescriptorSetLayout dsl_spmv_csr_ = VK_NULL_HANDLE, dsl_spmv_csc_ = VK_NULL_HANDLE;
-    VkDescriptorSetLayout dsl_primal_ = VK_NULL_HANDLE, dsl_dual_ = VK_NULL_HANDLE;
-    VkDescriptorSetLayout dsl_halpern_ = VK_NULL_HANDLE, dsl_avg_ = VK_NULL_HANDLE;
-    VkPipelineLayout layout_spmv_csr_ = VK_NULL_HANDLE, layout_spmv_csc_ = VK_NULL_HANDLE;
-    VkPipelineLayout layout_primal_ = VK_NULL_HANDLE, layout_dual_ = VK_NULL_HANDLE;
-    VkPipelineLayout layout_halpern_ = VK_NULL_HANDLE, layout_avg_ = VK_NULL_HANDLE;
-    VkPipeline pipe_spmv_csr_ = VK_NULL_HANDLE, pipe_spmv_csc_ = VK_NULL_HANDLE;
-    VkPipeline pipe_primal_ = VK_NULL_HANDLE, pipe_dual_ = VK_NULL_HANDLE;
-    VkPipeline pipe_halpern_ = VK_NULL_HANDLE, pipe_avg_ = VK_NULL_HANDLE;
+    Pipe k_spmv_csr_, k_spmv_csc_, k_primal_, k_dual_, k_combine_, k_avg_;
+    Pipe k_step_reduce_, k_kkt_rows_, k_kkt_cols_, k_kkt_finalize_;
 };
 
 }  // namespace

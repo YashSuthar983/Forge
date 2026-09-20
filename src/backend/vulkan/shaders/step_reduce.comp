@@ -1,0 +1,78 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Per-iteration scalar statistics, reduced on device inside the same command
+// buffer as the iteration itself.
+//
+// One workgroup, shared-memory tree.  Subgroup arithmetic
+// (VK_KHR_shader_subgroup_arithmetic) would be faster, but it is an optional
+// feature that has to be queried and enabled per device, and this kernel is
+// three reductions of a few hundred to a few million elements sitting behind
+// two SpMVs -- it is not where the time goes.  Portability across every
+// vendor is worth more here than the last few microseconds.
+//
+// step[0] = ||dx||^2 of THIS step        (restart metric uses the last one)
+// step[1] = ||dy||^2 of THIS step
+// step[2] = running max over the chunk of the operator ratio
+//           2|<A dx, dy>| / (||dx||^2/tau + ||dy||^2/sigma)
+// The max is what makes the adaptive-step test an acceptance test for the
+// whole transactional chunk: a single violating iteration anywhere inside it
+// must reject the chunk, exactly as the CPU device does.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n_cols;
+    uint n_rows;
+    double tau;
+    double sigma;
+} pc;
+
+layout(std430, binding = 0) readonly buffer Dx2Buf   { double dx2[]; };
+layout(std430, binding = 1) readonly buffer Dy2Buf   { double dy2[]; };
+layout(std430, binding = 2) readonly buffer InterBuf { double inter[]; };
+layout(std430, binding = 3) buffer StepBuf           { double step[]; };
+
+shared double sm[256];
+
+// Leading barrier so a caller may reuse sm[] immediately after reading the
+// previous result; every invocation reaches it (uniform control flow).
+double tree_sum(double v) {
+    uint t = gl_LocalInvocationID.x;
+    barrier();
+    sm[t] = v;
+    memoryBarrierShared();
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (t < s) sm[t] += sm[t + s];
+        memoryBarrierShared();
+        barrier();
+    }
+    return sm[0];
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+
+    double a = 0.0lf;
+    for (uint i = t; i < pc.n_cols; i += 256u) a += dx2[i];
+    double sum_dx2 = tree_sum(a);
+
+    a = 0.0lf;
+    for (uint i = t; i < pc.n_rows; i += 256u) a += dy2[i];
+    double sum_dy2 = tree_sum(a);
+
+    a = 0.0lf;
+    for (uint i = t; i < pc.n_rows; i += 256u) a += inter[i];
+    double sum_inter = tree_sum(a);
+
+    if (t == 0u) {
+        double lhs = 2.0lf * abs(sum_inter);
+        double rhs = 0.0lf;
+        if (pc.tau > 0.0lf)   rhs += sum_dx2 / pc.tau;
+        if (pc.sigma > 0.0lf) rhs += sum_dy2 / pc.sigma;
+        double ratio = (rhs > 0.0lf) ? (lhs / rhs) : 0.0lf;
+        step[0] = sum_dx2;
+        step[1] = sum_dy2;
+        step[2] = max(step[2], ratio);
+    }
+}

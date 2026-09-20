@@ -1,0 +1,97 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Column-space half of the device KKT reduction.  Slot layout, slot-minor:
+//   0 max  primal bound violation          3 sum  dual-bound column term
+//   1 max  dual residual from columns      4 sum  ||x - x_anchor||^2
+//   2 max  "dual bound is not finite" flag 5 sum  primal objective c'x
+// Partials land after the row partials, at pc.base doubles in.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n_cols;
+    uint base;
+    double primal_tol;
+    double dual_tol;
+} pc;
+
+layout(std430, binding = 0) readonly buffer XBuf     { double x[]; };
+layout(std430, binding = 1) readonly buffer AtyBuf   { double aty[]; };
+layout(std430, binding = 2) readonly buffer CBuf     { double c[]; };
+layout(std430, binding = 3) readonly buffer LoBuf    { double lo[]; };
+layout(std430, binding = 4) readonly buffer HiBuf    { double hi[]; };
+layout(std430, binding = 5) readonly buffer CsBuf    { double col_scale[]; };
+layout(std430, binding = 6) readonly buffer AnchBuf  { double x_anchor[]; };
+layout(std430, binding = 7) writeonly buffer PartBuf { double part[]; };
+
+shared double sm[256];
+
+bool not_finite(double v) { return !(abs(v) <= 1.7976931348623157e308lf); }
+
+double tree(double v, bool is_max) {
+    uint t = gl_LocalInvocationID.x;
+    barrier();
+    sm[t] = v;
+    memoryBarrierShared();
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (t < s) sm[t] = is_max ? max(sm[t], sm[t + s]) : sm[t] + sm[t + s];
+        memoryBarrierShared();
+        barrier();
+    }
+    return sm[0];
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint j = gl_WorkGroupID.x * 256u + t;
+    bool live = j < pc.n_cols;
+
+    double pres = 0.0lf, dres = 0.0lf, nonfinite = 0.0lf;
+    double dval = 0.0lf, dx2 = 0.0lf, pobj = 0.0lf;
+
+    if (live) {
+        double xj = x[j];
+        double cs = col_scale[j];
+        if (xj < lo[j]) pres = max(pres, (lo[j] - xj) * cs);
+        if (xj > hi[j]) pres = max(pres, (xj - hi[j]) * cs);
+
+        double r_scaled = c[j] + aty[j];
+        double r = r_scaled / cs;
+        double x_orig = xj * cs;
+        double at_tol = pc.primal_tol * (1.0lf + abs(x_orig)) / cs;
+        bool at_lo = !not_finite(lo[j]) && xj <= lo[j] + at_tol;
+        bool at_hi = !not_finite(hi[j]) && xj >= hi[j] - at_tol;
+        if (at_lo && !at_hi)       dres = max(0.0lf, -r);
+        else if (at_hi && !at_lo)  dres = max(0.0lf,  r);
+        else if (!at_lo && !at_hi) dres = abs(r);
+
+        double b = (r_scaled >= 0.0lf) ? lo[j] : hi[j];
+        if (not_finite(b)) {
+            double scale = 1.0lf + abs(c[j] / cs);
+            if (abs(r) > pc.dual_tol * scale) nonfinite = 1.0lf;
+        } else {
+            dval = r_scaled * b;
+        }
+
+        double d = xj - x_anchor[j];
+        dx2 = d * d;
+        pobj = c[j] * xj;
+    }
+
+    double r0 = tree(pres, true);
+    double r1 = tree(dres, true);
+    double r2 = tree(nonfinite, true);
+    double r3 = tree(dval, false);
+    double r4 = tree(dx2, false);
+    double r5 = tree(pobj, false);
+    if (t == 0u) {
+        uint o = pc.base + gl_WorkGroupID.x * 6u;
+        part[o + 0u] = r0;
+        part[o + 1u] = r1;
+        part[o + 2u] = r2;
+        part[o + 3u] = r3;
+        part[o + 4u] = r4;
+        part[o + 5u] = r5;
+    }
+}
