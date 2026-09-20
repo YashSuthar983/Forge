@@ -5,6 +5,7 @@
 #include "fixtures.hpp"
 #include "test_helpers.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <sstream>
 
@@ -123,6 +124,53 @@ int main() {
             const double ra = a.operator_rhs > 0.0 ? a.operator_lhs / a.operator_rhs : 0.0;
             const double rb = b.operator_rhs > 0.0 ? b.operator_lhs / b.operator_rhs : 0.0;
             CHECK(close(ra, rb, 1e-9));
+        }
+
+        // Reflected operator.  Two things have to hold: the Vulkan device must
+        // agree with the CPU device iterate for iterate under reflection, and
+        // gamma must actually reach the kernel -- a device that silently
+        // ignored reflection_gamma while declaring reflected_operator would
+        // pass the first check on its own.
+        {
+            auto ref_r = backend::make_cpu_lp_device();
+            auto vk_r = backend::make_vulkan_lp_device();
+            auto vk_plain = backend::make_vulkan_lp_device();
+            CHECK(vk_r != nullptr && vk_plain != nullptr);
+            for (auto* d : {ref_r.get(), vk_r.get(), vk_plain.get()}) {
+                d->upload(scaled);
+                d->init_zero();
+            }
+            backend::StepParams refl;
+            refl.tau = 0.05;
+            refl.sigma = 0.05;
+            refl.primal_weight = 1.0;
+            refl.update_average = false;
+            refl.use_halpern = true;
+            refl.use_reflection = true;
+            refl.reflection_gamma = 1.0;
+            backend::StepParams plain = refl;
+            plain.use_reflection = false;
+
+            ref_r->hpr_steps(40, refl);
+            vk_r->hpr_steps(40, refl);
+            vk_plain->hpr_steps(40, plain);
+
+            backend::LpSolution a, b, c;
+            ref_r->download(a);
+            vk_r->download(b);
+            vk_plain->download(c);
+            CHECK(a.x.size() == b.x.size() && b.x.size() == c.x.size());
+            double max_cpu_gpu = 0.0, max_refl_plain = 0.0;
+            for (std::size_t j = 0; j < a.x.size(); ++j) {
+                max_cpu_gpu = std::max(max_cpu_gpu, std::fabs(a.x[j] - b.x[j]));
+                max_refl_plain = std::max(max_refl_plain, std::fabs(b.x[j] - c.x[j]));
+            }
+            for (std::size_t i = 0; i < a.y.size(); ++i)
+                max_cpu_gpu = std::max(max_cpu_gpu, std::fabs(a.y[i] - b.y[i]));
+            CHECK(max_cpu_gpu < 1e-9);
+            // gamma = 1 is a genuinely different operator from gamma = 0.
+            CHECK(max_refl_plain > 1e-9);
+            CHECK(vk_r->capabilities().reflected_operator);
         }
 
         // The payload of a convergence check is eight doubles, full stop.

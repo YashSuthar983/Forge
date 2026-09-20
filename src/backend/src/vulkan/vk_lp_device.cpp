@@ -72,11 +72,9 @@ public:
 
     // Declared to match what is actually implemented below, nothing more.
     //
-    //   reflected_operator     false -- combine.comp can form
-    //                                   (1+gamma)T(z) - gamma*z, but hpr_steps
-    //                                   still pins gamma to 0 and the
-    //                                   reflected path has not been measured;
-    //                                   the capability stays false until it is.
+    //   reflected_operator     true  -- combine.comp forms
+    //                                   (1+gamma)T(z) - gamma*z and hpr_steps
+    //                                   pushes reflection_gamma into it.
     //   fixed_point_restart    true  -- snapshot_anchor(), restart_to() and
     //                                   the Halpern mix are all here, and
     //                                   RestartPoint::Current now genuinely
@@ -91,7 +89,7 @@ public:
     //                                   real device-reduced max over the
     //                                   chunk rather than a hardcoded zero.
     LpDeviceCapabilities capabilities() const override {
-        return {/*reflected_operator=*/false,
+        return {/*reflected_operator=*/true,
                 /*fixed_point_restart=*/true,
                 /*warm_start=*/true,
                 /*certificate_directions=*/false,
@@ -263,9 +261,12 @@ public:
         vkCmdFillBuffer(cmd, b_step_.buffer, 0, b_step_.size, 0);
         barrier(cmd);
 
-        // Pinned to zero: see capabilities() -- reflected_operator is not yet
-        // declared, so the device must not quietly run a reflected operator.
-        const f64 gamma = 0.0;
+        // r2HPDHG: the Halpern average acts on the REFLECTED image
+        // (1+gamma)T(z) - gamma*z, not on T(z).  Reflection only has meaning
+        // inside a Halpern epoch -- without the anchor mix the reflected
+        // operator is not averaged and need not be contractive -- so gamma is
+        // zero whenever use_halpern is off, exactly as on the CPU device.
+        const f64 gamma = (p.use_halpern && p.use_reflection) ? p.reflection_gamma : 0.0;
         for (std::uint32_t s = 0; s < k; ++s) {
             PcN pc_c{static_cast<uint32_t>(nc_), 0};
             PcN pc_r{static_cast<uint32_t>(nr_), 0};
