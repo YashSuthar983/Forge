@@ -76,7 +76,9 @@ bool dual_dse_accept_weight(core::f64 updated_weight,
 
 // Running-density and DSE-cost policy used by SimplexPricing::Choose. These
 // are pure functions so every strict boundary in the adaptive path is covered
-// without needing a benchmark-sized LP to happen upon it.
+// without needing a benchmark-sized LP to happen upon it. Historically these
+// gated a one-way handoff to Devex; Choose now rebuilds exact DSE by default
+// and only uses the Devex handoff when SOR_DUAL_CHOOSE_DEVEX_FALLBACK is set.
 core::f64 dual_update_running_density(core::f64 previous,
                                       core::f64 local_density);
 

@@ -1190,7 +1190,7 @@ bool try_structured_binary_search(const model::LpProblem& lp,
     const auto start = Clock::now();
     bool search_phase = true;
     const double search_limit_s = time_limit_s > 0.0
-        ? std::max(0.05, time_limit_s - 0.6) : 0.0;
+        ? std::max(0.0, time_limit_s - 0.6) : 0.0;
     const auto over_budget = [&]() {
         if (time_limit_s <= 0.0) return false;
         const double elapsed = std::chrono::duration<double>(Clock::now() - start).count();
@@ -3167,7 +3167,7 @@ ParaExpandOut para_expand_node(const model::LpProblem& global_lp,
     // limit (51.4 s and 83.0 s wall) because of this one line. The serial node
     // loop already clamps the same way.
     if (lp_seconds_left > 0.0)
-        lp_opts.time_limit_s = std::max(0.05, lp_seconds_left);
+        lp_opts.time_limit_s = lp_seconds_left;
     if (lp_opts.max_iterations == 0) {
         const std::uint64_t work_size =
             static_cast<std::uint64_t>(node_lp.n_rows()) +
@@ -4980,7 +4980,13 @@ core::RawResult solve_milp(const model::LpProblem& problem,
             // Captured once for the whole batch so every worker shares one
             // deadline (and the value stays deterministic across workers).
             const double para_lp_left =
-                opts.time_limit_s > 0.0 ? std::max(0.05, seconds_left()) : 0.0;
+                opts.time_limit_s > 0.0 ? seconds_left() : 0.0;
+            if (opts.time_limit_s > 0.0 && !(para_lp_left > 0.0)) {
+                for (auto& pending : batch) open.push(std::move(pending));
+                reason = "time limit";
+                SOR_ROUTE(1, "bab", "stop", "\"reason\":\"time_limit\"");
+                break;
+            }
             {
                 std::vector<std::jthread> workers_jt;
                 workers_jt.reserve(batch.size());
@@ -5379,7 +5385,13 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         if (opts.time_limit_s > 0.0) {
             const double elapsed =
                 std::chrono::duration<double>(Clock::now() - t0).count();
-            lp_opts.time_limit_s = std::max(0.05, opts.time_limit_s - elapsed);
+            const double left = opts.time_limit_s - elapsed;
+            if (!(left > 0.0)) {
+                reason = "time limit";
+                SOR_ROUTE(1, "bab", "stop", "\"reason\":\"time_limit\"");
+                break;
+            }
+            lp_opts.time_limit_s = left;
         }
         engines::SimplexDiagnostics sd;
         engines::SimplexBasis node_basis;
@@ -5454,21 +5466,26 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                 // solve and the caller's presolve preference; this is still
                 // accepted only after an independent certificate check.
                 fallback_opts.presolve = opts.lp.presolve;
+                bool fallback_has_time = true;
                 if (opts.time_limit_s > 0.0) {
                     const double left = opts.time_limit_s -
                         std::chrono::duration<double>(Clock::now() - t0).count();
-                    fallback_opts.time_limit_s = std::max(0.05, left);
+                    fallback_has_time = left > 0.0;
+                    fallback_opts.time_limit_s = std::max(0.0, left);
                 }
-                engines::SimplexDiagnostics fallback_sd;
-                engines::SimplexBasis fallback_basis;
-                auto fallback_raw = engines::solve_simplex(
-                    node_lp, fallback_opts, fallback_sd, &fallback_basis);
-                ++diag.lp_fallbacks;
-                if (relaxation_proved(fallback_raw, fallback_sd, fallback_opts) ||
-                    fallback_raw.proposed_status == core::Status::Infeasible) {
-                    lp_raw = std::move(fallback_raw);
-                    sd = std::move(fallback_sd);
-                    node_basis = std::move(fallback_basis);
+                if (fallback_has_time) {
+                    engines::SimplexDiagnostics fallback_sd;
+                    engines::SimplexBasis fallback_basis;
+                    auto fallback_raw = engines::solve_simplex(
+                        node_lp, fallback_opts, fallback_sd, &fallback_basis);
+                    ++diag.lp_fallbacks;
+                    if (relaxation_proved(fallback_raw, fallback_sd,
+                                          fallback_opts) ||
+                        fallback_raw.proposed_status == core::Status::Infeasible) {
+                        lp_raw = std::move(fallback_raw);
+                        sd = std::move(fallback_sd);
+                        node_basis = std::move(fallback_basis);
+                    }
                 }
             }
         }
@@ -6528,8 +6545,23 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         // incumbent can be far worse than a feasible point reached by
         // following the relaxation down a few branch decisions (the classic
         // weakness of independent rounding on markshare/assignment models).
+        // Bound the dive by TIME, not by dimension.
+        //
+        // The old gate was `n_cols <= 3000 && nnz <= 15000`, which disables
+        // the classic first-solution heuristic on essentially every real
+        // MIPLIB instance: of the NOSOL instances whose tree actually
+        // searches, 7 of 8 were blocked by it -- swath3 (6805 cols),
+        // air05 (7195), wachplan (89361 nnz), rocI-4-11, ns1830653,
+        // momentum1, kakapo -- all reporting "integer dive: 0 attempts"
+        // while exploring hundreds or thousands of nodes and never finding a
+        // single feasible point. A dimension cap is the wrong instrument when
+        // the call already carries its own wall budget (integer_dive_time_s,
+        // further clamped below for wide models and by the remaining solve
+        // time). The generous ceiling that remains only stops the dive being
+        // attempted on models where a single node LP cannot finish inside the
+        // budget anyway.
         if (opts.integer_dive && diag.nodes == 1 && !heuristics_over_budget() &&
-            problem.n_cols() <= 3000 && problem.nnz() <= 15000) {
+            problem.n_cols() <= 200000 && problem.nnz() <= 2000000) {
             const auto t_dive = Clock::now();
             ++diag.integer_dive_attempts;
             double dive_budget = opts.integer_dive_time_s;

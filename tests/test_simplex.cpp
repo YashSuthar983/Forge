@@ -803,7 +803,11 @@ ENDATA
     CHECK(dual.r.status == Status::Unbounded);
     CHECK(dual.r.proof < ProofLevel::ProvedOptimalFP);
     CHECK(dual.diag.phase_restarts > 0);
-    CHECK(dual.diag.final_phase == 1);
+    // Phase 2, not 1: under the Choose policy's exact-DSE drift rebuild the
+    // run restores the true bounds and finishes the unboundedness proof in
+    // phase 2 instead of terminating inside phase 1. Same outcome, one more
+    // handover -- the status and proof-level checks above are the contract.
+    CHECK(dual.diag.final_phase == 2);
     CHECK(dual.diag.perturbed_costs > 0);
     CHECK(dual.diag.perturbation_cleanups == 1);
 }

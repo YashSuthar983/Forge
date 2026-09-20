@@ -1,4 +1,5 @@
 // WP-F: TU / network / consecutive-ones implied integrality.
+#include "sor/search/bab.hpp"
 #include "sor/search/implied_int.hpp"
 #include "sor/sparse/csr.hpp"
 
@@ -10,6 +11,10 @@
 using sor::model::LpProblem;
 using sor::model::kInf;
 using sor::sparse::from_triplets;
+namespace model = sor::model;
+namespace core = sor::core;
+namespace sparse = sor::sparse;
+namespace search = sor::search;
 
 namespace {
 
@@ -140,6 +145,10 @@ void test_tu_network_block_pair() {
     o.network = false;
     o.consecutive_ones = false;
     o.dual_rational = false;
+    // Explicit opt-in: the rule is correct on this fixture but UNSOUND on real
+    // models (see the header), so it no longer defaults on. This test pins the
+    // rule's own behaviour, not the shipped default.
+    o.tu_network_block = true;
     const auto d = sor::search::infer_implied_integers_ex(lp, o);
     CHECK(d.tu_network_block >= 2);
     CHECK(lp.is_integer[0]);
@@ -154,5 +163,46 @@ int main() {
     test_c1_marks();
     test_dual_rational_marks_z();
     test_tu_network_block_pair();
-    return sor::test::finish("test_implied_int");
+    
+    // --- Regression: implied integrality must never fire on a pure LP ------
+    //
+    // 2026-09-19. Marking a continuous column integer RESTRICTS the feasible
+    // set, and snap_integer_bounds() then rounds that column's bounds. On a
+    // model the caller supplied with no integer columns there is no branching
+    // to help, so the upside is zero and the downside is a wrong answer:
+    //   netlib 80bau3b -> false Infeasible (true optimum 987224.19)
+    //   netlib d2q06c  -> 122784.63 against a true LP optimum of 122784.21
+    // Three separate rules were implicated (tu_network_block, dual_rational,
+    // network), so this is guarded at the call site in bab.cpp rather than
+    // rule by rule. This test pins the property the guard protects.
+    {
+        model::LpProblem lp;
+        // min -x  s.t.  2x + 2y = 3,  0<=x,y<=3.  Optimum x=1.5 is FRACTIONAL,
+        // so any integrality mark on x makes the true optimum unreachable.
+        std::vector<core::Index> rows{0, 0};
+        std::vector<core::Index> cols{0, 1};
+        std::vector<core::f64> vals{2.0, 2.0};
+        lp.A = sparse::from_triplets(1, 2, rows, cols, vals);
+        lp.c = {-1.0, 0.0};
+        lp.col_lo = {0.0, 0.0};
+        lp.col_hi = {3.0, 3.0};
+        lp.row_lo = {3.0};
+        lp.row_hi = {3.0};
+        lp.is_integer.assign(2, false);
+        CHECK(lp.n_integer() == 0);
+
+        // tu_network_block is unsound as implemented and must stay OFF.
+        search::ImpliedIntOptions defaults;
+        CHECK(!defaults.tu_network_block);
+
+        // And the MILP entry point must answer a pure LP as an LP.
+        search::BabOptions bopts;
+        bopts.time_limit_s = 10.0;
+        search::BabDiagnostics bdiag;
+        const auto out = search::solve_milp(lp, bopts, bdiag);
+        CHECK(out.proposed_status != core::Status::Infeasible);
+        CHECK_NEAR(out.objective, -1.5, 1e-7);
+    }
+
+return sor::test::finish("test_implied_int");
 }

@@ -11,6 +11,7 @@
 #include "sor/model/lp.hpp"
 
 #include <cstdint>
+#include <vector>
 #include <string>
 
 namespace sor::engines {
@@ -69,6 +70,15 @@ struct HprOptions {
 
 struct HprDiagnostics {
     core::Status status = core::Status::NotSolved;
+    // Features that were REQUESTED but which the selected device cannot
+    // execute, and which were therefore silently switched off for this solve.
+    //
+    // test_r2hpdg states the rule: a device may never run a weakened algorithm
+    // under the HPR name. Refusing outright made --backend vulkan a hard
+    // Unsupported, so the degradation is allowed -- but it must be VISIBLE, or
+    // the result claims an algorithm that did not run. Non-empty here means the
+    // solve was not the algorithm the caller asked for.
+    std::vector<std::string> degraded_features;
     std::uint64_t iterations = 0;
     std::uint64_t restarts   = 0;
     std::uint64_t sufficient_restarts = 0;
