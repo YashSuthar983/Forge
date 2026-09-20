@@ -1,19 +1,34 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
 
+// r2HPDHG's outer update, applied to one vector of the iterate:
+//
+//   z <- (1 - beta) * ((1 + gamma) * T(z) - gamma * z) + beta * anchor
+//
+// gamma is the reflection strength (gamma = 1 is Peaceman-Rachford, gamma = 0
+// is plain Halpern-PDHG) and beta = 1/(k+2) is the Halpern weight toward the
+// epoch anchor.  beta = gamma = 0 degenerates to z <- T(z), so the engine's
+// "no Halpern" configuration runs through this same dispatch rather than a
+// separate copy path -- one kernel, one place for the algebra to be wrong.
+
 layout(local_size_x = 256) in;
 
 layout(push_constant) uniform PC {
     uint n;
+    uint pad;
     double beta;
+    double gamma;
 } pc;
 
-layout(std430, binding = 0) buffer ZBuf { double z[]; };
-layout(std430, binding = 1) readonly buffer AnchorBuf { double anchor[]; };
+layout(std430, binding = 0) buffer ZBuf              { double z[]; };
+layout(std430, binding = 1) readonly buffer TzBuf    { double tz[]; };
+layout(std430, binding = 2) readonly buffer AnchorBuf { double anchor[]; };
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.n) return;
+    double g = pc.gamma;
     double b = pc.beta;
-    z[i] = (1.0lf - b) * z[i] + b * anchor[i];
+    double reflected = (1.0lf + g) * tz[i] - g * z[i];
+    z[i] = (1.0lf - b) * reflected + b * anchor[i];
 }
