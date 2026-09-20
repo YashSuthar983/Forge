@@ -3,6 +3,7 @@
 // dispatches Dual / Primal / Auto (dual first, primal fallback).
 #pragma once
 
+#include "sor/core/cancel.hpp"
 #include "sor/core/result.hpp"
 #include "sor/la/lu.hpp"
 #include "sor/model/lp.hpp"
@@ -27,7 +28,7 @@ enum class SimplexPricing : std::uint8_t {
     Dantzig = 0,
     Devex   = 1,
     DSE     = 2,
-    Choose  = 3,  // start with DSE; switch to Devex when DSE work is costly
+    Choose  = 3,  // start with DSE; rebuild DSE on drift (Devex handoff opt-in)
 };
 
 enum class SimplexMethod : std::uint8_t {
@@ -45,6 +46,14 @@ struct SimplexBasis {
 struct SimplexOptions {
     std::uint64_t max_iterations = 0;
     double time_limit_s = 0.0;
+
+    // Cooperative cancellation, polled alongside time_limit_s every 64
+    // iterations. Null on every serial path. Set by the concurrent racer so a
+    // losing arm stops pivoting the moment a rival proves the LP; the arm
+    // terminates Interrupted with reason "cancelled (concurrent race lost)",
+    // which is never reported to the caller because a cancelled arm can only
+    // lose.
+    const core::CancelToken* cancel = nullptr;
 
     f64 primal_feas_tol = 1e-7;
     f64 dual_feas_tol   = 1e-7;
@@ -71,7 +80,8 @@ struct SimplexOptions {
     // and are always removed before an optimality conclusion. A phase-1-only
     // variant is intentionally NOT the default: measured Netlib gains from
     // perturbation are concentrated in phase 2 (e.g. nesm), so gating to
-    // phase 1 would be a no-op on the models that benefit.
+    // phase 1 would be a no-op on the models that benefit; see
+    // docs/AGENT1_HANDOFF_20260910.md §18.
     f64 dual_cost_perturbation_multiplier = 0.0;
 
     // Refactor after this many basis updates. Product-form etas are as dense
@@ -125,7 +135,7 @@ struct SimplexOptions {
     // calibrated for product-form etas and cannot serve FT, whose row etas are
     // ~12x sparser: it fires about ten times less often, refactor_interval
     // never binds, and FT accuracy decays roughly a decade per 45 updates. See
-    // Inert on the product-form path.
+    // docs/PERFORMANCE_REPORT_20260908.md. Inert on the product-form path.
     // Chosen by sweeping {50, 100, 200} x {1.5, 2, 3} on d2q06c, pilot87,
     // dfl001, greenbea and 25fv47 by pivots and DSE log error. Every setting
     // removed the non-convergence outright; 50 gives the lowest pivot total of
@@ -145,7 +155,8 @@ struct SimplexOptions {
     // 100, 0.76x at 200) and is also the one whose DSE log error the old
     // comment flagged, so re-check that pair together if this is retuned.
     int ft_update_limit = 200;
-    // Collective FT (Huangfu & Hall 2015 Phase 2): when the product-form eta file hits
+    // Collective FT (Huangfu & Hall 2015 Phase 2, item 2 of
+    // docs/SIH26119_PS_ALIGNMENT.md §5): when the product-form eta file hits
     // refactor_eta_ratio, try BasisFactor::collapse_pending_into_ft() (fold
     // the pending etas into L/U via sequential update_ft() calls, verified
     // representation-transparent in tests/test_lu.cpp) before falling back
@@ -201,7 +212,7 @@ struct SimplexOptions {
     bool presolve_implied_slack = false;
     // Round every Ruiz factor to the nearest power of two, which makes the
     // scaling exact in floating point (see ruiz_scale). Off by default until
-    // it clears the full Netlib comparison.
+    // it clears the 93-model gate; see docs/SCALING_20260908.md.
     bool ruiz_power_of_two = false;
     bool verbose = false;
 };
@@ -311,6 +322,9 @@ struct SimplexDiagnostics {
     // paying the m-BTRAN rebuild (see DualEdgeWeightCarrier).
     std::uint64_t dse_weight_reuses = 0;
     std::uint64_t dse_weight_rebuilds = 0;
+    // Choose-mode drift recovery: exact DSE weight rebuilds that replace the
+    // old one-way handoff to Devex (see dual_simplex Choose policy).
+    std::uint64_t dse_drift_rebuilds = 0;
     std::uint64_t dse_to_devex_switches = 0;
     std::uint64_t dse_accuracy_switches = 0;
     std::uint64_t dse_stability_switches = 0;
@@ -452,11 +466,10 @@ struct SimplexDiagnostics {
     // primal infeasibility against the row weights.
     double chuzr_ms   = 0.0;
     std::uint64_t chuzr_calls        = 0;
-    // Exact indexed-heap maintenance. rows_scanned counts score evaluations,
-    // not implicit heap comparisons; full_scans is nonzero only for explicit
-    // exhaustive verification/ablation.  A production run should normally
-    // rebuild after factor/phase resynchronization and otherwise update only
-    // rows touched by the FTRAN direction.
+    // CHUZR work attribution. Production uses the sequential exhaustive scan;
+    // the exact indexed heap remains available through SOR_DUAL_INDEXED_CHUZR
+    // for controlled experiments and cross-checking. rows_scanned counts score
+    // evaluations, not implicit heap comparisons.
     std::uint64_t chuzr_rows_scanned = 0;
     std::uint64_t chuzr_heap_rebuilds = 0;
     std::uint64_t chuzr_heap_updates = 0;
@@ -473,6 +486,15 @@ struct SimplexDiagnostics {
     double pivotal_row_ms = 0.0;
     double ratio_test_ms  = 0.0;
     double basis_update_ms = 0.0;
+    // FTRAN cost split by the path the solve actually took. The aggregate
+    // average conflates a seeded solve that stays sparse with one that falls
+    // back to the O(m) path, and those differ by an order of magnitude.
+    std::uint64_t ftran_seeded_sparse_calls = 0;
+    std::uint64_t ftran_seeded_dense_calls = 0;
+    std::uint64_t ftran_unseeded_calls = 0;
+    double ftran_seeded_sparse_ms = 0.0;
+    double ftran_seeded_dense_ms = 0.0;
+    double ftran_unseeded_ms = 0.0;
     // Dual hypersparse-support diagnostics (ftran_with_support path):
     // sparse_iters counts iterations whose entering-column FTRAN returned a
     // support; support_entries accumulates |support| so the average density

@@ -1,6 +1,9 @@
 #include "sor/engines/hpr.hpp"
 #include "sor/engines/pdhg.hpp"
 
+#include "sor/core/route_debug.hpp"
+#include "sor/core/result.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -444,6 +447,8 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
                           const HprOptions& opts_in,
                           backend::LpDevice& device,
                           HprDiagnostics& diag) {
+    core::RouteSpan eng(1, "hpr", "loop", "loop", "",
+                        core::RouteLedgerBucket::Engine);
     const auto t_all = Clock::now();
     diag = HprDiagnostics{};
     device.reset_stats();
@@ -459,6 +464,8 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
         diag.status = raw.proposed_status;
         diag.termination_reason = raw.termination_reason;
         diag.total_ms = ms_since(t_all);
+        SOR_ROUTE(1, "hpr", "terminal",
+                  "\"status\":\"Unsupported\",\"kind\":\"device_caps\"");
         return raw;
     }
     if ((opts.use_restart || opts.use_adaptive_step || opts.use_halpern) &&
@@ -469,6 +476,8 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
         diag.status = raw.proposed_status;
         diag.termination_reason = raw.termination_reason;
         diag.total_ms = ms_since(t_all);
+        SOR_ROUTE(1, "hpr", "terminal",
+                  "\"status\":\"Unsupported\",\"kind\":\"device_caps\"");
         return raw;
     }
     if (opts.use_polishing && !caps.warm_start) {
@@ -478,18 +487,28 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
         diag.status = raw.proposed_status;
         diag.termination_reason = raw.termination_reason;
         diag.total_ms = ms_since(t_all);
+        SOR_ROUTE(1, "hpr", "terminal",
+                  "\"status\":\"Unsupported\",\"kind\":\"device_caps\"");
         return raw;
     }
     if (opts.detect_certificates && !caps.certificate_directions) {
         // Certificates are best-effort on FO. Vulkan (and any device that has
-        // not yet shipped ray candidates) must still be allowed to iterate -
+        // not yet shipped ray candidates) must still be allowed to iterate --
         // refusing the whole solve made `--backend vulkan` a hard Unsupported
         // even after E1-E5 parity landed on the hot path.
+        //
+        // The degradation is RECORDED rather than silent: test_r2hpdg's rule is
+        // that a weakened algorithm may not pass as HPR, and a named entry in
+        // degraded_features is what keeps that true.
         opts.detect_certificates = false;
+        diag.degraded_features.emplace_back("certificate directions");
+        SOR_ROUTE(2, "hpr", "certificate_degraded",
+                  "\"feature\":\"certificate_directions\"");
     }
     if (opts.use_adaptive_step && !caps.transactional_step) {
-        // Adaptive η needs snapshot/restore; without it keep a fixed step.
+        // Adaptive eta needs snapshot/restore; without it keep a fixed step.
         opts.use_adaptive_step = false;
+        diag.degraded_features.emplace_back("transactional step (adaptive eta)");
     }
 
     model::LpProblem p = problem;
@@ -571,6 +590,7 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
 
         if (opts.use_halpern && !halpern_armed && iter >= opts.halpern_warmup) {
             device.restart_to(backend::RestartPoint::Current);
+            SOR_ROUTE(2, "hpr", "restart", "\"kind\":\"halpern_warmup\"");
             halpern_armed = true;
             since_restart = 0;
             epoch_start_metric = core::kPosInf;
@@ -676,6 +696,13 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
                 std::max<std::uint32_t>(1, opts.certificate_checks_required);
             if (diag.dual_ray_check_streak >= required ||
                 diag.primal_ray_check_streak >= required) {
+                char ray_fields[96];
+                std::snprintf(
+                    ray_fields, sizeof(ray_fields),
+                    "\"dual_streak\":%llu,\"primal_streak\":%llu",
+                    static_cast<unsigned long long>(diag.dual_ray_check_streak),
+                    static_cast<unsigned long long>(diag.primal_ray_check_streak));
+                SOR_ROUTE(2, "hpr", "ray_detect", ray_fields);
                 backend::LpSolution certificate_solution;
                 device.download(certificate_solution);
                 const auto n_original = static_cast<std::size_t>(scaled.n_cols());
@@ -698,8 +725,12 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
                         diag.termination_reason =
                             "dual Farkas ray certified on original model after " +
                             std::to_string(required) + " consecutive checks";
+                        SOR_ROUTE(1, "hpr", "certificate",
+                                  "\"kind\":\"dual_farkas\",\"certified\":true");
                     } else {
                         diag.dual_ray_check_streak = 0;
+                        SOR_ROUTE(2, "hpr", "certificate",
+                                  "\"kind\":\"dual_farkas\",\"certified\":false");
                     }
                 }
 
@@ -722,8 +753,12 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
                         diag.termination_reason =
                             "primal ray certified on original model after " +
                             std::to_string(required) + " consecutive checks";
+                        SOR_ROUTE(1, "hpr", "certificate",
+                                  "\"kind\":\"primal_ray\",\"certified\":true");
                     } else {
                         diag.primal_ray_check_streak = 0;
+                        SOR_ROUTE(2, "hpr", "certificate",
+                                  "\"kind\":\"primal_ray\",\"certified\":false");
                     }
                 }
                 if (certificate_terminated) break;
@@ -745,6 +780,8 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
             if (useful_gap && needs_feasibility && each_budget > 0 &&
                 caps.warm_start && Clock::now() < deadline) {
                 ++diag.polish_attempts;
+                SOR_ROUTE(2, "hpr", "polish",
+                          "\"phase\":\"attempt\"");
                 backend::LpSolution incumbent;
                 device.download(incumbent);
                 const OriginalKkt incumbent_kkt = evaluate_original(
@@ -806,6 +843,7 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
                 }
                 if (best != &incumbent && device.init_iterate(best->x, best->y)) {
                     ++diag.polish_accepted;
+                    SOR_ROUTE(1, "hpr", "polish", "\"phase\":\"accepted\"");
                     since_restart = 0;
                     epoch_start_metric = core::kPosInf;
                     previous_metric = core::kPosInf;
@@ -827,6 +865,7 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
                     }
                 } else {
                     ++diag.polish_rejected;
+                    SOR_ROUTE(1, "hpr", "polish", "\"phase\":\"rejected\"");
                 }
                 if (!converged) ++diag.polish_resumed;
             }
@@ -873,9 +912,16 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
 
                     device.restart_to(backend::RestartPoint::Current);
                     ++diag.restarts;
-                    if (sufficient) ++diag.sufficient_restarts;
-                    else if (necessary_stall) ++diag.necessary_restarts;
-                    else ++diag.artificial_restarts;
+                    if (sufficient) {
+                        ++diag.sufficient_restarts;
+                        SOR_ROUTE(1, "hpr", "restart", "\"kind\":\"sufficient\"");
+                    } else if (necessary_stall) {
+                        ++diag.necessary_restarts;
+                        SOR_ROUTE(1, "hpr", "restart", "\"kind\":\"necessary\"");
+                    } else {
+                        ++diag.artificial_restarts;
+                        SOR_ROUTE(1, "hpr", "restart", "\"kind\":\"artificial\"");
+                    }
                     since_restart = 0;
                     epoch_start_metric = core::kPosInf;
                     previous_metric = core::kPosInf;
@@ -986,6 +1032,18 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
     }
     diag.status = raw.proposed_status;
     diag.total_ms = ms_since(t_all);
+    {
+        const auto st = core::to_string(raw.proposed_status);
+        char fields[160];
+        std::snprintf(fields, sizeof(fields),
+                      "\"status\":\"%.*s\",\"iter\":%llu,\"converged\":%s,"
+                      "\"certificate\":%s",
+                      static_cast<int>(st.size()), st.data(),
+                      static_cast<unsigned long long>(raw.iterations),
+                      converged ? "true" : "false",
+                      certificate_terminated ? "true" : "false");
+        SOR_ROUTE(1, "hpr", "terminal", fields);
+    }
     return raw;
 }
 

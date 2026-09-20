@@ -98,6 +98,14 @@ void usage() {
         "  --milp-policy NAME latest (default) | classical (ablation only)\n"
         "  --no-fixprop     skip Fix-Propagate-Repair\n"
         "  --fixprop-time S      wall budget for Fix-Propagate-Repair\n"
+        "  --feasjump-time S     wall budget for one Feasibility Jump run\n"
+        "  --feasjump-root-frac F  cap FJ at F * time limit (default 0.10)\n"
+        "  --batch-lp-sb / --no-batch-lp-sb    batched strong-branch LPs (default off)\n"
+        "  --batch-lp-obbt / --no-batch-lp-obbt  batched OBBT LPs (default off)\n"
+        "  --auto-cuts      let the cut loop pick the separator set\n"
+        "  --cut-max-rounds N   cap root cut rounds (default 20)\n"
+        "  --cut-min-progress F  stop the cut loop below this relative gain\n"
+        "  --verify-cuts PATH   abort on any cut that cuts off this .sol point\n"
         "  --branch-strategy NAME  auto|sparse-sb|sc-milp|lifted|planbb (latest only)\n"
         "  --sparse-sb-model PATH  load sparse-SB branching model (policy=latest)\n"
         "  --sparse-sb-collect    record SB labels during strong-branch probes\n"
@@ -338,6 +346,19 @@ int main(int argc, char** argv) {
     bool fixprop_enabled = true;
     double fixprop_time_s = 0.0;
     bool fixprop_time_given = false;
+    double feasjump_time_s = 0.0;
+    bool feasjump_time_given = false;
+    double feasjump_root_frac = 0.0;
+    bool feasjump_root_frac_given = false;
+    // BatchLP strong branching / OBBT are ON in the library but OFF here: the
+    // batched node LPs cost more per node than they save on the MIPLIB-easy
+    // set (blend2 2.3x, mod008 1.75x), so the CLI is the opt-in gate.
+    bool batch_lp_sb = false;
+    bool batch_lp_obbt = false;
+    double cut_min_progress = -1.0;  // <0 keeps the library default
+    int cut_max_rounds = -1;         // <0 keeps the library default
+    bool auto_cuts = false;
+    std::string verify_cuts_path;    // reference .sol for the cut-validity check
     std::string branch_strategy = "auto";
     std::string sparse_sb_model;
     bool sparse_sb_collect = false;
@@ -602,6 +623,32 @@ int main(int argc, char** argv) {
                                         "--fixprop-time", 0.0);
             fixprop_time_given = true;
         }
+        else if (a == "--feasjump-time") {
+            feasjump_time_s = parse_real(next("--feasjump-time"),
+                                         "--feasjump-time", 0.0);
+            feasjump_time_given = true;
+        }
+        else if (a == "--feasjump-root-frac") {
+            feasjump_root_frac = parse_real(next("--feasjump-root-frac"),
+                                            "--feasjump-root-frac", 0.0, 1.0,
+                                            true);
+            feasjump_root_frac_given = true;
+        }
+        else if (a == "--batch-lp-sb") batch_lp_sb = true;
+        else if (a == "--no-batch-lp-sb") batch_lp_sb = false;
+        else if (a == "--batch-lp-obbt") batch_lp_obbt = true;
+        else if (a == "--no-batch-lp-obbt") batch_lp_obbt = false;
+        else if (a == "--auto-cuts") auto_cuts = true;
+        else if (a == "--verify-cuts") verify_cuts_path = next("--verify-cuts");
+        else if (a == "--cut-min-progress") {
+            cut_min_progress = parse_real(next("--cut-min-progress"),
+                                          "--cut-min-progress", 0.0, 1.0, true);
+        }
+        else if (a == "--cut-max-rounds") {
+            cut_max_rounds = static_cast<int>(
+                parse_uint(next("--cut-max-rounds"), "--cut-max-rounds", 1,
+                           1000000));
+        }
         else if (a == "--branch-strategy")
             branch_strategy = next("--branch-strategy");
         else if (a == "--sparse-sb-model")
@@ -834,12 +881,37 @@ int main(int argc, char** argv) {
                         sor::search::branch_strategy_name(bab.branch_strategy));
             bab.probing = probing;
             bab.mip_presolve = mip_presolve;
+            // Held by pointer for the whole solve: every separator checks its
+            // cut against this point and aborts on a violation.
+            std::vector<sor::core::f64> cut_ref;
+            if (!verify_cuts_path.empty()) {
+                std::ifstream rf(verify_cuts_path);
+                if (rf) {
+                    const auto rs = sor::io::read_solution(rf);
+                    cut_ref = rs.x;
+                    if (static_cast<sor::core::Index>(cut_ref.size()) ==
+                        problem.n_cols()) {
+                        bab.cut_reference_point = &cut_ref;
+                        std::printf("cut verify:        reference point loaded "
+                                    "(%zu cols)\n", cut_ref.size());
+                    } else {
+                        std::fprintf(stderr, "warning: --verify-cuts point has "
+                                     "%zu values, model has %d cols; ignored\n",
+                                     cut_ref.size(), problem.n_cols());
+                    }
+                } else {
+                    std::fprintf(stderr, "warning: cannot open %s\n",
+                                 verify_cuts_path.c_str());
+                }
+            }
             bab.mip_pre.dual_fix_in_probing = dual_fix_probe;
             bab.mip_pre.clique_probing = clique_probe;
             bab.mip_pre.gf2 = gf2;
             bab.mip_pre.components = components;
             bab.mip_pre.implied_integers = implied_int;
             bab.mip_pre.obbt_lite = obbt;
+            bab.mip_pre.batch_lp_obbt = batch_lp_obbt && obbt;
+            bab.batch_lp_strong_branch = batch_lp_sb;
             if (mip_restarts >= 0) bab.mip_pre.max_restarts = mip_restarts;
             bab.symmetry = symmetry;
             bab.sym.reflection = reflection;
@@ -867,7 +939,10 @@ int main(int argc, char** argv) {
             bab.implied_bound_cuts = implied_bound_cuts;
             bab.lifted_cover_cuts = lifted_cover_cuts;
             bab.mir_cuts = mir_cuts;
+            bab.auto_cuts = auto_cuts;
             bab.mir.aggregate = mir_aggregate;
+            if (cut_min_progress >= 0.0) bab.cut.min_progress_rel = cut_min_progress;
+            if (cut_max_rounds > 0) bab.cut.max_rounds = cut_max_rounds;
             if (cut_nnz_budget >= 0.0) bab.cut.pool_nnz_budget_factor = cut_nnz_budget;
             if (cut_max_density >= 0.0) bab.cut.pool_max_density = cut_max_density;
             if (cut_par_penalty >= 0.0) bab.cut.pool_parallelism_penalty = cut_par_penalty;
@@ -877,7 +952,16 @@ int main(int argc, char** argv) {
             }
             bab.conflict_propagation = conflict_propagation;
             bab.fixprop = fixprop_enabled;
-            if (fixprop_time_given) bab.fixprop_time_s = fixprop_time_s;
+            if (fixprop_time_given) {
+                bab.fixprop_time_s = fixprop_time_s;
+                bab.fixprop_root_frac = 1.0;
+            }
+            if (feasjump_time_given) {
+                bab.feasibility_jump_time_s = feasjump_time_s;
+                bab.feasibility_jump_seeded_time_s = feasjump_time_s;
+            }
+            if (feasjump_root_frac_given)
+                bab.feasibility_jump_root_frac = feasjump_root_frac;
             bab.conflict_cut.enabled = conflict_cut;
             // --no-conflict-cut is the conflict-LEARNING family switch:
             // both the Mexi path and branch-trail nogoods go off together.

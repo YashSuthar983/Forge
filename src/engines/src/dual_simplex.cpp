@@ -1,4 +1,6 @@
 #include "sor/engines/dual_simplex.hpp"
+
+#include "sor/core/route_debug.hpp"
 #include "sor/engines/dual_cost_perturbation.hpp"
 #include "sor/engines/dual_ratio_test.hpp"
 #include "sor/engines/dual_edge_weights.hpp"
@@ -41,6 +43,27 @@ inline f64 mul_zero_safe(f64 a, f64 b) {
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 inline std::size_t sz(Offset i) { return static_cast<std::size_t>(i); }
 
+inline bool route_sample_pivot(std::uint64_t iter) noexcept {
+    const int every = ::sor::core::route_debug_pivot_every();
+    if (every <= 0) return true;
+    return iter % static_cast<std::uint64_t>(every) == 0;
+}
+
+void route_simplex_dual_terminal(const char* event, core::Status st,
+                                 std::uint64_t iter, int phase) noexcept {
+    const auto s = core::to_string(st);
+    char l1[96];
+    std::snprintf(l1, sizeof(l1), "\"status\":\"%.*s\"",
+                  static_cast<int>(s.size()), s.data());
+    SOR_ROUTE(1, "simplex_dual", event, l1);
+    char l2[160];
+    std::snprintf(l2, sizeof(l2),
+                  "\"status\":\"%.*s\",\"iter\":%llu,\"phase\":%d",
+                  static_cast<int>(s.size()), s.data(),
+                  static_cast<unsigned long long>(iter), phase);
+    SOR_ROUTE(2, "simplex_dual", event, l2);
+}
+
 constexpr f64 kAtBound = 1e-9;
 
 // Exact indexed max-heap used by dual CHUZR.  Each basis slot occurs at most
@@ -56,6 +79,29 @@ public:
         heap_.clear();
         std::fill(position_.begin(), position_.end(), -1);
         std::fill(score_.begin(), score_.end(), 0.0);
+    }
+
+    // Rebuilding by calling update() for every row is O(m log m), even though
+    // every old heap entry is being discarded.  Dense FTRAN directions make
+    // all rows dirty and can trigger this on most pivots.  Score each row once
+    // and use Floyd's bottom-up heap construction instead: identical keys and
+    // tie-breaking, O(m) work, and sequential writes to the backing arrays.
+    template <class Score>
+    void rebuild(Index size, Score&& score) {
+        heap_.clear();
+        std::fill(position_.begin(), position_.end(), -1);
+        std::fill(score_.begin(), score_.end(), 0.0);
+        heap_.reserve(static_cast<std::size_t>(std::max<Index>(0, size)));
+        for (Index row = 0; row < size; ++row) {
+            const f64 value = score(row);
+            if (!(value > 0.0) || std::isnan(value)) continue;
+            score_[sz(row)] = value;
+            position_[sz(row)] = static_cast<Index>(heap_.size());
+            heap_.push_back(row);
+        }
+        if (heap_.size() < 2) return;
+        for (Index at = static_cast<Index>(heap_.size() / 2); at-- > 0;)
+            sift_down(at);
     }
 
     void update(Index row, f64 score) {
@@ -214,11 +260,18 @@ core::RawResult solve_dual_simplex_prepared(
     const bool use_devex =
         initial_pricing != DualInitialPricingStrategy::Dantzig;
     // Choose starts from a content-derived strategy. Only a DSE start owns
-    // the one-way numerical/cost fallback to Devex; explicit strategies stay
-    // forced exactly as requested by the caller.
-    const bool allow_dse_to_devex_switch =
+    // the adaptive drift/cost recovery path; explicit strategies stay forced
+    // exactly as requested by the caller. Default recovery rebuilds exact DSE
+    // weights (pilot87: mid-solve Devex handoff was worse than staying on
+    // DSE). SOR_DUAL_CHOOSE_DEVEX_FALLBACK restores the old one-way Devex
+    // handoff for A/B.
+    const bool allow_dse_adaptive =
         opts.pricing == SimplexPricing::Choose &&
         initial_pricing == DualInitialPricingStrategy::DSE;
+    const bool prefer_devex_fallback =
+        allow_dse_adaptive &&
+        std::getenv("SOR_DUAL_CHOOSE_DEVEX_FALLBACK") != nullptr;
+    const bool allow_dse_to_devex_switch = prefer_devex_fallback;
     bool dse_active = initial_pricing == DualInitialPricingStrategy::DSE;
     if (initial_pricing == DualInitialPricingStrategy::Dantzig)
         ++diag.dual_dantzig_starts;
@@ -416,6 +469,8 @@ core::RawResult solve_dual_simplex_prepared(
         const auto t0 = tick();
         factor.ftran(v, capture ? &entering_spike : nullptr);
         const double dt = tock(t0);
+        ++diag.ftran_unseeded_calls;
+        diag.ftran_unseeded_ms += dt;
         ++diag.solve_calls;
         ++diag.ftran_calls;
         diag.ftran_ms += dt;
@@ -456,6 +511,18 @@ core::RawResult solve_dual_simplex_prepared(
         const bool sparse = factor.ftran_seeded_with_support(
             v, seed, support, capture ? &entering_spike : nullptr);
         const double dt = tock(t0);
+        // Split the cost by which path the solve actually took. FTRAN measured
+        // 0.210 ms/call against BTRAN's 0.070 ms with a SMALLER support (594 vs
+        // 719), so the average hides two very different populations: a seeded
+        // solve that stays sparse, and one that falls back to the O(m) path
+        // inside ftran_seeded_with_support.
+        if (sparse) {
+            ++diag.ftran_seeded_sparse_calls;
+            diag.ftran_seeded_sparse_ms += dt;
+        } else {
+            ++diag.ftran_seeded_dense_calls;
+            diag.ftran_seeded_dense_ms += dt;
+        }
         ++diag.solve_calls;
         ++diag.ftran_calls;
         diag.ftran_ms += dt;
@@ -664,13 +731,25 @@ core::RawResult solve_dual_simplex_prepared(
     std::FILE* trace_fp = nullptr;
     if (const char* tp = std::getenv("SOR_DUAL_TRACE"))
         trace_fp = std::fopen(tp, "w");
-    const bool force_full_chuzr =
-        std::getenv("SOR_DUAL_FULLSCAN_CHUZR") != nullptr;
-#ifdef NDEBUG
-    const bool verify_chuzr_heap =
+    // A full CHUZR scan scores each row once and selects the maximum in the
+    // same sequential pass.  The indexed heap only wins if enough successive
+    // FTRAN directions stay sparse to amortize its construction and O(log m)
+    // updates.  On ten varied Netlib models (including fit1p/bnl2 hypersparse
+    // cases) it lost every controlled comparison, by 2--13%, while producing
+    // identical pivot paths. Keep it available for experiments and its exact
+    // cross-check, but use the cache-friendly scan in production.
+    const bool verify_heap_requested =
         std::getenv("SOR_DUAL_VERIFY_CHUZR_HEAP") != nullptr;
+    const bool use_indexed_chuzr =
+        std::getenv("SOR_DUAL_INDEXED_CHUZR") != nullptr ||
+        verify_heap_requested;
+    const bool force_full_chuzr =
+        std::getenv("SOR_DUAL_FULLSCAN_CHUZR") != nullptr ||
+        !use_indexed_chuzr;
+#ifdef NDEBUG
+    const bool verify_chuzr_heap = verify_heap_requested;
 #else
-    const bool verify_chuzr_heap = true;
+    const bool verify_chuzr_heap = use_indexed_chuzr;
 #endif
     if (trace_fp) {
         // Self-describing, so a trace file read months later does not depend
@@ -975,6 +1054,24 @@ core::RawResult solve_dual_simplex_prepared(
         invalidate_leave_heap();
     };
 
+    // Choose drift recovery: rebuild exact ||B^-T e_i||^2 instead of handing
+    // the live basis to a fresh Devex framework mid-solve. Resets the log-
+    // error / cost counters so the same burst does not immediately re-fire.
+    const auto rebuild_dse_on_drift = [&](const char* reason_json) {
+        ++diag.dse_weight_rebuilds;
+        ++diag.dse_drift_rebuilds;
+        if (!rebuild_dual_edge_weights(m, do_btran, row_w, dse_rebuild_btran))
+            std::fill(row_w.begin(), row_w.end(), 1.0);
+        average_log_low_dse_error = 0.0;
+        average_log_high_dse_error = 0.0;
+        costly_dse_iterations = 0;
+        dse_local_iterations = 0;
+        dse_switch_pending = false;
+        dse_accuracy_switch_pending = false;
+        invalidate_leave_heap();
+        SOR_ROUTE(1, "simplex_dual", "dse_drift_rebuild", reason_json);
+    };
+
     // Adopt weights the caller carried in from an earlier solve, in place of
     // the m-BTRAN rebuild. Legal exactly when they describe the basis this run
     // is actually starting from: w_i = ||B^-T e_i||^2 sees only B, and the
@@ -1251,10 +1348,20 @@ core::RawResult solve_dual_simplex_prepared(
     // numerical trouble instead of being written into the working costs.
     const auto shift_cost = [&](Index j, f64 delta) -> bool {
         if (delta == 0.0 || !std::isfinite(delta)) return false;
+        // Ablation hook for pilot87 H2: refuse every shift and count it.
+        if (std::getenv("SOR_DUAL_NO_COST_SHIFT") != nullptr) {
+            ++diag.refused_cost_shifts;
+            return false;
+        }
         const f64 bound = 1e3 * opts.dual_feas_tol *
                           std::max(1.0, std::fabs(cost[sz(j)]));
         if (std::fabs(delta) > bound) {
             ++diag.refused_cost_shifts;
+            SOR_ROUTE(1, "simplex_dual", "cost_shift_refused");
+            char l2[96];
+            std::snprintf(l2, sizeof(l2), "\"column\":%d,\"delta\":%.17g",
+                          static_cast<int>(j), delta);
+            SOR_ROUTE(2, "simplex_dual", "cost_shift_refused", l2);
             return false;
         }
         if (trace_fp)
@@ -1400,6 +1507,7 @@ core::RawResult solve_dual_simplex_prepared(
         phase = 1;
         sync_slot_bounds();
         recompute_xB();
+        SOR_ROUTE(1, "simplex_dual", "enter_phase1");
     };
 
     // Put the model's own bounds back and re-derive the point against them.
@@ -1429,6 +1537,7 @@ core::RawResult solve_dual_simplex_prepared(
         phase = 2;
         sync_slot_bounds();
         recompute_xB();
+        SOR_ROUTE(1, "simplex_dual", "enter_phase2");
     };
 
     // Phase-2 dual feasibility repair against EXACT reduced costs (called
@@ -1588,6 +1697,15 @@ core::RawResult solve_dual_simplex_prepared(
         }
         ++diag.refactorizations;
         diag.factor_ms += tock(t0);
+        {
+            char l1[128];
+            std::snprintf(l1, sizeof(l1),
+                          "\"n\":%llu,\"phase\":%d,\"repairs\":%llu",
+                          static_cast<unsigned long long>(diag.refactorizations),
+                          phase,
+                          static_cast<unsigned long long>(diag.basis_repairs));
+            SOR_ROUTE_PATH(1, "simplex_dual", "factor", "refactor", l1);
+        }
         // A repair moved columns in and out of the basis without going through
         // the pivot path, so the partitioned row store is rebuilt rather than
         // tracked. Repairs are rare and bounded by max_basis_repairs.
@@ -1671,9 +1789,7 @@ core::RawResult solve_dual_simplex_prepared(
 
     const auto refresh_leave_heap = [&]() {
         if (leave_heap_all_dirty) {
-            leave_heap.clear();
-            for (Index i = 0; i < m; ++i)
-                leave_heap.update(i, leave_row_score(i));
+            leave_heap.rebuild(m, leave_row_score);
             diag.chuzr_rows_scanned += static_cast<std::uint64_t>(m);
             ++diag.chuzr_heap_rebuilds;
             leave_heap_all_dirty = false;
@@ -1847,7 +1963,7 @@ core::RawResult solve_dual_simplex_prepared(
                     ++diag.costly_dse_iterations;
                 }
                 dse_switch_pending = dse_switch_pending ||
-                    (allow_dse_to_devex_switch &&
+                    (allow_dse_adaptive &&
                      dual_dse_should_switch_to_devex(
                          costly_dse_iterations, dse_local_iterations, nt));
                 dse_switch_pending = dse_switch_pending ||
@@ -2033,18 +2149,29 @@ core::RawResult solve_dual_simplex_prepared(
         if (iter >= max_iter) {
             status = core::Status::Interrupted;
             reason = "iteration limit (" + std::to_string(max_iter) + ")";
+            route_simplex_dual_terminal("terminal_status", status, iter, phase);
             break;
         }
         if (diag.basis_repairs > opts.max_basis_repairs) {
             status = core::Status::NumericalFailure;
             reason = "basis went singular " + std::to_string(diag.basis_repairs) +
                      " times; refusing to continue on a degraded factorization";
+            route_simplex_dual_terminal("numerical_failure", status, iter, phase);
             break;
         }
         if (opts.time_limit_s > 0.0 && (iter % 64) == 0 &&
             std::chrono::duration<double>(Clock::now() - t_all).count() > opts.time_limit_s) {
             status = core::Status::Interrupted;
             reason = "time limit (" + std::to_string(opts.time_limit_s) + "s)";
+            route_simplex_dual_terminal("terminal_status", status, iter, phase);
+            break;
+        }
+        // Same cadence, no clock read: a rival arm has already proved this LP,
+        // so everything this one computes from here is discarded.
+        if ((iter % 64) == 0 && core::cancel_requested(opts.cancel)) {
+            status = core::Status::Interrupted;
+            reason = "cancelled (concurrent race lost)";
+            route_simplex_dual_terminal("terminal_status", status, iter, phase);
             break;
         }
         if ((iter & 127u) == 0u) repair_weights();
@@ -2072,6 +2199,7 @@ core::RawResult solve_dual_simplex_prepared(
                 reason = "dual stalled: phase " + std::to_string(phase) +
                          " merit flat for " + std::to_string(kFlatLimit * kMeritEvery) +
                          " iterations";
+                route_simplex_dual_terminal("terminal_status", status, iter, phase);
                 break;
             }
         }
@@ -2146,6 +2274,8 @@ core::RawResult solve_dual_simplex_prepared(
                     (reference >= 0 && reference_to_lower != leave_to_lower)) {
                     status = core::Status::NumericalFailure;
                     reason = "dual CHUZR indexed heap disagreed with exhaustive scan";
+                    route_simplex_dual_terminal("numerical_failure", status, iter,
+                                                phase);
                     break;
                 }
             }
@@ -2169,6 +2299,8 @@ core::RawResult solve_dual_simplex_prepared(
                         status = core::Status::NotSolved;
                         reason = "dual: true costs leave the optimal working "
                                  "basis dual infeasible; primal clean-up";
+                        SOR_ROUTE(1, "simplex_dual", "cleanup_to_primal",
+                                  "\"exit\":\"leave_lt_zero\"");
                         break;
                     }
                     continue;
@@ -2203,18 +2335,18 @@ core::RawResult solve_dual_simplex_prepared(
                     // Unbounded.
                     restore_true_bounds();
                     true_bounds_restored = true;
-                    if (primal_infeasibility() <= 0.0) {
-                        status = core::Status::Unbounded;
-                        reason = "dual phase 1: model has no dual-feasible basis "
-                                 "at a primal-feasible point";
-                    } else {
-                        // Dual infeasibility is proved; primal status is not.
-                        // Report it so the dispatcher finishes with the primal
-                        // engine, which decides unbounded vs infeasible.
-                        status = core::Status::NumericalFailure;
-                        reason = "dual phase 1: model has no dual-feasible basis; "
-                                 "primal status undetermined";
-                    }
+                    // Dual phase 1 can prove "no dual-feasible basis". Separating
+                    // Unbounded from Infeasible requires a feasible primal point
+                    // AND an improving ray. The cheap primal_infeasibility()
+                    // sum on basics has false zeros on infeasible models
+                    // (fuzz 480/105): claiming Unbounded here shipped false
+                    // certificates via BoundOnly. Always defer to the primal
+                    // engine (Dual/Auto already fall back on NumericalFailure).
+                    status = core::Status::NumericalFailure;
+                    reason = "dual phase 1: model has no dual-feasible basis; "
+                             "primal status undetermined";
+                    route_simplex_dual_terminal("p1_handoff_primal", status, iter,
+                                                phase);
                     break;
                 }
 
@@ -2224,6 +2356,7 @@ core::RawResult solve_dual_simplex_prepared(
                 // old exit-only recompute).
                 status = core::Status::Optimal;
                 reason = "no primal-infeasible basic variable";
+                route_simplex_dual_terminal("terminal_status", status, iter, phase);
                 break;
             }
             phase1_verified = false;
@@ -2264,6 +2397,8 @@ core::RawResult solve_dual_simplex_prepared(
                 if (!std::isfinite(computed_weight) || computed_weight <= 0.0) {
                     status = core::Status::NumericalFailure;
                     reason = "DSE pivotal-row norm is zero or non-finite";
+                    route_simplex_dual_terminal("numerical_failure", status, iter,
+                                                phase);
                     break;
                 }
                 if (!dual_update_dse_log_error(
@@ -2272,9 +2407,11 @@ core::RawResult solve_dual_simplex_prepared(
                         average_log_high_dse_error)) {
                     status = core::Status::NumericalFailure;
                     reason = "DSE weight error history became non-finite";
+                    route_simplex_dual_terminal("numerical_failure", status, iter,
+                                                phase);
                     break;
                 }
-                dse_accuracy_switch_pending = allow_dse_to_devex_switch &&
+                dse_accuracy_switch_pending = allow_dse_adaptive &&
                     dual_dse_accuracy_requires_devex(
                         average_log_low_dse_error,
                         average_log_high_dse_error);
@@ -2283,14 +2420,10 @@ core::RawResult solve_dual_simplex_prepared(
                 if (!dual_dse_accept_weight(updated_weight, computed_weight)) {
                     ++diag.dse_weight_rejections;
                     // A rejected row proves the propagated weights made an
-                    // unsafe row look artificially attractive. HiGHS can
-                    // normally correct and continue because its update stack
-                    // keeps DSE errors small; SOR's longer product-form eta
-                    // chains can make this recur in bursts. In Choose mode,
-                    // fail over immediately from the unchanged basis instead
-                    // of spending hundreds more rejected BTRANs waiting for
-                    // the smoothed log-error threshold. Forced DSE retains
-                    // the exact correct-and-reprice behavior for diagnostics.
+                    // unsafe row look artificially attractive. Default Choose
+                    // policy rebuilds exact DSE from the unchanged basis;
+                    // SOR_DUAL_CHOOSE_DEVEX_FALLBACK restores the old immediate
+                    // Devex handoff used for A/B.
                     if (allow_dse_to_devex_switch) {
                         dse_active = false;
                         dse_switch_pending = false;
@@ -2298,6 +2431,11 @@ core::RawResult solve_dual_simplex_prepared(
                         reset_devex_framework();
                         ++diag.dse_to_devex_switches;
                         ++diag.dse_accuracy_switches;
+                        SOR_ROUTE(1, "simplex_dual", "dse_to_devex",
+                                  "\"reason\":\"weight_rejection\"");
+                    } else if (allow_dse_adaptive) {
+                        rebuild_dse_on_drift(
+                            "\"reason\":\"weight_rejection\"");
                     }
                     continue;
                 }
@@ -2426,6 +2564,8 @@ core::RawResult solve_dual_simplex_prepared(
                         reason = "dual: true costs leave the basis dual "
                                  "infeasible at a no-entering-column exit; "
                                  "primal clean-up";
+                        SOR_ROUTE(1, "simplex_dual", "cleanup_to_primal",
+                                  "\"exit\":\"no_entering_column\"");
                         break;
                     }
                     continue;
@@ -2440,10 +2580,13 @@ core::RawResult solve_dual_simplex_prepared(
                     status = core::Status::NumericalFailure;
                     reason = "dual phase 1 subproblem: no eligible entering column "
                              "on a fresh factorization";
+                    route_simplex_dual_terminal("numerical_failure", status, iter,
+                                                phase);
                     break;
                 }
                 status = core::Status::Infeasible;
                 reason = "primal-infeasible basic with no dual-feasible entering column";
+                route_simplex_dual_terminal("terminal_status", status, iter, phase);
                 // Farkas certificate: `rho` (already B^-T e_leave, computed
                 // above for the pivotal row) times `srow` gives d_j = srow *
                 // prow[j] for every column j -- exactly the quantity the
@@ -2621,6 +2764,7 @@ core::RawResult solve_dual_simplex_prepared(
                 if (since_refactor > 0) { do_factorize(); since_refactor = 0; continue; }
                 status = core::Status::NumericalFailure;
                 reason = "dual pivot element vanished after FTRAN";
+                route_simplex_dual_terminal("numerical_failure", status, iter, phase);
                 break;
             }
 
@@ -2707,13 +2851,24 @@ core::RawResult solve_dual_simplex_prepared(
                 ++diag.dual_resyncs;
             }
             if (dse_switch_pending) {
-                dse_active = false;
-                dse_switch_pending = false;
-                reset_devex_framework();
-                ++diag.dse_to_devex_switches;
-                if (dse_accuracy_switch_pending)
-                    ++diag.dse_accuracy_switches;
-                dse_accuracy_switch_pending = false;
+                if (allow_dse_to_devex_switch) {
+                    dse_active = false;
+                    dse_switch_pending = false;
+                    reset_devex_framework();
+                    ++diag.dse_to_devex_switches;
+                    if (dse_accuracy_switch_pending)
+                        ++diag.dse_accuracy_switches;
+                    dse_accuracy_switch_pending = false;
+                    SOR_ROUTE(1, "simplex_dual", "dse_to_devex",
+                              "\"reason\":\"post_pivot\"");
+                } else if (allow_dse_adaptive) {
+                    const char* why = dse_accuracy_switch_pending
+                                          ? "\"reason\":\"accuracy\""
+                                          : "\"reason\":\"costly_dse\"";
+                    if (dse_accuracy_switch_pending)
+                        ++diag.dse_accuracy_switches;
+                    rebuild_dse_on_drift(why);
+                }
             }
             maybe_update_factor(leave, since_refactor);
             if (renew_devex_framework) reset_devex_framework();
@@ -2731,6 +2886,18 @@ core::RawResult solve_dual_simplex_prepared(
         ++iter;
         if (phase == 1) ++diag.phase1_iterations;
         else            ++diag.phase2_iterations;
+
+        if (route_sample_pivot(iter)) {
+            char p3[256];
+            std::snprintf(p3, sizeof(p3),
+                          "\"iter\":%llu,\"phase\":%d,\"entering\":%d,"
+                          "\"leave\":%d,\"dinf\":%.6e,\"pinf\":%.6e",
+                          static_cast<unsigned long long>(iter), phase,
+                          static_cast<int>(q), static_cast<int>(leave),
+                          true_dual_infeasibility_inf(),
+                          primal_infeasibility());
+            SOR_ROUTE(3, "simplex_dual", "pivot", p3);
+        }
 
         if (trace_fp) {
             // The last two columns are what a stall actually looks like, and
@@ -2790,7 +2957,14 @@ core::RawResult solve_dual_simplex_prepared(
     // column). The primal engine continues from exactly this basis; its own
     // phase logic handles either case, and it is a complete solver, so the
     // outcome is final. Its pivots and timers are folded into this run.
-    if (needs_primal_cleanup) {
+    const double cleanup_time_left = opts.time_limit_s > 0.0
+        ? opts.time_limit_s -
+              std::chrono::duration<double>(Clock::now() - t_all).count()
+        : 0.0;
+    if (needs_primal_cleanup &&
+        (opts.time_limit_s <= 0.0 || cleanup_time_left > 0.0)) {
+        SOR_ROUTE(1, "simplex_dual", "cleanup_to_primal",
+                  "\"phase\":\"handoff\"");
         SimplexBasis current;
         current.n_struct = ns;
         current.basic = basis;
@@ -2799,9 +2973,7 @@ core::RawResult solve_dual_simplex_prepared(
         popts.method = SimplexMethod::Primal;
         popts.dual_cost_perturbation_multiplier = 0.0;
         if (opts.time_limit_s > 0.0) {
-            const double spent =
-                std::chrono::duration<double>(Clock::now() - t_all).count();
-            popts.time_limit_s = std::max(0.05, opts.time_limit_s - spent);
+            popts.time_limit_s = cleanup_time_left;
         }
         if (opts.max_iterations != 0)
             popts.max_iterations =
@@ -3029,7 +3201,14 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
         weights->weights.clear();
     }
 
-    const auto prepared = prepare_simplex_model(problem, opts);
+    SimplexPrepared prepared;
+    {
+        core::RouteSpan prep(1, "simplex_dual", "factor", "prepare", "",
+                             core::RouteLedgerBucket::ScaleFactor);
+        prepared = prepare_simplex_model(problem, opts);
+    }
+    core::RouteSpan eng(1, "simplex_dual", "loop", "loop", "",
+                        core::RouteLedgerBucket::Engine);
     auto raw = solve_dual_simplex_prepared(prepared, opts, diag, out_basis, warm,
                                            weights);
     if (weights != nullptr && !weights->weights.empty()) {

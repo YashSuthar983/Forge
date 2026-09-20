@@ -125,18 +125,16 @@ void test_pricing_scans_are_separately_attributed() {
     CHECK(diag.chuzr_rows_scanned > 0);
     CHECK(diag.prow_entries_scanned > 0);
 
-    // CHUZR is now an exact indexed heap. It rebuilds only at full state
-    // resynchronizations and otherwise refreshes rows touched by the current
-    // FTRAN direction. The production path must therefore do materially less
-    // work than one basis scan per call, without invoking the exhaustive
-    // diagnostic/ablation path.
+    // CHUZR's production path is a sequential exact scan. Controlled Netlib
+    // comparisons found it 2--13% faster than indexed-heap maintenance across
+    // ten varied models, including hypersparse fit1p and bnl2, with identical
+    // pivots. The heap remains an opt-in cross-check rather than a default.
     const auto m = static_cast<std::uint64_t>(diag.basis_dimension);
     CHECK(m > 0);
-    CHECK(diag.chuzr_heap_rebuilds > 0);
-    CHECK(diag.chuzr_heap_updates > 0);
-    CHECK(diag.chuzr_full_scans == 0);
-    CHECK(diag.chuzr_heap_max_size <= m);
-    CHECK(diag.chuzr_rows_scanned < diag.chuzr_calls * m);
+    CHECK(diag.chuzr_heap_rebuilds == 0);
+    CHECK(diag.chuzr_heap_updates == 0);
+    CHECK(diag.chuzr_full_scans == diag.chuzr_calls);
+    CHECK(diag.chuzr_rows_scanned == diag.chuzr_calls * m);
 
     // The parts may not exceed the whole they were split out of.
     CHECK(diag.chuzr_ms <= diag.price_ms + 1e-9);
