@@ -4,7 +4,8 @@
 set(SOR_SHADER_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders)
 set(SOR_SHADER_BINARY_DIR ${CMAKE_BINARY_DIR}/shaders)
 set(SOR_SHADER_NAMES
-  spmv_csr spmv_csc primal_step dual_step halpern_mix avg_update)
+  spmv_csr spmv_csc primal_step dual_step halpern_mix avg_update
+  step_reduce kkt_cols kkt_rows kkt_final)
 
 if(SOR_ENABLE_VULKAN)
   find_package(Vulkan REQUIRED)
