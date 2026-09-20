@@ -26,7 +26,25 @@ struct ImpliedIntOptions {
     bool dual_rational = true;
     // Theorem 3.2 + Algorithm 1 (paper §7.1): grow network / transposed-network
     // blocks on continuous connected components (subset of full TU recognition).
-    bool tu_network_block = true;
+    //
+    // DEFAULT OFF -- this inference is UNSOUND as implemented, 2026-09-19.
+    //
+    // It marks continuous columns integer whose integrality is not implied, and
+    // snap_integer_bounds() then rounds their bounds, which can empty the box.
+    // Measured on two integer-free Netlib LPs that --engine simplex proves
+    // Optimal:
+    //   80bau3b  4385 of 4446 marks come from here (99%), 105 bounds snapped
+    //   d2q06c    649 of  699 marks come from here (93%)
+    // Both then report a FALSE Infeasible under --engine milp, because marking
+    // any column integer also bypasses bab.cpp's pure-LP fast path.
+    //
+    // Growing "network blocks on continuous connected components" is only a
+    // subset of TU recognition, and a submatrix being network-structured does
+    // not make the columns of the FULL matrix implied-integer -- integrality is
+    // implied only when the polyhedron on the remaining variables is integral
+    // (van der Hulst & Walter, arXiv:2504.07209). Re-enable only with a proof
+    // obligation attached and the regression in tests/test_implied_int.cpp.
+    bool tu_network_block = false;
     f64 tol = 1e-9;
     // Wall budget in seconds for the whole inference. 0 = unlimited.
     //
