@@ -1,5 +1,4 @@
-// FORGE — root-node cutting-plane separation and cut-pool management
-// (Branch-and-Cut items 1, 9, and 11 of docs/PS_ALIGNMENT.md §5).
+// FORGE — root-node cutting-plane separation and cut-pool management.
 //
 // LAYER L5 (search), sibling of bab.hpp. Given a proved-optimal LP relaxation
 // and its basis, separate_gomory_mi() derives valid inequalities from the
