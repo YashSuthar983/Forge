@@ -114,8 +114,7 @@ struct BabOptions {
     ScMilpOptions sc_milp;
     // Offline training sinks (WP-H). When non-null and the matching
     // collect_labels flag is set, samples gathered during strong-branch
-    // probes are appended here after the solve so tools like sor_milp_train
-    // can fit models without re-parsing the tree.
+    // probes are appended here after the solve for offline model fitting.
     SparseSbCollector* sparse_sb_collect_out = nullptr;
     ScMilpCollector* sc_milp_collect_out = nullptr;
     LiftedSbCollector* lifted_collect_out = nullptr;
@@ -355,7 +354,7 @@ struct BabOptions {
     // probing implication is the compressed result of a whole propagation
     // cascade, so this reaches fixings that row-at-a-time propagation cannot.
     bool conflict_propagation = true;
-    // Hybrid node selection (item 16 of docs/SIH26119_PS_ALIGNMENT.md §5): a
+    // Hybrid node selection: a
     // general best-bound + bounded-plunging strategy, not a verified
     // reproduction of a specific published DIVE paper's exact mechanics.
     // Best-bound remains the ONLY source of pruning/proof; this only changes

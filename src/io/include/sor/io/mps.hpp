@@ -2,7 +2,7 @@
 //
 // LAYER L2. Written from the published MPS format description (IBM MPSX
 // convention as documented by Netlib and the MIPLIB/QPLIB format notes).
-// No reader source from any solver was consulted -- see docs/clean_room_policy.md.
+// No reader source from another solver was used; see docs/architecture.md §8.
 #pragma once
 
 #include "sor/model/lp.hpp"

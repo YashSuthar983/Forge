@@ -3,7 +3,7 @@
 // LAYER L1. Depends only on sor_core.
 //
 // The pattern is deliberately separated from the values: batched kernels share
-// ONE pattern across N value/vector sets (docs/architecture.md §6.1), and the
+// one pattern across N value/vector sets, and the
 // first-order engine reuses a fixed pattern across every iteration.
 #pragma once
 

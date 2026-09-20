@@ -797,10 +797,12 @@ DynSepDecision DynSepController::decide_gnn(const DynSepRoundInput& in) {
     int taken = 0;
     for (const auto& [p, f] : ranked) {
         if (taken >= opts_.max_optional_arms) break;
+        const auto family_index = static_cast<std::size_t>(f);
+        if (family_index >= bscale.size()) continue;
         const int bud = std::max(
             1, static_cast<int>(std::lround(
                    budget_for(opts_, f) *
-                   bscale[static_cast<std::size_t>(f)])));
+                   bscale[family_index])));
         set_run(d, f, bud);
         ++taken;
     }
