@@ -104,6 +104,11 @@ public:
         b_y_avg_ = create_device_buffer_zero(nr_ * sizeof(f64));
         b_x_anchor_ = create_device_buffer_zero(nc_ * sizeof(f64));
         b_y_anchor_ = create_device_buffer_zero(nr_ * sizeof(f64));
+        b_x_ckpt_ = create_device_buffer_zero(nc_ * sizeof(f64));
+        b_y_ckpt_ = create_device_buffer_zero(nr_ * sizeof(f64));
+        b_x_avg_ckpt_ = create_device_buffer_zero(nc_ * sizeof(f64));
+        b_y_avg_ckpt_ = create_device_buffer_zero(nr_ * sizeof(f64));
+        ckpt_valid_ = false;
 
         x_host_.assign(nc_, 0.0);
         y_host_.assign(nr_, 0.0);
@@ -316,6 +321,82 @@ public:
         k.dx_norm = 0.0;
         k.dy_norm = 0.0;
         return k;
+    }
+
+    // Declared to match what is actually implemented below, nothing more.
+    // Previously this override was absent, so the device inherited the
+    // all-false base default and the HPR engine refused every configuration
+    // with "device does not support ..." -- which is why the Vulkan path had
+    // never executed a single iteration.
+    //
+    //   reflected_operator     false -- hpr_steps ignores use_reflection and
+    //                                   reflection_gamma; not implemented.
+    //   fixed_point_restart    true  -- snapshot_anchor(), restart_to() and
+    //                                   the halpern_mix dispatch are all here.
+    //   warm_start             true  -- init_iterate() below.
+    //   certificate_directions false -- download() populates x/y/averages but
+    //                                   not primal_ray / dual_farkas_ray; ray
+    //                                   tracking is genuinely not implemented.
+    //   transactional_step     true  -- step checkpoints below.
+    LpDeviceCapabilities capabilities() const override {
+        return {/*reflected_operator=*/false,
+                /*fixed_point_restart=*/true,
+                /*warm_start=*/true,
+                /*certificate_directions=*/false,
+                /*transactional_step=*/true};
+    }
+
+    // Warm start from a host point. Clamped to the column box on the way in,
+    // matching the CPU device, so a caller's slightly-out-of-bounds warm start
+    // cannot put the device in an infeasible-by-construction state.
+    bool init_iterate(const std::vector<f64>& x, const std::vector<f64>& y) override {
+        require_up();
+        if (x.size() != nc_ || y.size() != nr_) return false;
+        for (std::size_t j = 0; j < nc_; ++j) {
+            if (!std::isfinite(x[j])) return false;
+            x_host_[j] = clamp_to(x[j], col_lo_[j], col_hi_[j]);
+        }
+        for (std::size_t i = 0; i < nr_; ++i) {
+            if (!std::isfinite(y[i])) return false;
+            y_host_[i] = y[i];
+        }
+        x_avg_host_ = x_host_;
+        y_avg_host_ = y_host_;
+        avg_count_ = 1;
+        epoch_step_ = 0;
+        upload_vec(b_x_, x_host_);
+        upload_vec(b_y_, y_host_);
+        upload_vec(b_x_avg_, x_avg_host_);
+        upload_vec(b_y_avg_, y_avg_host_);
+        return true;
+    }
+
+    // The adaptive-step controller runs a chunk of fused iterations and rolls
+    // back if the operator inequality was violated anywhere inside it. Device
+    // to device copies only -- nothing crosses the bus, which is the whole
+    // reason this is cheap enough to do around every chunk.
+    bool snapshot_step_checkpoint() override {
+        require_up();
+        copy_buf(b_x_, b_x_ckpt_, nc_ * sizeof(f64));
+        copy_buf(b_y_, b_y_ckpt_, nr_ * sizeof(f64));
+        copy_buf(b_x_avg_, b_x_avg_ckpt_, nc_ * sizeof(f64));
+        copy_buf(b_y_avg_, b_y_avg_ckpt_, nr_ * sizeof(f64));
+        ckpt_avg_count_ = avg_count_;
+        ckpt_epoch_step_ = epoch_step_;
+        ckpt_valid_ = true;
+        return true;
+    }
+
+    bool restore_step_checkpoint() override {
+        require_up();
+        if (!ckpt_valid_) return false;
+        copy_buf(b_x_ckpt_, b_x_, nc_ * sizeof(f64));
+        copy_buf(b_y_ckpt_, b_y_, nr_ * sizeof(f64));
+        copy_buf(b_x_avg_ckpt_, b_x_avg_, nc_ * sizeof(f64));
+        copy_buf(b_y_avg_ckpt_, b_y_avg_, nr_ * sizeof(f64));
+        avg_count_ = ckpt_avg_count_;
+        epoch_step_ = ckpt_epoch_step_;
+        return true;
     }
 
     void snapshot_anchor() override {
@@ -724,6 +805,10 @@ private:
     Buf b_c_, b_col_lo_, b_col_hi_, b_row_lo_, b_row_hi_;
     Buf b_x_, b_y_, b_xbar_, b_Aty_, b_Ax_;
     Buf b_x_avg_, b_y_avg_, b_x_anchor_, b_y_anchor_;
+    Buf b_x_ckpt_, b_y_ckpt_, b_x_avg_ckpt_, b_y_avg_ckpt_;
+    std::uint64_t ckpt_avg_count_ = 0;
+    std::uint64_t ckpt_epoch_step_ = 0;
+    bool ckpt_valid_ = false;
 
     VkShaderModule mod_spmv_csr_ = VK_NULL_HANDLE, mod_spmv_csc_ = VK_NULL_HANDLE;
     VkShaderModule mod_primal_ = VK_NULL_HANDLE, mod_dual_ = VK_NULL_HANDLE;
