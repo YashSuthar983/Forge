@@ -56,13 +56,8 @@ sor_add_test(test_mir                 sor_search sor_engines sor_certify sor_io)
 sor_add_test(test_zerohalf            sor_search)
 sor_add_test(test_flowcover           sor_search)
 sor_add_test(test_dynsep              sor_search sor_certify sor_io)
-# test_l2sep / test_hgtsm: sources owned by cut-control agent (add when present)
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_l2sep.cpp")
-  sor_add_test(test_l2sep             sor_search sor_certify sor_io)
-endif()
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_hgtsm.cpp")
-  sor_add_test(test_hgtsm             sor_search sor_certify sor_io)
-endif()
+sor_add_test(test_l2sep              sor_search sor_certify sor_io)
+sor_add_test(test_hgtsm              sor_search sor_certify sor_io)
 sor_add_test(test_qp                  sor_engines sor_certify)
 sor_add_test(test_qps                 sor_io sor_engines sor_certify)
 sor_add_test(test_ps_must             sor_search sor_engines sor_certify sor_io
@@ -92,7 +87,7 @@ set_tests_properties(test_forbidden_dependencies PROPERTIES
 target_compile_definitions(test_ps_must PRIVATE
   SOR_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
   SOR_BINARY_DIR="${CMAKE_BINARY_DIR}")
-add_dependencies(test_ps_must sor_solve sor_check sor_ext_demo)
+add_dependencies(test_ps_must sor_solve sor_check)
 
 target_compile_definitions(test_dispatch_regressions PRIVATE
   SOR_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

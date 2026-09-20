@@ -1744,7 +1744,7 @@ namespace {
 // kind is P (product form: delta is the eta's nonzeros) or F (Forrest-Tomlin:
 // delta is the ROW eta's nonzeros). This is what showed that FT's row eta is
 // 10-12x SPARSER than the product-form eta and that its real cost is fill-in
-// in U -- see docs/PERFORMANCE_REPORT_20260908.md.
+// in U.
 //
 // It is compile-time rather than runtime because update() runs once per pivot,
 // and on a machine quiet enough to measure it, even a predictable branch there
