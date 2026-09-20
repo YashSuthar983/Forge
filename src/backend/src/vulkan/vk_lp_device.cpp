@@ -245,9 +245,12 @@ public:
         const PCStep pc_primal{static_cast<uint32_t>(nc_), stride_, p.tau};
         const PCStep pc_dual{static_cast<uint32_t>(nr_), stride_, p.sigma};
         const PCStepReduce pc_sr{wg_cols_, wg_rows_, stride_, 0, p.tau, p.sigma};
-        // Reflection is advertised as unimplemented (see capabilities()), so
-        // gamma is pinned at zero here no matter what the caller asked for.
-        const f64 gamma = 0.0;
+        // r2HPDHG: Halpern acts on (1 + gamma) * T(z) - gamma * z.  gamma is
+        // meaningful only inside the Halpern mix -- with the mix off the outer
+        // update is plain z <- T(z) -- which is exactly how the CPU device
+        // gates it, so the two backends reflect on the same iterations.
+        const f64 gamma = (p.use_halpern && p.use_reflection)
+            ? p.reflection_gamma : 0.0;
 
         for (std::uint32_t s = 0; s < k; ++s) {
             record(cmd, pipe_spmv_csc_, layout_spmv_, set_csc, &pc_c, sizeof(pc_c), nc_);
@@ -379,9 +382,9 @@ public:
     // with "device does not support ..." -- which is why the Vulkan path had
     // never executed a single iteration.
     //
-    //   reflected_operator     false -- halpern_mix.comp carries the gamma
-    //                                   term, but hpr_steps pins gamma to 0
-    //                                   and ignores use_reflection.
+    //   reflected_operator     true  -- halpern_mix.comp applies
+    //                                   (1+gamma)*T(z) - gamma*z and
+    //                                   hpr_steps forwards reflection_gamma.
     //   fixed_point_restart    true  -- snapshot_anchor(), restart_to() and
     //                                   the halpern_mix dispatch are all here.
     //   warm_start             true  -- init_iterate() below.
@@ -392,7 +395,7 @@ public:
     //                                   operator-inequality evidence behind
     //                                   them (device-reduced, see step_reduce).
     LpDeviceCapabilities capabilities() const override {
-        return {/*reflected_operator=*/false,
+        return {/*reflected_operator=*/true,
                 /*fixed_point_restart=*/true,
                 /*warm_start=*/true,
                 /*certificate_directions=*/false,

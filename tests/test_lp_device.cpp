@@ -173,8 +173,43 @@ int main() {
                        a.operator_lhs / a.operator_rhs, 1e-9);
         }
 
+        // Reflected operator: Halpern acting on (1+gamma)*T(z) - gamma*z.
+        // Same parity bar as the unreflected pass -- the point of the device
+        // advertising reflected_operator is that the engine gets the SAME
+        // algorithm it gets on the CPU, not a nearby one.
+        backend::StepParams rp_params = bp;
+        rp_params.use_reflection = true;
+        rp_params.reflection_gamma = 1.0;
+        cpu2->init_zero();
+        vk->init_zero();
+        for (int round = 0; round < 4; ++round) {
+            cpu2->hpr_steps(25, rp_params);
+            vk->hpr_steps(25, rp_params);
+            const auto a = cpu2->reduce_kkt();
+            const auto b = vk->reduce_kkt();
+            CHECK_NEAR(b.primal_res, a.primal_res, 1e-9);
+            CHECK_NEAR(b.dual_res, a.dual_res, 1e-9);
+            CHECK_NEAR(b.primal_obj, a.primal_obj, 1e-9);
+            CHECK_NEAR(b.restart_metric, a.restart_metric, 1e-9);
+            CHECK_NEAR(b.epoch_dx_norm, a.epoch_dx_norm, 1e-9);
+            CHECK_NEAR(b.epoch_dy_norm, a.epoch_dy_norm, 1e-9);
+        }
+        // gamma = 1 must not be the same trajectory as gamma = 0, or the
+        // reflection term is being silently dropped somewhere.
+        cpu2->init_zero();
+        cpu2->hpr_steps(100, bp);
+        const f64 unreflected = cpu2->reduce_kkt().restart_metric;
+        vk->init_zero();
+        vk->hpr_steps(100, rp_params);
+        CHECK(std::fabs(vk->reduce_kkt().restart_metric - unreflected) > 1e-12);
+        CHECK(vk->capabilities().reflected_operator);
+
         // Restart parity: RestartPoint::Current must land on T(z), not on the
         // Halpern iterate, on both devices.
+        cpu2->init_zero();
+        vk->init_zero();
+        cpu2->hpr_steps(50, bp);
+        vk->hpr_steps(50, bp);
         cpu2->restart_to(backend::RestartPoint::Current);
         vk->restart_to(backend::RestartPoint::Current);
         cpu2->hpr_steps(20, bp);
