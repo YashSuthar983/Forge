@@ -1,4 +1,4 @@
-// SOR — disconnected-component MIP root reductions (WP-F).
+// SOR - disconnected-component MIP root reductions (WP-F).
 //
 // Columns are connected when they share a constraint with nonzero coefficient.
 // Independent components can be tightened separately (dual-fix + FBBT, and
@@ -28,9 +28,13 @@ struct ComponentPresolveOptions {
     bool enumerate_tiny = true;
     Index max_enum_bins = 12;
     f64 tol = 1e-9;
+    // 0 = unlimited. Set it from the caller's remaining budget:
+    // this phase was unbounded and took 129 s of a 30 s limit.
+    double time_limit_s = 0.0;
 };
 
 struct ComponentPresolveDiagnostics {
+    bool aborted_on_time = false;
     std::uint64_t n_components = 0;
     std::uint64_t multi_col_components = 0;
     std::uint64_t largest_component = 0;

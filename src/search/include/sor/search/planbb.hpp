@@ -1,15 +1,15 @@
-// SOR — PlanB&B (AAAI 2026 / arXiv:2511.09219 clean-room).
+// SOR - PlanB&B (AAAI 2026 / arXiv:2511.09219 clean-room).
 //
 // Paper-complete path (MuZero-style MBRL over B&B):
-//   * Representation h — BranchFeatureVec + pooled bipartite state → latent
-//   * Dynamics g — latent + action → child dual gains / prune / next latent
-//   * Prediction f — policy prior (PUCT), value, branchability
-//   * Full MCTS — selection / expansion / simulation / backpropagation
+//   * Representation h - BranchFeatureVec + pooled bipartite state → latent
+//   * Dynamics g - latent + action → child dual gains / prune / next latent
+//   * Prediction f - policy prior (PUCT), value, branchability
+//   * Full MCTS - selection / expansion / simulation / backpropagation
 //
 // Lite fallback (v1): linear PlanBbPolicy + one-step / shallow UCT over probe
 // gains when paper mode is off and no paper model is loaded.
 //
-// VARIABLE-CHOICE ONLY — never writes dual bounds.
+// VARIABLE-CHOICE ONLY - never writes dual bounds.
 #pragma once
 
 #include "sor/search/features.hpp"

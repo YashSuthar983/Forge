@@ -377,7 +377,7 @@ std::vector<CutRow> separate_zerohalf(const model::LpProblem& lp,
     // Higher-degree enumeration of reduced-row combinations.
     const int deg = std::max(1, opts.max_enum_degree);
     if (deg >= 2 && static_cast<int>(cuts.size()) < opts.max_cuts) {
-        // Prefer light reduced rows (few odd entries) — Caprara–Fischetti /
+        // Prefer light reduced rows (few odd entries) - Caprara-Fischetti /
         // Koster heuristic: sparse mod-2 supports yield denser CG cuts less
         // often, but small-weight rows separate well.
         std::vector<int> order(static_cast<std::size_t>(nred));

@@ -1,5 +1,7 @@
 #include "sor/io/mps.hpp"
 
+#include <chrono>
+
 #include "sor/io/gzip.hpp"
 
 #include <algorithm>
@@ -112,6 +114,15 @@ struct Builder {
 
 model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
                           const MpsReadOptions& opt) {
+    // Phase timing. Reading was measured superlinear on large models --
+    // 1 MB -> 0.6 s, 11 MB -> 12.7 s, 25 MB -> >90 s, with gzip ruled out --
+    // and it sits entirely OUTSIDE the solver's time budget, so a big model
+    // blows the limit before any phase that checks the clock even starts.
+    // External profilers are unavailable here (perf_event_paranoid=4,
+    // ptrace_scope), so the reader measures itself.
+    using RClock = std::chrono::steady_clock;
+    const auto t_start = RClock::now();
+    double ms_parse = 0.0, ms_assemble = 0.0;
     Builder b;
     Section sec = Section::None;
     std::string name;
@@ -352,6 +363,10 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
     if (sec != Section::End)
         rep.warnings.push_back("no ENDATA record found");
 
+    ms_parse = std::chrono::duration<double, std::milli>(
+                   RClock::now() - t_start).count();
+    const auto t_assemble = RClock::now();
+
     // Assemble.
     const Index n_cols = static_cast<Index>(b.col_names.size());
     const Index n_rows = static_cast<Index>(b.rhs.size());
@@ -421,6 +436,12 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
     // The count the FILE carried, so a relaxation still reports what it relaxed.
     rep.n_integer = integer_columns;
     rep.had_objsense_max = maximize;
+    ms_assemble = std::chrono::duration<double, std::milli>(
+                      RClock::now() - t_assemble).count();
+    rep.ms_parse = ms_parse;
+    rep.ms_assemble = ms_assemble;
+    rep.lines_read = line_no;
+
     return p;
 }
 

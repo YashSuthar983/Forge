@@ -1,4 +1,4 @@
-// SOR — gzip decompression via system zlib (libz).
+// SOR - gzip decompression via system zlib (libz).
 //
 // LAYER L2. MIPLIB and similar corpora ship `.mps.gz`. Compression is I/O
 // plumbing, not a solver dependency; CMake links ZLIB::ZLIB.

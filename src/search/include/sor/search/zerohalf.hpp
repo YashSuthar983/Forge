@@ -1,6 +1,6 @@
-// SOR — zero-half ({0,1/2}-Chvátal–Gomory) cut separator.
+// SOR - zero-half ({0,1/2}-Chvátal-Gomory) cut separator.
 //
-// Clean-room Caprara–Fischetti {0,½}-CG cuts with a Koster–Zymolka–Kutschka
+// Clean-room Caprara-Fischetti {0,½}-CG cuts with a Koster-Zymolka-Kutschka
 // style separation heuristic:
 //   1. Build near-integral inequality rows (continuous terms relaxed safely).
 //   2. Form the mod-2 matrix of odd coefficients + RHS parity.

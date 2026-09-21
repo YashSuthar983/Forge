@@ -1,6 +1,6 @@
 module SorPdhg
 
-# Port of sor_engines PDHG (vanilla Chambolle–Pock). 1-based CSR.
+# Port of sor_engines PDHG (vanilla Chambolle-Pock). 1-based CSR.
 # Cannot claim Status.Optimal: no basis. Caller should run SorCertify.finalize_result.
 
 using Printf: @printf

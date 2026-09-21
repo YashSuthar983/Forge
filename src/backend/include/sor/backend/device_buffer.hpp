@@ -1,4 +1,4 @@
-// SOR — device buffers, batch views, and transfer accounting.
+// SOR - device buffers, batch views, and transfer accounting.
 //
 // LAYER L1.
 //
@@ -77,7 +77,7 @@ private:
 
 // N vectors of equal length, contiguous. The batched kernels take one shared
 // SparsePattern plus a BatchView -- the shape that makes affordable strong
-// branching possible (docs/architecture.md §3 — batched LpDevice seam).
+// branching possible (docs/architecture.md §3 - batched LpDevice seam).
 template <class T>
 class BatchView {
 public:

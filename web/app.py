@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SOR demo console — thin FastAPI shell over sor_solve / sor_check / sor_gen.
+"""SOR demo console - thin FastAPI shell over sor_solve / sor_check / sor_gen.
 
 Presentation surface for SIH26119. The product is the C++ engine; every solve
 is a subprocess. Not a modelling environment.
@@ -58,7 +58,7 @@ End
     {
         "id": "knapsack",
         "label": "Knapsack · integers",
-        "blurb": "Pick whole items that fit a weight limit — introduces Binary / General.",
+        "blurb": "Pick whole items that fit a weight limit - introduces Binary / General.",
         "text": """Maximize
   10 laptop + 6 camera + 4 book
 Subject To
@@ -138,7 +138,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "path": DEFAULT_EXAMPLES / "sparse500.mps",
         "engine": "hpr",
         "backend": "cpu",
-        "blurb": "First-order method — flip Advanced → GPU if you have Vulkan.",
+        "blurb": "First-order method - flip Advanced → GPU if you have Vulkan.",
     },
 }
 
@@ -266,7 +266,7 @@ async def health() -> dict[str, Any]:
         "timeout_s": DEFAULT_TIMEOUT,
         "bins": bins,
         "presets": presets,
-        "note": "Demo UI over the SOR engine — CLI remains the PS interface.",
+        "note": "Demo UI over the SOR engine - CLI remains the PS interface.",
         "lp_sample": LP_SAMPLE,
         "learn_templates": LEARN_TEMPLATES,
     }
@@ -283,7 +283,7 @@ async def get_preset_model(preset_id: str) -> dict[str, Any]:
     # Cap huge files for the browser editor
     truncated = False
     if len(text) > 400_000:
-        text = text[:400_000] + "\n* … truncated for editor …\n"
+        text = text[:400_000] + "\n* ... truncated for editor ...\n"
         truncated = True
     return {
         "id": preset_id,
@@ -374,7 +374,7 @@ async def solve(
         else:
             raise HTTPException(
                 400,
-                "Provide mps_text=…, model_text=…, preset=…, or upload a model file",
+                "Provide mps_text=..., model_text=..., preset=..., or upload a model file",
             )
 
         sol_path = session / "out.sol"
@@ -403,7 +403,7 @@ async def solve(
         result = await _run(cmd, timeout=timeout)
         parsed = _parse_solve_output(result["stdout"])
         if text_meta and text_meta.get("maximize") and parsed.get("objective") is not None:
-            # Free MPS has no MAXIMIZE flag — we negated costs on write.
+            # Free MPS has no MAXIMIZE flag - we negated costs on write.
             parsed["objective"] = -float(parsed["objective"])
 
         check_ready = sol_path.is_file() and sol_path.stat().st_size > 0
@@ -438,7 +438,7 @@ async def check(
         raise HTTPException(400, "Invalid sol_token")
     session = SESSIONS / sol_token
     if not session.is_dir():
-        raise HTTPException(404, "Solution expired — solve again")
+        raise HTTPException(404, "Solution expired - solve again")
 
     candidates = [p for p in session.iterdir() if p.suffix.lower() in {".mps", ".qps"}]
     if not candidates:

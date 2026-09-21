@@ -1,4 +1,4 @@
-// SOR — minimal Vulkan compute context (instance, device, queue, allocator).
+// SOR - minimal Vulkan compute context (instance, device, queue, allocator).
 #pragma once
 
 #include <cstdint>

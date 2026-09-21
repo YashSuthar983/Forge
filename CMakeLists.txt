@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(sor LANGUAGES CXX VERSION 0.0.1)
 
 # ---------------------------------------------------------------------------
-# SOR — Sovereign Optimization Runtime
+# SOR - Sovereign Optimization Runtime
 #
 # Layering (docs/architecture.md §2) is enforced by target_link_libraries: a
 # module may only link strictly lower layers. The add_subdirectory() order

@@ -1,4 +1,4 @@
-// SOR — domain propagation at B&B nodes (Achterberg thesis 2007, Ch.10.4).
+// SOR - domain propagation at B&B nodes (Achterberg thesis 2007, Ch.10.4).
 //
 // LAYER L5, sibling of bab.hpp/cuts.hpp. Row-based bound tightening: for each
 // row and each variable in it, the OTHER variables' current bounds imply a

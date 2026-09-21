@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sor/engines/pdhg.hpp"
+#include "sor/engines/dual_simplex.hpp"
 #include "sor/engines/simplex.hpp"
 #include "sor/sparse/csc.hpp"
 
@@ -39,7 +40,7 @@ core::RawResult solve_primal_simplex_prepared(
 core::RawResult solve_dual_simplex_prepared(
     const SimplexPrepared& prepared, const SimplexOptions& opts,
     SimplexDiagnostics& diag, SimplexBasis* out_basis,
-    const SimplexBasis* warm);
+    const SimplexBasis* warm, DualEdgeWeightCarrier* carrier = nullptr);
 
 // Add one stage's work counters and timers into `total` (and count a stage).
 // Shared by the Auto dispatcher and by the dual engine's primal clean-up so a

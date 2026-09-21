@@ -43,7 +43,7 @@ LpProblem xor_infeas_model() {
     return lp;
 }
 
-// x + y = 1, both free binaries — no singleton fixing (2 vars).
+// x + y = 1, both free binaries - no singleton fixing (2 vars).
 LpProblem xor_pair_model() {
     LpProblem lp;
     lp.name = "xor_pair";
@@ -84,7 +84,7 @@ void test_gf2_keeps_pair_feasible() {
     sor::search::Gf2PresolveOptions o;
     const auto d = sor::search::apply_gf2_presolve(lp, lo, hi, o);
     CHECK(!d.infeasible);
-    // Both (1,0) and (0,1) remain — no variable forced.
+    // Both (1,0) and (0,1) remain - no variable forced.
     CHECK(lo[0] <= 0.0 + 1e-9);
     CHECK(hi[0] >= 1.0 - 1e-9);
     CHECK(lo[1] <= 0.0 + 1e-9);

@@ -1,4 +1,4 @@
-// SOR — lattice reformulation implementation (AHL / Aardal–Wolsey).
+// SOR - lattice reformulation implementation (AHL / Aardal-Wolsey).
 #include "sor/search/lattice_reform.hpp"
 
 #include "sor/sparse/csr.hpp"
@@ -53,8 +53,8 @@ long double dot_ld(const std::vector<long double>& a,
     return s;
 }
 
-// Classical LLL on integer column vectors (Lenstra–Lenstra–Lovász 1982).
-// Gram–Schmidt in long double; basis updates exact int64.
+// Classical LLL on integer column vectors (Lenstra-Lenstra-Lovász 1982).
+// Gram-Schmidt in long double; basis updates exact int64.
 void lll_reduce(DenseCols& B, long double delta = kDelta) {
     const int n_rows = static_cast<int>(B.empty() ? 0 : B[0].size());
     const int n_cols = static_cast<int>(B.size());
@@ -435,7 +435,7 @@ try_lattice_reform(const model::LpProblem& lp, const LatticeReformOptions& opts)
             const Index j = ci[static_cast<std::size_t>(p)];
             if (is_fixed[static_cast<std::size_t>(j)]) continue;
             if (!lp.is_integer[static_cast<std::size_t>(j)]) {
-                // Continuous column must not appear if we force it to 0 —
+                // Continuous column must not appear if we force it to 0 -
                 // its contribution is already excluded from b_work only if
                 // value is 0; verify coeff is finite and we'll set x=0.
                 continue;
@@ -826,7 +826,7 @@ solve_milp_lattice(const model::LpProblem& lp,
         }
         // A transformed-space dual bound is a bound on the RESTRICTED
         // problem (forced-zero continuous columns excluded), not on the
-        // original — NaN it on every non-fallback path so no downstream
+        // original - NaN it on every non-fallback path so no downstream
         // gap/printout can over-read it.
         out.raw.dual_bound = core::kNaN;
         out.diag.dual_bound = core::kNaN;
@@ -839,7 +839,7 @@ solve_milp_lattice(const model::LpProblem& lp,
     // own LP relaxation bound before falling back: if the restricted
     // optimum V_r exactly matches the original LP bound V_LP, then
     // V_LP <= V_orig <= V_r = V_LP forces V_orig = V_r, so the postsolved
-    // incumbent is provably optimal for the ORIGINAL problem — a rigorous
+    // incumbent is provably optimal for the ORIGINAL problem - a rigorous
     // argument (not a heuristic), and it is what lets a solved restriction
     // (e.g. "does an exact 0/1 split exist" for markshare) actually close
     // the original instance instead of always being thrown away.
@@ -883,9 +883,9 @@ solve_milp_lattice(const model::LpProblem& lp,
         }
     }
 
-    // Not certifiable (restricted Infeasible — no exact split exists but the
+    // Not certifiable (restricted Infeasible - no exact split exists but the
     // original may still be feasible with the forced columns active; or a
-    // restricted Optimal that does not match the LP bound — the forced
+    // restricted Optimal that does not match the LP bound - the forced
     // columns were genuinely needed): nothing about the original follows
     // from the restricted run. Re-solve the original in full.
     out.fell_back = true;

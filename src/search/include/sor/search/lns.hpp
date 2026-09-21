@@ -1,12 +1,12 @@
-// SOR — Adaptive Large Neighborhood Search: a bandit-scheduled portfolio of
+// SOR - Adaptive Large Neighborhood Search: a bandit-scheduled portfolio of
 // sub-MIP neighborhoods.
 //
 // LAYER L5 (search), sibling of bab.hpp. Implementation spec:
 //   Hendel, "Adaptive large neighborhood search for mixed integer programming",
-//     Mathematical Programming Computation 14, 2022 — ALNS as a bandit over LNS
+//     Mathematical Programming Computation 14, 2022 - ALNS as a bandit over LNS
 //     neighborhoods, with an adaptive fixing rate.
 //   Kilinc-Karzan et al., "BALANS: Multi-Armed Bandits-based Adaptive Large
-//     Neighborhood Search for MIP", IJCAI 2025 — the arm/reward formulation used
+//     Neighborhood Search for MIP", IJCAI 2025 - the arm/reward formulation used
 //     below (tiered outcome rewards, one arm per neighborhood configuration).
 //   Per-neighborhood sources: RENS (Berthold, MPC 6, 2014), RINS (Danna,
 //     Rothberg & Le Pape, Oper. Res. 53(5), 2005), Local Branching (Fischetti &

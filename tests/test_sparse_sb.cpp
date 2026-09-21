@@ -1,4 +1,4 @@
-// Slice 1 — sparse SB branching (arXiv:2604.00094 clean-room).
+// Slice 1 - sparse SB branching (arXiv:2604.00094 clean-room).
 #include "sor/io/mps.hpp"
 #include "sor/search/bab.hpp"
 #include "sor/search/features.hpp"

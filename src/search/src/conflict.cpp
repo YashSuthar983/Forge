@@ -278,9 +278,9 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
                                        opts.probe_propagation_rounds);
             diag.probes += 2;
 
-            // Snapshot binary pins from FBBT only — dual-fix pins with
+            // Snapshot binary pins from FBBT only - dual-fix pins with
             // zero objective must not become conflict implications
-            // (Wang–Chen–Dai §2.3 inconsistency).
+            // (Wang-Chen-Dai §2.3 inconsistency).
             std::vector<f64> pin_lo0 = lo0, pin_hi0 = hi0;
             std::vector<f64> pin_lo1 = lo1, pin_hi1 = hi1;
 

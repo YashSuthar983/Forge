@@ -1,4 +1,4 @@
-// SOR — GF(2) / mod-2 subsystem reductions for MIP root presolve (WP-F).
+// SOR - GF(2) / mod-2 subsystem reductions for MIP root presolve (WP-F).
 //
 // Clean-room spirit of PaPILO/SCIP XOR equation handling: collect binary
 // parity equalities ∑ x_j ≡ b (mod 2), Gaussian-eliminate over GF(2), and

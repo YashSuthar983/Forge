@@ -1,4 +1,4 @@
-// SOR — PDHG first-order LP engine (prototype).
+// SOR - PDHG first-order LP engine (prototype).
 //
 // LAYER L4.
 //

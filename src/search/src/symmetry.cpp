@@ -54,8 +54,26 @@ bool is_bounded_int_col(const model::LpProblem& lp, Index j, f64 tol) {
            lp.col_hi[sz(j)] + tol >= lp.col_lo[sz(j)];
 }
 
-bool orbit_is_amo_clique(const ConflictGraph& cg, const Orbit& o) {
+// Is every pair in this orbit mutually conflicting (an at-most-one clique)?
+//
+// O(k^2) conflict lookups in the orbit size k. That is fine for the small
+// orbits this was written for and catastrophic for a large one: on atlanta-ip
+// a single orbit kept this in a 28.5 s loop against a ~1.1 s budget, while
+// orbit DETECTION had already been bounded to 740 ms. Polling the caller's
+// orbit loop could not help, because the cost was inside ONE call.
+//
+// `max_pairs` caps the work. A huge orbit is also the least likely to be a
+// clique -- one non-conflicting pair disqualifies it -- so refusing to check
+// it loses almost nothing: the answer is overwhelmingly "no" and the early
+// exit below usually finds that in the first few pairs anyway.
+bool orbit_is_amo_clique(const ConflictGraph& cg, const Orbit& o,
+                         std::uint64_t max_pairs = 0) {
     if (o.cols.size() < 2) return false;
+    if (max_pairs > 0) {
+        const std::uint64_t k = o.cols.size();
+        // k*(k-1)/2 without overflowing on a large orbit.
+        if (k > 1 && (k / 2) * (k - 1) > max_pairs) return false;
+    }
     for (std::size_t a = 0; a < o.cols.size(); ++a) {
         const Index ja = o.cols[a];
         if (!cg.is_binary(ja)) return false;
@@ -81,13 +99,6 @@ std::vector<f64> column_coeffs(const model::LpProblem& lp, Index j) {
     return col;
 }
 
-bool columns_equal(const std::vector<f64>& a, const std::vector<f64>& b,
-                   f64 tol) {
-    if (a.size() != b.size()) return false;
-    for (std::size_t i = 0; i < a.size(); ++i)
-        if (!near(a[i], b[i], tol)) return false;
-    return true;
-}
 
 bool columns_negations(const std::vector<f64>& a, const std::vector<f64>& b,
                        f64 tol) {
@@ -157,7 +168,7 @@ void append_sbc_rows(model::LpProblem& lp,
     }
 }
 
-// Weisfeiler–Leman-style color refinement on a node list with adjacency
+// Weisfeiler-Leman-style color refinement on a node list with adjacency
 // signatures (neighbor_color, edge_tag) multisets.
 void refine_colors(std::vector<std::uint64_t>& color,
                    const std::vector<std::vector<std::pair<Index, std::uint64_t>>>&
@@ -206,6 +217,10 @@ bool verify_self_reflection(const model::LpProblem& lp, Index j, f64 tol) {
 std::vector<Orbit> detect_permutation_orbits(const model::LpProblem& lp,
                                              const SymmetryOptions& opts,
                                              SymmetryDiagnostics* diag) {
+    // Instrumented because symmetry kept overrunning its budget after the
+    // refinement loop was already bounded -- so the cost had to be somewhere
+    // else in here, and guessing had already failed twice elsewhere.
+    const auto orbit_entry = Clock::now();
     const Index n = lp.n_cols();
     const Index m = lp.n_rows();
     const auto& rp = lp.A.pattern.row_ptr();
@@ -236,7 +251,7 @@ std::vector<Orbit> detect_permutation_orbits(const model::LpProblem& lp,
 
     // Column-major adjacency with duplicate (row, col) entries summed,
     // built ONCE. The previous code rescanned the entire matrix per column
-    // per round — O(n * m * nnz_row) ≈ 9e9 ops on schedule_milp_huge
+    // per round - O(n * m * nnz_row) ≈ 9e9 ops on schedule_milp_huge
     // (67200 cols x 34272 rows) and ran for hours past --time-limit before
     // the first node LP. Same signatures, linear cost (2026-09-14).
     const std::size_t nnz = av.size();
@@ -253,7 +268,7 @@ std::vector<Orbit> detect_permutation_orbits(const model::LpProblem& lp,
             }
         }
         // Sort each column's slice by row and merge duplicates (summed),
-        // compacting left-to-right — safe because columns only shrink.
+        // compacting left-to-right - safe because columns only shrink.
         std::vector<core::Offset> nstart(sz(n) + 1, 0);
         core::Offset total = 0;
         for (Index j = 0; j < n; ++j) {
@@ -277,12 +292,35 @@ std::vector<Orbit> detect_permutation_orbits(const model::LpProblem& lp,
         cptr = std::move(nstart);
     }
 
+    // Color refinement is the expensive half of symmetry detection, and it
+    // was both unbudgeted and allocation-bound. On MIPLIB2017 atlanta-ip
+    // (21732 x 48738, 257532 nnz) it ran 25.1 s against a 1 SECOND solver
+    // limit. Two problems, fixed together:
+    //   * no deadline -- it ran all `cap` iterations regardless of the budget;
+    //   * a fresh std::vector per column AND per row, every iteration, i.e.
+    //     ~3.1M allocations here. The buffers are now hoisted and cleared.
+    const auto refine_start = Clock::now();
+    if (diag != nullptr)
+        diag->ms_adjacency = std::chrono::duration<double, std::milli>(
+            refine_start - orbit_entry).count();
+    const auto refine_over_budget = [&]() {
+        return opts.time_limit_s > 0.0 &&
+               std::chrono::duration<double>(Clock::now() - refine_start)
+                       .count() > opts.time_limit_s;
+    };
+    std::vector<std::uint64_t> sig;
+    sig.reserve(64);
+    std::vector<std::uint64_t> vnew, rnew;
     for (int it = 0; it < cap; ++it) {
+        if (refine_over_budget()) {
+            if (diag != nullptr) diag->aborted_on_time = 1;
+            break;
+        }
         ++iters;
-        std::vector<std::uint64_t> vnew = vcol, rnew = rcol;
+        vnew = vcol;
+        rnew = rcol;
         for (Index j = 0; j < n; ++j) {
-            std::vector<std::uint64_t> sig;
-            sig.reserve(8);
+            sig.clear();
             for (core::Offset k = cptr[sz(j)]; k < cptr[sz(j) + 1]; ++k) {
                 const f64 a = cent[sz(k)].second;
                 if (std::fabs(a) <= opts.tol) continue;
@@ -295,7 +333,7 @@ std::vector<Orbit> detect_permutation_orbits(const model::LpProblem& lp,
             vnew[sz(j)] = h;
         }
         for (Index i = 0; i < m; ++i) {
-            std::vector<std::uint64_t> sig;
+            sig.clear();
             for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
                 const Index j = ci[sz(k)];
                 sig.push_back(mix64(vcol[sz(j)] ^ hash_f64(av[sz(k)])));
@@ -313,7 +351,12 @@ std::vector<Orbit> detect_permutation_orbits(const model::LpProblem& lp,
         vcol = std::move(vnew);
         rcol = std::move(rnew);
     }
-    if (diag) diag->color_iters = iters;
+    if (diag) {
+        diag->color_iters = iters;
+        diag->ms_refine = std::chrono::duration<double, std::milli>(
+            Clock::now() - refine_start).count();
+    }
+    const auto bucket_start = Clock::now();
 
     std::map<std::uint64_t, std::vector<Index>> buckets;
     for (Index j = 0; j < n; ++j) buckets[vcol[sz(j)]].push_back(j);
@@ -326,6 +369,9 @@ std::vector<Orbit> detect_permutation_orbits(const model::LpProblem& lp,
         std::sort(o.cols.begin(), o.cols.end());
         orbits.push_back(std::move(o));
     }
+    if (diag)
+        diag->ms_bucket = std::chrono::duration<double, std::milli>(
+            Clock::now() - bucket_start).count();
     return orbits;
 }
 
@@ -465,10 +511,27 @@ std::uint64_t apply_orbital_fixing(const ConflictGraph& cg,
                                    const std::vector<Orbit>& orbits,
                                    std::vector<f64>& col_lo,
                                    std::vector<f64>& col_hi,
-                                   f64 tol) {
+                                   f64 tol,
+                                   double time_limit_s,
+                                   std::uint64_t max_orbit_pairs) {
+    // orbit_is_amo_clique is an all-pairs conflict-graph check, O(k^2) in the
+    // orbit size, run over every orbit. On atlanta-ip that is 8051 orbits and
+    // 28.7 s -- against a ~1.1 s budget, producing 0 fixings. Detection itself
+    // was already bounded (adjacency 4.4 ms, refine 743.8 ms, bucket 9.4 ms),
+    // so this loop was the entire overrun.
+    const auto of_t0 = Clock::now();
+    const auto of_over = [&]() {
+        return time_limit_s > 0.0 &&
+               std::chrono::duration<double>(Clock::now() - of_t0).count() >
+                   time_limit_s;
+    };
     std::uint64_t fixings = 0;
+    std::uint64_t seen = 0;
     for (const Orbit& o : orbits) {
-        if (!orbit_is_amo_clique(cg, o)) continue;
+        // Poll every 64 orbits: the per-orbit cost varies by orders of
+        // magnitude with orbit size, so a coarser interval can still overshoot.
+        if (((seen++) & 0x3F) == 0 && of_over()) break;
+        if (!orbit_is_amo_clique(cg, o, max_orbit_pairs)) continue;
         Index fixed_one = -1;
         for (Index j : o.cols) {
             if (col_lo[sz(j)] > 0.5) {
@@ -680,7 +743,7 @@ std::uint64_t apply_reflection_symmetry(model::LpProblem& lp,
             (global_ok ? " global=1" : " global=0") +
             " signed_iters=" + std::to_string(diag.signed_color_iters);
         if (!diag.reflection_applied) {
-            // Detected but no root reduction — still report complete path.
+            // Detected but no root reduction - still report complete path.
             diag.reflection_status += " (detected; no root reduction)";
         }
     }
@@ -698,6 +761,67 @@ std::uint64_t apply_folding_symmetry(model::LpProblem& lp,
     std::uint64_t removed = 0;
     std::vector<char> used(sz(lp.n_cols()), 0);
 
+    // Column-major index, built ONCE.
+    //
+    // This replaced column_coeffs(lp, j), which scanned the WHOLE matrix and
+    // materialised a dense n_rows vector for every column it was asked about.
+    // Folding calls it once per column of every orbit, so the cost was
+    // O(orbit_columns * (nnz + n_rows)): on MIPLIB2017 atlanta-ip that is
+    // 46773 * (257532 + 21732) ~ 1.3e10 operations, measured at 27.3 s inside
+    // a phase budgeted to ~1.1 s. Building CSC once and comparing columns
+    // SPARSELY is O(nnz) total -- the same answer for ~50000x less work.
+    //
+    // Duplicate (row, col) entries are summed, matching what the dense
+    // accumulation did.
+    const auto t_csc = Clock::now();
+    const Index n_cols_all = lp.n_cols();
+    const auto& rp_f = lp.A.pattern.row_ptr();
+    const auto& ci_f = lp.A.pattern.col_idx();
+    const auto& av_f = lp.A.vals;
+    std::vector<core::Offset> cstart(sz(n_cols_all) + 1, 0);
+    for (std::size_t k = 0; k < ci_f.size(); ++k) ++cstart[sz(ci_f[k]) + 1];
+    for (Index j = 0; j < n_cols_all; ++j) cstart[sz(j) + 1] += cstart[sz(j)];
+    std::vector<std::pair<Index, f64>> centry(ci_f.size());
+    {
+        std::vector<core::Offset> fill(cstart.begin(), cstart.end() - 1);
+        for (Index i = 0; i < lp.n_rows(); ++i)
+            for (core::Offset k = rp_f[sz(i)]; k < rp_f[sz(i) + 1]; ++k)
+                centry[sz(fill[sz(ci_f[sz(k)])]++)] = {i, av_f[sz(k)]};
+        for (Index j = 0; j < n_cols_all; ++j) {
+            auto b = centry.begin() + sz(cstart[sz(j)]);
+            auto e = centry.begin() + sz(cstart[sz(j) + 1]);
+            std::sort(b, e);
+        }
+    }
+    diag.ms_fold_csc = std::chrono::duration<double, std::milli>(
+        Clock::now() - t_csc).count();
+    // Sparse column equality: same pattern and values, duplicates summed,
+    // explicit zeros ignored so the comparison matches the dense one.
+    const auto columns_equal_sparse = [&](Index ja, Index jb) {
+        auto next = [&](core::Offset& k, core::Offset end, Index& row, f64& val) {
+            while (k < end) {
+                row = centry[sz(k)].first;
+                val = centry[sz(k)].second;
+                ++k;
+                while (k < end && centry[sz(k)].first == row)
+                    val += centry[sz(k++)].second;
+                if (std::fabs(val) > tol) return true;
+            }
+            return false;
+        };
+        core::Offset ka = cstart[sz(ja)], kb = cstart[sz(jb)];
+        const core::Offset ea = cstart[sz(ja) + 1], eb = cstart[sz(jb) + 1];
+        Index ra = 0, rb = 0;
+        f64 va = 0.0, vb = 0.0;
+        for (;;) {
+            const bool ha = next(ka, ea, ra, va);
+            const bool hb = next(kb, eb, rb, vb);
+            if (!ha && !hb) return true;
+            if (ha != hb) return false;
+            if (ra != rb || !near(va, vb, tol)) return false;
+        }
+    };
+
     auto try_fold_orbit = [&](const Orbit& o) -> bool {
         if (o.cols.size() < 2) return false;
         for (Index j : o.cols)
@@ -709,7 +833,6 @@ std::uint64_t apply_folding_symmetry(model::LpProblem& lp,
         }
 
         const Index rep = o.cols[0];
-        const auto rep_col = column_coeffs(lp, rep);
 
         // Require identical parallel columns + matching obj/bounds.
         for (std::size_t t = 1; t < o.cols.size(); ++t) {
@@ -717,7 +840,7 @@ std::uint64_t apply_folding_symmetry(model::LpProblem& lp,
             if (!near(lp.c[sz(j)], lp.c[sz(rep)], tol) ||
                 !near(lp.col_lo[sz(j)], lp.col_lo[sz(rep)], tol) ||
                 !near(lp.col_hi[sz(j)], lp.col_hi[sz(rep)], tol) ||
-                !columns_equal(rep_col, column_coeffs(lp, j), tol))
+                !columns_equal_sparse(rep, j))
                 return false;
         }
 
@@ -746,7 +869,7 @@ std::uint64_t apply_folding_symmetry(model::LpProblem& lp,
             for (Index j : o.cols) {
                 if (std::fabs(col_hi[sz(j)] - col_lo[sz(j)]) <= tol &&
                     col_lo[sz(j)] > tol)
-                    return false;  // partial fix — folding moot / unsafe
+                    return false;  // partial fix - folding moot / unsafe
                 if (col_lo[sz(j)] > 0.5 && all_bin) return false;
                 if (col_hi[sz(j)] < 0.5 && all_bin &&
                     col_hi[sz(j)] + tol < 1.0)
@@ -815,22 +938,60 @@ std::uint64_t apply_folding_symmetry(model::LpProblem& lp,
     };
 
     // Prefer CR orbits (general equitable column cells).
-    for (const Orbit& o : orbits) (void)try_fold_orbit(o);
+    // Bounded. The sparse column comparison above removed the worst of the
+    // cost (27.3 s -> 16.3 s on atlanta-ip), but folding still exceeds its
+    // budget on large models, and honouring the time limit cannot depend on
+    // every inner routine being fast enough. Poll every 32 orbits: per-orbit
+    // cost varies with orbit size, so a coarse interval can still overshoot.
+    const auto fold_t0 = Clock::now();
+    const auto t_loop = fold_t0;
+    std::uint64_t fold_seen = 0;
+    for (const Orbit& o : orbits) {
+        if (((fold_seen++) & 0x1F) == 0 && opts.time_limit_s > 0.0 &&
+            std::chrono::duration<double>(Clock::now() - fold_t0).count() >
+                opts.time_limit_s) {
+            diag.aborted_on_time = 1;
+            break;
+        }
+        (void)try_fold_orbit(o);
+    }
+    diag.ms_fold_loop = std::chrono::duration<double, std::milli>(
+        Clock::now() - t_loop).count();
 
     // Also fold identical-parallel groups that share an exact column hash even
     // if CR split them (hash-bucket general orbits).
     {
+        // Hashed from the SPARSE column, reusing the CSC built above.
+        //
+        // This loop previously called column_coeffs(lp, j) for every column
+        // and then hashed the dense result -- O(n_cols * (nnz + n_rows)),
+        // which is 48738 * ~280000 ~ 1.4e10 operations on atlanta-ip and was
+        // measured at 16.5 s, the single largest remaining overrun. It is the
+        // SECOND site with this exact defect in one function.
+        //
+        // Hashing (row, value) pairs is also strictly better than hashing the
+        // dense vector: it is position-aware, independent of n_rows, and two
+        // columns collide only if their actual patterns and values agree.
         std::map<std::uint64_t, std::vector<Index>> buckets;
         for (Index j = 0; j < lp.n_cols(); ++j) {
             if (used[sz(j)]) continue;
-            const auto col = column_coeffs(lp, j);
             std::uint64_t h = mix64(hash_f64(lp.c[sz(j)]));
             h = mix64(h ^ hash_f64(lp.col_lo[sz(j)]));
             h = mix64(h ^ hash_f64(lp.col_hi[sz(j)]));
             const bool integral =
                 !lp.is_integer.empty() && lp.is_integer[sz(j)];
             h = mix64(h ^ (integral ? 3ULL : 5ULL));
-            for (f64 a : col) h = mix64(h ^ hash_f64(a));
+            const core::Offset cb = cstart[sz(j)], ce = cstart[sz(j) + 1];
+            for (core::Offset k = cb; k < ce;) {
+                const Index row = centry[sz(k)].first;
+                f64 val = centry[sz(k)].second;
+                ++k;
+                while (k < ce && centry[sz(k)].first == row)
+                    val += centry[sz(k++)].second;
+                if (std::fabs(val) <= tol) continue;   // match the dense skip
+                h = mix64(h ^ (static_cast<std::uint64_t>(row) * 0x9E3779B97F4A7C15ULL));
+                h = mix64(h ^ hash_f64(val));
+            }
             buckets[h].push_back(j);
         }
         for (auto& kv : buckets) {
@@ -961,8 +1122,29 @@ SymmetryDiagnostics apply_symmetry(model::LpProblem& lp,
         return diag;
     }
 
+    // Symmetry detection must live inside the solver's budget. Measured
+    // unbudgeted on MIPLIB2017 atlanta-ip (21732 x 48738) with a 1 SECOND
+    // solver limit: this phase alone ran 25.3 s. Checked between the major
+    // stages, which is the granularity at which the seconds accrue.
+    const auto over_budget = [&]() {
+        return opts.time_limit_s > 0.0 &&
+               std::chrono::duration<double>(Clock::now() - t0).count() >
+                   opts.time_limit_s;
+    };
+    if (over_budget()) {
+        diag.aborted_on_time = 1;
+        diag.reflection_status = "skipped (time)";
+        diag.folding_status = "skipped (time)";
+        diag.ms = ms_since(t0);
+        return diag;
+    }
+
+    const auto t_detect = Clock::now();
     const auto orbits = detect_permutation_orbits(lp, opts, &diag);
+    diag.ms_detect = std::chrono::duration<double, std::milli>(
+        Clock::now() - t_detect).count();
     diag.n_orbits = orbits.size();
+    const auto t_binscan = Clock::now();
     for (const Orbit& o : orbits) {
         bool all_bin = true;
         for (Index j : o.cols) {
@@ -973,26 +1155,45 @@ SymmetryDiagnostics apply_symmetry(model::LpProblem& lp,
         }
         if (all_bin) ++diag.n_binary_orbits;
     }
+    diag.ms_binary_scan = std::chrono::duration<double, std::milli>(
+        Clock::now() - t_binscan).count();
+    const auto t_fix = Clock::now();
 
-    if (opts.orbital_fixing && cg != nullptr && !cg->empty()) {
+    if (over_budget()) { diag.aborted_on_time = 1; }
+    if (opts.orbital_fixing && !diag.aborted_on_time && cg != nullptr && !cg->empty()) {
         diag.orbital_fixings =
-            apply_orbital_fixing(*cg, orbits, col_lo, col_hi, opts.tol);
+            apply_orbital_fixing(*cg, orbits, col_lo, col_hi, opts.tol,
+                                 opts.time_limit_s, opts.max_orbit_pairs);
     }
 
+    diag.ms_orbital_fix = std::chrono::duration<double, std::milli>(
+        Clock::now() - t_fix).count();
+
+    const auto t_tail = Clock::now();
     // Fold before reflection SBCs: orbitopal rows would break identical-column
     // equality and silently disable folding.
-    if (opts.folding) {
+    if (over_budget()) { diag.aborted_on_time = 1; }
+    if (opts.folding && !diag.aborted_on_time) {
+        const auto t_f = Clock::now();
         (void)apply_folding_symmetry(lp, col_lo, col_hi, orbits, opts, diag);
+        diag.ms_folding = std::chrono::duration<double, std::milli>(
+            Clock::now() - t_f).count();
     } else {
         diag.folding_status = "disabled";
     }
 
-    if (opts.reflection) {
+    if (over_budget()) { diag.aborted_on_time = 1; }
+    if (opts.reflection && !diag.aborted_on_time) {
+        const auto t_r = Clock::now();
         (void)apply_reflection_symmetry(lp, col_lo, col_hi, cg, opts, diag);
+        diag.ms_reflection = std::chrono::duration<double, std::milli>(
+            Clock::now() - t_r).count();
     } else {
         diag.reflection_status = "disabled";
     }
 
+    diag.ms_tail = std::chrono::duration<double, std::milli>(
+        Clock::now() - t_tail).count();
     diag.ms = ms_since(t0);
     return diag;
 }

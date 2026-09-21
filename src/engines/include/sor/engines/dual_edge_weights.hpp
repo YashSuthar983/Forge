@@ -31,10 +31,21 @@ DualInitialPricingStrategy choose_dual_initial_pricing(
 // is ||B^{-T} e_i||_2^2. This is the Forrest-Goldfarb reference quantity; the
 // caller supplies the factor's BTRAN so the module remains independent of the
 // particular sparse factor/update implementation.
+// Optional seeded BTRAN: solves with d = e_{seed_slot} (the caller guarantees
+// d is zero elsewhere), returns true and fills `support` with the rows it
+// wrote when the solve stayed hypersparse, false when it took its own dense
+// path -- in which case d holds the full result and must not be solved again.
+using SeededUnitBtran =
+    std::function<bool(std::vector<core::f64>& d, core::Index seed_slot,
+                       std::vector<core::Index>& support)>;
+
+// Supplying `btran_seeded` makes the rebuild cost O(sum of reach sizes)
+// instead of O(m^2) + m dense solves. Weights are bit-identical either way.
 bool rebuild_dual_edge_weights(
     core::Index m,
     const std::function<void(std::vector<core::f64>&)>& btran,
-    std::vector<core::f64>& weights);
+    std::vector<core::f64>& weights,
+    const SeededUnitBtran& btran_seeded = {});
 
 // Exact Devex weight of a pivotal row for the current reference framework.
 // `reference[j] != 0` identifies the variables that were basic when the
@@ -65,7 +76,9 @@ bool dual_dse_accept_weight(core::f64 updated_weight,
 
 // Running-density and DSE-cost policy used by SimplexPricing::Choose. These
 // are pure functions so every strict boundary in the adaptive path is covered
-// without needing a benchmark-sized LP to happen upon it.
+// without needing a benchmark-sized LP to happen upon it. Historically these
+// gated a one-way handoff to Devex; Choose now rebuilds exact DSE by default
+// and only uses the Devex handoff when SOR_DUAL_CHOOSE_DEVEX_FALLBACK is set.
 core::f64 dual_update_running_density(core::f64 previous,
                                       core::f64 local_density);
 

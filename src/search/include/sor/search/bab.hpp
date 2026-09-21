@@ -1,4 +1,4 @@
-// SOR — branch-and-cut MILP search (PS initial focus).
+// SOR - branch-and-cut MILP search (PS initial focus).
 //
 // LAYER L5. Uses the LP simplex engine at each node, with root GMI/cover cuts,
 // cut-pool management, propagation, reliability branching / sparse-SB (under
@@ -27,6 +27,8 @@
 #include "sor/search/mip_presolve.hpp"
 #include "sor/search/mir.hpp"
 #include "sor/search/mrens.hpp"
+#include "sor/search/para_bab.hpp"
+#include "sor/search/portfolio.hpp"
 #include "sor/search/planbb.hpp"
 #include "sor/search/sc_milp_branch.hpp"
 #include "sor/search/sparse_sb.hpp"
@@ -105,7 +107,7 @@ inline engines::SimplexOptions default_node_lp_options() {
 }
 
 struct BabOptions {
-    // Product default = latest improved (sparse-SB, DynSep/GCS, Mexi, Balans…).
+    // Product default = latest improved (sparse-SB, DynSep/GCS, Mexi, Balans...).
     // Classical is debug/ablation only.
     MilpPolicy policy = kDefaultMilpPolicy;
     // Selectable Latest branching policy. Classical ignores this field.
@@ -114,7 +116,8 @@ struct BabOptions {
     ScMilpOptions sc_milp;
     // Offline training sinks (WP-H). When non-null and the matching
     // collect_labels flag is set, samples gathered during strong-branch
-    // probes are appended here after the solve for offline model fitting.
+    // probes are appended here after the solve so tools like sor_milp_train
+    // can fit models without re-parsing the tree.
     SparseSbCollector* sparse_sb_collect_out = nullptr;
     ScMilpCollector* sc_milp_collect_out = nullptr;
     LiftedSbCollector* lifted_collect_out = nullptr;
@@ -129,6 +132,31 @@ struct BabOptions {
     DynSepOptions dynsep;
     L2SepOptions l2sep;
     HgtsmOptions hgtsm;
+    // Para-B&B (arXiv:2604.09556): deterministic parallel tree via state
+    // replication + barrier phases - NOT work-stealing. threads==0 → auto
+    // (min(8, hardware_concurrency)) under Latest; Classical forces 1.
+    // --- portfolio racing (portfolio.hpp) ---------------------------------
+    // Cooperative cancellation: set by the portfolio driver when a rival arm
+    // has already produced a certified answer. Null on every serial path.
+    // --- cut validity diagnostic -----------------------------------------
+    // A known feasible (ideally optimal) point. When set, every candidate cut
+    // is checked against it BEFORE the cut is applied, and any cut that
+    // excludes it is reported by name with its violation. A valid cut cannot
+    // exclude a feasible point, so this names the guilty separator directly
+    // instead of leaving a wrong objective to be bisected.
+    //
+    // Diagnostic only: it reports, it does not alter the search.
+    const std::vector<f64>* cut_reference_point = nullptr;
+
+    const core::CancelToken* cancel = nullptr;
+    // Shared incumbent/bound channel. Null = no exchange. When set, this
+    // worker reads the pool's incumbent as an additional CUTOFF and publishes
+    // its own improvements.
+    PortfolioPool* pool = nullptr;
+
+    ParaBabOptions para_bab;
+    // Cost model deciding WHEN parallel phases start (see para_bab.hpp).
+    ParaBabCostModel para_bab_cost;
     // Tree restarts (Latest only): after a significant incumbent jump, if
     // search stalls for tree_restart_node_gap nodes without further improve,
     // clear the open set once, rebuild the root under current global cuts /
@@ -159,6 +187,12 @@ struct BabOptions {
     // just below the incumbent. 0 disables them.
     std::uint64_t feasibility_jump_improve_interval = 3000;  // nodes
     double feasibility_jump_improve_time_s = 0.4;
+    // Fix-Propagate-Repair. Runs in the same LP-free slot as Feasibility Jump
+    // (before the root LP), because the instances that need it most are the
+    // ones whose root relaxation never finishes.
+    bool fixprop = true;
+    double fixprop_time_s = 1.0;
+    double fixprop_root_frac = 0.10;
     // Large-neighbourhood search by RECURSIVE sub-MIP, scheduled by a
     // multi-armed bandit over a portfolio of neighbourhoods rather than by a
     // fixed interval per heuristic. See sor/search/lns.hpp for the portfolio,
@@ -175,9 +209,9 @@ struct BabOptions {
     // the classical AlnsScheduler as the primary primal controller. Classical
     // keeps `lns` / AlnsScheduler unchanged.
     BalansOptions balans;
-    // Kernel Pump (Assunção et al., MPC 2026) — FP-class, incumbent only.
+    // Kernel Pump (Assunção et al., MPC 2026) - FP-class, incumbent only.
     KernelPumpOptions kernel_pump;
-    // MRENS (arXiv:2408.00718) — multi-reference RENS box builder.
+    // MRENS (arXiv:2408.00718) - multi-reference RENS box builder.
     MrensOptions mrens;
     // BTBS-LNS-v1 / CL-TLNS-v1 destroy arms (Balans meta-arms under Latest).
     BtbsOptions btbs;
@@ -257,10 +291,20 @@ struct BabOptions {
     int strong_branch_candidates = 6;
     std::uint64_t strong_branch_nodes = 128;
     double strong_branch_time_s = 0.02;
+    // BatchLP (arXiv:2601.21990): FO bound-overlay probes for strong branching
+    // instead of dual-simplex warm-starts. Advisory ranking / pseudocost seed
+    // only - certified node bounds still come from simplex. Falls back to
+    // dual simplex when the batch path throws or returns no usable scores.
+    bool batch_lp_strong_branch = true;
+    std::uint32_t batch_lp_sb_steps = 200;
     // Branch-and-Cut: root GMI loop, plus (under policy=latest) tree/local
-    // separation on a depth schedule — see TreeCutOptions / tree_cuts.hpp.
+    // separation on a depth schedule - see TreeCutOptions / tree_cuts.hpp.
     // Classical keeps root-only separation.
     bool cuts_enabled = true;
+    // Turner et al. (arXiv:2307.07322) pool scoring + pre-filter and the
+    // measured-safe optional separators (MIR, cover, ZH, flow cover). Clique
+    // cuts remain opt-in. Ignored under milp.policy=classical.
+    bool auto_cuts = false;
     CutOptions cut;
     // NOTE: a gap gate on the root cutting loop was tried here and REMOVED.
     // The idea was to stop cutting when the gap showed the instance would not
@@ -284,7 +328,7 @@ struct BabOptions {
     // is what made the A/B attribution in the benchmark runs possible.
     bool probing = true;
     ProbingOptions probe;
-    // WP-F: Wang–Chen–Dai dual-fix⊕probing, clique probing, GF2, components,
+    // WP-F: Wang-Chen-Dai dual-fix⊕probing, clique probing, GF2, components,
     // TU/network implied-int, OBBT-lite, multi-round restart. Runs once at
     // MILP root entry before B&C.
     bool mip_presolve = true;
@@ -354,7 +398,7 @@ struct BabOptions {
     // probing implication is the compressed result of a whole propagation
     // cascade, so this reaches fixings that row-at-a-time propagation cannot.
     bool conflict_propagation = true;
-    // Hybrid node selection: a
+    // Hybrid node selection (item 16 of docs/SIH26119_PS_ALIGNMENT.md §5): a
     // general best-bound + bounded-plunging strategy, not a verified
     // reproduction of a specific published DIVE paper's exact mechanics.
     // Best-bound remains the ONLY source of pruning/proof; this only changes
@@ -375,7 +419,7 @@ struct BabOptions {
     bool verbose = false;
 
     // Node LP options (dual preferred for bound changes).
-    // WP-J policy hook: lp.update_method selects product-form vs Forrest–Tomlin
+    // WP-J policy hook: lp.update_method selects product-form vs Forrest-Tomlin
     // basis updates (engines already expose both; hypersparse FTRAN/BTRAN is
     // always on inside the factor). CLI: --basis-update product|ft.
     //
@@ -399,6 +443,40 @@ struct BabDiagnostics {
     // and how many of those the engine actually accepted (sd.warm_starts).
     std::uint64_t warm_start_attempts = 0;
     std::uint64_t warm_start_hits = 0;
+    // Stored bases extended over rows added since they were recorded
+    // (nogoods/cuts). Without this they fail the size check and the
+    // node re-solves cold.
+    std::uint64_t warm_start_extended = 0;
+    // Per-node work OUTSIDE the LP. The MILP timing block reported only
+    // "node LP" and a grand total, so everything else in the node loop was
+    // invisible: on app1-1, 24 s of a 30 s budget was unaccounted.
+    std::uint64_t loop_iters_started = 0;
+    std::uint64_t loop_iters_completed = 0;
+    std::uint64_t loop_iters_past_lp = 0;
+    double ms_check_binary = 0.0;
+    double ms_check_general = 0.0;
+    double ms_nogood_build = 0.0;
+    double ms_nogood_validate = 0.0;
+    double ms_exit_prune = 0.0;
+    std::uint64_t n_exit_prune = 0;
+    double ms_exit_b = 0.0;
+    std::uint64_t n_exit_b = 0;
+    double ms_exit_nobranch = 0.0;
+    std::uint64_t n_exit_nobranch = 0;
+    double ms_exit_cont_b = 0.0;
+    std::uint64_t n_exit_cont_b = 0;
+    double ms_exit_cont_nobranch = 0.0;
+    std::uint64_t n_exit_cont_nobranch = 0;
+    double ms_exit_cont_round = 0.0;
+    std::uint64_t n_exit_cont_round = 0;
+
+    double ms_lp_repair = 0.0;
+    double ms_feas_pump = 0.0;
+    double ms_branching = 0.0;   // candidate scoring + branch variable choice
+    double ms_node_loop = 0.0;    // whole loop body, all nodes
+    double ms_node_setup = 0.0;   // node_lp construction (copy / apply_cuts)
+    double ms_node_prop = 0.0;    // domain propagation
+    std::uint64_t node_local_cut_rebuilds = 0;
     // Simplex iterations summed over every node relaxation, plus the wall time
     // spent inside them. Nodes-per-second alone cannot distinguish "the tree is
     // huge" from "each node relaxation is expensive", and those have opposite
@@ -408,6 +486,54 @@ struct BabDiagnostics {
     std::uint64_t integer_row_roundings = 0;
     std::uint64_t binary_cover_cuts = 0;
     std::uint64_t strong_branch_solves = 0;
+    std::uint64_t batch_lp_sb_probes = 0;
+    std::uint64_t batch_lp_sb_batches = 0;
+    // Columns that root TU/network implied integrality marked integer. If this
+    // is non-zero on a model the user supplied with no integer columns, the
+    // pure-LP fast path is being bypassed -- see bab.cpp.
+    std::uint64_t root_implied_int_marked = 0;
+    // Coarse root-phase wall clock (ms). ms_root_setup covers everything from
+    // solve entry to the start of MIP presolve -- model copies, LP presolve,
+    // feature extraction. ms_before_search is entry to the first node pop.
+    // Added because the instrumented phases accounted for only 2.2 s of a
+    // 6.4 s run on atlanta-ip, and the missing time has to be somewhere.
+    double ms_root_setup = 0.0;
+    double ms_before_search = 0.0;
+    // Non-zero when the root cut loop stopped on its own time cap so that the
+    // search would get budget. See kRootCutShare.
+    std::uint64_t cut_loop_time_capped = 0;
+    // Time in the cut ROUND LOOP alone. cut_loop_ms spans a much wider region,
+    // so the two together localise post-loop root work.
+    double cut_rounds_ms = 0.0;
+    // Portfolio exchange telemetry.
+    // Node cuts refused promotion to the global pool because their support
+    // touched a branch-tightened bound. Non-zero here is the guard working.
+    std::uint64_t local_cuts_kept_local = 0;
+    // Cuts refused entry to the global pool because they excluded the
+    // incumbent. Non-zero means a separator emitted an invalid cut: the guard
+    // caught it, but the separator still needs fixing.
+    std::uint64_t cuts_rejected_by_incumbent = 0;
+    // Objective granularity g: every feasible integer point has an objective
+    // that is a multiple of g. 0 when none could be established.
+    f64 objective_granularity = 0.0;
+    std::uint64_t granularity_tightenings = 0;
+    // Cuts that excluded BabOptions::cut_reference_point. Any non-zero value
+    // is a separator bug.
+    std::uint64_t invalid_cuts_detected = 0;
+    std::uint64_t foreign_cutoff_prunes = 0;
+    std::uint64_t incumbents_published = 0;
+    std::uint64_t incumbents_adopted = 0;
+    // True if this worker ever pruned using a cutoff it did not derive itself.
+    // Such a worker may NOT claim Infeasible from an exhausted tree: it proved
+    // "nothing better than the shared incumbent lives here", which is not the
+    // same as "nothing lives here". Same defect class as the
+    // implied-integrality false Infeasible fixed 2026-09-19.
+    bool used_foreign_cutoff = false;
+    // Set when the tree was exhausted against a foreign cutoff with no own
+    // incumbent: proves nothing better than that cutoff exists anywhere, so
+    // the arm holding the cutoff has a global optimum.
+    bool proved_no_better_than_cutoff = false;
+    ParaBabDiagnostics para_bab;
     std::uint64_t pseudocost_updates = 0;
     // Sparse-SB (WP-H2): model picks vs fallback to reliability / fractionality.
     std::uint64_t sparse_sb_picks = 0;
@@ -448,6 +574,17 @@ struct BabDiagnostics {
     // without this the only visible outcome would be "no hit".
     std::size_t feasjump_best_violated_rows = 0;
     double feasjump_ms = 0.0;
+    // Fix-Propagate-Repair (fixprop.hpp): the LP-free constructive heuristic
+    // that complements Feasibility Jump's local search.
+    std::uint64_t fixprop_attempts = 0;
+    std::uint64_t fixprop_hits = 0;
+    std::uint64_t fixprop_dives = 0;
+    std::uint64_t fixprop_fixings = 0;
+    std::uint64_t fixprop_conflicts = 0;
+    std::uint64_t fixprop_backtracks = 0;
+    std::uint64_t fixprop_bottom_lps = 0;
+    int fixprop_best_depth_pct = 0;
+    double fixprop_ms = 0.0;
     std::uint64_t integer_dive_attempts = 0;
     std::uint64_t integer_dive_lp_solves = 0;
     std::uint64_t integer_dive_hits = 0;
@@ -522,6 +659,11 @@ struct BabDiagnostics {
     ConflictCutDiagnostics conflict_cut_diag;
     std::uint64_t conflict_cuts_global = 0;
     std::uint64_t nogood_cuts_global = 0;
+    // Wall time inside apply_cuts_inplace for learned nogoods, and inside
+    // analyze_conflict_cuts (Mexi). On misc03 the former was 41-55% of total
+    // wall while every other timer missed it entirely.
+    double nogood_apply_ms = 0.0;
+    double conflict_analysis_ms = 0.0;
     std::uint64_t tree_restarts = 0;
     std::uint64_t plunge_nodes = 0;
     f64 incumbent = core::kPosInf;

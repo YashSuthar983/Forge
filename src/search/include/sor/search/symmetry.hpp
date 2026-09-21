@@ -1,11 +1,11 @@
-// SOR — formulation symmetry (WP-G), paper-complete:
+// SOR - formulation symmetry (WP-G), paper-complete:
 //   Reflection (Hojny arXiv:2405.08379) + Folding (van der Hulst arXiv:2603.12136).
 //
 // LAYER L5. Clean-room:
-//   • Signed-permutation / reflection detection via colored SDG + own color
-//     refinement (Hojny §§3–4 compact encoding). No nauty/bliss.
-//   • Orbitopal / lex SBCs + reflection orbital fixing for binary groups.
-//   • Folding = DRCR-style dimension reduction on color-refinement orbits
+//   - Signed-permutation / reflection detection via colored SDG + own color
+//     refinement (Hojny §§3-4 compact encoding). No nauty/bliss.
+//   - Orbitopal / lex SBCs + reflection orbital fixing for binary groups.
+//   - Folding = DRCR-style dimension reduction on color-refinement orbits
 //     (identical-parallel binary/integer + continuous equitable sum folds)
 //     with mandatory lift back to original space.
 #pragma once
@@ -24,11 +24,18 @@ using core::f64;
 using core::Index;
 
 struct SymmetryOptions {
+    // Wall budget for symmetry detection, seconds. 0 = unlimited.
+    // Unbudgeted this ran 25.3 s against a 1 s solver limit on atlanta-ip.
+    double time_limit_s = 0.0;
+    // Cap on the all-pairs conflict check per orbit (see orbit_is_amo_clique).
+    // 1e6 pairs is ~1400 columns, far above any orbit that is plausibly an
+    // at-most-one clique, and bounds a single call to milliseconds.
+    std::uint64_t max_orbit_pairs = 1000000;
     bool enabled = true;
     // Color-refinement rounds (0 = until fixpoint or max_iters).
     int color_refinement_max_iters = 64;
     // Orbital fixing on binary orbits that are pairwise conflicting in `cg`
-    // (AMO). Never applied to non-clique orbits — that would cut optima.
+    // (AMO). Never applied to non-clique orbits - that would cut optima.
     bool orbital_fixing = true;
     // Reflection-complete: signed SDG detection + orbitopal/lex SBCs +
     // reflection orbital fixing. Default OFF until SBCs are validated on
@@ -70,6 +77,20 @@ struct ReflectionGen {
 };
 
 struct SymmetryDiagnostics {
+    // Non-zero when a stage was skipped to stay inside the budget.
+    std::uint64_t aborted_on_time = 0;
+    // Where orbit detection actually spends its time.
+    double ms_adjacency = 0.0;
+    double ms_refine = 0.0;
+    double ms_bucket = 0.0;
+    double ms_detect = 0.0;
+    double ms_binary_scan = 0.0;
+    double ms_orbital_fix = 0.0;
+    double ms_tail = 0.0;
+    double ms_folding = 0.0;
+    double ms_reflection = 0.0;
+    double ms_fold_csc = 0.0;
+    double ms_fold_loop = 0.0;
     std::uint64_t color_iters = 0;
     std::uint64_t signed_color_iters = 0;
     std::uint64_t n_orbits = 0;  // orbits of size >= 2
@@ -108,7 +129,9 @@ std::uint64_t apply_orbital_fixing(const ConflictGraph& cg,
                                    const std::vector<Orbit>& orbits,
                                    std::vector<f64>& col_lo,
                                    std::vector<f64>& col_hi,
-                                   f64 tol = 1e-9);
+                                   f64 tol = 1e-9,
+                                   double time_limit_s = 0.0,
+                                   std::uint64_t max_orbit_pairs = 0);
 
 // Reflection-complete handling: signed detection, orbitopal/lex SBCs,
 // reflection orbital fixing. May append rows to `lp`.

@@ -1,4 +1,4 @@
-# SOR — MPS / QPS / solution I/O (port of sor/sor_io).
+# SOR - MPS / QPS / solution I/O (port of sor/sor_io).
 #
 # LAYER L2. Written from the published MPS format description (IBM MPSX
 # convention as documented by Netlib and the MIPLIB/QPLIB format notes).

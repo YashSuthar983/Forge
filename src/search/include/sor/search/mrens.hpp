@@ -1,4 +1,4 @@
-// SOR — MRENS: Multi-Reference Relaxation Enforced Neighborhood Search
+// SOR - MRENS: Multi-Reference Relaxation Enforced Neighborhood Search
 // (Bolusani, Mexi, Besançon & Turner, arXiv:2408.00718). Clean-room.
 //
 // LAYER L5. Builds a restricted box from several fractional LP references;
@@ -7,7 +7,7 @@
 //
 // Also hosts BTBS-LNS-v1 (ICLR 2025 spirit) and CL-TLNS-v1 (arXiv:2412.08206
 // spirit): destroy operators that emit NeighborhoodProblem boxes for Balans;
-// repair is the existing sub-MIP path in bab.cpp — primal-only.
+// repair is the existing sub-MIP path in bab.cpp - primal-only.
 #pragma once
 
 #include "sor/core/result.hpp"
@@ -53,7 +53,7 @@ struct MrensNeighborhood {
     std::uint64_t free_integer = 0;
 };
 
-// Build the multi-reference RENS box. `refs` should contain 1–max_refs LP
+// Build the multi-reference RENS box. `refs` should contain 1-max_refs LP
 // points of size n. When only one ref is supplied this reduces to classical
 // RENS domain tightening. Returns false when degenerate or below min_fix_frac.
 bool build_mrens_neighborhood(const model::LpProblem& mip,
@@ -63,7 +63,7 @@ bool build_mrens_neighborhood(const model::LpProblem& mip,
                               const MrensOptions& opts,
                               MrensNeighborhood& out);
 
-// Materialise as an LpProblem (box only — no extra rows).
+// Materialise as an LpProblem (box only - no extra rows).
 model::LpProblem apply_mrens(const model::LpProblem& mip,
                              const MrensNeighborhood& nb);
 
