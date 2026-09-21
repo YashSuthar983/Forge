@@ -3,10 +3,12 @@
 // LAYER L8.
 #include "sor/backend/kernel_backend.hpp"
 #include "sor/backend/lp_device.hpp"
+#include "sor/backend/qp_device.hpp"
 #include "sor/certify/finalize.hpp"
 #include "sor/engines/hpr.hpp"
 #include "sor/engines/lp.hpp"
 #include "sor/engines/pdhg.hpp"
+#include "sor/engines/hpr_qp.hpp"
 #include "sor/engines/qp.hpp"
 #include "sor/engines/simplex.hpp"
 #include "sor/io/mps.hpp"
@@ -34,6 +36,7 @@ void usage() {
         "  --engine NAME    simplex (default) | auto | primal | dual | pdhg | hpr | milp | qp\n"
         "  --q-diag LIST    comma-separated diagonal of Q (if not using .qps)\n"
         "  --backend NAME   cpu (default) | vulkan | cuda\n"
+        "  --engine hprqp   GPU-capable HPR-QP convex QP engine (honours --backend)\n"
         "  --method NAME    auto | primal | dual   (simplex and MILP node LPs)\n"
         "  --pricing NAME   choose | dantzig | devex | dse  (simplex pricing)\n"
         "  --basis-update NAME  product | ft       (simplex basis updates)\n"
@@ -253,6 +256,54 @@ void print_transfer(const sor::backend::TransferStats& s) {
 }
 
 }  // namespace
+
+// Shared .qps / --q-diag loading for --engine qp and --engine hprqp. Returns
+// false after printing the reason, so each caller can just propagate the exit
+// code. Factored out when hprqp arrived rather than duplicated, because the two
+// engines must accept exactly the same inputs or "--engine hprqp" silently
+// means something different from "--engine qp" on the same file.
+static bool load_qp_problem(sor::engines::QpProblem& qp,
+                            const std::string& path,
+                            const std::string& q_diag_arg,
+                            bool path_is_qps,
+                            bool mps_format_forced,
+                            const sor::io::MpsReadOptions& mps_opts) {
+    if (!q_diag_arg.empty()) {
+        sor::io::MpsReadReport rep;
+        qp.linear = mps_format_forced
+            ? sor::io::read_mps_file(path, rep, mps_opts)
+            : sor::io::read_mps_file_auto(path, rep, mps_opts);
+        for (const auto& w : rep.warnings)
+            std::fprintf(stderr, "warning: %s\n", w.c_str());
+        qp.q_diag.clear();
+        std::size_t start = 0;
+        while (start <= q_diag_arg.size()) {
+            const auto comma = q_diag_arg.find(',', start);
+            const auto tok = q_diag_arg.substr(
+                start, comma == std::string::npos ? std::string::npos
+                                                  : comma - start);
+            if (!tok.empty())
+                qp.q_diag.push_back(parse_real(
+                    tok, "--q-diag", -std::numeric_limits<double>::max()));
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+        return true;
+    }
+    if (path_is_qps) {
+        sor::io::QpsReadReport rep;
+        auto loaded = sor::io::read_qps_file(path, rep, mps_opts);
+        for (const auto& w : rep.warnings)
+            std::fprintf(stderr, "warning: %s\n", w.c_str());
+        qp.linear = std::move(loaded.linear);
+        qp.q_diag = std::move(loaded.q_diag);
+        qp.q_matrix = std::move(loaded.q_matrix);
+        return true;
+    }
+    std::fprintf(stderr,
+                 "error: a quadratic engine needs a .qps file or --q-diag\n");
+    return false;
+}
 
 int main(int argc, char** argv) {
     if (argc < 2) { usage(); return 2; }
@@ -652,7 +703,8 @@ int main(int argc, char** argv) {
     if (path.empty()) { usage(); return 2; }
     if (engine_name != "pdhg" && engine_name != "simplex" && engine_name != "auto" &&
         engine_name != "primal" && engine_name != "dual" && engine_name != "hpr" &&
-        engine_name != "milp" && engine_name != "qp") {
+        engine_name != "milp" && engine_name != "qp" &&
+        engine_name != "hprqp") {
         std::fprintf(stderr,
                      "error: engine '%s' not implemented "
                      "(have simplex|auto|primal|dual|pdhg|hpr|milp|qp)\n",
@@ -687,6 +739,80 @@ int main(int argc, char** argv) {
         const bool path_is_qps = path.size() >= 4 &&
             (path.compare(path.size() - 4, 4, ".qps") == 0 ||
              path.compare(path.size() - 4, 4, ".QPS") == 0);
+
+        if (engine_name == "hprqp") {
+            // HPR-QP shares the .qps / --q-diag loading of --engine qp but
+            // runs the dual Halpern Peaceman-Rachford method on a QpDevice,
+            // so --backend selects where the iteration actually runs.
+            sor::engines::QpProblem qp;
+            if (!load_qp_problem(qp, path, q_diag_arg, path_is_qps,
+                                 mps_format_forced, mps_opts))
+                return 2;
+
+            std::printf("model:             %s\n",
+                        qp.linear.name.empty() ? path.c_str()
+                                               : qp.linear.name.c_str());
+            std::printf("rows x cols:       %d x %d   nnz %lld\n",
+                        qp.linear.n_rows(), qp.linear.n_cols(),
+                        static_cast<long long>(qp.linear.nnz()));
+            std::printf("engine:            hpr_qp\n");
+
+            auto dev = sor::backend::make_qp_device(backend_name);
+            if (!dev) {
+                sor::core::RawResult unavailable;
+                unavailable.proposed_status = sor::core::Status::Unsupported;
+                unavailable.engine = "hpr_qp";
+                unavailable.backend = backend_name;
+                unavailable.termination_reason =
+                    "requested QP device '" + backend_name + "' is unavailable";
+                const auto r = sor::certify::finalize_result(
+                    std::move(unavailable), sor::core::ProofEvidence{});
+                print_result(r);
+                std::printf("termination:       %s\n", r.termination_reason.c_str());
+                return exit_code_for(r.status);
+            }
+            std::printf("backend:           %s (accelerated=%s)\n",
+                        std::string(dev->name()).c_str(),
+                        dev->is_accelerated() ? "yes" : "no");
+
+            sor::engines::HprQpOptions hqopts;
+            hqopts.max_iterations = pdhg_opts.max_iterations;
+            hqopts.time_limit_s = sx_opts.time_limit_s;
+            hqopts.verbose = sx_opts.verbose;
+            if (tol_given) {
+                hqopts.feas_tol = tol;
+                hqopts.stationarity_tol = tol;
+                hqopts.gap_tol = tol;
+            }
+            sor::engines::HprQpDiagnostics hqdiag;
+            auto raw = sor::engines::solve_hpr_qp(qp, hqopts, *dev, hqdiag);
+            const auto ev = sor::engines::hpr_qp_evidence(hqdiag, hqopts);
+            const auto r = sor::certify::finalize_result(std::move(raw), ev);
+            print_result(r);
+            write_solution_out(solution_out, r);
+            std::printf("stationarity:      %.3e  (rel %.3e)\n",
+                        hqdiag.stationarity, hqdiag.stationarity_rel);
+            std::printf("max primal viol:   %.3e  (rel %.3e)\n",
+                        hqdiag.primal_residual, hqdiag.primal_residual_rel);
+            std::printf("relative gap:      %.3e\n", hqdiag.gap_rel);
+            std::printf("lambda_Q/lambda_A: %.6e / %.6e\n",
+                        hqdiag.lambda_q, hqdiag.lambda_a);
+            std::printf("sigma (final):     %.6e\n", hqdiag.sigma_final);
+            std::printf("restarts:          %llu (suff %llu / nec %llu / long %llu)\n",
+                        static_cast<unsigned long long>(hqdiag.restarts),
+                        static_cast<unsigned long long>(hqdiag.sufficient_restarts),
+                        static_cast<unsigned long long>(hqdiag.necessary_restarts),
+                        static_cast<unsigned long long>(hqdiag.long_loop_restarts));
+            std::printf("iterations:        %llu\n",
+                        static_cast<unsigned long long>(hqdiag.iterations));
+            std::printf("termination:       %s\n", r.termination_reason.c_str());
+            std::printf("\ntiming (ms)\n");
+            std::printf("  total            %10.3f\n", hqdiag.total_ms);
+            std::printf("  setup            %10.3f\n", hqdiag.setup_ms);
+            std::printf("  loop             %10.3f\n", hqdiag.loop_ms);
+            print_transfer(hqdiag.device_stats);
+            return exit_code_for(r.status);
+        }
 
         if (engine_name == "qp") {
             sor::engines::QpProblem qp;

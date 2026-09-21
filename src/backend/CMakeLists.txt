@@ -5,7 +5,13 @@ set(SOR_SHADER_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders)
 set(SOR_SHADER_BINARY_DIR ${CMAKE_BINARY_DIR}/shaders)
 set(SOR_SHADER_NAMES
   spmv_csr spmv_csc primal_step dual_step halpern_mix avg_update
-  step_reduce kkt_cols kkt_rows kkt_final)
+  step_reduce kkt_cols kkt_rows kkt_final
+  )
+# The QP shaders (qp_x_step, qp_v_build, qp_y_step, qp_w_step, qp_halpern,
+# qp_axpby, qp_dot, qp_boxres, qp_absmax, qp_fold) are named here in the
+# commit that adds the Vulkan QpDevice. Listing them before they exist makes
+# the shader target unbuildable, and make_vulkan_qp_device() returns nullptr
+# until then, so nothing can reach them anyway.
 
 if(SOR_ENABLE_VULKAN)
   find_package(Vulkan REQUIRED)
@@ -29,9 +35,11 @@ endif()
 set(SOR_BACKEND_SOURCES
   src/cpu_backend.cpp
   src/backend_factory.cpp
-  src/cpu_lp_device.cpp)
+  src/cpu_lp_device.cpp
+  src/cpu_qp_device.cpp)
 if(SOR_ENABLE_VULKAN)
-  list(APPEND SOR_BACKEND_SOURCES src/vulkan/vk_context.cpp src/vulkan/vk_lp_device.cpp)
+  list(APPEND SOR_BACKEND_SOURCES src/vulkan/vk_context.cpp src/vulkan/vk_lp_device.cpp
+                                  src/vulkan/vk_qp_device.cpp)
 else()
   list(APPEND SOR_BACKEND_SOURCES src/vulkan_stub.cpp)
 endif()
