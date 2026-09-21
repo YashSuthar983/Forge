@@ -1,0 +1,43 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// wbar, then the Halpern update of BOTH w and x, in one dispatch.
+//
+//   wbar = wa*w + wb*xhat + wc*(A'dy)
+//   w    = a*w0 + b*(2*wbar - w_old)
+//   x    = a*x0 + b*xhat            (xhat is already 2*xbar - x)
+//
+// w and x are both length n and both need the same two Halpern weights, so
+// they ride in the same kernel.  The CPU reference writes them as two loops;
+// as two dispatches that is pure launch overhead over identical indexing.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint pad;
+    double wa;   // sigma*lambda_Q/den
+    double wb;   // 1/den
+    double wc;   // sigma/den
+    double a;    // Halpern anchor weight
+    double b;
+} pc;
+
+layout(std430, binding = 0) buffer WBuf              { double w[]; };
+layout(std430, binding = 1) readonly  buffer XhatBuf { double xhat[]; };
+layout(std430, binding = 2) readonly  buffer AtdyBuf { double atdy[]; };
+layout(std430, binding = 3) readonly  buffer W0Buf   { double w0[]; };
+layout(std430, binding = 4) readonly  buffer X0Buf   { double x0[]; };
+layout(std430, binding = 5) buffer XBuf              { double x[]; };
+layout(std430, binding = 6) writeonly buffer WbarBuf { double wbar[]; };
+
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.n) return;
+    double wo = w[j];
+    double xh = xhat[j];
+    double wb_ = pc.wa * wo + pc.wb * xh + pc.wc * atdy[j];
+    wbar[j] = wb_;
+    w[j] = pc.a * w0[j] + pc.b * (2.0lf * wb_ - wo);
+    x[j] = pc.a * x0[j] + pc.b * xh;
+}
