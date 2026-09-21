@@ -553,7 +553,19 @@ core::RawResult solve_lp(const model::LpProblem& problem,
     // capability refusal, not an invitation to silently finish on CPU.
     if (fo_raw.proposed_status == core::Status::Unsupported)
         return finish(std::move(fo_raw), fo_ev);
-    if (certified_terminal(fo_raw, fo_ev) || !is_auto) {
+    // An explicitly requested FO strategy used to return here unconditionally,
+    // which made --fo-crossover a silent no-op on --engine hpr and --engine
+    // pdhg: the flag was parsed, plumbed into LpOptions, and then never read
+    // unless the strategy was Auto. The observable effect was that a
+    // first-order solve could reach the exact optimal objective with residuals
+    // at 1e-9 and still report proof_level None, because the one component
+    // that can turn a first-order point into a certified basis was skipped.
+    //
+    // Honour the flag instead. An explicit strategy with crossover DISABLED
+    // still returns straight after FO, which is the "just run the engine I
+    // asked for" behaviour the old condition was reaching for.
+    const bool explicit_fo_without_crossover = !is_auto && !options.fo_crossover;
+    if (certified_terminal(fo_raw, fo_ev) || explicit_fo_without_crossover) {
         if (presolve_map != nullptr &&
             candidate_in_reduced_space(work_problem, fo_raw)) {
             const auto lifted = lift_reduced_candidate(
