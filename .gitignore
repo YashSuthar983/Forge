@@ -59,6 +59,16 @@ benchmarks/results/*
 !benchmarks/results/miplib-easy-20260905-141554.md
 !benchmarks/results/miplib-easy-20260905-141554.jsonl
 
+# The gate's own state is not a "run": scripts/gate.py compares against these
+# and they are the contract that says what this tree is allowed to do, so they
+# are versioned deliberately (and only move under --accept --reason). The
+# per-run candidate sweeps it writes next to them stay ignored.
+!benchmarks/results/baseline-*.jsonl
+!benchmarks/results/gate-allow.json
+!benchmarks/results/reference-highs-*.jsonl
+!benchmarks/results/netlib-gpu-crossover-20260921-171500.md
+!benchmarks/results/netlib-gpu-crossover-20260921-171500.txt
+
 # Third-party papers read for the clean-room work (docs/paper_bibliography.md
 # cites them by DOI/arXiv). 38 MB of published PDFs, so they are kept locally
 # rather than redistributed through this repository's history.
