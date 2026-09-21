@@ -72,6 +72,8 @@ benchmarks/results/*
 !benchmarks/results/baseline-*.jsonl
 !benchmarks/results/gate-allow.json
 !benchmarks/results/reference-highs-*.jsonl
+!benchmarks/results/netlib-gpu-crossover-20260921-171500.md
+!benchmarks/results/netlib-gpu-crossover-20260921-171500.txt
 
 # Third-party papers read for the clean-room work (docs/paper_bibliography.md
 # cites them by DOI/arXiv). 38 MB of published PDFs, so they are kept locally
