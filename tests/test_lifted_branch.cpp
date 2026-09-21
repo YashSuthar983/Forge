@@ -1,4 +1,4 @@
-// Slice 6 — Lifted Branching (Renard–Louveaux–Fortz / var+constraint lifts).
+// Slice 6 - Lifted Branching (Renard-Louveaux-Fortz / var+constraint lifts).
 #include "forge/io/mps.hpp"
 #include "forge/search/bab.hpp"
 #include "forge/search/features.hpp"

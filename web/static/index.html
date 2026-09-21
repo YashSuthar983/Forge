@@ -20,7 +20,7 @@
         <span>Open <code>.mps</code> / <code>.qps</code></span>
       </label>
     </div>
-    <span class="topbar-right" id="health">Starting…</span>
+    <span class="topbar-right" id="health">Starting...</span>
   </div>
 
   <main class="shell workspace">
@@ -48,7 +48,7 @@
           <div class="inspector-head">
             <div>
               <p class="step-light">Model</p>
-              <p class="model-title" id="model-title">—</p>
+              <p class="model-title" id="model-title">-</p>
             </div>
             <div class="tabs" role="tablist">
               <button type="button" class="tab active" data-tab="mps" id="tab-mps">MPS</button>
@@ -62,7 +62,7 @@
               <span class="dirty" id="dirty" hidden>edited</span>
             </div>
             <textarea id="mps_text" class="code-edit" spellcheck="false" rows="16"
-              placeholder="NAME …&#10;ROWS&#10;…&#10;ENDATA"></textarea>
+              placeholder="NAME ...&#10;ROWS&#10;...&#10;ENDATA"></textarea>
           </div>
 
           <div class="editor-wrap" id="panel-eq" hidden>
@@ -72,9 +72,9 @@
             </div>
             <div class="templates" id="templates" role="list"></div>
             <textarea id="model_text" class="code-edit eq-edit" spellcheck="false" rows="12"
-              placeholder="Maximize&#10;  3 x + 4 y&#10;Subject To&#10;  …&#10;End"></textarea>
+              placeholder="Maximize&#10;  3 x + 4 y&#10;Subject To&#10;  ...&#10;End"></textarea>
             <p class="writer-help">
-              <strong>How to write it</strong> —
+              <strong>How to write it</strong> -
               <code>Maximize</code>/<code>Minimize</code> ·
               <code>Subject To</code> ·
               <code>Bounds</code> ·
@@ -90,7 +90,7 @@
             <p class="step-light">Run</p>
             <button type="button" class="solve" id="btn-solve">
               <span id="solve-label">Optimize</span>
-              <span class="solve-hint" id="solve-hint">—</span>
+              <span class="solve-hint" id="solve-hint">-</span>
             </button>
             <div class="toggles">
               <label class="toggle"><input type="checkbox" id="verbose" /> Show solver log</label>

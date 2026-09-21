@@ -1,4 +1,4 @@
-// FORGE — compressed-sparse-column pattern and matrix.
+// FORGE - compressed-sparse-column pattern and matrix.
 //
 // LAYER L1. Depends only on forge_core.
 //
@@ -77,7 +77,7 @@ struct CscMatrix {
 
 // Transpose a CSR matrix into CSC. Row indices within each column come out
 // ascending, which the triangular solves rely on for cache behaviour and which
-// makes the result canonical (so two equal matrices transpose identically —
+// makes the result canonical (so two equal matrices transpose identically -
 // commitment C3, determinism).
 CscMatrix to_csc(const CsrMatrix& a);
 

@@ -1,6 +1,6 @@
 module SovereignSolver
 
-# C++-port modules first (L0–L7), then the original solver_accl engines
+# C++-port modules first (L0-L7), then the original solver_accl engines
 # (one-sided LPProblem + KA PDHG). Include order is a dependency DAG.
 
 include("core/Result.jl")

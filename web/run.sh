@@ -14,7 +14,7 @@ fi
 export FORGE_EXAMPLES="${FORGE_EXAMPLES:-$ROOT/examples}"
 
 if [[ -z "${FORGE_BIN_DIR:-}" || ! -x "$FORGE_BIN_DIR/forge_solve" ]]; then
-  echo "error: forge_solve not found — build FORGE first (cmake -S . -B build && cmake --build build -j)" >&2
+  echo "error: forge_solve not found - build FORGE first (cmake -S . -B build && cmake --build build -j)" >&2
   exit 1
 fi
 

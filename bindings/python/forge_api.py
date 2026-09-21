@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FORGE Python API — thin client over forge_solve / forge_check.
+"""FORGE Python API - thin client over forge_solve / forge_check.
 
 Part of the project (not the web demo).
 
@@ -151,7 +151,7 @@ def help_sor() -> None:
 def run_repl() -> None:
     print(HELP)
     print(f"binaries: {BIN}")
-    print("Type solve(...)  —  basic API over forge_solve / forge_check.\n")
+    print("Type solve(...)  -  basic API over forge_solve / forge_check.\n")
     import code
 
     code.interact(

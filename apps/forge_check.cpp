@@ -1,4 +1,4 @@
-// forge_check — independent checker (item 30 of the product checklist item 30). Re-verifies
+// forge_check - independent checker (item 30 of the product checklist item 30). Re-verifies
 // a claim written by `forge_solve --solution-out` against the ORIGINAL model
 // file, using nothing from the solve itself: no basis, no iteration state,
 // just the model's own row/bound violation methods and (for an infeasibility

@@ -1,4 +1,4 @@
-// FORGE — serial top-level LP dispatcher.
+// FORGE - serial top-level LP dispatcher.
 #pragma once
 
 #include "forge/core/result.hpp"

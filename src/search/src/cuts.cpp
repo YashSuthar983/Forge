@@ -267,7 +267,7 @@ std::vector<CutRow> CutPool::select_violated(const std::vector<f64>& x,
             for (std::size_t k = 0; k < order.size(); ++k)
                 entries_[order[k]].last_score = batch_scores[k];
         } else {
-            // Malformed batch — fall back to efficacy so selection still runs.
+            // Malformed batch - fall back to efficacy so selection still runs.
             for (const std::size_t i : order) {
                 auto& entry = entries_[i];
                 entry.last_score =
@@ -661,11 +661,10 @@ f64 max_row_parallelism(const model::LpProblem& lp,
     return best;
 }
 
-model::LpProblem apply_cuts(const model::LpProblem& lp,
-                            const std::vector<CutRow>& cuts,
-                            const CutOptions& opts) {
-    model::LpProblem out = lp;
-    if (cuts.empty()) return out;
+void apply_cuts_inplace(model::LpProblem& lp,
+                        const std::vector<CutRow>& cuts,
+                        const CutOptions& opts) {
+    if (cuts.empty()) return;
 
     std::vector<std::vector<Index>> col_rows(sz(lp.n_cols()));
     {
@@ -676,7 +675,7 @@ model::LpProblem apply_cuts(const model::LpProblem& lp,
                 col_rows[sz(ci0[sz(k)])].push_back(i);
     }
 
-    const Index m = lp.n_rows();
+    const Index m0 = lp.n_rows();
     const Index n = lp.n_cols();
     const auto& rp = lp.A.pattern.row_ptr();
     const auto& ci = lp.A.pattern.col_idx();
@@ -692,10 +691,10 @@ model::LpProblem apply_cuts(const model::LpProblem& lp,
     // and cost the instance its proof. Tightening the existing row instead
     // keeps every bit of the cut's strength and adds no dependence at all.
     std::unordered_map<std::string, Index> shape_of;
-    shape_of.reserve(sz(m) * 2);
+    shape_of.reserve(sz(m0) * 2);
     std::vector<Index> rcols;
     std::vector<f64> rvals;
-    for (Index i = 0; i < m; ++i) {
+    for (Index i = 0; i < m0; ++i) {
         rcols.clear();
         rvals.clear();
         for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
@@ -707,21 +706,9 @@ model::LpProblem apply_cuts(const model::LpProblem& lp,
         if (!key.empty()) shape_of.emplace(key, i);
     }
 
-    std::vector<Index> rows, cols;
-    std::vector<f64> vals;
-    rows.reserve(sz(lp.nnz()) + cuts.size() * 8);
-    cols.reserve(rows.capacity());
-    vals.reserve(rows.capacity());
-    for (Index i = 0; i < m; ++i)
-        for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
-            rows.push_back(i);
-            cols.push_back(ci[sz(k)]);
-            vals.push_back(av[sz(k)]);
-        }
-
-    // Pending appends are not yet in `lp.A` / `out.row_*`. shape_of may point
-    // either at an existing model row (< m) or at a pending slot (>= m). Merging
-    // into a pending slot must tighten that CutRow's bounds — never index `rp`.
+    // Pending appends are not yet in `lp.A` / `lp.row_*`. shape_of may point
+    // either at an existing model row (< m0) or at a pending slot (>= m0).
+    // Merging into a pending slot must tighten that CutRow's bounds.
     std::vector<CutRow> pending;
     pending.reserve(cuts.size());
     auto cut_cols_in_range = [&](const CutRow& cut) -> bool {
@@ -737,11 +724,11 @@ model::LpProblem apply_cuts(const model::LpProblem& lp,
         const auto it = key.empty() ? shape_of.end() : shape_of.find(key);
         if (it != shape_of.end() && cs != 0.0) {
             // Existing/pending row constrains (row_scale/cs) times the same
-            // form as the cut. Map cut bounds into that scaling — FLIP when
-            // the ratio is negative — and keep the tighter side of each.
+            // form as the cut. Map cut bounds into that scaling - FLIP when
+            // the ratio is negative - and keep the tighter side of each.
             const Index i = it->second;
             f64 rsc = 0.0;
-            if (i < m) {
+            if (i < m0) {
                 rcols.clear();
                 rvals.clear();
                 for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
@@ -750,7 +737,7 @@ model::LpProblem apply_cuts(const model::LpProblem& lp,
                 }
                 row_signature(rcols, rvals, rsc);
             } else {
-                const std::size_t q = static_cast<std::size_t>(i - m);
+                const std::size_t q = static_cast<std::size_t>(i - m0);
                 if (q >= pending.size()) continue;
                 row_signature(pending[q].cols, pending[q].vals, rsc);
             }
@@ -758,13 +745,13 @@ model::LpProblem apply_cuts(const model::LpProblem& lp,
             const f64 ratio = rsc / cs;
             f64 lo = cut.row_lo * ratio, hi = cut.row_hi * ratio;
             if (ratio < 0.0) std::swap(lo, hi);
-            if (i < m) {
+            if (i < m0) {
                 if (std::isfinite(lo))
-                    out.row_lo[sz(i)] = std::max(out.row_lo[sz(i)], lo);
+                    lp.row_lo[sz(i)] = std::max(lp.row_lo[sz(i)], lo);
                 if (std::isfinite(hi))
-                    out.row_hi[sz(i)] = std::min(out.row_hi[sz(i)], hi);
+                    lp.row_hi[sz(i)] = std::min(lp.row_hi[sz(i)], hi);
             } else {
-                CutRow& dest = pending[static_cast<std::size_t>(i - m)];
+                CutRow& dest = pending[static_cast<std::size_t>(i - m0)];
                 if (std::isfinite(lo))
                     dest.row_lo = std::max(dest.row_lo, lo);
                 if (std::isfinite(hi))
@@ -779,31 +766,31 @@ model::LpProblem apply_cuts(const model::LpProblem& lp,
             continue;
         pending.push_back(cut);
         if (!key.empty())
-            shape_of.emplace(key, m + static_cast<Index>(pending.size()) - 1);
+            shape_of.emplace(key, m0 + static_cast<Index>(pending.size()) - 1);
     }
 
-    if (pending.empty()) return out;
+    if (pending.empty()) return;
     for (std::size_t q = 0; q < pending.size(); ++q) {
-        const Index r = m + static_cast<Index>(q);
-        for (std::size_t t = 0; t < pending[q].cols.size(); ++t) {
-            rows.push_back(r);
-            cols.push_back(pending[q].cols[t]);
-            vals.push_back(pending[q].vals[t]);
-        }
-        out.row_lo.push_back(pending[q].row_lo);
-        out.row_hi.push_back(pending[q].row_hi);
+        lp.A.append_row(pending[q].cols, pending[q].vals);
+        lp.row_lo.push_back(pending[q].row_lo);
+        lp.row_hi.push_back(pending[q].row_hi);
     }
-    out.A = sparse::from_triplets(m + static_cast<Index>(pending.size()), n,
-                                  rows, cols, vals);
     // Only materialize names when the source already had them, or when we
     // need labels for the new cuts; keep vector length == n_rows().
-    if (!out.row_names.empty() || !pending.empty()) {
-        out.row_names.resize(sz(m) + pending.size());
+    if (!lp.row_names.empty() || !pending.empty()) {
+        lp.row_names.resize(sz(m0) + pending.size());
         for (std::size_t q = 0; q < pending.size(); ++q) {
-            out.row_names[sz(m) + q] = pending[q].name.empty()
+            lp.row_names[sz(m0) + q] = pending[q].name.empty()
                 ? ("CUT_" + std::to_string(q)) : pending[q].name;
         }
     }
+}
+
+model::LpProblem apply_cuts(const model::LpProblem& lp,
+                            const std::vector<CutRow>& cuts,
+                            const CutOptions& opts) {
+    model::LpProblem out = lp;
+    apply_cuts_inplace(out, cuts, opts);
     return out;
 }
 

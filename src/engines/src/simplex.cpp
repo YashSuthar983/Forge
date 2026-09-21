@@ -310,6 +310,8 @@ void accumulate_work(SimplexDiagnostics& total,
     total.devex_frameworks  += stage.devex_frameworks;
     total.devex_weight_checks += stage.devex_weight_checks;
     total.dse_weight_checks += stage.dse_weight_checks;
+    total.dse_weight_reuses += stage.dse_weight_reuses;
+    total.dse_weight_rebuilds += stage.dse_weight_rebuilds;
     total.dse_weight_rejections += stage.dse_weight_rejections;
     total.dse_to_devex_switches += stage.dse_to_devex_switches;
     total.dse_accuracy_switches += stage.dse_accuracy_switches;
@@ -431,6 +433,8 @@ void install_work_totals(SimplexDiagnostics& chosen,
     chosen.devex_frameworks   = total.devex_frameworks;
     chosen.devex_weight_checks = total.devex_weight_checks;
     chosen.dse_weight_checks  = total.dse_weight_checks;
+    chosen.dse_weight_reuses  = total.dse_weight_reuses;
+    chosen.dse_weight_rebuilds = total.dse_weight_rebuilds;
     chosen.dse_weight_rejections = total.dse_weight_rejections;
     chosen.dse_to_devex_switches = total.dse_to_devex_switches;
     chosen.dse_accuracy_switches = total.dse_accuracy_switches;

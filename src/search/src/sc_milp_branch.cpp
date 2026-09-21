@@ -388,7 +388,7 @@ bool load_sc_milp_model(const std::string& path, ScMilpModel& model) {
     }
     if (model.base_dim <= 0 || model.base_dim > kBranchFeatureDim) return false;
     if (model.n_strata != kBranchStratumCount) return false;
-    // P0 (2026-09-14): refuse NaN-poisoned weights — old fits wrote "nan"
+    // P0 (2026-09-14): refuse NaN-poisoned weights - old fits wrote "nan"
     // and load treated them as loaded=true, silently disabling learned branch.
     if (!model.finite()) {
         model.clear();

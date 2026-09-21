@@ -1,4 +1,4 @@
-# FORGE — Forge Optimization Runtime
+# FORGE - Forge Optimization Runtime
 
 From-scratch **LP / MILP / QP** engine for  . No foreign solver
 library in the solve path. Papers in, clean-room code out.
@@ -28,7 +28,7 @@ python3 scripts/forge_repl.py --one-shot
 
 Vulkan `LpDevice` builds by default (`-DFORGE_ENABLE_VULKAN=ON`). CUDA is a stub.
 
-## What’s in the tree (verified)
+## What's in the tree (verified)
 
 | Piece | Module |
 |---|---|
@@ -43,7 +43,7 @@ Vulkan `LpDevice` builds by default (`-DFORGE_ENABLE_VULKAN=ON`). CUDA is a stub
 
 ## Measured snapshot (4 Sep 2026, optimized pass)
 
-Netlib 93 / 30 s — `benchmarks/results/compare-netlib-20260904-152608.md`.
+Netlib 93 / 30 s - `benchmarks/results/compare-netlib-20260904-152608.md`.
 The harness now compares solver-internal time symmetrically and retains complete
 process wall time separately in JSONL:
 

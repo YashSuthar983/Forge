@@ -1,4 +1,4 @@
-// FORGE — first-order to simplex crossover.
+// FORGE - first-order to simplex crossover.
 #pragma once
 
 #include "forge/engines/simplex.hpp"

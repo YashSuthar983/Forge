@@ -3,13 +3,13 @@
 
   const PLAIN = {
     Optimal: "Proved best answer for this model.",
-    Feasible: "Good feasible answer — not yet proved globally best.",
+    Feasible: "Good feasible answer - not yet proved globally best.",
     Interrupted: "Stopped on the time limit. Best answer found so far.",
     Infeasible: "No feasible answer exists for this model.",
     Unbounded: "Objective can improve without bound.",
-    NumericalFailure: "Numerics failed — try another engine or tighten the model.",
+    NumericalFailure: "Numerics failed - try another engine or tighten the model.",
     Unsupported: "This model needs a capability we have not shipped yet.",
-    Timeout: "Stopped — raise the time limit in Advanced.",
+    Timeout: "Stopped - raise the time limit in Advanced.",
     error: "Something went wrong. See the log.",
   };
 
@@ -91,7 +91,7 @@
       $("time_limit").value = p.kind === "milp" ? "30" : "15";
     }
 
-    $("mps-meta").textContent = "Loading…";
+    $("mps-meta").textContent = "Loading...";
     try {
       const r = await fetch("/api/model/" + encodeURIComponent(id));
       const j = await r.json();
@@ -261,7 +261,7 @@
       else if (Object.keys(presets)[0]) await loadPreset(Object.keys(presets)[0]);
     } catch {
       el.className = "topbar-right bad";
-      el.textContent = "Server offline — run web/run.sh";
+      el.textContent = "Server offline - run web/run.sh";
     }
   }
 
@@ -269,8 +269,8 @@
     solToken = null;
     btnCheck.hidden = true;
     btnSolve.disabled = true;
-    $("solve-label").textContent = "Optimizing…";
-    setAnswer("run", "Working", "Running the from-scratch engine…", null, null);
+    $("solve-label").textContent = "Optimizing...";
+    setAnswer("run", "Working", "Running the from-scratch engine...", null, null);
     showLog("");
 
     // If on equations tab, refresh MPS first so edits flow through.
@@ -296,7 +296,7 @@
     }
 
     if (!fd.has("mps_text") && !fd.has("model_text") && !fd.has("preset") && !fd.has("file")) {
-      setAnswer("bad", "Failed", "Model buffer is empty — pick a model or paste MPS.", null, null);
+      setAnswer("bad", "Failed", "Model buffer is empty - pick a model or paste MPS.", null, null);
       btnSolve.disabled = false;
       $("solve-label").textContent = "Optimize";
       return;
@@ -363,7 +363,7 @@
   async function verify(silent) {
     if (!solToken) return;
     btnCheck.disabled = true;
-    if (!silent) $("meta-check").textContent = "checking…";
+    if (!silent) $("meta-check").textContent = "checking...";
     const fd = new FormData();
     fd.append("sol_token", solToken);
     try {

@@ -196,8 +196,20 @@ int main() {
     CHECK_NEAR(original_kkt.primal_res, 1.0, 1e-14);
     CHECK_NEAR(original_kkt.dual_res, 1.0, 1e-14);
 
-    // A non-CPU device must refuse an enabled feature it cannot execute.  It
-    // is never permitted to run a weakened algorithm under the HPR name.
+    // A non-CPU device may never run a weakened algorithm under the HPR name.
+    // That rule is enforced two ways, and which way depends on whether the
+    // missing capability changes the ANSWER or only its extras:
+    //
+    //  * reflected operator / fixed-point restart / warm-started polishing are
+    //    the algorithm itself -- running without them is a different method, so
+    //    the device must REFUSE (Status::Unsupported).
+    //
+    //  * certificate directions and the transactional step are best-effort
+    //    extras. Refusing outright made `--backend vulkan` a hard Unsupported
+    //    even after E1-E5 parity landed, so these DEGRADE instead -- but the
+    //    degradation must be named in HprDiagnostics::degraded_features, so a
+    //    caller can always tell that the algorithm it asked for did not run.
+    //    A silent downgrade would still violate the rule.
     const auto expect_unsupported = [&](backend::LpDeviceCapabilities caps,
                                         const char* capability) {
         ScriptedDevice limited({}, {}, {}, caps);
@@ -213,8 +225,34 @@ int main() {
     expect_unsupported({false, true, true, true, true}, "reflected");
     expect_unsupported({true, false, true, true, true}, "restart");
     expect_unsupported({true, true, false, true, true}, "warm-started");
-    expect_unsupported({true, true, true, false, true}, "certificate");
-    expect_unsupported({true, true, true, true, false}, "transactional");
+
+    const auto expect_declared_degradation =
+        [&](backend::LpDeviceCapabilities caps, const char* feature) {
+            ScriptedDevice limited({}, {}, {}, caps);
+            engines::HprOptions options;
+            options.max_iterations = 1;
+            engines::HprDiagnostics diagnostics;
+            const auto raw = engines::solve_hpr(
+                controller_problem(), options, limited, diagnostics);
+            // It ran -- so it must say what it dropped.
+            CHECK(raw.proposed_status != core::Status::Unsupported);
+            bool declared = false;
+            for (const auto& entry : diagnostics.degraded_features)
+                if (entry.find(feature) != std::string::npos) declared = true;
+            CHECK(declared);
+        };
+    expect_declared_degradation({true, true, true, false, true}, "certificate");
+    expect_declared_degradation({true, true, true, true, false}, "transactional");
+
+    // And a fully capable device must report NO degradation at all.
+    {
+        ScriptedDevice full({}, {}, {}, {true, true, true, true, true});
+        engines::HprOptions options;
+        options.max_iterations = 1;
+        engines::HprDiagnostics diagnostics;
+        engines::solve_hpr(controller_problem(), options, full, diagnostics);
+        CHECK(diagnostics.degraded_features.empty());
+    }
 
     // One Ruiz-free Pock--Chambolle alpha=1 pass has the published l1
     // inverse-square-root factors.

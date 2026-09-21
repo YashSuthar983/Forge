@@ -43,7 +43,9 @@ struct BaseRow {
 bool build_base_from(const model::LpProblem& lp, const BaseRow& row, f64 delta,
                      const std::vector<f64>& x, const std::vector<f64>& lo,
                      const std::vector<f64>& hi, const MirOptions& opts,
-                     std::vector<Term>& terms, f64& rhs, MirDiagnostics& diag) {
+                     std::vector<Term>& terms, f64& rhs, MirDiagnostics& diag,
+                     const std::vector<f64>* root_lo,
+                     const std::vector<f64>* root_hi, bool* used_local) {
     terms.clear();
     rhs = delta * row.rhs;
     for (std::size_t q = 0; q < row.cols.size(); ++q) {
@@ -72,6 +74,14 @@ bool build_base_from(const model::LpProblem& lp, const BaseRow& row, f64 delta,
         t.integral = integral;
         t.at_upper = use_upper;
         t.bound = use_upper ? u : l;
+        // Provenance: this term is substituted onto `t.bound`. If that bound
+        // is tighter than the root's, the resulting cut is only valid inside
+        // this subtree.
+        if (used_local != nullptr && root_lo != nullptr && root_hi != nullptr &&
+            sz(j) < root_lo->size() && sz(j) < root_hi->size()) {
+            const f64 rb = use_upper ? (*root_hi)[sz(j)] : (*root_lo)[sz(j)];
+            if (!(t.bound == rb)) *used_local = true;
+        }
         // x_j = bound + s  (lower)  or  x_j = bound - s  (upper), s >= 0
         t.coef = use_upper ? -a : a;
         t.shifted_x = use_upper ? (u - xv) : (xv - l);
@@ -121,7 +131,9 @@ void try_mir_on_base(const model::LpProblem& lp, const BaseRow& base,
                      const std::vector<f64>& x, const std::vector<f64>& lo,
                      const std::vector<f64>& hi, const MirOptions& opts,
                      bool require_violation, MirDiagnostics& diag,
-                     std::vector<CutRow>& cuts) {
+                     std::vector<CutRow>& cuts,
+                     const std::vector<f64>* root_lo = nullptr,
+                     const std::vector<f64>* root_hi = nullptr) {
     // Scalings: 1, and 1/|a_j| over the base's integer coefficients.
     std::vector<f64> deltas;
     deltas.push_back(1.0);
@@ -142,7 +154,9 @@ void try_mir_on_base(const model::LpProblem& lp, const BaseRow& base,
     for (const f64 delta : deltas) {
         if (static_cast<int>(cuts.size()) >= opts.max_cuts) return;
         f64 rhs = 0.0;
-        if (!build_base_from(lp, base, delta, x, lo, hi, opts, terms, rhs, diag))
+        bool used_local = (root_lo == nullptr || root_hi == nullptr);
+        if (!build_base_from(lp, base, delta, x, lo, hi, opts, terms, rhs, diag,
+                             root_lo, root_hi, &used_local))
             continue;
 
         const f64 fl = std::floor(rhs + opts.tol);
@@ -186,6 +200,7 @@ void try_mir_on_base(const model::LpProblem& lp, const BaseRow& base,
             ++diag.rejected_not_violated;
             continue;
         }
+        cut.used_local_bound = used_local;
         cut.row_lo = -kInf;
         cut.row_hi = cut_rhs;
         cut.name = "MIR_" + std::to_string(cuts.size());
@@ -201,7 +216,9 @@ std::vector<CutRow> separate_mir(const model::LpProblem& lp,
                                  const std::vector<f64>& col_lo,
                                  const std::vector<f64>& col_hi,
                                  const MirOptions& opts,
-                                 MirDiagnostics& diag) {
+                                 MirDiagnostics& diag,
+                                 const std::vector<f64>* root_lo,
+                                 const std::vector<f64>* root_hi) {
     std::vector<CutRow> cuts;
     const Index n = lp.n_cols();
     if (!opts.enabled || static_cast<Index>(x.size()) != n ||
@@ -222,7 +239,8 @@ std::vector<CutRow> separate_mir(const model::LpProblem& lp,
         for (const f64 sign : {1.0, -1.0}) {
             if (static_cast<int>(cuts.size()) >= opts.max_cuts) break;
             if (!row_as_base(lp, i, sign, base)) continue;
-            try_mir_on_base(lp, base, x, col_lo, col_hi, opts, true, diag, cuts);
+            try_mir_on_base(lp, base, x, col_lo, col_hi, opts, true, diag,
+                            cuts, root_lo, root_hi);
         }
     }
     if (!opts.aggregate || static_cast<int>(cuts.size()) >= opts.max_cuts)
@@ -348,7 +366,7 @@ std::vector<CutRow> separate_mir(const model::LpProblem& lp,
                 if (agg.cols.size() >= 2 && agg.cols.size() <= opts.max_row_len) {
                     ++diag.aggregations;
                     try_mir_on_base(lp, agg, x, col_lo, col_hi, opts, true, diag,
-                                    cuts);
+                                    cuts, root_lo, root_hi);
                 }
             }
 
@@ -376,7 +394,7 @@ bool apply_cmir_geq(const model::LpProblem& lp,
     out_rhs_geq = 0.0;
     if (cols.size() != vals.size() || cols.empty()) return false;
 
-    // >= form → <= base for the shared Marchand–Wolsey machinery.
+    // >= form → <= base for the shared Marchand-Wolsey machinery.
     BaseRow base;
     base.cols = cols;
     base.vals.resize(vals.size());

@@ -399,7 +399,7 @@ bool LiveMatrix::try_doubleton_equality(Index i) {
     //   * elim is free (both bounds infinite), or
     //   * elim is boxed and those bounds are redundant over keep's range.
     // Semi-bounded columns (one infinite bound) are the Andersen "implied
-    // slack" case and must not be removed here — that path is opt-in via
+    // slack" case and must not be removed here - that path is opt-in via
     // implied_slack on the singleton-column rule.
     const bool elim_free = !std::isfinite(clo) && !std::isfinite(chi);
     const bool elim_boxed = std::isfinite(clo) && std::isfinite(chi);
