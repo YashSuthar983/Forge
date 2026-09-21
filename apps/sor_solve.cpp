@@ -102,6 +102,7 @@ void usage() {
         "  --feasjump-root-frac F  cap FJ at F * time limit (default 0.10)\n"
         "  --batch-lp-sb / --no-batch-lp-sb    batched strong-branch LPs (default off)\n"
         "  --batch-lp-obbt / --no-batch-lp-obbt  batched OBBT LPs (default off)\n"
+        "  --bab-threads N  Para-B&B workers; 0=auto (min(8,cores)), 1=serial\n"
         "  --auto-cuts      let the cut loop pick the separator set\n"
         "  --cut-max-rounds N   cap root cut rounds (default 20)\n"
         "  --cut-min-progress F  stop the cut loop below this relative gain\n"
@@ -355,6 +356,10 @@ int main(int argc, char** argv) {
     // set (blend2 2.3x, mod008 1.75x), so the CLI is the opt-in gate.
     bool batch_lp_sb = false;
     bool batch_lp_obbt = false;
+    // Para-B&B worker count. 0 = auto (min(8, cores)) under the Latest policy,
+    // 1 = serial tree. The library default is 1; the CLI hands 0 through so a
+    // default run uses the parallel tree, as the pre-squash branch did.
+    int bab_threads = 0;
     double cut_min_progress = -1.0;  // <0 keeps the library default
     int cut_max_rounds = -1;         // <0 keeps the library default
     bool auto_cuts = false;
@@ -634,6 +639,9 @@ int main(int argc, char** argv) {
                                             true);
             feasjump_root_frac_given = true;
         }
+        else if (a == "--bab-threads")
+            bab_threads = static_cast<int>(
+                parse_uint(next("--bab-threads"), "--bab-threads", 0, 1024));
         else if (a == "--batch-lp-sb") batch_lp_sb = true;
         else if (a == "--no-batch-lp-sb") batch_lp_sb = false;
         else if (a == "--batch-lp-obbt") batch_lp_obbt = true;
@@ -912,6 +920,7 @@ int main(int argc, char** argv) {
             bab.mip_pre.obbt_lite = obbt;
             bab.mip_pre.batch_lp_obbt = batch_lp_obbt && obbt;
             bab.batch_lp_strong_branch = batch_lp_sb;
+            bab.para_bab.threads = bab_threads;
             if (mip_restarts >= 0) bab.mip_pre.max_restarts = mip_restarts;
             bab.symmetry = symmetry;
             bab.sym.reflection = reflection;
@@ -1260,6 +1269,26 @@ int main(int argc, char** argv) {
             std::printf("strong branch LPs: %llu  (pseudocost updates %llu)\n",
                         static_cast<unsigned long long>(diag.strong_branch_solves),
                         static_cast<unsigned long long>(diag.pseudocost_updates));
+            if (diag.para_bab.threads_used > 1) {
+                std::printf("Para-B&B:          %d threads, %llu phases, "
+                            "%llu parallel expansions, %llu syncs\n",
+                            diag.para_bab.threads_used,
+                            static_cast<unsigned long long>(diag.para_bab.phases),
+                            static_cast<unsigned long long>(
+                                diag.para_bab.parallel_expansions),
+                            static_cast<unsigned long long>(diag.para_bab.syncs));
+                if (diag.para_bab.activated)
+                    std::printf("  cost model:      activated at %.3fs / node "
+                                "%llu (%llu serial nodes first)\n",
+                                diag.para_bab.activated_at_s,
+                                static_cast<unsigned long long>(
+                                    diag.para_bab.activated_at_node),
+                                static_cast<unsigned long long>(
+                                    diag.para_bab.serial_nodes));
+                else
+                    std::printf("  cost model:      never activated -- stayed "
+                                "serial with plunging\n");
+            }
             std::printf("branch policy:     resolved=%s last=%s\n"
                         "  sparse-sb picks/fallbacks/samples: %llu / %llu / %llu\n"
                         "  sc-milp picks/fallbacks/samples:   %llu / %llu / %llu\n"
