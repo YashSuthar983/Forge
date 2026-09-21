@@ -1,6 +1,6 @@
 # SOR Demo Console (web)
 
-Thin browser UI over `sor_solve` / `sor_check`. **Not** a modelling product — SIH26119 says CLI/API is enough; this is for demos and the video.
+Thin browser UI over `sor_solve` / `sor_check`. **Not** a modelling product - SIH26119 says CLI/API is enough; this is for demos and the video.
 
 ## Run
 
@@ -25,14 +25,14 @@ Optional env:
 
 ## UX idea (simpler than commercial consoles)
 
-Commercial UIs dump parameters, logs, and modelling chrome up front. SOR’s demo is three steps:
+Commercial UIs dump parameters, logs, and modelling chrome up front. SOR's demo is three steps:
 
 1. **Choose** a problem (or drop an MPS/QPS)  
-2. **Solve** — one big button; engine/GPU live under Advanced  
-3. **Answer** — plain-language verdict + objective; residuals auto-verified  
+2. **Solve** - one big button; engine/GPU live under Advanced  
+3. **Answer** - plain-language verdict + objective; residuals auto-verified  
 
 Same binaries as the CLI. Not a modelling environment (PS does not require a polished GUI).
 
 ## Video line
 
-> “Choose a problem, press Solve, get a verified answer — same from-scratch engine as the terminal.”
+> "Choose a problem, press Solve, get a verified answer - same from-scratch engine as the terminal."

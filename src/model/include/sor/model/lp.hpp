@@ -1,4 +1,4 @@
-// SOR — minimal LP problem in the canonical two-sided form used throughout.
+// SOR - minimal LP problem in the canonical two-sided form used throughout.
 //
 // LAYER L2.
 //

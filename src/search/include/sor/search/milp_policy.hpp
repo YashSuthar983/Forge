@@ -1,6 +1,6 @@
-// SOR — MILP control policy (latest improved vs classical ablation).
+// SOR - MILP control policy (latest improved vs classical ablation).
 //
-// Default product path is Latest (2025–2026 algorithms). Classical is debug /
+// Default product path is Latest (2025-2026 algorithms). Classical is debug /
 // ablation only: plain reliability branching, efficacy-only cut scoring,
 // static LNS, graph-only conflict, root-only separation.
 #pragma once

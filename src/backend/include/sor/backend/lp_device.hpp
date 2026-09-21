@@ -1,10 +1,10 @@
-// SOR — LpDevice: device-resident first-order seam.
+// SOR - LpDevice: device-resident first-order seam.
 //
 // LAYER L1.
 //
 // Replaces the per-op KernelBackend as the FO engine's contract. The device owns
 // iterates; the host asks for work and receives scalars. There is deliberately
-// no operator[] and no host() — host addressability cannot be depended on.
+// no operator[] and no host() - host addressability cannot be depended on.
 // See docs/architecture.md §3.2 (LpDevice / HPR path).
 #pragma once
 
@@ -39,6 +39,19 @@ struct ScaledLp {
 
     Index n_rows() const noexcept { return A_csr.n_rows(); }
     Index n_cols() const noexcept { return A_csr.n_cols(); }
+};
+
+// Per-batch-slot bounds overlay (BatchLP / AL1). Same shared A,c,row scales as
+// upload(); branch nodes typically differ in column bounds only. Empty row_lo/
+// row_hi means use the row bounds from the last upload().
+struct LpBoundOverlay {
+    std::vector<f64> col_lo;
+    std::vector<f64> col_hi;
+    std::vector<f64> row_lo;
+    std::vector<f64> row_hi;
+    // Optional per-slot objective in scaled (uploaded) space. Empty → keep the
+    // shared c from upload(). Used by BatchLP OBBT (min/max x_j).
+    std::vector<f64> c;
 };
 
 struct StepParams {
@@ -89,8 +102,20 @@ public:
     // ---- one upload, once per solve ----
     virtual void upload(const ScaledLp&) = 0;
 
+    // ---- BatchLP seam (shared A, k bound vectors) -------------------------
+    // batch_size() is 1 until bind_bounds_batch(k>1). hpr_steps / reduce_kkt
+    // always apply to the active slot (slot 0 when batch_size()==1).
+    virtual std::uint32_t batch_size() const { return 1; }
+
+    virtual void bind_bounds_batch(std::uint32_t batch_size,
+                                   const std::vector<LpBoundOverlay>& bounds);
+
+    virtual void init_zero_batched();
+
     // ---- the hot path: K fused iterations, ZERO host sync of vectors ----
     virtual void hpr_steps(std::uint32_t k, const StepParams&) = 0;
+
+    virtual void hpr_steps_batched(std::uint32_t k, const StepParams&);
 
     // ---- the only D2H in the loop: ~8 doubles, once per check_every ----
     struct Kkt {
@@ -99,7 +124,7 @@ public:
         f64 primal_obj = 0.0;   // scaled, minimize sense
         f64 dual_obj   = 0.0;
         f64 gap_rel    = 0.0;
-        f64 dx_norm    = 0.0;   // ‖Δx‖₂ last step — primal-weight controller
+        f64 dx_norm    = 0.0;   // ‖Δx‖₂ last step - primal-weight controller
         f64 dy_norm    = 0.0;
         f64 epoch_dx_norm = 0.0;
         f64 epoch_dy_norm = 0.0;
@@ -113,6 +138,8 @@ public:
         bool dual_bound_finite = false;
     };
     virtual Kkt reduce_kkt() = 0;
+
+    virtual std::vector<Kkt> reduce_kkt_batched();
 
     // ---- restart / averaging, on device ----
     virtual void snapshot_anchor() = 0;

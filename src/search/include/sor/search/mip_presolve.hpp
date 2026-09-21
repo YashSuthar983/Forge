@@ -1,4 +1,4 @@
-// SOR — MIP root presolve depth (WP-F): Wang–Chen–Dai dual-fix⊕probing,
+// SOR - MIP root presolve depth (WP-F): Wang-Chen-Dai dual-fix⊕probing,
 // clique probing strengthen, GF2, disconnected components, TU/network
 // implied-int, OBBT-lite / FBBT deepen, multi-round restart with conflict
 // graph rebuild.
@@ -29,7 +29,7 @@ using core::Index;
 struct MipPresolveOptions {
     bool enabled = true;
     // Classic dual fixing + lock recount after FBBT on each probe side
-    // (Wang–Chen–Dai Algorithm 1 spirit). Wired into build_conflict_graph via
+    // (Wang-Chen-Dai Algorithm 1 spirit). Wired into build_conflict_graph via
     // ProbingOptions::dual_fix_in_probing.
     bool dual_fixing = true;
     bool dual_fix_in_probing = true;
@@ -54,7 +54,25 @@ struct MipPresolveOptions {
     Index max_obbt_vars = 8;
     std::uint64_t obbt_lp_max_iterations = 500;
     double obbt_lp_time_s = 0.05;
+    // Wall budget for the WHOLE root MIP presolve, seconds. 0 = unlimited.
+    //
+    // This phase was unbudgeted, and on large models that makes the solver
+    // ignore its own time limit. Measured on MIPLIB2017 atlanta-ip
+    // (21732 x 48738) with a 1 SECOND limit: mip-presolve ran 15.2 s and
+    // symmetry 25.3 s, so the solve finished 45.7 s late having done 0 nodes
+    // and 0 LP solves. Across a 20-instance MIPLIB2017 sample, HALF the
+    // instances never searched a single node.
+    //
+    // A solver that cannot honour its time limit is unusable industrially,
+    // and no amount of algorithmic work compensates for never reaching the
+    // search.
+    double time_limit_s = 0.0;
     int fbbt_deepen_rounds = 20;
+    // BatchLP FO probes for OBBT min/max x_j (shared A, per-slot c=±e_j).
+    // Tightenings apply only when residuals look feasible; otherwise the
+    // existing simplex / FBBT path runs. Default on.
+    bool batch_lp_obbt = true;
+    std::uint32_t batch_lp_obbt_steps = 200;
     // Restart: if the fraction of columns with a finite domain shrink
     // (or newly fixed) meets tau, re-run the full dual-fix / FBBT / clique
     // probe / GF2 / components cycle up to max_restarts times, rebuilding the
@@ -69,6 +87,8 @@ struct DualFixDiagnostics {
     std::uint64_t fixings = 0;
     std::uint64_t rounds = 0;
     bool infeasible = false;
+    // Non-zero when rounds were cut short to stay inside the budget.
+    std::uint64_t aborted_on_time = 0;
 };
 
 struct CliqueProbeDiagnostics {
@@ -85,10 +105,22 @@ struct ObbtDiagnostics {
     std::uint64_t lp_solves = 0;
     std::uint64_t lp_tightenings = 0;
     std::uint64_t fbbt_tightenings = 0;
+    std::uint64_t batch_lp_probes = 0;
+    std::uint64_t batch_lp_tightenings = 0;
     bool used_fbbt_fallback = false;
 };
 
 struct MipPresolveDiagnostics {
+    // Per-sub-phase wall time (ms). "mip-presolve: 7702 ms" does not say which
+    // phase to bound, and bounding the wrong one achieves nothing.
+    double ms_dual_fix = 0.0;
+    double ms_conflict_graph = 0.0;
+    double ms_clique_probe = 0.0;
+    double ms_gf2 = 0.0;
+    double ms_components = 0.0;
+    double ms_implied_int = 0.0;
+    // Non-zero when the phase stopped early to stay inside its budget.
+    std::uint64_t aborted_on_time = 0;
     DualFixDiagnostics dual_fix;
     ConflictDiagnostics conflict;
     CliqueProbeDiagnostics clique_probe;
@@ -114,7 +146,8 @@ DualFixDiagnostics apply_dual_fixing(const model::LpProblem& lp,
                                       std::vector<f64>& col_hi,
                                       f64 tol = 1e-9,
                                       int max_rounds = 4,
-                                      bool zero_cost_ok = true);
+                                      bool zero_cost_ok = true,
+                                     double time_limit_s = 0.0);
 
 // Clique probing over `cg.cliques()`: for each AMO clique, propagate the
 // all-zero assignment and each single-1 assignment; take the hull of feasible

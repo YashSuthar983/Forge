@@ -1,4 +1,4 @@
-// Zero-half ({0,1/2}-CG) cut validity tests — including Koster-style GF(2).
+// Zero-half ({0,1/2}-CG) cut validity tests - including Koster-style GF(2).
 #include "sor/search/zerohalf.hpp"
 #include "sor/sparse/csr.hpp"
 
@@ -77,7 +77,7 @@ void test_textbook_odd_knapsack() {
 }
 
 // Multi-row instance where single-row ZH may miss but GF(2) aggregation of
-// odd rows produces a violated cut (Caprara–Fischetti odd-set spirit).
+// odd rows produces a violated cut (Caprara-Fischetti odd-set spirit).
 void test_mod2_gaussian_nonvacuous() {
     // Rows:
     //   x0+x1     <= 1

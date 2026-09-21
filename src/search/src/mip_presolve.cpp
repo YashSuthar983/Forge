@@ -1,5 +1,6 @@
 #include "sor/search/mip_presolve.hpp"
 
+#include "sor/engines/lp_batched.hpp"
 #include "sor/search/component_presolve.hpp"
 #include "sor/search/gf2_presolve.hpp"
 #include "sor/search/implied_int.hpp"
@@ -79,8 +80,18 @@ DualFixDiagnostics apply_dual_fixing(const model::LpProblem& lp,
                                       std::vector<f64>& col_hi,
                                       f64 tol,
                                       int max_rounds,
-                                      bool zero_cost_ok) {
+                                      bool zero_cost_ok,
+                                      double time_limit_s) {
     DualFixDiagnostics diag;
+    // Dual fixing is the non-optional core of root MIP presolve and, on large
+    // models, its dominant cost: 5.6 s on atlanta-ip (48738 cols) with every
+    // optional phase disabled, against a 5 s SOLVER budget. Bounded per round.
+    const auto dfx_t0 = Clock::now();
+    const auto dfx_over = [&]() {
+        return time_limit_s > 0.0 &&
+               std::chrono::duration<double>(Clock::now() - dfx_t0).count() >
+                   time_limit_s;
+    };
     const Index n = lp.n_cols();
     const Index m = lp.n_rows();
     if (static_cast<Index>(col_lo.size()) != n ||
@@ -92,6 +103,7 @@ DualFixDiagnostics apply_dual_fixing(const model::LpProblem& lp,
     const auto& av = lp.A.vals;
 
     for (int round = 0; round < max_rounds; ++round) {
+        if (dfx_over()) { diag.aborted_on_time = 1; break; }
         bool any = false;
         ++diag.rounds;
         std::vector<int> down_locks(sz(n), 0), up_locks(sz(n), 0);
@@ -167,17 +179,34 @@ CliqueProbeDiagnostics apply_clique_probing(const model::LpProblem& lp,
                                             const MipPresolveOptions& opts) {
     CliqueProbeDiagnostics diag;
     if (!opts.clique_probing || cg.cliques().empty()) return diag;
+    // Bounded. This ran 82.2 s in a SINGLE call on MIPLIB2017 ex10
+    // (69608 x 17680, 1162000 nnz) against a ~2.5 s budget: the caller's
+    // check runs before the call, which is no help when one call is the whole
+    // overrun. Same lesson as implied-int and folding -- the check has to be
+    // where the loop is.
+    const auto cp_t0 = Clock::now();
+    const auto cp_over = [&]() {
+        return opts.time_limit_s > 0.0 &&
+               std::chrono::duration<double>(Clock::now() - cp_t0).count() >
+                   opts.time_limit_s;
+    };
+    std::uint64_t cp_seen = 0;
 
     const Index n = lp.n_cols();
     const f64 tol = opts.tol;
     std::size_t probed = 0;
 
     for (const Clique& c : cg.cliques()) {
+        // Per-clique cost scales with clique size, so poll often.
+        if (((cp_seen++) & 0x0F) == 0 && cp_over()) {
+            diag.truncated = true;
+            break;
+        }
         if (probed >= opts.max_cliques_probed) {
             diag.truncated = true;
             break;
         }
-        // Collect positive literals (x_j = 1) only — AMO on the true side.
+        // Collect positive literals (x_j = 1) only - AMO on the true side.
         std::vector<Index> bins;
         bins.reserve(c.lits.size());
         for (Index lit : c.lits) {
@@ -323,9 +352,78 @@ ObbtDiagnostics apply_obbt_lite(const model::LpProblem& lp,
         cands.resize(sz(opts.max_obbt_vars));
 
     bool any_lp = false;
-    for (const Cand& c : cands) {
+
+    // BatchLP FO min/max x_j probes (shared A). Apply only confident
+    // tightenings; remaining vars fall through to simplex / FBBT.
+    std::vector<char> batch_done(cands.size(), 0);
+    if (opts.batch_lp_obbt && !cands.empty()) {
+        std::vector<engines::BatchBoundProbe> probes;
+        struct Meta { std::size_t ci; Index j; int sense; };
+        std::vector<Meta> meta;
+        probes.reserve(cands.size() * 2);
+        meta.reserve(cands.size() * 2);
+        for (std::size_t ci = 0; ci < cands.size(); ++ci) {
+            const Index j = cands[ci].j;
+            for (int sense = 0; sense < 2; ++sense) {
+                engines::BatchBoundProbe pr;
+                pr.col_lo = col_lo;
+                pr.col_hi = col_hi;
+                pr.c.assign(sz(n), 0.0);
+                // Minimize sense: sense 0 → min x_j, sense 1 → min -x_j.
+                pr.c[sz(j)] = (sense == 0) ? 1.0 : -1.0;
+                probes.push_back(std::move(pr));
+                meta.push_back({ci, j, sense});
+            }
+        }
+        try {
+            engines::BatchProbeOptions bopt;
+            bopt.hpr_steps = opts.batch_lp_obbt_steps;
+            model::LpProblem base = lp;
+            base.col_lo = col_lo;
+            base.col_hi = col_hi;
+            base.maximize = false;
+            base.obj_offset = 0.0;
+            const auto results =
+                engines::batch_bound_probes_hpr(base, probes, bopt);
+            diag.batch_lp_probes += results.size();
+            for (std::size_t pi = 0; pi < results.size(); ++pi) {
+                const auto& r = results[pi];
+                const auto& m = meta[pi];
+                if (!r.looks_feasible || !std::isfinite(r.primal_obj))
+                    continue;
+                // Objective was ±x_j (+ offset 0); undo the sign for max.
+                const f64 val =
+                    (m.sense == 0) ? r.primal_obj : -r.primal_obj;
+                if (m.sense == 0) {
+                    f64 nl = is_int_col(lp, m.j) ? std::ceil(val - tol) : val;
+                    if (nl > col_lo[sz(m.j)] + tol) {
+                        col_lo[sz(m.j)] = std::min(nl, col_hi[sz(m.j)]);
+                        ++diag.batch_lp_tightenings;
+                        ++diag.lp_tightenings;
+                        batch_done[m.ci] = 1;
+                        any_lp = true;
+                    }
+                } else {
+                    f64 nh = is_int_col(lp, m.j) ? std::floor(val + tol) : val;
+                    if (nh < col_hi[sz(m.j)] - tol) {
+                        col_hi[sz(m.j)] = std::max(nh, col_lo[sz(m.j)]);
+                        ++diag.batch_lp_tightenings;
+                        ++diag.lp_tightenings;
+                        batch_done[m.ci] = 1;
+                        any_lp = true;
+                    }
+                }
+            }
+        } catch (...) {
+            // Fall through to simplex / FBBT.
+        }
+    }
+
+    for (std::size_t ci = 0; ci < cands.size(); ++ci) {
+        const Cand& c = cands[ci];
         ++diag.vars_tried;
         const Index j = c.j;
+        if (batch_done[ci]) continue;
         if (lp_opts != nullptr) {
             bool tightened = false;
             for (int sense = 0; sense < 2; ++sense) {
@@ -400,6 +498,13 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
                                         const engines::SimplexOptions* lp_opts) {
     MipPresolveDiagnostics diag;
     const auto t0 = Clock::now();
+    // Root presolve must live inside the solver's budget. Checked at the
+    // coarse restart boundary, which is where the multi-second costs sit.
+    const auto out_of_time = [&]() {
+        return opts.time_limit_s > 0.0 &&
+               std::chrono::duration<double>(Clock::now() - t0).count() >
+                   opts.time_limit_s;
+    };
     if (!opts.enabled) {
         diag.ms = ms_since(t0);
         return diag;
@@ -442,10 +547,39 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
 
     // One dual-fix / probe / clique / GF2 / components / implied-int / OBBT
     // cycle. Returns false on proved infeasibility.
+    // Deadline checked between sub-phases, not only at the restart boundary.
+    // A SINGLE cycle on a large model costs seconds -- 8.2 s on atlanta-ip --
+    // so a restart-level check alone still blows the budget by an order of
+    // magnitude. Each sub-phase is individually expensive enough to be worth
+    // a check, and cheap enough that one clock read per phase is free.
+    const auto remaining_budget = [&]() -> double {
+        if (opts.time_limit_s <= 0.0) return 0.0;
+        const double used =
+            std::chrono::duration<double>(Clock::now() - t0).count();
+        return std::max(0.001, opts.time_limit_s - used);
+    };
+
+    // Per-sub-phase timing. Without it, "mip-presolve: 7702 ms" says nothing
+    // about WHICH phase to bound, and bounding the wrong one is a no-op.
+    // RAII so a phase is timed by its own scope -- no manual stop() to forget
+    // or to call from the wrong scope.
+    struct PhaseTimer {
+        double& sink;
+        std::chrono::steady_clock::time_point start;
+        explicit PhaseTimer(double& s) : sink(s), start(Clock::now()) {}
+        ~PhaseTimer() {
+            sink += std::chrono::duration<double, std::milli>(
+                        Clock::now() - start).count();
+        }
+    };
+
     auto run_cycle = [&](bool do_probe) -> bool {
+        if (out_of_time()) { ++diag.aborted_on_time; return true; }
         if (opts.dual_fixing) {
+            PhaseTimer _t(diag.ms_dual_fix);
             const auto d = apply_dual_fixing(lp, col_lo, col_hi, opts.tol,
-                                              opts.dual_fix_max_rounds, true);
+                                              opts.dual_fix_max_rounds, true,
+                                             remaining_budget());
             diag.dual_fix.fixings += d.fixings;
             diag.dual_fix.rounds += d.rounds;
             if (d.infeasible) {
@@ -456,14 +590,18 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
 
         ProbingOptions po = probe_opts;
         po.dual_fix_in_probing = opts.dual_fix_in_probing;
+        if (out_of_time()) { ++diag.aborted_on_time; return true; }
         if (do_probe) {
+            PhaseTimer _t(diag.ms_conflict_graph);
             const auto cd =
                 build_conflict_graph(lp, col_lo, col_hi, cg, po);
             merge_conflict(cd);
             if (cd.infeasible) return false;
         }
 
+        if (out_of_time()) { ++diag.aborted_on_time; return true; }
         if (opts.clique_probing) {
+            PhaseTimer _t(diag.ms_clique_probe);
             const auto cp =
                 apply_clique_probing(lp, cg, col_lo, col_hi, opts);
             diag.clique_probe.cliques_probed += cp.cliques_probed;
@@ -478,7 +616,9 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
             }
         }
 
+        if (out_of_time()) { ++diag.aborted_on_time; return true; }
         if (opts.gf2) {
+            PhaseTimer _t(diag.ms_gf2);
             Gf2PresolveOptions go = opts.gf2_opts;
             go.tol = opts.tol;
             const auto g = apply_gf2_presolve(lp, col_lo, col_hi, go);
@@ -494,8 +634,11 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
             }
         }
 
+        if (out_of_time()) { ++diag.aborted_on_time; return true; }
         if (opts.components) {
+            PhaseTimer _t(diag.ms_components);
             ComponentPresolveOptions co = opts.component_opts;
+            co.time_limit_s = remaining_budget();
             co.tol = opts.tol;
             const auto c = apply_component_presolve(lp, col_lo, col_hi, co);
             diag.components.n_components =
@@ -516,14 +659,28 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
             }
         }
 
+        if (out_of_time()) { ++diag.aborted_on_time; return true; }
         if (opts.implied_integers) {
+            PhaseTimer _t(diag.ms_implied_int);
             ImpliedIntOptions io = opts.implied_int_opts;
             io.tol = opts.tol;
+            // ImpliedIntOptions::time_limit_s defaults to 0.0, which means
+            // UNLIMITED -- so leaving it unset silently disabled the whole
+            // IiDeadline mechanism inside implied_int.cpp (a poll in every
+            // rule's column loop, all of them dead). Measured on
+            // snp-02-004-104 with a 60 s solver limit: this single phase ran
+            // 299,749 ms, mip-presolve overran its ~12 s allowance by 25x, the
+            // solve took 309 s wall, and BOTH LP-free primal heuristics got
+            // zero attempts on an instance whose only hope was a heuristic.
+            io.time_limit_s = remaining_budget();
             const auto ii =
                 infer_implied_integers_ex(lp, io, &col_lo, &col_hi);
             diag.implied_int.equality_pm1 += ii.equality_pm1;
             diag.implied_int.network += ii.network;
             diag.implied_int.consecutive_ones += ii.consecutive_ones;
+            diag.implied_int.dual_rational += ii.dual_rational;
+            diag.implied_int.tu_network_block += ii.tu_network_block;
+            diag.implied_int.tu_network_transpose += ii.tu_network_transpose;
             diag.implied_int.total += ii.total;
             diag.implied_int.bounds_snapped += ii.bounds_snapped;
         }
@@ -535,13 +692,16 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
             diag.obbt.lp_solves += od.lp_solves;
             diag.obbt.lp_tightenings += od.lp_tightenings;
             diag.obbt.fbbt_tightenings += od.fbbt_tightenings;
+            diag.obbt.batch_lp_probes += od.batch_lp_probes;
+            diag.obbt.batch_lp_tightenings += od.batch_lp_tightenings;
             diag.obbt.used_fbbt_fallback =
                 diag.obbt.used_fbbt_fallback || od.used_fbbt_fallback;
         }
 
         if (opts.dual_fixing) {
             const auto d2 = apply_dual_fixing(lp, col_lo, col_hi, opts.tol,
-                                               opts.dual_fix_max_rounds, true);
+                                               opts.dual_fix_max_rounds, true,
+                                             remaining_budget());
             diag.dual_fix.fixings += d2.fixings;
             diag.dual_fix.rounds += d2.rounds;
             if (d2.infeasible) {
@@ -574,6 +734,7 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
     // components with a rebuilt conflict graph while reductions keep landing.
     if (diag.restart_recommended && opts.max_restarts > 0) {
         for (int r = 0; r < opts.max_restarts; ++r) {
+            if (out_of_time()) { ++diag.aborted_on_time; break; }
             const std::uint64_t before = count_reduced();
             ++diag.restart_rounds;
             if (!run_cycle(/*do_probe=*/run_probing || opts.clique_probing)) {

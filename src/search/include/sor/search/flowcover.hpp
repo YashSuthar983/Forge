@@ -1,6 +1,6 @@
-// SOR — single-node flow-cover cut separator.
+// SOR - single-node flow-cover cut separator.
 //
-// Clean-room Padberg–Van Roy–Wolsey / Gu–Nemhauser–Savelsbergh flow covers:
+// Clean-room Padberg-Van Roy-Wolsey / Gu-Nemhauser-Savelsbergh flow covers:
 //
 //   ∑_{j ∈ N} y_j  ≤  b ,   0 ≤ y_j ≤ u_j x_j ,   x_j ∈ {0,1}.
 //
@@ -59,6 +59,13 @@ struct FlowCoverDiagnostics {
     std::uint64_t vubs_found = 0;
     std::uint64_t vubs_projected = 0;
     std::uint64_t si_lifted_arcs = 0;
+    // Arcs refused lifting because u + beta > 0 would have added slack the
+    // fixed rhs never paid for. Non-zero means the guard is doing work.
+    std::uint64_t rejected_unsafe_lift = 0;
+    // Continuous columns refused as flow arcs because their lower bound is
+    // negative (or unbounded below), which the 0 <= y <= u*x derivation
+    // forbids.
+    std::uint64_t rejected_negative_flow = 0;
 };
 
 // Separates violated flow-cover cuts from `lp` at `x` under [col_lo, col_hi].

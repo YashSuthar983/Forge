@@ -1,14 +1,14 @@
-// SOR — tree / local cut lifecycle + GCS paper-complete selection (WP-C / E3).
+// SOR - tree / local cut lifecycle + GCS paper-complete selection (WP-C / E3).
 //
 // Under milp.policy=latest, separation is allowed past the root on a depth
 // schedule. Cuts generated from a node tableau with local bounds are LOCAL:
 // they are valid in that node's subtree and must not leak to siblings.
 //
 // Global Cut Selection (GCS, arXiv:2503.15847 spirit, clean-room):
-//   • Tree-wide candidate pool with multi-node violation history
-//   • Global scoring via node embeddings + learned promote/reinject policy
-//   • Optional cut×node bipartite GNN scorer (SOR_GCS)
-//   • Local (!globally_valid) cuts are never promoted into the global LP
+//   - Tree-wide candidate pool with multi-node violation history
+//   - Global scoring via node embeddings + learned promote/reinject policy
+//   - Optional cut×node bipartite GNN scorer (SOR_GCS)
+//   - Local (!globally_valid) cuts are never promoted into the global LP
 //
 // Classical efficacy scoring remains the ablation fallback when no model is
 // loaded (heuristic multi-node score only).

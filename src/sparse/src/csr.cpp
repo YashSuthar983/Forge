@@ -24,6 +24,56 @@ void SparsePattern::validate() const {
     }
 }
 
+void SparsePattern::append_row(const std::vector<Index>& cols) {
+    // Empty pattern (default-constructed) has no row_ptr sentinel yet.
+    if (row_ptr_.empty()) {
+        if (n_rows_ != 0)
+            throw std::invalid_argument("SparsePattern::append_row: empty row_ptr");
+        row_ptr_.push_back(0);
+    }
+    for (const Index c : cols) {
+        if (c < 0 || c >= n_cols_)
+            throw std::invalid_argument("SparsePattern::append_row: column out of range");
+    }
+    for (std::size_t k = 1; k < cols.size(); ++k) {
+        if (cols[k] <= cols[k - 1])
+            throw std::invalid_argument(
+                "SparsePattern::append_row: cols must be strictly ascending");
+    }
+    col_idx_.insert(col_idx_.end(), cols.begin(), cols.end());
+    ++n_rows_;
+    row_ptr_.push_back(static_cast<Offset>(col_idx_.size()));
+}
+
+void CsrMatrix::append_row(std::vector<Index> cols, std::vector<f64> row_vals) {
+    if (cols.size() != row_vals.size())
+        throw std::invalid_argument("CsrMatrix::append_row: mismatched lengths");
+    // Sort by column and sum duplicates, same contract as from_triplets.
+    // Callers must start from a real LP (n_cols known via from_triplets).
+    std::vector<std::size_t> order(cols.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::sort(order.begin(), order.end(),
+              [&](std::size_t a, std::size_t b) { return cols[a] < cols[b]; });
+    std::vector<Index> out_cols;
+    std::vector<f64> out_vals;
+    out_cols.reserve(cols.size());
+    out_vals.reserve(cols.size());
+    for (std::size_t i = 0; i < order.size();) {
+        const Index c = cols[order[i]];
+        f64 acc = 0.0;
+        std::size_t j = i;
+        while (j < order.size() && cols[order[j]] == c) {
+            acc += row_vals[order[j]];
+            ++j;
+        }
+        out_cols.push_back(c);
+        out_vals.push_back(acc);
+        i = j;
+    }
+    pattern.append_row(out_cols);
+    vals.insert(vals.end(), out_vals.begin(), out_vals.end());
+}
+
 CsrMatrix from_triplets(Index n_rows, Index n_cols,
                         const std::vector<Index>& rows,
                         const std::vector<Index>& cols,

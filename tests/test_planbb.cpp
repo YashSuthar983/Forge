@@ -1,4 +1,4 @@
-// PlanB&B — lite + paper-complete (arXiv:2511.09219).
+// PlanB&B - lite + paper-complete (arXiv:2511.09219).
 #include "sor/io/mps.hpp"
 #include "sor/search/bab.hpp"
 #include "sor/search/features.hpp"
@@ -323,7 +323,7 @@ void test_bab_planbb_paper_fires() {
     CHECK(diag.nodes > 1);
     CHECK(diag.planbb_picks > 0 || diag.planbb_fallbacks > 0);
     CHECK(diag.planbb_mcts_sims > 0);
-    // Variable choice only — dual bounds remain engine LP bounds.
+    // Variable choice only - dual bounds remain engine LP bounds.
     CHECK(raw.proposed_status == sor::core::Status::Optimal ||
           raw.proposed_status == sor::core::Status::Feasible ||
           raw.proposed_status == sor::core::Status::Interrupted);

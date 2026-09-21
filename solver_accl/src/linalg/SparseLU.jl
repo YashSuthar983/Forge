@@ -428,7 +428,7 @@ end
 
 function build_col_patterns!(bf::SparseBasisFactor)
     n = length(bf.piv_val)
-    # 0-based prefix counts, then +1 — same conversion as SorSparse.to_csc.
+    # 0-based prefix counts, then +1 - same conversion as SorSparse.to_csc.
     bf.u_col_start = zeros(Int, n + 1)
     bf.u_col_row = fill(0, length(bf.u_idx))
     bf.l_col_start = zeros(Int, n + 1)

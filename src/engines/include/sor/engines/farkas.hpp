@@ -1,4 +1,4 @@
-// SOR — Farkas infeasibility certificate check (Chvátal 1983, Ch.8).
+// SOR - Farkas infeasibility certificate check (Chvátal 1983, Ch.8).
 //
 // LAYER L4, shared by both simplex engines. Independently verifies a
 // candidate infeasibility certificate against the UNSCALED original model --

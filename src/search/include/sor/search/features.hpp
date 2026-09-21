@@ -1,7 +1,7 @@
-// SOR — feature export APIs for latest MILP policies (WP-L0).
+// SOR - feature export APIs for latest MILP policies (WP-L0).
 //
 // Clean-room feature set inspired by Khalil et al. 2016 / Gasse et al. 2019 /
-// Bayramoğlu–Nemhauser–Sahinidis (arXiv:2604.00094): variable, constraint, and
+// Bayramoğlu-Nemhauser-Sahinidis (arXiv:2604.00094): variable, constraint, and
 // cut descriptors with stable dimensions so learners can load without scraping
 // SCIP-style internals. Features never tighten dual bounds.
 #pragma once
@@ -18,10 +18,10 @@ namespace sor::search {
 using core::f64;
 using core::Index;
 
-// Forward decl — avoid a cuts.hpp ↔ features.hpp ↔ hgtsm.hpp include cycle.
+// Forward decl - avoid a cuts.hpp ↔ features.hpp ↔ hgtsm.hpp include cycle.
 struct CutRow;
 
-// Stable dimensions — bumping is a soft ABI break; loaders accept legacy dims
+// Stable dimensions - bumping is a soft ABI break; loaders accept legacy dims
 // by zero-padding missing coordinates (see sparse_sb / sc_milp / lifted load).
 //
 // Branch layout (Khalil/Gasse/Sparse-SB spirit):
@@ -34,7 +34,7 @@ inline constexpr int kVarNodeFeatureDim = 8;
 inline constexpr int kConNodeFeatureDim = 6;
 inline constexpr int kCutNodeFeatureDim = 6;
 inline constexpr int kEdgeFeatureDim = 2;
-// Lifted Branching (Renard–Louveaux–Fortz): branch vec + extra var/con lifts.
+// Lifted Branching (Renard-Louveaux-Fortz): branch vec + extra var/con lifts.
 inline constexpr int kLiftedExtraDim = 8;
 inline constexpr int kLiftedFeatureDim = kBranchFeatureDim + kLiftedExtraDim;
 

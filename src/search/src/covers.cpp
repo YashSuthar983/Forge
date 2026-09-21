@@ -181,7 +181,7 @@ f64 balas_lifting_f(const std::vector<f64>& mu, f64 lambda, int t, f64 z,
     return static_cast<f64>(t - 1);
 }
 
-// Cover geometry for Gu/Prasad gw (0-indexed sorted weights a0 ≥ a1 ≥ …).
+// Cover geometry for Gu/Prasad gw (0-indexed sorted weights a0 ≥ a1 ≥ ...).
 struct CoverGeom {
     int t = 0;
     f64 lambda = 0.0;
@@ -286,7 +286,7 @@ bool sequence_independent_lift(const std::vector<f64>& cover_w, f64 cap,
     if (mode == 0 && !g.pc_ok) return false;
     // GNS needs ρ_1 > 0 for the linear w; if ρ_1=0, S_h empty and g=f on flats.
     if (mode == 1 && g.t >= 2 && g.rho[1] <= tol) {
-        // Degenerate: fall through using w=1/2 on empty S — still ≤ f.
+        // Degenerate: fall through using w=1/2 on empty S - still ≤ f.
     }
 
     for (std::size_t i = 0; i < outside_w.size(); ++i) {
@@ -441,10 +441,12 @@ std::vector<CutRow> separate_lifted_covers(const model::LpProblem& lp,
 
                 std::vector<f64> alphas_pc, alphas_gns;
                 f64 score_pc = -1.0, score_gns = -1.0;
-                const bool ok_pc = sequence_independent_lift(
+                bool ok_pc = sequence_independent_lift(
                     cover_w, cap, outside_w, outside_vals, opts.tol, /*PC*/ 0,
                     alphas_pc, score_pc);
-                const bool ok_gns = sequence_independent_lift(
+                ok_pc = ok_pc && opts.sequence_independent_lifting;
+                const bool ok_gns = opts.sequence_independent_lifting &&
+                    sequence_independent_lift(
                     cover_w, cap, outside_w, outside_vals, opts.tol, /*GNS*/ 1,
                     alphas_gns, score_gns);
 

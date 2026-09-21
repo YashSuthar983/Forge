@@ -1,5 +1,5 @@
-// SOR — Aardal–Hurkens–Lenstra lattice reformulation for pure integer
-// equality systems (market-split / Cornuéjols–Dawande family).
+// SOR - Aardal-Hurkens-Lenstra lattice reformulation for pure integer
+// equality systems (market-split / Cornuéjols-Dawande family).
 //
 // LAYER L5. Opt-in preprocessing only: transforms Ax=b (integer x) into an
 // equivalent bounded MILP in a reduced kernel basis μ, solved by the existing
@@ -7,7 +7,7 @@
 //
 // Safety: every accepted reduction is checked with exact integer arithmetic
 // (A·Q = 0, A·x0 = b, and the AHL block-zero pattern). On any failure the
-// caller must fall back to unmodified solve_milp — never ship a guess.
+// caller must fall back to unmodified solve_milp - never ship a guess.
 #pragma once
 
 #include "sor/model/lp.hpp"
@@ -23,7 +23,7 @@ namespace sor::search {
 struct LatticeReformOptions {
     // Refuse instances with more free integer columns than this.
     int max_columns = 200;
-    // Max LLL / N1–N2 retry attempts before giving up.
+    // Max LLL / N1-N2 retry attempts before giving up.
     int max_retries = 5;
     // If true, continuous free columns with nonnegative (min) / nonpositive
     // (max) objective that can be set to zero are forced to zero and the
@@ -67,7 +67,7 @@ struct LatticeReformMap {
 };
 
 // Returns nullopt when the instance is out of scope or reduction fails
-// verification — caller must then run unmodified solve_milp.
+// verification - caller must then run unmodified solve_milp.
 std::optional<LatticeReformMap>
 try_lattice_reform(const model::LpProblem& lp,
                    const LatticeReformOptions& opts = {});

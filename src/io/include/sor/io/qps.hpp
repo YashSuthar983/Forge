@@ -1,6 +1,6 @@
-// SOR — QPS reader (MPS + QUADOBJ/QMATRIX/QSECTION).
+// SOR - QPS reader (MPS + QUADOBJ/QMATRIX/QSECTION).
 //
-// LAYER L2 — does not depend on engines. The CLI maps this into engines::QpProblem.
+// LAYER L2 - does not depend on engines. The CLI maps this into engines::QpProblem.
 #pragma once
 
 #include "sor/io/mps.hpp"

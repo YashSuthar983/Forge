@@ -7,6 +7,7 @@ add_library(sor_engines
   src/dual_ratio_test.cpp
   src/farkas.cpp
   src/hpr.cpp
+  src/lp_batched.cpp
   src/crossover.cpp
   src/lp.cpp
   src/qp.cpp

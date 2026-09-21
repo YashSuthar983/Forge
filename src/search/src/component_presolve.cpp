@@ -1,5 +1,7 @@
 #include "sor/search/component_presolve.hpp"
 
+#include <chrono>
+
 #include "sor/search/mip_presolve.hpp"
 #include "sor/search/propagate.hpp"
 
@@ -71,6 +73,15 @@ bool assignment_feasible(const model::LpProblem& lp,
 ComponentPresolveDiagnostics apply_component_presolve(
     const model::LpProblem& lp, std::vector<f64>& col_lo,
     std::vector<f64>& col_hi, const ComponentPresolveOptions& opts) {
+    const auto t0 = std::chrono::steady_clock::now();
+    // Unbounded before 2026-09-20; see the comment on the component loop.
+    const auto out_of_time = [&]() {
+        return opts.time_limit_s > 0.0 &&
+               std::chrono::duration<double>(
+                   std::chrono::steady_clock::now() - t0).count() >
+                   opts.time_limit_s;
+    };
+
     ComponentPresolveDiagnostics diag;
     if (!opts.enabled) return diag;
 
@@ -137,27 +148,43 @@ ComponentPresolveDiagnostics apply_component_presolve(
         comp_rows[sz(rid)].push_back(i);
     }
 
+    // ONE working copy for the whole loop, with every row relaxed. Each
+    // component restores only its OWN rows, runs, and relaxes them again.
+    //
+    // This used to deep-copy the entire LpProblem per component and then
+    // decide row ownership with a linear search over all m rows for each of
+    // them -- O(components * (nnz + m * |comp_rows|)). On
+    // neos-5114902-kasavu (961170 x 710164, 4.2M nnz) that phase took
+    // 129,491 ms against a 30 s solver limit, and because it ran before the
+    // LP-free heuristics, Feasibility Jump and Fix-Propagate-Repair both
+    // recorded ZERO attempts. Restoring per component is O(|comp_rows|).
+    model::LpProblem sub = lp;
+    for (Index i = 0; i < m; ++i) {
+        sub.row_lo[sz(i)] = -model::kInf;
+        sub.row_hi[sz(i)] = model::kInf;
+    }
+
     for (std::size_t cid = 0; cid < comps.size(); ++cid) {
         const auto& cols = comps[cid];
         if (cols.size() < 2) continue;
+        if (out_of_time()) { diag.aborted_on_time = true; break; }
 
-        // Dual fixing using only this component's rows: build a view by
-        // temporarily treating other rows as redundant via a local LP copy
-        // with those rows dropped — cheaper: call apply_dual_fixing on a
-        // shallow clone that zeros out foreign rows' bounds to ±inf.
-        model::LpProblem sub = lp;
-        for (Index i = 0; i < m; ++i) {
-            bool mine = false;
-            for (Index r : comp_rows[cid])
-                if (r == i) {
-                    mine = true;
-                    break;
-                }
-            if (!mine) {
-                sub.row_lo[sz(i)] = -model::kInf;
-                sub.row_hi[sz(i)] = model::kInf;
-            }
+        // Activate exactly this component's rows.
+        for (Index r : comp_rows[cid]) {
+            sub.row_lo[sz(r)] = lp.row_lo[sz(r)];
+            sub.row_hi[sz(r)] = lp.row_hi[sz(r)];
         }
+        // Relax them again on every exit path from this iteration.
+        struct RowGuard {
+            model::LpProblem& sub;
+            const std::vector<Index>& rows;
+            ~RowGuard() {
+                for (Index r : rows) {
+                    sub.row_lo[static_cast<std::size_t>(r)] = -model::kInf;
+                    sub.row_hi[static_cast<std::size_t>(r)] = model::kInf;
+                }
+            }
+        } row_guard{sub, comp_rows[cid]};
 
         auto dfix = apply_dual_fixing(sub, col_lo, col_hi, opts.tol,
                                          opts.dual_fix_rounds, true);

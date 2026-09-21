@@ -1,4 +1,4 @@
-// SOR — convex quadratic programming.
+// SOR - convex quadratic programming.
 //
 // Native form:
 //   min 1/2 x'Qx + c'x + offset

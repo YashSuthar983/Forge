@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SOR Python API — thin client over sor_solve / sor_check.
+"""SOR Python API - thin client over sor_solve / sor_check.
 
 Part of the project (not the web demo).
 
@@ -151,7 +151,7 @@ def help_sor() -> None:
 def run_repl() -> None:
     print(HELP)
     print(f"binaries: {BIN}")
-    print("Type solve(...)  —  basic API over sor_solve / sor_check.\n")
+    print("Type solve(...)  -  basic API over sor_solve / sor_check.\n")
     import code
 
     code.interact(

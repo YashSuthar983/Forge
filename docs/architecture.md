@@ -1,7 +1,7 @@
-# SOR — Architecture
+# SOR - Architecture
 
 **Product:** SOR (Sovereign Optimization Runtime)  
-**PS:** SIH26119 (MRPL — Indigenous GPU-Accelerated Optimization Solver)  
+**PS:** SIH26119 (MRPL - Indigenous GPU-Accelerated Optimization Solver)  
 **Rule:** code under `src/`, `apps/`, and `CMakeLists.txt` wins over any paragraph here.
 **Measured numbers:** committed `benchmarks/results/compare-netlib-20260904-152608.md` (historical configuration).
 **Companion:** `paper_bibliography.md`
@@ -18,22 +18,22 @@ in §7 describe the configuration used for each committed run.
 | MPS / QPS / solution I/O | **shipped** | `src/io/`; Netlib 93/93 parse |
 | Primal + dual revised simplex | **shipped** | `simplex.cpp`, `dual_simplex.cpp`; Auto dispatch |
 | Markowitz LU, hypersparse FTRAN/BTRAN | **shipped** | `src/la/src/lu.cpp`; `test_lu` |
-| Forrest–Tomlin update | **shipped (standalone LP default)** | `--basis-update product` selects product form; MILP node LPs default to product form; `collective_ft` remains opt-in and applies to product form |
+| Forrest-Tomlin update | **shipped (standalone LP default)** | `--basis-update product` selects product form; MILP node LPs default to product form; `collective_ft` remains opt-in and applies to product form |
 | Harris / BFRT / Devex / DSE | **shipped** | `dual_bfrt.cpp`, `dual_edge_weights.cpp` |
-| Presolve + postsolve (v1) | **shipped** | `src/presolve/` — Andersen-class subset |
+| Presolve + postsolve (v1) | **shipped** | `src/presolve/` - Andersen-class subset |
 | Ruiz scaling | **shipped** | shared via engines / `simplex_prepared` |
 | PDHG (vanilla) | **shipped** | `pdhg.cpp` + `KernelBackend` |
 | HPR on `LpDevice` | **shipped** | `hpr.cpp`; CPU + Vulkan |
 | Vulkan SPIR-V (6 shaders) | **shipped** | `SOR_ENABLE_VULKAN=ON` default |
 | CUDA `LpDevice` | **stub** | `make_cuda_lp_device()` → `nullptr` |
-| MILP B&B + root GMI cuts | **shipped** | `src/search/` — root cuts only |
+| MILP B&B + root GMI cuts | **shipped** | `src/search/` - root cuts only |
 | AHL lattice reform | **opt-in** | `--lattice-reform`; exact LP-projection μ bounds + exact-equivalence direct-ship / LP-bound certification protocol; markshare1/2 apply, verified correct, 0 incumbent even at 1800s (genuinely hard search, not an implementation gap) |
 | Convex QP (+ diagonal fast path) | **shipped** | `qp.cpp`, `qp_pdhcg.cpp` |
 | `finalize_result` gate | **shipped** | sole writer of `Status::Optimal` |
 | `sor_check` independent checker | **shipped** | CLI; not a VIPR verifier |
 | `sor_verify` / rational / VIPR | **not built** | enums exist; no target |
 | FO→basis crossover | **shipped in Auto LP** | `crossover.cpp`; `--[no-]fo-crossover`; simplex cleanup and proof check still required |
-| Barrier / IPM | **not built** | — |
+| Barrier / IPM | **not built** | - |
 | Netlib simplex (committed run) | **93/93** Optimal | SGM 0.2189 s vs HiGHS 0.0866 s |
 
 `solver_accl/` is a first-party Julia solver with its own whole-model and batch
@@ -47,8 +47,8 @@ API. It is not a CMake target or a C++ engine dependency. See
 | # | Commitment | Reality in tree |
 |---|---|---|
 | C1 | Device-resident FO path | **HPR** uses `LpDevice` (CPU / Vulkan). PDHG still uses host-driven `KernelBackend`. CUDA stub only. |
-| C2 | Structure-preserving IR | **Partial** — `LpProblem` + integer flags; full `StructureMap` / ExprDag not present |
-| C3 | Deterministic by construction | **Partial** — no wall-clock in status claims; no `DetTick` module / bit-identical CI yet |
+| C2 | Structure-preserving IR | **Partial** - `LpProblem` + integer flags; full `StructureMap` / ExprDag not present |
+| C3 | Deterministic by construction | **Partial** - no wall-clock in status claims; no `DetTick` module / bit-identical CI yet |
 | C4 | Numeric tower f32/f64/rational | **f64 working**; f32 device path partial; rational types / `sor_num` **absent** |
 | C5 | Policy seam | **Classical only** inside `bab.cpp` (reliability / strong-branch probes) |
 | C6 | Reversible transforms | **Presolve postsolve** exists; certifying proof steps per reduction **not** emitted |
@@ -63,7 +63,7 @@ API. It is not a CMake target or a C++ engine dependency. See
 L8  FRONT ENDS     sor_solve · sor_check · sor_gen
 L7  VERIFICATION   sor_certify  (finalize_result)
                    sor_check CLI  (independent residual / Farkas recheck)
-                   ✗ sor_verify executable — not in CMake
+                   ✗ sor_verify executable - not in CMake
 L5  SEARCH         sor_search   (bab · cuts · propagate · miqp · minlp)
 L4  ENGINES        sor_engines  (simplex · dual_simplex · pdhg · hpr · crossover · qp · nlp · farkas)
 L3  TRANSFORM      sor_presolve
@@ -135,7 +135,7 @@ flowchart TB
 
 ## 3. End-to-end solve flows
 
-### 3.1 LP — revised simplex (default proof path)
+### 3.1 LP - revised simplex (default proof path)
 
 ```mermaid
 flowchart TD
@@ -159,13 +159,13 @@ flowchart TD
   N --> O[finalize_result]
   O --> P{ProofLevel}
   P -->|ProvedOptimalFP + checker| Q[Status::Optimal]
-  P -->|else| R[Feasible / Interrupted / …]
+  P -->|else| R[Feasible / Interrupted / ...]
 ```
 
 **Hot loop (per pivot):** price → ratio test → LU update → FTRAN/BTRAN  
 **Proof:** basis + dual/primal residuals inside tolerances → `ProvedOptimalFP`.
 
-### 3.2 LP — first-order (PDHG / HPR)
+### 3.2 LP - first-order (PDHG / HPR)
 
 ```mermaid
 flowchart TD
@@ -192,7 +192,7 @@ flowchart TD
 **Proof boundary:** FO alone cannot claim `ProvedOptimalFP`. Auto LP may
 crossover to simplex; the resulting basis must pass the proof check.
 
-### 3.3 MILP — branch-and-cut (root cuts)
+### 3.3 MILP - branch-and-cut (root cuts)
 
 ```mermaid
 flowchart TD
@@ -307,7 +307,7 @@ sor_gen   blend | schedule | dispatch | all
 
 **Host:** `yash-Bravo-15-B5DD` · Linux 6.17 · 12 CPUs · AMD Radeon RX 5500M available for Vulkan.
 
-### Netlib LP — `compare-netlib-20260904-152608` (93 inst, 30 s)
+### Netlib LP - `compare-netlib-20260904-152608` (93 inst, 30 s)
 
 | Solver | Solved | Obj match | SGM (s) |
 |---|---:|---:|---:|
@@ -319,7 +319,7 @@ sor_gen   blend | schedule | dispatch | all
 - Ratio vs HiGHS SGM: **2.53×** for this dated run.
 - FO alone has no basis proof; Auto LP can attempt simplex crossover.
 
-### Industrial ladder — `industrial-perf-20260904-101927` (seed 42, 120 s)
+### Industrial ladder - `industrial-perf-20260904-101927` (seed 42, 120 s)
 
 | Kind | Pattern |
 |---|---|
@@ -328,14 +328,14 @@ sor_gen   blend | schedule | dispatch | all
 | dispatch_qp S→XL | Optimal + agree; large diagonal path very fast vs HiGHS-QP |
 | dispatch_qp XXL/HUGE | SOR Optimal; HiGHS timed out → **obj disagree flagged** (honest) |
 
-### MIPLIB-easy + demos — `compare-new-all-20260904-102744`
+### MIPLIB-easy + demos - `compare-new-all-20260904-102744`
 
 - Coverage: **23/23** incumbents (12 Optimal · 11 Feasible).
 - Proved Optimal examples: `blend2`, `enigma`, `flugpl`, `mod010`, `p0033`, `p0201`, `rgn`, plus demos.
 
 ### Clean-room link check
 
-`ldd build/sor_solve` (Vulkan ON): `libvulkan` + libstdc++ / libm / libgcc / libc — **no** HiGHS / SCIP / CBC / cuOpt.
+`ldd build/sor_solve` (Vulkan ON): `libvulkan` + libstdc++ / libm / libgcc / libc - **no** HiGHS / SCIP / CBC / cuOpt.
 
 ---
 
@@ -352,18 +352,18 @@ build decision.
 
 | Capability | Claim? |
 |---|---|
-| From-scratch solve path | **Yes** — CMake + `ldd` |
-| Netlib LP solved at scale | **Yes** — 93/93 in the committed comparison |
+| From-scratch solve path | **Yes** - CMake + `ldd` |
+| Netlib LP solved at scale | **Yes** - 93/93 in the committed comparison |
 | Dual simplex + BFRT + DSE/Devex | **Yes** |
-| FT update available | **Yes** — standalone LP default; product-form for MILP node LPs |
-| Hypersparse triangular solves | **Yes** — base L/U; eta path still product-form cost |
-| MILP vertical slice | **Yes** — with honest Feasible majority on hard MIPLIB-easy |
+| FT update available | **Yes** - standalone LP default; product-form for MILP node LPs |
+| Hypersparse triangular solves | **Yes** - base L/U; eta path still product-form cost |
+| MILP vertical slice | **Yes** - with honest Feasible majority on hard MIPLIB-easy |
 | Convex QP vertical slice | **Yes** |
-| Vulkan HPR path | **Yes** — measure transfer-inclusive |
-| Faster than HiGHS on Netlib SGM | **No** — 2.53× slower in the committed comparison |
+| Vulkan HPR path | **Yes** - measure transfer-inclusive |
+| Faster than HiGHS on Netlib SGM | **No** - 2.53× slower in the committed comparison |
 | Million-var proved MIP | **No** |
-| VIPR / rational certified | **No** — not built |
-| Crossover FO→basis | **Yes** — Auto LP path, followed by simplex proof check |
+| VIPR / rational certified | **No** - not built |
+| Crossover FO→basis | **Yes** - Auto LP path, followed by simplex proof check |
 | Linked foreign solver | **Never** |
 
 ---
@@ -372,9 +372,9 @@ build decision.
 
 Keep these seams; do not claim them as shipped:
 
-1. **Crossover maturity** — broaden coverage and measure FO-to-basis on larger LPs
-2. **`sor_verify`** — separate target; L0–L2 only  
-3. **Certifying / broader presolve** — probing, dual fixing, aggregation  
+1. **Crossover maturity** - broaden coverage and measure FO-to-basis on larger LPs
+2. **`sor_verify`** - separate target; L0-L2 only  
+3. **Certifying / broader presolve** - probing, dual fixing, aggregation  
 4. **Per-node cuts + more cut families**  
 5. **CUDA `LpDevice`** and batched SpMV for strong branching  
 6. **Barrier IPM** (late)  
@@ -392,7 +392,7 @@ Papers / implement order: `paper_bibliography.md`.
 | BFRT | Bound-flipping (long-step) dual ratio test |
 | HPR | Halpern-accelerated restarted first-order LP |
 | `LpDevice` | Device owns FO state; host requests fused iterations |
-| `ProvedOptimalFP` | Basis optimal at f64 tolerances — commercial “Optimal” |
+| `ProvedOptimalFP` | Basis optimal at f64 tolerances - commercial "Optimal" |
 | Clean-room | Papers allowed; linking/translating solver source forbidden |
 
 ---
