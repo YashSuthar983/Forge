@@ -88,6 +88,50 @@ int main() {
         CHECK(rep.n_h_entries == 528);
     }
 
+
+    // ---- reader: quadratic constraints, LCQ -----------------------------
+    // Three sections are conditional and each one silently desyncs the cursor
+    // if mis-handled rather than erroring. LCQ exercises two of them at once:
+    // a LINEAR objective, so the objective-H block is absent entirely, and
+    // QUADRATIC constraints, so the per-constraint Hessian block is present
+    // between f and A as (constraint,row,col,value) QUADRUPLES.
+    {
+        io::QplibReadReport rep;
+        const auto q = io::read_qplib_file(data_path("QPLIB_2430.qplib"), rep);
+        CHECK(q.classification[0] == 'L' && q.classification[1] == 'C' &&
+              q.classification[2] == 'Q');
+        CHECK(q.n == 125);
+        CHECK(q.m == 92);                  // general constraints DO exist here
+        CHECK(rep.n_h_entries == 0);       // linear objective: no H block
+        CHECK(!q.has_quadratic_objective());
+        CHECK(rep.n_hc_entries == 279);
+        CHECK(rep.n_a_entries == 127);
+        CHECK(q.has_quadratic_constraints());
+        // Every per-constraint entry addresses a real constraint and real
+        // variables; an off-by-one in the quadruple reader shows up here.
+        for (std::size_t t = 0; t < q.hc_val.size(); ++t) {
+            CHECK(q.hc_con[t] >= 1 && q.hc_con[t] <= q.m);
+            CHECK(q.hc_row[t] >= 1 && q.hc_row[t] <= q.n);
+            CHECK(q.hc_col[t] >= 1 && q.hc_col[t] <= q.n);
+        }
+    }
+
+    // ---- reader: quadratic objective AND quadratic constraints, QCQ -----
+    // Both Hessian blocks present, in order: objective H, then g, then f,
+    // then the per-constraint H_i, then A.
+    {
+        io::QplibReadReport rep;
+        const auto q = io::read_qplib_file(data_path("QPLIB_1157.qplib"), rep);
+        CHECK(q.classification[0] == 'Q' && q.classification[2] == 'Q');
+        CHECK(q.n == 40);
+        CHECK(q.m == 9);
+        CHECK(rep.n_h_entries == 776);
+        CHECK(rep.n_hc_entries == 778);
+        CHECK(rep.n_a_entries == 359);
+        CHECK(q.has_quadratic_objective());
+        CHECK(q.has_quadratic_constraints());
+    }
+
     // ---- engine: matches QPLIB's own published solution point ------------
     {
         io::QplibReadReport rep;

@@ -71,6 +71,21 @@ public:
         v = x;
     }
 
+    // One (constraint, row, col, value) quadruple -- the per-constraint
+    // Hessian block is the only section shaped like this.
+    void quadruple(Index& ci, Index& r, Index& c, f64& v) {
+        const std::string& l = next();
+        std::istringstream is(l);
+        long long a = 0, b = 0, d = 0;
+        double x = 0.0;
+        if (!(is >> a >> b >> d >> x))
+            fail("expected \"constraint row col value\", found \"" + l + "\"");
+        ci = static_cast<Index>(a);
+        r = static_cast<Index>(b);
+        c = static_cast<Index>(d);
+        v = x;
+    }
+
     // One (index, value) pair.
     void pair(Index& i, f64& v) {
         const std::string& l = next();
@@ -143,11 +158,14 @@ QplibInstance read_qplib_file(const std::string& path, QplibReadReport& rep) {
     // constraint type means extra per-constraint Hessian sections this reader
     // does not decode. Refusing here keeps the line cursor honest.
     const char ctype = cls[2];
-    if (ctype != 'N' && ctype != 'B' && ctype != 'L') {
-        cur.fail(std::string("constraint type '") + ctype + "' in classification " +
-                 cls + " means quadratic constraints, which this reader does not "
-                 "decode (supported: N, B, L)");
+    // N none · B bounds only · L linear · D diagonal quadratic ·
+    // C convex quadratic · Q general quadratic. All six are decoded now.
+    if (ctype != 'N' && ctype != 'B' && ctype != 'L' &&
+        ctype != 'D' && ctype != 'C' && ctype != 'Q') {
+        cur.fail(std::string("unknown constraint type '") + ctype +
+                 "' in classification " + cls);
     }
+    const bool has_quad_constraints = (ctype == 'D' || ctype == 'C' || ctype == 'Q');
     const char vtype = cls[1];
     if (vtype != 'B' && vtype != 'C' && vtype != 'I' && vtype != 'G' && vtype != 'M') {
         cur.fail(std::string("unknown variable type '") + vtype + "' in classification " + cls);
@@ -164,12 +182,20 @@ QplibInstance read_qplib_file(const std::string& path, QplibReadReport& rep) {
     // type 'N' or 'B' -- verified on real QBB files, where the H count
     // follows n directly). Reading an unconditional m here silently consumes
     // nnz(H) instead and desyncs everything after it.
-    const bool has_general_constraints = (ctype == 'L');
+    // General constraints exist for L (linear) AND for the quadratic types
+    // D/C/Q -- those instances still have an m, an A and row bounds, they
+    // just carry per-constraint Hessians as well. Only N (none) and B
+    // (bounds only) omit the whole block.
+    const bool has_general_constraints =
+        (ctype == 'L' || ctype == 'D' || ctype == 'C' || ctype == 'Q');
     q.m = has_general_constraints ? cur.integer() : 0;
     if (q.n < 0 || q.m < 0) cur.fail("negative n or m");
 
     // ---- H: upper triangle of the objective Hessian ----------------------
-    const Index nnz_h = cur.integer();
+    // ABSENT when the objective is linear. On an LCQ file the g block follows
+    // m directly; reading an unconditional nnz(H) here consumes the g default
+    // instead and desyncs everything after it.
+    const Index nnz_h = (cls[0] == 'L') ? 0 : cur.integer();
     q.h_row.resize(static_cast<std::size_t>(nnz_h));
     q.h_col.resize(static_cast<std::size_t>(nnz_h));
     q.h_val.resize(static_cast<std::size_t>(nnz_h));
@@ -187,6 +213,30 @@ QplibInstance read_qplib_file(const std::string& path, QplibReadReport& rep) {
 
     q.g = read_defaulted_vector(cur, q.n, "objective gradient");
     q.f_const = cur.real();
+
+    // ---- per-constraint Hessians, between f and A ------------------------
+    // One count, then that many (constraint, row, col, value) QUADRUPLES --
+    // note four fields, not the three of every other matrix block here.
+    if (has_quad_constraints) {
+        const Index nnz_hc = cur.integer();
+        q.hc_con.resize(static_cast<std::size_t>(nnz_hc));
+        q.hc_row.resize(static_cast<std::size_t>(nnz_hc));
+        q.hc_col.resize(static_cast<std::size_t>(nnz_hc));
+        q.hc_val.resize(static_cast<std::size_t>(nnz_hc));
+        for (Index t = 0; t < nnz_hc; ++t) {
+            Index ci = 0, r = 0, c = 0;
+            f64 v = 0.0;
+            cur.quadruple(ci, r, c, v);
+            if (ci < 1 || ci > q.m) cur.fail("H_i constraint index out of range");
+            if (r < 1 || r > q.n || c < 1 || c > q.n)
+                cur.fail("H_i entry out of range");
+            q.hc_con[static_cast<std::size_t>(t)] = ci;
+            q.hc_row[static_cast<std::size_t>(t)] = r;
+            q.hc_col[static_cast<std::size_t>(t)] = c;
+            q.hc_val[static_cast<std::size_t>(t)] = v;
+        }
+        rep.n_hc_entries = static_cast<std::size_t>(nnz_hc);
+    }
 
     // ---- A and the constraint bounds, only when constraints exist --------
     if (has_general_constraints) {

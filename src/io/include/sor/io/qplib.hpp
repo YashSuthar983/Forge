@@ -31,12 +31,19 @@
 // OBJECTIVE CONVENTION: 0.5 x'Hx + g'x + f, with H given as its UPPER
 // TRIANGLE only. Callers wanting a full symmetric Q must mirror it.
 //
-// SCOPE: classification[2] (the constraint-type letter) must be one of
-// N (none), B (bounds only) or L (linear). Types D/C/Q are quadratic
-// constraints, which carry extra per-constraint Hessian sections this
-// reader does not decode. It fails fast and specifically on those rather
-// than desyncing the line cursor and producing a confusing downstream
-// error. That is a stated scope limit, not a silent gap.
+// THREE SECTIONS ARE CONDITIONAL, and each one was verified against real
+// instances rather than assumed. Getting any of them wrong does not produce
+// an error -- it silently desyncs the line cursor and every later section is
+// read from the wrong offset.
+//
+//   1. The OBJECTIVE Hessian block (nnz(H) + triplets) is ABSENT when the
+//      objective letter is 'L' (linear objective). Verified on LCQ files,
+//      where the g block follows m directly.
+//   2. The PER-CONSTRAINT Hessian block (nnz + (constraint,row,col,value)
+//      QUADRUPLES) is PRESENT when the constraint letter is D, C or Q, and
+//      sits between f and the A matrix. Verified on LCQ and QCQ.
+//   3. m, the A matrix and the constraint-bound blocks are ABSENT when the
+//      constraint letter is N or B. Verified on QBB/QBN.
 #pragma once
 
 #include "sor/core/result.hpp"
@@ -71,12 +78,24 @@ struct QplibInstance {
     std::vector<Index> a_row, a_col;  // 1-based
     std::vector<f64> a_val;
 
+    // Per-constraint Hessians, as flat quadruples: constraint hc_con[t] has
+    // H entry (hc_row[t], hc_col[t]) = hc_val[t], all 1-based, upper triangle.
+    // Same objective convention as H: the stored triangle is used AS-IS, so
+    // the coefficient of x_r x_c in constraint i is 0.5 * hc_val, NOT hc_val.
+    // Empty when the instance has no quadratic constraints.
+    std::vector<Index> hc_con, hc_row, hc_col;
+    std::vector<f64> hc_val;
+
     f64 inf_bound = 1e20;   // the file's own infinity sentinel
     std::vector<f64> c_lo, c_hi;      // length m
     std::vector<f64> x_lo, x_hi;      // length n
     std::vector<QplibVarType> var_type;  // length n
 
     bool all_binary() const noexcept { return classification[1] == 'B'; }
+    // True when any constraint carries a quadratic term.
+    bool has_quadratic_constraints() const noexcept { return !hc_val.empty(); }
+    // True when the objective has a quadratic term.
+    bool has_quadratic_objective() const noexcept { return classification[0] != 'L'; }
     // True when every variable is binary or integer -- no continuous part.
     bool is_discrete() const noexcept;
 };
@@ -85,6 +104,7 @@ struct QplibReadReport {
     std::size_t lines_consumed = 0;
     std::size_t n_h_entries = 0;
     std::size_t n_a_entries = 0;
+    std::size_t n_hc_entries = 0;   // per-constraint Hessian nonzeros
     bool h_has_off_diagonal = false;
 };
 
