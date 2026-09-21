@@ -1,6 +1,6 @@
 # SOR — Paper Reference (single source of truth)
 
-**Companions:** `architecture.md` · `clean_room_policy.md` · `dependency_ledger.md` §5 · `reference_log.md` (forbidden-repo audit only)
+**Companion:** `architecture.md`
 
 **Rule:** Implement from these papers and textbooks. Do **not** port HiGHS / CBC / SCIP / OR-Tools / cuOpt / cuPDLPx / HPR-LP / PSLP / PaPILO **source**. Their **papers are allowed**. External binaries as oracles only.
 
@@ -25,20 +25,18 @@ Use DOI or arXiv links below. Paywalled journals → arXiv preprint when listed.
 
 ## 2. Impact-ranked priorities (Sep 2026)
 
-**Measured 4 Sep 2026** (`compare-netlib-20260904-070105`): SOR-simplex **92/93** `ProvedOptimalFP`, SGM **0.2085 s** vs HiGHS **0.0905 s** (**2.30×**). Dual simplex + BFRT + DSE/Devex + v1 presolve + HPR/Vulkan ship; FT is opt-in (`--basis-update ft`).
+**Committed comparison** (`benchmarks/results/compare-netlib-20260904-152608.md`): SOR-simplex **93/93** solved, SGM **0.2189 s** vs HiGHS **0.0866 s** (**2.53×**). This run predates the FT-default change.
 
 | Rank | Technique | Expected gain | Papers (§) | SOR status |
 |------|-----------|---------------|------------|------------|
-| 1 | Make FT **default** + tune collective collapse | 2–5× basis work | §4.1 #2, #9 | FT + `collapse_pending_into_ft` **in tree** (both opt-in); product-form still default |
-| 2 | Hypersparse end-to-end on default path | large-sparse pivots | §4.1 #4, #8 | Reach-set FTRAN/BTRAN **+ eta skip** shipped (`test_lu`); default product-form still accumulates eta cost |
+| 1 | Tune FT default and product-form collective collapse | measured per workload | §4.1 #2, #9 | FT defaults for standalone LP; product form defaults for MILP node LPs; collective collapse opt-in |
+| 2 | Hypersparse end-to-end on default path | large-sparse pivots | §4.1 #4, #8 | Reach-set FTRAN/BTRAN **+ eta skip** shipped (`test_lu`) |
 | 3 | Dual DSE/BFRT constant-factor tune | fewer / cheaper iters | §4.1 #5–8 | DSE/Devex + BFRT **shipped**; still behind HiGHS on hard models |
 | 4 | Broader LP/MILP presolve | 2–10× end-to-end | §6 | v1 **shipped**; probing/aggregation missing |
 | 5 | HPR maturity (restart + PID weight) | 40+/65 LPfeas | §5 | `hpr.cpp` + Vulkan; Netlib FO still weak (17/93) |
-| 6 | Crossover FO→basis | GPU path → `ProvedOptimalFP` | §5.3 | **not built** |
+| 6 | Broaden crossover coverage | GPU path → `ProvedOptimalFP` after basis proof | §5.2 | Auto LP crossover shipped; broader validation remains |
 | 7 | Node cuts + stronger MILP heuristics | credible MIP at scale | §7 | Root B&C **shipped**; node cuts missing |
 | 8 | PAMI/SIP parallel dual | ~1.5–2× multi-core | §4.1 #8 | after serial closer to HiGHS |
-
-**Do not start:** barrier IPM, GNN branching, VIPR, global pooling until crossover + FT-default + broader presolve are green.
 
 ---
 
@@ -46,10 +44,10 @@ Use DOI or arXiv links below. Paywalled journals → arXiv preprint when listed.
 
 ```text
 A. Broader presolve  — probing / dual fixing / aggregation         (§6)     ← v1 done
-B. FT-default + tune — default FT; collective collapse on by default (§4.1) ← both exist, opt-in
+B. FT-default + tune — standalone default shipped; collective collapse opt-in (§4.1)
 C. Keep hypersparse  — measure on large sparse with FT default       (§4.1) ← reach+eta skip done
 D. HPR maturity      — restart + PID weight → LPfeas                (§5)     ← prototype + Vulkan
-E. Crossover         — Bixby–Saltzman / Schork IPX / spiral         (§5.3)   ← missing
+E. Crossover         — spiral basis build + simplex cleanup          (§5.2)   ← Auto LP path shipped
 F. MILP depth        — node cuts · stronger heuristics              (§7)     ← root B&C done
 G. Parallel + batch  — batched SpMV · PAMI later                    (§5, §9) ← Vulkan HPR done
 ```
@@ -65,14 +63,14 @@ Vanilla PDHG (`pdhg.cpp`) and HPR (`hpr.cpp`) are separate entry points today; d
 | # | Citation | Link | Why | SOR status |
 |---|----------|------|-----|------------|
 | 1 | **Maros**, *Computational Techniques of the Simplex Method* (2003) | [DOI](https://doi.org/10.1007/978-1-4615-0257-9) | Implementation bible | primal + dual in tree |
-| 2 | **Forrest & Tomlin (1972)** | [DOI](https://doi.org/10.1007/BF01584548) | Basis update — critical | **implemented** (`UpdateMethod::ForrestTomlin`, `--basis-update ft`); product-form still default |
+| 2 | **Forrest & Tomlin (1972)** | [DOI](https://doi.org/10.1007/BF01584548) | Basis update — critical | **implemented**; standalone LP default, product-form for MILP node LPs |
 | 3 | **Suhl & Suhl (1990)** | [DOI](https://doi.org/10.1287/ijoc.2.4.325) | Sparse LU for bases | `lu.cpp` |
 | 4 | **Hall & McKinnon (2005)** | [DOI](https://doi.org/10.1007/s10589-005-4803-z) | Hypersparse FTRAN/BTRAN | **shipped** — reach-set L/U + identity-eta skip; `test_lu` hypersparse+etas |
 | 5 | **Forrest & Goldfarb (1992)** | [DOI](https://doi.org/10.1007/BF01581089) | Dual steepest-edge / DEVEX | `dual_edge_weights.cpp` — DSE + Devex |
 | 6 | **Harris (1973)** | [DOI](https://doi.org/10.1007/BF01580108) | Two-pass ratio test | `simplex.cpp`, `dual_simplex.cpp` |
 | 7 | **Koberstein (2008)** | [DOI](https://doi.org/10.1007/s10589-008-9207-4) | Dual simplex + BFRT line | `dual_simplex.cpp` + `dual_bfrt.cpp` |
 | 8 | **Huangfu & Hall (2018)** — *Parallelizing the dual revised simplex* | [DOI](https://doi.org/10.1007/s12532-017-0130-5) · arXiv:[1503.01889](https://arxiv.org/abs/1503.01889) | HiGHS dual blueprint; PAMI/SIP; Table 1 time shares | serial dual + BFRT; PAMI/SIP not built |
-| 9 | **Huangfu & Hall (2015)** — *Novel update techniques* | [DOI](https://doi.org/10.1007/s10589-014-9689-1) · [PDF](https://optimization-online.org/wp-content/uploads/2013/02/3774.pdf) | Collective FT/APF for multi-flip BFRT | **partial** — `collapse_pending_into_ft()` + `collective_ft` opt-in; not full multi-column APF |
+| 9 | **Huangfu & Hall (2015)** — *Novel update techniques* | [DOI](https://doi.org/10.1007/s10589-014-9689-1) · [PDF](https://optimization-online.org/wp-content/uploads/2013/02/3774.pdf) | Collective FT/APF for multi-flip BFRT | **partial** — `collapse_pending_into_ft()` + `collective_ft` opt-in for product form; not full multi-column APF |
 | 10 | **Koberstein & Suhl (2007)** — dual phase 1 | [DOI](https://doi.org/10.1007/s10589-007-9018-z) | Dual-feasible start | partial |
 | — | **Markowitz (1957)** | [DOI](https://doi.org/10.1287/mnsc.3.3.255) | Threshold pivoting | `lu.cpp` |
 | — | **Tomlin (1972)** | [DOI](https://doi.org/10.1147/rd.164.0415) | Sparse inverse practice | ref |
@@ -87,10 +85,10 @@ Vanilla PDHG (`pdhg.cpp`) and HPR (`hpr.cpp`) are separate entry points today; d
 | BTRAN | 12% | same |
 | SPMV | 11% | CSR/CSC |
 | CHUZC/BFRT | 8% | `dual_bfrt.cpp` |
-| UPDATE-FACTOR | 7% | product-form **default**; FT + collective collapse **opt-in** |
+| UPDATE-FACTOR | 7% | FT standalone LP default; product-form MILP node LP default; collective collapse opt-in |
 | CHUZR/DSE | 6% | DSE + Devex in `dual_edge_weights.cpp` |
 
-**Simplex next levers (measured gap still ~2.3× Netlib SGM):** FT-as-default → enable collective collapse by default → broader presolve → pricing/partial pricing → PAMI/SIP last.
+**Simplex next levers:** measure FT and product-form by workload, broaden presolve, then evaluate parallel dual methods. Partial pricing was removed after regressions.
 
 ### 4.2 Textbooks
 
@@ -131,7 +129,7 @@ Chambolle–Pock PDHG (2011)  →  PDLP (2021)  →  HPR-LP (2024)  →  cuPDLPx
 | # | Citation | Link | Role | SOR status |
 |---|----------|------|------|------------|
 | 1 | **Megiddo (1991)** | [DOI](https://doi.org/10.1287/ijoc.3.1.63) | Crossover foundations | **not built** |
-| 2 | **Bixby & Saltzman (1994)** | [DOI](https://doi.org/10.1016/0167-6377(94)90075-2) | Practical crossover | **not built** |
+| 2 | **Bixby & Saltzman (1994)** | [DOI](https://doi.org/10.1016/0167-6377(94)90075-2) | Practical crossover | Auto LP crossover path in `crossover.cpp`; not claimed as a reproduction |
 | 3 | **Schork — IPX (2019)** | [PDF](https://www.pure.ed.ac.uk/ws/files/134475941/ipmBasis_1_.pdf) | Basis-precond IPM + push crossover | **not built** |
 | 4 | **Liu & Lu (2025)** PDHG-spiral | DOI:10.1287/ijoc.2024.0996 | GPU-friendly FO→vertex | **not built** |
 | 5 | **Gleixner, Steffy, Wolter (2016)** | [DOI](https://doi.org/10.1287/ijoc.2016.0692) | Iterative refinement → exact | **not built** |
@@ -290,11 +288,12 @@ LP duality / Farkas: any LP textbook — implement checker from first principles
 |--------|----------|-------|
 | Markowitz + Suhl singleton tri | `src/la/src/lu.cpp` | |
 | Hypersparse FTRAN/BTRAN | `lu.cpp` | Hall–McKinnon reach sets + identity-eta skip; `test_lu` |
-| Forrest–Tomlin update | `lu.cpp` `update_ft()` | opt-in `--basis-update ft` |
+| Forrest–Tomlin update | `lu.cpp` `update_ft()` | standalone LP default; MILP node LPs use product form |
+| FO-to-simplex crossover | `crossover.cpp`, `lp.cpp` | Auto LP; basis and checker required for `Optimal` |
 | Collective FT collapse | `lu.cpp` `collapse_pending_into_ft()` | opt-in `collective_ft` in simplex options |
-| Product-form (MPF) update | `lu.cpp` | **default** |
+| Product-form (MPF) update | `lu.cpp` | MILP node LP default |
 | Harris ratio test | `simplex.cpp`, `dual_simplex.cpp` | |
-| Primal + dual revised simplex | `simplex.cpp`, `dual_simplex.cpp` | **92/93** Netlib ProvedOptimalFP (4 Sep 2026) |
+| Primal + dual revised simplex | `simplex.cpp`, `dual_simplex.cpp` | **93/93** solved in the committed comparison |
 | BFRT | `dual_bfrt.cpp` | Koberstein/Huangfu line |
 | DSE + Devex | `dual_edge_weights.cpp` | |
 | Presolve v1 + postsolve | `src/presolve/` | Andersen-class subset |
@@ -306,7 +305,7 @@ LP duality / Farkas: any LP textbook — implement checker from first principles
 | Ruiz scaling | engines | |
 | MPS/QPS I/O, certify gate | `src/io/`, `src/certify/` | |
 
-Log forbidden-repo lookups that influenced design in `reference_log.md`.
+The clean-room boundary is described in `architecture.md` §8.
 
 ---
 
@@ -333,9 +332,9 @@ Log forbidden-repo lookups that influenced design in `reference_log.md`.
 
 ## 14. Maintenance
 
-- When an algorithm lands: add `implemented in path · date` under §12 or `dependency_ledger.md` §5.
+- When an algorithm lands: add its implementation path and date under §12.
 - Fix broken DOIs here — **this file is the only paper index.**
-- Forbidden-repo audit → `reference_log.md` only (not duplicated here).
+- The solve-path policy is in `architecture.md` §8.
 
 ### Reality check
 

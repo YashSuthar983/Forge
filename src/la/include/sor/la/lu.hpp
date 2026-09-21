@@ -58,8 +58,7 @@ using core::Offset;
 struct LuOptions {
     // Threshold pivoting: accept a Markowitz pivot only if its magnitude is at
     // least this fraction of the largest remaining magnitude in its column.
-    // 0.1 is the value in docs/architecture.md §4.2. Lower preserves sparsity,
-    // higher preserves accuracy.
+    // Lower preserves sparsity, higher preserves accuracy.
     f64 markowitz_threshold = 0.1;
 
     // Absolute floor. A candidate below this is not a pivot at any threshold;
@@ -241,8 +240,7 @@ public:
                    const std::vector<Index>* alpha_support = nullptr,
                    const SpikeCapture* spike = nullptr);
 
-    // Collective FT (Huangfu & Hall 2015 Phase 2 in docs/SIH26119_PS_ALIGNMENT.md
-    // §5 item 2): folds every PENDING product-form eta (from update(), not
+    // Collective FT (Huangfu & Hall 2015 Phase 2): folds every PENDING product-form eta (from update(), not
     // update_ft()) into L/U via a sequence of update_ft() calls -- reusing
     // that already-verified single-update path exactly, rather than a new
     // combined multi-column bump-elimination algorithm -- then clears the

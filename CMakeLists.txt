@@ -9,7 +9,7 @@ project(sor LANGUAGES CXX VERSION 0.0.1)
 # below IS the layer order; each module owns its own CMakeLists.txt.
 #
 # Clean-room rule: no HiGHS / SCIP / CBC / GLPK / OR-Tools / cuOpt / PaPILO /
-# Ipopt anywhere in this file or the link graph. See docs/clean_room_policy.md.
+# Ipopt anywhere in this file or the link graph. See docs/architecture.md §8.
 # ---------------------------------------------------------------------------
 
 set(CMAKE_CXX_STANDARD 20)
