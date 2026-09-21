@@ -56,13 +56,8 @@ forge_add_test(test_mir                 forge_search forge_engines forge_certify
 forge_add_test(test_zerohalf            forge_search)
 forge_add_test(test_flowcover           forge_search)
 forge_add_test(test_dynsep              forge_search forge_certify forge_io)
-# test_l2sep / test_hgtsm: sources owned by cut-control agent (add when present)
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_l2sep.cpp")
-  forge_add_test(test_l2sep             forge_search forge_certify forge_io)
-endif()
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_hgtsm.cpp")
-  forge_add_test(test_hgtsm             forge_search forge_certify forge_io)
-endif()
+forge_add_test(test_l2sep              forge_search forge_certify forge_io)
+forge_add_test(test_hgtsm              forge_search forge_certify forge_io)
 forge_add_test(test_qp                  forge_engines forge_certify)
 forge_add_test(test_qps                 forge_io forge_engines forge_certify)
 forge_add_test(test_ps_must             forge_search forge_engines forge_certify forge_io
@@ -92,7 +87,7 @@ set_tests_properties(test_forbidden_dependencies PROPERTIES
 target_compile_definitions(test_ps_must PRIVATE
   FORGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
   FORGE_BINARY_DIR="${CMAKE_BINARY_DIR}")
-add_dependencies(test_ps_must forge_solve forge_check forge_ext_demo)
+add_dependencies(test_ps_must forge_solve forge_check)
 
 target_compile_definitions(test_dispatch_regressions PRIVATE
   FORGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

@@ -1,1 +1,0 @@
-../../netlib/mps/adlittle.mps

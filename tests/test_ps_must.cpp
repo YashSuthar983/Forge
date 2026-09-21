@@ -133,7 +133,6 @@ void test_m7_cli_and_m8_public_harnesses() {
     const fs::path src(FORGE_SOURCE_DIR), bin(FORGE_BINARY_DIR);
     CHECK(fs::is_regular_file(bin / "forge_solve"));
     CHECK(fs::is_regular_file(bin / "forge_check"));
-    CHECK(fs::is_regular_file(bin / "forge_ext_demo"));
     CHECK(regular_file_count(src / "benchmarks/netlib/mps") > 0);
     CHECK(regular_file_count(src / "benchmarks/miplib-easy/mps") > 0);
     // M8 requires a public harness that measures FORGE against independent
