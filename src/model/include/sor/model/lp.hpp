@@ -10,9 +10,7 @@
 // RANGES all collapse to one representation, and the first-order engine's dual
 // prox is a single formula for all of them (sor_engines/pdhg.cpp).
 //
-// This is a PROTOTYPE model object. The full structure-preserving IR with
-// StructureMap / FamilyFingerprint (docs/architecture.md §3.4, commitment C2)
-// is Sprint 0 work and is not implemented here.
+// A full structure-preserving expression graph is not implemented here.
 #pragma once
 
 #include "sor/sparse/csr.hpp"
