@@ -22,7 +22,7 @@ otherwise, never silently dropped.
 
 CLEAN ROOM: external solvers are used ONLY as independent reference points for
 these measurements. They are never linked into SOR and never contribute to a
-result SOR reports. See docs/clean_room_policy.md.
+result SOR reports. See docs/architecture.md §8.
 """
 from __future__ import annotations
 
@@ -642,11 +642,7 @@ def shifted_geomean(values: list[float], shift: float) -> float | None:
 
 
 # --------------------------------------------------------------------------
-# The public claim gate (plan §3.4/§3.5). THIS IS THE ONLY DEFINITION.
-#
-# Everything that scores a suite against HiGHS -- compare.py's own summary,
-# gate.py, ablate.py -- goes through here, so the number in a report and the
-# number a gate enforces cannot drift apart.
+# Shifted geometric mean used by comparison reports.
 #
 # The metric is the RATIO OF SHIFTED GEOMETRIC MEANS:
 #

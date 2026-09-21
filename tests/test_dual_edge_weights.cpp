@@ -232,8 +232,7 @@ int test_dse_accuracy_switch_chain() {
     return failures;
 }
 
-// Exact DSE end-to-end regression (item 4 of docs/SIH26119_PS_ALIGNMENT.md
-// §5): the incremental per-pivot weight update used to be capped to m <= 64
+// Exact DSE end-to-end regression: the incremental per-pivot weight update used to be capped to m <= 64
 // because the ONLY implementation was a full O(m)-BTRAN rebuild after every
 // pivot. It is now a genuine O(1)-extra-FTRAN incremental update (Forrest &
 // Goldfarb 1992) with no size cap. DSE weights only affect PRICING (which

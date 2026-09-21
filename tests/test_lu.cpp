@@ -942,7 +942,7 @@ void test_ft_rejects_tiny_pivot_untouched() {
     check_solves(b, f, "after refused ft update", 1e-9);
 }
 
-// Collective FT (item 2 Phase 2, docs/SIH26119_PS_ALIGNMENT.md §5):
+// Collective FT:
 // collapse_pending_into_ft() folds a BATCH of pending product-form etas into
 // L/U via sequential update_ft() calls. Its entire contract is that this is
 // a pure REPRESENTATION change -- ftran()/btran() must return IDENTICAL

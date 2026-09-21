@@ -1,7 +1,6 @@
 // SOR — the KernelBackend contract.
 //
-// LAYER L1. This is the C1 seam: CPU is a backend, not the default.
-// See docs/architecture.md §3.3.
+// LAYER L1. CPU provides the reference implementation.
 //
 // Every backend must satisfy test_backend_parity: identical results to the CPU
 // reference within a declared tolerance. A backend that disagrees fails the

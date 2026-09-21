@@ -2,12 +2,7 @@
 //
 // LAYER L0. Depends on nothing but the standard library.
 //
-// NOTE ON LAYERING (deviation from docs/architecture.md §4.1):
-// architecture.md places Status/ProofLevel/results in sor_certify/result.hpp,
-// but sor_certify is L7 while the engines that must produce them are L4. That is
-// a layer inversion -- an L4 engine cannot include an L7 header.
-//
-// Resolution: every result TYPE lives here in L0, and only the guard FUNCTION
+// Result types live in L0; only the guard function
 // certify::finalize_result() -- the sole writer of Status::Optimal -- lives in
 // sor_certify (L7). The invariant is unchanged: engines can fill in a RawResult
 // but cannot produce a SolveResult, so they cannot claim optimality.
@@ -41,7 +36,7 @@ enum class Status {
     Unsupported             // capability refusal
 };
 
-// Strictly increasing rigor. See docs/architecture.md §4 (ProofLevel ladder).
+// Strictly increasing rigor. See docs/architecture.md §4.
 // The top three rows are not reported by any commercial solver.
 enum class ProofLevel {
     None = 0,

@@ -9,9 +9,7 @@ CMakeCache.txt
 CMakeFiles/
 
 # ---- models ----------------------------------------------------------------
-# Shipped solver models under models/milp/ ARE tracked. Training outputs and
-# backups are reproducible via apps/sor_milp_train and stay local.
-models/milp-retrain/
+# Shipped solver models under models/milp/ are tracked.
 models/**/*.bak
 
 # ---- Python ----------------------------------------------------------------
@@ -23,7 +21,7 @@ web/.venv/
 
 # External-solver baselines (HiGHS / SciPy / PuLP). NEVER commit: the venv
 # contains libhighs.so, and shipping a competitor solver's binary would
-# contradict the clean-room claim in docs/clean_room_policy.md. Recreate with:
+# contradict the clean-room boundary in docs/architecture.md §8. Recreate with:
 #   python3 -m venv benchmarks/.venv-baseline
 #   benchmarks/.venv-baseline/bin/pip install -r benchmarks/requirements-baseline.txt
 benchmarks/.venv-baseline/
@@ -49,10 +47,6 @@ nohup.out
 benchmarks/miplib2017/mps/
 benchmarks/miplib2017/*.zip
 
-# Cut from the archive above by scripts/make_miplib_small.py -- derived data,
-# regenerate rather than track. reference.csv IS tracked: it is a few KB and it
-# is what scripts/miplib_eval.py scores soundness against.
-benchmarks/miplib-small/mps/
 # Synthetic scaling-study LPs (generated, up to ~150 MB each). Regenerate:
 #   python3 scripts/gen_lp_ladder.py
 benchmarks/synthetic/mps/
@@ -64,14 +58,6 @@ benchmarks/results/*
 !benchmarks/results/compare-netlib-20260905-140353.jsonl
 !benchmarks/results/miplib-easy-20260905-141554.md
 !benchmarks/results/miplib-easy-20260905-141554.jsonl
-
-# The gate's own state is not a "run": scripts/gate.py compares against these
-# and they are the contract that says what this tree is allowed to do, so they
-# are versioned deliberately (and only move under --accept --reason). The
-# per-run candidate sweeps it writes next to them stay ignored.
-!benchmarks/results/baseline-*.jsonl
-!benchmarks/results/gate-allow.json
-!benchmarks/results/reference-highs-*.jsonl
 !benchmarks/results/netlib-gpu-crossover-20260921-171500.md
 !benchmarks/results/netlib-gpu-crossover-20260921-171500.txt
 

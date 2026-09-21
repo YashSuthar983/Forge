@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Generate a sparse LP in free-format MPS for backend timing comparisons.
 
-Synthetic and seeded -- no confidential data, reproducible from the seed alone
-(sor/docs/architecture.md: industrial generators must record their seed).
+Synthetic and seeded -- no confidential data, reproducible from the seed alone.
 
 Shape:  min c'x  s.t.  lo_i <= sum_j A_ij x_j <= hi_i,  0 <= x_j <= u_j
 with `nnz_per_row` entries per row, so the pattern is genuinely sparse rather

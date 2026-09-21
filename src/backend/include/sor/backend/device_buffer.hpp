@@ -2,17 +2,13 @@
 //
 // LAYER L1.
 //
-// C1 (docs/architecture.md §1): the backend owns large buffers; engines never
-// touch raw device pointers. In this prototype every backend stages through
-// host memory -- the CPU backend computes there directly, and the Julia backend
-// serialises from there.
+// KernelBackend buffers are host-addressable. The CPU backend computes there
+// directly; device-resident first-order engines use LpDevice instead.
 //
 // HONEST LIMITATION: this type does NOT deliver C1. `operator[]` returns a
 // reference and `host()` hands out the vector, so host addressability is part of
 // the contract and callers depend on it. A device-resident backend therefore
-// cannot be dropped in behind this interface -- see docs/architecture.md §3.3.1
-// for why, and for the `LpDevice` seam that replaces it for the first-order
-// engine.
+// cannot be dropped in behind this interface.
 #pragma once
 
 #include "sor/core/result.hpp"
@@ -28,15 +24,14 @@ namespace sor::backend {
 using core::f64;
 
 // Host<->device traffic and kernel time. Accumulated INSIDE the backend so a
-// reported GPU time that omits transfer is unreachable through the API
-// (docs/architecture.md §3.3).
+// reported GPU time that omits transfer is unreachable through the API.
 struct TransferStats {
     std::uint64_t h2d_bytes = 0;
     std::uint64_t d2h_bytes = 0;
     double h2d_ms    = 0.0;
     double d2h_ms    = 0.0;
     double kernel_ms = 0.0;
-    double ipc_ms    = 0.0;   // prototype only: serialise + pipe round trip
+    double ipc_ms    = 0.0;   // reserved for out-of-process backends
     std::uint64_t calls = 0;
 
     void add(const TransferStats& o) noexcept {

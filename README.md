@@ -24,7 +24,7 @@ python3 scripts/sor_repl.py --one-shot
 | `--engine` | `simplex` (default) · `pdhg` · `hpr` · `milp` · `qp` |
 | `--backend` | `cpu` · `vulkan` · `cuda` (stub) |
 | `--method` | `auto` · `primal` · `dual` |
-| `--basis-update` | `product` (default) · `ft` |
+| `--basis-update` | `ft` (standalone LP default) · `product` (MILP node LP default) |
 
 Vulkan `LpDevice` builds by default (`-DSOR_ENABLE_VULKAN=ON`). CUDA is a stub.
 
@@ -33,7 +33,7 @@ Vulkan `LpDevice` builds by default (`-DSOR_ENABLE_VULKAN=ON`). CUDA is a stub.
 | Piece | Module |
 |---|---|
 | Primal + dual revised simplex, Harris/BFRT, DSE/Devex | `sor_engines` |
-| Markowitz LU, hypersparse FTRAN/BTRAN, FT opt-in | `sor_la_cpu` |
+| Markowitz LU, hypersparse FTRAN/BTRAN, FT default for standalone LP | `sor_la_cpu` |
 | Presolve v1, Ruiz scaling | `sor_presolve` / engines |
 | HPR on CPU/Vulkan; vanilla PDHG | `hpr.cpp` / `pdhg.cpp` |
 | MILP B&B (Latest: learned branch/cuts/LNS) | `sor_search` |
@@ -62,11 +62,7 @@ optimum (latest exact-binary check: ~27.8 s).
 | File | Role |
 |---|---|
 | [`docs/architecture.md`](docs/architecture.md) | Layers, flows, diagrams, capability ladder |
-| [`docs/SIH26119_PS_ALIGNMENT.md`](docs/SIH26119_PS_ALIGNMENT.md) | PS Must/Should map |
-| [`docs/SIH26119_PPT.md`](docs/SIH26119_PPT.md) | Idea-PPT speaker notes |
-| [`docs/SIH26119_DEMO_VIDEO.md`](docs/SIH26119_DEMO_VIDEO.md) | Film script |
-| [`docs/clean_room_policy.md`](docs/clean_room_policy.md) | Forbidden solver list |
 | [`docs/paper_bibliography.md`](docs/paper_bibliography.md) | Paper / DOI index |
-| [`docs/README.md`](docs/README.md) | Doc map |
+| [`solver_accl/VENDORED.md`](solver_accl/VENDORED.md) | Standalone first-party Julia solver |
 
 **Code wins** if a doc disagrees with headers or `CMakeLists.txt`.
