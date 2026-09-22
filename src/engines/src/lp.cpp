@@ -216,7 +216,8 @@ std::pair<core::RawResult, core::ProofEvidence> lift_reduced_candidate(
     core::RawResult raw,
     const core::LpOptions& options,
     const core::ProofEvidence& producer_ev,
-    const SimplexBasis* reduced_basis = nullptr) {
+    const SimplexBasis* reduced_basis = nullptr,
+    SimplexBasis* out_basis = nullptr) {
     if (raw.proposed_status == core::Status::Unbounded &&
         !raw.primal_ray.direction.empty()) {
         raw.primal_ray = presolve::recover_primal_ray(
@@ -235,6 +236,17 @@ std::pair<core::RawResult, core::ProofEvidence> lift_reduced_candidate(
         install_reduced_basis(reduced, *reduced_basis);
     const auto recovered = presolve::recover_solution(
         original, pmap, reduced, recovery_options(options));
+
+    if (out_basis != nullptr && recovered.basis.n_struct > 0) {
+        out_basis->n_struct = recovered.basis.n_struct;
+        out_basis->basic = recovered.basis.basic;
+        out_basis->status.resize(recovered.basis.status.size());
+        for (std::size_t k = 0; k < recovered.basis.status.size(); ++k) {
+            out_basis->status[k] = static_cast<NonbasicStatus>(
+                recovered.basis.status[k]);
+        }
+    }
+
     core::RawResult lifted = std::move(recovered.raw);
     lifted.proposed_status = raw.proposed_status;
     lifted.proposed_level = raw.proposed_level;
@@ -452,84 +464,84 @@ core::RawResult solve_lp(const model::LpProblem& problem,
         return finish(std::move(raw), ev);
     }
 
-    if (route == LpStrategy::Pdhg) {
-        const double stage_time = remaining_seconds(options, start, 1.0);
-        if (options.time_limit_s > 0.0 && stage_time <= 0.0) {
-            core::RawResult raw;
-            raw.proposed_status = core::Status::Interrupted;
-            raw.engine = "pdhg";
-            raw.termination_reason = "global time limit reached before PDHG";
-            core::ProofEvidence ev;
-            ev.primal_feas_tol = options.primal_feas_tol;
-            ev.dual_feas_tol = options.dual_feas_tol;
-            ev.gap_tol = options.gap_tol;
-            return finish(std::move(raw), ev);
-        }
-        auto backend = backend::make_backend(options.backend);
-        if (!backend) return unsupported(
-            "selected backend is unavailable for PDHG", diagnostics, evidence);
-        PdhgOptions pdhg_options;
-        if (options.max_iterations > 0)
-            pdhg_options.max_iterations = options.max_iterations;
-        pdhg_options.time_limit_s = stage_time;
-        pdhg_options.primal_tol = options.primal_feas_tol;
-        pdhg_options.dual_tol = options.dual_feas_tol;
-        pdhg_options.gap_tol = options.gap_tol;
-        PdhgDiagnostics pdhg_diag;
-        const auto fo_start = Clock::now();
-        core::RawResult raw = solve_pdhg(
-            work_problem, pdhg_options, *backend, pdhg_diag);
-        diagnostics.fo_elapsed_s = elapsed_seconds(fo_start);
-        const auto producer_ev = pdhg_evidence(pdhg_diag, pdhg_options);
-        if (presolve_map != nullptr) {
-            const auto lifted = lift_reduced_candidate(
-                problem, *presolve_map, std::move(raw), options, producer_ev);
-            diagnostics.fo_iterations = lifted.first.iterations;
-            return finish(std::move(lifted.first), lifted.second);
-        }
-        const auto ev = independently_checked(
-            problem, raw, producer_ev);
-        diagnostics.fo_iterations = pdhg_diag.iterations;
-        return finish(std::move(raw), ev);
-    }
-
-    if (route != LpStrategy::Hpr)
+    if (route != LpStrategy::Hpr && route != LpStrategy::Pdhg)
         return unsupported("unknown LP route", diagnostics, evidence);
 
-    auto device = backend::make_lp_device(options.backend);
-    if (!device) return unsupported(
-        "selected backend is unavailable for HPR", diagnostics, evidence);
     const bool is_auto = options.strategy == LpStrategy::Auto;
     const double fo_fraction = is_auto ? diagnostics.fo_budget_fraction : 1.0;
     const double fo_time = remaining_seconds(
         options, start, fo_fraction);
-    HprOptions hpr_options;
-    hpr_options.max_iterations = iteration_share(
-        options.max_iterations, fo_fraction, 200000);
-    hpr_options.time_limit_s = fo_time;
-    hpr_options.primal_tol = is_auto ? diagnostics.fo_target_tolerance
-                                     : options.primal_feas_tol;
-    hpr_options.dual_tol = is_auto ? diagnostics.fo_target_tolerance
-                                   : options.dual_feas_tol;
-    hpr_options.gap_tol = is_auto ? diagnostics.fo_target_tolerance
-                                  : options.gap_tol;
-    hpr_options.use_polishing = options.fo_polish;
-    hpr_options.detect_certificates = options.fo_certificates;
-    hpr_options.abandon_after_stalled_epochs =
-        is_auto ? 3 : 0;
-    HprDiagnostics hpr_diag;
+    
     core::RawResult fo_raw;
     core::ProofEvidence fo_ev;
+    
+    std::unique_ptr<backend::KernelBackend> pdhg_backend;
+    std::unique_ptr<backend::LpDevice> hpr_device;
+    if (route == LpStrategy::Pdhg) {
+        pdhg_backend = backend::make_backend(options.backend);
+        if (!pdhg_backend) return unsupported(
+            "selected backend is unavailable for PDHG", diagnostics, evidence);
+    } else {
+        hpr_device = backend::make_lp_device(options.backend);
+        if (!hpr_device) return unsupported(
+            "selected backend is unavailable for HPR", diagnostics, evidence);
+    }
+
     if (options.time_limit_s > 0.0 && fo_time <= 0.0) {
         fo_raw.proposed_status = core::Status::Interrupted;
-        fo_raw.engine = "hpr";
-        fo_raw.termination_reason = "global FO budget expired before HPR";
-        fo_ev.primal_feas_tol = hpr_options.primal_tol;
-        fo_ev.dual_feas_tol = hpr_options.dual_tol;
-        fo_ev.gap_tol = hpr_options.gap_tol;
-    } else {
+        fo_raw.engine = route == LpStrategy::Pdhg ? "pdhg" : "hpr";
+        fo_raw.termination_reason = "global FO budget expired before FO engine";
+        fo_ev.primal_feas_tol = is_auto ? diagnostics.fo_target_tolerance : options.primal_feas_tol;
+        fo_ev.dual_feas_tol = is_auto ? diagnostics.fo_target_tolerance : options.dual_feas_tol;
+        fo_ev.gap_tol = is_auto ? diagnostics.fo_target_tolerance : options.gap_tol;
+    } else if (route == LpStrategy::Pdhg) {
+        PdhgOptions pdhg_options;
+        pdhg_options.max_iterations = iteration_share(
+            options.max_iterations, fo_fraction, 200000);
+        pdhg_options.time_limit_s = fo_time;
+        pdhg_options.primal_tol = is_auto ? diagnostics.fo_target_tolerance
+                                          : options.primal_feas_tol;
+        pdhg_options.dual_tol = is_auto ? diagnostics.fo_target_tolerance
+                                        : options.dual_feas_tol;
+        pdhg_options.gap_tol = is_auto ? diagnostics.fo_target_tolerance
+                                       : options.gap_tol;
+        PdhgDiagnostics pdhg_diag;
         const auto fo_start = Clock::now();
-        fo_raw = solve_hpr(work_problem, hpr_options, *device, hpr_diag);
+        fo_raw = solve_pdhg(
+            work_problem, pdhg_options, *pdhg_backend, pdhg_diag);
+        diagnostics.fo_elapsed_s = elapsed_seconds(fo_start);
+        const auto producer_ev = pdhg_evidence(pdhg_diag, pdhg_options);
+        const bool defer_fo_lift = presolve_map != nullptr && is_auto;
+        if (defer_fo_lift) {
+            fo_ev = independently_checked(
+                work_problem, fo_raw, producer_ev);
+        } else if (presolve_map != nullptr) {
+            const auto lifted = lift_reduced_candidate(
+                problem, *presolve_map, std::move(fo_raw), options, producer_ev);
+            fo_raw = std::move(lifted.first);
+            fo_ev = lifted.second;
+        } else {
+            fo_ev = independently_checked(problem, fo_raw, producer_ev);
+        }
+        diagnostics.fo_iterations = pdhg_diag.iterations;
+    } else {
+        HprOptions hpr_options;
+        hpr_options.max_iterations = iteration_share(
+            options.max_iterations, fo_fraction, 200000);
+        hpr_options.time_limit_s = fo_time;
+        hpr_options.primal_tol = is_auto ? diagnostics.fo_target_tolerance
+                                         : options.primal_feas_tol;
+        hpr_options.dual_tol = is_auto ? diagnostics.fo_target_tolerance
+                                       : options.dual_feas_tol;
+        hpr_options.gap_tol = is_auto ? diagnostics.fo_target_tolerance
+                                      : options.gap_tol;
+        hpr_options.use_polishing = options.fo_polish;
+        hpr_options.detect_certificates = options.fo_certificates;
+        hpr_options.abandon_after_stalled_epochs =
+            is_auto ? 3 : 0;
+        HprDiagnostics hpr_diag;
+        const auto fo_start = Clock::now();
+        fo_raw = solve_hpr(work_problem, hpr_options, *hpr_device, hpr_diag);
         diagnostics.fo_elapsed_s = elapsed_seconds(fo_start);
         const auto producer_ev = hpr_evidence(hpr_diag, hpr_options);
         const bool defer_fo_lift = presolve_map != nullptr && is_auto;
@@ -544,11 +556,11 @@ core::RawResult solve_lp(const model::LpProblem& problem,
         } else {
             fo_ev = independently_checked(problem, fo_raw, producer_ev);
         }
+        diagnostics.fo_epochs_without_decay = hpr_diag.epochs_without_necessary_decay;
+        diagnostics.polish_attempts = hpr_diag.polish_attempts;
+        diagnostics.polish_iterations = hpr_diag.polish_iterations;
+        diagnostics.fo_iterations = fo_raw.iterations;
     }
-    diagnostics.fo_iterations = fo_raw.iterations;
-    diagnostics.fo_epochs_without_decay = hpr_diag.epochs_without_necessary_decay;
-    diagnostics.polish_attempts = hpr_diag.polish_attempts;
-    diagnostics.polish_iterations = hpr_diag.polish_iterations;
     // A requested non-CPU device that lacks a required HPR capability is a
     // capability refusal, not an invitation to silently finish on CPU.
     if (fo_raw.proposed_status == core::Status::Unsupported)
@@ -634,9 +646,15 @@ core::RawResult solve_lp(const model::LpProblem& problem,
             if (presolve_map != nullptr) {
                 const SimplexBasis* basis_for_lift =
                     crossover_diag.validated_basis ? &crossover_basis : nullptr;
+                SimplexBasis lifted_basis;
                 const auto lifted = lift_reduced_candidate(
                     problem, *presolve_map, std::move(crossed), options,
-                    crossover_producer, basis_for_lift);
+                    crossover_producer, basis_for_lift, &lifted_basis);
+                if (lifted_basis.n_struct > 0) {
+                    crossover_basis = std::move(lifted_basis);
+                } else {
+                    crossover_diag.validated_basis = false;
+                }
                 best_raw = std::move(lifted.first);
                 best_ev = lifted.second;
             } else {
