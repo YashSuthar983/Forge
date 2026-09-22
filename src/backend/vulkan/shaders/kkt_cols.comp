@@ -1,5 +1,7 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 // Column half of the device-side KKT reduction.  Mirrors the CPU LpDevice
 // term for term, including the un-scaling: residuals are reported in the
@@ -35,22 +37,28 @@ const uint SLOT_POBJ     = 3u;
 const uint SLOT_DOBJ_C   = 4u;
 const uint SLOT_EDX2     = 5u;
 
-shared double s_red[256];
+shared double s_red[32];
 
 double wg_reduce(double v, bool take_max) {
-    uint t = gl_LocalInvocationID.x;
-    barrier();
-    s_red[t] = v;
-    barrier();
-    for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (t < s) s_red[t] = take_max ? max(s_red[t], s_red[t + s])
-                                       : s_red[t] + s_red[t + s];
-        barrier();
+    double sg_v = take_max ? subgroupMax(v) : subgroupAdd(v);
+    uint sg_id = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    if (lane == 0u) {
+        s_red[sg_id] = sg_v;
     }
-    double r = s_red[0];
     barrier();
-    return r;
+
+    if (sg_id == 0u) {
+        double v2 = (lane < gl_NumSubgroups) ? s_red[lane] : (take_max ? -1.0e300 : 0.0lf);
+        v2 = take_max ? subgroupMax(v2) : subgroupAdd(v2);
+        if (lane == 0u) {
+            s_red[0] = v2;
+        }
+    }
+    barrier();
+    return s_red[0];
 }
+
 
 void main() {
     uint j = gl_GlobalInvocationID.x;

@@ -253,12 +253,12 @@ public:
             ? p.reflection_gamma : 0.0;
 
         for (std::uint32_t s = 0; s < k; ++s) {
-            record(cmd, pipe_spmv_csc_, layout_spmv_, set_csc, &pc_c, sizeof(pc_c), nc_);
+            record_spmv(cmd, pipe_spmv_csc_, layout_spmv_, set_csc, &pc_c, sizeof(pc_c), nc_);
             barrier(cmd);
             record(cmd, pipe_primal_, layout_primal_, set_primal,
                    &pc_primal, sizeof(pc_primal), nc_);
             barrier(cmd);
-            record(cmd, pipe_spmv_csr_, layout_spmv_, set_csr, &pc_r, sizeof(pc_r), nr_);
+            record_spmv(cmd, pipe_spmv_csr_, layout_spmv_, set_csr, &pc_r, sizeof(pc_r), nr_);
             barrier(cmd);
             record(cmd, pipe_dual_, layout_dual_, set_dual,
                    &pc_dual, sizeof(pc_dual), nr_);
@@ -331,8 +331,9 @@ public:
         // maintained A*x: the recursion is for the step's interaction term,
         // where drift is harmless, but a termination test must not be decided
         // on a drifted residual.
-        record(cmd, pipe_spmv_csr_, layout_spmv_, set_csr, &pc_r, sizeof(pc_r), nr_);
-        record(cmd, pipe_spmv_csc_, layout_spmv_, set_csc, &pc_c, sizeof(pc_c), nc_);
+        record_spmv(cmd, pipe_spmv_csr_, layout_spmv_, set_csr, &pc_r, sizeof(pc_r), nr_);
+        record_spmv(cmd, pipe_spmv_csc_, layout_spmv_, set_csc, &pc_c, sizeof(pc_c), nc_);
+
         barrier(cmd);
         record(cmd, pipe_kkt_cols_, layout_kkt_cols_, set_cols,
                &pc_k_cols, sizeof(pc_k_cols), nc_);
@@ -513,6 +514,13 @@ private:
             1, static_cast<std::uint32_t>((n + kGroup - 1) / kGroup));
     }
 
+    static std::uint32_t groups_spmv(std::size_t n) {
+        // Subgroup SpMV assigns 1 subgroup per row/col. Dispatching (n + 3) / 4 workgroups
+        // ensures at least n subgroups are active for any hardware subgroup size (up to 64).
+        return std::max<std::uint32_t>(
+            1, static_cast<std::uint32_t>((n + 3) / 4));
+    }
+
     void require_up() const {
         if (!uploaded_) throw std::logic_error("VulkanLpDevice: upload required");
     }
@@ -563,7 +571,7 @@ private:
         write_ssbos(set, {&b_row_ptr_, &b_col_idx_, &b_csr_vals_, &b_x_, &b_Ax_cur_});
         const PCSpmv pc{static_cast<uint32_t>(nr_), 0};
         VkCommandBuffer cmd = begin_once();
-        record(cmd, pipe_spmv_csr_, layout_spmv_, set, &pc, sizeof(pc), nr_);
+        record_spmv(cmd, pipe_spmv_csr_, layout_spmv_, set, &pc, sizeof(pc), nr_);
         barrier_compute_to_transfer(cmd);
         copy_in(cmd, b_Ax_cur_, b_Ax_fixed_, nr_);
         end_submit_wait(cmd);
@@ -579,6 +587,18 @@ private:
                            static_cast<uint32_t>(push_size), push);
         vkCmdDispatch(cmd, groups(n), 1, 1);
     }
+
+    void record_spmv(VkCommandBuffer cmd, VkPipeline pipe, VkPipelineLayout layout,
+                     VkDescriptorSet set, const void* push, std::size_t push_size,
+                     std::size_t n) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1,
+                                &set, 0, nullptr);
+        vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           static_cast<uint32_t>(push_size), push);
+        vkCmdDispatch(cmd, groups_spmv(n), 1, 1);
+    }
+
 
     std::vector<uint32_t> read_spv(const char* name) {
         const std::string path = std::string(SOR_SHADER_DIR) + "/" + name;
@@ -1015,6 +1035,7 @@ std::unique_ptr<LpDevice> make_vulkan_lp_device(int device) {
     try {
         return std::make_unique<VulkanLpDevice>(std::move(ctx));
     } catch (const std::exception& e) {
+        std::printf("[DEBUG] SOR Vulkan LpDevice failed exception: %s\n", e.what());
         std::fprintf(stderr, "SOR Vulkan LpDevice failed: %s\n", e.what());
         return nullptr;
     }

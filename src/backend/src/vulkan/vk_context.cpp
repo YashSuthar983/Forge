@@ -36,6 +36,7 @@ std::unique_ptr<Context> Context::create(int device_index) {
         uint32_t nphys = 0;
         check(vkEnumeratePhysicalDevices(ctx->instance_, &nphys, nullptr),
               "enumerate devices count");
+        std::printf("[DEBUG] Found %u physical devices\n", nphys);
         if (nphys == 0) return nullptr;
         std::vector<VkPhysicalDevice> phys(nphys);
         check(vkEnumeratePhysicalDevices(ctx->instance_, &nphys, phys.data()),
@@ -103,6 +104,7 @@ std::unique_ptr<Context> Context::create(int device_index) {
             c.score = score;
             cands.push_back(c);
         }
+        std::printf("[DEBUG] Found %zu valid candidates\n", cands.size());
         if (cands.empty()) return nullptr;
         std::sort(cands.begin(), cands.end(),
                   [](const Cand& a, const Cand& b) { return a.score > b.score; });
@@ -122,11 +124,16 @@ std::unique_ptr<Context> Context::create(int device_index) {
         VkPhysicalDeviceFeatures en_feats{};
         en_feats.shaderFloat64 = pick.info.shader_float64 ? VK_TRUE : VK_FALSE;
 
+        VkPhysicalDeviceVulkan12Features feats12{};
+        feats12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+        feats12.shaderSubgroupExtendedTypes = VK_TRUE;
+
         VkDeviceCreateInfo dci{};
         dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
         dci.pEnabledFeatures = &en_feats;
+        dci.pNext = &feats12;
         check(vkCreateDevice(ctx->physical_, &dci, nullptr, &ctx->device_),
               "vkCreateDevice");
         vkGetDeviceQueue(ctx->device_, ctx->queue_family_, 0, &ctx->queue_);
@@ -160,6 +167,7 @@ std::unique_ptr<Context> Context::create(int device_index) {
                      ctx->info_.device_local_bytes / (1024.0 * 1024.0));
         return ctx;
     } catch (const std::exception& e) {
+        std::printf("[DEBUG] SOR Vulkan unavailable exception: %s\n", e.what());
         std::fprintf(stderr, "SOR Vulkan unavailable: %s\n", e.what());
         return nullptr;
     }
