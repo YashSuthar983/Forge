@@ -50,7 +50,7 @@ process wall time separately in JSONL:
 | Solver | Solved | SGM |
 |---|---:|---:|
 | SOR-simplex | **93/93** (`ProvedOptimalFP`) | 0.2189 s |
-| HiGHS (external, 1 thread) | 93/93 | 0.0866 s |
+| reference solver (external process, never linked, 1 thread) | 93/93 | 0.0866 s |
 
 The dispatch fix cuts `fit2d` from 8,912 pivots / ~2.6 s to 219 pivots /
 ~0.13 s internal. Periodic dual-state refresh plus uninterrupted large-sparse
@@ -61,8 +61,7 @@ optimum (latest exact-binary check: ~27.8 s).
 
 | File | Role |
 |---|---|
-| [`docs/architecture.md`](docs/architecture.md) | Layers, flows, diagrams, capability ladder |
-| [`docs/paper_bibliography.md`](docs/paper_bibliography.md) | Paper / DOI index |
+| [`QP.md`](QP.md) | Layout, engines and what each may claim, the claim discipline, measurements, references |
 | [`solver_accl/VENDORED.md`](solver_accl/VENDORED.md) | Standalone first-party Julia solver |
 
 **Code wins** if a doc disagrees with headers or `CMakeLists.txt`.
