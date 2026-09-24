@@ -1,0 +1,41 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Row-side terms of the HPR-QP KKT check, one row per thread:
+//   viol[i] = dist(A xbar, [row_lo, row_hi])_i        -> max-reduced
+//   sup[i]  = sup_{s in K_i} (-ybar_i * s)            -> sum-reduced
+//   infl[i] = 1 if that support term is +inf, else 0  -> max-reduced
+// An infinite support term makes the dual bound -inf; it is flagged rather
+// than stored so the sum stays finite and the host decides.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC { uint m; } pc;
+
+layout(std430, binding = 0) readonly  buffer AxBuf   { double ax[]; };
+layout(std430, binding = 1) readonly  buffer RLoBuf  { double rlo[]; };
+layout(std430, binding = 2) readonly  buffer RHiBuf  { double rhi[]; };
+layout(std430, binding = 3) readonly  buffer YbarBuf { double ybar[]; };
+layout(std430, binding = 4) writeonly buffer ViolBuf { double viol[]; };
+layout(std430, binding = 5) writeonly buffer SupBuf  { double sup[]; };
+layout(std430, binding = 6) writeonly buffer InfBuf  { double infl[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.m) return;
+    double v = ax[i];
+    double lo = rlo[i], hi = rhi[i];
+    double r = 0.0lf;
+    if (v < lo) r = lo - v;
+    if (v > hi) r = max(r, v - hi);
+    viol[i] = r;
+
+    double mu = ybar[i];
+    double t = 0.0lf, f = 0.0lf;
+    if (mu != 0.0lf) {
+        double at = (mu < 0.0lf) ? hi : lo;
+        if (isinf(at)) f = 1.0lf; else t = -mu * at;
+    }
+    sup[i] = t;
+    infl[i] = f;
+}

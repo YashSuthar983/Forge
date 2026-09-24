@@ -3,8 +3,10 @@
 // hpr_steps does zero host sync of vectors.
 #include "sor/backend/lp_device.hpp"
 #include "sor/backend/vulkan/vk_context.hpp"
+#include "vk_profiler.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -46,9 +48,13 @@ class VulkanLpDevice final : public LpDevice {
 public:
     explicit VulkanLpDevice(std::unique_ptr<vk::Context> ctx) : ctx_(std::move(ctx)) {
         load_pipelines();
+        prof_ = std::make_unique<vk::KernelProfiler>(*ctx_, "lp");
     }
 
-    ~VulkanLpDevice() override { destroy_all(); }
+    ~VulkanLpDevice() override {
+        prof_.reset();   // prints the SOR_VK_PROFILE table while the device lives
+        destroy_all();
+    }
 
     std::string_view name() const override { return "vulkan"; }
     bool is_accelerated() const override { return true; }
@@ -231,6 +237,7 @@ public:
         }
 
         VkCommandBuffer cmd = begin_once();
+        prof_->begin_cmd(cmd);
         for (std::uint32_t s = 0; s < k; ++s) {
             PC1 pc_c{static_cast<uint32_t>(nc_), 0};
             PC1 pc_r{static_cast<uint32_t>(nr_), 0};
@@ -246,7 +253,7 @@ public:
                                     layout_spmv_csc_, 0, 1, &set_csc, 0, nullptr);
             vkCmdPushConstants(cmd, layout_spmv_csc_, VK_SHADER_STAGE_COMPUTE_BIT,
                                0, sizeof(pc_c), &pc_c);
-            dispatch(cmd, nc_);
+            dispatch(cmd, nc_, "spmv_csc");
             barrier(cmd);
 
             alignas(8) struct { uint32_t n; uint32_t pad; double tau; } pc_p{
@@ -256,7 +263,7 @@ public:
                                     layout_primal_, 0, 1, &set_primal, 0, nullptr);
             vkCmdPushConstants(cmd, layout_primal_, VK_SHADER_STAGE_COMPUTE_BIT,
                                0, sizeof(pc_p), &pc_p);
-            dispatch(cmd, nc_);
+            dispatch(cmd, nc_, "primal_step");
             barrier(cmd);
 
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_spmv_csr_);
@@ -264,7 +271,7 @@ public:
                                     layout_spmv_csr_, 0, 1, &set_csr, 0, nullptr);
             vkCmdPushConstants(cmd, layout_spmv_csr_, VK_SHADER_STAGE_COMPUTE_BIT,
                                0, sizeof(pc_r), &pc_r);
-            dispatch(cmd, nr_);
+            dispatch(cmd, nr_, "spmv_csr");
             barrier(cmd);
 
             if (p.use_halpern) {
@@ -279,7 +286,7 @@ public:
                                     layout_dual_, 0, 1, &set_dual, 0, nullptr);
             vkCmdPushConstants(cmd, layout_dual_, VK_SHADER_STAGE_COMPUTE_BIT,
                                0, sizeof(pc_d), &pc_d);
-            dispatch(cmd, nr_);
+            dispatch(cmd, nr_, "dual_step");
             barrier(cmd);
 
             if (p.use_halpern) {
@@ -296,14 +303,14 @@ public:
                                         layout_halpern_, 0, 1, &set_hal_x, 0, nullptr);
                 vkCmdPushConstants(cmd, layout_halpern_, VK_SHADER_STAGE_COMPUTE_BIT,
                                    0, sizeof(pc_h), &pc_h);
-                dispatch(cmd, nc_);
+                dispatch(cmd, nc_, "halpern_mix");
                 barrier(cmd);
                 pc_h.n = static_cast<uint32_t>(nr_);
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                         layout_halpern_, 0, 1, &set_hal_y, 0, nullptr);
                 vkCmdPushConstants(cmd, layout_halpern_, VK_SHADER_STAGE_COMPUTE_BIT,
                                    0, sizeof(pc_h), &pc_h);
-                dispatch(cmd, nr_);
+                dispatch(cmd, nr_, "halpern_mix");
                 barrier(cmd);
             }
 
@@ -315,20 +322,23 @@ public:
                                         layout_avg_, 0, 1, &set_avg_x, 0, nullptr);
                 vkCmdPushConstants(cmd, layout_avg_, VK_SHADER_STAGE_COMPUTE_BIT,
                                    0, sizeof(pc_a), &pc_a);
-                dispatch(cmd, nc_);
+                dispatch(cmd, nc_, "avg_update");
                 barrier(cmd);
                 pc_a.n = static_cast<uint32_t>(nr_);
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                         layout_avg_, 0, 1, &set_avg_y, 0, nullptr);
                 vkCmdPushConstants(cmd, layout_avg_, VK_SHADER_STAGE_COMPUTE_BIT,
                                    0, sizeof(pc_a), &pc_a);
-                dispatch(cmd, nr_);
+                dispatch(cmd, nr_, "avg_update");
                 barrier(cmd);
             }
             ++epoch_step_;
             ++stats_.calls;
         }
+        const auto t_submit = std::chrono::steady_clock::now();
         end_submit_wait(cmd);
+        prof_->collect(std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - t_submit).count());
     }
 
     Kkt reduce_kkt() override {
@@ -734,9 +744,11 @@ private:
                              0, 1, &mb, 0, nullptr, 0, nullptr);
     }
 
-    void dispatch(VkCommandBuffer cmd, std::size_t n) {
+    void dispatch(VkCommandBuffer cmd, std::size_t n, const char* kernel) {
         const uint32_t g = static_cast<uint32_t>((n + 255) / 256);
+        if (prof_->on()) prof_->before(cmd, kernel);
         vkCmdDispatch(cmd, std::max(1u, g), 1, 1);
+        prof_->after(cmd);
     }
 
     VkDescriptorSet alloc_set(VkDescriptorSetLayout dsl) {
@@ -842,6 +854,7 @@ private:
     std::uint64_t avg_count_ = 0;
     std::uint64_t epoch_step_ = 0;
     TransferStats stats_{};
+    std::unique_ptr<vk::KernelProfiler> prof_;   // inert unless SOR_VK_PROFILE
 
     sparse::CsrMatrix A_csr_;
     sparse::CscMatrix A_csc_;

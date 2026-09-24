@@ -1,0 +1,54 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Per-lane reduction over K interleaved lanes, two passes, no atomics.
+//   op 0: sum a*b    op 1: max a (a >= 0; identity 0)    op 2: sum a
+// Pass 1: workgroup (l, g), g < G, grid-strides lane l's entries into
+// partials[l*G + g].  Pass 2: workgroup l folds its G partials into
+// outv[out_off + l].  Fixed tree order: reproducible run to run.
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint n; uint K; uint op; uint G; uint out_off; uint pass_;
+} pc;
+
+layout(std430, binding = 0) readonly buffer AB   { double a[]; };
+layout(std430, binding = 1) readonly buffer BB   { double b[]; };
+layout(std430, binding = 2) buffer PB            { double partials[]; };
+layout(std430, binding = 3) writeonly buffer OB  { double outv[]; };
+
+shared double sh[256];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    double acc = 0.0lf;
+    uint l;
+    if (pc.pass_ == 1u) {
+        l = gl_WorkGroupID.x / pc.G;
+        uint g = gl_WorkGroupID.x - l * pc.G;
+        for (uint j = g * 256u + lid; j < pc.n; j += pc.G * 256u) {
+            uint idx = j * pc.K + l;
+            if (pc.op == 0u)      acc += a[idx] * b[idx];
+            else if (pc.op == 1u) acc = max(acc, a[idx]);
+            else                  acc += a[idx];
+        }
+    } else {
+        l = gl_WorkGroupID.x;
+        for (uint g = lid; g < pc.G; g += 256u) {
+            double v = partials[l * pc.G + g];
+            if (pc.op == 1u) acc = max(acc, v); else acc += v;
+        }
+    }
+    sh[lid] = acc;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (lid < s) {
+            if (pc.op == 1u) sh[lid] = max(sh[lid], sh[lid + s]);
+            else             sh[lid] = sh[lid] + sh[lid + s];
+        }
+        barrier();
+    }
+    if (lid != 0u) return;
+    if (pc.pass_ == 1u) partials[gl_WorkGroupID.x] = sh[0];
+    else outv[pc.out_off + l] = sh[0];
+}

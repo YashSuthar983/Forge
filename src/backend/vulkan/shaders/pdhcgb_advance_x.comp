@@ -1,0 +1,35 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Batched pdhcg_advance_x: xbar = 2 xc - x_old; x_new = xc or the reflected
+// Halpern mix; x_prev = x_old; mv = (x_new - x_old)^2; x = x_new.
+// Batched layout: lane l of entry j lives at [j*K + l] (lanes interleaved,
+// so neighbouring threads touch neighbouring lanes).  mask[l] != 0 selects
+// the lanes this dispatch may touch; masked-out lanes are left untouched.
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint n; uint K; uint halpern; uint pad; double a; double t; } pc;
+
+layout(std430, binding = 0) readonly  buffer XcBuf    { double xc[]; };
+layout(std430, binding = 1) readonly  buffer X0Buf    { double x0[]; };
+layout(std430, binding = 2) buffer XprevBuf           { double xprev[]; };
+layout(std430, binding = 3) buffer XBuf               { double x[]; };
+layout(std430, binding = 4) writeonly buffer XbarBuf  { double xbar[]; };
+layout(std430, binding = 5) writeonly buffer MvBuf    { double mv[]; };
+layout(std430, binding = 6) readonly  buffer MK       { double mask[]; };
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    if (g >= pc.n * pc.K) return;
+    if (mask[g % pc.K] == 0.0lf) return;
+    double xo = x[g];
+    double cand = xc[g];
+    xbar[g] = 2.0lf * cand - xo;
+    double xn = cand;
+    if (pc.halpern != 0u)
+        xn = (1.0lf + pc.t) * (pc.a * cand + (1.0lf - pc.a) * x0[g]) - pc.t * xprev[g];
+    xprev[g] = xo;
+    double d = xn - xo;
+    mv[g] = d * d;
+    x[g] = xn;
+}

@@ -1,0 +1,19 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Projected gradient step of the inner loop: trial = clamp(xin - alpha grad).
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint n; uint pad; double alpha; } pc;
+
+layout(std430, binding = 0) readonly  buffer XinBuf   { double xin[]; };
+layout(std430, binding = 1) readonly  buffer GradBuf  { double grad[]; };
+layout(std430, binding = 2) readonly  buffer LoBuf    { double lo[]; };
+layout(std430, binding = 3) readonly  buffer HiBuf    { double hi[]; };
+layout(std430, binding = 4) writeonly buffer TrialBuf { double trial[]; };
+
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.n) return;
+    trial[j] = max(lo[j], min(xin[j] - pc.alpha * grad[j], hi[j]));
+}

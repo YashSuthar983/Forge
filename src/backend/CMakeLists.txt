@@ -4,7 +4,16 @@
 set(SOR_SHADER_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders)
 set(SOR_SHADER_BINARY_DIR ${CMAKE_BINARY_DIR}/shaders)
 set(SOR_SHADER_NAMES
-  spmv_csr spmv_csc primal_step dual_step halpern_mix avg_update)
+  spmv_csr spmv_csc primal_step dual_step halpern_mix avg_update
+  qp_x_step qp_v_build qp_y_step qp_w_halpern
+  vec_axpby vec_reduce qp_kkt_rows qp_kkt_cols
+  pdhcg_diag_prox pdhcg_grad pdhcg_trial pdhcg_bb pdhcg_advance_x pdhcg_advance_y
+  pdhcg_eval_cols pdhcg_eval_rows
+  bq_gain bq_select bq_apply bq_save_best bq_perturb bq_rebuild_h bq_rebuild_r bq_rescore
+  spmvb_csr spmvb_csc vec_copy_lanes vec_reduce_lanes
+  pdhcgb_diag_prox pdhcgb_grad pdhcgb_trial pdhcgb_bb pdhcgb_advance_x pdhcgb_advance_y
+  pdhcgb_eval_cols pdhcgb_eval_rows
+  bench_fma_f32 bench_fma_f64)   # sor_gpu_bench only
 
 if(SOR_ENABLE_VULKAN)
   find_package(Vulkan REQUIRED)
@@ -29,9 +38,18 @@ set(SOR_BACKEND_SOURCES
   src/cpu_backend.cpp
   src/backend_factory.cpp
   src/cpu_lp_device.cpp
+  src/cpu_qp_device.cpp
+  src/cpu_pdhcg_device.cpp
+  src/cpu_binquad_device.cpp
+  src/lanes_pdhcg_device.cpp
   src/lp_device_batch.cpp)
 if(SOR_ENABLE_VULKAN)
-  list(APPEND SOR_BACKEND_SOURCES src/vulkan/vk_context.cpp src/vulkan/vk_lp_device.cpp)
+  list(APPEND SOR_BACKEND_SOURCES src/vulkan/vk_context.cpp src/vulkan/vk_compute.cpp src/vulkan/vk_profiler.cpp
+                                  src/vulkan/vk_lp_device.cpp
+                                  src/vulkan/vk_qp_device.cpp
+                                  src/vulkan/vk_pdhcg_device.cpp
+                                  src/vulkan/vk_binquad_device.cpp
+                                  src/vulkan/vk_batched_pdhcg_device.cpp)
 else()
   list(APPEND SOR_BACKEND_SOURCES src/vulkan_stub.cpp)
 endif()

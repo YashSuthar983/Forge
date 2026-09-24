@@ -1,0 +1,35 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Batched pdhcg_diag_prox: xc = clamp((x - tau (c + aty)) / (1 + tau q)),
+// c and q shared, bounds per lane.
+// Batched layout: lane l of entry j lives at [j*K + l] (lanes interleaved,
+// so neighbouring threads touch neighbouring lanes).  mask[l] != 0 selects
+// the lanes this dispatch may touch; masked-out lanes are left untouched.
+
+// tau/sigma are PER LANE (a mapped buffer, one value per lane): the primal
+// weight rebalances them per lane, so a lane batched with others takes the
+// same steps it would take solved alone.
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint n; uint K; } pc;
+
+layout(std430, binding = 0) readonly  buffer XBuf   { double x[]; };
+layout(std430, binding = 1) readonly  buffer CBuf   { double c[]; };
+layout(std430, binding = 2) readonly  buffer AtyBuf { double aty[]; };
+layout(std430, binding = 3) readonly  buffer QdBuf  { double qd[]; };
+layout(std430, binding = 4) readonly  buffer LoBuf  { double lo[]; };
+layout(std430, binding = 5) readonly  buffer HiBuf  { double hi[]; };
+layout(std430, binding = 6) writeonly buffer XcBuf  { double xc[]; };
+layout(std430, binding = 7) readonly  buffer MK     { double mask[]; };
+layout(std430, binding = 8) readonly  buffer TB     { double tau[]; };
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    if (g >= pc.n * pc.K) return;
+    uint j = g / pc.K, l = g - j * pc.K;
+    if (mask[l] == 0.0lf) return;
+    double t = tau[l];
+    double v = (x[g] - t * (c[j] + aty[g])) / (1.0lf + t * qd[j]);
+    xc[g] = max(lo[g], min(v, hi[g]));
+}
