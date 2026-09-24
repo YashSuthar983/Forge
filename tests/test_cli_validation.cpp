@@ -427,6 +427,54 @@ void test_bad_engine_option_is_refused() {
     CHECK(contains(frac.output, "whole number"));
 }
 
+
+// A zero-column model must not be reported as solved by ANY engine.
+//
+// Raised in review on the QP routes: a zero-column .qps still came back
+// "Optimal / ProvedKKT". The first fix guarded only the LP path, so the four
+// quadratic engines still claimed it -- which is why the guard now sits in the
+// shared QP loader and in the QPLIB reader rather than at each call site.
+//
+// Sweeping every engine rather than the reported one also turned up a
+// zero-variable QPLIB instance that made the mixed-integer path claim
+// ProvedGlobalEpsilon and made the binary-quadratic path SEGFAULT. A
+// per-engine loop is the only assertion shape that catches those.
+void test_zero_column_model_is_refused_by_every_engine() {
+    const fs::path tmp = fs::temp_directory_path();
+    const std::string qps = (tmp / "sor_cli_zerocol.qps").string();
+    {
+        std::ofstream out(qps);
+        out << "NAME          ZEROCOL\nROWS\n N  COST\nCOLUMNS\nRHS\nBOUNDS\nENDATA\n";
+    }
+    const std::string qplib = (tmp / "sor_cli_zerovar.qplib").string();
+    {
+        std::ofstream out(qplib);
+        out << "ZEROVAR\nLCL\nminimize\n0\n0\n0.0\n0\n0.0\n0\n1e20\n";
+    }
+
+    const char* engines[] = {"simplex", "auto", "qp", "qpipm", "qpauto",
+                             "hprqp", "binquad", "qcqplocal", "global", "miqp"};
+    for (const std::string& input : {qps, qplib}) {
+        for (const char* eng : engines) {
+            const Run r = run({solve_exe, input, "--engine", eng,
+                               "--time-limit", "3"});
+            // no claim of optimality, however the engine chooses to decline
+            const bool claimed = contains(r.output, "ProvedOptimal") ||
+                                 contains(r.output, "ProvedKKT") ||
+                                 contains(r.output, "ProvedGlobal") ||
+                                 contains(r.output, "status:            Optimal");
+            CHECK(!claimed);
+            // and it must not die on a signal
+            CHECK(r.exit_code >= 0 && r.exit_code < 128);
+            if (claimed || r.exit_code >= 128)
+                std::fprintf(stderr, "  %s on %s: exit %d\n", eng,
+                             input.c_str(), r.exit_code);
+        }
+    }
+    fs::remove(qps);
+    fs::remove(qplib);
+}
+
 int main() {
     const fs::path src(SOR_SOURCE_DIR), bin(SOR_BINARY_DIR);
     solve_exe = (bin / "sor_solve").string();
@@ -440,6 +488,7 @@ int main() {
     }
 
     test_unusable_input_is_refused();
+    test_zero_column_model_is_refused_by_every_engine();
     test_unwritable_solution_out_is_refused();
     test_bad_engine_option_is_refused();
 

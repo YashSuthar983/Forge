@@ -738,12 +738,12 @@ static void print_local_result(const sor::io::QplibInstance& q,
 // code. Factored out when hprqp arrived rather than duplicated, because the two
 // engines must accept exactly the same inputs or "--engine hprqp" silently
 // means something different from "--engine qp" on the same file.
-static bool load_qp_problem(sor::engines::QpProblem& qp,
-                            const std::string& path,
-                            const std::string& q_diag_arg,
-                            bool path_is_qps,
-                            bool mps_format_forced,
-                            const sor::io::MpsReadOptions& mps_opts) {
+static bool load_qp_problem_impl(sor::engines::QpProblem& qp,
+                                 const std::string& path,
+                                 const std::string& q_diag_arg,
+                                 bool path_is_qps,
+                                 bool mps_format_forced,
+                                 const sor::io::MpsReadOptions& mps_opts) {
     if (!q_diag_arg.empty()) {
         sor::io::MpsReadReport rep;
         qp.linear = mps_format_forced
@@ -781,6 +781,35 @@ static bool load_qp_problem(sor::engines::QpProblem& qp,
     std::fprintf(stderr,
                  "error: a quadratic engine needs a .qps file or --q-diag\n");
     return false;
+}
+
+// Every QP route loads through here, and a model with no columns is refused for
+// all of them in ONE place rather than at each call site.
+//
+// A zero-column problem is vacuously optimal -- no variables, nothing to
+// violate, objective 0 -- so the engines are not wrong to converge on it. The
+// danger is that this is indistinguishable from a file that did not parse, and
+// what the caller sees is "Optimal / ProvedKKT" for input that carried no
+// model. An earlier fix guarded only the LP path, so the four quadratic engines
+// still claimed it; putting the check in the shared loader is what stops the
+// next route from reintroducing it.
+static bool load_qp_problem(sor::engines::QpProblem& qp,
+                            const std::string& path,
+                            const std::string& q_diag_arg,
+                            bool path_is_qps,
+                            bool mps_format_forced,
+                            const sor::io::MpsReadOptions& mps_opts) {
+    if (!load_qp_problem_impl(qp, path, q_diag_arg, path_is_qps, mps_format_forced, mps_opts))
+        return false;
+    if (qp.linear.n_cols() == 0) {
+        std::fprintf(stderr,
+                     "error: %s contains no variables -- nothing to solve. A model "
+                     "with no columns is almost always a file that did not parse as "
+                     "the format it was read as.\n",
+                     path.c_str());
+        return false;
+    }
+    return true;
 }
 
 int main(int argc, char** argv) {
