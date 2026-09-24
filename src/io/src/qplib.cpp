@@ -368,6 +368,14 @@ QplibInstance read_qplib_file(const std::string& path, QplibReadReport& rep) {
     q.maximize = sense.rfind("max", 0) == 0;
 
     q.n = cur.integer();
+    // Refuse a non-positive variable count here rather than downstream. Every
+    // engine treats a zero-variable model as vacuously solved -- no variables,
+    // nothing to violate, objective 0 -- so what a caller sees is a proved
+    // optimum for a file that carried no model, and one engine indexed into the
+    // empty problem and crashed. The format has no use for n <= 0, so this is a
+    // malformed instance, and the reader is the one place that covers every
+    // caller.
+    if (q.n <= 0) cur.fail("variable count must be positive, got " + std::to_string(q.n));
     // The m line, the A section and the constraint-bound sections are ALL
     // ABSENT when the instance has no general linear constraints (constraint
     // type 'N' or 'B' -- verified on real QBB files, where the H count
