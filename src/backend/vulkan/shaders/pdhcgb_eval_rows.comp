@@ -1,0 +1,37 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Batched pdhcg_eval_rows: per-lane row terms of the convergence check.
+// Batched layout: lane l of entry j lives at [j*K + l] (lanes interleaved,
+// so neighbouring threads touch neighbouring lanes).  mask[l] != 0 selects
+// the lanes this dispatch may touch; masked-out lanes are left untouched.
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint m; uint K; } pc;
+
+layout(std430, binding = 0) readonly  buffer AxBuf   { double ax[]; };
+layout(std430, binding = 1) readonly  buffer YBuf    { double y[]; };
+layout(std430, binding = 2) readonly  buffer LoBuf   { double lo[]; };
+layout(std430, binding = 3) readonly  buffer HiBuf   { double hi[]; };
+layout(std430, binding = 4) writeonly buffer ViolBuf { double viol[]; };
+layout(std430, binding = 5) writeonly buffer DresBuf { double dres[]; };
+layout(std430, binding = 6) writeonly buffer PyBuf   { double py[]; };
+layout(std430, binding = 7) writeonly buffer PinfBuf { double pinf[]; };
+layout(std430, binding = 8) readonly  buffer MK      { double mask[]; };
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    if (g >= pc.m * pc.K) return;
+    if (mask[g % pc.K] == 0.0lf) return;
+    double a = ax[g], yi = y[g], lw = lo[g], h = hi[g];
+    double v = 0.0lf;
+    if (a < lw) v = lw - a;
+    if (a > h) v = max(v, a - h);
+    viol[g] = v;
+    dres[g] = abs(a - max(lw, min(a + yi, h)));
+    double p = 0.0lf, f = 0.0lf;
+    if (yi > 0.0lf) { if (isinf(h)) f = 1.0lf; else p = h * yi; }
+    else if (yi < 0.0lf) { if (isinf(lw)) f = 1.0lf; else p = lw * yi; }
+    py[g] = p;
+    pinf[g] = f;
+}

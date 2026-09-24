@@ -1,0 +1,24 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// PDHCG-II x-prox for a DIAGONAL Q, closed form (no inner loop):
+//   xc = clamp((x - tau (c + A'y)) / (1 + tau q), lo, hi)
+// clamp is written max(lo, min(v, hi)) to match the CPU oracle exactly.
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint n; uint pad; double tau; } pc;
+
+layout(std430, binding = 0) readonly  buffer XBuf   { double x[]; };
+layout(std430, binding = 1) readonly  buffer CBuf   { double c[]; };
+layout(std430, binding = 2) readonly  buffer AtyBuf { double aty[]; };
+layout(std430, binding = 3) readonly  buffer QdBuf  { double qd[]; };
+layout(std430, binding = 4) readonly  buffer LoBuf  { double lo[]; };
+layout(std430, binding = 5) readonly  buffer HiBuf  { double hi[]; };
+layout(std430, binding = 6) writeonly buffer XcBuf  { double xc[]; };
+
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.n) return;
+    double v = (x[j] - pc.tau * (c[j] + aty[j])) / (1.0lf + pc.tau * qd[j]);
+    xc[j] = max(lo[j], min(v, hi[j]));
+}

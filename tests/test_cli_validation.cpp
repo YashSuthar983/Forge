@@ -359,6 +359,122 @@ void test_sor_check_tolerance_validation() {
 
 }  // namespace
 
+
+// Unreadable or model-less input must never produce a CLAIM.
+//
+// This is the failure these cases exist to prevent: the readers return an EMPTY
+// model rather than an error, an empty LP is trivially optimal, and the solver
+// therefore reported "Optimal / ProvedOptimalFP / objective 0" for a directory,
+// an empty file, or a file that did not parse. A confident proof for input that
+// was never read is worse than any crash, and worse than a plain error.
+void test_unusable_input_is_refused() {
+    const fs::path tmp = fs::temp_directory_path();
+    const std::string missing = (tmp / "sor_cli_no_such_model.mps").string();
+    fs::remove(missing);
+    const std::string empty_file = (tmp / "sor_cli_empty.mps").string();
+    { std::ofstream out(empty_file); }
+    const std::string nomodel = (tmp / "sor_cli_nomodel.mps").string();
+    {
+        std::ofstream out(nomodel);
+        out << "NAME          NOTHING\nROWS\nCOLUMNS\nRHS\nBOUNDS\nENDATA\n";
+    }
+
+    struct Case { std::string path; const char* what; };
+    const Case cases[] = {
+        {missing, "missing file"},
+        {tmp.string(), "a directory"},
+        {empty_file, "an empty file"},
+        {nomodel, "a file with no columns"},
+    };
+    for (const auto& c : cases) {
+        const Run r = run({solve_exe, c.path, "--engine", "auto"});
+        // nonzero exit, and above all NOT a claim of optimality
+        CHECK(r.exit_code != 0);
+        CHECK(!contains(r.output, "ProvedOptimalFP"));
+        CHECK(!contains(r.output, "status:            Optimal"));
+        CHECK(contains(r.output, "error:"));
+        if (r.exit_code == 0 || contains(r.output, "ProvedOptimalFP"))
+            std::fprintf(stderr, "  %s was not refused\n", c.what);
+    }
+    fs::remove(empty_file);
+    fs::remove(nomodel);
+}
+
+// An output path that cannot be written is refused BEFORE solving, so a long
+// solve does not finish into a file that was never openable.
+void test_unwritable_solution_out_is_refused() {
+    const Run r = run({solve_exe, model, "--engine", "auto", "--time-limit", "30",
+                       "--solution-out", "/sor_no_such_dir/x.sol"});
+    CHECK(r.exit_code != 0);
+    CHECK(contains(r.output, "--solution-out"));
+    // refused up front: the run must not have got as far as reporting a status
+    CHECK(!contains(r.output, "status:"));
+}
+
+// A mistyped engine option is fatal, not ignored: a dropped option would make a
+// tuning run attribute its number to a setting that never applied.
+void test_bad_engine_option_is_refused() {
+    for (const auto& kv : {std::string("--qp-opt"), std::string("--qcqp-opt"),
+                           std::string("--miqp-opt"), std::string("--global-opt")}) {
+        const Run r = run({solve_exe, model, kv, "definitely_not_an_option=1"});
+        CHECK(r.exit_code != 0);
+        CHECK(contains(r.output, "error:"));
+        CHECK(!contains(r.output, "status:"));
+    }
+    // a whole-number option refuses a fractional value rather than truncating
+    const Run frac = run({solve_exe, model, "--miqp-opt", "max_nodes=2.5"});
+    CHECK(frac.exit_code != 0);
+    CHECK(contains(frac.output, "whole number"));
+}
+
+
+// A zero-column model must not be reported as solved by ANY engine.
+//
+// Raised in review on the QP routes: a zero-column .qps still came back
+// "Optimal / ProvedKKT". The first fix guarded only the LP path, so the four
+// quadratic engines still claimed it -- which is why the guard now sits in the
+// shared QP loader and in the QPLIB reader rather than at each call site.
+//
+// Sweeping every engine rather than the reported one also turned up a
+// zero-variable QPLIB instance that made the mixed-integer path claim
+// ProvedGlobalEpsilon and made the binary-quadratic path SEGFAULT. A
+// per-engine loop is the only assertion shape that catches those.
+void test_zero_column_model_is_refused_by_every_engine() {
+    const fs::path tmp = fs::temp_directory_path();
+    const std::string qps = (tmp / "sor_cli_zerocol.qps").string();
+    {
+        std::ofstream out(qps);
+        out << "NAME          ZEROCOL\nROWS\n N  COST\nCOLUMNS\nRHS\nBOUNDS\nENDATA\n";
+    }
+    const std::string qplib = (tmp / "sor_cli_zerovar.qplib").string();
+    {
+        std::ofstream out(qplib);
+        out << "ZEROVAR\nLCL\nminimize\n0\n0\n0.0\n0\n0.0\n0\n1e20\n";
+    }
+
+    const char* engines[] = {"simplex", "auto", "qp", "qpipm", "qpauto",
+                             "hprqp", "binquad", "qcqplocal", "global", "miqp"};
+    for (const std::string& input : {qps, qplib}) {
+        for (const char* eng : engines) {
+            const Run r = run({solve_exe, input, "--engine", eng,
+                               "--time-limit", "3"});
+            // no claim of optimality, however the engine chooses to decline
+            const bool claimed = contains(r.output, "ProvedOptimal") ||
+                                 contains(r.output, "ProvedKKT") ||
+                                 contains(r.output, "ProvedGlobal") ||
+                                 contains(r.output, "status:            Optimal");
+            CHECK(!claimed);
+            // and it must not die on a signal
+            CHECK(r.exit_code >= 0 && r.exit_code < 128);
+            if (claimed || r.exit_code >= 128)
+                std::fprintf(stderr, "  %s on %s: exit %d\n", eng,
+                             input.c_str(), r.exit_code);
+        }
+    }
+    fs::remove(qps);
+    fs::remove(qplib);
+}
+
 int main() {
     const fs::path src(SOR_SOURCE_DIR), bin(SOR_BINARY_DIR);
     solve_exe = (bin / "sor_solve").string();
@@ -370,6 +486,11 @@ int main() {
         std::fprintf(stderr, "missing binaries or model; nothing to validate\n");
         return 1;
     }
+
+    test_unusable_input_is_refused();
+    test_zero_column_model_is_refused_by_every_engine();
+    test_unwritable_solution_out_is_refused();
+    test_bad_engine_option_is_refused();
 
     // One good solve produces the solution file the sor_check cases need.
     solution_file = (fs::temp_directory_path() / "sor_cli_validation.sol").string();
