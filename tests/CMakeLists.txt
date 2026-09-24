@@ -5,10 +5,18 @@ function(forge_add_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+forge_add_test(test_options             forge_search forge_engines forge_core)
+forge_add_test(test_qplib               forge_search forge_io)
+target_compile_definitions(test_qplib PRIVATE
+  FORGE_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/benchmarks")
+forge_add_test(test_pooling             forge_search forge_io forge_engines)
+target_compile_definitions(test_pooling PRIVATE
+  FORGE_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/benchmarks")
 forge_add_test(test_csr                 forge_sparse)
 forge_add_test(test_csc                 forge_sparse)
 forge_add_test(test_lu                  forge_la_cpu)
 forge_add_test(test_lu_ft               forge_la_cpu)
+forge_add_test(test_ldlt               forge_la_cpu)
 forge_add_test(test_backend_parity      forge_backend)
 forge_add_test(test_no_unproved_optimal forge_certify)
 forge_add_test(test_lp_certificates      forge_certify forge_io)
@@ -23,6 +31,9 @@ forge_add_test(test_dual_cost_perturbation forge_engines)
 forge_add_test(test_presolve            forge_presolve)
 forge_add_test(test_hpr                 forge_engines forge_certify forge_io)
 forge_add_test(test_lp_device           forge_backend forge_engines forge_io)
+forge_add_test(test_qp_device           forge_backend forge_sparse)
+forge_add_test(test_pdhcg_device        forge_engines forge_backend forge_sparse)
+forge_add_test(test_batched_pdhcg       forge_engines forge_backend forge_sparse)
 forge_add_test(test_lp_batched          forge_backend forge_engines forge_io)
 forge_add_test(test_r2hpdg              forge_backend forge_engines)
 forge_add_test(test_hpr_integration     forge_engines forge_certify forge_io)
@@ -65,6 +76,7 @@ forge_add_test(test_qps                 forge_io forge_engines forge_certify)
 forge_add_test(test_ps_must             forge_search forge_engines forge_certify forge_io
                                       forge_la_cpu)
 forge_add_test(test_extensions          forge_search forge_engines forge_certify)
+forge_add_test(test_miqp_bb             forge_search forge_engines forge_certify)
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
@@ -79,6 +91,7 @@ function(forge_add_python_test name)
 endfunction()
 
 forge_add_python_test(test_compare)
+forge_add_python_test(test_qplib_eval)
 forge_add_python_test(test_forbidden_dependencies)
 set_tests_properties(test_forbidden_dependencies PROPERTIES
   ENVIRONMENT
@@ -104,3 +117,37 @@ target_compile_definitions(test_cli_validation PRIVATE
   FORGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
   FORGE_BINARY_DIR="${CMAKE_BINARY_DIR}")
 add_dependencies(test_cli_validation forge_solve forge_check)
+
+# --engine auto (.qplib) dispatch table: also drives the real CLI, plus
+# needs the checked-in QPLIB samples the repo already ships.
+forge_add_test(test_qplib_auto_engine)
+target_compile_definitions(test_qplib_auto_engine PRIVATE
+  FORGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+  FORGE_BINARY_DIR="${CMAKE_BINARY_DIR}")
+add_dependencies(test_qplib_auto_engine forge_solve)
+
+forge_add_test(test_qcr                 forge_search forge_io)
+target_compile_definitions(test_qcr PRIVATE
+  FORGE_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/benchmarks")
+forge_add_test(test_binquad_device      forge_search forge_backend forge_io)
+target_compile_definitions(test_binquad_device PRIVATE
+  FORGE_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/benchmarks")
+forge_add_test(test_bqp_bab             forge_search forge_io)
+forge_add_test(test_qp_ipm              forge_engines forge_certify)
+forge_add_test(test_qcqp_ipm            forge_search forge_engines forge_certify)
+# Quadratic constraints in the model layer; shells out to forge_solve for the
+# "every engine reports Unsupported on a QC instance" check.
+forge_add_test(test_qcqp                forge_search forge_engines forge_certify forge_io)
+target_compile_definitions(test_qcqp PRIVATE
+  FORGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+  FORGE_BINARY_DIR="${CMAKE_BINARY_DIR}")
+add_dependencies(test_qcqp forge_solve)
+forge_add_test(test_global_qp          forge_search)
+
+# The same device tests with FORGE_VK_PROFILE on: timestamp queries bracket
+# every dispatch, and must change nothing the tests check.  (Without a Vulkan
+# device these reduce to the CPU runs, as the unprofiled tests do.)
+foreach(_t test_pdhcg_device test_batched_pdhcg test_lp_device test_qp_device)
+  add_test(NAME ${_t}_profiled COMMAND ${_t})
+  set_tests_properties(${_t}_profiled PROPERTIES ENVIRONMENT FORGE_VK_PROFILE=1)
+endforeach()
