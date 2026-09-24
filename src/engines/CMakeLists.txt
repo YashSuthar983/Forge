@@ -7,11 +7,13 @@ add_library(sor_engines
   src/dual_ratio_test.cpp
   src/farkas.cpp
   src/hpr.cpp
+  src/hpr_qp.cpp
+  src/qp_option_bindings.cpp
   src/lp_batched.cpp
   src/crossover.cpp
   src/lp.cpp
-  src/qp.cpp
-  src/qp_pdhcg.cpp
+  src/qp.cpp src/qcqp.cpp src/qcqp_local.cpp
+  src/qp_pdhcg.cpp src/qp_ipm.cpp src/qp_polish.cpp src/qp_krylov.cpp src/qp_route.cpp
   src/nlp.cpp)
 add_library(sor::engines ALIAS sor_engines)
 target_include_directories(sor_engines PUBLIC include)

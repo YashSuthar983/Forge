@@ -1,0 +1,21 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Masked copy dst = src over K interleaved lanes.
+// Batched layout: lane l of entry j lives at [j*K + l] (lanes interleaved,
+// so neighbouring threads touch neighbouring lanes).  mask[l] != 0 selects
+// the lanes this dispatch may touch; masked-out lanes are left untouched.
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint n; uint K; } pc;
+
+layout(std430, binding = 0) readonly buffer SB  { double src[]; };
+layout(std430, binding = 1) writeonly buffer DB { double dst[]; };
+layout(std430, binding = 2) readonly buffer MK  { double mask[]; };
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    if (g >= pc.n * pc.K) return;
+    if (mask[g % pc.K] == 0.0lf) return;
+    dst[g] = src[g];
+}

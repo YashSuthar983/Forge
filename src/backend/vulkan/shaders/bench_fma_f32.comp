@@ -1,0 +1,31 @@
+#version 450
+
+
+// sor_gpu_bench only (not in any solve path): peak float FMA throughput.
+// Eight independent accumulator chains per thread hide FMA latency; the
+// operands depend on the thread id and the results are stored, so the
+// compiler can neither constant-fold nor discard the loop.  Each iteration
+// is 8 FMAs = 16 flops per thread.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint iters;
+    uint pad;
+} pc;
+
+layout(std430, binding = 0) writeonly buffer OutBuf { float outv[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    float s = float(i & 1023u) * float(1.0e-7);
+    float b = float(0.999999) + s * float(1.0e-3);
+    float c = float(1.0e-6);
+    float a0 = s, a1 = s + float(1), a2 = s + float(2), a3 = s + float(3);
+    float a4 = s + float(4), a5 = s + float(5), a6 = s + float(6), a7 = s + float(7);
+    for (uint k = 0u; k < pc.iters; ++k) {
+        a0 = fma(a0, b, c); a1 = fma(a1, b, c); a2 = fma(a2, b, c); a3 = fma(a3, b, c);
+        a4 = fma(a4, b, c); a5 = fma(a5, b, c); a6 = fma(a6, b, c); a7 = fma(a7, b, c);
+    }
+    outv[i] = ((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7));
+}
