@@ -1,0 +1,29 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Batched x = A' y over K lanes, gather form through the CSC of A,
+// one thread per (column, lane).
+// Batched layout: lane l of entry j lives at [j*K + l] (lanes interleaved,
+// so neighbouring threads touch neighbouring lanes).  mask[l] != 0 selects
+// the lanes this dispatch may touch; masked-out lanes are left untouched.
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint rows; uint K; } pc;
+
+layout(std430, binding = 0) readonly buffer RP  { int row_ptr[]; };
+layout(std430, binding = 1) readonly buffer CI  { int col_idx[]; };
+layout(std430, binding = 2) readonly buffer VB  { double vals[]; };
+layout(std430, binding = 3) readonly buffer XB  { double x[]; };
+layout(std430, binding = 4) writeonly buffer YB { double y[]; };
+layout(std430, binding = 5) readonly buffer MK  { double mask[]; };
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    if (g >= pc.rows * pc.K) return;
+    uint i = g / pc.K, l = g - i * pc.K;
+    if (mask[l] == 0.0lf) return;
+    double acc = 0.0lf;
+    for (int k = row_ptr[i]; k < row_ptr[i + 1]; ++k)
+        acc += vals[k] * x[uint(col_idx[k]) * pc.K + l];
+    y[g] = acc;
+}

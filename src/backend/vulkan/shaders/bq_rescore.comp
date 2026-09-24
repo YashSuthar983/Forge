@@ -1,0 +1,65 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Restart: objective and violation of a rebuilt search from scratch (one
+// workgroup per search, tree sums), then the same incumbent rule as a step.
+// Clears the restart and stalled flags and the stagnation counter.
+// Per-search state, 16 doubles per search:
+//   0 obj  1 viol  2 penalty  3 best_obj  4 best_viol  5 iter  6 since_improve
+//   7 have_feasible  8 chosen  9 improved  10 stalled  11 restart  12 base
+
+// Arithmetic that feeds a decision is declared `precise`: it forbids the
+// compiler contracting a*b+c into an FMA, which would round differently
+// from the CPU oracle (built with -ffp-contract=off) and could flip a tie.
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint n; uint m; uint P; uint pad; } pc;
+
+layout(std430, binding = 0) readonly buffer XB  { double x[]; };
+layout(std430, binding = 1) readonly buffer HB  { double h[]; };
+layout(std430, binding = 2) readonly buffer LB  { double lin[]; };
+layout(std430, binding = 3) readonly buffer RB  { double r[]; };
+layout(std430, binding = 4) readonly buffer CLO { double clo[]; };
+layout(std430, binding = 5) readonly buffer CHI { double chi[]; };
+layout(std430, binding = 6) buffer STB          { double st[]; };
+
+shared double so_[256];
+shared double sv_[256];
+
+double rv(double v, double lo, double hi) {
+    if (v < lo) return lo - v;
+    if (v > hi) return v - hi;
+    return 0.0lf;
+}
+
+void main() {
+    uint s = gl_WorkGroupID.x, lid = gl_LocalInvocationID.x;
+    uint so = s * 16u;
+    if (st[so + 11u] == 0.0lf) return;   // uniform per workgroup
+    precise double o = 0.0lf, v = 0.0lf;
+    for (uint j = lid; j < pc.n; j += 256u)
+        o += x[s * pc.n + j] * (lin[j] + 0.5lf * h[s * pc.n + j]);
+    for (uint i = lid; i < pc.m; i += 256u)
+        v += rv(r[s * pc.m + i], clo[i], chi[i]);
+    so_[lid] = o; sv_[lid] = v;
+    barrier();
+    for (uint w = 128u; w > 0u; w >>= 1) {
+        if (lid < w) { so_[lid] += so_[lid + w]; sv_[lid] += sv_[lid + w]; }
+        barrier();
+    }
+    if (lid != 0u) return;
+    double obj = so_[0], viol = sv_[0];
+    st[so + 0u] = obj;
+    st[so + 1u] = viol;
+    bool improved = false;
+    precise double o_best = st[so + 3u] - 1e-12lf;
+    if (viol <= 1e-9lf && obj < o_best) {
+        st[so + 3u] = obj; st[so + 4u] = 0.0lf; st[so + 7u] = 1.0lf; improved = true;
+    } else if (st[so + 7u] == 0.0lf && viol < st[so + 4u]) {
+        st[so + 4u] = viol; improved = true;
+    }
+    st[so + 6u] = 0.0lf;
+    st[so + 9u] = improved ? 1.0lf : 0.0lf;
+    st[so + 10u] = 0.0lf;
+    st[so + 11u] = 0.0lf;
+}

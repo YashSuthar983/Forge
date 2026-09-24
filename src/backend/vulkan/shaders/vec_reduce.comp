@@ -1,0 +1,53 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Two-pass reduction to one scalar per call, no atomics.
+//
+//   op 0: sum a[i]*b[i]     (dot product)
+//   op 1: max a[i]          (inputs must be >= 0: the identity is 0, which is
+//                            what every residual reduced this way starts at)
+//   op 2: sum a[i]
+//
+// Each workgroup grid-strides over the input and tree-reduces in shared
+// memory, writing out[out_off + group].  The host dispatches pass 1 with at
+// most 1024 groups into a partials buffer, then pass 2 with ONE group over
+// those partials (op 2 for sums, op 1 for max) into the scalar slot.  No
+// float atomics, because fp64 atomic add is not core on every vendor this
+// has to run on, and because a fixed tree order makes the result
+// reproducible run to run on the same device.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint op;
+    uint out_off;
+    uint pad;
+} pc;
+
+layout(std430, binding = 0) readonly  buffer ABuf   { double a[]; };
+layout(std430, binding = 1) readonly  buffer BBuf   { double b[]; };
+layout(std430, binding = 2) writeonly buffer OutBuf { double outv[]; };
+
+shared double sh[256];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint stride = gl_NumWorkGroups.x * 256u;
+    double acc = 0.0lf;
+    for (uint i = gl_GlobalInvocationID.x; i < pc.n; i += stride) {
+        if (pc.op == 0u)      acc += a[i] * b[i];
+        else if (pc.op == 1u) acc = max(acc, a[i]);
+        else                  acc += a[i];
+    }
+    sh[lid] = acc;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (lid < s) {
+            if (pc.op == 1u) sh[lid] = max(sh[lid], sh[lid + s]);
+            else             sh[lid] = sh[lid] + sh[lid + s];
+        }
+        barrier();
+    }
+    if (lid == 0u) outv[pc.out_off + gl_WorkGroupID.x] = sh[0];
+}

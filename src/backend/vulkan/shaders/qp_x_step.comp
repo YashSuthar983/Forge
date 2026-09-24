@@ -1,0 +1,48 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// HPR-QP x half-step, FUSED.  Computes rz, xbar, zbar and xhat in one pass.
+//
+// Fused deliberately: the CPU reference walks these as four separate loops,
+// but mapping each to its own dispatch costs ~4 us of launch overhead apiece
+// against nanoseconds of arithmetic.  Measured on the LP device, the
+// per-iteration floor is ~35 us across ~8 dispatches; the QP iteration has
+// more elementwise work, so dispatch count is what decides where the
+// CPU/GPU crossover lands.  Everything that reads the same operands in the
+// same pass belongs in the same kernel.
+//
+//   rz   = x + sigma*(-Qw + A'y - c)
+//   xbar = clamp(rz, col_lo, col_hi)
+//   zbar = (xbar - rz)/sigma          (only read by the KKT check)
+//   xhat = 2*xbar - x
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint pad;
+    double sigma;
+} pc;
+
+layout(std430, binding = 0) readonly  buffer XBuf    { double x[]; };
+layout(std430, binding = 1) readonly  buffer QwBuf   { double qw[]; };
+layout(std430, binding = 2) readonly  buffer AtyBuf  { double aty[]; };
+layout(std430, binding = 3) readonly  buffer CBuf    { double c[]; };
+layout(std430, binding = 4) readonly  buffer LoBuf   { double lo[]; };
+layout(std430, binding = 5) readonly  buffer HiBuf   { double hi[]; };
+layout(std430, binding = 6) writeonly buffer XbarBuf { double xbar[]; };
+layout(std430, binding = 7) writeonly buffer ZbarBuf { double zbar[]; };
+layout(std430, binding = 8) writeonly buffer XhatBuf { double xhat[]; };
+
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.n) return;
+    double xj = x[j];
+    double rz = xj + pc.sigma * (-qw[j] + aty[j] - c[j]);
+    double xb = rz;
+    if (xb < lo[j]) xb = lo[j];
+    if (xb > hi[j]) xb = hi[j];
+    xbar[j] = xb;
+    zbar[j] = (xb - rz) / pc.sigma;
+    xhat[j] = 2.0lf * xb - xj;
+}

@@ -1,0 +1,34 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Dual step and the dual half of the move, FUSED on the same reasoning:
+//   v      = y_old + sigma (A xbar)
+//   yc     = v - sigma clamp(v / sigma, row_lo, row_hi)
+//   y_new  = yc, or (1+t)(a yc + (1-a) y0) - t y_prev
+//   y_prev = y_old ;  y = y_new
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint m; uint halpern; double sigma; double a; double t;
+} pc;
+
+layout(std430, binding = 0) readonly  buffer AxbBuf   { double axbar[]; };
+layout(std430, binding = 1) readonly  buffer LoBuf    { double lo[]; };
+layout(std430, binding = 2) readonly  buffer HiBuf    { double hi[]; };
+layout(std430, binding = 3) readonly  buffer Y0Buf    { double y0[]; };
+layout(std430, binding = 4) buffer YprevBuf           { double yprev[]; };
+layout(std430, binding = 5) buffer YBuf               { double y[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.m) return;
+    double yo = y[i];
+    double v = yo + pc.sigma * axbar[i];
+    double proj = max(lo[i], min(v / pc.sigma, hi[i]));
+    double yc = v - pc.sigma * proj;
+    double yn = yc;
+    if (pc.halpern != 0u)
+        yn = (1.0lf + pc.t) * (pc.a * yc + (1.0lf - pc.a) * y0[i]) - pc.t * yprev[i];
+    yprev[i] = yo;
+    y[i] = yn;
+}
