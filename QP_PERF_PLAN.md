@@ -66,16 +66,47 @@ refactorizes every barrier iteration because the KKT matrix changes each step,
 while the convex path amortises one factorization over many Krylov solves. A
 conclusion drawn on one path does not transfer to the other.
 
-## 4. First target
+## 4. First target -- and two corrections to this section
 
-The 9% in `memset` traces to `cmod_window` (`ldlt.cpp:93`), which calls
-`w.assign(m * kc, 0.0)` on every invocation: zero a scratch buffer, then
-accumulate into it. The first accumulation pass can write instead of add,
-removing the fill entirely. Same arithmetic in the same order, so the
-bit-identical-at-any-thread-count property is unaffected.
+Both hypotheses written here first were checked against evidence and both were
+wrong. They are kept rather than edited away, because the corrections are the
+useful part.
 
-Ranked after that: `panel_update` at 26.5%, where the question is whether the
-inner loop is bound by W traffic as its comment claims.
+**The 9% memset does NOT come from `cmod_window`.** This section originally
+attributed it to `w.assign(m * kc, 0.0)` there, from reading the source. Traced
+properly -- gdb breakpoints on live `memset` calls, plus callgrind
+`--tree=caller` -- it is `Ldlt::factorize`'s own per-iteration zeroing of
+`cx_`/`head_`/`sx_`, which is structurally required because the KKT matrix
+changes every barrier iteration. Removing `cmod_window`'s fill entirely (verified
+absent from the compiled code with objdump) moved the memset share from 8.96% to
+**8.92%** and the wall clock slightly the wrong way, so the change was not kept.
+A grep is not an attribution.
+
+A related bucket the original profile missed: `ThreadPool::parallel_for` at
+~5.5%, dispatching the chunked `sx_` fill -- possibly paying dispatch cost for
+very little work at this instance size.
+
+**`panel_update` is not memory-bound.** Its comment claimed the loop is bound by
+W traffic. Measured with `--cache-sim=yes`: D1 read miss ~0.10%, write miss
+~0.01%, no measurable LL misses -- the row range is capped at 128 rows and stays
+resident in L1. What is true is 0.75 memory operations per flop, so it is bound
+by load/store issue count rather than by the memory hierarchy or by arithmetic.
+Disassembly confirms it vectorises.
+
+Two restructurings to amortise per-column setup across a batch of target columns
+(64-wide and 8-wide) were both bit-identical and both **8-12% slower**,
+consistently, across repeated paired A/Bs. The original per-column order keeps
+one column's small row range hot in L1 for its whole source sweep; both batched
+orders broke that, and the lost locality cost more than the saved address
+arithmetic. Recorded in `ldlt.cpp` so it is not retried without cause.
+
+## 5. What is actually next
+
+* `Ldlt::factorize`'s `cx_`/`head_`/`sx_` zeroing, ~9%, now correctly located.
+* `ThreadPool::parallel_for` dispatch overhead on that fill, ~5.5%.
+* `panel_update` remains 26.5% and is issue-bound, so a win there needs fewer
+  memory operations per flop, not better locality -- the locality is already
+  good.
 
 ## Rules for this work
 

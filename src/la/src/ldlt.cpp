@@ -129,6 +129,29 @@ SOR_KERNEL void cmod_window(const f64* Xd, Offset Rd, const Index* rd, const f64
 // Rows [r0, r1) of panel columns [ja, jb), each reduced by panel columns
 // [c0, c1) in groups of four, the tail one column at a time skipping zero
 // multipliers.  Entry (i, j) is touched only for i >= j.
+//
+// This is ~26% of factorization's self cost (callgrind, QPLIB_3337,
+// --engine qcqplocal, 300 iterations), so it has been profiled with
+// --cache-sim=yes rather than assumed to be memory-bound the way
+// cmod_window's W is (see that function's comment). Measured: D1 read
+// miss rate ~0.10%, D1 write miss rate ~0.01%, no measurable LL misses --
+// the row range here is bounded (kRowChunk = 128 rows, 1KB/column) and
+// stays resident in L1, so this loop is NOT memory- or cache-miss-bound.
+// What IS true: per (c-quad, row) it does 4 loads plus one load-modify-
+// store of the target column for 8 flops -- 0.75 mem-ops/flop, low
+// arithmetic intensity -- so it's bound by load/store issue count, not by
+// the memory hierarchy or FLOP throughput; the 4-column unroll already
+// amortizes the target column's read-modify-write over 4 source columns
+// for that reason. Reordering to also amortize the per-column pointer/
+// scalar setup across a batch of target columns (hoisting it out of the
+// column loop, c-quad outermost) was tried and measured SLOWER by ~8-12%
+// on the fixed benchmark protocol, at both a 64-column and an 8-column
+// batch width -- the original per-column order keeps one column's small
+// row range pinned hot in L1 for its whole source-column sweep before
+// touching another column, which the batched orders both broke, and that
+// locality loss cost more than the saved address arithmetic. Not
+// reflected in the code below; recorded here and in
+// ~/work_a/agent-runs/ldlt/notes.md so it isn't retried without cause.
 SOR_KERNEL void panel_update(f64* X, Offset R, const f64* D, Index c0, Index c1, Index ja, Index jb,
                   Offset r0, Offset r1) {
     for (Index j = ja; j < jb; ++j) {
