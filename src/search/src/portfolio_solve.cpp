@@ -7,7 +7,7 @@
 // and loses on 70% is a bad default and an excellent portfolio arm, because
 // the portfolio pays only for the arm that wins and cancels the rest.
 //
-// See docs/OPENSOURCE_PARALLEL_ARCH_20260919.md for the evidence that this
+// See the earlier measurement notes for the evidence that this
 // architecture, not tree splitting, is what separates the fast open-source
 // parallel solvers from the slow ones.
 
@@ -47,7 +47,7 @@ const ArmSpec kArms[] = {
     // flow cover and sequence-independent lifting emitted INVALID cuts, and
     // node cuts were promoted globally on a naming convention. Nine of ten
     // separator pairs produced a false Optimal or false Infeasible before that
-    // was fixed (see --verify-cuts and docs/PORTFOLIO_P1_20260919.md).
+    // was fixed (see --verify-cuts and the earlier measurement notes).
     //
     // The two still-broken families are deliberately NOT enabled here: flow
     // cover stays out until flowcover.cpp is fixed, and sequence-independent
