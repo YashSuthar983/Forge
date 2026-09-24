@@ -398,7 +398,7 @@ struct BabOptions {
     // probing implication is the compressed result of a whole propagation
     // cascade, so this reaches fixings that row-at-a-time propagation cannot.
     bool conflict_propagation = true;
-    // Hybrid node selection (item 16 of docs/SIH26119_PS_ALIGNMENT.md §5): a
+    // Hybrid node selection (item 16 of the problem-statement notes §5): a
     // general best-bound + bounded-plunging strategy, not a verified
     // reproduction of a specific published DIVE paper's exact mechanics.
     // Best-bound remains the ONLY source of pruning/proof; this only changes
