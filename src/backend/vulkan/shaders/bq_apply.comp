@@ -1,0 +1,45 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Parallel binquad, kernel 3 of 4: flip each search's chosen variable and
+// move h = Mx and r = Ax by one column.  One thread per search, on purpose:
+// a column may list the same index twice (QPLIB allows duplicate entries),
+// and a single writer per search makes that race-free without atomics.
+// Per-search state, 16 doubles per search:
+//   0 obj  1 viol  2 penalty  3 best_obj  4 best_viol  5 iter  6 since_improve
+//   7 have_feasible  8 chosen  9 improved  10 stalled  11 restart  12 base
+
+// Arithmetic that feeds a decision is declared `precise`: it forbids the
+// compiler contracting a*b+c into an FMA, which would round differently
+// from the CPU oracle (built with -ffp-contract=off) and could flip a tie.
+
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uint n; uint m; uint P; uint pad; } pc;
+
+layout(std430, binding = 0) buffer XB            { double x[]; };
+layout(std430, binding = 1) buffer HB            { double h[]; };
+layout(std430, binding = 2) buffer RB            { double r[]; };
+layout(std430, binding = 3) readonly buffer MS   { int m_start[]; };
+layout(std430, binding = 4) readonly buffer MI   { int m_idx[]; };
+layout(std430, binding = 5) readonly buffer MV   { double m_val[]; };
+layout(std430, binding = 6) readonly buffer ACS  { int a_cstart[]; };
+layout(std430, binding = 7) readonly buffer ACR  { int a_crow[]; };
+layout(std430, binding = 8) readonly buffer ACV  { double a_cval[]; };
+layout(std430, binding = 9) readonly buffer STB  { double st[]; };
+
+void main() {
+    uint s = gl_GlobalInvocationID.x;
+    if (s >= pc.P) return;
+    uint off = s * pc.n, ro = s * pc.m;
+    uint j = uint(st[s * 16u + 8u]);
+    double delta = x[off + j] != 0.0lf ? -1.0lf : 1.0lf;
+    for (int k = m_start[j]; k < m_start[j + 1]; ++k) {
+        precise double hv = h[off + uint(m_idx[k])] + delta * m_val[k];
+        h[off + uint(m_idx[k])] = hv;
+    }
+    for (int k = a_cstart[j]; k < a_cstart[j + 1]; ++k) {
+        precise double rv_ = r[ro + uint(a_crow[k])] + delta * a_cval[k];
+        r[ro + uint(a_crow[k])] = rv_;
+    }
+    x[off + j] = x[off + j] != 0.0lf ? 0.0lf : 1.0lf;
+}

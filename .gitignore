@@ -66,3 +66,36 @@ docs/papers/
 
 # Local Netlib emps binary (source: benchmarks/netlib/raw/emps.c)
 benchmarks/tools/
+
+# ---- QP work: kept locally, not shipped -------------------------------------
+# Working notes, superseded status documents, generated pooling instances and
+# sweep output. QP.md at the repository root carries what a reader needs; the
+# generators under scripts/ are seeded, so every generated instance is
+# reproducible from the command recorded there.
+docs/agent-notes/
+docs/ENGINE_PARITY.md
+docs/QP_STATUS.md
+docs/REFINERY.md
+docs/THIRD_PARTY.md
+docs/WORK_PLAN.md
+benchmarks/refinery/
+benchmarks/reference/
+benchmarks/qplib/
+# QP generators, sweep drivers and fetchers. scripts/qplib_eval.py stays: the
+# registered test_qplib_eval loads it at runtime, so it is a build dependency.
+scripts/compare_reference.py
+scripts/fetch_qplib.py
+scripts/fetch_qplib_all.py
+scripts/fetch_qplib_varnames.py
+scripts/gen_qp_ladder.py
+scripts/pooling_gen.py
+scripts/qp_crossover.py
+scripts/qplib_all_sweep.py
+scripts/qplib_global_sweep.py
+scripts/qplib_miqp_sweep.py
+scripts/qplib_parse_all.py
+scripts/qplib_sweep.py
+scripts/refinery_bench.py
+
+# superseded by QP_PERFS.md
+QPLIB_TIMING.md

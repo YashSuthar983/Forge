@@ -1,0 +1,40 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Restart: x = elite[base] XOR Bernoulli(flip_prob) per bit, for searches
+// flagged in st[11]; also clears their tabu list.  The coin is a stateless
+// hash of (seed, epoch, s, j) -- the same function as bq_hash() in
+// binquad_device.hpp -- so a restart does not depend on thread order.
+// Per-search state, 16 doubles per search:
+//   0 obj  1 viol  2 penalty  3 best_obj  4 best_viol  5 iter  6 since_improve
+//   7 have_feasible  8 chosen  9 improved  10 stalled  11 restart  12 base
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint n; uint P; uint seed; uint epoch; double flip_prob;
+} pc;
+
+layout(std430, binding = 0) buffer XB           { double x[]; };
+layout(std430, binding = 1) readonly buffer ELB { double elite[]; };
+layout(std430, binding = 2) readonly buffer STB { double st[]; };
+layout(std430, binding = 3) buffer TB           { double tabu[]; };
+
+uint bq_hash(uint a, uint b, uint c, uint d) {
+    uint h = a * 0x9E3779B1u ^ b * 0x85EBCA77u ^ c * 0xC2B2AE3Du ^ d * 0x27D4EB2Fu;
+    h ^= h >> 15; h *= 0x2C1B3C6Du;
+    h ^= h >> 12; h *= 0x297A2D39u;
+    h ^= h >> 15;
+    return h;
+}
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    if (g >= pc.n * pc.P) return;
+    uint s = g / pc.n, j = g - s * pc.n;
+    if (st[s * 16u + 11u] == 0.0lf) return;
+    double base = st[s * 16u + 12u];
+    uint b = base >= 0.0lf ? (elite[uint(base) * pc.n + j] != 0.0lf ? 1u : 0u) : 0u;
+    double u = double(bq_hash(pc.seed, pc.epoch, s, j) >> 8) * (1.0lf / 16777216.0lf);
+    x[g] = double(b ^ (u < pc.flip_prob ? 1u : 0u));
+    tabu[g] = 0.0lf;
+}

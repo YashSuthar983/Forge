@@ -1,0 +1,41 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Column-side terms of the HPR-QP KKT check, one column per thread:
+//   dres[j] = |Q xbar + c - A'ybar - zbar|_j          -> max-reduced
+//   pobj[j] = (0.5 (Q xbar)_j + c_j) xbar_j           -> sum-reduced
+//   sup[j]  = sup_{s in C_j} (-zbar_j * s)            -> sum-reduced
+//   infl[j] = 1 if that support term is +inf, else 0  -> max-reduced
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC { uint n; } pc;
+
+layout(std430, binding = 0)  readonly  buffer QxBuf   { double qx[]; };
+layout(std430, binding = 1)  readonly  buffer CBuf    { double c[]; };
+layout(std430, binding = 2)  readonly  buffer AtyBuf  { double aty[]; };
+layout(std430, binding = 3)  readonly  buffer ZbarBuf { double zbar[]; };
+layout(std430, binding = 4)  readonly  buffer XbarBuf { double xbar[]; };
+layout(std430, binding = 5)  readonly  buffer CLoBuf  { double clo[]; };
+layout(std430, binding = 6)  readonly  buffer CHiBuf  { double chi[]; };
+layout(std430, binding = 7)  writeonly buffer DresBuf { double dres[]; };
+layout(std430, binding = 8)  writeonly buffer PobjBuf { double pobj[]; };
+layout(std430, binding = 9)  writeonly buffer SupBuf  { double sup[]; };
+layout(std430, binding = 10) writeonly buffer InfBuf  { double infl[]; };
+
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.n) return;
+    double q = qx[j];
+    double z = zbar[j];
+    dres[j] = abs(q + c[j] - aty[j] - z);
+    pobj[j] = (0.5lf * q + c[j]) * xbar[j];
+
+    double t = 0.0lf, f = 0.0lf;
+    if (z != 0.0lf) {
+        double at = (z < 0.0lf) ? chi[j] : clo[j];
+        if (isinf(at)) f = 1.0lf; else t = -z * at;
+    }
+    sup[j] = t;
+    infl[j] = f;
+}

@@ -1,0 +1,47 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Column terms of the PDHCG-II convergence check at (x, y), r = Qx + c + A'y:
+//   viol = distance of x outside [lo, hi]                 -> max
+//   dres = |x - clamp(x - r, lo, hi)|  (natural map)      -> max
+//   xq = x (Qx) ;  cx = c x                                -> sum
+//   px = support of [lo, hi] at z = -r                    -> sum
+//   pinf = 1 when that support is infinite, else 0        -> max
+// Infinite support is flagged, not stored, so the sum stays finite and the
+// host decides whether a Wolfe bound exists at all.
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint n; } pc;
+
+layout(std430, binding = 0)  readonly  buffer XBuf    { double x[]; };
+layout(std430, binding = 1)  readonly  buffer QxBuf   { double qx[]; };
+layout(std430, binding = 2)  readonly  buffer CBuf    { double c[]; };
+layout(std430, binding = 3)  readonly  buffer AtyBuf  { double aty[]; };
+layout(std430, binding = 4)  readonly  buffer LoBuf   { double lo[]; };
+layout(std430, binding = 5)  readonly  buffer HiBuf   { double hi[]; };
+layout(std430, binding = 6)  writeonly buffer ViolBuf { double viol[]; };
+layout(std430, binding = 7)  writeonly buffer DresBuf { double dres[]; };
+layout(std430, binding = 8)  writeonly buffer XqBuf   { double xq[]; };
+layout(std430, binding = 9)  writeonly buffer CxBuf   { double cx[]; };
+layout(std430, binding = 10) writeonly buffer PxBuf   { double px[]; };
+layout(std430, binding = 11) writeonly buffer PinfBuf { double pinf[]; };
+
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.n) return;
+    double xj = x[j], l = lo[j], h = hi[j];
+    double r = qx[j] + c[j] + aty[j];
+    double v = 0.0lf;
+    if (xj < l) v = l - xj;
+    if (xj > h) v = max(v, xj - h);
+    viol[j] = v;
+    dres[j] = abs(xj - max(l, min(xj - r, h)));
+    xq[j] = xj * qx[j];
+    cx[j] = c[j] * xj;
+
+    double z = -r, p = 0.0lf, f = 0.0lf;
+    if (z > 0.0lf) { if (isinf(h)) f = 1.0lf; else p = h * z; }
+    else if (z < 0.0lf) { if (isinf(l)) f = 1.0lf; else p = l * z; }
+    px[j] = p;
+    pinf[j] = f;
+}

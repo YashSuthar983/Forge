@@ -1,0 +1,62 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Parallel binquad, kernel 1 of 4: the gain of flipping every variable in
+// every search, P x n threads, O(1) plus one column of A each.  The
+// semantics are cpu_binquad_device.cpp's step() "gain" block exactly.
+// Per-search state, 16 doubles per search:
+//   0 obj  1 viol  2 penalty  3 best_obj  4 best_viol  5 iter  6 since_improve
+//   7 have_feasible  8 chosen  9 improved  10 stalled  11 restart  12 base
+
+// Arithmetic that feeds a decision is declared `precise`: it forbids the
+// compiler contracting a*b+c into an FMA, which would round differently
+// from the CPU oracle (built with -ffp-contract=off) and could flip a tie.
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint n; uint m; uint P; uint pad; } pc;
+
+layout(std430, binding = 0)  readonly  buffer XB   { double x[]; };
+layout(std430, binding = 1)  readonly  buffer HB   { double h[]; };
+layout(std430, binding = 2)  readonly  buffer TB   { double tabu[]; };
+layout(std430, binding = 3)  readonly  buffer LB   { double lin[]; };
+layout(std430, binding = 4)  readonly  buffer ACS  { int a_cstart[]; };
+layout(std430, binding = 5)  readonly  buffer ACR  { int a_crow[]; };
+layout(std430, binding = 6)  readonly  buffer ACV  { double a_cval[]; };
+layout(std430, binding = 7)  readonly  buffer RB   { double r[]; };
+layout(std430, binding = 8)  readonly  buffer CLO  { double clo[]; };
+layout(std430, binding = 9)  readonly  buffer CHI  { double chi[]; };
+layout(std430, binding = 10) readonly  buffer STB  { double st[]; };
+layout(std430, binding = 11) writeonly buffer DOB  { double dobj[]; };
+layout(std430, binding = 12) writeonly buffer DVB  { double dviol[]; };
+layout(std430, binding = 13) writeonly buffer SCB  { double score[]; };
+
+double rv(double v, double lo, double hi) {
+    if (v < lo) return lo - v;
+    if (v > hi) return v - hi;
+    return 0.0lf;
+}
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    if (g >= pc.n * pc.P) return;
+    uint s = g / pc.n, j = g - s * pc.n;
+    uint so = s * 16u, ro = s * pc.m;
+    double delta = x[g] != 0.0lf ? -1.0lf : 1.0lf;
+    precise double d_o = delta * (lin[j] + h[g]);
+    precise double d_v = 0.0lf;
+    for (int k = a_cstart[j]; k < a_cstart[j + 1]; ++k) {
+        uint i = uint(a_crow[k]);
+        double a = a_cval[k];
+        precise double moved = r[ro + i] + delta * a;
+        d_v += rv(moved, clo[i], chi[i]) - rv(r[ro + i], clo[i], chi[i]);
+    }
+    precise double sc = d_o + st[so + 2u] * d_v;
+    bool is_tabu = tabu[g] > st[so + 5u];
+    precise double v_after = st[so + 1u] + d_v;
+    precise double o_after = st[so + 0u] + d_o;
+    precise double o_best = st[so + 3u] - 1e-12lf;
+    bool aspires = is_tabu && v_after <= 0.0lf && o_after < o_best;
+    dobj[g] = d_o;
+    dviol[g] = d_v;
+    score[g] = (is_tabu && !aspires) ? 1e300lf : sc;
+}
