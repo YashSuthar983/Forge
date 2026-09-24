@@ -81,7 +81,7 @@ struct SimplexOptions {
     // variant is intentionally NOT the default: measured Netlib gains from
     // perturbation are concentrated in phase 2 (e.g. nesm), so gating to
     // phase 1 would be a no-op on the models that benefit; see
-    // docs/AGENT1_HANDOFF_20260910.md §18.
+    // the earlier handoff notes.
     f64 dual_cost_perturbation_multiplier = 0.0;
 
     // Refactor after this many basis updates. Product-form etas are as dense
@@ -135,7 +135,7 @@ struct SimplexOptions {
     // calibrated for product-form etas and cannot serve FT, whose row etas are
     // ~12x sparser: it fires about ten times less often, refactor_interval
     // never binds, and FT accuracy decays roughly a decade per 45 updates. See
-    // docs/PERFORMANCE_REPORT_20260908.md. Inert on the product-form path.
+    // the earlier measurement notes. Inert on the product-form path.
     // Chosen by sweeping {50, 100, 200} x {1.5, 2, 3} on d2q06c, pilot87,
     // dfl001, greenbea and 25fv47 by pivots and DSE log error. Every setting
     // removed the non-convergence outright; 50 gives the lowest pivot total of
@@ -156,7 +156,7 @@ struct SimplexOptions {
     // comment flagged, so re-check that pair together if this is retuned.
     int ft_update_limit = 200;
     // Collective FT (Huangfu & Hall 2015 Phase 2, item 2 of
-    // docs/SIH26119_PS_ALIGNMENT.md §5): when the product-form eta file hits
+    // the problem-statement notes §5): when the product-form eta file hits
     // refactor_eta_ratio, try BasisFactor::collapse_pending_into_ft() (fold
     // the pending etas into L/U via sequential update_ft() calls, verified
     // representation-transparent in tests/test_lu.cpp) before falling back
@@ -212,7 +212,7 @@ struct SimplexOptions {
     bool presolve_implied_slack = false;
     // Round every Ruiz factor to the nearest power of two, which makes the
     // scaling exact in floating point (see ruiz_scale). Off by default until
-    // it clears the 93-model gate; see docs/SCALING_20260908.md.
+    // it clears the 93-model gate; see the earlier measurement notes.
     bool ruiz_power_of_two = false;
     bool verbose = false;
 };

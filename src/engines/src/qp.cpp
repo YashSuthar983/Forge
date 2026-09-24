@@ -433,17 +433,24 @@ core::RawResult solve_qp_diag(const QpProblem& problem,
 core::ProofEvidence qp_evidence(const QpDiagnostics& diag, const QpOptions& opts) {
     core::ProofEvidence ev;
     ev.has_basis = false;
-    ev.max_primal_violation = diag.primal_residual;
-    ev.max_dual_violation = diag.stationarity;
-    ev.gap_rel = diag.used_general_path ? diag.gap_rel : 0.0;
+    // Engines that evaluated qpc::kkt_original report the residuals net of
+    // their rigorous floating-point evaluation error (qp_common.hpp); the
+    // exact fast path does not, and is judged on its raw residuals.
+    const bool has_net = std::isfinite(diag.primal_net) && std::isfinite(diag.stationarity_net);
+    const f64 pr = has_net ? diag.primal_net : diag.primal_residual;
+    const f64 st = has_net ? diag.stationarity_net : diag.stationarity;
+    const f64 gp = has_net && std::isfinite(diag.gap_net) ? diag.gap_net : diag.gap_rel;
+    const bool general = diag.used_general_path || has_net;
+    ev.max_primal_violation = pr;
+    ev.max_dual_violation = st;
+    ev.gap_rel = general ? gp : 0.0;
     ev.primal_feas_tol = opts.feas_tol;
     ev.dual_feas_tol = opts.stationarity_tol;
     ev.gap_tol = opts.gap_tol;
-    ev.checker_passed = diag.primal_residual <= opts.feas_tol &&
-                        diag.stationarity <= opts.stationarity_tol &&
-                        (!diag.used_general_path ||
+    ev.checker_passed = pr <= opts.feas_tol && st <= opts.stationarity_tol &&
+                        (!general ||
                          (diag.convexity_certified &&
-                          (!diag.gap_finite || diag.gap_rel <= opts.gap_tol)));
+                          (!diag.gap_finite || gp <= opts.gap_tol)));
     if (ev.checker_passed)
         ev.claimed_level = core::ProofLevel::ProvedKKT;
     else
