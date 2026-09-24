@@ -4,12 +4,12 @@ project(sor LANGUAGES CXX VERSION 0.0.1)
 # ---------------------------------------------------------------------------
 # SOR - Sovereign Optimization Runtime
 #
-# Layering (docs/architecture.md §2) is enforced by target_link_libraries: a
+# Layering (QP.md, Layout) is enforced by target_link_libraries: a
 # module may only link strictly lower layers. The add_subdirectory() order
 # below IS the layer order; each module owns its own CMakeLists.txt.
 #
-# Clean-room rule: no HiGHS / SCIP / CBC / GLPK / OR-Tools / cuOpt / PaPILO /
-# Ipopt anywhere in this file or the link graph. See docs/architecture.md §8.
+# Clean-room rule: no external optimization solver, in any form, anywhere in
+# this file or in the link graph. Every engine here is built in-tree.
 # ---------------------------------------------------------------------------
 
 set(CMAKE_CXX_STANDARD 20)
