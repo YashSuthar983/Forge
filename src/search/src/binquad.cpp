@@ -191,6 +191,20 @@ BinQuadResult solve_binquad(const io::QplibInstance& q,
         for (Index k = A.start[sz(j)]; k < A.start[sz(j) + 1]; ++k)
             r[sz(A.row[sz(k)])] += A.val[sz(k)];
     }
+    // row_viol[i] == row_violation(r[i], lo, hi), kept in sync by apply_flip
+    // (the sole mutator of r) below. The gain sweep calls violation_delta for
+    // every candidate column, and every one of those calls used to recompute
+    // this SAME "current violation of row i" from scratch -- it does not
+    // depend on which candidate column is being evaluated, only on the row
+    // and the current r. Caching it turns that from an O(nnz(A)) recompute
+    // per sweep into an O(nnz of the one flipped column) update per flip.
+    // Profiled 2026-09-24 (callgrind, QPLIB_3307): row_violation's two calls
+    // inside violation_delta -- one of them this now-redundant "before" --
+    // were together the single largest cost in the engine, ~35% of
+    // instructions self+inclusive.
+    std::vector<f64> row_viol(sz(m));
+    for (Index i = 0; i < m; ++i)
+        row_viol[sz(i)] = row_violation(r[sz(i)], q.c_lo[sz(i)], q.c_hi[sz(i)]);
 
     auto objective_of = [&](const std::vector<std::uint8_t>& v) {
         f64 o = 0.0;
@@ -237,14 +251,17 @@ BinQuadResult solve_binquad(const io::QplibInstance& q,
     std::uniform_int_distribution<Index> var_dist(0, n > 0 ? n - 1 : 0);
 
     // The change in total violation if variable j flips. O(nnz of column j).
+    // "before" is row_viol[i] -- the row's CURRENT violation, already known,
+    // not recomputed. Only "after" (the hypothetical post-flip value) needs
+    // an actual row_violation call, since that state is never materialised
+    // unless this candidate is the one taken.
     auto violation_delta = [&](Index j, f64 delta) {
         f64 dv = 0.0;
         for (Index k = A.start[sz(j)]; k < A.start[sz(j) + 1]; ++k) {
             const Index i = A.row[sz(k)];
-            const f64 before = row_violation(r[sz(i)], q.c_lo[sz(i)], q.c_hi[sz(i)]);
             const f64 after = row_violation(r[sz(i)] + delta * A.val[sz(k)],
                                             q.c_lo[sz(i)], q.c_hi[sz(i)]);
-            dv += after - before;
+            dv += after - row_viol[sz(i)];
         }
         return dv;
     };
@@ -253,11 +270,28 @@ BinQuadResult solve_binquad(const io::QplibInstance& q,
         const f64 delta = x[sz(j)] ? -1.0 : 1.0;
         for (Index k = adj.start[sz(j)]; k < adj.start[sz(j) + 1]; ++k)
             h[sz(adj.idx[sz(k)])] += delta * adjval[sz(k)];
-        for (Index k = A.start[sz(j)]; k < A.start[sz(j) + 1]; ++k)
-            r[sz(A.row[sz(k)])] += delta * A.val[sz(k)];
+        // r is mutated ONLY here, so this is also the only place row_viol
+        // needs to be refreshed to stay in sync with it.
+        for (Index k = A.start[sz(j)]; k < A.start[sz(j) + 1]; ++k) {
+            const Index i = A.row[sz(k)];
+            r[sz(i)] += delta * A.val[sz(k)];
+            row_viol[sz(i)] = row_violation(r[sz(i)], q.c_lo[sz(i)], q.c_hi[sz(i)]);
+        }
         x[sz(j)] ^= 1U;
         ++diag.flips;
     };
+
+    // Scratch for the swap neighbourhood below, hoisted out of the iteration
+    // loop. These used to be declared fresh (and, for outs/ins, reserved to
+    // n; for coupling, allocated AND zero-filled) on every single iteration
+    // that took the cardinality-swap path -- i.e. a malloc/free and an O(n)
+    // fill per iteration on top of the O(n) work the block already does.
+    // coupling's own reset loop (below) always leaves it all-zero again
+    // before the block exits, so zero-filling it here once is sufficient;
+    // outs/ins only need their size reset, not their capacity.
+    std::vector<std::pair<f64, Index>> outs, ins;
+    outs.reserve(sz(n)); ins.reserve(sz(n));
+    std::vector<f64> coupling(sz(n), 0.0);
 
     std::uint64_t since_improve = 0;
     for (diag.iterations = 0; diag.iterations < opts.max_iterations; ++diag.iterations) {
@@ -299,8 +333,7 @@ BinQuadResult solve_binquad(const io::QplibInstance& q,
         // cost at K*(nnz + K) and is the same shape a GPU would evaluate.
         if (has_cardinality && viol <= 1e-9) {
             constexpr Index kCand = 24;
-            std::vector<std::pair<f64, Index>> outs, ins;
-            outs.reserve(sz(n)); ins.reserve(sz(n));
+            outs.clear(); ins.clear();
             for (Index j = 0; j < n; ++j) {
                 if (tabu_until[sz(j)] > diag.iterations) continue;
                 const f64 gain_remove = -(lin[sz(j)] + h[sz(j)]);
@@ -322,7 +355,6 @@ BinQuadResult solve_binquad(const io::QplibInstance& q,
                 // frozen at 6962.46 across the whole budget).
                 f64 best_swap = std::numeric_limits<f64>::infinity();
                 Index si = -1, sj = -1;
-                std::vector<f64> coupling(sz(n), 0.0);
                 for (Index a = 0; a < n_out; ++a) {
                     const Index i = outs[sz(a)].second;
                     for (Index k = adj.start[sz(i)]; k < adj.start[sz(i) + 1]; ++k)
