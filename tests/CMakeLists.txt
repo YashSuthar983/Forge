@@ -5,10 +5,18 @@ function(sor_add_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+sor_add_test(test_options             sor_search sor_engines sor_core)
+sor_add_test(test_qplib               sor_search sor_io)
+target_compile_definitions(test_qplib PRIVATE
+  SOR_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/benchmarks")
+sor_add_test(test_pooling             sor_search sor_io sor_engines)
+target_compile_definitions(test_pooling PRIVATE
+  SOR_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/benchmarks")
 sor_add_test(test_csr                 sor_sparse)
 sor_add_test(test_csc                 sor_sparse)
 sor_add_test(test_lu                  sor_la_cpu)
 sor_add_test(test_lu_ft               sor_la_cpu)
+sor_add_test(test_ldlt               sor_la_cpu)
 sor_add_test(test_backend_parity      sor_backend)
 sor_add_test(test_no_unproved_optimal sor_certify)
 sor_add_test(test_lp_certificates      sor_certify sor_io)
@@ -23,6 +31,9 @@ sor_add_test(test_dual_cost_perturbation sor_engines)
 sor_add_test(test_presolve            sor_presolve)
 sor_add_test(test_hpr                 sor_engines sor_certify sor_io)
 sor_add_test(test_lp_device           sor_backend sor_engines sor_io)
+sor_add_test(test_qp_device           sor_backend sor_sparse)
+sor_add_test(test_pdhcg_device        sor_engines sor_backend sor_sparse)
+sor_add_test(test_batched_pdhcg       sor_engines sor_backend sor_sparse)
 sor_add_test(test_lp_batched          sor_backend sor_engines sor_io)
 sor_add_test(test_r2hpdg              sor_backend sor_engines)
 sor_add_test(test_hpr_integration     sor_engines sor_certify sor_io)
@@ -65,6 +76,7 @@ sor_add_test(test_qps                 sor_io sor_engines sor_certify)
 sor_add_test(test_ps_must             sor_search sor_engines sor_certify sor_io
                                       sor_la_cpu)
 sor_add_test(test_extensions          sor_search sor_engines sor_certify)
+sor_add_test(test_miqp_bb             sor_search sor_engines sor_certify)
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
@@ -79,6 +91,7 @@ function(sor_add_python_test name)
 endfunction()
 
 sor_add_python_test(test_compare)
+sor_add_python_test(test_qplib_eval)
 sor_add_python_test(test_forbidden_dependencies)
 set_tests_properties(test_forbidden_dependencies PROPERTIES
   ENVIRONMENT
@@ -104,3 +117,37 @@ target_compile_definitions(test_cli_validation PRIVATE
   SOR_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
   SOR_BINARY_DIR="${CMAKE_BINARY_DIR}")
 add_dependencies(test_cli_validation sor_solve sor_check)
+
+# --engine auto (.qplib) dispatch table: also drives the real CLI, plus
+# needs the checked-in QPLIB samples the repo already ships.
+sor_add_test(test_qplib_auto_engine)
+target_compile_definitions(test_qplib_auto_engine PRIVATE
+  SOR_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+  SOR_BINARY_DIR="${CMAKE_BINARY_DIR}")
+add_dependencies(test_qplib_auto_engine sor_solve)
+
+sor_add_test(test_qcr                 sor_search sor_io)
+target_compile_definitions(test_qcr PRIVATE
+  SOR_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/benchmarks")
+sor_add_test(test_binquad_device      sor_search sor_backend sor_io)
+target_compile_definitions(test_binquad_device PRIVATE
+  SOR_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/benchmarks")
+sor_add_test(test_bqp_bab             sor_search sor_io)
+sor_add_test(test_qp_ipm              sor_engines sor_certify)
+sor_add_test(test_qcqp_ipm            sor_search sor_engines sor_certify)
+# Quadratic constraints in the model layer; shells out to sor_solve for the
+# "every engine reports Unsupported on a QC instance" check.
+sor_add_test(test_qcqp                sor_search sor_engines sor_certify sor_io)
+target_compile_definitions(test_qcqp PRIVATE
+  SOR_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+  SOR_BINARY_DIR="${CMAKE_BINARY_DIR}")
+add_dependencies(test_qcqp sor_solve)
+sor_add_test(test_global_qp          sor_search)
+
+# The same device tests with SOR_VK_PROFILE on: timestamp queries bracket
+# every dispatch, and must change nothing the tests check.  (Without a Vulkan
+# device these reduce to the CPU runs, as the unprofiled tests do.)
+foreach(_t test_pdhcg_device test_batched_pdhcg test_lp_device test_qp_device)
+  add_test(NAME ${_t}_profiled COMMAND ${_t})
+  set_tests_properties(${_t}_profiled PROPERTIES ENVIRONMENT SOR_VK_PROFILE=1)
+endforeach()

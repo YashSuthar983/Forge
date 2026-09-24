@@ -1,0 +1,54 @@
+QCQP_TINY # hand-written test instance, NOT from QPLIB; see tests/test_qcqp.cpp
+QGQ # quadratic objective, general variables, quadratic constraints
+maximize # objective sense
+4 # number of variables
+3 # number of constraints
+2 # number of quadratic terms in objective
+1 1 2.0
+2 1 3.0
+0.0 # default value for linear coefficients in objective
+2 # number of non-default linear coefficients in objective
+1 1.0
+3 -1.0
+5.0 # objective constant
+8 # number of quadratic terms in all constraints
+1 1 1 2.0
+1 2 1 4.0
+1 2 1 -1.0
+2 1 2 1.0
+2 2 1 -1.0
+3 4 4 -2.0
+3 4 3 1.0
+3 3 4 1.0
+4 # number of linear terms in all constraints
+1 1 1.0
+2 2 1.0
+2 3 1.0
+3 4 1.0
+1.0E+20 # value for infinity
+-1.0E+20 # default left-hand-side value
+1 # number of non-default left-hand-sides
+2 1.0
+10.0 # default right-hand-side value
+1 # number of non-default right-hand-sides
+3 -4.5
+0.0 # default variable lower bound value
+1 # number of non-default variable lower bounds
+4 -5.0
+1.0E+20 # default variable upper bound value
+1 # number of non-default variable upper bounds
+4 5.0
+0 # default variable type
+2 # number of non-default variable types
+2 2
+3 1
+0.0 # default variable primal value in starting point
+0 # number of non-default variable primal values in starting point
+0.0 # default constraint dual value in starting point
+0 # number of non-default constraint dual values in starting point
+0.0 # default variable bound dual value in starting point
+0 # number of non-default variable bound dual values in starting point
+1 # number of non-default variable names
+4 w4
+1 # number of non-default constraint names
+3 cap
