@@ -364,7 +364,7 @@ namespace detail {
 LpStrategy route_lp_auto(const core::LpStructuralFeatures& f,
                          std::string& rationale) {
     // Frozen bootstrap rule table, depth <= 3.  It is deliberately
-    // conservative and is not the promoted default.  Agent-1 benchmark data
+    // conservative and is not the promoted default.  Earlier benchmark data
     // can replace this table only with a new manifest hash and holdout report.
     if (f.nonzeros < 250000) {
         rationale = "bootstrap rule 1: fewer than 250k nonzeros; simplex tie-break";
