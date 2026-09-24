@@ -1,0 +1,32 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Barzilai-Borwein terms of one inner step, per entry, for the host to
+// sum-reduce into s's and s'dg:
+//   grad_new = Q trial + c + aty + (trial - x)/tau
+//   s = trial - xin ;  dg = grad_new - grad
+// grad_new is not stored: the next inner iteration recomputes the gradient
+// at the new point anyway, exactly as the CPU oracle does.
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint n; uint pad; double tau; } pc;
+
+layout(std430, binding = 0) readonly  buffer QxBuf    { double qx[]; };
+layout(std430, binding = 1) readonly  buffer CBuf     { double c[]; };
+layout(std430, binding = 2) readonly  buffer AtyBuf   { double aty[]; };
+layout(std430, binding = 3) readonly  buffer TrialBuf { double trial[]; };
+layout(std430, binding = 4) readonly  buffer XBuf     { double x[]; };
+layout(std430, binding = 5) readonly  buffer XinBuf   { double xin[]; };
+layout(std430, binding = 6) readonly  buffer GradBuf  { double grad[]; };
+layout(std430, binding = 7) writeonly buffer S2Buf    { double s2[]; };
+layout(std430, binding = 8) writeonly buffer SdgBuf   { double sdg[]; };
+
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.n) return;
+    double t = trial[j];
+    double gn = qx[j] + c[j] + aty[j] + (t - x[j]) / pc.tau;
+    double s = t - xin[j];
+    s2[j] = s * s;
+    sdg[j] = s * (gn - grad[j]);
+}

@@ -1,0 +1,85 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Parallel binquad, kernel 2 of 4: one workgroup per search picks the
+// minimum score (smallest index on ties, as a sequential strict-< scan
+// would), then thread 0 does the search's bookkeeping: move the running
+// objective/violation, tabu tenure, incumbent test, penalty, stagnation.
+// A search whose every move is excluded takes a random one, drawn from its
+// own xorshift32 stream in the same order as the CPU oracle.
+// Per-search state, 16 doubles per search:
+//   0 obj  1 viol  2 penalty  3 best_obj  4 best_viol  5 iter  6 since_improve
+//   7 have_feasible  8 chosen  9 improved  10 stalled  11 restart  12 base
+
+// Arithmetic that feeds a decision is declared `precise`: it forbids the
+// compiler contracting a*b+c into an FMA, which would round differently
+// from the CPU oracle (built with -ffp-contract=off) and could flip a tie.
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint n; uint tenure_min; uint tenure_span; uint stagnation;
+    double penalty_floor;
+} pc;
+
+layout(std430, binding = 0) readonly buffer SCB { double score[]; };
+layout(std430, binding = 1) readonly buffer DOB { double dobj[]; };
+layout(std430, binding = 2) readonly buffer DVB { double dviol[]; };
+layout(std430, binding = 3) buffer TB           { double tabu[]; };
+layout(std430, binding = 4) buffer STB          { double st[]; };
+layout(std430, binding = 5) buffer RNG          { uint rng[]; };
+
+shared double sv[256];
+shared uint sj[256];
+
+uint xs(inout uint v) { v ^= v << 13; v ^= v >> 17; v ^= v << 5; return v; }
+
+void main() {
+    uint s = gl_WorkGroupID.x, lid = gl_LocalInvocationID.x;
+    uint off = s * pc.n;
+    double bv = 1e300lf;
+    uint bj = 0xFFFFFFFFu;
+    for (uint j = lid; j < pc.n; j += 256u) {
+        double v = score[off + j];
+        if (v < bv) { bv = v; bj = j; }
+    }
+    sv[lid] = bv; sj[lid] = bj;
+    barrier();
+    for (uint w = 128u; w > 0u; w >>= 1) {
+        if (lid < w) {
+            double ov = sv[lid + w]; uint oj = sj[lid + w];
+            if (ov < sv[lid] || (ov == sv[lid] && oj < sj[lid])) { sv[lid] = ov; sj[lid] = oj; }
+        }
+        barrier();
+    }
+    if (lid != 0u) return;
+
+    uint so = s * 16u;
+    uint state = rng[s];
+    uint j = sj[0];
+    if (!(sv[0] < 1e300lf)) j = xs(state) % pc.n;
+    precise double o_new = st[so + 0u] + dobj[off + j];
+    precise double v_new = st[so + 1u] + dviol[off + j];
+    st[so + 0u] = o_new;
+    st[so + 1u] = v_new;
+    uint tenure = pc.tenure_min + xs(state) % max(1u, pc.tenure_span);
+    tabu[off + j] = st[so + 5u] + double(tenure);
+    rng[s] = state;
+
+    double obj = st[so + 0u], viol = st[so + 1u];
+    bool improved = false;
+    precise double o_best = st[so + 3u] - 1e-12lf;
+    if (viol <= 1e-9lf && obj < o_best) {
+        st[so + 3u] = obj; st[so + 4u] = 0.0lf; st[so + 7u] = 1.0lf; improved = true;
+    } else if (st[so + 7u] == 0.0lf && viol < st[so + 4u]) {
+        st[so + 4u] = viol; improved = true;
+    }
+    st[so + 6u] = improved ? 0.0lf : st[so + 6u] + 1.0lf;
+    precise double pen_up = st[so + 2u] * 1.0005lf;
+    precise double pen_dn = st[so + 2u] * 0.999lf;
+    if (viol > 1e-9lf) st[so + 2u] = pen_up;
+    else st[so + 2u] = max(pen_dn, pc.penalty_floor);
+    st[so + 5u] += 1.0lf;
+    if (st[so + 6u] >= double(pc.stagnation)) st[so + 10u] = 1.0lf;
+    st[so + 8u] = double(j);
+    st[so + 9u] = improved ? 1.0lf : 0.0lf;
+}

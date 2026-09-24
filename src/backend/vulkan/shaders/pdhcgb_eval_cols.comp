@@ -1,0 +1,45 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Batched pdhcg_eval_cols: per-lane column terms of the convergence check.
+// Batched layout: lane l of entry j lives at [j*K + l] (lanes interleaved,
+// so neighbouring threads touch neighbouring lanes).  mask[l] != 0 selects
+// the lanes this dispatch may touch; masked-out lanes are left untouched.
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint n; uint K; } pc;
+
+layout(std430, binding = 0)  readonly  buffer XBuf    { double x[]; };
+layout(std430, binding = 1)  readonly  buffer QxBuf   { double qx[]; };
+layout(std430, binding = 2)  readonly  buffer CBuf    { double c[]; };
+layout(std430, binding = 3)  readonly  buffer AtyBuf  { double aty[]; };
+layout(std430, binding = 4)  readonly  buffer LoBuf   { double lo[]; };
+layout(std430, binding = 5)  readonly  buffer HiBuf   { double hi[]; };
+layout(std430, binding = 6)  writeonly buffer ViolBuf { double viol[]; };
+layout(std430, binding = 7)  writeonly buffer DresBuf { double dres[]; };
+layout(std430, binding = 8)  writeonly buffer XqBuf   { double xq[]; };
+layout(std430, binding = 9)  writeonly buffer CxBuf   { double cx[]; };
+layout(std430, binding = 10) writeonly buffer PxBuf   { double px[]; };
+layout(std430, binding = 11) writeonly buffer PinfBuf { double pinf[]; };
+layout(std430, binding = 12) readonly  buffer MK      { double mask[]; };
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    if (g >= pc.n * pc.K) return;
+    uint j = g / pc.K, l = g - j * pc.K;
+    if (mask[l] == 0.0lf) return;
+    double xj = x[g], lw = lo[g], h = hi[g];
+    double r = qx[g] + c[j] + aty[g];
+    double v = 0.0lf;
+    if (xj < lw) v = lw - xj;
+    if (xj > h) v = max(v, xj - h);
+    viol[g] = v;
+    dres[g] = abs(xj - max(lw, min(xj - r, h)));
+    xq[g] = xj * qx[g];
+    cx[g] = c[j] * xj;
+    double z = -r, p = 0.0lf, f = 0.0lf;
+    if (z > 0.0lf) { if (isinf(h)) f = 1.0lf; else p = h * z; }
+    else if (z < 0.0lf) { if (isinf(lw)) f = 1.0lf; else p = lw * z; }
+    px[g] = p;
+    pinf[g] = f;
+}

@@ -1,0 +1,44 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// HPR-QP y half-step AND the Halpern update of y, FUSED into one dispatch.
+//
+// This fusion is only sound because dy is read before y is overwritten:
+//   ry   = A*v - sigma*lambda_A*y
+//   ybar = (clamp(ry, row_lo, row_hi) - ry)/(sigma*lambda_A)
+//   dy   = ybar - y_old            <- consumed by the following A'dy matvec
+//   y    = a*y0 + b*(2*ybar - y_old)
+// Both dy and the new y derive from y_old, which is still in a register, so
+// splitting this into two dispatches would re-read y for no reason.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint pad;
+    double sla;      // sigma * lambda_A
+    double a;        // Halpern anchor weight 1/(t+2)
+    double b;        // (t+1)/(t+2)
+} pc;
+
+layout(std430, binding = 0) readonly  buffer AvBuf   { double av[]; };
+layout(std430, binding = 1) readonly  buffer RLoBuf  { double rlo[]; };
+layout(std430, binding = 2) readonly  buffer RHiBuf  { double rhi[]; };
+layout(std430, binding = 3) readonly  buffer Y0Buf   { double y0[]; };
+layout(std430, binding = 4) buffer YBuf              { double y[]; };
+layout(std430, binding = 5) writeonly buffer YbarBuf { double ybar[]; };
+layout(std430, binding = 6) writeonly buffer DyBuf   { double dy[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.m) return;
+    double yo = y[i];
+    double ry = av[i] - pc.sla * yo;
+    double cl = ry;
+    if (cl < rlo[i]) cl = rlo[i];
+    if (cl > rhi[i]) cl = rhi[i];
+    double yb = (cl - ry) / pc.sla;
+    ybar[i] = yb;
+    dy[i]   = yb - yo;
+    y[i]    = pc.a * y0[i] + pc.b * (2.0lf * yb - yo);
+}
