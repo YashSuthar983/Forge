@@ -344,8 +344,25 @@ BinQuadResult solve_binquad(const io::QplibInstance& q,
             const Index n_out = std::min<Index>(kCand, static_cast<Index>(outs.size()));
             const Index n_in = std::min<Index>(kCand, static_cast<Index>(ins.size()));
             if (n_out > 0 && n_in > 0) {
-                std::partial_sort(outs.begin(), outs.begin() + n_out, outs.end());
-                std::partial_sort(ins.begin(), ins.begin() + n_in, ins.end());
+                // Only the SET of the n_out/n_in best candidates matters
+                // below: the (a, b) loop scans the full cross product
+                // regardless of order, nothing downstream indexes outs/ins
+                // expecting sorted position. So this needs a SELECTION, not
+                // a SORT -- nth_element instead of partial_sort avoids
+                // paying to order the kept elements against each other, and
+                // is skipped entirely when there is nothing to select down
+                // to (n_out == outs.size(), the common case for "outs": a
+                // cardinality row keeps few variables at 1, usually fewer
+                // than kCand). Profiled 2026-09-24 (callgrind, QPLIB_3834,
+                // n=50, cardinality=10): this pair of partial_sort calls,
+                // run on every iteration once the search is feasible, was
+                // ~32% of the engine's instructions -- the "outs" side never
+                // truncates on this instance (10 <= kCand), so half of that
+                // was sorting an array not being cut down at all.
+                if (n_out < static_cast<Index>(outs.size()))
+                    std::nth_element(outs.begin(), outs.begin() + (n_out - 1), outs.end());
+                if (n_in < static_cast<Index>(ins.size()))
+                    std::nth_element(ins.begin(), ins.begin() + (n_in - 1), ins.end());
 
                 // Take the BEST available swap even when it worsens the
                 // objective -- that is what makes this a tabu search rather
