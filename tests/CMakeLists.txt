@@ -91,6 +91,7 @@ function(forge_add_python_test name)
 endfunction()
 
 forge_add_python_test(test_compare)
+forge_add_python_test(test_fetch_benchmarks)
 forge_add_python_test(test_qplib_eval)
 forge_add_python_test(test_forbidden_dependencies)
 set_tests_properties(test_forbidden_dependencies PROPERTIES
