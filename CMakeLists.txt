@@ -72,7 +72,7 @@ target_compile_options(sor_flags INTERFACE
 add_subdirectory(src/core)        # L0  platform types
 add_subdirectory(src/sparse)      # L1  sparse containers
 add_subdirectory(src/la)          # L1  LU, FTRAN/BTRAN
-add_subdirectory(src/backend)     # L1  CPU / Vulkan / Julia devices
+add_subdirectory(src/backend)     # L1  CPU / Vulkan devices
 add_subdirectory(src/model)       # L2  problem representation
 add_subdirectory(src/io)          # L2  MPS / QPS / solution I/O
 add_subdirectory(src/presolve)    # L3  problem transformation
