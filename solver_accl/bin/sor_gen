@@ -1,6 +1,0 @@
-#!/usr/bin/env julia
-const ROOT = normpath(joinpath(@__DIR__, ".."))
-import Pkg
-Pkg.activate(ROOT; io=devnull)
-using SovereignSolver
-exit(Int(sor_gen_main(ARGS)))
