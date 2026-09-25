@@ -91,6 +91,7 @@ function(sor_add_python_test name)
 endfunction()
 
 sor_add_python_test(test_compare)
+sor_add_python_test(test_fetch_benchmarks)
 sor_add_python_test(test_qplib_eval)
 sor_add_python_test(test_forbidden_dependencies)
 set_tests_properties(test_forbidden_dependencies PROPERTIES

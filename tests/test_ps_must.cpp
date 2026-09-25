@@ -122,19 +122,12 @@ void test_m5_sparse_linear_algebra() {
     CHECK_NEAR(2.0 * x[0] + 3.0 * x[1], 2.0, 1e-12);
 }
 
-std::size_t regular_file_count(const fs::path& dir) {
-    if (!fs::is_directory(dir)) return 0;
-    return static_cast<std::size_t>(std::count_if(
-        fs::directory_iterator(dir), fs::directory_iterator(),
-        [](const fs::directory_entry& e) { return e.is_regular_file(); }));
-}
-
 void test_m7_cli_and_m8_public_harnesses() {
     const fs::path src(SOR_SOURCE_DIR), bin(SOR_BINARY_DIR);
     CHECK(fs::is_regular_file(bin / "sor_solve"));
     CHECK(fs::is_regular_file(bin / "sor_check"));
-    CHECK(regular_file_count(src / "benchmarks/netlib/mps") > 0);
-    CHECK(regular_file_count(src / "benchmarks/miplib-easy/mps") > 0);
+    CHECK(fs::is_regular_file(src / "scripts/fetch_benchmarks.py"));
+    CHECK(fs::is_regular_file(src / "benchmarks/miplib2017/benchmark-v2.test"));
     // M8 requires a public harness that measures SOR against independent
     // reference solvers. That used to be one script per baseline
     // (run_highs_baseline.py, run_cbc_baseline.py, ...); they are now a single
