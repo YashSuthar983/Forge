@@ -36,10 +36,6 @@ in §7 describe the configuration used for each committed run.
 | Barrier / IPM | **not built** | - |
 | Netlib simplex (committed run) | **93/93** Optimal | SGM 0.2189 s vs HiGHS 0.0866 s |
 
-`solver_accl/` is a first-party Julia solver with its own whole-model and batch
-API. It is not a CMake target or a C++ engine dependency. See
-`solver_accl/VENDORED.md` for its dependencies and runtime requirements.
-
 ---
 
 ## 1. Design commitments (as enforced today)
@@ -341,12 +337,8 @@ sor_gen   blend | schedule | dispatch | all
 
 ## 8. Clean-room boundary
 
-The C++ solve path does not link to or translate third-party solver code.
-External solvers are benchmark and correctness oracles only. `solver_accl/`
-follows the same rule and runs independently, using a coarse-grained,
-out-of-process API rather than per-iteration calls. Linking it into CMake
-would add Julia and optional GPU package requirements and requires a separate
-build decision.
+The solve path does not link to or translate third-party solver code.
+External solvers are benchmark and correctness oracles only.
 
 ## 9. Capability ladder (claimable vs not)
 
