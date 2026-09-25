@@ -485,11 +485,22 @@ std::vector<f64> LocalIpm::random_start(const std::vector<f64>& near) {
 }
 
 void LocalIpm::eval_rows(const std::vector<f64>& x, std::vector<f64>& gx) {
-    gx.assign(sz(m_), 0.0);
+    // Every row i is fully overwritten below (each gx[i] gets a local
+    // accumulator, not a +=  onto whatever was in gx before), so this only
+    // needs the buffer at the right SIZE, not zeroed first -- resize() is a
+    // no-op once gx has already grown to m_ on an earlier call, where
+    // assign(m_, 0.0) used to re-touch the whole buffer on every single
+    // call.  Same summation order as before (row-by-row, row-local
+    // accumulator instead of gx[i] starting at a pre-zeroed 0.0), so the
+    // result is bit-identical.
+    gx.resize(sz(m_));
     const auto& rp = k_.A.pattern.row_ptr();
     const auto& ci = k_.A.pattern.col_idx();
-    for (core::Index i = 0; i < m_; ++i)
-        for (auto t = rp[sz(i)]; t < rp[sz(i) + 1]; ++t) gx[sz(i)] += k_.A.vals[sz(t)] * x[sz(ci[sz(t)])];
+    for (core::Index i = 0; i < m_; ++i) {
+        f64 acc = 0.0;
+        for (auto t = rp[sz(i)]; t < rp[sz(i) + 1]; ++t) acc += k_.A.vals[sz(t)] * x[sz(ci[sz(t)])];
+        gx[sz(i)] = acc;
+    }
     for (std::size_t t = 0; t < nq_; ++t) {
         const auto& q = k_.quad[t];
         auto& w = qix_[t];
@@ -729,12 +740,16 @@ LocalRun LocalIpm::run(std::vector<f64> x, int max_it, f64 tol, Clock::time_poin
         }
     };
     // Barrier merit: f - mu sum log s + nu_pen ||g(x) - w||_1 (evaluated with
-    // its own g, so the line search can call it at trial points).
+    // its own g, so the line search can call it at trial points).  objective()
+    // and eval_rows() only ever index their first argument at columns < n
+    // (they never touch the w block), and zz's first n entries ARE x, so
+    // they can read zz directly -- no need to copy it into a fresh x-only
+    // vector first.  This runs up to ~40x per outer iteration (once per
+    // backtracking trial), so that copy was real per-call allocation churn.
     std::vector<f64> gtrial, ltrial(sz(N)), utrial(sz(N));
     auto merit = [&](const std::vector<f64>& zz, f64 mu_, f64 pen, f64& infeas) {
-        std::vector<f64> xx(zz.begin(), zz.begin() + n);
-        f64 phi = objective(xx);
-        eval_rows(xx, gtrial);
+        f64 phi = objective(zz);
+        eval_rows(zz, gtrial);
         infeas = 0.0;
         for (core::Index i = 0; i < m; ++i) infeas += std::fabs(gtrial[sz(i)] - zz[sz(n + i)]);
         slacks(zz, ltrial, utrial);
@@ -828,6 +843,7 @@ LocalRun LocalIpm::run(std::vector<f64> x, int max_it, f64 tol, Clock::time_poin
 
         // Optimality error (Waechter & Biegler s.2.1: dual and complementarity scaled by
         // the multipliers' size, s_max = 100).
+        f64 sd_cache = 0.0;   // set by errors() below; see ec_only()'s comment
         auto errors = [&](f64 mu_, f64& e_p, f64& e_d, f64& e_c) {
             e_p = e_d = e_c = 0.0;
             f64 msum = 0.0;
@@ -841,8 +857,28 @@ LocalRun LocalIpm::run(std::vector<f64> x, int max_it, f64 tol, Clock::time_poin
                 if (has_u_[sz(c)]) { e_c = std::max(e_c, std::fabs(su[sz(c)] * nu[sz(c)] - mu_)); msum += nu[sz(c)]; ++mcnt; }
             }
             const f64 sd = std::max(100.0, mcnt > 0 ? msum / mcnt : 0.0) / 100.0;
+            sd_cache = sd;
             e_d /= sd;
             e_c /= sd;
+        };
+        // e_p and e_d (and the sd scale) above never read mu_ -- only e_c
+        // does.  The barrier-update guard loop right below calls this at up
+        // to 20 candidate mu values per outer iteration with rp/rdx/rdw/y/
+        // lam/nu/sl/su all fixed (nothing in that loop touches them), so
+        // e_p/e_d/sd are IDENTICAL on every one of those calls -- recomputing
+        // them each time is pure waste.  ec_only() recomputes just the
+        // mu_-dependent piece (same loop, same operations, same order as
+        // errors()'s e_c, divided by the same cached sd), so combined with
+        // the untouched ep/ed from the errors(0.0, ...) call just below, it
+        // reproduces exactly what errors(mu_, ep, ed, ec) would have written
+        // into ep/ed/ec -- bit-identical, just without the redundant passes.
+        auto ec_only = [&](f64 mu_) {
+            f64 e_c = 0.0;
+            for (core::Index c = 0; c < N; ++c) {
+                if (has_l_[sz(c)]) e_c = std::max(e_c, std::fabs(sl[sz(c)] * lam[sz(c)] - mu_));
+                if (has_u_[sz(c)]) e_c = std::max(e_c, std::fabs(su[sz(c)] * nu[sz(c)] - mu_));
+            }
+            return e_c / sd_cache;
         };
         errors(0.0, ep, ed, ec);
         ep_best = std::min(ep_best, ep);
@@ -877,8 +913,10 @@ LocalRun LocalIpm::run(std::vector<f64> x, int max_it, f64 tol, Clock::time_poin
             stall_window_start = it;
         }
         // Barrier update: solve each barrier problem to kappa_eps * mu.
+        // ep/ed are left as errors(0.0, ...) above set them (mu_-independent,
+        // see ec_only()'s comment); only ec is refreshed per candidate mu.
         for (int guard = 0; guard < 20; ++guard) {
-            errors(mu, ep, ed, ec);
+            ec = ec_only(mu);
             if (std::max({ep, ed, ec}) > kappa_eps * mu || mu <= tol / 10.0) break;
             mu = std::max(tol / 10.0, std::min(kappa_mu * mu, std::pow(mu, theta_mu)));
         }
@@ -964,8 +1002,11 @@ LocalRun LocalIpm::run(std::vector<f64> x, int max_it, f64 tol, Clock::time_poin
             if (has_l_[sz(c)]) dbar -= mu * dz[sz(c)] / sl[sz(c)];
             if (has_u_[sz(c)]) dbar += mu * dz[sz(c)] / su[sz(c)];
         }
-        std::vector<f64> dxv(dz.begin(), dz.begin() + n);
-        jac(dxv, jdx);
+        // jac() only reads its first argument at columns < n (never the w
+        // block), and dz's first n entries ARE the x-step, so pass dz
+        // directly instead of copying it into a fresh n-vector every
+        // iteration.
+        jac(dz, jdx);
         f64 dinf = 0.0, inf1 = 0.0;
         for (core::Index i = 0; i < m; ++i) {
             const f64 lin = jdx[sz(i)] - dz[sz(n + i)];
@@ -994,8 +1035,23 @@ LocalRun LocalIpm::run(std::vector<f64> x, int max_it, f64 tol, Clock::time_poin
         if (dbar + nu_pen * dinf >= 0.0 && dinf < 0.0)
             nu_pen = std::min(kNuPenCap, std::max(nu_pen, -2.0 * dbar / dinf + 1e-6));
         const f64 dphi = dbar + nu_pen * dinf;
+        // phi0 is merit(z, mu, nu_pen, inf0) -- but z is exactly the point
+        // this same iteration already evaluated at the top of the loop:
+        // gx = g(z) (eval_rows(xv, gx) above, xv == z's x-block, unchanged
+        // since) and sl/su = slacks(z) (slacks(z, sl, su) above, z also
+        // unchanged since).  merit() would just recompute both from
+        // scratch to get the identical values back.  Inlined here with the
+        // exact same operations in the exact same order as merit() (accumulate
+        // infeas over i, then phi = objective(.) minus mu*log(slack) per
+        // column, then phi += pen*infeas), so bit-identical to calling it.
         f64 inf0 = 0.0;
-        const f64 phi0 = merit(z, mu, nu_pen, inf0);
+        for (core::Index i = 0; i < m; ++i) inf0 += std::fabs(gx[sz(i)] - z[sz(n + i)]);
+        f64 phi0 = objective(xv);
+        for (core::Index c = 0; c < N; ++c) {
+            if (has_l_[sz(c)]) phi0 -= mu * std::log(sl[sz(c)]);
+            if (has_u_[sz(c)]) phi0 -= mu * std::log(su[sz(c)]);
+        }
+        phi0 += nu_pen * inf0;
         f64 alpha = ap;
         std::vector<f64> ztrial(sz(N));
         bool accepted = false;
