@@ -62,6 +62,6 @@ optimum (latest exact-binary check: ~27.8 s).
 | File | Role |
 |---|---|
 | [`QP.md`](QP.md) | Layout, engines and what each may claim, the claim discipline, measurements, references |
-| [`solver_accl/VENDORED.md`](solver_accl/VENDORED.md) | Standalone first-party Julia solver |
+| [`CLI_FLAGS.md`](CLI_FLAGS.md) | Complete command-line flag and dynamic-option reference |
 
 **Code wins** if a doc disagrees with headers or `CMakeLists.txt`.
