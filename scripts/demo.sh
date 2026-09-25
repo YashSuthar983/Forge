@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# FORGE  - CLI film track (no Julia).
+# FORGE  - CLI film track.
 # Usage:
 #   ./scripts/demo.sh              # full track
 #   ./scripts/demo.sh blend        # one beat
