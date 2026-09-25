@@ -7,7 +7,8 @@ Public + SOR-generated. **No confidential MRPL data.**
 | `open-refinery-lp/` | github.com/khb-git/downstream-refinery-lp → MPS | yes (simplex) |
 | `minlplib-crudeoil/` | MINLPLib crude-oil (bilinear/quadratic) | **no** (MINLP later) |
 
-Netlib and MIPLIB models are in `../netlib/mps/` and `../miplib-easy/mps/`.
+Netlib and MIPLIB models can be fetched into `../netlib/mps/` and
+`../miplib-easy/mps/` with `scripts/fetch_benchmarks.py`.
 Generated blend, schedule, and dispatch size ladders are in
 `../industrial-ladder/`. Demo instances are in `../../examples/`.
 

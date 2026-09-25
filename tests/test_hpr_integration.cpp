@@ -382,72 +382,77 @@ int main() {
         CHECK(result.max_dual_violation <= options.dual_tol);
     }
 
-    // AFIRO is a real bounded Netlib problem.  This is a correctness test,
-    // not a timing claim.
     const auto afiro_path = std::filesystem::path(SOR_SOURCE_DIR) /
                             "benchmarks/netlib/mps/afiro.mps";
-    io::MpsReadReport report;
-    const auto afiro = io::read_mps_file(afiro_path.string(), report);
-    for (int ablation = 0; ablation < 5; ++ablation) {
-        engines::HprOptions options;
-        options.max_iterations = 200000;
-        options.check_every = 100;
-        options.primal_tol = 1e-4;
-        options.dual_tol = 1e-4;
-        options.gap_tol = 1e-4;
-        options.use_polishing = false;
-        if (ablation == 1) options.use_restart = false;
-        if (ablation == 2) options.use_reflection = false;
-        if (ablation == 3) options.use_primal_weight = false;
-        if (ablation == 4) {
-            options.use_primal_weight = false;
-            options.use_restart = false;
-            options.use_halpern = false;
-            options.use_reflection = false;
-            options.use_adaptive_step = false;
-        }
-        engines::HprDiagnostics diagnostics;
-        const auto result = solve_checked(afiro, options, diagnostics);
-        const std::string case_name = "AFIRO feature-ladder case " +
-                                      std::to_string(ablation);
-        const bool restart_off_budget_end = ablation == 1 &&
-            result.status == core::Status::Interrupted;
-        test::report(result.status == core::Status::Feasible ||
-                         restart_off_budget_end,
-                     "feature-ladder run has an honest status", __FILE__,
-                     __LINE__, case_name);
-        CHECK(result.x.size() ==
-              static_cast<std::size_t>(afiro.n_cols()));
-        CHECK(std::isfinite(result.max_primal_violation));
-        CHECK(std::isfinite(result.max_dual_violation));
-        if (!restart_off_budget_end) {
-            test::report(result.max_primal_violation <= options.primal_tol,
-                         "feature-ladder primal residual passes", __FILE__,
+    if (std::filesystem::is_regular_file(afiro_path)) {
+        io::MpsReadReport report;
+        const auto afiro = io::read_mps_file(afiro_path.string(), report);
+        for (int ablation = 0; ablation < 5; ++ablation) {
+            engines::HprOptions options;
+            options.max_iterations = 200000;
+            options.check_every = 100;
+            options.primal_tol = 1e-4;
+            options.dual_tol = 1e-4;
+            options.gap_tol = 1e-4;
+            options.use_polishing = false;
+            if (ablation == 1) options.use_restart = false;
+            if (ablation == 2) options.use_reflection = false;
+            if (ablation == 3) options.use_primal_weight = false;
+            if (ablation == 4) {
+                options.use_primal_weight = false;
+                options.use_restart = false;
+                options.use_halpern = false;
+                options.use_reflection = false;
+                options.use_adaptive_step = false;
+            }
+            engines::HprDiagnostics diagnostics;
+            const auto result = solve_checked(afiro, options, diagnostics);
+            const std::string case_name = "AFIRO feature-ladder case " +
+                                          std::to_string(ablation);
+            const bool restart_off_budget_end = ablation == 1 &&
+                result.status == core::Status::Interrupted;
+            test::report(result.status == core::Status::Feasible ||
+                             restart_off_budget_end,
+                         "feature-ladder run has an honest status", __FILE__,
                          __LINE__, case_name);
-            test::report(result.max_dual_violation <= options.dual_tol,
-                         "feature-ladder dual residual passes", __FILE__,
-                         __LINE__, case_name);
+            CHECK(result.x.size() ==
+                  static_cast<std::size_t>(afiro.n_cols()));
+            CHECK(std::isfinite(result.max_primal_violation));
+            CHECK(std::isfinite(result.max_dual_violation));
+            if (!restart_off_budget_end) {
+                test::report(result.max_primal_violation <= options.primal_tol,
+                             "feature-ladder primal residual passes", __FILE__,
+                             __LINE__, case_name);
+                test::report(result.max_dual_violation <= options.dual_tol,
+                             "feature-ladder dual residual passes", __FILE__,
+                             __LINE__, case_name);
+            }
+            CHECK(diagnostics.polish_attempts == 0);
         }
-        CHECK(diagnostics.polish_attempts == 0);
+
+        // Negative polishing case: enabling the feature is not permission to run
+        // it.  AFIRO has no finite useful gap at the scheduled checkpoints before
+        // convergence, so both subproblem counters must remain zero.
+        {
+            engines::HprOptions options;
+            options.max_iterations = 10000;
+            options.check_every = 100;
+            options.primal_tol = 1e-7;
+            options.dual_tol = 1e-7;
+            options.gap_tol = 1e-7;
+            options.use_polishing = true;
+            engines::HprDiagnostics diagnostics;
+            const auto result = solve_checked(afiro, options, diagnostics);
+            CHECK(result.status == core::Status::Feasible);
+            CHECK(diagnostics.polish_attempts == 0);
+            CHECK(diagnostics.polish_iterations == 0);
+        }
+
+    } else {
+        test::report(true, "AFIRO HPR checks skipped (fetch Netlib afiro)",
+                     __FILE__, __LINE__);
     }
 
-    // Negative polishing case: enabling the feature is not permission to run
-    // it.  AFIRO has no finite useful gap at the scheduled checkpoints before
-    // convergence, so both subproblem counters must remain zero.
-    {
-        engines::HprOptions options;
-        options.max_iterations = 10000;
-        options.check_every = 100;
-        options.primal_tol = 1e-7;
-        options.dual_tol = 1e-7;
-        options.gap_tol = 1e-7;
-        options.use_polishing = true;
-        engines::HprDiagnostics diagnostics;
-        const auto result = solve_checked(afiro, options, diagnostics);
-        CHECK(result.status == core::Status::Feasible);
-        CHECK(diagnostics.polish_attempts == 0);
-        CHECK(diagnostics.polish_iterations == 0);
-    }
 
     // Polishing ablation: both feasibility subproblems run, respect the total
     // 25% cap, and the main HPR loop resumes if polishing does not finish.

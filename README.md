@@ -19,6 +19,23 @@ python3 scripts/sor_repl.py
 python3 scripts/sor_repl.py --one-shot
 ```
 
+## Benchmark data
+
+Public benchmark instances are downloaded on demand and are not stored in
+Git. List suites and instance names, fetch a whole suite, or request only the
+models needed for one run:
+
+```bash
+python3 scripts/fetch_benchmarks.py --list
+python3 scripts/fetch_benchmarks.py --suite netlib --instance afiro --instance sc50a
+python3 scripts/fetch_benchmarks.py --suite miplib-easy
+python3 scripts/fetch_benchmarks.py --suite miplib2017 --instance air05
+```
+
+The downloader uses the official Netlib and MIPLIB archives, is resumable,
+and accepts `--force`, `--timeout`, and `--root`. Netlib expansion needs the C
+compiler already required by the project build.
+
 | Flag | Values |
 |---|---|
 | `--engine` | `simplex` (default) · `pdhg` · `hpr` · `milp` · `qp` |
