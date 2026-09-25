@@ -343,6 +343,15 @@ void test_primal_phase1_composite_sparse_and_dense_paths() {
 }  // namespace
 
 int main() {
+    const fs::path data = fs::path(FORGE_SOURCE_DIR) /
+                          "benchmarks/netlib/mps/cycle.mps";
+    if (!fs::is_regular_file(data)) {
+        forge::test::report(true,
+            "Netlib dispatch regressions skipped (fetch with "
+            "scripts/fetch_benchmarks.py --suite netlib)",
+            __FILE__, __LINE__);
+        return forge::test::finish("test_dispatch_regressions");
+    }
     test_route_features_on_real_models();
     test_pricing_scans_are_separately_attributed();
     test_real_model_dispatch_sentinels();

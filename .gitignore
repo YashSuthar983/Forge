@@ -36,14 +36,13 @@ nohup.out
 *.out
 *.log
 
-# ---- benchmark INSTANCES ---------------------------------------------------
-# Instance sets are deliberately KEPT in the repo so every published number is
-# reproducible from a clean clone. Only the two bulk downloads below are
-# excluded, purely on size grounds.
-#
-# MIPLIB 2017 collection (~7.3 GB). Re-download:
-#   curl -fL -o /tmp/collection.zip https://miplib.zib.de/downloads/collection.zip
-#   unzip -o -d benchmarks/miplib2017/mps /tmp/collection.zip
+# ---- downloaded benchmark instances ---------------------------------------
+# Public benchmark models are fetched selectively rather than committed:
+#   python3 scripts/fetch_benchmarks.py --list
+#   python3 scripts/fetch_benchmarks.py --suite netlib --instance afiro
+#   python3 scripts/fetch_benchmarks.py --suite miplib-easy
+benchmarks/netlib/
+benchmarks/miplib-easy/mps/
 benchmarks/miplib2017/mps/
 benchmarks/miplib2017/*.zip
 
