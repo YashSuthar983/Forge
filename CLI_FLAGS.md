@@ -322,7 +322,8 @@ These flags belong to repository utilities rather than the solver binaries.
   `--allow-unavailable`, `--allow-unchecked`, `--jsonl`, `--solutions-dir`,
   `--highs-source`, `--exe`, `--relax-integrality`, `--small-matrix-value`, and
   repeatable `--sor-arg`.
-- `scripts/fetch_miplib_easy.py`: `--outdir`, `--limit`.
+- `scripts/fetch_benchmarks.py`: repeatable `--suite` and `--instance`, plus
+  `--all`, `--list`, `--root`, `--timeout`, and `--force`.
 - `scripts/gen_sparse_lp.py`: `--rows`, `--cols`, `--nnz-per-row`, `--seed`,
   `-o`/`--out`.
 - `scripts/qplib_eval.py`: `--zero`, `--machine`.

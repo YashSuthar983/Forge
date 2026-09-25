@@ -479,7 +479,7 @@ int main() {
     const fs::path src(SOR_SOURCE_DIR), bin(SOR_BINARY_DIR);
     solve_exe = (bin / "sor_solve").string();
     check_exe = (bin / "sor_check").string();
-    model = (src / "benchmarks/netlib/mps/afiro.mps").string();
+    model = (src / "examples/testlp.mps").string();
 
     if (!fs::is_regular_file(solve_exe) || !fs::is_regular_file(check_exe) ||
         !fs::is_regular_file(model)) {
