@@ -191,9 +191,9 @@ applied.
 QPLIB sweep with per-instance times, the refinery suite, thread scaling, the
 CPU/GPU crossover, and the per-class engine comparisons.
 
-**[`QP_FLAGS.md`](QP_FLAGS.md) is the full flag reference** — 68 options across the
-four engines. It is generated from the same tables the flags apply and the
-listing prints, so it cannot drift from the solver.
+**[`CLI_FLAGS.md`](CLI_FLAGS.md) is the full flag reference** — including options across
+the four engines. Its dynamic-option section is audited against the same
+binding tables printed by `sor_solve --list-opts`.
 
 One thing worth knowing before reaching for a tolerance: `gap_tol`, `feas_tol`
 and `int_tol` set what the solver will **claim**, not how hard it works.

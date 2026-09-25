@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SOR SIH26119 - CLI film track (no Julia).
+# SOR SIH26119 - CLI film track.
 # Usage:
 #   ./scripts/demo.sh              # full track
 #   ./scripts/demo.sh blend        # one beat
