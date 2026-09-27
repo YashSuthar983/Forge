@@ -3,17 +3,18 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$(dirname "$0")"
 
-if [[ -z "${FORGE_BIN_DIR:-}" ]]; then
+BIN_DIR="${FORGE_BIN_DIR:-${FORGE_BIN_DIR:-}}"
+if [[ -z "$BIN_DIR" ]]; then
   for cand in "$ROOT/build" "$ROOT/build-native"; do
     if [[ -x "$cand/forge_solve" ]]; then
-      export FORGE_BIN_DIR="$cand"
+      BIN_DIR="$cand"
       break
     fi
   done
 fi
-export FORGE_EXAMPLES="${FORGE_EXAMPLES:-$ROOT/examples}"
+export FORGE_BIN_DIR="$BIN_DIR"
 
-if [[ -z "${FORGE_BIN_DIR:-}" || ! -x "$FORGE_BIN_DIR/forge_solve" ]]; then
+if [[ -z "$BIN_DIR" || ! -x "$BIN_DIR/forge_solve" ]]; then
   echo "error: forge_solve not found - build FORGE first (cmake -S . -B build && cmake --build build -j)" >&2
   exit 1
 fi
