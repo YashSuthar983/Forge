@@ -311,14 +311,12 @@ def _apply_bound(m: _Model, line: str) -> None:
 def to_mps(model: _Model, name: str = "TEXTLP") -> str:
     cols = sorted(model.vars)
     # default bounds: 0 <= x  (unless free/set)
-    # Free MPS has no maximize bit - we negate COST and tag sense for the UI.
-    sense_tag = "MAXIMIZE" if model.maximize else "MINIMIZE"
-    lines = [
-        f"NAME          {name}",
-        f"* SOR_SENSE {sense_tag}",
-        "ROWS",
-        f" N  COST",
-    ]
+    lines = [f"NAME          {name}"]
+    if model.maximize:
+        # sor_solve reads OBJSENSE natively, so objective, bounds and gaps all
+        # come back in the user's own sense.
+        lines += ["OBJSENSE", "    MAX"]
+    lines += ["ROWS", " N  COST"]
     for rname, sense, _, _ in model.rows:
         lines.append(f" {sense}  {rname}")
 
@@ -331,9 +329,6 @@ def to_mps(model: _Model, name: str = "TEXTLP") -> str:
     def emit_col(v: str) -> None:
         # objective
         obj_coef = sum(c for c, name_ in model.obj if name_ == v)
-        # MPS stores minimize; flip if maximize
-        if model.maximize:
-            obj_coef = -obj_coef
         entries: list[tuple[str, float]] = []
         if abs(obj_coef) > 0:
             entries.append(("COST", obj_coef))
