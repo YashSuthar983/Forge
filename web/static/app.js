@@ -1,461 +1,718 @@
 (() => {
   const $ = (id) => document.getElementById(id);
-
-  const PLAIN = {
-    Optimal: "Proved best answer for this model.",
-    Feasible: "Good feasible answer - not yet proved globally best.",
-    Interrupted: "Stopped on the time limit. Best answer found so far.",
-    Infeasible: "No feasible answer exists for this model.",
-    Unbounded: "Objective can improve without bound.",
-    NumericalFailure: "Numerics failed - try another engine or tighten the model.",
-    Unsupported: "This model needs a capability we have not shipped yet.",
-    Timeout: "Stopped - raise the time limit in Advanced.",
-    error: "Something went wrong. See the log.",
+  const el = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
   };
 
-  const ORDER = ["blend", "schedule", "dispatch", "sparse"];
+  // How many of the solver's own report fields get promoted to summary tiles.
+  const TILE_COUNT = 4;
 
-  let selected = "blend";
-  let mode = "preset"; // preset | write | file
-  let sourceTab = "mps"; // mps | eq
-  let solToken = null;
-  let presets = {};
-  let templates = [];
-  let activeTmpl = null;
-  let customName = null;
-  let mpsBaseline = "";
-  let mpsDirty = false;
+  const state = {
+    caps: null,
+    checkClasses: [],
+    templates: [],
+    groups: [],
+    current: null, // { id, title, path, info, origin, note }
+    source: "mps", // mps | eq
+    baseline: "",
+    solToken: null,
+    genKind: null,
+  };
 
-  const answer = $("answer");
-  const btnSolve = $("btn-solve");
-  const btnCheck = $("btn-check");
-  const btnWrite = $("btn-write");
-  const logEl = $("log");
   const mpsEl = $("mps_text");
   const eqEl = $("model_text");
+  const btnSolve = $("btn-solve");
+  const result = $("result");
 
-  function currentLabel() {
-    if (mode === "file" && customName) return customName;
-    if (mode === "write") {
-      const t = templates.find((x) => x.id === activeTmpl);
-      return t ? t.label : "Your equations";
+  $("solve-kbd").textContent = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)
+    ? "⌘ ↵"
+    : "Ctrl ↵";
+
+  // ---------- formatting ----------
+
+  const fmtInt = (n) => (n == null ? "-" : Number(n).toLocaleString());
+  const cap = (s) => (s ? s[0].toUpperCase() + s.slice(1) : s);
+
+  function fmtBytes(b) {
+    if (b == null) return "";
+    if (b < 1024) return `${b} B`;
+    if (b < 1024 ** 2) return `${(b / 1024).toFixed(1)} KB`;
+    return `${(b / 1024 ** 2).toFixed(1)} MB`;
+  }
+
+  function fmtObjective(v) {
+    const n = Number(v);
+    const a = Math.abs(n);
+    return a >= 1e15 || (a > 0 && a < 1e-4)
+      ? n.toExponential(8)
+      : n.toLocaleString(undefined, { maximumFractionDigits: 6 });
+  }
+
+  function dims(info) {
+    if (!info || info.rows == null) return "";
+    return `${fmtInt(info.rows)} × ${fmtInt(info.cols)}` + (info.nnz != null ? ` · ${fmtInt(info.nnz)} nnz` : "");
+  }
+
+  function metaLine(meta) {
+    if (!meta) return "";
+    return Object.entries(meta)
+      .filter(([k]) => k !== "generator")
+      .map(([k, v]) => `${k} ${v}`)
+      .join(" · ");
+  }
+
+  // Short ids (cpu, gpu) read best upper-cased; longer ones (vulkan) capitalised.
+  const backendName = (id) => (id.length <= 4 ? id.toUpperCase() : cap(id));
+  const kindBadge = (kind) => el("span", `kind kind-${kind}`, kind);
+  const shellQuote = (a) => (/^[\w./:=,+-]+$/.test(a) ? a : `'${a.replace(/'/g, `'\\''`)}'`);
+
+  async function api(url, opts) {
+    const r = await fetch(url, opts);
+    let j = null;
+    try { j = await r.json(); } catch { /* non-JSON error page */ }
+    if (!r.ok) {
+      const d = j && j.detail;
+      throw new Error(typeof d === "string" ? d : Array.isArray(d) ? d.map((x) => x.msg).join("; ") : `HTTP ${r.status}`);
     }
-    return presets[selected]?.label || selected || "Model";
+    return j;
   }
 
-  function updateChrome() {
-    $("solve-hint").textContent = currentLabel();
-    $("model-title").textContent = currentLabel();
-    $("dirty").hidden = !mpsDirty;
+  function setAlert(text, title) {
+    const a = $("alert");
+    a.hidden = !text;
+    a.textContent = text || "";
+    a.title = title || "";
   }
 
-  function setDirty(on) {
-    mpsDirty = on;
-    updateChrome();
+  // ---------- capabilities → controls ----------
+
+  function fillSelect(select, items, { placeholder } = {}) {
+    select.innerHTML = "";
+    if (placeholder) select.append(new Option(placeholder, ""));
+    for (const it of items) {
+      const o = new Option(it.label || it.id, it.id);
+      if (it.about) o.title = it.about;
+      if (it.disabled) o.disabled = true;
+      select.append(o);
+    }
   }
 
-  function showTab(tab) {
-    sourceTab = tab;
-    $("tab-mps").classList.toggle("active", tab === "mps");
-    $("tab-eq").classList.toggle("active", tab === "eq");
-    $("panel-mps").hidden = tab !== "mps";
-    $("panel-eq").hidden = tab !== "eq";
-  }
+  function renderControls(health) {
+    const caps = health.capabilities || {};
+    fillSelect($("engine"), caps.engines || [], { placeholder: "Match model" });
 
-  function setMpsText(text, { clean = true } = {}) {
-    mpsEl.value = text || "";
-    mpsBaseline = clean ? mpsEl.value : mpsBaseline;
-    if (clean) setDirty(false);
-    const lines = (text || "").split("\n").length;
-    const bytes = new Blob([text || ""]).size;
-    $("mps-meta").textContent = text
-      ? `${lines} lines · ${(bytes / 1024).toFixed(1)} KB · editable`
-      : "Select a model to inspect";
-  }
+    const backends = caps.backends || [];
+    fillSelect(
+      $("backend"),
+      backends.map((b) => ({
+        id: b.id,
+        label: backendName(b.id) + (b.available ? "" : " (unavailable)"),
+        about: b.reason,
+        disabled: !b.available,
+      }))
+    );
+    if (caps.default_backend) $("backend").value = caps.default_backend;
 
-  async function loadPreset(id) {
-    selected = id;
-    mode = "preset";
-    customName = null;
-    activeTmpl = null;
-    btnWrite.classList.remove("active");
-    $("file").value = "";
-    const hit = $("file").closest(".file-hit");
-    hit.classList.remove("has-file");
-    hit.querySelector("span").innerHTML = 'Open <code>.mps</code> / <code>.qps</code>';
-
-    const p = presets[id];
-    if (p) {
-      $("engine").value = p.engine || "simplex";
-      $("backend").value = p.backend || "cpu";
-      $("time_limit").value = p.kind === "milp" ? "30" : "15";
+    const off = backends.filter((b) => !b.available);
+    const note = $("hw-note");
+    note.innerHTML = "";
+    note.hidden = !off.length;
+    for (const b of off) {
+      const p = el("p");
+      p.append(el("strong", null, `${backendName(b.id)}: `), document.createTextNode(b.reason || "unavailable"));
+      note.append(p);
     }
 
-    $("mps-meta").textContent = "Loading...";
-    try {
-      const r = await fetch("/api/model/" + encodeURIComponent(id));
-      const j = await r.json();
-      if (!r.ok) throw new Error(j.detail || "load failed");
-      setMpsText(j.text, { clean: true });
-      if (j.truncated) $("mps-meta").textContent += " · truncated";
-      showTab("mps");
-    } catch (e) {
-      setMpsText("", { clean: true });
-      $("mps-meta").textContent = String(e);
-    }
+    fillSelect($("method"), caps.methods || [], { placeholder: "Solver default" });
+    $("method-field").hidden = !caps.methods?.length;
+    $("threads-field").hidden = !caps.has_threads;
 
-    renderProblems();
-    renderTemplates();
-    updateChrome();
-    resetAnswer();
+    const tl = $("time_limit");
+    tl.value = health.time_limit?.default ?? "";
+    if (health.time_limit?.max) tl.max = health.time_limit.max;
+
+    renderGenerator(caps.generator);
+  }
+
+  function updateEngineHint() {
+    const opt = $("engine").options[0];
+    const auto = state.current?.info?.engine;
+    if (opt) opt.textContent = auto ? `Match model (${auto})` : "Match model";
+  }
+
+  // ---------- sidebar ----------
+
+  function showSidePanel(name) {
+    for (const b of document.querySelectorAll(".seg-btn")) b.classList.toggle("active", b.dataset.panel === name);
+    for (const p of ["models", "write", "generate"]) $(`panel-${p}`).hidden = p !== name;
+  }
+
+  function renderLibrary() {
+    const nav = $("library");
+    nav.innerHTML = "";
+    const q = $("filter").value.trim().toLowerCase();
+    let shown = 0;
+    for (const g of state.groups) {
+      const models = g.models.filter(
+        (m) => !q || [m.title, m.file, m.kind, g.title, g.id].join(" ").toLowerCase().includes(q)
+      );
+      if (!models.length) continue;
+      shown += models.length;
+      const d = el("details", "group");
+      const hasActive = models.some((m) => m.id === state.current?.id);
+      d.open = !!q || hasActive || g.models.length <= 6;
+      const s = el("summary");
+      s.append(el("span", null, g.title), el("span", "count", String(models.length)));
+      s.title = g.id;
+      d.append(s);
+      if (g.about) d.append(el("p", "group-about", g.about));
+      for (const m of models) d.append(libraryItem(m));
+      nav.append(d);
+    }
+    if (!shown) nav.append(el("p", "empty", q ? "No models match." : "No models found in the configured folders."));
+  }
+
+  function libraryItem(m) {
+    const b = el("button", "item" + (m.id === state.current?.id ? " active" : ""));
+    b.type = "button";
+    b.title = m.id;
+    b.append(el("span", "item-title", m.title), kindBadge(m.kind));
+    const sub = m.meta ? metaLine(m.meta) : [dims(m), fmtBytes(m.bytes)].filter(Boolean).join(" · ");
+    b.append(el("span", "item-sub", sub));
+    b.addEventListener("click", () => openModel(m.id));
+    return b;
+  }
+
+  function pickCard({ title, sub, kind, active, onClick }) {
+    const b = el("button", "pick" + (active ? " active" : ""));
+    b.type = "button";
+    b.append(el("span", "pick-title", title));
+    b.append(kind ? kindBadge(kind) : el("span"));
+    if (sub) b.append(el("span", "pick-sub", sub));
+    b.addEventListener("click", onClick);
+    return b;
   }
 
   function renderTemplates() {
     const box = $("templates");
-    if (!box) return;
     box.innerHTML = "";
-    for (const t of templates) {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = "tmpl" + (t.id === activeTmpl ? " active" : "");
-      b.title = t.blurb || "";
-      b.textContent = t.label;
-      b.addEventListener("click", () => applyTemplate(t.id));
-      box.appendChild(b);
+    $("seg-write").hidden = !state.templates.length;
+    for (const t of state.templates) {
+      box.append(pickCard({
+        title: t.title,
+        sub: t.about,
+        kind: t.kind,
+        active: state.current?.id === `template:${t.id}`,
+        onClick: () => openTemplate(t),
+      }));
     }
   }
 
-  async function applyTemplate(id) {
-    const t = templates.find((x) => x.id === id) || templates[0];
-    if (!t) return;
-    mode = "write";
-    activeTmpl = t.id;
-    customName = null;
-    btnWrite.classList.add("active");
-    eqEl.value = t.text;
-    $("engine").value = /Binary|General/i.test(t.text) ? "milp" : "simplex";
-    $("time_limit").value = "30";
-    showTab("eq");
-    renderTemplates();
-    renderProblems();
-    updateChrome();
-    resetAnswer();
-    await syncEqToMps();
+  function renderGenerator(spec) {
+    const kinds = spec?.kinds || [];
+    $("seg-generate").hidden = !kinds.length;
+    if (!kinds.length) return;
+    if (!kinds.includes(state.genKind)) state.genKind = kinds[0];
+
+    const box = $("gen-kinds");
+    box.innerHTML = "";
+    for (const k of kinds) {
+      const flags = (spec.options[k] || []).map((o) => o.flag).join(" ");
+      box.append(pickCard({
+        title: cap(k),
+        sub: `sor_gen ${k}${flags ? " " + flags : ""}`,
+        active: k === state.genKind,
+        onClick: () => { state.genKind = k; renderGenerator(spec); },
+      }));
+    }
+
+    const opts = $("gen-opts");
+    opts.innerHTML = "";
+    for (const o of [...(spec.options[state.genKind] || []), ...(spec.common || [])]) {
+      const f = el("label", "field");
+      f.append(el("span", null, cap(o.flag.replace(/^--/, ""))));
+      const inp = el("input");
+      inp.type = "number";
+      inp.name = o.flag;
+      inp.placeholder = "default";
+      if (o.about) inp.title = o.about;
+      f.append(inp);
+      opts.append(f);
+    }
   }
 
-  async function syncEqToMps() {
+  function markActive() {
+    renderLibrary();
+    renderTemplates();
+  }
+
+  // ---------- current model ----------
+
+  function setCurrent(cur) {
+    state.current = cur;
+    state.solToken = null;
+    const info = cur.info || {};
+
+    $("model-title").textContent = cur.title;
+    const kind = $("model-kind");
+    kind.hidden = !info.kind;
+    kind.className = `kind kind-${info.kind}`;
+    kind.textContent = info.kind || "";
+    $("model-path").textContent = cur.path || "";
+    renderStats(info);
+
+    const note = $("run-note");
+    note.hidden = !cur.note;
+    note.textContent = cur.note || "";
+
+    $("engine").value = "";
+    updateEngineHint();
+    btnSolve.disabled = false;
+    resetResult();
+    markActive();
+  }
+
+  function renderStats(info) {
+    const stats = $("model-stats");
+    stats.innerHTML = "";
+    const stat = (label, value) => {
+      const d = el("div");
+      d.append(el("dt", null, label), el("dd", null, value));
+      stats.append(d);
+    };
+    if (info.rows != null) stat("rows", fmtInt(info.rows));
+    if (info.cols != null) stat("columns", fmtInt(info.cols));
+    if (info.nnz != null) stat("nonzeros", fmtInt(info.nnz));
+    if (info.integers) stat("integer", fmtInt(info.integers));
+    if (info.bytes != null) stat("file", fmtBytes(info.bytes));
+  }
+
+  function setSource(text, { readonly = false, truncated = false } = {}) {
+    mpsEl.value = text || "";
+    mpsEl.readOnly = readonly;
+    state.baseline = mpsEl.value;
+    const lines = (text || "").split("\n").length;
+    $("editor-meta").textContent = text
+      ? truncated
+        ? `First ${fmtBytes(new Blob([text]).size)} shown · read-only`
+        : `${fmtInt(lines)} lines` + (readonly ? " · read-only" : " · editable")
+      : "";
+    updateDirty();
+  }
+
+  const isDirty = () => state.source === "mps" && !mpsEl.readOnly && mpsEl.value !== state.baseline;
+  const updateDirty = () => { $("dirty").hidden = !isDirty(); };
+
+  function showTab(tab) {
+    state.source = tab;
+    $("tab-mps").classList.toggle("active", tab === "mps");
+    $("tab-eq").classList.toggle("active", tab === "eq");
+    mpsEl.hidden = tab !== "mps";
+    $("eq-pane").hidden = tab !== "eq";
+    updateDirty();
+  }
+
+  function modelToCurrent(p, origin, extra = {}) {
+    const libEntry = state.groups.flatMap((g) => g.models).find((m) => m.id === p.id);
+    const notes = [];
+    if (p.truncated) notes.push(`Large model: the editor shows the first ${fmtBytes(p.text.length)}. Solve always uses the full file.`);
+    if (libEntry?.meta?.generator) notes.push(`Synthetic instance from ${libEntry.meta.generator} (${metaLine(libEntry.meta)}).`);
+    if (extra.note) notes.push(extra.note);
+    return {
+      id: p.id,
+      title: extra.title || p.file.split(".")[0],
+      path: p.id.startsWith("session:") ? p.file : p.id,
+      info: p.info,
+      origin,
+      note: notes.join(" "),
+    };
+  }
+
+  async function openModel(id) {
+    try {
+      loadPayload(await api("/api/model?id=" + encodeURIComponent(id)), "repo");
+    } catch (e) {
+      showError("Could not open model", e);
+    }
+  }
+
+  function loadPayload(p, origin, extra) {
+    $("tab-eq").hidden = true;
+    $("tab-mps").textContent = "Source";
+    setCurrent(modelToCurrent(p, origin, extra));
+    setSource(p.text, { readonly: p.truncated, truncated: p.truncated });
+    showTab("mps");
+  }
+
+  async function openTemplate(t) {
+    eqEl.value = t.text;
+    $("tab-eq").hidden = false;
+    $("tab-mps").textContent = "MPS preview";
+    setCurrent({ id: `template:${t.id}`, title: t.title, path: t.about, info: { kind: t.kind }, origin: "write" });
+    showTab("eq");
+    await syncEquations();
+  }
+
+  let syncTimer = null;
+  async function syncEquations() {
     const text = eqEl.value.trim();
-    if (!text) return;
+    if (!text) return false;
+    const meta = $("editor-meta");
     try {
       const fd = new FormData();
       fd.append("model_text", text);
-      const r = await fetch("/api/lp-to-mps", { method: "POST", body: fd });
-      const j = await r.json();
-      if (!r.ok) throw new Error(typeof j.detail === "string" ? j.detail : "parse failed");
-      setMpsText(j.mps, { clean: true });
-      if (j.meta?.suggested_engine === "milp" && $("engine").value === "simplex") {
-        $("engine").value = "milp";
+      const j = await api("/api/lp-to-mps", { method: "POST", body: fd });
+      setSource(j.mps, { readonly: true });
+      if (state.current) {
+        state.current.info = { ...j.info };
+        const k = $("model-kind");
+        k.hidden = false;
+        k.className = `kind kind-${j.info.kind}`;
+        k.textContent = j.info.kind;
+        renderStats(j.info);
+        updateEngineHint();
       }
+      meta.textContent = `${j.meta.n_vars} variables · ${j.meta.n_constraints} constraints`;
+      meta.style.color = "";
+      return true;
     } catch (e) {
-      $("mps-meta").textContent = String(e);
+      meta.textContent = e.message;
+      meta.style.color = "var(--bad)";
+      return false;
     }
   }
 
-  function renderProblems() {
-    const box = $("problems");
+  // ---------- result ----------
+
+  function resetResult() {
+    result.className = "card result idle";
+    $("result-empty").hidden = false;
+    $("result-body").hidden = true;
+  }
+
+  function tone(status, timedOut) {
+    if (timedOut) return "warn";
+    if (status === "Optimal") return "ok";
+    if (status === "Infeasible" || status === "Unbounded") return "info";
+    if (status && /Feasible|Interrupted|Limit/i.test(status)) return "warn";
+    return "bad";
+  }
+
+  function showRTab(name) {
+    for (const b of document.querySelectorAll(".rtab")) b.classList.toggle("active", b.dataset.rtab === name);
+    for (const p of ["checks", "report", "command", "log"]) $(`rpanel-${p}`).hidden = p !== name;
+  }
+
+  function clearSummary(cls, statusText, human) {
+    result.className = `card result ${cls}`;
+    $("result-empty").hidden = true;
+    $("result-body").hidden = false;
+    $("status").textContent = statusText;
+    $("proof").textContent = "";
+    $("wall").textContent = "";
+    $("objective-wrap").hidden = true;
+    $("human").textContent = human || "";
+    $("notes").innerHTML = "";
+    $("tiles").innerHTML = "";
+    $("verify-line").hidden = true;
+    $("rtabs").hidden = true;
+    for (const p of ["checks", "report", "command", "log"]) $(`rpanel-${p}`).hidden = true;
+  }
+
+  const showRunning = () => clearSummary("run", "Solving…", "Running sor_solve…");
+  const showError = (title, e) => clearSummary("bad", title, e.message || String(e));
+
+  function renderTiles(rows) {
+    const box = $("tiles");
     box.innerHTML = "";
-    const ids = ORDER.filter((id) => presets[id]).concat(
-      Object.keys(presets).filter((id) => !ORDER.includes(id))
-    );
-    for (const id of ids) {
-      const p = presets[id];
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "problem" + (mode === "preset" && id === selected ? " active" : "");
-      btn.innerHTML =
-        `<span class="kind">${escapeHtml(p.kind)}</span>` +
-        `<span class="name">${escapeHtml(shortName(p.label))}</span>` +
-        `<span class="blurb">${escapeHtml(p.blurb)}</span>`;
-      btn.addEventListener("click", () => loadPreset(id));
-      box.appendChild(btn);
+    for (const [k, v] of rows.slice(0, TILE_COUNT)) {
+      const t = el("dl", "tile");
+      const [main] = v.split(/\s+/);
+      const dd = el("dd", null, main);
+      dd.title = v;
+      t.append(el("dt", null, cap(k)), dd);
+      box.append(t);
     }
   }
 
-  function shortName(label) {
-    return String(label)
-      .replace(/\s+LP$/i, "")
-      .replace(/\s+MILP$/i, "")
-      .replace(/\s+QP$/i, "")
-      .replace(/\s*\(first-order\)/i, "")
-      .trim();
-  }
+  function renderSolve(j) {
+    const t = tone(j.status, j.timed_out);
+    clearSummary(t, j.timed_out ? "Timed out" : j.status || "Error", j.human && j.human !== j.status ? j.human : "");
+    $("proof").textContent = j.proof_level && j.proof_level !== "None" ? j.proof_level : "";
+    $("proof").title = "Proof level reported by the solver's certification gate";
+    $("wall").textContent = j.wall_s != null ? `${Number(j.wall_s).toFixed(3)} s` : "";
 
-  function escapeHtml(s) {
-    return String(s)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
-  }
+    // An Infeasible / Unbounded verdict has no meaningful objective value.
+    const hasObj = j.objective != null && t !== "info";
+    $("objective-wrap").hidden = !hasObj;
+    $("objective").textContent = hasObj ? fmtObjective(j.objective) : "";
 
-  function setAnswer(modeCls, verdict, plain, objective, bits) {
-    answer.className = "answer " + modeCls;
-    $("verdict").textContent = verdict;
-    $("plain").textContent = plain || "";
-    if (objective === null || objective === undefined || Number.isNaN(Number(objective))) {
-      $("obj").textContent = "";
-    } else {
-      const n = Number(objective);
-      $("obj").textContent =
-        Math.abs(n) >= 1e6 || (Math.abs(n) > 0 && Math.abs(n) < 1e-3)
-          ? n.toExponential(6)
-          : n.toLocaleString(undefined, { maximumFractionDigits: 6 });
+    const notes = $("notes");
+    for (const n of [
+      ...(j.header || []).filter(([k]) => k === k.toUpperCase()).map(([k, v]) => `${k}: ${v}`),
+      ...(j.warnings || []),
+      ...(j.timed_out ? [j.stderr] : []),
+    ]) notes.append(el("li", null, n));
+
+    const report = j.report || [];
+    renderTiles(report);
+
+    const dl = $("report");
+    dl.innerHTML = "";
+    for (const [k, v] of [...report, ...(j.header || []).filter(([k]) => k !== k.toUpperCase())]) {
+      dl.append(el("dt", null, cap(k)), el("dd", null, v));
     }
-    const meta = $("meta");
-    if (bits) {
-      meta.hidden = false;
-      $("meta-time").textContent = bits.time || "";
-      $("meta-proof").textContent = bits.proof || "";
-      $("meta-check").textContent = bits.check || "";
-    } else meta.hidden = true;
+
+    $("cmd").textContent = (j.cmd || []).map(shellQuote).join(" ");
+    $("log").textContent = [j.stdout?.trimEnd(), j.stderr?.trim() ? "--- stderr ---\n" + j.stderr.trimEnd() : ""]
+      .filter(Boolean)
+      .join("\n\n");
+
+    $("rtabs").hidden = false;
+    state.solToken = j.check_ready ? j.sol_token : null;
+    $("rtab-checks").hidden = !state.solToken;
+    showRTab(state.solToken ? "checks" : t === "bad" || $("verbose").checked ? "log" : "report");
+    renderCheckIntro(j);
   }
 
-  function showLog(text, force) {
-    const want = force || $("verbose").checked;
-    if (!want || !text) {
-      logEl.hidden = true;
-      logEl.textContent = "";
+  function setVerifyLine(cls, strong, text, go) {
+    const v = $("verify-line");
+    v.hidden = false;
+    v.className = "verify-line " + (cls || "");
+    v.innerHTML = "";
+    if (strong) v.append(el("strong", null, strong));
+    v.append(el("span", null, text));
+    if (go) v.append(el("span", "go", go));
+  }
+
+  function renderCheckIntro(j) {
+    const box = $("check");
+    box.innerHTML = "";
+    if (!state.solToken) return;
+
+    if (j.check_authoritative) {
+      if ($("autocheck").checked) return runCheck();
+      setVerifyLine("", null, "Independent check not run.", "Run →");
+      $("verify-line").onclick = runCheck;
+      const b = el("button", "btn btn-small", "Run sor_check");
+      b.type = "button";
+      b.onclick = runCheck;
+      box.append(b);
       return;
     }
-    logEl.hidden = false;
-    logEl.textContent = text;
+    const kind = j.model_info?.kind || "this";
+    const scope = state.checkClasses.join(" / ");
+    setVerifyLine("info", null, `sor_check certifies ${scope} models only. Not run for ${kind}.`, "Details →");
+    $("verify-line").onclick = () => showRTab("checks");
+    const v = el("div", "verdict info");
+    v.append(el("span", null,
+      `The independent checker is authoritative for ${scope} models in this build. ` +
+      `Its verdict on a ${kind} answer isn't reliable yet, so it doesn't run automatically.`));
+    box.append(v);
+    const b = el("button", "btn btn-small", "Run sor_check anyway");
+    b.type = "button";
+    b.onclick = runCheck;
+    box.append(b);
   }
 
-  function resetAnswer() {
-    solToken = null;
-    btnCheck.hidden = true;
-    setAnswer("idle", "Waiting", "Inspect or edit the model, then Optimize.", null, null);
-    showLog("");
-  }
-
-  async function loadHealth() {
-    const el = $("health");
+  async function runCheck() {
+    if (!state.solToken) return;
+    const box = $("check");
+    box.innerHTML = "";
+    box.append(el("div", "verdict", "Checking…"));
+    setVerifyLine("", null, "Running the independent checker…");
     try {
-      const r = await fetch("/api/health");
-      const j = await r.json();
-      presets = j.presets || {};
-      templates = Array.isArray(j.learn_templates) ? j.learn_templates : [];
-      renderProblems();
-      renderTemplates();
-      const missing = Object.entries(j.bins || {})
-        .filter(([, ok]) => !ok)
-        .map(([n]) => n);
-      if (!j.ok) {
-        el.className = "topbar-right bad";
-        el.textContent = "Solver binaries missing: " + missing.join(", ");
+      const fd = new FormData();
+      fd.append("sol_token", state.solToken);
+      const j = await api("/api/check", { method: "POST", body: fd });
+      const passed = j.checks.filter((c) => c.ok).length;
+      const cls = !j.authoritative ? "info" : j.passed ? "ok" : "bad";
+      const word = j.verdict || (j.passed ? "PASSED" : "FAILED");
+
+      setVerifyLine(cls, word,
+        j.authoritative
+          ? `${passed}/${j.checks.length} checks passed · independent sor_check`
+          : `Not authoritative for ${j.model_kind}`,
+        "Details →");
+      $("verify-line").onclick = () => showRTab("checks");
+
+      box.innerHTML = "";
+      if (j.authoritative) {
+        box.append(el("p", "panel-intro", j.passed
+          ? "sor_check re-derived every residual from the raw model file. It is a separate binary that shares no search code with the solver."
+          : "The solver's claim did not pass the independent checker."));
       } else {
-        el.className = "topbar-right";
-        el.textContent = "Ready · inspect MPS · edit · optimize";
+        const v = el("div", "verdict info");
+        v.append(el("strong", null, word));
+        v.append(el("span", null, `Not authoritative for ${j.model_kind} models. Shown for transparency only.`));
+        box.append(v);
       }
-      if (presets.blend) await loadPreset("blend");
-      else if (Object.keys(presets)[0]) await loadPreset(Object.keys(presets)[0]);
-    } catch {
-      el.className = "topbar-right bad";
-      el.textContent = "Server offline - run web/run.sh";
+      if (j.authoritative && !j.passed && result.classList.contains("ok")) result.classList.replace("ok", "bad");
+
+      if (j.checks?.length) {
+        const ul = el("ul", "checks" + (j.authoritative ? "" : " muted"));
+        for (const c of j.checks) {
+          const li = el("li", c.ok ? "pass" : "fail");
+          li.append(el("span", "mark", c.ok ? "✓" : "✗"), el("span", null, cap(c.name)), el("span", "res", `${c.residual} / ${c.tol}`));
+          li.title = `residual ${c.residual}, tolerance ${c.tol}`;
+          ul.append(li);
+        }
+        box.append(ul);
+      }
+      if (j.warnings?.length) {
+        const n = el("ul", "notes");
+        for (const w of j.warnings) n.append(el("li", null, w));
+        box.append(n);
+      }
+      if (j.stdout) $("log").textContent += "\n\n=== sor_check ===\n" + j.stdout.trimEnd();
+    } catch (e) {
+      box.innerHTML = "";
+      box.append(el("div", "verdict bad", e.message));
+      setVerifyLine("bad", null, `Checker failed: ${e.message}`);
     }
   }
+
+  // ---------- solve ----------
 
   async function solve() {
-    solToken = null;
-    btnCheck.hidden = true;
+    if (btnSolve.disabled || !state.current) return;
     btnSolve.disabled = true;
-    $("solve-label").textContent = "Optimizing...";
-    setAnswer("run", "Working", "Running the from-scratch engine...", null, null);
-    showLog("");
-
-    // If on equations tab, refresh MPS first so edits flow through.
-    if (sourceTab === "eq" && eqEl.value.trim()) {
-      await syncEqToMps();
-    }
-
-    const fd = new FormData();
-    const mps = mpsEl.value.trim();
-    // Equations tab: send model_text so Maximize/Minimize display flip is known.
-    // Otherwise prefer the MPS buffer (inspect / edit / upload).
-    if (sourceTab === "eq" && eqEl.value.trim()) {
-      fd.append("model_text", eqEl.value.trim());
-    } else if (mps) {
-      fd.append("mps_text", mps);
-    }
-    if (mode === "preset" && selected) {
-      fd.append("preset", selected);
-    }
-    const file = $("file").files[0];
-    if (!fd.has("mps_text") && !fd.has("model_text") && file) {
-      fd.append("file", file);
-    }
-
-    if (!fd.has("mps_text") && !fd.has("model_text") && !fd.has("preset") && !fd.has("file")) {
-      setAnswer("bad", "Failed", "Model buffer is empty - pick a model or paste MPS.", null, null);
-      btnSolve.disabled = false;
-      $("solve-label").textContent = "Optimize";
-      return;
-    }
-
-    fd.append("engine", $("engine").value);
-    fd.append("backend", $("backend").value);
-    fd.append("method", $("method").value);
-    fd.append("time_limit", $("time_limit").value || "30");
-    if ($("verbose").checked) fd.append("verbose", "true");
+    btnSolve.classList.add("busy");
+    $("solve-label").textContent = "Solving";
+    showRunning();
 
     try {
-      const r = await fetch("/api/solve", { method: "POST", body: fd });
-      const j = await r.json();
-      if (!r.ok) {
-        const detail = typeof j.detail === "string" ? j.detail : "Request failed";
-        setAnswer("bad", "Failed", detail, null, null);
-        showLog(JSON.stringify(j, null, 2), true);
-        return;
+      const fd = new FormData();
+      if (state.current.origin === "write") {
+        if (!(await syncEquations())) throw new Error($("editor-meta").textContent);
+        fd.append("model_text", eqEl.value);
+      } else if (isDirty()) {
+        fd.append("mps_text", mpsEl.value);
+      } else {
+        fd.append("model", state.current.id);
       }
-      if (j.engine) $("engine").value = j.engine;
+      fd.append("engine", $("engine").value);
+      fd.append("backend", $("backend").value);
+      if ($("method").value) fd.append("method", $("method").value);
+      if ($("threads").value) fd.append("threads", $("threads").value);
+      fd.append("time_limit", $("time_limit").value || "0");
+      if ($("verbose").checked) fd.append("verbose", "true");
 
-      const status = j.timed_out ? "Timeout" : j.status || "error";
-      const modeCls =
-        status === "Optimal" ? "ok" :
-        status === "Feasible" || status === "Interrupted" || status === "Timeout" ? "warn" :
-        "bad";
-      const verdict =
-        status === "Optimal" ? "Optimal" :
-        status === "Feasible" ? "Feasible" :
-        status === "Interrupted" || status === "Timeout" ? "Time limit" :
-        status;
-
-      setAnswer(modeCls, verdict, PLAIN[status] || j.human || "", j.objective, {
-        time: j.wall_s != null ? `${Number(j.wall_s).toFixed(3)} s` : "",
-        proof: j.proof_level ? `proof ${j.proof_level}` : "",
-        check: "",
-      });
-
-      const parts = [];
-      if (j.cmd) parts.push("$ " + j.cmd.join(" "));
-      if (j.stdout) parts.push(j.stdout.trimEnd());
-      if (j.stderr) parts.push("--- stderr ---\n" + j.stderr.trimEnd());
-      // Always keep log available; visible when verbose is on
-      if (parts.length) {
-        logEl.textContent = parts.join("\n\n");
-        logEl.hidden = !$("verbose").checked;
-      }
-
-      if (j.check_ready && j.sol_token) {
-        solToken = j.sol_token;
-        btnCheck.hidden = false;
-        if ($("autocheck").checked) await verify(true);
-      }
+      renderSolve(await api("/api/solve", { method: "POST", body: fd }));
     } catch (e) {
-      setAnswer("bad", "Failed", String(e), null, null);
-      showLog(String(e), true);
+      showError("Failed", e);
     } finally {
       btnSolve.disabled = false;
-      $("solve-label").textContent = "Optimize";
+      btnSolve.classList.remove("busy");
+      $("solve-label").textContent = "Solve";
     }
   }
 
-  async function verify(silent) {
-    if (!solToken) return;
-    btnCheck.disabled = true;
-    if (!silent) $("meta-check").textContent = "checking...";
-    const fd = new FormData();
-    fd.append("sol_token", solToken);
-    try {
-      const r = await fetch("/api/check", { method: "POST", body: fd });
-      const j = await r.json();
-      if (!r.ok) {
-        $("meta-check").textContent = "check error";
-        return;
-      }
-      $("meta-check").textContent = j.passed ? "✓ independently verified" : "✗ check failed";
-      if (!j.passed && answer.classList.contains("ok")) {
-        answer.classList.remove("ok");
-        answer.classList.add("bad");
-        $("plain").textContent = "Solver claim did not pass the independent checker.";
-      }
-      if ($("verbose").checked && j.stdout) {
-        showLog((logEl.textContent ? logEl.textContent + "\n\n" : "") + "=== verify ===\n" + j.stdout, true);
-      }
-    } catch (e) {
-      $("meta-check").textContent = String(e);
-    } finally {
-      btnCheck.disabled = false;
-    }
-  }
+  // ---------- events ----------
 
+  for (const b of document.querySelectorAll(".seg-btn")) b.addEventListener("click", () => showSidePanel(b.dataset.panel));
+  for (const b of document.querySelectorAll(".rtab")) b.addEventListener("click", () => showRTab(b.dataset.rtab));
+
+  $("filter").addEventListener("input", renderLibrary);
+  $("engine").addEventListener("change", updateEngineHint);
   $("tab-mps").addEventListener("click", () => showTab("mps"));
-  $("tab-eq").addEventListener("click", () => {
-    mode = "write";
-    btnWrite.classList.add("active");
-    showTab("eq");
-    renderProblems();
-    updateChrome();
+  $("tab-eq").addEventListener("click", () => showTab("eq"));
+  mpsEl.addEventListener("input", updateDirty);
+  eqEl.addEventListener("input", () => {
+    clearTimeout(syncTimer);
+    syncTimer = setTimeout(syncEquations, 400);
   });
 
-  btnWrite.addEventListener("click", () => {
-    mode = "write";
-    btnWrite.classList.add("active");
-    showTab("eq");
-    if (!eqEl.value.trim() && templates[0]) applyTemplate(templates[0].id);
-    else {
-      renderProblems();
-      updateChrome();
+  $("file").addEventListener("change", async () => {
+    const f = $("file").files[0];
+    if (!f) return;
+    const fd = new FormData();
+    fd.append("file", f);
+    try {
+      const p = await api("/api/upload", { method: "POST", body: fd });
+      loadPayload(p, "upload", { title: f.name.split(".")[0], note: `Uploaded ${f.name}.` });
+    } catch (e) {
+      showError("Upload failed", e);
+    } finally {
+      $("file").value = "";
     }
   });
 
-  $("btn-to-mps").addEventListener("click", async () => {
-    await syncEqToMps();
-    showTab("mps");
+  $("gen-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const opts = {};
+    for (const inp of $("gen-opts").querySelectorAll("input")) if (inp.value !== "") opts[inp.name] = inp.value;
+    const fd = new FormData();
+    fd.append("kind", state.genKind);
+    fd.append("options", JSON.stringify(opts));
+    $("gen-btn").disabled = true;
+    try {
+      const p = await api("/api/gen", { method: "POST", body: fd });
+      loadPayload(p, "gen", { title: `${cap(state.genKind)} (generated)`, note: `Synthetic instance: ${p.cmd}` });
+    } catch (err) {
+      showError("Generator failed", err);
+    } finally {
+      $("gen-btn").disabled = false;
+    }
   });
 
-  mpsEl.addEventListener("input", () => {
-    setDirty(mpsEl.value !== mpsBaseline);
-    mode = mode === "write" ? "write" : "file";
-    updateChrome();
+  $("copy-cmd").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText($("cmd").textContent);
+      $("copy-cmd").textContent = "Copied";
+      setTimeout(() => ($("copy-cmd").textContent = "Copy"), 1200);
+    } catch { /* clipboard blocked */ }
   });
 
-  eqEl.addEventListener("input", () => {
-    mode = "write";
-    activeTmpl = null;
-    btnWrite.classList.add("active");
-    renderTemplates();
-    updateChrome();
+  document.addEventListener("click", (e) => {
+    const more = $("more");
+    if (more.open && !more.contains(e.target)) more.open = false;
   });
 
-  $("file").addEventListener("change", () => {
-    const f = $("file").files[0];
-    const hit = $("file").closest(".file-hit");
-    if (!f) return;
-    mode = "file";
-    customName = f.name;
-    activeTmpl = null;
-    btnWrite.classList.remove("active");
-    hit.classList.add("has-file");
-    hit.querySelector("span").textContent = "Using " + f.name;
-    if (f.name.toLowerCase().endsWith(".qps")) $("engine").value = "qp";
-    const reader = new FileReader();
-    reader.onload = () => {
-      setMpsText(String(reader.result || ""), { clean: true });
-      showTab("mps");
-      renderProblems();
-      updateChrome();
-      resetAnswer();
-    };
-    reader.readAsText(f);
-  });
-
-  $("verbose").addEventListener("change", () => {
-    if ($("verbose").checked && logEl.textContent.trim()) logEl.hidden = false;
-    else if (!$("verbose").checked) logEl.hidden = true;
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      solve();
+    }
   });
 
   btnSolve.addEventListener("click", solve);
-  btnCheck.addEventListener("click", () => verify(false));
-  loadHealth();
+
+  // ---------- boot ----------
+
+  async function boot() {
+    let health;
+    try {
+      health = await api("/api/health");
+    } catch (e) {
+      setAlert("Server offline - run web/run.sh");
+      showError("Server offline", e);
+      return;
+    }
+    const missing = Object.entries(health.bins || {}).filter(([, ok]) => !ok).map(([n]) => n);
+    if (missing.length) setAlert(`Missing ${missing.join(", ")}`, health.bin_dir);
+
+    state.caps = health.capabilities || {};
+    state.checkClasses = health.check_classes || [];
+    state.templates = health.templates || [];
+    renderControls(health);
+    renderTemplates();
+
+    try {
+      const { groups } = await api("/api/models");
+      state.groups = groups || [];
+      renderLibrary();
+      const all = state.groups.flatMap((g) => g.models);
+      const first = all.find((m) => m.meta) || all[0];
+      if (first) await openModel(first.id);
+    } catch (e) {
+      $("library").innerHTML = "";
+      $("library").append(el("p", "empty", e.message));
+    }
+  }
+
+  boot();
 })();
