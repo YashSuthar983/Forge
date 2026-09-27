@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
-"""SOR demo console - thin FastAPI shell over sor_solve / sor_check / sor_gen.
+"""FORGE demo console - thin FastAPI shell over sor_solve / sor_check / sor_gen.
 
 Presentation surface for SIH26119. The product is the C++ engine; every solve
 is a subprocess. Not a modelling environment.
+
+Models are discovered on disk,
+engines / backends / generator options are read from the binaries' own usage
+text, and results are whatever the binaries print.
 """
 
 from __future__ import annotations
 
 import asyncio
+import gzip
+import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -20,79 +28,20 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from lp_text import SAMPLE as LP_SAMPLE
 from lp_text import LpTextError, lp_text_to_mps
 
-LEARN_TEMPLATES: list[dict[str, str]] = [
-    {
-        "id": "toy_lp",
-        "label": "Start here · tiny LP",
-        "blurb": "Two variables, two inequalities. Best first lesson.",
-        "text": """Maximize
-  3 x + 4 y
-Subject To
-  wood:   x + 2 y <= 14
-  metal:  3 x + y <= 18
-Bounds
-  x >= 0
-  y >= 0
-End
-""",
-    },
-    {
-        "id": "diet",
-        "label": "Diet · meet nutrition",
-        "blurb": "Minimize cost while hitting calorie and protein targets.",
-        "text": """Minimize
-  2 bread + 3 milk + 5 eggs
-Subject To
-  calories:  80 bread + 120 milk + 70 eggs >= 2000
-  protein:   4 bread + 8 milk + 6 eggs >= 50
-Bounds
-  bread >= 0
-  milk >= 0
-  eggs >= 0
-End
-""",
-    },
-    {
-        "id": "knapsack",
-        "label": "Knapsack · integers",
-        "blurb": "Pick whole items that fit a weight limit - introduces Binary / General.",
-        "text": """Maximize
-  10 laptop + 6 camera + 4 book
-Subject To
-  weight: 5 laptop + 3 camera + 1 book <= 8
-Binary
-  laptop
-  camera
-  book
-End
-""",
-    },
-    {
-        "id": "blend_mini",
-        "label": "Mini blend · refinery flavour",
-        "blurb": "Mix two crudes into one product under a sulfur cap.",
-        "text": """Maximize
-  90 product - 40 light - 55 heavy
-Subject To
-  mass:     light + heavy - product = 0
-  sulfur:   0.5 light + 2.5 heavy - 1.0 product <= 0
-  demand:   product >= 100
-Bounds
-  light >= 0
-  heavy >= 0
-  product >= 0
-End
-""",
-    },
-]
-
 ROOT = Path(__file__).resolve().parents[1]
-STATIC = Path(__file__).resolve().parent / "static"
+WEB = Path(__file__).resolve().parent
+STATIC = WEB / "static"
+
+
+def _env(name: str, default: str | None = None) -> str | None:
+    """FORGE_<name>, falling back to the legacy SOR_<name>."""
+    return os.environ.get(f"FORGE_{name}") or os.environ.get(f"SOR_{name}") or default
+
+
 def _default_bin() -> Path:
-    env = os.environ.get("SOR_BIN_DIR")
+    env = _env("BIN_DIR")
     if env:
         return Path(env)
     for cand in (ROOT / "build", ROOT / "build-native"):
@@ -101,97 +50,560 @@ def _default_bin() -> Path:
     return ROOT / "build"
 
 
-DEFAULT_BIN = _default_bin()
-DEFAULT_EXAMPLES = Path(os.environ.get("SOR_EXAMPLES", ROOT / "examples"))
-DEFAULT_TIMEOUT = float(os.environ.get("SOR_WEB_TIMEOUT", "90"))
+BIN_DIR = _default_bin()
+MODEL_DIRS = [
+    Path(p) for p in (_env("MODEL_DIRS") or os.pathsep.join(
+        [str(ROOT / "examples"), str(ROOT / "benchmarks")]
+    )).split(os.pathsep) if p
+]
+TEMPLATE_DIR = Path(_env("TEMPLATE_DIR", str(WEB / "templates")))
+MODEL_EXTS = tuple((_env("MODEL_EXTS") or ".mps,.qps,.qplib").split(","))
+DEFAULT_TIMEOUT = float(_env("WEB_TIMEOUT", "90"))
+DEFAULT_TIME_LIMIT = float(_env("WEB_TIME_LIMIT", "30"))
+MAX_TIME_LIMIT = float(_env("WEB_MAX_TIME_LIMIT", "300"))
+EDITOR_MAX_BYTES = int(_env("WEB_EDITOR_MAX_BYTES", "400000"))
+UPLOAD_MAX_BYTES = int(_env("WEB_UPLOAD_MAX_BYTES", "40000000"))
+# Model classes whose sor_check verdict is authoritative today (see the evidence
+# report, section L: MILP dual/gap checks and QPS objectives are not supported yet).
+CHECK_CLASSES = {c.strip().upper() for c in (_env("CHECK_CLASSES") or "LP").split(",") if c.strip()}
+
 SESSIONS = Path(tempfile.gettempdir()) / "sor_web_sessions"
 SESSIONS.mkdir(exist_ok=True)
 
-PRESETS: dict[str, dict[str, Any]] = {
-    "blend": {
-        "label": "Crude blending",
-        "kind": "lp",
-        "path": DEFAULT_EXAMPLES / "crude_blending" / "blend_s42.mps",
-        "engine": "simplex",
-        "backend": "cpu",
-        "blurb": "Pick crudes and products. Maximize margin under quality limits.",
-    },
-    "schedule": {
-        "label": "Unit scheduling",
-        "kind": "milp",
-        "path": DEFAULT_EXAMPLES / "scheduling" / "schedule_s42.mps",
-        "engine": "milp",
-        "backend": "cpu",
-        "blurb": "Turn units on/off across periods. Integer decisions.",
-    },
-    "dispatch": {
-        "label": "Power dispatch",
-        "kind": "qp",
-        "path": DEFAULT_EXAMPLES / "dispatch" / "dispatch_s42.qps",
-        "engine": "qp",
-        "backend": "cpu",
-        "blurb": "Meet demand at lowest quadratic generation cost.",
-    },
-    "sparse": {
-        "label": "Large sparse LP",
-        "kind": "lp",
-        "path": DEFAULT_EXAMPLES / "sparse500.mps",
-        "engine": "hpr",
-        "backend": "cpu",
-        "blurb": "First-order method - flip Advanced → GPU if you have Vulkan.",
-    },
-}
 
-STATUS_RE = re.compile(r"^status:\s+(\S+)", re.M)
-PROOF_RE = re.compile(r"^proof_level:\s+(\S+)", re.M)
-OBJ_RE = re.compile(r"^objective:\s+([^\s]+)", re.M)
-SOR_SENSE_RE = re.compile(r"^\*\s*SOR_SENSE\s+(MAXIMIZE|MINIMIZE)\s*$", re.M | re.I)
-
-
-def _mps_sense_meta(mps: str) -> dict[str, Any] | None:
-    """Recover maximize/minimize when solving an edited MPS from Write equations."""
-    m = SOR_SENSE_RE.search(mps)
-    if not m:
-        return None
-    return {"maximize": m.group(1).upper() == "MAXIMIZE"}
-HUMAN_RE = re.compile(r"^ {19}(.+)$", re.M)
-DOWNGRADE_RE = re.compile(r"^downgrade:\s+(.+)$", re.M)
-ENGINE_RE = re.compile(r"^engine:\s+(\S+)", re.M)
-BACKEND_RE = re.compile(r"^backend:\s+(.+)$", re.M)
+# ---------------------------------------------------------------------------
+# Binary introspection
+# ---------------------------------------------------------------------------
 
 
 def _bin(name: str) -> Path:
-    p = DEFAULT_BIN / name
+    p = BIN_DIR / name
     if not p.is_file():
         raise HTTPException(
             status_code=503,
-            detail=f"Binary not found: {p}. Build SOR or set SOR_BIN_DIR.",
+            detail=f"Binary not found: {p}. Build FORGE or set FORGE_BIN_DIR.",
         )
     return p
 
 
-def _parse_solve_output(text: str) -> dict[str, Any]:
-    def first(rx: re.Pattern[str]) -> str | None:
-        m = rx.search(text)
-        return m.group(1).strip() if m else None
+def _usage(name: str, *args: str) -> str:
+    p = BIN_DIR / name
+    if not p.is_file():
+        return ""
+    try:
+        r = subprocess.run([str(p), *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return r.stdout + r.stderr
 
-    obj_raw = first(OBJ_RE)
-    objective: float | None = None
-    if obj_raw is not None:
-        try:
-            objective = float(obj_raw)
-        except ValueError:
-            objective = None
 
+def _split_choices(text: str) -> list[str]:
+    return [c.strip() for c in text.split("|") if c.strip()]
+
+
+def _parse_choice_flag(help_text: str, flag: str) -> tuple[list[dict[str, str]], str | None]:
+    """Collect `--flag NAME a (default) | b | c` plus `--flag x  description` lines."""
+    out: list[dict[str, str]] = []
+    default: str | None = None
+    seen: set[str] = set()
+    for line in help_text.splitlines():
+        m = re.match(rf"^\s*{re.escape(flag)}\s+(\S+)\s+(.*)$", line)
+        if not m:
+            continue
+        head, rest = m.group(1), m.group(2).strip()
+        if head.isupper():  # `--engine NAME  a (default) | b | c`
+            for choice in _split_choices(rest):
+                cm = re.match(r"^([\w-]+)(?:\s*\((default)\))?", choice)
+                if cm and cm.group(1) not in seen:
+                    seen.add(cm.group(1))
+                    out.append({"id": cm.group(1), "about": ""})
+                    if cm.group(2):
+                        default = cm.group(1)
+        elif head not in seen:  # `--engine binquad  binary QP (.qplib): ...`
+            seen.add(head)
+            out.append({"id": head, "about": rest})
+    # Continuation lines of a described choice belong to its description.
+    lines = help_text.splitlines()
+    for item in out:
+        if not item["about"]:
+            continue
+        for i, line in enumerate(lines):
+            if re.match(rf"^\s*{re.escape(flag)}\s+{re.escape(item['id'])}\s", line):
+                j = i + 1
+                while j < len(lines) and re.match(r"^\s{10,}\S", lines[j]):
+                    item["about"] += " " + lines[j].strip()
+                    j += 1
+                break
+    return out, default
+
+
+_TINY_LP = """NAME PROBE
+ROWS
+ N obj
+ L c1
+COLUMNS
+ x obj 1 c1 1
+RHS
+ rhs c1 1
+ENDATA
+"""
+
+
+def _probe_backend(backend: str, engine: str) -> bool:
+    """A backend is available when a tiny first-order solve on it is not Unsupported."""
+    d = Path(tempfile.mkdtemp(prefix="sor_probe_", dir=SESSIONS))
+    try:
+        mps = d / "probe.mps"
+        mps.write_text(_TINY_LP)
+        # --no-presolve: otherwise presolve solves the probe before the backend runs.
+        out = _usage("sor_solve", str(mps), "--engine", engine, "--backend", backend,
+                     "--no-presolve", "--time-limit", "5")
+        status = _parse_solve_output(out).get("status")
+        return bool(status) and status not in {"Unsupported", "Error"}
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _git_info() -> dict[str, str] | None:
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(ROOT), "log", "-1", "--format=%h%x09%cd", "--date=short"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0 or "\t" not in r.stdout:
+        return None
+    commit, date = r.stdout.strip().split("\t", 1)
+    return {"commit": commit, "date": date}
+
+
+def _build_flags() -> dict[str, str]:
+    cache = BIN_DIR / "CMakeCache.txt"
+    flags: dict[str, str] = {}
+    if cache.is_file():
+        for line in cache.read_text(errors="replace").splitlines():
+            m = re.match(r"^((?:SOR|FORGE)_[A-Z0-9_]+|CMAKE_BUILD_TYPE):[A-Z]+=(.*)$", line)
+            if m:
+                flags[m.group(1)] = m.group(2)
+    return flags
+
+
+def _gen_spec() -> dict[str, Any]:
+    text = _usage("sor_gen", "--help")
+    kinds: list[str] = []
+    m = re.search(r"usage:\s*sor_gen\s+(\S+)", text)
+    if m:
+        kinds = [k for k in m.group(1).split("|") if k != "all"]
+    common = [
+        {"flag": f, "arg": a, "about": d.strip()}
+        for f, a, d in re.findall(r"^\s+(--[\w-]+)\s+([A-Z]+)\s+(.*)$", text, re.M)
+        if f in {"--seed"}
+    ]
+    per_kind: dict[str, list[dict[str, str]]] = {}
+    for kind in kinds:
+        km = re.search(rf"^\s+{re.escape(kind)}:\s+(.*)$", text, re.M)
+        opts = re.findall(r"(--[\w-]+)\s+([A-Z]+)", km.group(1)) if km else []
+        per_kind[kind] = [{"flag": f, "arg": a} for f, a in opts]
+    return {"kinds": kinds, "common": common, "options": per_kind}
+
+
+@lru_cache(maxsize=1)
+def capabilities() -> dict[str, Any]:
+    help_text = _usage("sor_solve", "--help")
+    engines, default_engine = _parse_choice_flag(help_text, "--engine")
+    backends, default_backend = _parse_choice_flag(help_text, "--backend")
+    methods, _ = _parse_choice_flag(help_text, "--method")
+    engine_ids = {e["id"] for e in engines}
+    probe_engine = next((e for e in ("hpr", "pdhg") if e in engine_ids), default_engine or "")
+    build = _build_flags()
+    for b in backends:
+        b["available"] = b["id"] == default_backend or (
+            bool(probe_engine) and _probe_backend(b["id"], probe_engine)
+        )
+        if not b["available"]:
+            flag = next((k for k in build if k.endswith(f"_ENABLE_{b['id'].upper()}")), None)
+            b["reason"] = (
+                f"Disabled when the engine was built ({flag}={build[flag]})"
+                if flag and build[flag].upper() in {"OFF", "0", "FALSE", "NO"}
+                else "sor_solve reports this backend as Unsupported in this build"
+            )
     return {
-        "status": first(STATUS_RE),
-        "proof_level": first(PROOF_RE),
-        "human": first(HUMAN_RE),
-        "downgrade": first(DOWNGRADE_RE),
-        "objective": objective,
-        "engine_line": first(ENGINE_RE),
-        "backend_line": first(BACKEND_RE),
+        "engines": engines,
+        "default_engine": default_engine,
+        "backends": backends,
+        "default_backend": default_backend,
+        "methods": methods,
+        "has_threads": "--threads" in help_text,
+        "generator": _gen_spec(),
+        "build": build,
+        "git": _git_info(),
     }
+
+
+def pick_engine(info: dict[str, Any]) -> str | None:
+    """Engine that actually solves this model class, chosen from what the binary offers.
+
+    The CLI default (simplex) silently solves the LP relaxation of a MILP and
+    ignores QUADOBJ, so the web UI must route by the model's own structure.
+    """
+    ids = {e["id"] for e in capabilities()["engines"]}
+    if info.get("format") == "qplib" and "auto" in ids:
+        return "auto"
+    if info.get("quadratic"):
+        return next((e for e in ("qp", "qpauto") if e in ids), None)
+    if info.get("integers"):
+        return "milp" if "milp" in ids else None
+    return capabilities()["default_engine"]
+
+
+# ---------------------------------------------------------------------------
+# Model discovery
+# ---------------------------------------------------------------------------
+
+
+def _model_format(path: Path) -> str | None:
+    name = path.name.lower()
+    if name.endswith(".gz"):
+        name = name[:-3]
+    for ext in MODEL_EXTS:
+        if name.endswith(ext):
+            return ext.lstrip(".")
+    return None
+
+
+def _open_text(path: Path):
+    if path.name.lower().endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return path.open("r", encoding="utf-8", errors="replace")
+
+
+def _scan_mps(lines) -> dict[str, Any]:
+    name = None
+    section = None
+    obj_rows: set[str] = set()
+    rows = 0
+    cols = 0
+    nnz = 0
+    ints: set[str] = set()
+    in_int = False
+    last_col = None
+    quadratic = False
+    sense = None
+    for raw in lines:
+        if not raw.strip() or raw.startswith("*"):
+            continue
+        if not raw[0].isspace():
+            parts = raw.split()
+            section = parts[0].upper()
+            if section == "NAME" and len(parts) > 1:
+                name = parts[1]
+            if section == "OBJSENSE" and len(parts) > 1:
+                sense = parts[1].upper()
+            if section in {"QUADOBJ", "QMATRIX", "QSECTION", "QCMATRIX"}:
+                quadratic = True
+            continue
+        parts = raw.split()
+        if section == "ROWS" and len(parts) >= 2:
+            if parts[0].upper() == "N":
+                obj_rows.add(parts[1])
+            else:
+                rows += 1
+        elif section == "COLUMNS" and parts:
+            if len(parts) >= 3 and parts[1].strip("'").upper() == "MARKER":
+                in_int = "INTORG" in raw.upper()
+                continue
+            col = parts[0]
+            if col != last_col:
+                cols += 1
+                last_col = col
+            if in_int:
+                ints.add(col)
+            for r in parts[1::2]:
+                if r not in obj_rows:
+                    nnz += 1
+        elif section == "BOUNDS" and len(parts) >= 3:
+            if parts[0].upper() in {"BV", "LI", "UI"}:
+                ints.add(parts[2])
+        elif section == "OBJSENSE" and parts:
+            sense = parts[0].upper()
+    return {
+        "name": name, "rows": rows, "cols": cols, "nnz": nnz,
+        "integers": len(ints), "quadratic": quadratic, "sense": sense,
+    }
+
+
+def _scan_qplib(lines) -> dict[str, Any]:
+    body = [l.split("#", 1)[0].strip() for l in lines]
+    body = [l for l in body if l]
+    info: dict[str, Any] = {"name": body[0] if body else None}
+    code = body[1].upper() if len(body) > 1 else ""
+    info["qplib_class"] = code
+    info["quadratic"] = code[:1] in {"Q", "C"} or code[2:3] in {"Q", "C"}
+    info["integers"] = 1 if code[1:2] in {"B", "M", "I", "G"} else 0
+    nums = [int(x) for x in body[3:5] if x.lstrip("-").isdigit()]
+    info["cols"] = nums[0] if nums else None
+    info["rows"] = nums[1] if len(nums) > 1 else None
+    info["sense"] = body[2].upper() if len(body) > 2 else None
+    return info
+
+
+def _classify(info: dict[str, Any]) -> str:
+    if info.get("quadratic"):
+        return "MIQP" if info.get("integers") else "QP"
+    return "MILP" if info.get("integers") else "LP"
+
+
+_scan_cache: dict[tuple[str, int, int], dict[str, Any]] = {}
+
+
+def scan_model(path: Path) -> dict[str, Any]:
+    st = path.stat()
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    if key in _scan_cache:
+        return _scan_cache[key]
+    fmt = _model_format(path) or "mps"
+    try:
+        with _open_text(path) as f:
+            info = _scan_qplib(f) if fmt == "qplib" else _scan_mps(f)
+    except OSError as e:
+        info = {"error": str(e)}
+    info.update(format=fmt, bytes=st.st_size, gz=path.name.lower().endswith(".gz"))
+    info["kind"] = _classify(info)
+    info["engine"] = pick_engine(info)
+    _scan_cache[key] = info
+    return info
+
+
+def _manifest_meta() -> dict[str, dict[str, Any]]:
+    """Extra per-file facts from any sor_gen MANIFEST.json under the model dirs."""
+    meta: dict[str, dict[str, Any]] = {}
+    for d in MODEL_DIRS:
+        for mf in d.rglob("MANIFEST.json") if d.is_dir() else []:
+            try:
+                data = json.loads(mf.read_text())
+            except (OSError, ValueError):
+                continue
+            for inst in data.get("instances", []):
+                p = inst.get("path")
+                if not p:
+                    continue
+                full = (ROOT / p).resolve()
+                extra = {k: v for k, v in inst.items() if k not in {"path", "kind"}}
+                extra["generator"] = data.get("generator")
+                meta[str(full)] = extra
+    return meta
+
+
+def _readme_blurb(d: Path) -> str | None:
+    readme = d / "README.md"
+    if not readme.is_file():
+        return None
+    for line in readme.read_text(errors="replace").splitlines():
+        s = line.strip()
+        if s and not s.startswith(("#", "|", "```", "-")):
+            return re.sub(r"[*_`]", "", s)
+    return None
+
+
+def _humanize(name: str) -> str:
+    s = re.sub(r"[_-]+", " ", name).strip()
+    return s[:1].upper() + s[1:]
+
+
+def _rel(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(ROOT))
+    except ValueError:
+        return str(path.resolve())
+
+
+def _group_dir(root: Path, path: Path) -> Path:
+    """Shallowest folder, walking down from the model root, that holds models itself.
+
+    Keeps examples/ (and its per-case subfolders) as one group, while benchmarks/
+    splits into one group per suite.
+    """
+    d = root
+    for part in path.parent.relative_to(root).parts:
+        if any(f.is_file() and _model_format(f) for f in d.iterdir()):
+            return d
+        d = d / part
+    return path.parent
+
+
+def discover_models() -> list[dict[str, Any]]:
+    manifest = _manifest_meta()
+    groups: dict[str, dict[str, Any]] = {}
+    for root in MODEL_DIRS:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or _model_format(path) is None:
+                continue
+            parent = _group_dir(root, path)
+            gid = _rel(parent)
+            g = groups.setdefault(gid, {
+                "id": gid,
+                "title": _humanize(parent.name),
+                "about": _readme_blurb(parent) or (
+                    _readme_blurb(parent.parent) if parent != root else None
+                ),
+                "models": [],
+            })
+            info = scan_model(path)
+            g["models"].append({
+                "id": _rel(path),
+                "file": path.name,
+                "title": path.name.split(".")[0],
+                **info,
+                "meta": manifest.get(str(path.resolve())),
+            })
+    out = list(groups.values())
+    for g in out:
+        g["models"].sort(key=lambda m: (m["kind"], m.get("nnz") or 0, m["file"]))
+    root_order = {str(_rel(r)): i for i, r in enumerate(MODEL_DIRS)}
+    out.sort(key=lambda g: (
+        next((i for r, i in root_order.items() if g["id"] == r or g["id"].startswith(r + "/")), 99),
+        g["id"] != next((r for r in root_order if g["id"] == r), None),
+        g["id"],
+    ))
+    return out
+
+
+def resolve_model(model_id: str) -> Path:
+    """Map a model id (repo-relative path or session path) to a file, refusing escapes."""
+    if model_id.startswith("session:"):
+        rel = model_id[len("session:"):]
+        path = (SESSIONS / rel).resolve()
+        if SESSIONS.resolve() not in path.parents:
+            raise HTTPException(400, "Invalid model id")
+    else:
+        path = (ROOT / model_id).resolve()
+        if not any(r.resolve() in path.parents for r in MODEL_DIRS):
+            raise HTTPException(400, "Model is outside the configured model directories")
+    if not path.is_file() or _model_format(path) is None:
+        raise HTTPException(404, f"Model not found: {model_id}")
+    return path
+
+
+def _read_for_editor(path: Path) -> tuple[str, bool]:
+    with _open_text(path) as f:
+        text = f.read(EDITOR_MAX_BYTES + 1)
+    truncated = len(text) > EDITOR_MAX_BYTES
+    return (text[:EDITOR_MAX_BYTES] if truncated else text), truncated
+
+
+def _model_payload(model_id: str, path: Path) -> dict[str, Any]:
+    text, truncated = _read_for_editor(path)
+    return {
+        "id": model_id,
+        "file": path.name,
+        "info": scan_model(path),
+        "text": text,
+        "truncated": truncated,
+    }
+
+
+def load_templates() -> list[dict[str, str]]:
+    out = []
+    if not TEMPLATE_DIR.is_dir():
+        return out
+    for p in sorted(TEMPLATE_DIR.glob("*.lp")):
+        text = p.read_text(errors="replace")
+        head = dict(re.findall(r"^#\s*(\w+):\s*(.+)$", text, re.M))
+        try:
+            _, meta = lp_text_to_mps(text, name="TEMPLATE")
+            kind = "MILP" if meta.get("n_integer") else "LP"
+        except LpTextError:
+            kind = "LP"
+        out.append({
+            "id": p.stem,
+            "title": head.get("title", _humanize(p.stem)),
+            "about": head.get("about", ""),
+            "kind": kind,
+            "text": text,
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Output parsing
+# ---------------------------------------------------------------------------
+
+FIELD_RE = re.compile(r"^([A-Za-z][\w /()+.-]*?):\s+(.*\S)\s*$")
+CONT_RE = re.compile(r"^\s{10,}(\S.*)$")
+
+
+def _parse_solve_output(text: str) -> dict[str, Any]:
+    """Every `key: value` line the solver prints before its timing block, in order."""
+    header: list[list[str]] = []
+    report: list[list[str]] = []
+    warnings: list[str] = []
+    human = None
+    target = header
+    total_ms = None
+    in_timing = False
+    for line in text.splitlines():
+        if in_timing:
+            m = re.match(r"^\s+total\s+([\d.eE+-]+)", line)
+            if m:
+                total_ms = float(m.group(1))
+            continue
+        if line.startswith("timing"):
+            in_timing = True
+            continue
+        if line.lower().startswith(("warning:", "error:")):
+            warnings.append(line.strip())
+            continue
+        m = FIELD_RE.match(line)
+        if m:
+            key, val = m.group(1).strip(), m.group(2).strip()
+            if key == "status":
+                target = report
+            target.append([key, val])
+            continue
+        c = CONT_RE.match(line)
+        if c and target and target[-1][0] == "proof_level" and human is None:
+            human = c.group(1).strip()
+        elif c and target:
+            target[-1][1] += " " + c.group(1).strip()
+
+    def get(key: str) -> str | None:
+        return next((v for k, v in header + report if k == key), None)
+
+    objective: float | None = None
+    try:
+        objective = float(get("objective")) if get("objective") is not None else None
+    except ValueError:
+        objective = None
+    if objective is not None and objective != objective:  # nan
+        objective = None
+    return {
+        "status": get("status"),
+        "proof_level": get("proof_level"),
+        "human": human,
+        "objective": objective,
+        "header": header,
+        "report": [kv for kv in report if kv[0] not in {"status", "proof_level", "objective"}],
+        "warnings": warnings,
+        "solver_ms": total_ms,
+    }
+
+
+def _parse_check_output(text: str) -> dict[str, Any]:
+    checks = [
+        {"ok": ok == "pass", "name": name.strip(), "residual": res, "tol": tol}
+        for ok, name, res, tol in re.findall(
+            r"^(pass|FAIL)\s+(.+?)\s+residual=(\S+)\s+tol=(\S+)", text, re.M
+        )
+    ]
+    verdict = next(
+        (l.strip() for l in reversed(text.splitlines()) if re.match(r"^[A-Z]{4,}$", l.strip())),
+        None,
+    )
+    warnings = [l.strip() for l in text.splitlines() if l.lower().startswith("warning:")]
+    return {"checks": checks, "verdict": verdict, "warnings": warnings}
 
 
 async def _run(cmd: list[str], *, timeout: float) -> dict[str, Any]:
@@ -230,7 +642,24 @@ async def _run(cmd: list[str], *, timeout: float) -> dict[str, Any]:
     }
 
 
-app = FastAPI(title="SOR Demo Console", version="0.1.0")
+def _new_session() -> Path:
+    return Path(tempfile.mkdtemp(prefix="sor_sol_", dir=SESSIONS))
+
+
+def _fix_suffix(path: Path) -> Path:
+    """sor_solve's quadratic engines key on the .qps extension, whatever the content."""
+    if path.suffix.lower() == ".mps" and scan_model(path).get("quadratic"):
+        new = path.with_suffix(".qps")
+        path.rename(new)
+        return new
+    return path
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="FORGE Demo Console", version="0.2.0")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
@@ -241,60 +670,77 @@ async def index() -> FileResponse:
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    bins = {n: (DEFAULT_BIN / n).is_file() for n in ("sor_solve", "sor_check", "sor_gen")}
-    presets: dict[str, dict[str, Any]] = {}
-    for k, v in PRESETS.items():
-        p = Path(v["path"])
-        try:
-            rel = str(p.relative_to(ROOT))
-        except ValueError:
-            rel = str(p)
-        presets[k] = {
-            "label": v["label"],
-            "kind": v["kind"],
-            "engine": v["engine"],
-            "backend": v["backend"],
-            "blurb": v["blurb"],
-            "exists": p.is_file(),
-            "path": rel,
-        }
-
+    bins = {n: (BIN_DIR / n).is_file() for n in ("sor_solve", "sor_check", "sor_gen")}
+    caps = await asyncio.to_thread(capabilities) if bins["sor_solve"] else {}
     return {
         "ok": all(bins.values()),
-        "bin_dir": str(DEFAULT_BIN),
-        "examples": str(DEFAULT_EXAMPLES),
-        "timeout_s": DEFAULT_TIMEOUT,
+        "bin_dir": str(BIN_DIR),
         "bins": bins,
-        "presets": presets,
-        "note": "Demo UI over the SOR engine - CLI remains the PS interface.",
-        "lp_sample": LP_SAMPLE,
-        "learn_templates": LEARN_TEMPLATES,
+        "capabilities": caps,
+        "check_classes": sorted(CHECK_CLASSES),
+        "time_limit": {"default": DEFAULT_TIME_LIMIT, "max": MAX_TIME_LIMIT},
+        "templates": load_templates(),
     }
 
 
-@app.get("/api/model/{preset_id}")
-async def get_preset_model(preset_id: str) -> dict[str, Any]:
-    if preset_id not in PRESETS:
-        raise HTTPException(404, f"Unknown preset '{preset_id}'")
-    path = Path(PRESETS[preset_id]["path"])
-    if not path.is_file():
-        raise HTTPException(404, f"File missing: {path}")
-    text = path.read_text(encoding="utf-8", errors="replace")
-    # Cap huge files for the browser editor
-    truncated = False
-    if len(text) > 400_000:
-        text = text[:400_000] + "\n* ... truncated for editor ...\n"
-        truncated = True
-    return {
-        "id": preset_id,
-        "label": PRESETS[preset_id]["label"],
-        "path": str(path.name),
-        "format": path.suffix.lower().lstrip(".") or "mps",
-        "text": text,
-        "truncated": truncated,
-        "engine": PRESETS[preset_id]["engine"],
-        "backend": PRESETS[preset_id].get("backend", "cpu"),
-    }
+@app.get("/api/models")
+async def models() -> dict[str, Any]:
+    return {"groups": await asyncio.to_thread(discover_models)}
+
+
+@app.get("/api/model")
+async def get_model(id: str) -> dict[str, Any]:
+    path = resolve_model(id)
+    return await asyncio.to_thread(_model_payload, id, path)
+
+
+@app.post("/api/upload")
+async def upload(file: UploadFile = File(...)) -> dict[str, Any]:
+    name = Path(file.filename or "model.mps").name
+    if _model_format(Path(name)) is None:
+        raise HTTPException(400, f"Unsupported file type - expected one of {', '.join(MODEL_EXTS)} (optionally .gz)")
+    data = await file.read()
+    if len(data) > UPLOAD_MAX_BYTES:
+        raise HTTPException(400, f"Upload too large ({UPLOAD_MAX_BYTES // 1_000_000} MB max)")
+    session = _new_session()
+    (session / name).write_bytes(data)
+    path = _fix_suffix(session / name)
+    model_id = f"session:{session.name}/{path.name}"
+    return await asyncio.to_thread(_model_payload, model_id, path)
+
+
+@app.post("/api/gen")
+async def gen(
+    kind: str = Form(...),
+    options: str = Form(default="{}"),
+) -> dict[str, Any]:
+    spec = capabilities()["generator"]
+    if kind not in spec["kinds"]:
+        raise HTTPException(400, f"kind must be one of {', '.join(spec['kinds'])}")
+    allowed = {o["flag"] for o in spec["options"].get(kind, [])} | {o["flag"] for o in spec["common"]}
+    try:
+        opts = json.loads(options)
+    except ValueError as e:
+        raise HTTPException(400, "options must be JSON") from e
+    session = _new_session()
+    out = session / f"{kind}.mps"
+    cmd = [str(_bin("sor_gen")), kind]
+    for flag, value in opts.items():
+        if value in (None, ""):
+            continue
+        if flag not in allowed or not re.fullmatch(r"-?\d+(\.\d+)?", str(value)):
+            raise HTTPException(400, f"Invalid option {flag}={value}")
+        cmd += [flag, str(value)]
+    # sor_gen picks the extension; write to a stem and find what it produced.
+    cmd += ["-o", str(out)]
+    res = await _run(cmd, timeout=60.0)
+    produced = [p for p in session.iterdir() if _model_format(p)]
+    if not res["ok"] or not produced:
+        raise HTTPException(400, (res["stderr"] or res["stdout"] or "generator failed").strip())
+    path = _fix_suffix(produced[0])
+    payload = await asyncio.to_thread(_model_payload, f"session:{session.name}/{path.name}", path)
+    payload["cmd"] = " ".join([Path(cmd[0]).name, *cmd[1:-2]])
+    return payload
 
 
 @app.post("/api/lp-to-mps")
@@ -303,127 +749,98 @@ async def lp_to_mps(model_text: str = Form(...)) -> dict[str, Any]:
         mps, meta = lp_text_to_mps(model_text, name="WEBTEXT")
     except LpTextError as e:
         raise HTTPException(400, f"Equation parse error: {e}") from e
-    return {"mps": mps, "meta": meta}
+    info = _scan_mps(mps.splitlines())
+    info["kind"] = _classify(info)
+    info["engine"] = pick_engine(info)
+    return {"mps": mps, "meta": meta, "info": info}
 
 
 @app.post("/api/solve")
 async def solve(
-    preset: str | None = Form(default=None),
-    engine: str = Form(default="simplex"),
-    backend: str = Form(default="cpu"),
-    method: str = Form(default="auto"),
-    time_limit: float = Form(default=30.0),
+    model: str | None = Form(default=None),
+    engine: str = Form(default=""),
+    backend: str = Form(default=""),
+    method: str = Form(default=""),
+    threads: int | None = Form(default=None),
+    time_limit: float = Form(default=DEFAULT_TIME_LIMIT),
     verbose: bool = Form(default=False),
-    max_iter: int | None = Form(default=None),
     model_text: str | None = Form(default=None),
     mps_text: str | None = Form(default=None),
-    file: UploadFile | None = File(default=None),
 ) -> dict[str, Any]:
-    if time_limit < 0 or time_limit > 300:
-        raise HTTPException(400, "time_limit must be in [0, 300]")
+    if time_limit < 0 or time_limit > MAX_TIME_LIMIT:
+        raise HTTPException(400, f"time_limit must be in [0, {MAX_TIME_LIMIT:g}]")
 
+    caps = capabilities()
     solve_bin = _bin("sor_solve")
-    session = Path(tempfile.mkdtemp(prefix="sor_sol_", dir=SESSIONS))
-    model_path: Path
-    display_name: str
-    text_meta: dict[str, Any] | None = None
+    session = _new_session()
 
     try:
-        # Edited MPS / QPS buffer wins (Gurobi-style inspect → tweak → optimize).
-        if mps_text is not None and mps_text.strip():
-            raw = mps_text.strip()
-            suffix = ".qps" if "QUADOBJ" in raw.upper() else ".mps"
-            model_path = session / f"model{suffix}"
-            model_path.write_text(raw + ("\n" if not raw.endswith("\n") else ""))
-            display_name = "Edited model"
-            text_meta = _mps_sense_meta(raw)
-            if suffix == ".qps" and engine == "simplex":
-                engine = "qp"
-        elif model_text is not None and model_text.strip():
+        if model_text is not None and model_text.strip():
             try:
-                mps, text_meta = lp_text_to_mps(model_text, name="WEBTEXT")
+                mps, _ = lp_text_to_mps(model_text, name="WEBTEXT")
             except LpTextError as e:
                 raise HTTPException(400, f"Equation parse error: {e}") from e
             model_path = session / "model.mps"
             model_path.write_text(mps)
-            display_name = "Your equations"
-            if text_meta.get("suggested_engine") == "milp" and engine == "simplex":
-                engine = "milp"
-        elif file is not None and file.filename:
-            suffix = Path(file.filename).suffix.lower() or ".mps"
-            if suffix not in {".mps", ".qps"}:
-                raise HTTPException(400, "Upload .mps or .qps only")
+        elif mps_text is not None and mps_text.strip():
+            raw = mps_text.strip() + "\n"
+            suffix = ".qps" if re.search(r"^QUADOBJ|^QMATRIX|^QSECTION", raw, re.M | re.I) else ".mps"
             model_path = session / f"model{suffix}"
-            data = await file.read()
-            if len(data) > 40_000_000:
-                raise HTTPException(400, "Upload too large (40 MB max)")
-            model_path.write_bytes(data)
-            display_name = file.filename
-            if engine == "simplex" and suffix == ".qps":
-                engine = "qp"
-        elif preset:
-            if preset not in PRESETS:
-                raise HTTPException(400, f"Unknown preset '{preset}'")
-            info = PRESETS[preset]
-            src = Path(info["path"])
-            if not src.is_file():
-                raise HTTPException(404, f"Preset file missing: {src}")
+            model_path.write_text(raw)
+        elif model:
+            src = resolve_model(model)
             model_path = session / src.name
-            shutil.copy2(src, model_path)
-            display_name = str(info["label"])
+            try:
+                model_path.symlink_to(src)
+            except OSError:
+                shutil.copy2(src, model_path)
         else:
-            raise HTTPException(
-                400,
-                "Provide mps_text=..., model_text=..., preset=..., or upload a model file",
-            )
+            raise HTTPException(400, "Nothing to solve - pick a model, upload one, or write equations")
+
+        display_path = model if model and model_path.is_symlink() and not model.startswith("session:") else model_path.name
+        model_path = await asyncio.to_thread(_fix_suffix, model_path)
+        info = await asyncio.to_thread(scan_model, model_path)
+        engine_ids = {e["id"] for e in caps["engines"]}
+        if not engine:
+            engine = info["engine"] or caps["default_engine"] or ""
+        if engine and engine not in engine_ids:
+            raise HTTPException(400, f"Unknown engine '{engine}'")
+        backend_ids = {b["id"] for b in caps["backends"]}
+        if backend and backend not in backend_ids:
+            raise HTTPException(400, f"Unknown backend '{backend}'")
 
         sol_path = session / "out.sol"
-        cmd = [
-            str(solve_bin),
-            str(model_path),
-            "--engine",
-            engine,
-            "--backend",
-            backend,
-            "--method",
-            method,
-            "--solution-out",
-            str(sol_path),
-        ]
+        cmd = [str(solve_bin), str(model_path), "--solution-out", str(sol_path)]
+        if engine:
+            cmd += ["--engine", engine]
+        if backend:
+            cmd += ["--backend", backend]
+        if method:
+            cmd += ["--method", method]
+        if threads and caps["has_threads"]:
+            cmd += ["--threads", str(threads)]
         if time_limit > 0:
-            cmd += ["--time-limit", str(time_limit)]
+            cmd += ["--time-limit", f"{time_limit:g}"]
         if verbose:
             cmd.append("--verbose")
-        if max_iter is not None:
-            cmd += ["--max-iter", str(max_iter)]
 
-        timeout = max(time_limit + 15.0, 20.0) if time_limit > 0 else DEFAULT_TIMEOUT
-        timeout = min(timeout, max(DEFAULT_TIMEOUT, time_limit + 15.0))
-
-        result = await _run(cmd, timeout=timeout)
-        parsed = _parse_solve_output(result["stdout"])
-        if text_meta and text_meta.get("maximize") and parsed.get("objective") is not None:
-            # Free MPS has no MAXIMIZE flag - we negated costs on write.
-            parsed["objective"] = -float(parsed["objective"])
+        timeout = time_limit + 15.0 if time_limit > 0 else DEFAULT_TIMEOUT
+        result = await _run(cmd, timeout=max(timeout, 20.0))
+        parsed = _parse_solve_output(result["stdout"] + "\n" + result["stderr"])
 
         check_ready = sol_path.is_file() and sol_path.stat().st_size > 0
-
-        out = {
+        return {
             **result,
             **parsed,
-            "display_name": display_name,
-            "model_name": model_path.name,
+            # Show the command as a user would type it from the repo root.
+            "cmd": [Path(cmd[0]).name, display_path,
+                    *[sol_path.name if a == str(sol_path) else a for a in cmd[2:]]],
+            "model_info": info,
             "sol_token": session.name if check_ready else None,
             "check_ready": check_ready,
+            "check_authoritative": info["kind"] in CHECK_CLASSES,
             "engine": engine,
-            "backend": backend,
         }
-        if text_meta:
-            out["model_meta"] = text_meta
-        return out
-    except HTTPException:
-        shutil.rmtree(session, ignore_errors=True)
-        raise
     except Exception:
         shutil.rmtree(session, ignore_errors=True)
         raise
@@ -432,7 +849,7 @@ async def solve(
 @app.post("/api/check")
 async def check(
     sol_token: str = Form(...),
-    tol: float = Form(default=1e-7),
+    tol: float | None = Form(default=None),
 ) -> dict[str, Any]:
     if "/" in sol_token or ".." in sol_token or not sol_token.startswith("sor_sol_"):
         raise HTTPException(400, "Invalid sol_token")
@@ -440,7 +857,7 @@ async def check(
     if not session.is_dir():
         raise HTTPException(404, "Solution expired - solve again")
 
-    candidates = [p for p in session.iterdir() if p.suffix.lower() in {".mps", ".qps"}]
+    candidates = [p for p in session.iterdir() if _model_format(p)]
     if not candidates:
         raise HTTPException(404, "Model missing in session")
     model_file = candidates[0]
@@ -448,36 +865,19 @@ async def check(
     if not sol_file.is_file():
         raise HTTPException(404, "Solution file missing")
 
-    check_bin = _bin("sor_check")
-    cmd = [str(check_bin), str(model_file), str(sol_file), "--tol", str(tol)]
+    cmd = [str(_bin("sor_check")), str(model_file), str(sol_file)]
+    if tol is not None:
+        cmd += ["--tol", str(tol)]
     result = await _run(cmd, timeout=60.0)
-    passed = bool(result["ok"]) and "FAIL" not in result["stdout"]
-    return {**result, "passed": passed}
-
-
-@app.post("/api/gen")
-async def gen(
-    kind: str = Form(default="all"),
-    seed: int = Form(default=42),
-) -> dict[str, Any]:
-    if kind not in {"blend", "schedule", "dispatch", "all"}:
-        raise HTTPException(400, "kind must be blend|schedule|dispatch|all")
-    gen_bin = _bin("sor_gen")
-    outdir = DEFAULT_EXAMPLES
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    if kind == "all":
-        cmd = [str(gen_bin), "all", "--seed", str(seed), "--outdir", str(outdir)]
-    else:
-        targets = {
-            "blend": outdir / "crude_blending" / f"blend_s{seed}.mps",
-            "schedule": outdir / "scheduling" / f"schedule_s{seed}.mps",
-            "dispatch": outdir / "dispatch" / f"dispatch_s{seed}.qps",
-        }
-        targets[kind].parent.mkdir(parents=True, exist_ok=True)
-        cmd = [str(gen_bin), kind, "--seed", str(seed), "-o", str(targets[kind])]
-
-    return await _run(cmd, timeout=60.0)
+    parsed = _parse_check_output(result["stdout"] + "\n" + result["stderr"])
+    info = scan_model(model_file)
+    return {
+        **result,
+        **parsed,
+        "passed": bool(result["ok"]),
+        "authoritative": info["kind"] in CHECK_CLASSES,
+        "model_kind": info["kind"],
+    }
 
 
 def main() -> None:
@@ -485,8 +885,8 @@ def main() -> None:
 
     uvicorn.run(
         "app:app",
-        host=os.environ.get("SOR_WEB_HOST", "127.0.0.1"),
-        port=int(os.environ.get("SOR_WEB_PORT", "8765")),
+        host=_env("WEB_HOST", "127.0.0.1"),
+        port=int(_env("WEB_PORT", "8765")),
         reload=False,
     )
 

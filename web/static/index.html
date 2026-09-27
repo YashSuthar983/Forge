@@ -3,156 +3,186 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>SOR</title>
+  <title>FORGE</title>
+  <link rel="icon" type="image/png" href="/static/favicon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Sora:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/app.css?v=12" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/app.css?v=40" />
 </head>
 <body>
-  <div class="bg" aria-hidden="true"></div>
-
-  <div class="topbar">
-    <div class="topbar-left">
-      <span><strong>SOR</strong><span class="sep">·</span>Optimization Runtime</span>
-      <label class="file-hit top-file">
-        <input type="file" id="file" accept=".mps,.qps" />
-        <span>Open <code>.mps</code> / <code>.qps</code></span>
+  <header class="topbar">
+    <a class="brand" href="/">
+      <img src="/static/forge-mark.png" alt="" width="34" height="34" />
+      <span class="brand-name">FORGE</span>
+      <span class="brand-sub">Optimization Runtime</span>
+    </a>
+    <div class="topbar-right">
+      <span class="alert" id="alert" hidden></span>
+      <label class="btn" title="Open an .mps, .qps or .qplib model from disk">
+        <input type="file" id="file" hidden />
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 13V3m0 0L6 7m4-4 4 4M4 13v3h12v-3" /></svg>
+        Open file
       </label>
     </div>
-    <span class="topbar-right" id="health">Starting...</span>
-  </div>
+  </header>
 
-  <main class="shell workspace">
-    <header class="brand-block">
-      <p class="logo">SOR</p>
-      <p class="tag">Inspect or edit the model, set options, optimize.</p>
-    </header>
+  <div class="app">
+    <!-- 1. Choose a model -->
+    <aside class="sidebar" aria-label="Choose a model">
+      <div class="seg" role="tablist" id="side-tabs">
+        <button type="button" role="tab" class="seg-btn active" data-panel="models">Models</button>
+        <button type="button" role="tab" class="seg-btn" data-panel="write" id="seg-write">Write</button>
+        <button type="button" role="tab" class="seg-btn" data-panel="generate" id="seg-generate">Generate</button>
+      </div>
 
-    <div class="panes">
-      <!-- LEFT: models -->
-      <aside class="pane-left" aria-label="Models">
-        <p class="step-dark">Models</p>
-        <div class="problems" id="problems"></div>
+      <section class="side-panel" id="panel-models">
+        <div class="search">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="9" cy="9" r="5.5" /><path d="m13 13 4 4" /></svg>
+          <input type="search" id="filter" placeholder="Search models" autocomplete="off" />
+        </div>
+        <nav id="library"><p class="empty">Loading models…</p></nav>
+      </section>
 
-        <button type="button" class="problem write-toggle" id="btn-write">
-          <span class="kind">learn</span>
-          <span class="name">Write equations</span>
-          <span class="blurb">LP text → editable MPS.</span>
-        </button>
-      </aside>
+      <section class="side-panel" id="panel-write" hidden>
+        <p class="side-intro">Type a model as plain equations. Start from one of these:</p>
+        <div class="cards" id="templates"></div>
+      </section>
 
-      <!-- RIGHT: editor + options + result -->
-      <div class="pane-right-stack">
-        <section class="pane-right" aria-label="Model inspector">
-          <div class="inspector-head">
-            <div>
-              <p class="step-light">Model</p>
-              <p class="model-title" id="model-title">-</p>
+      <section class="side-panel" id="panel-generate" hidden>
+        <p class="side-intro">Create a fresh <strong>synthetic</strong> instance with <code>sor_gen</code>, the same generator the CLI uses.</p>
+        <form class="gen" id="gen-form">
+          <div class="cards" id="gen-kinds" role="radiogroup" aria-label="Instance type"></div>
+          <div class="gen-opts" id="gen-opts"></div>
+          <button type="submit" class="btn btn-block btn-strong" id="gen-btn">Generate instance</button>
+        </form>
+      </section>
+    </aside>
+
+    <main class="main">
+      <!-- 2. Configure + run -->
+      <section class="card model-card">
+        <div class="model-head">
+          <div class="model-id">
+            <div class="model-title-row">
+              <h1 id="model-title">No model selected</h1>
+              <span class="kind" id="model-kind" hidden></span>
+              <span class="tag tag-warn" id="dirty" hidden>edited</span>
             </div>
+            <p class="model-path" id="model-path"></p>
+          </div>
+          <dl class="stats" id="model-stats"></dl>
+        </div>
+
+        <p class="callout" id="run-note" hidden></p>
+
+        <div class="run-bar">
+          <label class="field field-engine">
+            <span>Engine</span>
+            <select id="engine"></select>
+          </label>
+          <label class="field">
+            <span>Hardware</span>
+            <select id="backend"></select>
+          </label>
+          <label class="field field-narrow">
+            <span>Time limit (s)</span>
+            <input type="number" id="time_limit" min="0" step="1" />
+          </label>
+          <details class="more" id="more">
+            <summary class="btn"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h12M4 10h12M4 14h12" /><circle cx="8" cy="6" r="1.6" fill="currentColor" /><circle cx="13" cy="10" r="1.6" fill="currentColor" /><circle cx="7" cy="14" r="1.6" fill="currentColor" /></svg>Options</summary>
+            <div class="more-panel">
+              <label class="field" id="method-field">
+                <span>Simplex method</span>
+                <select id="method"></select>
+              </label>
+              <label class="field" id="threads-field">
+                <span>Threads</span>
+                <input type="number" id="threads" min="1" step="1" placeholder="auto" />
+              </label>
+              <label class="check"><input type="checkbox" id="autocheck" checked /> Run the independent checker after each solve</label>
+              <label class="check"><input type="checkbox" id="verbose" /> Verbose solver log</label>
+              <div class="hw-note" id="hw-note" hidden></div>
+            </div>
+          </details>
+          <button type="button" class="solve" id="btn-solve" disabled>
+            <span class="spinner" aria-hidden="true"></span>
+            <span id="solve-label">Solve</span>
+            <kbd id="solve-kbd"></kbd>
+          </button>
+        </div>
+      </section>
+
+      <div class="work">
+        <!-- 3. Answer -->
+        <section class="card result idle" id="result" aria-live="polite" aria-label="Result">
+          <div class="result-empty" id="result-empty">
+            <ol class="steps">
+              <li><span>1</span><div><strong>Pick a model</strong><p>From the library, your own equations, or a generated instance.</p></div></li>
+              <li><span>2</span><div><strong>Press Solve</strong><p>The engine is matched to the model type. Override it if you like.</p></div></li>
+              <li><span>3</span><div><strong>Read the answer</strong><p>Objective, the solver's proof level, and an independent re-check.</p></div></li>
+            </ol>
+          </div>
+
+          <div class="result-body" id="result-body" hidden>
+            <div class="summary">
+              <div class="result-top">
+                <span class="status" id="status"></span>
+                <span class="proof" id="proof"></span>
+                <span class="wall" id="wall"></span>
+              </div>
+              <div class="objective" id="objective-wrap">
+                <span class="label">Objective</span>
+                <p class="objective-value" id="objective"></p>
+              </div>
+              <p class="human" id="human"></p>
+              <ul class="notes" id="notes"></ul>
+              <div class="tiles" id="tiles"></div>
+              <button type="button" class="verify-line" id="verify-line" hidden></button>
+            </div>
+
+            <div class="rtabs" role="tablist" id="rtabs">
+              <button type="button" class="rtab" data-rtab="checks" id="rtab-checks">Checks</button>
+              <button type="button" class="rtab" data-rtab="report">Report</button>
+              <button type="button" class="rtab" data-rtab="command">Command</button>
+              <button type="button" class="rtab" data-rtab="log">Log</button>
+            </div>
+
+            <div class="rpanel" id="rpanel-checks"><div id="check"></div></div>
+            <div class="rpanel" id="rpanel-report" hidden><dl class="kv" id="report"></dl></div>
+            <div class="rpanel" id="rpanel-command" hidden>
+              <p class="panel-intro">The exact call the console made. Paste it in a terminal at the repo root to reproduce.</p>
+              <div class="cmd">
+                <code id="cmd"></code>
+                <button type="button" class="btn btn-small" id="copy-cmd">Copy</button>
+              </div>
+            </div>
+            <div class="rpanel" id="rpanel-log" hidden><pre class="log" id="log"></pre></div>
+          </div>
+        </section>
+
+        <!-- Source -->
+        <section class="card editor" aria-label="Model source">
+          <div class="editor-head">
             <div class="tabs" role="tablist">
-              <button type="button" class="tab active" data-tab="mps" id="tab-mps">MPS</button>
-              <button type="button" class="tab" data-tab="eq" id="tab-eq">Equations</button>
+              <button type="button" class="tab" role="tab" id="tab-eq" hidden>Equations</button>
+              <button type="button" class="tab active" role="tab" id="tab-mps">Source</button>
             </div>
+            <span class="editor-meta" id="editor-meta"></span>
           </div>
-
-          <div class="editor-wrap" id="panel-mps">
-            <div class="editor-toolbar">
-              <span id="mps-meta">Select a model to inspect</span>
-              <span class="dirty" id="dirty" hidden>edited</span>
-            </div>
-            <textarea id="mps_text" class="code-edit" spellcheck="false" rows="16"
-              placeholder="NAME ...&#10;ROWS&#10;...&#10;ENDATA"></textarea>
-          </div>
-
-          <div class="editor-wrap" id="panel-eq" hidden>
-            <div class="editor-toolbar">
-              <span>Learner LP text</span>
-              <button type="button" class="mini" id="btn-to-mps">Update MPS from equations</button>
-            </div>
-            <div class="templates" id="templates" role="list"></div>
-            <textarea id="model_text" class="code-edit eq-edit" spellcheck="false" rows="12"
-              placeholder="Maximize&#10;  3 x + 4 y&#10;Subject To&#10;  ...&#10;End"></textarea>
-            <p class="writer-help">
-              <strong>How to write it</strong> -
-              <code>Maximize</code>/<code>Minimize</code> ·
-              <code>Subject To</code> ·
-              <code>Bounds</code> ·
-              <code>Binary</code>/<code>General</code> ·
-              <code>End</code>
+          <textarea id="mps_text" class="code" spellcheck="false" placeholder="Pick a model on the left, open a file, or paste MPS here."></textarea>
+          <div class="eq-pane" id="eq-pane" hidden>
+            <textarea id="model_text" class="code" spellcheck="false"></textarea>
+            <p class="eq-help">
+              <code>Maximize</code>/<code>Minimize</code> · <code>Subject To</code> · <code>Bounds</code> ·
+              <code>Binary</code>/<code>General</code> · <code>End</code> · <code>#</code> starts a comment
             </p>
           </div>
         </section>
-
-        <!-- LEFT/RIGHT: Optimize | Parameters -->
-        <section class="run-split" aria-label="Run">
-          <div class="run-left">
-            <p class="step-light">Run</p>
-            <button type="button" class="solve" id="btn-solve">
-              <span id="solve-label">Optimize</span>
-              <span class="solve-hint" id="solve-hint">-</span>
-            </button>
-            <div class="toggles">
-              <label class="toggle"><input type="checkbox" id="verbose" /> Show solver log</label>
-              <label class="toggle"><input type="checkbox" id="autocheck" checked /> Verify residuals</label>
-            </div>
-          </div>
-
-          <div class="run-right">
-            <p class="step-light">Options</p>
-            <div class="adv-grid">
-              <label>Engine
-                <select id="engine">
-                  <option value="simplex">simplex (continuous LP)</option>
-                  <option value="milp">milp (integers)</option>
-                  <option value="qp">qp (quadratic)</option>
-                  <option value="hpr">hpr (first-order LP)</option>
-                  <option value="pdhg">pdhg (first-order LP)</option>
-                </select>
-              </label>
-              <label>Hardware
-                <select id="backend">
-                  <option value="cpu">CPU</option>
-                  <option value="vulkan">GPU (Vulkan)</option>
-                </select>
-              </label>
-              <label>Simplex method
-                <select id="method">
-                  <option value="auto">auto</option>
-                  <option value="dual">dual</option>
-                  <option value="primal">primal</option>
-                </select>
-              </label>
-              <label>Time limit (s)
-                <input type="number" id="time_limit" value="30" min="0" max="300" />
-              </label>
-            </div>
-          </div>
-        </section>
-
-        <section class="answer idle" id="answer" aria-live="polite" aria-label="Answer">
-          <p class="step-light">Result</p>
-          <div class="answer-grid">
-            <div class="answer-main">
-              <p class="verdict" id="verdict">Waiting</p>
-              <p class="plain" id="plain">Load a model, edit if you want, then Optimize.</p>
-              <p class="obj" id="obj"></p>
-            </div>
-            <div class="answer-side">
-              <div class="meta" id="meta" hidden>
-                <span id="meta-time"></span>
-                <span id="meta-proof"></span>
-                <span id="meta-check"></span>
-              </div>
-              <button type="button" class="verify" id="btn-check" hidden>Verify again</button>
-            </div>
-          </div>
-          <pre class="log" id="log" hidden></pre>
-        </section>
       </div>
-    </div>
-  </main>
+    </main>
+  </div>
 
-  <script src="/static/app.js?v=13"></script>
+  <script src="/static/app.js?v=40"></script>
 </body>
 </html>
