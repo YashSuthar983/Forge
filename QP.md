@@ -1,4 +1,4 @@
-# QP, QCQP and global optimization
+# Forge: QP, QCQP and global optimization
 
 The quadratic side of the solver: convex QP, nonconvex QP and QCQP, mixed
 integer quadratic, and a spatial branch-and-bound. Built from published
@@ -130,8 +130,9 @@ requires convex node relaxations and pooling's bilinear rows never are.
 
 ## QPLIB
 
-All 453 instances parse and route. Measured: 301 feasible, 137 matching the
-published objective, about 35 proved. Two routing changes suggested by the
+All 453 instances parse and route. Measured: 311 feasible, 138 matching the
+published objective, 43 proved, 0 disagreements with the independent re-check
+(`QP_PERFS.md` §1). Two routing changes suggested by the
 refinery work were tested on the affected classes and **refused**: sending the
 52 continuous quadratic-constrained instances to the spatial branch-and-bound
 gives 12 feasible against 33, winning on none; sending the 134 mixed-integer

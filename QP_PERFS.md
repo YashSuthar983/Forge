@@ -1,4 +1,4 @@
-# QP performance: every measurement, with its time
+# Forge: QP performance measurements
 
 Each section states the budget, the thread count and the concurrency it ran
 under. A number without its conditions is not a measurement.
