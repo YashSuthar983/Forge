@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SOR SIH26119 - CLI film track.
+# Forge (SIH26119) - CLI demo track.
 # Usage:
 #   ./scripts/demo.sh              # full track
 #   ./scripts/demo.sh blend        # one beat
@@ -112,7 +112,7 @@ run_gen() {
 
 usage() {
   cat <<EOF
-SOR demo CLI - film track
+Forge demo CLI - demo track
 
   $0 all          full video track
   $0 blend        Blend LP + write .sol

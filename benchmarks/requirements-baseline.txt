@@ -1,6 +1,6 @@
 # External-solver baselines used ONLY as separate processes for differential
-# testing and benchmark comparison. Never linked into SOR, never in the solve
-# path, never in a certificate -- see docs/clean_room_policy.md.
+# testing and benchmark comparison. Never linked into Forge, never in the solve
+# path, never in a certificate -- see docs/architecture.md §8.
 #
 # Recreate with:
 #   python3 -m venv benchmarks/.venv-baseline
