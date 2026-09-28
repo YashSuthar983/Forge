@@ -1,6 +1,7 @@
-# Command-line flag reference
+# Forge: command-line flag reference
 
-This is the current inventory of user-facing command-line flags in `SOR_PB`.
+This page lists every user-facing command-line flag in Forge. The binaries keep
+their `sor_` names.
 It was audited against the argument parsers on 2026-09-25. The implementation
 is authoritative; update this document whenever a parser changes.
 
