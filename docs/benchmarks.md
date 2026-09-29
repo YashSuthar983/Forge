@@ -7,6 +7,12 @@ comparison covers LP, MILP, convex QP, nonconvex QP, MIQP and the GPU path.
 QPLIB and pooling measurements for the quadratic engines are in
 [`../QP_PERFS.md`](../QP_PERFS.md).
 
+A later campaign covering **all 453 QPLIB instances**, a 300 s MILP repeat and a
+single-thread Netlib repeat - on different hardware, against HiGHS and SCIP only
+- is in [`benchmark-campaign-2026-09.md`](benchmark-campaign-2026-09.md). It
+supersedes the concurrent QPLIB sweep in `QP_PERFS.md` and lists five defects it
+found in Forge.
+
 ## Method
 
 | Field | Value |

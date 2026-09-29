@@ -246,6 +246,7 @@ corpus and the pooling generators are not.
 |---|---|
 | [`docs/architecture.md`](docs/architecture.md) | Layers, solve flows, proof levels, module contracts, clean-room boundary |
 | [`docs/benchmarks.md`](docs/benchmarks.md) | Full benchmark method and per-instance results against 8 solvers, plus GPU |
+| [`docs/benchmark-campaign-2026-09.md`](docs/benchmark-campaign-2026-09.md) | Sequential campaign on one machine: Netlib, MIPLIB-easy at 60 s and 300 s, all 453 QPLIB instances, vs HiGHS and SCIP - plus the defects it found |
 | [`QP.md`](QP.md) | The quadratic side: engines, the rules for what may be claimed, the pooling suite, failure behaviour |
 | [`QP_PERFS.md`](QP_PERFS.md) | Every QP measurement, including per-instance times for the 453 QPLIB instances |
 | [`CLI_FLAGS.md`](CLI_FLAGS.md) | Every command-line flag and `KEY=VALUE` option |
