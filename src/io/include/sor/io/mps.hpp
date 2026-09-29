@@ -54,6 +54,14 @@ struct MpsReadReport {
     std::size_t small_values_dropped = 0;
     core::f64 largest_small_value_dropped = 0.0;
     std::vector<std::string> warnings;
+    // Sections the file contains that this reader does not implement. These
+    // are NOT cosmetic: SOS sets, INDICATORS and piecewise-linear objectives
+    // all constrain the feasible set, so a model read with one dropped is a
+    // DIFFERENT model than the file describes -- and an optimum proved for it
+    // is not an optimum of the caller's problem. A warning on stderr is not
+    // enough protection for that, so the caller is expected to refuse the run
+    // (sor_solve does) rather than quietly solve the wrong thing.
+    std::vector<std::string> ignored_sections;
 };
 
 // Throws std::runtime_error with a line number on malformed input.

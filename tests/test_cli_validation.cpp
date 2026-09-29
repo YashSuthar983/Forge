@@ -232,6 +232,76 @@ void test_q_diag_rejects_malformed_entries() {
     }
 }
 
+// A section this build cannot read is not a warning-level event. SOS sets and
+// INDICATORS restrict the feasible set, so a model read without them is a
+// RELAXATION: its optimum is better than the true one and may be infeasible for
+// the caller's real problem. Before this was pinned, sor_solve printed a
+// warning on stderr and went on to report `Optimal` -- a confidently wrong
+// answer, which is the one outcome this codebase refuses everywhere else.
+void test_unreadable_section_is_refused_not_warned() {
+    const std::string sos_model =
+        (fs::temp_directory_path() / "sor_cli_sos.mps").string();
+    {
+        std::ofstream out(sos_model);
+        out << "NAME          SOSCLI\n"
+               "ROWS\n"
+               " N  COST\n"
+               " L  LIM1\n"
+               "COLUMNS\n"
+               "    X1        COST      1.0        LIM1      1.0\n"
+               "    X2        COST      2.0        LIM1      1.0\n"
+               "RHS\n"
+               "    RHS       LIM1      4.0\n"
+               "BOUNDS\n"
+               " UP BND       X1        4.0\n"
+               " UP BND       X2        4.0\n"
+               "SOS\n"
+               " S2 SOS1      X1        1.0\n"
+               "    SOS1      X2        2.0\n"
+               "ENDATA\n";
+    }
+
+    // Refused by default, and the message names the section so the user can act.
+    const Run refused = run({solve_exe, sos_model, "--engine", "simplex"});
+    CHECK(refused.exit_code != 0);
+    CHECK(contains(refused.output, "SOS"));
+    // And it must NOT have claimed anything about the model it could not read.
+    CHECK(!contains(refused.output, "status:            Optimal"));
+
+    // The escape hatch still works, and says what the answer now describes.
+    const Run allowed = run({solve_exe, sos_model, "--engine", "simplex",
+                             "--allow-ignored-sections"});
+    CHECK(allowed.exit_code == 0);
+    CHECK(contains(allowed.output, "RELAXATION"));
+
+    // --report explains the file instead of just refusing it.
+    const Run report = run({solve_exe, sos_model, "--report"});
+    CHECK(contains(report.output, "NOT SUPPORTED"));
+    CHECK(contains(report.output, "SOS"));
+
+    fs::remove(sos_model);
+}
+
+// The CSV export exists so a planner can read the answer in the vocabulary of
+// their own model. If it ever regresses to bare indices it is useless to them,
+// so pin that the ORIGINAL names reach the file.
+void test_solution_csv_uses_original_names() {
+    const std::string csv =
+        (fs::temp_directory_path() / "sor_cli_solution.csv").string();
+    const Run r = run({solve_exe, model, "--engine", "simplex",
+                       "--solution-csv", csv});
+    CHECK(r.exit_code == 0);
+
+    std::ifstream in(csv);
+    const std::string text((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    CHECK(contains(text, "kind,name,value,lower,upper,at_bound"));
+    CHECK(contains(text, "summary,\"objective\""));
+    CHECK(contains(text, "variable,"));
+    CHECK(contains(text, "constraint,"));
+    fs::remove(csv);
+}
+
 void test_unknown_option_and_no_arguments() {
     const Run unknown = run({solve_exe, model, "--not-an-option"});
     CHECK(unknown.exit_code != 0);
@@ -491,6 +561,8 @@ int main() {
     test_zero_column_model_is_refused_by_every_engine();
     test_unwritable_solution_out_is_refused();
     test_bad_engine_option_is_refused();
+    test_unreadable_section_is_refused_not_warned();
+    test_solution_csv_uses_original_names();
 
     // One good solve produces the solution file the sor_check cases need.
     solution_file = (fs::temp_directory_path() / "sor_cli_validation.sol").string();

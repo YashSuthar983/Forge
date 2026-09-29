@@ -18,6 +18,7 @@
 #include "sor/io/qplib.hpp"
 #include "sor/io/qps.hpp"
 #include "sor/io/solution.hpp"
+#include "sor/io/solution_csv.hpp"
 #include "sor/search/bab.hpp"
 #include "sor/search/binquad.hpp"
 #include "sor/search/bqp_bab.hpp"
@@ -198,7 +199,13 @@ void usage() {
         "  --threads N      worker threads for the sparse linear algebra\n"
         "  --verbose        iteration / node log\n"
         "  --hpr-vanilla | --hpr-full\n"
-        "  --solution-out PATH   write a plain-text solution file for sor_check\n",
+        "  --solution-out PATH   write a plain-text solution file for sor_check\n"
+        "  --solution-csv PATH   write named variables/constraints as CSV (opens in Excel)\n"
+        "  --report              describe the model and what this build can do with it,\n"
+        "                        then exit without solving\n"
+        "  --allow-ignored-sections  solve anyway when the file has sections this\n"
+        "                        build cannot read; results then describe a\n"
+        "                        RELAXATION of the file, not the file\n",
         stderr);
 }
 
@@ -270,8 +277,28 @@ unsigned long long parse_uint(const std::string& text, const char* what,
     return v;
 }
 
+// --solution-csv needs the MODEL as well as the result, because it reports
+// original names, bounds and row activities. Every engine path already funnels
+// through write_solution_out(), so the model is parked here once at load time
+// rather than threading an extra argument through a dozen call sites. Both are
+// set only while the owning problem is alive on the stack below.
+static std::string g_solution_csv;
+static const sor::model::LpProblem* g_csv_problem = nullptr;
+
+static void write_solution_csv_out(const sor::core::SolveResult& r) {
+    if (g_solution_csv.empty() || g_csv_problem == nullptr) return;
+    std::ofstream out(g_solution_csv);
+    if (!out) {
+        std::fprintf(stderr, "error: could not open '%s' for --solution-csv; "
+                             "the CSV was NOT written\n", g_solution_csv.c_str());
+        return;
+    }
+    sor::io::write_solution_csv(out, *g_csv_problem, r);
+}
+
 // No-op when `path` is empty (the common case: --solution-out wasn't given).
 void write_solution_out(const std::string& path, const sor::core::SolveResult& r) {
+    write_solution_csv_out(r);
     if (path.empty()) return;
     std::ofstream out(path);
     if (!out) {
@@ -293,6 +320,20 @@ void print_result(const sor::core::SolveResult& r) {
     if (!r.downgrade_reason.empty())
         std::printf("downgrade:         %s\n", r.downgrade_reason.c_str());
     std::printf("objective:         %.10e\n", r.objective);
+    // Recompute the claim from the MODEL, not from the engine that produced it.
+    // The engine reports what its own arithmetic concluded; this line evaluates
+    // the returned point against the file's rows and bounds independently, so a
+    // reader can see the evidence next to the claim instead of taking the
+    // status on trust. Silent when no LP model is bound (the quadratic engines
+    // carry their own re-check, printed by their own paths).
+    if (g_csv_problem != nullptr &&
+        r.x.size() == static_cast<std::size_t>(g_csv_problem->n_cols())) {
+        std::printf("re-checked:        objective %.10e  max row violation %.3e"
+                    "  max bound violation %.3e\n",
+                    g_csv_problem->objective(r.x),
+                    g_csv_problem->max_row_violation(r.x),
+                    g_csv_problem->max_bound_violation(r.x));
+    }
 }
 
 int exit_code_for(sor::core::Status s) {
@@ -556,6 +597,105 @@ static bool input_is_usable(const std::string& path, std::string& err) {
     return true;
 }
 
+// A section the reader does not implement is not a warning-level event. SOS
+// sets, INDICATORS and piecewise-linear objectives all RESTRICT the feasible
+// set, so dropping one leaves us solving a relaxation of the caller's model.
+// Its optimum is then better than the true one and may be infeasible for the
+// real problem -- the worst direction for a wrong answer to be wrong in, and
+// exactly the failure this codebase refuses elsewhere (zero-column models,
+// unproved points labelled Optimal). The reader already warns on stderr, but a
+// warning is invisible to anyone reading stdout or a log, so refuse the run.
+static bool g_allow_ignored_sections = false;
+static bool g_report_only = false;
+
+// --report: describe the model the reader actually built, then stop. The point
+// is that first contact with somebody else's file should never be a bare error.
+// A planner handed "unknown section" learns nothing; a planner handed "12,043
+// rows, 4 integer columns, SOS not supported" knows exactly where they stand
+// and what to ask for. It prints what was READ, so it doubles as evidence that
+// the reader understood the file the same way its author did.
+static void print_model_report(const sor::model::LpProblem& p,
+                               const sor::io::MpsReadReport& rep,
+                               const std::string& path) {
+    std::size_t eq = 0, range = 0, le = 0, ge = 0, free_rows = 0;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(p.n_rows()); ++i) {
+        const auto lo = p.row_lo[i], hi = p.row_hi[i];
+        const bool lo_f = !std::isinf(lo), hi_f = !std::isinf(hi);
+        if (lo_f && hi_f) { if (lo == hi) ++eq; else ++range; }
+        else if (hi_f) ++le;
+        else if (lo_f) ++ge;
+        else ++free_rows;
+    }
+    std::size_t boxed = 0, lower_only = 0, free_cols = 0, fixed = 0, binary = 0;
+    for (std::size_t j = 0; j < static_cast<std::size_t>(p.n_cols()); ++j) {
+        const auto lo = p.col_lo[j], hi = p.col_hi[j];
+        const bool lo_f = !std::isinf(lo), hi_f = !std::isinf(hi);
+        if (lo_f && hi_f) {
+            if (lo == hi) ++fixed;
+            else { ++boxed;
+                   if (j < p.is_integer.size() && p.is_integer[j] &&
+                       lo == 0.0 && hi == 1.0) ++binary; }
+        } else if (lo_f) ++lower_only;
+        else if (!hi_f) ++free_cols;
+    }
+
+    std::printf("model report\n");
+    std::printf("  file             %s\n", path.c_str());
+    std::printf("  name             %s\n", p.name.empty() ? "(none)" : p.name.c_str());
+    std::printf("  format           %s MPS%s\n",
+                rep.used_fixed_format ? "fixed-format" : "free-format",
+                rep.used_gzip ? ", gzip" : "");
+    std::printf("  size             %d rows x %d cols, %lld nonzeros\n",
+                p.n_rows(), p.n_cols(),
+                static_cast<long long>(p.nnz()));
+    std::printf("  objective        %s%s\n", p.maximize ? "maximize" : "minimize",
+                p.obj_offset != 0.0 ? " (has a constant term)" : "");
+    std::printf("  rows             %zu equality, %zu <=, %zu >=, %zu ranged, %zu free\n",
+                eq, le, ge, range, free_rows);
+    std::printf("  columns          %zu bounded, %zu lower-bounded only, %zu free, %zu fixed\n",
+                boxed, lower_only, free_cols, fixed);
+    std::printf("  integrality      %zu integer columns (%zu binary)\n",
+                p.n_integer(), binary);
+
+    if (!rep.ignored_sections.empty()) {
+        std::printf("  NOT SUPPORTED    ");
+        for (std::size_t i = 0; i < rep.ignored_sections.size(); ++i)
+            std::printf("%s%s", i ? ", " : "", rep.ignored_sections[i].c_str());
+        std::printf("\n");
+        std::printf("  verdict          CANNOT solve this file as written. Those sections\n");
+        std::printf("                   restrict the feasible set and are dropped on read.\n");
+        return;
+    }
+    std::printf("  verdict          can solve: %s\n",
+                p.n_integer() > 0 ? "MILP (--engine milp)"
+                                  : "LP (--engine simplex, the default)");
+}
+
+
+
+static bool sections_were_ignored(const std::vector<std::string>& ignored,
+                                  const std::string& path) {
+    if (ignored.empty()) return false;
+    std::string list;
+    for (std::size_t i = 0; i < ignored.size(); ++i) {
+        if (i) list += ", ";
+        list += ignored[i];
+    }
+    if (g_allow_ignored_sections) {
+        std::printf("ignored sections:  %s  (--allow-ignored-sections given; "
+                    "results describe a RELAXATION of this file)\n", list.c_str());
+        return false;
+    }
+    std::fprintf(stderr,
+                 "error: %s contains section(s) this build does not implement: %s\n"
+                 "       Those sections constrain the feasible set, so solving without\n"
+                 "       them would answer a different problem than the file describes.\n"
+                 "       Re-run with --allow-ignored-sections to solve the relaxation\n"
+                 "       anyway, understanding that no result from it describes this file.\n",
+                 path.c_str(), list.c_str());
+    return true;
+}
+
 // Apply every "key=value" collected for one engine. A bad key or value is
 // fatal, never a warning: a caller who mistyped an option believes it took
 // effect, and silently ignoring it would make a tuning run a lie.
@@ -751,6 +891,7 @@ static bool load_qp_problem_impl(sor::engines::QpProblem& qp,
             : sor::io::read_mps_file_auto(path, rep, mps_opts);
         for (const auto& w : rep.warnings)
             std::fprintf(stderr, "warning: %s\n", w.c_str());
+        if (sections_were_ignored(rep.ignored_sections, path)) return false;
         qp.q_diag.clear();
         std::size_t start = 0;
         while (start <= q_diag_arg.size()) {
@@ -773,6 +914,7 @@ static bool load_qp_problem_impl(sor::engines::QpProblem& qp,
         auto loaded = sor::io::read_qps_file(path, rep, mps_opts);
         for (const auto& w : rep.warnings)
             std::fprintf(stderr, "warning: %s\n", w.c_str());
+        if (sections_were_ignored(rep.ignored_sections, path)) return false;
         qp.linear = std::move(loaded.linear);
         qp.q_diag = std::move(loaded.q_diag);
         qp.q_matrix = std::move(loaded.q_matrix);
@@ -926,6 +1068,7 @@ int main(int argc, char** argv) {
     double cut_min_progress = -1.0;  // <0 keeps the library default
     int cut_max_rounds = -1;         // <0 keeps the library default
     bool auto_cuts = false;
+    std::string solution_csv;        // --solution-csv: named, spreadsheet-readable export
     std::string verify_cuts_path;    // reference .sol for the cut-validity check
     std::string branch_strategy = "auto";
     std::string sparse_sb_model;
@@ -1367,6 +1510,10 @@ int main(int argc, char** argv) {
         else if (a == "--threads")
             n_threads = static_cast<int>(parse_uint(next("--threads"), "--threads", 1, 256));
         else if (a == "--solution-out") solution_out = next("--solution-out");
+        else if (a == "--allow-ignored-sections") g_allow_ignored_sections = true;
+        else if (a == "--report") g_report_only = true;
+        else if (a == "--solution-csv") { solution_csv = next("--solution-csv");
+                                          g_solution_csv = solution_csv; }
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else if (!a.empty() && a[0] == '-') {
             std::fprintf(stderr, "error: unknown option '%s'\n", a.c_str());
@@ -2573,6 +2720,19 @@ int main(int argc, char** argv) {
             : sor::io::read_mps_file_auto(path, rep, mps_opts);
         for (const auto& w : rep.warnings)
             std::fprintf(stderr, "warning: %s\n", w.c_str());
+        // --report runs BEFORE the refusal, deliberately: the whole value of
+        // the mode is to explain a file this build cannot solve.
+        if (g_report_only) {
+            print_model_report(problem, rep, path);
+            return rep.ignored_sections.empty()
+                       ? 0
+                       : exit_code_for(sor::core::Status::NotSolved);
+        }
+        if (sections_were_ignored(rep.ignored_sections, path))
+            return exit_code_for(sor::core::Status::NotSolved);
+        // `problem` outlives every solve below it in this scope, so the CSV
+        // writer can safely borrow it for the rest of the run.
+        g_csv_problem = &problem;
 
         std::printf("model:             %s\n",
                     problem.name.empty() ? path.c_str() : problem.name.c_str());

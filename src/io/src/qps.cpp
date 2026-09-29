@@ -33,12 +33,34 @@ QpsProblem read_qps_file(const std::string& path, QpsReadReport& rep,
     QpsProblem qp;
     qp.linear = read_mps_file_auto(path, mrep, opt.strict);
     static_cast<MpsReadReport&>(rep) = mrep;
+    // The quadratic sections are re-parsed below, so they are NOT ignored by
+    // the QPS path even though the LP reader skipped them. Clear them from
+    // ignored_sections or sor_solve would refuse every quadratic file. QSECTION
+    // is unknown to the LP reader (QUADOBJ/QMATRIX are known-but-skipped), so
+    // all three names have to come out.
+    {
+        static const char* kReparsed[] = {"QUADOBJ", "QMATRIX", "QSECTION"};
+        rep.ignored_sections.erase(
+            std::remove_if(rep.ignored_sections.begin(), rep.ignored_sections.end(),
+                           [](const std::string& sec) {
+                               for (const char* k : kReparsed)
+                                   if (sec == k) return true;
+                               return false;
+                           }),
+            rep.ignored_sections.end());
+    }
     // QUADOBJ is re-parsed below; drop the LP-only ignore warning.
     rep.warnings.erase(
         std::remove_if(rep.warnings.begin(), rep.warnings.end(),
                        [](const std::string& w) {
-                           return w.find("QUADOBJ") != std::string::npos &&
-                                  w.find("ignored") != std::string::npos;
+                           // Every quadratic section name the loop below
+                           // re-parses, not just QUADOBJ: QSECTION is unknown
+                           // to the LP reader, so it warned "ignored" while in
+                           // fact being read here.
+                           return w.find("ignored") != std::string::npos &&
+                                  (w.find("QUADOBJ") != std::string::npos ||
+                                   w.find("QMATRIX") != std::string::npos ||
+                                   w.find("QSECTION") != std::string::npos);
                        }),
         rep.warnings.end());
     qp.q_diag.assign(static_cast<std::size_t>(qp.linear.n_cols()), 0.0);

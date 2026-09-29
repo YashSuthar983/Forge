@@ -168,7 +168,14 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
                 if (opt.strict)
                     throw std::runtime_error("MPS line " + std::to_string(line_no) +
                                              ": unknown section '" + f[0] + "'");
-                rep.warnings.push_back("ignored unknown section '" + f[0] + "'");
+                // Record it as well as warn. A dropped SOS/INDICATORS
+                // section changes the feasible set, and a warning on stderr
+                // is invisible to anyone reading stdout or a log file, so
+                // the caller needs something it can branch on.
+                rep.ignored_sections.push_back(f[0]);
+                rep.warnings.push_back("ignored unknown section '" + f[0] +
+                                       "' -- the model solved is NOT the model "
+                                       "in this file");
                 sec = Section::None;
             }
             continue;
