@@ -2,13 +2,13 @@
 
 A browser console for the FORGE engine. Pick a model, press **Solve**, and get the answer, the solver's own proof level, and an independent re-check.
 
-It is a thin FastAPI layer over the same `sor_solve`, `sor_check` and `sor_gen` binaries as the CLI. Every solve is a subprocess call, and the console shows the exact command it ran, so anything you see in the browser can be reproduced in a terminal. It is a demo surface, not a modelling environment.
+It is a thin FastAPI layer over the same `sor_solve` and `sor_check` binaries as the CLI. Every solve is a subprocess call, and the console shows the exact command it ran, so anything you see in the browser can be reproduced in a terminal. It is a demo surface, not a modelling environment.
 
 ## Run
 
 ```bash
 # from the repo root
-cmake --build build -j"$(nproc)"   # builds sor_solve, sor_check, sor_gen
+cmake --build build -j"$(nproc)"   # builds sor_solve, sor_check
 
 ./web/run.sh
 # or: cd web && source .venv/bin/activate && python app.py
@@ -24,10 +24,9 @@ The screen has three parts: a sidebar to choose a model, a header to configure a
 
 The sidebar has three tabs.
 
+- **Solution (.sol).** After every solve the result opens on the solver's own solution file: status, proof and objective, plus every variable (`x`) and dual (`y`) value named from the model, with search, a non-zero filter, Clear, Copy, Download and the raw file. Values are read from the file, nothing is precomputed.
 - **Models.** Every `.mps`, `.qps` and `.qplib` file (optionally `.gz`) under `examples/` and `benchmarks/`, grouped by folder. Each entry shows its type badge (**LP**, **MILP**, **QP**, **MIQP**) and its size (rows × columns, nonzeros, file size), read from the file itself. Generated examples show their seed and generator parameters instead. The search box filters by name, type or folder.
 - **Write.** Type a model as plain equations (`Maximize`/`Minimize`, `Subject To`, `Bounds`, `Binary`/`General`, `End`). Start from a template: Tiny LP, Diet, Knapsack or Mini crude blend. The equations are converted to MPS as you type, and the **MPS preview** tab shows the result.
-- **Generate.** Create a fresh synthetic instance with `sor_gen`: crude blending (LP), unit scheduling (MILP) or power dispatch (QP). Set the size and seed, or leave them blank for the generator defaults. Generated files go to a temporary folder, never into the repo.
-
 **Open file** (top right) uploads your own model from disk.
 
 ### 2. Configure and run (header)
@@ -90,7 +89,7 @@ The `examples/` and `industrial-ladder/` models are synthetic, seeded `sor_gen` 
 2. **Models → Industrial ladder → blend_lp_huge_s42**: 1,002 × 3,000 with 1.26M nonzeros, proved and VERIFIED in about 3 s.
 3. **schedule_s42** and **dispatch_s42**: MILP and QP proved optimal by `milp` and `qp`. The Checks tab explains the checker's LP-only scope.
 4. **Command** tab: copy the command and run it in a terminal to show it's the same binary.
-5. **Generate** a new instance with a different seed, or **Write** your own model and solve it.
+5. **Write** your own model and solve it.
 
 ## GPU backends
 
@@ -106,7 +105,7 @@ Environment variables, `FORGE_*` (the older `SOR_*` names still work):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FORGE_BIN_DIR` | `../build`, then `../build-native` | Directory with `sor_solve`, `sor_check`, `sor_gen` |
+| `FORGE_BIN_DIR` | `../build`, then `../build-native` | Directory with `sor_solve`, `sor_check` |
 | `FORGE_MODEL_DIRS` | `../examples:../benchmarks` | Folders scanned for models (`:`-separated) |
 | `FORGE_MODEL_EXTS` | `.mps,.qps,.qplib` | File types listed |
 | `FORGE_TEMPLATE_DIR` | `templates/` | Equation templates for the Write tab (`# title:` / `# about:` headers) |
