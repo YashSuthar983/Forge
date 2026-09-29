@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/app.css?v=40" />
+  <link rel="stylesheet" href="/static/app.css?v=43" />
 </head>
 <body>
   <header class="topbar">
@@ -33,7 +33,6 @@
       <div class="seg" role="tablist" id="side-tabs">
         <button type="button" role="tab" class="seg-btn active" data-panel="models">Models</button>
         <button type="button" role="tab" class="seg-btn" data-panel="write" id="seg-write">Write</button>
-        <button type="button" role="tab" class="seg-btn" data-panel="generate" id="seg-generate">Generate</button>
       </div>
 
       <section class="side-panel" id="panel-models">
@@ -47,15 +46,6 @@
       <section class="side-panel" id="panel-write" hidden>
         <p class="side-intro">Type a model as plain equations. Start from one of these:</p>
         <div class="cards" id="templates"></div>
-      </section>
-
-      <section class="side-panel" id="panel-generate" hidden>
-        <p class="side-intro">Create a fresh <strong>synthetic</strong> instance with <code>sor_gen</code>, the same generator the CLI uses.</p>
-        <form class="gen" id="gen-form">
-          <div class="cards" id="gen-kinds" role="radiogroup" aria-label="Instance type"></div>
-          <div class="gen-opts" id="gen-opts"></div>
-          <button type="submit" class="btn btn-block btn-strong" id="gen-btn">Generate instance</button>
-        </form>
       </section>
     </aside>
 
@@ -118,7 +108,7 @@
         <section class="card result idle" id="result" aria-live="polite" aria-label="Result">
           <div class="result-empty" id="result-empty">
             <ol class="steps">
-              <li><span>1</span><div><strong>Pick a model</strong><p>From the library, your own equations, or a generated instance.</p></div></li>
+              <li><span>1</span><div><strong>Pick a model</strong><p>From the library, your own equations, or an uploaded file.</p></div></li>
               <li><span>2</span><div><strong>Press Solve</strong><p>The engine is matched to the model type. Override it if you like.</p></div></li>
               <li><span>3</span><div><strong>Read the answer</strong><p>Objective, the solver's proof level, and an independent re-check.</p></div></li>
             </ol>
@@ -167,8 +157,23 @@
             <div class="tabs" role="tablist">
               <button type="button" class="tab" role="tab" id="tab-eq" hidden>Equations</button>
               <button type="button" class="tab active" role="tab" id="tab-mps">Source</button>
+              <button type="button" class="tab-sol" role="tab" id="tab-sol" hidden>Solution (.sol)</button>
             </div>
             <span class="editor-meta" id="editor-meta"></span>
+          </div>
+          <div class="sol-pane" id="sol-pane" hidden>
+              <div class="sol-scalars" id="sol-scalars"></div>
+              <div class="sol-bar">
+                <div class="seg" id="sol-views" role="tablist"></div>
+                <input type="search" id="sol-q" placeholder="Filter by name or value" autocomplete="off" />
+                <label class="check"><input type="checkbox" id="sol-nz" /> Non-zero only</label>
+                <button type="button" class="btn btn-small" id="sol-clear">Clear</button>
+                <button type="button" class="btn btn-small" id="sol-copy">Copy</button>
+                <button type="button" class="btn btn-small" id="sol-dl">Download .sol</button>
+              </div>
+              <p class="panel-intro" id="sol-count"></p>
+              <div class="sol-table" id="sol-table"></div>
+              <button type="button" class="btn btn-small" id="sol-more" hidden></button>
           </div>
           <textarea id="mps_text" class="code" spellcheck="false" placeholder="Pick a model on the left, open a file, or paste MPS here."></textarea>
           <div class="eq-pane" id="eq-pane" hidden>
@@ -183,6 +188,6 @@
     </main>
   </div>
 
-  <script src="/static/app.js?v=40"></script>
+  <script src="/static/app.js?v=43"></script>
 </body>
 </html>

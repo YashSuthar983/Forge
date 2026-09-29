@@ -19,7 +19,9 @@
     source: "mps", // mps | eq
     baseline: "",
     solToken: null,
-    genKind: null,
+    sol: null, // parsed /api/solution payload
+    solView: null,
+    solShown: 0,
   };
 
   const mpsEl = $("mps_text");
@@ -133,8 +135,6 @@
     const tl = $("time_limit");
     tl.value = health.time_limit?.default ?? "";
     if (health.time_limit?.max) tl.max = health.time_limit.max;
-
-    renderGenerator(caps.generator);
   }
 
   function updateEngineHint() {
@@ -147,7 +147,7 @@
 
   function showSidePanel(name) {
     for (const b of document.querySelectorAll(".seg-btn")) b.classList.toggle("active", b.dataset.panel === name);
-    for (const p of ["models", "write", "generate"]) $(`panel-${p}`).hidden = p !== name;
+    for (const p of ["models", "write"]) $(`panel-${p}`).hidden = p !== name;
   }
 
   function renderLibrary() {
@@ -211,39 +211,6 @@
     }
   }
 
-  function renderGenerator(spec) {
-    const kinds = spec?.kinds || [];
-    $("seg-generate").hidden = !kinds.length;
-    if (!kinds.length) return;
-    if (!kinds.includes(state.genKind)) state.genKind = kinds[0];
-
-    const box = $("gen-kinds");
-    box.innerHTML = "";
-    for (const k of kinds) {
-      const flags = (spec.options[k] || []).map((o) => o.flag).join(" ");
-      box.append(pickCard({
-        title: cap(k),
-        sub: `sor_gen ${k}${flags ? " " + flags : ""}`,
-        active: k === state.genKind,
-        onClick: () => { state.genKind = k; renderGenerator(spec); },
-      }));
-    }
-
-    const opts = $("gen-opts");
-    opts.innerHTML = "";
-    for (const o of [...(spec.options[state.genKind] || []), ...(spec.common || [])]) {
-      const f = el("label", "field");
-      f.append(el("span", null, cap(o.flag.replace(/^--/, ""))));
-      const inp = el("input");
-      inp.type = "number";
-      inp.name = o.flag;
-      inp.placeholder = "default";
-      if (o.about) inp.title = o.about;
-      f.append(inp);
-      opts.append(f);
-    }
-  }
-
   function markActive() {
     renderLibrary();
     renderTemplates();
@@ -254,6 +221,8 @@
   function setCurrent(cur) {
     state.current = cur;
     state.solToken = null;
+    state.sol = null;
+    $("tab-sol").hidden = true;
     const info = cur.info || {};
 
     $("model-title").textContent = cur.title;
@@ -310,6 +279,8 @@
     state.source = tab;
     $("tab-mps").classList.toggle("active", tab === "mps");
     $("tab-eq").classList.toggle("active", tab === "eq");
+    $("tab-sol").classList.toggle("active", tab === "sol");
+    $("sol-pane").hidden = tab !== "sol";
     mpsEl.hidden = tab !== "mps";
     $("eq-pane").hidden = tab !== "eq";
     updateDirty();
@@ -474,7 +445,11 @@
     $("rtabs").hidden = false;
     state.solToken = j.check_ready ? j.sol_token : null;
     $("rtab-checks").hidden = !state.solToken;
+    $("tab-sol").hidden = true;
+    state.sol = null;
+    if (state.source === "sol") showTab(state.current?.origin === "write" ? "eq" : "mps");
     showRTab(state.solToken ? "checks" : t === "bad" || $("verbose").checked ? "log" : "report");
+    if (state.solToken) loadSolution();
     renderCheckIntro(j);
   }
 
@@ -575,6 +550,113 @@
     }
   }
 
+  // ---------- solution (.sol) ----------
+
+  const SOL_PAGE = 200;
+  const fmtVal = (v) => {
+    if (v === 0) return "0";
+    const a = Math.abs(v);
+    return a >= 1e12 || a < 1e-6 ? v.toExponential(6) : v.toLocaleString(undefined, { maximumFractionDigits: 10 });
+  };
+
+  // Name each vector from the model: x -> columns, y -> rows. Anything else is indexed.
+  function solViews(s) {
+    const names = { x: s.col_names, y: s.row_names };
+    const label = { x: "Variables (x)", y: "Duals (y)" };
+    const views = Object.entries(s.vectors).map(([k, vals]) => ({
+      id: k,
+      label: label[k] || k,
+      nameHead: k === "x" ? "Variable" : k === "y" ? "Constraint" : "Index",
+      valueHead: k === "x" ? "Value" : k === "y" ? "Dual" : "Value",
+      rows: vals.map((v, i) => [(names[k] && names[k][i]) || `${k}[${i}]`, v, i]),
+    })).filter((v) => v.rows.length);
+    views.push({ id: "raw", label: "Raw file", raw: true });
+    return views;
+  }
+
+  async function loadSolution() {
+    const box = $("sol-table");
+    try {
+      const s = await api("/api/solution?sol_token=" + encodeURIComponent(state.solToken));
+      state.sol = { ...s, views: solViews(s) };
+      $("tab-sol").hidden = false;
+      showTab("sol");
+      state.solView = state.sol.views[0].id;
+      const sc = $("sol-scalars");
+      sc.innerHTML = "";
+      for (const [k, v] of s.scalars) {
+        const t = el("dl", "tile");
+        t.append(el("dt", null, cap(k.replace(/_/g, " "))), el("dd", null, v));
+        sc.append(t);
+      }
+      const seg = $("sol-views");
+      seg.innerHTML = "";
+      for (const v of state.sol.views) {
+        const b = el("button", "seg-btn", v.label + (v.rows ? ` · ${fmtInt(v.rows.length)}` : ""));
+        b.type = "button";
+        b.dataset.view = v.id;
+        b.addEventListener("click", () => { state.solView = v.id; state.solShown = SOL_PAGE; renderSol(); });
+        seg.append(b);
+      }
+      state.solShown = SOL_PAGE;
+      renderSol();
+    } catch (e) {
+      $("tab-sol").hidden = true;
+      showError("Could not load solution", e);
+    }
+  }
+
+  function renderSol() {
+    const s = state.sol;
+    if (!s) return;
+    for (const b of $("sol-views").children) b.classList.toggle("active", b.dataset.view === state.solView);
+    const view = s.views.find((v) => v.id === state.solView);
+    const box = $("sol-table");
+    const more = $("sol-more");
+    const q = $("sol-q").value.trim().toLowerCase();
+    box.innerHTML = "";
+    more.hidden = true;
+    for (const id of ["sol-q", "sol-nz"]) $(id).disabled = !!view.raw;
+
+    if (view.raw) {
+      const pre = el("pre", "log", s.text);
+      box.append(pre);
+      $("sol-count").textContent = `${fmtBytes(s.bytes)}${s.truncated ? " · first part shown" : ""} · exactly what sor_solve wrote`;
+      return;
+    }
+    const nz = $("sol-nz").checked;
+    const rows = view.rows.filter(([n, v]) =>
+      (!nz || v !== 0) && (!q || n.toLowerCase().includes(q) || String(v).includes(q)));
+    const nonzero = view.rows.filter((r) => r[1] !== 0).length;
+    $("sol-count").textContent =
+      `${fmtInt(rows.length)} of ${fmtInt(view.rows.length)} shown · ${fmtInt(nonzero)} non-zero`;
+
+    if (!rows.length) { box.append(el("p", "empty", "Nothing matches.")); return; }
+    const table = el("table");
+    const head = el("tr");
+    head.append(el("th", null, "#"), el("th", null, view.nameHead), el("th", "num", view.valueHead));
+    table.append(head);
+    for (const [n, v, i] of rows.slice(0, state.solShown)) {
+      const tr = el("tr", v === 0 ? "zero" : "");
+      const val = el("td", "num", fmtVal(v));
+      val.title = String(v);
+      tr.append(el("td", "idx", String(i + 1)), el("td", null, n), val);
+      table.append(tr);
+    }
+    box.append(table);
+    if (rows.length > state.solShown) {
+      more.hidden = false;
+      more.textContent = `Show more (${fmtInt(rows.length - state.solShown)} left)`;
+    }
+  }
+
+  function clearSolFilters() {
+    $("sol-q").value = "";
+    $("sol-nz").checked = false;
+    state.solShown = SOL_PAGE;
+    renderSol();
+  }
+
   // ---------- solve ----------
 
   async function solve() {
@@ -620,6 +702,7 @@
   $("engine").addEventListener("change", updateEngineHint);
   $("tab-mps").addEventListener("click", () => showTab("mps"));
   $("tab-eq").addEventListener("click", () => showTab("eq"));
+  $("tab-sol").addEventListener("click", () => showTab("sol"));
   mpsEl.addEventListener("input", updateDirty);
   eqEl.addEventListener("input", () => {
     clearTimeout(syncTimer);
@@ -641,22 +724,25 @@
     }
   });
 
-  $("gen-form").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const opts = {};
-    for (const inp of $("gen-opts").querySelectorAll("input")) if (inp.value !== "") opts[inp.name] = inp.value;
-    const fd = new FormData();
-    fd.append("kind", state.genKind);
-    fd.append("options", JSON.stringify(opts));
-    $("gen-btn").disabled = true;
+  $("sol-q").addEventListener("input", () => { state.solShown = SOL_PAGE; renderSol(); });
+  $("sol-nz").addEventListener("change", () => { state.solShown = SOL_PAGE; renderSol(); });
+  $("sol-clear").addEventListener("click", clearSolFilters);
+  $("sol-more").addEventListener("click", () => { state.solShown += SOL_PAGE; renderSol(); });
+  $("sol-copy").addEventListener("click", async () => {
+    if (!state.sol) return;
     try {
-      const p = await api("/api/gen", { method: "POST", body: fd });
-      loadPayload(p, "gen", { title: `${cap(state.genKind)} (generated)`, note: `Synthetic instance: ${p.cmd}` });
-    } catch (err) {
-      showError("Generator failed", err);
-    } finally {
-      $("gen-btn").disabled = false;
-    }
+      await navigator.clipboard.writeText(state.sol.text);
+      $("sol-copy").textContent = "Copied";
+      setTimeout(() => ($("sol-copy").textContent = "Copy"), 1200);
+    } catch { /* clipboard blocked */ }
+  });
+  $("sol-dl").addEventListener("click", () => {
+    if (!state.sol) return;
+    const a = el("a");
+    a.href = URL.createObjectURL(new Blob([state.sol.text], { type: "text/plain" }));
+    a.download = `${(state.current?.title || "model").replace(/\W+/g, "_")}.sol`;
+    a.click();
+    URL.revokeObjectURL(a.href);
   });
 
   $("copy-cmd").addEventListener("click", async () => {

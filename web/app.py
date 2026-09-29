@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""FORGE demo console - thin FastAPI shell over sor_solve / sor_check / sor_gen.
+"""FORGE demo console - thin FastAPI shell over sor_solve / sor_check.
 
 Presentation surface for SIH26119. The product is the C++ engine; every solve
 is a subprocess. Not a modelling environment.
 
 Models are discovered on disk,
-engines / backends / generator options are read from the binaries' own usage
+engines / backends are read from the binaries' own usage
 text, and results are whatever the binaries print.
 """
 
@@ -189,25 +189,6 @@ def _build_flags() -> dict[str, str]:
     return flags
 
 
-def _gen_spec() -> dict[str, Any]:
-    text = _usage("sor_gen", "--help")
-    kinds: list[str] = []
-    m = re.search(r"usage:\s*sor_gen\s+(\S+)", text)
-    if m:
-        kinds = [k for k in m.group(1).split("|") if k != "all"]
-    common = [
-        {"flag": f, "arg": a, "about": d.strip()}
-        for f, a, d in re.findall(r"^\s+(--[\w-]+)\s+([A-Z]+)\s+(.*)$", text, re.M)
-        if f in {"--seed"}
-    ]
-    per_kind: dict[str, list[dict[str, str]]] = {}
-    for kind in kinds:
-        km = re.search(rf"^\s+{re.escape(kind)}:\s+(.*)$", text, re.M)
-        opts = re.findall(r"(--[\w-]+)\s+([A-Z]+)", km.group(1)) if km else []
-        per_kind[kind] = [{"flag": f, "arg": a} for f, a in opts]
-    return {"kinds": kinds, "common": common, "options": per_kind}
-
-
 @lru_cache(maxsize=1)
 def capabilities() -> dict[str, Any]:
     help_text = _usage("sor_solve", "--help")
@@ -235,7 +216,6 @@ def capabilities() -> dict[str, Any]:
         "default_backend": default_backend,
         "methods": methods,
         "has_threads": "--threads" in help_text,
-        "generator": _gen_spec(),
         "build": build,
         "git": _git_info(),
     }
@@ -339,7 +319,10 @@ def _scan_qplib(lines) -> dict[str, Any]:
     info: dict[str, Any] = {"name": body[0] if body else None}
     code = body[1].upper() if len(body) > 1 else ""
     info["qplib_class"] = code
-    info["quadratic"] = code[:1] in {"Q", "C"} or code[2:3] in {"Q", "C"}
+    # QPLIB code = objective / variables / constraints; D, C, Q are all quadratic.
+    quad_obj = code[:1] in {"D", "C", "Q"}
+    info["quad_constraints"] = code[2:3] in {"D", "C", "Q"}
+    info["quadratic"] = quad_obj or info["quad_constraints"]
     info["integers"] = 1 if code[1:2] in {"B", "M", "I", "G"} else 0
     nums = [int(x) for x in body[3:5] if x.lstrip("-").isdigit()]
     info["cols"] = nums[0] if nums else None
@@ -349,6 +332,8 @@ def _scan_qplib(lines) -> dict[str, Any]:
 
 
 def _classify(info: dict[str, Any]) -> str:
+    if info.get("quad_constraints"):
+        return "MIQCQP" if info.get("integers") else "QCQP"
     if info.get("quadratic"):
         return "MIQP" if info.get("integers") else "QP"
     return "MILP" if info.get("integers") else "LP"
@@ -642,6 +627,15 @@ async def _run(cmd: list[str], *, timeout: float) -> dict[str, Any]:
     }
 
 
+def _session_dir(token: str) -> Path:
+    if "/" in token or ".." in token or not token.startswith("sor_sol_"):
+        raise HTTPException(400, "Invalid sol_token")
+    session = SESSIONS / token
+    if not session.is_dir():
+        raise HTTPException(404, "Solution expired - solve again")
+    return session
+
+
 def _new_session() -> Path:
     return Path(tempfile.mkdtemp(prefix="sor_sol_", dir=SESSIONS))
 
@@ -670,7 +664,7 @@ async def index() -> FileResponse:
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    bins = {n: (BIN_DIR / n).is_file() for n in ("sor_solve", "sor_check", "sor_gen")}
+    bins = {n: (BIN_DIR / n).is_file() for n in ("sor_solve", "sor_check")}
     caps = await asyncio.to_thread(capabilities) if bins["sor_solve"] else {}
     return {
         "ok": all(bins.values()),
@@ -707,40 +701,6 @@ async def upload(file: UploadFile = File(...)) -> dict[str, Any]:
     path = _fix_suffix(session / name)
     model_id = f"session:{session.name}/{path.name}"
     return await asyncio.to_thread(_model_payload, model_id, path)
-
-
-@app.post("/api/gen")
-async def gen(
-    kind: str = Form(...),
-    options: str = Form(default="{}"),
-) -> dict[str, Any]:
-    spec = capabilities()["generator"]
-    if kind not in spec["kinds"]:
-        raise HTTPException(400, f"kind must be one of {', '.join(spec['kinds'])}")
-    allowed = {o["flag"] for o in spec["options"].get(kind, [])} | {o["flag"] for o in spec["common"]}
-    try:
-        opts = json.loads(options)
-    except ValueError as e:
-        raise HTTPException(400, "options must be JSON") from e
-    session = _new_session()
-    out = session / f"{kind}.mps"
-    cmd = [str(_bin("sor_gen")), kind]
-    for flag, value in opts.items():
-        if value in (None, ""):
-            continue
-        if flag not in allowed or not re.fullmatch(r"-?\d+(\.\d+)?", str(value)):
-            raise HTTPException(400, f"Invalid option {flag}={value}")
-        cmd += [flag, str(value)]
-    # sor_gen picks the extension; write to a stem and find what it produced.
-    cmd += ["-o", str(out)]
-    res = await _run(cmd, timeout=60.0)
-    produced = [p for p in session.iterdir() if _model_format(p)]
-    if not res["ok"] or not produced:
-        raise HTTPException(400, (res["stderr"] or res["stdout"] or "generator failed").strip())
-    path = _fix_suffix(produced[0])
-    payload = await asyncio.to_thread(_model_payload, f"session:{session.name}/{path.name}", path)
-    payload["cmd"] = " ".join([Path(cmd[0]).name, *cmd[1:-2]])
-    return payload
 
 
 @app.post("/api/lp-to-mps")
@@ -846,16 +806,85 @@ async def solve(
         raise
 
 
+def _mps_names(path: Path) -> tuple[list[str], list[str]]:
+    """(row names, column names) in file order; the objective (N) rows are excluded."""
+    rows: list[str] = []
+    cols: list[str] = []
+    obj: set[str] = set()
+    section = None
+    last = None
+    try:
+        with _open_text(path) as fh:
+            for raw in fh:
+                if not raw.strip() or raw.startswith("*"):
+                    continue
+                if not raw[0].isspace():
+                    section = raw.split()[0].upper()
+                    continue
+                p = raw.split()
+                if section == "ROWS" and len(p) >= 2:
+                    if p[0].upper() == "N":
+                        obj.add(p[1])
+                    else:
+                        rows.append(p[1])
+                elif section == "COLUMNS" and p:
+                    if len(p) >= 3 and p[1].strip("'").upper() == "MARKER":
+                        continue
+                    if p[0] != last:
+                        cols.append(p[0])
+                        last = p[0]
+                elif section in {"RHS", "RANGES", "BOUNDS"}:
+                    break
+    except OSError:
+        pass
+    return rows, cols
+
+
+def _parse_sol(text: str) -> dict[str, Any]:
+    """Parse the plain-text .sol: `key value` scalars and `key N v1 .. vN` vectors."""
+    scalars: list[list[str]] = []
+    vectors: dict[str, list[float]] = {}
+    for line in text.splitlines():
+        p = line.split()
+        if len(p) < 2:
+            continue
+        key = p[0]
+        if len(p) >= 3 and p[1].isdigit() and int(p[1]) == len(p) - 2:
+            try:
+                vectors[key] = [float(v) for v in p[2:]]
+                continue
+            except ValueError:
+                pass
+        scalars.append([key, " ".join(p[1:])])
+    return {"scalars": scalars, "vectors": vectors}
+
+
+@app.get("/api/solution")
+async def solution(sol_token: str) -> dict[str, Any]:
+    session = _session_dir(sol_token)
+    sol_file = session / "out.sol"
+    if not sol_file.is_file():
+        raise HTTPException(404, "Solution file missing")
+    text = sol_file.read_text(errors="replace")
+    parsed = _parse_sol(text)
+    model_file = next((p for p in session.iterdir() if _model_format(p)), None)
+    rows, cols = await asyncio.to_thread(_mps_names, model_file) if model_file else ([], [])
+    return {
+        **parsed,
+        "row_names": rows,
+        "col_names": cols,
+        "bytes": len(text.encode()),
+        "text": text if len(text) <= EDITOR_MAX_BYTES else text[:EDITOR_MAX_BYTES],
+        "truncated": len(text) > EDITOR_MAX_BYTES,
+    }
+
+
 @app.post("/api/check")
 async def check(
     sol_token: str = Form(...),
     tol: float | None = Form(default=None),
 ) -> dict[str, Any]:
-    if "/" in sol_token or ".." in sol_token or not sol_token.startswith("sor_sol_"):
-        raise HTTPException(400, "Invalid sol_token")
-    session = SESSIONS / sol_token
-    if not session.is_dir():
-        raise HTTPException(404, "Solution expired - solve again")
+    session = _session_dir(sol_token)
 
     candidates = [p for p in session.iterdir() if _model_format(p)]
     if not candidates:
