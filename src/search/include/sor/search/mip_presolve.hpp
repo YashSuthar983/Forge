@@ -182,6 +182,7 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
                                         const MipPresolveOptions& opts,
                                         bool run_probing,
                                         const ProbingOptions& probe_opts,
-                                        const engines::SimplexOptions* lp_opts = nullptr);
+                                        const engines::SimplexOptions* lp_opts = nullptr,
+                                        ProbingState* probing_state = nullptr);
 
 }  // namespace sor::search

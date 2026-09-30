@@ -1,10 +1,13 @@
 
 #include "sor/certify/finalize.hpp"
 #include "sor/search/bab.hpp"
+#include "sor/search/portfolio.hpp"
 #include "sor/engines/simplex.hpp"
 
+#include "milp_oracle.hpp"
 #include "test_helpers.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -18,152 +21,51 @@ using sor::model::LpProblem;
 
 namespace {
 
-std::uint32_t next(std::uint32_t& state) {
-    state ^= state << 13;
-    state ^= state >> 17;
-    state ^= state << 5;
-    return state;
-}
+using sor::test::oracle::next;
+using sor::test::oracle::make_random_milp;
+using sor::test::oracle::solve_oracle;
+using sor::test::oracle::OracleResult;
 
-LpProblem make_random_milp(std::uint32_t seed) {
+LpProblem make_separator_milp(std::uint32_t seed, bool zh) {
     std::uint32_t state = seed * 747796405u + 2891336453u;
-    
-    Index n = 3 + (next(state) % 6); // 3 to 8 columns
-    Index m = 2 + (next(state) % 5); // 2 to 6 rows
-
-    LpProblem lp;
-    lp.name = "rand_" + std::to_string(seed);
-    lp.maximize = (next(state) & 1u) != 0;
-    
-    lp.c.assign(n, 0.0);
-    lp.col_lo.assign(n, 0.0);
-    lp.col_hi.assign(n, 0.0);
-    lp.is_integer.assign(n, false);
-    lp.col_names.assign(n, "");
-    
-    for (Index j = 0; j < n; ++j) {
-        lp.col_names[j] = "x" + std::to_string(j);
-        lp.c[j] = static_cast<int>(next(state) % 11) - 5;
-        
-        int type = next(state) % 3;
-        if (type == 0) { // binary
-            lp.col_lo[j] = 0.0;
-            lp.col_hi[j] = 1.0;
-            lp.is_integer[j] = true;
-        } else if (type == 1) { // integer
-            lp.col_lo[j] = static_cast<int>(next(state) % 4) - 2;
-            lp.col_hi[j] = lp.col_lo[j] + 1.0 + static_cast<int>(next(state) % 4);
-            lp.is_integer[j] = true;
-        } else { // continuous
-            lp.col_lo[j] = 0.0;
-            lp.col_hi[j] = 2.0 + static_cast<int>(next(state) % 5);
-            lp.is_integer[j] = false;
-        }
-    }
-
+    Index n = zh ? 3 + 2 * (next(state) % 3) : 6 + next(state) % 3;
+    Index m = zh ? n : 3;
+    LpProblem p;
+    p.maximize = true;
+    p.name = std::string(zh ? "odd_" : "knapsack_") + std::to_string(seed);
+    p.c.assign(n, 1.0);
+    p.col_lo.assign(n, 0.0);
+    p.col_hi.assign(n, zh ? 2.0 : 1.0);
+    p.is_integer.assign(n, true);
+    p.row_lo.assign(m, -sor::model::kInf);
+    p.row_hi.resize(m);
     std::vector<Index> rows, cols;
     std::vector<double> vals;
-    lp.row_lo.resize(m);
-    lp.row_hi.resize(m);
-    lp.row_names.resize(m);
-    
-    for (Index i = 0; i < m; ++i) {
-        lp.row_names[i] = "r" + std::to_string(i);
-        
-        for (Index j = 0; j < n; ++j) {
-            if ((next(state) % 3) != 0) {
-                int a = static_cast<int>(next(state) % 11) - 5;
-                if (a != 0) {
-                    rows.push_back(i);
-                    cols.push_back(j);
-                    vals.push_back(static_cast<double>(a));
-                }
-            }
+    if (zh) {
+        const double a = 3 + 2 * (next(state) % 5);
+        for (Index i = 0; i < m; ++i) {
+            rows.insert(rows.end(), {i, i});
+            cols.insert(cols.end(), {i, (i + 1) % n});
+            vals.insert(vals.end(), {a, a});
+            p.row_hi[i] = a;
         }
-        
-        int sense = next(state) % 3;
-        double b = static_cast<int>(next(state) % 21) - 10;
-        if (sense == 0) { // <=
-            lp.row_lo[i] = -sor::model::kInf;
-            lp.row_hi[i] = b;
-        } else if (sense == 1) { // >=
-            lp.row_lo[i] = b;
-            lp.row_hi[i] = sor::model::kInf;
-        } else { // ==
-            lp.row_lo[i] = b;
-            lp.row_hi[i] = b;
+    } else {
+        for (Index i = 0; i < m; ++i) {
+            double sum = 0.0;
+            for (Index j = 0; j < n; ++j) {
+                const double a = 5 + next(state) % 26;
+                rows.push_back(i); cols.push_back(j); vals.push_back(a); sum += a;
+                if (i == 0) p.c[j] = a;
+            }
+            p.row_hi[i] = std::floor(sum * (40 + next(state) % 21) / 100.0);
         }
     }
-    
-    lp.A = sor::sparse::from_triplets(m, n, rows, cols, vals);
-    lp.validate();
-    return lp;
+    p.A = sor::sparse::from_triplets(m, n, rows, cols, vals);
+    p.validate();
+    return p;
 }
-
-struct OracleResult {
-    bool feasible = false;
-    double objective = 0.0;
-};
-
-OracleResult solve_oracle(const LpProblem& lp) {
-    std::vector<Index> int_cols;
-    std::vector<Index> cont_cols;
-    for (Index j = 0; j < static_cast<Index>(lp.c.size()); ++j) {
-        if (lp.is_integer[j]) int_cols.push_back(j);
-        else cont_cols.push_back(j);
-    }
-    
-    OracleResult best;
-    best.feasible = false;
-    best.objective = lp.maximize ? -sor::model::kInf : sor::model::kInf;
-    
-    // Build combinations
-    std::vector<std::vector<double>> int_assignments;
-    int_assignments.push_back({}); // start with empty
-    
-    for (Index j : int_cols) {
-        std::vector<std::vector<double>> next_assignments;
-        int lo = static_cast<int>(std::ceil(lp.col_lo[j]));
-        int hi = static_cast<int>(std::floor(lp.col_hi[j]));
-        for (const auto& asn : int_assignments) {
-            for (int val = lo; val <= hi; ++val) {
-                auto next_asn = asn;
-                next_asn.push_back(static_cast<double>(val));
-                next_assignments.push_back(next_asn);
-            }
-        }
-        int_assignments = std::move(next_assignments);
-    }
-    
-    // For each assignment, solve continuous LP remainder
-    for (const auto& asn : int_assignments) {
-        LpProblem sub = lp;
-        for (size_t k = 0; k < int_cols.size(); ++k) {
-            Index j = int_cols[k];
-            sub.col_lo[j] = asn[k];
-            sub.col_hi[j] = asn[k];
-        }
-        
-        sor::engines::SimplexOptions opts;
-        sor::engines::SimplexDiagnostics diag;
-        auto raw = sor::engines::solve_simplex(sub, opts, diag);
-        auto ev = sor::engines::simplex_evidence(diag, opts);
-        auto res = sor::certify::finalize_result(std::move(raw), ev);
-        
-        if (res.status == Status::Optimal) {
-            if (!best.feasible) {
-                best.feasible = true;
-                best.objective = res.objective;
-            } else {
-                if (lp.maximize && res.objective > best.objective) best.objective = res.objective;
-                if (!lp.maximize && res.objective < best.objective) best.objective = res.objective;
-            }
-        }
-    }
-    return best;
-}
-
 void test_random_milps() {
+    std::array<std::uint64_t, 4> cut_models{}, cut_totals{};
     for (std::uint32_t seed = 1; seed <= 2000; ++seed) {
         const LpProblem lp = make_random_milp(seed);
         const OracleResult oracle = solve_oracle(lp);
@@ -174,6 +76,15 @@ void test_random_milps() {
         sor::search::BabOptions default_opts;
         default_opts.para_bab.threads = 1;
         default_opts.structural_presolve.enabled = false;
+        default_opts.cuts_enabled = true;
+        if (oracle.feasible) {
+            CHECK(lp.max_row_violation(oracle.x) <= 1e-7);
+            CHECK(lp.max_bound_violation(oracle.x) <= 1e-7);
+            default_opts.cut_reference_point = &oracle.x;
+        }
+        const auto default_gap_opts = default_opts;
+        default_opts.gap_tol = 1e-9;
+        default_opts.abs_gap_tol = 1e-9;
         configs.push_back(default_opts);
         
         // mir_cuts
@@ -208,19 +119,42 @@ void test_random_milps() {
         cq_opts.clique_cuts = true;
         configs.push_back(cq_opts);
         
-        for (const auto& opts : configs) {
+        // Numerical objective checks above are exact; keep a separate run
+        // that permits the solver's default MIP gap and checks its bound.
+        configs.push_back(default_gap_opts);
+        for (std::size_t config = 0; config < configs.size(); ++config) {
+            const auto& opts = configs[config];
+            const bool default_gap = config + 1 == configs.size();
             sor::search::BabDiagnostics diag;
             auto raw = sor::search::solve_milp(lp, opts, diag);
+            if (config >= 1 && config <= 4) {
+                CHECK(diag.invalid_cuts_detected == 0);
+                CHECK(diag.node_cuts_invalid_inserted == 0);
+                const std::array<std::uint64_t, 4> added{
+                    diag.mir_cuts_added, diag.lifted_cover_cuts_added,
+                    diag.zerohalf_cuts_added, diag.clique_cuts_added};
+                cut_models[config - 1] += added[config - 1] > 0;
+                cut_totals[config - 1] += added[config - 1];
+            }
             const auto ev = sor::search::milp_evidence(diag, opts);
             const auto result = sor::certify::finalize_result(std::move(raw), ev);
             
             if (oracle.feasible) {
-                if (result.status != Status::Optimal || std::abs(result.objective - oracle.objective) > 1e-5) {
+                const double allowed_error = default_gap
+                    ? std::max(1e-6, 1e-4 * std::fabs(oracle.objective)) : 1e-6;
+                if (result.status != Status::Optimal ||
+                    std::abs(result.objective - oracle.objective) > allowed_error) {
                     std::cout << "FAIL: seed=" << seed << " oracle.obj=" << oracle.objective 
                               << " solver.status=" << (int)result.status << " solver.obj=" << result.objective << std::endl;
                 }
                 CHECK(result.status == Status::Optimal);
-                CHECK_NEAR(result.objective, oracle.objective, 1e-6);
+                CHECK(std::isfinite(result.objective) &&
+                      std::fabs(result.objective - oracle.objective) <= allowed_error);
+                if (default_gap) {
+                    CHECK(std::isfinite(diag.dual_bound));
+                    CHECK(lp.maximize ? diag.dual_bound >= oracle.objective - 1e-7
+                                      : diag.dual_bound <= oracle.objective + 1e-7);
+                }
             } else {
                 if (result.status != Status::Infeasible) {
                     std::cout << "FAIL: seed=" << seed << " oracle.feas=false"
@@ -230,11 +164,98 @@ void test_random_milps() {
             }
         }
     }
+    constexpr std::array<const char*, 4> families{"mir", "lifted_cover", "zerohalf", "clique"};
+    for (std::size_t k = 0; k < families.size(); ++k)
+        std::cout << "CUT_COUNTS " << families[k] << " models=" << cut_models[k]
+                  << " cuts=" << cut_totals[k] << '\n';
+
+}
+
+
+// Direct separation checks cover candidates that selection or duplicate
+// filtering may omit from the solver's cut-reference diagnostic.
+void test_separator_families() {
+    for (bool odd : {false, true}) {
+        std::uint64_t generated_models = 0, generated_cuts = 0;
+        std::uint64_t inserted_models = 0, inserted_cuts = 0;
+        for (std::uint32_t seed = 1; seed <= 200; ++seed) {
+            const auto lp = make_separator_milp(seed, odd);
+            const auto oracle = solve_oracle(lp);
+            CHECK(oracle.feasible);
+            if (!oracle.feasible) continue;
+            sor::engines::SimplexOptions sx;
+            sx.presolve = false;
+            sor::engines::SimplexDiagnostics sd;
+            auto relaxation = sor::engines::solve_simplex(lp, sx, sd);
+            const auto evidence = sor::certify::check_lp_result(lp, relaxation,
+                sor::engines::simplex_evidence(sd, sx));
+            auto checked = sor::certify::finalize_result(std::move(relaxation), evidence);
+            CHECK(checked.status == Status::Optimal);
+            if (checked.status != Status::Optimal) continue;
+            std::vector<sor::search::CutRow> cuts;
+            if (odd) {
+                sor::search::ZeroHalfOptions options;
+                sor::search::ZeroHalfDiagnostics diagnostics;
+                cuts = sor::search::separate_zerohalf(lp, checked.x,
+                    lp.col_lo, lp.col_hi, options, diagnostics);
+            } else {
+                sor::search::CoverOptions options;
+                sor::search::CoverDiagnostics diagnostics;
+                cuts = sor::search::separate_lifted_covers(lp, checked.x,
+                    lp.col_lo, lp.col_hi, options, diagnostics);
+            }
+            generated_models += !cuts.empty();
+            generated_cuts += cuts.size();
+            std::uint64_t assignments = 1;
+            for (double hi : lp.col_hi) assignments *= static_cast<std::uint64_t>(hi) + 1;
+            std::vector<double> point(lp.n_cols(), 0.0);
+            for (std::uint64_t assignment = 0; assignment < assignments; ++assignment) {
+                auto code = assignment;
+                for (Index j = 0; j < lp.n_cols(); ++j) {
+                    const auto radix = static_cast<std::uint64_t>(lp.col_hi[j]) + 1;
+                    point[j] = static_cast<double>(code % radix);
+                    code /= radix;
+                }
+                if (lp.max_row_violation(point) > 1e-9) continue;
+                for (const auto& cut : cuts)
+                    CHECK(sor::search::cut_admits_point(cut.cols, cut.vals,
+                          cut.row_lo, cut.row_hi, point, 1e-9));
+            }
+            sor::search::BabOptions options;
+            options.para_bab.threads = 1;
+            options.auto_cuts = false;
+            options.mip_presolve = options.probing = options.symmetry = false;
+            options.integer_row_rounding = false;
+            options.structural_presolve.enabled = false;
+            options.cuts_enabled = true;
+            options.cut_reference_point = &oracle.x;
+            options.lifted_cover_cuts = !odd;
+            options.zerohalf_cuts = odd;
+            options.gap_tol = options.abs_gap_tol = 1e-9;
+            sor::search::BabDiagnostics diag;
+            auto raw = sor::search::solve_milp(lp, options, diag);
+            const auto result = sor::certify::finalize_result(std::move(raw),
+                                sor::search::milp_evidence(diag, options));
+            CHECK(result.status == Status::Optimal);
+            CHECK_NEAR(result.objective, oracle.objective, 1e-6);
+            CHECK(diag.invalid_cuts_detected == 0);
+            CHECK(diag.node_cuts_invalid_inserted == 0);
+            const auto inserted = odd ? diag.zerohalf_cuts_added
+                                      : diag.lifted_cover_cuts_added;
+            inserted_models += inserted > 0;
+            inserted_cuts += inserted;
+        }
+        std::cout << "SEPARATOR_FAMILY " << (odd ? "zerohalf_odd_cycle" : "lifted_cover_knapsack")
+                  << " generated_models=" << generated_models << " generated_cuts=" << generated_cuts
+                  << " inserted_models=" << inserted_models << " inserted_cuts=" << inserted_cuts << '\n';
+        CHECK(generated_models >= 50);
+    }
 }
 
 } // namespace
 
 int main() {
     test_random_milps();
+    test_separator_families();
     return sor::test::finish("test_milp_random_oracle");
 }

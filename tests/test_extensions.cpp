@@ -6,6 +6,7 @@
 
 #include "test_helpers.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <utility>
 #include <vector>
@@ -37,6 +38,10 @@ void test_miqp_interrupted_assignments_do_not_prove_infeasible() {
     sor::search::MiqpOptions opts;
     opts.qp.max_iterations = 1;
     opts.qp.check_every = 1;
+    // 9969be5 restored the upstream post-limit polish path, which can
+    // certify these one-iteration QPs. Disable it to exercise unresolved
+    // assignments; the polishing-on certificate test below covers resolution.
+    opts.qp.polish = false;
     sor::search::MiqpDiagnostics diag;
     const auto result = finalize_miqp(p, opts, diag);
     CHECK(diag.assignments == 2);
@@ -62,6 +67,7 @@ void test_miqp_incumbent_with_unresolved_assignment_is_only_feasible() {
     sor::search::MiqpOptions opts;
     opts.qp.max_iterations = 1;
     opts.qp.check_every = 1;
+    opts.qp.polish = false;  // Unresolved path; see the 9969be5 comment above.
     sor::search::MiqpDiagnostics diag;
     const auto result = finalize_miqp(p, opts, diag);
     CHECK(diag.assignments == 2);
@@ -235,7 +241,63 @@ void test_explicit_refusals() {
 
 }  // namespace
 
+void test_miqp_polishing_has_checked_assignment_certificates() {
+    auto equality = interrupted_miqp_reproducer();
+    equality.linear.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {-1.0, 1.0});
+    equality.linear.row_lo = {0.0};
+    equality.linear.row_hi = {0.0};
+    equality.linear.c = {0.0, 0.0};
+    for (const auto& problem : {interrupted_miqp_reproducer(), equality}) {
+        sor::search::MiqpOptions options;
+        options.qp.max_iterations = 1;
+        options.qp.check_every = 1;
+        options.qp.polish = true;
+        sor::search::MiqpDiagnostics diagnostics;
+        const auto result = finalize_miqp(problem, options, diagnostics);
+        double optimum = sor::core::kPosInf;
+        std::uint64_t certified = 0;
+        bool saw_polish = false;
+        for (double binary : {0.0, 1.0}) {
+            auto fixed = problem;
+            fixed.linear.col_lo[0] = fixed.linear.col_hi[0] = binary;
+            sor::engines::QpOptions reference_options;
+            reference_options.polish = false;
+            sor::engines::QpDiagnostics reference_diag;
+            auto reference_raw = sor::engines::solve_qp_ipm(fixed, reference_options, reference_diag);
+            auto reference = sor::certify::finalize_result(std::move(reference_raw),
+                sor::engines::qp_evidence(reference_diag, reference_options));
+            CHECK(reference.status == sor::core::Status::Optimal);
+            CHECK(reference_diag.primal_residual <= reference_options.feas_tol);
+            CHECK(reference_diag.stationarity <= reference_options.stationarity_tol);
+            optimum = std::min(optimum, reference.objective);
+            sor::engines::QpDiagnostics assignment_diag;
+            const auto assignment = sor::engines::solve_qp(fixed, options.qp, assignment_diag);
+            if (assignment.proposed_status == sor::core::Status::Optimal) {
+                CHECK(assignment.proposed_level == sor::core::ProofLevel::ProvedKKT);
+                CHECK(assignment_diag.primal_residual <= options.qp.feas_tol);
+                CHECK(assignment_diag.stationarity <= options.qp.stationarity_tol);
+                CHECK(assignment_diag.primal_net <= options.qp.feas_tol);
+                CHECK(assignment_diag.stationarity_net <= options.qp.stationarity_tol);
+                CHECK(assignment_diag.gap_finite && assignment_diag.gap_net <= options.qp.gap_tol);
+                ++certified;
+            }
+            saw_polish |= assignment.termination_reason.find("+ polish") != std::string::npos;
+        }
+        CHECK(saw_polish);
+        CHECK(certified == 2);
+        CHECK(diagnostics.assignments == 2);
+        CHECK(diagnostics.feasible_assignments == certified);
+        CHECK(diagnostics.unresolved_assignments == 0);
+        CHECK(diagnostics.all_subproblems_resolved);
+        CHECK(diagnostics.primal_residual <= options.qp.feas_tol);
+        CHECK(diagnostics.stationarity <= options.qp.stationarity_tol);
+        CHECK(result.status == sor::core::Status::Optimal);
+        CHECK_NEAR(result.objective, optimum, 1e-6);
+    }
+}
+
 int main() {
+    test_miqp_polishing_has_checked_assignment_certificates();
     test_miqp_interrupted_assignments_do_not_prove_infeasible();
     test_miqp_incumbent_with_unresolved_assignment_is_only_feasible();
     test_miqp_all_infeasible_assignments_prove_infeasible();

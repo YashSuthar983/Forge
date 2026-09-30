@@ -46,12 +46,55 @@ using ConNodeFeatureVec = std::array<f64, kConNodeFeatureDim>;
 using CutNodeFeatureVec = std::array<f64, kCutNodeFeatureDim>;
 using EdgeFeatureVec = std::array<f64, kEdgeFeatureDim>;
 
+// Model data the feature extractors read, built once per matrix/objective
+// revision in O(nnz) so that one candidate costs O(nnz of its column) rather
+// than a scan of the whole matrix. The previous extractor rescanned every row
+// three times per candidate (four for lifted features), which made each
+// branching step O(candidates x nnz) whether or not any learner used the
+// result. Row activities depend on the LP point and are refreshed once per
+// point by set_point().
+//
+// Values are computed in the same order as the direct row-wise formulas, so
+// a cached feature equals the uncached one bit for bit.
+struct BranchFeatureCache {
+    // Identity of what this cache describes: the model object and a revision
+    // token the caller advances whenever A, the row sides or c change.
+    const model::LpProblem* lp = nullptr;
+    std::uint64_t revision = 0;
+    bool built = false;
+    f64 obj_scale = 1.0;                  // 1 + max |c_j|
+    // Column incidence (CSC of A): entries col_start[j] .. col_start[j+1]-1,
+    // rows increasing; a duplicate (i, j) keeps its first CSR entry only.
+    std::vector<core::Offset> col_start;
+    std::vector<Index> row_of;
+    std::vector<f64> val_of;
+    // Per column over entries with |a| > 1e-15: mean, max, min |a|, count.
+    std::vector<f64> col_mean_abs, col_max_abs, col_min_abs;
+    std::vector<int> col_nnz;
+    // Per row: stored entries, sum |a|, sum a_ij c_j (in CSR order).
+    std::vector<int> row_nnz;
+    std::vector<f64> row_abs_sum, row_obj_dot;
+    // Per LP point (set_point): a_i . x in CSR order.
+    std::vector<f64> row_activity;
+    const std::vector<f64>* point = nullptr;
+    std::uint64_t builds = 0;             // full rebuilds, for tests/diagnostics
+
+    bool matches(const model::LpProblem& m, std::uint64_t rev) const {
+        return built && lp == &m && revision == rev;
+    }
+    void build(const model::LpProblem& m, std::uint64_t rev);
+    // Row activities of x; the vector must outlive the feature calls.
+    void set_point(const std::vector<f64>& x);
+};
+
 struct BranchFeatureContext {
     const model::LpProblem* lp = nullptr;
     const std::vector<f64>* col_lo = nullptr;
     const std::vector<f64>* col_hi = nullptr;
     const std::vector<f64>* x = nullptr;
-    const std::vector<f64>* pc_down = nullptr;   // unit gains; may be null
+    // Directional pseudocost SUMS of unit gains and their observation counts;
+    // the features use the averages sum / count. May be null.
+    const std::vector<f64>* pc_down = nullptr;
     const std::vector<f64>* pc_up = nullptr;
     const std::vector<std::uint32_t>* pc_down_count = nullptr;
     const std::vector<std::uint32_t>* pc_up_count = nullptr;
@@ -61,6 +104,9 @@ struct BranchFeatureContext {
     f64 dual_bound = 0.0;
     f64 incumbent = 0.0;
     bool have_incumbent = false;
+    // Built for *lp with its point set to *x. When null, each call builds a
+    // private cache (one O(nnz) pass per call, as the batch helper avoids).
+    const BranchFeatureCache* cache = nullptr;
 };
 
 // SC-MILP-style discrete stratum over branch features (stable bucket count).

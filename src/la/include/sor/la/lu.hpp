@@ -47,6 +47,7 @@
 
 #include <cstdint>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace sor::la {
@@ -296,6 +297,33 @@ public:
     // nonzeros, and installing U * alpha instead added rounding residue with
     // alpha's density.
     Offset u_nnz()     const noexcept { return u_live_nnz_; }
+
+    // Heap bytes this factorization holds, scratch included (a copy copies
+    // the scratch too). For memory budgets of cached factorizations; it counts
+    // vector capacities, not sizes, because capacity is what a copy allocates.
+    std::size_t memory_bytes() const noexcept {
+        std::size_t total = 0;
+        const auto add = [&total](const auto& v) {
+            total += v.capacity() * sizeof(typename std::decay_t<decltype(v)>::value_type);
+        };
+        add(piv_row_); add(piv_slot_); add(piv_val_); add(rpos_); add(cpos_);
+        add(u_off_); add(u_len_); add(u_cap_); add(u_idx_); add(u_val_);
+        add(uord_); add(upos_);
+        add(u_cstart_); add(u_clen_); add(u_ccap_); add(u_crow_); add(u_cval_);
+        add(r_pos_); add(r_start_); add(r_idx_); add(r_val_);
+        add(spike_stamp_);
+        add(ft_atilde_); add(ft_v_); add(ft_support_); add(ft_vsupport_);
+        add(ft_seed_); add(ft_stamp_); add(ft_move_idx_); add(ft_move_val_);
+        add(l_start_); add(l_idx_); add(l_val_); add(l_col_start_); add(l_col_row_);
+        add(eta_p_); add(eta_start_); add(eta_idx_); add(eta_val_); add(eta_pivot_);
+        add(work_); add(pair_work_); add(mark_); add(dfs_stack_); add(reach_);
+        add(order_); add(seed_); add(support_stamp_);
+        for (const auto& r : rev_) total += r.capacity() * sizeof(Index);
+        total += rev_.capacity() * sizeof(std::vector<Index>);
+        add(fire_stamp_); add(fire_input_seed_); add(fire_heap_);
+        add(fire_touched_); add(work_dirty_); add(row_eta_touched_);
+        return total;
+    }
 
     // Cumulative triangular-solve work (nnz actually touched: a hypersparse
     // reach-set size, or the dense m when the hypersparse path was skipped)

@@ -43,11 +43,16 @@
 
 namespace sor::search {
 
+class ConflictGraph;
+
 using core::f64;
 using core::Index;
 
 struct MirOptions {
     bool enabled = true;
+    // Use globally valid conditional upper bounds found during root probing
+    // as additional MIR substitutions. The graph must belong to this model.
+    bool probe_bounds = false;
     int max_cuts = 150;
     // Candidates generated per call, as a multiple of max_cuts, before the
     // most efficacious max_cuts are kept (see separate_mir).
@@ -60,6 +65,12 @@ struct MirOptions {
     // valid and numerically useless; cuts.hpp records what a high-dynamism cut
     // did to rgn's node LP.
     f64 max_dynamism = 1e4;
+    // Relax terms below max|coef| / max_dynamism into the right-hand side
+    // (relax_small_terms) before a wide cut is rejected.
+    bool relax_small_terms = false;   // see CutOptions::relax_small_terms
+    // Wall-clock allowance for one separation call (0 = none); checked between
+    // rows and between aggregation starts.
+    double time_limit_s = 0.0;
     f64 min_fractionality = 1e-4;   // skip f outside [this, 1 - this]
     // c-MIR scaling (Marchand & Wolsey): the same row scaled by 1/|a_j| gives a
     // different fractional part and therefore a different -- often much
@@ -99,8 +110,18 @@ struct MirOptions {
     // bounds only, such an x has a positive continuous coefficient and is
     // simply dropped from the base.
     bool variable_bounds = true;
-    int max_aggregations = 4;      // rows combined into one base
-    int max_start_rows = 200;      // starting rows tried per separation call
+    // Superadditively lifted cover on the same transformed base (Marchand &
+    // Wolsey 1999, knapsack with one continuous variable). It needs a cover,
+    // not a fractional right-hand side, so it still cuts on the many bases
+    // c-MIR rejects for fractionality. Per base the more efficacious of the
+    // two inequalities is kept.
+    // MEASURED OFF by default: on p200x1188c it won 553 bases on efficacy yet
+    // lowered the 20-round root bound 7306 -> 5899 by displacing the c-MIR
+    // cuts behind the later large gain; exp/sp150 root bounds were unchanged.
+    // Per-base efficacy is not a sufficient selection signal here. Opt-in.
+    bool lifted_cover = false;
+    int max_aggregations = 24;     // rows combined into one base (was 4)
+    int max_start_rows = 800;      // starting rows tried per separation call (was 200)
     f64 bad_variable_min_distance = 1e-4;
 };
 
@@ -110,11 +131,17 @@ struct MirDiagnostics {
     std::uint64_t cuts_emitted = 0;
     std::uint64_t rejected_fractionality = 0;
     std::uint64_t rejected_dynamism = 0;
+    std::uint64_t time_stops = 0;
+    std::uint64_t dynamism_repaired = 0;
     std::uint64_t rejected_not_violated = 0;
     std::uint64_t rejected_unbounded_var = 0;
     std::uint64_t aggregations = 0;
-    std::uint64_t variable_bound_rows = 0;      // x <= u*y rows found
-    std::uint64_t variable_bound_substitutions = 0;
+    std::uint64_t variable_bound_rows = 0;      // two-term x-vs-y bound rows
+    std::uint64_t variable_bound_substitutions = 0;  // x replaced by a VUB/VLB
+    std::uint64_t probe_bound_candidates = 0;
+    std::uint64_t probe_bound_substitutions = 0;
+    std::uint64_t lifted_cover_bases = 0;   // bases with a valid cover
+    std::uint64_t lifted_cover_cuts = 0;    // kept instead of / without c-MIR
 };
 
 // Separates violated MIR cuts from the rows of `lp` at `x`, under the box
@@ -133,7 +160,8 @@ std::vector<CutRow> separate_mir(const model::LpProblem& lp,
                                  const MirOptions& opts,
                                  MirDiagnostics& diag,
                                  const std::vector<f64>* root_lo = nullptr,
-                                 const std::vector<f64>* root_hi = nullptr);
+                                 const std::vector<f64>* root_hi = nullptr,
+                                 const ConflictGraph* global_implications = nullptr);
 
 // Shared cMIR primitive for Mexi conflict reason reduction (arXiv:2410.15110
 // §4.2 / §7) and Marchand-Wolsey separation.
@@ -148,6 +176,8 @@ std::vector<CutRow> separate_mir(const model::LpProblem& lp,
 // reason is accepted even when the local vertex is already cut off weakly.
 //
 // Returns false if no useful MIR cut (bad fractionality, dynamism, or empty).
+// opts.variable_bounds uses the same model-row VUB substitution as
+// separate_mir. The caller owns the base inequality's validity and scope.
 bool apply_cmir_geq(const model::LpProblem& lp,
                     const std::vector<Index>& cols,
                     const std::vector<f64>& vals,

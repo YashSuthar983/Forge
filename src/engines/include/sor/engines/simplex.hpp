@@ -10,6 +10,7 @@
 #include "sor/model/lp.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace sor::engines {
@@ -94,6 +95,15 @@ struct SimplexOptions {
     // removed before any optimality conclusion (primal clean-up, §6.3.1).
     // Ignored when dual_cost_perturbation_multiplier > 0 (legacy ablation).
     bool dual_perturbation = true;
+    // When the dual gives up with "cycling detected" (no objective progress
+    // for several windows despite stagnation perturbation), re-solve the same
+    // LP with up-front cost perturbation (dual_cost_perturbation_multiplier
+    // = 1) instead of returning the stalled point. A flat dual objective is
+    // not cycling when it has already reached its final value and the
+    // remaining pivots only work off primal infeasibility; the up-front
+    // perturbation breaks those plateaus. The result is judged by the same
+    // optimality checks as any other solve.
+    bool dual_cycling_recovery = true;
     // Lower bound on an UPDATED dual steepest-edge weight. Koberstein (2005
     // thesis §8.2.2.1, following Forrest & Goldfarb 1992) sets
     // beta_i = max(beta_i, 1e-4): cancellation in the update can drive a
@@ -101,6 +111,13 @@ struct SimplexOptions {
     // score infeasibility^2 / beta explode. Exactly recomputed weights
     // (beta_r = rho'rho) are not floored by this.
     f64 dse_weight_floor = 1e-4;
+    // Skip the exact all-row DSE rebuild in reset_weights() when the warm
+    // basis is non-logical, using weights of 1 instead. Weights only steer
+    // CHUZR (see DualEdgeWeightCarrier's doc comment in dual_simplex.hpp) --
+    // never correctness -- so this can only cost pivots, not the answer.
+    // Off by default; set true only for B&B node LPs, where the m dense
+    // BTRANs of a rebuild are paid every single warm-started node.
+    bool warm_dse_reset = false;
     // Dual simplex: stop in phase 2 once the objective (minimization sense,
     // including the offset) reaches this value -- a branch-and-bound node
     // that will be pruned by bound need not be solved to optimality. The
@@ -208,6 +225,13 @@ struct SimplexOptions {
 
     // EXPAND-style bound relaxation for degenerate steps (Gill et al. 1989).
     bool  use_expand        = true;
+    // Break a phase-2 plateau by temporarily expanding finite bounds by a
+    // deterministic multiple of their scale-adjusted feasibility tolerance.
+    // The original bounds are restored by a warm dual solve before any proof
+    // exit; both stages share the caller's time and iteration allowance.
+    bool primal_bound_perturbation = true;
+    // Trace phase-2 progress and recovery even inside normally silent MILP LPs.
+    bool trace_degeneracy = false;
     f64   expand_delta      = 1e-6;
     f64   expand_factor     = 10.0;
     f64   expand_max        = 1e-3;
@@ -355,8 +379,26 @@ struct SimplexDiagnostics {
     std::uint64_t dse_weight_reuses = 0;
     std::uint64_t stagnation_perturbations = 0;  // objective-window detector
     std::uint64_t cycling_exits = 0;             // gave up: cycling detected
+    std::uint64_t cycling_recoveries = 0;        // re-solved with perturbation
+    std::uint64_t cycling_recovered = 0;         // ... and that finished
     std::uint64_t objective_limit_exits = 0;
+    std::uint64_t objective_limit_checks = 0;     // true-cost Lagrangian evaluations
     std::uint64_t factor_adoptions = 0;   // carried LU adopted instead of factorizing
+    // A4: mutually exclusive with each other and with factor_adoptions --
+    // exactly one adoption/outcome fires per call that was PASSED a non-null
+    // FactorCarrier*, in the same priority order the adoption check itself
+    // uses (see the "EXPERIMENTAL factor reuse" comment in dual_simplex.cpp).
+    std::uint64_t factor_reuse_carrier_empty = 0;    // has_factor was false at entry
+    std::uint64_t factor_reuse_matrix_null = 0;      // matrix token was never set
+    std::uint64_t factor_reuse_rows_mismatch = 0;    // carrier's row count != this solve's
+    std::uint64_t factor_reuse_preparation_mismatch = 0; // columns/nnz/scaling changed
+    std::uint64_t factor_reuse_basis_mismatch = 0;   // carried basis != this solve's starting basis
+    // The carrier is refilled only at the ONE NORMAL exit (see FactorCarrier's
+    // own doc comment); the primal clean-up hand-off is the one other RawResult
+    // return in this function and does not refill it. Every other termination
+    // (infeasible, time limit, optimal, iteration limit) falls through to that
+    // one normal exit and DOES refill it, whether or not it just adopted one.
+    std::uint64_t factor_reuse_skipped_refill_primal_cleanup = 0;
     std::uint64_t dse_weight_rebuilds = 0;
     // Choose-mode drift recovery: exact DSE weight rebuilds that replace the
     // old one-way handoff to Devex (see dual_simplex Choose policy).
@@ -393,6 +435,10 @@ struct SimplexDiagnostics {
     f64 cost_shift_max = 0.0;
     std::uint64_t primal_cleanups = 0;
     std::uint64_t primal_cleanup_iterations = 0;
+    std::uint64_t primal_bound_perturbations = 0;
+    std::uint64_t primal_perturbed_bounds = 0;
+    std::uint64_t primal_bound_restorations = 0;
+    std::uint64_t primal_bound_restore_iterations = 0;
     // Sum of dual infeasibilities (true costs) at the hand-off to the
     // primal clean-up; zero when no clean-up was needed.
     f64 cleanup_dual_infeasibility = 0.0;
@@ -600,10 +646,49 @@ bool prefer_simplex_candidate(const core::RawResult& candidate,
 
 }  // namespace detail
 
+class DualProbeSession;
+
+// Optional ownership transfer of this solve's preparation to repeated bound
+// solves/probes. No second base solve or preparation is performed. A presolved
+// result cannot export its reduced workspace into the original model space.
 core::RawResult solve_simplex(const model::LpProblem& problem,
                               const SimplexOptions& opts,
                               SimplexDiagnostics& diag,
-                              SimplexBasis* out_basis = nullptr);
+                              SimplexBasis* out_basis = nullptr,
+                              std::unique_ptr<DualProbeSession>* out_session = nullptr);
+
+// Collect work separately from endpoint evidence. Installing totals never
+// replaces the chosen status, residuals, objective, gap, basis or certificate.
+void accumulate_simplex_work(SimplexDiagnostics& total,
+                             const SimplexDiagnostics& stage);
+void install_simplex_work_totals(SimplexDiagnostics& chosen,
+                                 const SimplexDiagnostics& total);
+
+// One prepared LP (scaling, column-wise matrix, tolerances) re-solved for a
+// sequence of OBJECTIVES over the same rows and bounds -- what a feasibility
+// pump does every round. A cost change leaves the basis primal feasible, so
+// each solve is a warm PRIMAL simplex from the previous basis; nothing is
+// rebuilt or re-scaled between rounds.
+class PrimalCostSession {
+public:
+    PrimalCostSession(const model::LpProblem& problem, const SimplexOptions& opts);
+    ~PrimalCostSession();
+    PrimalCostSession(const PrimalCostSession&) = delete;
+    PrimalCostSession& operator=(const PrimalCostSession&) = delete;
+
+    // Replace the objective (in the sense of the problem given to the
+    // constructor, size n_cols). O(n).
+    void set_costs(const std::vector<core::f64>& c);
+
+    // Solve from `warm` (empty / null: cold). The basis reached is returned in
+    // `out_basis` for the next round.
+    core::RawResult solve(const SimplexOptions& opts, SimplexDiagnostics& diag,
+                          SimplexBasis* out_basis, const SimplexBasis* warm);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 core::ProofEvidence simplex_evidence(const SimplexDiagnostics&,
                                      const SimplexOptions&);

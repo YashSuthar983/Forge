@@ -21,8 +21,10 @@ void apply_auto_cuts_policy(BabOptions& o);
 // Pre-pool greedy rank/limit: normalised efficacy + sparsity / locks / objective
 // alignment, parallelism penalties, nnz budget - mirrors CutPool selection but
 // on a single round's candidate batch so separators can stay generous.
+// When `stats` is non-null every dropped candidate is counted there by reason.
 std::vector<CutRow> filter_cut_candidates_for_round(
     std::vector<CutRow> candidates, const model::LpProblem& lp,
-    const std::vector<f64>& x, const CutOptions& opts);
+    const std::vector<f64>& x, const CutOptions& opts,
+    CutFilterStats* stats = nullptr);
 
 }  // namespace sor::search

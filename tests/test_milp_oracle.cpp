@@ -182,6 +182,9 @@ void test_fractional_root_branches_and_proves() {
     opts.probing = false;
     opts.symmetry = false;
     opts.cuts_enabled = false;
+    // The tree cuts re-solved at the root would close this instance without
+    // branching; the test is about branching.
+    opts.tree_cut.resolve_with_local = false;
     opts.feasibility_jump = false;
     opts.fixprop = false;
     opts.sub_mip_lns = false;
@@ -219,9 +222,30 @@ void test_continuous_objective_disables_lattice_rounding() {
     CHECK_NEAR(result.objective, 1.05, 1e-7);
 }
 
+void test_lp_only_evidence() {
+    for (bool infeasible : {false, true}) {
+        LpProblem lp;
+        lp.name = infeasible ? "lp_only_infeasible" : "lp_only_optimal";
+        lp.c = {-1.0}; lp.col_lo = {0.0}; lp.col_hi = {3.0};
+        lp.is_integer = {false}; lp.row_lo = {-sor::model::kInf};
+        lp.row_hi = {infeasible ? -1.0 : 2.0};
+        lp.A = sor::sparse::from_triplets(1, 1, {0}, {0}, {1.0});
+        sor::search::BabOptions opts; opts.structural_presolve.enabled = false;
+        sor::search::BabDiagnostics diag;
+        auto raw = sor::search::solve_milp(lp, opts, diag);
+        auto result = sor::certify::finalize_result(std::move(raw), sor::search::milp_evidence(diag, opts));
+        CHECK(result.status == (infeasible ? Status::Infeasible : Status::Optimal));
+        if (!infeasible) {
+            CHECK(std::fabs(result.objective + 2.0) <= 1e-6);
+            CHECK(diag.final_primal_violation <= opts.primal_feas_tol);
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
+    test_lp_only_evidence();
     test_original_model_oracle();
     test_fractional_root_branches_and_proves();
     test_continuous_objective_disables_lattice_rounding();

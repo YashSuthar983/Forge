@@ -165,8 +165,46 @@ CliqueProbeDiagnostics apply_clique_probing(const model::LpProblem& lp,
     std::uint64_t cp_seen = 0;
 
     const Index n = lp.n_cols();
+    const Index m = lp.n_rows();
     const f64 tol = opts.tol;
     std::size_t probed = 0;
+
+    // Incremental probing. Each case fixes the clique's literals on the ONE
+    // global box, propagates only the rows its fixings reach (event queue,
+    // same row rule and integer rounding as the full sweep), records every
+    // bound change on a trail and undoes it afterwards. A case therefore costs
+    // its own cascade instead of an O(n) box copy plus `rounds` sweeps of the
+    // whole matrix (ex9: 18.1 s for 1,038 cliques before this).
+    //
+    // Hull over the feasible cases: a column no case changed keeps its bound
+    // in every case, so only a column changed by EVERY feasible case can be
+    // tightened. `seen_count[j] == f` after f feasible cases marks exactly
+    // those, and h_lo/h_hi hold their running hull.
+    const ColumnRowIndex index = build_column_row_index(lp);
+    PropagationScratch scratch;
+    PropTrail trail;
+    const std::uint64_t visit_cap =
+        static_cast<std::uint64_t>(std::max(1, opts.clique_propagation_rounds)) *
+        static_cast<std::uint64_t>(std::max<Index>(1, m));
+    std::vector<std::uint32_t> seen_stamp(sz(n), 0);
+    std::vector<std::uint32_t> seen_count(sz(n), 0);
+    std::vector<std::uint32_t> case_stamp(sz(n), 0);
+    std::vector<f64> h_lo(sz(n), 0.0), h_hi(sz(n), 0.0);
+    std::vector<Index> candidates, seeds;
+    std::uint32_t clique_stamp = 0, case_id = 0;
+    // Propagation fixpoint of the global box first, so a case differs from
+    // it only by what the case's fixings cause (the hull logic relies on it).
+    {
+        std::vector<Index> all(sz(n));
+        for (Index k = 0; k < n; ++k) all[sz(k)] = k;
+        const auto fr = propagate_bounds_events(lp, index, col_lo, col_hi, all,
+                                                scratch, nullptr, 0, tol, visit_cap);
+        if (!fr.feasible) {
+            diag.infeasible = true;
+            return diag;
+        }
+        diag.tightenings += fr.tightened;
+    }
 
     for (const Clique& c : cg.cliques()) {
         // Per-clique cost scales with clique size, so poll often.
@@ -192,58 +230,70 @@ CliqueProbeDiagnostics apply_clique_probing(const model::LpProblem& lp,
         if (bins.size() < 2 || bins.size() > opts.max_clique_size) continue;
         ++probed;
         ++diag.cliques_probed;
+        ++clique_stamp;
+        candidates.clear();
+        std::uint32_t feasible_cases = 0;
 
-        std::vector<f64> hull_lo = col_lo, hull_hi = col_hi;
-        bool hull_init = false;
-        std::size_t feasible_cases = 0;
-
-        auto absorb = [&](const std::vector<f64>& lo, const std::vector<f64>& hi) {
-            if (!hull_init) {
-                hull_lo = lo;
-                hull_hi = hi;
-                hull_init = true;
-            } else {
-                for (Index j = 0; j < n; ++j) {
-                    hull_lo[sz(j)] = std::min(hull_lo[sz(j)], lo[sz(j)]);
-                    hull_hi[sz(j)] = std::max(hull_hi[sz(j)], hi[sz(j)]);
+        // Runs one assignment (x_on = 1, the rest 0; on < 0: all 0) on the
+        // global box and restores it. Returns whether it stayed feasible.
+        const auto run_case = [&](Index on) -> bool {
+            const std::size_t mark = trail.size();
+            seeds.clear();
+            for (const Index j : bins) {
+                const f64 v = j == on ? 1.0 : 0.0;
+                if (col_lo[sz(j)] != v) {
+                    trail.push(j, BoundDir::Lower, v, col_lo[sz(j)],
+                               ReasonKind::Branch, -1, 1);
+                    col_lo[sz(j)] = v;
                 }
+                if (col_hi[sz(j)] != v) {
+                    trail.push(j, BoundDir::Upper, v, col_hi[sz(j)],
+                               ReasonKind::Branch, -1, 1);
+                    col_hi[sz(j)] = v;
+                }
+                seeds.push_back(j);
             }
-            ++feasible_cases;
+            const auto pr = propagate_bounds_events(lp, index, col_lo, col_hi,
+                                                    seeds, scratch, &trail, 1,
+                                                    tol, visit_cap);
+            if (pr.feasible) {
+                ++case_id;
+                const auto& es = trail.entries();
+                for (std::size_t k = mark; k < es.size(); ++k) {
+                    const Index v = es[k].var;
+                    if (case_stamp[sz(v)] == case_id) continue;  // once per case
+                    case_stamp[sz(v)] = case_id;
+                    if (feasible_cases == 0) {
+                        seen_stamp[sz(v)] = clique_stamp;
+                        seen_count[sz(v)] = 1;
+                        h_lo[sz(v)] = col_lo[sz(v)];
+                        h_hi[sz(v)] = col_hi[sz(v)];
+                        candidates.push_back(v);
+                    } else if (seen_stamp[sz(v)] == clique_stamp &&
+                               seen_count[sz(v)] == feasible_cases) {
+                        seen_count[sz(v)] = feasible_cases + 1;
+                        h_lo[sz(v)] = std::min(h_lo[sz(v)], col_lo[sz(v)]);
+                        h_hi[sz(v)] = std::max(h_hi[sz(v)], col_hi[sz(v)]);
+                    }
+                }
+                ++feasible_cases;
+            }
+            const auto& es = trail.entries();
+            for (std::size_t k = es.size(); k-- > mark;) {
+                const auto& e = es[k];
+                (e.dir == BoundDir::Lower ? col_lo : col_hi)[sz(e.var)] = e.old_bound;
+            }
+            trail.truncate(mark);
+            return pr.feasible;
         };
 
-        // All-zero assignment.
-        {
-            std::vector<f64> lo = col_lo, hi = col_hi;
-            for (Index j : bins) {
-                lo[sz(j)] = 0.0;
-                hi[sz(j)] = 0.0;
-            }
-            const auto pr =
-                propagate_bounds(lp, lo, hi, tol, opts.clique_propagation_rounds);
-            if (!pr.feasible) {
-                ++diag.exactly_one_upgrades;
-                // At least one must be 1: cannot tighten globally without more
-                // structure; skip hull contribution.
-            } else {
-                absorb(lo, hi);
-            }
-        }
+        // All-zero assignment. Infeasible means at least one must be 1:
+        // no global tightening from that alone, and no hull contribution.
+        if (!run_case(-1)) ++diag.exactly_one_upgrades;
 
         for (Index on : bins) {
-            std::vector<f64> lo = col_lo, hi = col_hi;
-            for (Index j : bins) {
-                if (j == on) {
-                    lo[sz(j)] = 1.0;
-                    hi[sz(j)] = 1.0;
-                } else {
-                    lo[sz(j)] = 0.0;
-                    hi[sz(j)] = 0.0;
-                }
-            }
-            const auto pr =
-                propagate_bounds(lp, lo, hi, tol, opts.clique_propagation_rounds);
-            if (!pr.feasible) {
-                // x_on = 1 is impossible → fix to 0.
+            if (!run_case(on)) {
+                // x_on = 1 is impossible -> fix to 0.
                 if (col_hi[sz(on)] > 0.5) {
                     col_hi[sz(on)] = 0.0;
                     if (col_lo[sz(on)] > col_hi[sz(on)] + tol) {
@@ -252,30 +302,29 @@ CliqueProbeDiagnostics apply_clique_probing(const model::LpProblem& lp,
                     }
                     ++diag.fixings;
                 }
-                continue;
             }
-            absorb(lo, hi);
         }
 
-        if (!hull_init) {
-            // Every case infeasible → global infeasibility.
+        if (feasible_cases == 0) {
+            // Every case infeasible -> global infeasibility.
             diag.infeasible = true;
             return diag;
         }
 
-        for (Index j = 0; j < n; ++j) {
+        for (const Index j : candidates) {
+            if (seen_count[sz(j)] != feasible_cases) continue;
             const f64 width = col_hi[sz(j)] - col_lo[sz(j)];
             const bool integral = is_int_col(lp, j);
             const f64 need =
                 (integral || !std::isfinite(width))
                     ? tol
                     : std::max(tol, 0.05 * width);
-            if (hull_lo[sz(j)] > col_lo[sz(j)] + need) {
-                col_lo[sz(j)] = hull_lo[sz(j)];
+            if (h_lo[sz(j)] > col_lo[sz(j)] + need) {
+                col_lo[sz(j)] = h_lo[sz(j)];
                 ++diag.tightenings;
             }
-            if (hull_hi[sz(j)] < col_hi[sz(j)] - need) {
-                col_hi[sz(j)] = hull_hi[sz(j)];
+            if (h_hi[sz(j)] < col_hi[sz(j)] - need) {
+                col_hi[sz(j)] = h_hi[sz(j)];
                 ++diag.tightenings;
             }
             if (col_lo[sz(j)] > col_hi[sz(j)] + tol) {
@@ -283,7 +332,6 @@ CliqueProbeDiagnostics apply_clique_probing(const model::LpProblem& lp,
                 return diag;
             }
         }
-        (void)feasible_cases;
     }
     return diag;
 }
@@ -425,7 +473,8 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
                                         const MipPresolveOptions& opts,
                                         bool run_probing,
                                         const ProbingOptions& probe_opts,
-                                        const engines::SimplexOptions* lp_opts) {
+                                        const engines::SimplexOptions* lp_opts,
+                                        ProbingState* probing_state) {
     MipPresolveDiagnostics diag;
     const auto t0 = Clock::now();
     // Root presolve must live inside the solver's budget. Checked at the
@@ -521,10 +570,17 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
         ProbingOptions po = probe_opts;
         po.dual_fix_in_probing = opts.dual_fix_in_probing;
         if (out_of_time()) { ++diag.aborted_on_time; return true; }
+        // The probing allowance is for the whole presolve, not per cycle: two
+        // cycles each allowed the full limit doubled the cost (piperout-27
+        // spent 7.4 s in probing against a 3 s limit).
+        if (do_probe && po.probe_time_limit_s > 0.0) {
+            po.probe_time_limit_s -= diag.ms_conflict_graph / 1000.0;
+            if (po.probe_time_limit_s < 0.05) do_probe = false;
+        }
         if (do_probe) {
             PhaseTimer _t(diag.ms_conflict_graph);
             const auto cd =
-                build_conflict_graph(lp, col_lo, col_hi, cg, po);
+                build_conflict_graph(lp, col_lo, col_hi, cg, po, probing_state);
             merge_conflict(cd);
             if (cd.infeasible) return false;
         }

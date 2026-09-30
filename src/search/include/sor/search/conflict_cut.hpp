@@ -57,6 +57,17 @@ struct ConflictCutOptions {
     // leaves them on (no trail analysis, no LP stall).
     bool nogood_cuts = true;
     int max_nogood_cuts = 24;
+    // Learn branch-decision nogoods into the persistent ConflictStore (bound
+    // disjunctions propagated at every node, general integers included)
+    // instead of appending binary-only rows to the global LP, which bumped
+    // global_lp_generation and discarded the LP sessions and checkpoints.
+    // Off: the row path above is used.
+    bool conflict_store = true;
+    std::size_t store_bytes = 64ull << 20;
+    // Farkas explanations can be longer than short decision nogoods. Retain
+    // them under the byte budget instead of discarding most at 16 literals;
+    // propagation already backs off when the store supplies few deductions.
+    std::size_t store_max_len = 64;
     // Prefer cMIR reduction (Prop. 2 / general Marchand-Wolsey) before / with
     // the coefficient-tightening loop.
     bool use_cmirror = true;

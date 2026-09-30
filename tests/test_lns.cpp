@@ -311,6 +311,47 @@ void test_reference_outside_box_is_refused() {
 
 }  // namespace
 
+// Guarded RENS keeps a neighbourhood that fixing every integral LP value would
+// empty. x0+x1 = 1, x2+x3 = 1, x0+x2 = 1 has exactly (1,0,0,1) and (0,1,1,0).
+// The integral point (0,0,1,1) violates x0+x1 = 1: fixing all four of its
+// values leaves no solution, while propagating each fixing refutes the ones
+// that conflict and must leave a feasible point in the box.
+void test_guarded_rens_stays_feasible_on_partitioning() {
+    LpProblem lp;
+    lp.A = from_triplets(3, 4, {0, 0, 1, 1, 2, 2}, {0, 1, 2, 3, 0, 2},
+                         {1., 1., 1., 1., 1., 1.});
+    lp.row_lo = {1., 1., 1.};
+    lp.row_hi = {1., 1., 1.};
+    lp.col_lo = {0., 0., 0., 0.};
+    lp.col_hi = {1., 1., 1., 1.};
+    lp.is_integer = {true, true, true, true};
+    lp.c = {1., 1., 1., 1.};
+    const std::vector<f64> relax = {0., 0., 1., 1.};
+    for (const f64 rate : {0.5, 1.0}) {
+        NeighborhoodProblem np;
+        std::uint32_t rs = 7u;
+        SolutionPool pool(2);
+        const bool built = build_neighborhood(Neighborhood::Rens, lp, lp.col_lo,
+                                              lp.col_hi, relax, {}, pool, rate,
+                                              1e-6, rs, np);
+        CHECK(built);
+        const LpProblem sub = apply_neighborhood(lp, np);
+        int feasible = 0;
+        for (std::uint64_t mask = 0; mask < 16; ++mask) {
+            std::vector<f64> x(4);
+            for (Index j = 0; j < 4; ++j)
+                x[static_cast<std::size_t>(j)] = (mask >> j) & 1ULL ? 1.0 : 0.0;
+            bool in_box = true;
+            for (Index j = 0; j < 4; ++j)
+                in_box &= x[static_cast<std::size_t>(j)] >= sub.col_lo[static_cast<std::size_t>(j)] &&
+                          x[static_cast<std::size_t>(j)] <= sub.col_hi[static_cast<std::size_t>(j)];
+            if (in_box && point_feasible(sub, x)) ++feasible;
+        }
+        CHECK(feasible >= 1);
+        CHECK(np.fixed >= 2);
+    }
+}
+
 int main() {
     test_bandit_explores_every_arm_first();
     test_bandit_favours_the_paying_arm();
@@ -321,5 +362,6 @@ int main() {
     test_local_branching_ball_contains_incumbent();
     test_proximity_excludes_the_incumbent();
     test_reference_outside_box_is_refused();
+    test_guarded_rens_stays_feasible_on_partitioning();
     return sor::test::finish("test_lns");
 }

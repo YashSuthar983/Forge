@@ -12,6 +12,7 @@
 #include "test_helpers.hpp"
 
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 using sor::core::f64;
@@ -21,6 +22,10 @@ using sor::search::ConflictGraph;
 using sor::search::MipPresolveOptions;
 using sor::search::ProbingOptions;
 using sor::sparse::from_triplets;
+
+namespace {
+inline std::size_t sz_t(Index i) { return static_cast<std::size_t>(i); }
+}  // namespace
 
 namespace {
 
@@ -167,6 +172,106 @@ void test_clique_probing_keeps_opt() {
         CHECK(lo[static_cast<std::size_t>(j)] <= 0.0 + 1e-9);
         CHECK(hi[static_cast<std::size_t>(j)] >= 0.0 - 1e-9);
     }
+}
+
+// Incremental clique probing: the hull over the feasible cases is taken only
+// over columns every case changed. Exactly one of x0..x2 is 1 and each x_i = 1
+// forces w <= 3, so every feasible case bounds w by 3 and the hull must too.
+void test_clique_probing_hull_tightens_common_implication() {
+    LpProblem lp;
+    // rows: x0+x1+x2 = 1 ; w + 10 x_i <= 13 (i = 0..2)
+    lp.A = from_triplets(4, 4, {0, 0, 0, 1, 1, 2, 2, 3, 3},
+                         {0, 1, 2, 3, 0, 3, 1, 3, 2},
+                         {1., 1., 1., 1., 10., 1., 10., 1., 10.});
+    lp.row_lo = {1., -sor::model::kInf, -sor::model::kInf, -sor::model::kInf};
+    lp.row_hi = {1., 13., 13., 13.};
+    lp.col_lo = {0., 0., 0., 0.};
+    lp.col_hi = {1., 1., 1., 10.};
+    lp.is_integer = {true, true, true, true};
+    lp.c = {0., 0., 0., -1.};
+    auto lo = lp.col_lo, hi = lp.col_hi;
+    ConflictGraph cg;
+    ProbingOptions po;
+    po.enabled = true;
+    po.dual_fix_in_probing = false;
+    (void)sor::search::build_conflict_graph(lp, lo, hi, cg, po);
+    CHECK(!cg.cliques().empty());
+    lo = lp.col_lo;
+    hi = lp.col_hi;
+    MipPresolveOptions opts;
+    opts.clique_probing = true;
+    const auto cd = sor::search::apply_clique_probing(lp, cg, lo, hi, opts);
+    CHECK(!cd.infeasible);
+    CHECK(cd.exactly_one_upgrades >= 1);
+    CHECK_NEAR(hi[3], 3.0, 1e-12);
+}
+
+// Soundness: every integer-feasible point of small random models stays inside
+// the box clique probing returns.
+void test_clique_probing_retains_every_integer_point() {
+    std::uint32_t state = 12345u;
+    const auto rnd = [&](int k) {
+        state = state * 1664525u + 1013904223u;
+        return static_cast<int>((state >> 8) % static_cast<std::uint32_t>(k));
+    };
+    int checked = 0;
+    for (int trial = 0; trial < 200; ++trial) {
+        const Index nb = 4, n = 6;  // x0..x3 binary, y4,y5 in [0,3]
+        LpProblem lp;
+        lp.col_lo.assign(n, 0.0);
+        lp.col_hi = {1., 1., 1., 1., 3., 3.};
+        lp.is_integer.assign(n, true);
+        lp.c.assign(n, 0.0);
+        std::vector<Index> r, c;
+        std::vector<f64> v;
+        // one AMO/exactly-one row over a random subset of the binaries
+        int members = 0;
+        for (Index j = 0; j < nb; ++j)
+            if (rnd(3) != 0) { r.push_back(0); c.push_back(j); v.push_back(1.); ++members; }
+        if (members < 2) { r.push_back(0); c.push_back(0); v.push_back(1.);
+                           r.push_back(0); c.push_back(1); v.push_back(1.); }
+        lp.row_lo.push_back(rnd(2) ? 1. : -sor::model::kInf);
+        lp.row_hi.push_back(1.);
+        for (Index i = 1; i <= 3; ++i) {
+            f64 act_hi = 0.;
+            for (Index j = 0; j < n; ++j) {
+                if (rnd(2) == 0) continue;
+                const int a = rnd(9) - 4;
+                if (a == 0) continue;
+                r.push_back(i); c.push_back(j); v.push_back(a);
+                act_hi += std::fabs(static_cast<f64>(a)) * lp.col_hi[sz_t(j)];
+            }
+            lp.row_lo.push_back(-sor::model::kInf);
+            lp.row_hi.push_back(std::floor(act_hi * 0.3) - 1.);
+        }
+        lp.A = from_triplets(4, n, r, c, v);
+        auto lo = lp.col_lo, hi = lp.col_hi;
+        ConflictGraph cg;
+        ProbingOptions po;
+        po.enabled = true;
+        po.dual_fix_in_probing = false;
+        (void)sor::search::build_conflict_graph(lp, lo, hi, cg, po);
+        lo = lp.col_lo;
+        hi = lp.col_hi;
+        MipPresolveOptions opts;
+        opts.clique_probing = true;
+        const auto cd = sor::search::apply_clique_probing(lp, cg, lo, hi, opts);
+        // enumerate every integer point of the ORIGINAL box
+        for (int code = 0; code < 16 * 16; ++code) {
+            std::vector<f64> x(n);
+            for (Index j = 0; j < nb; ++j) x[sz_t(j)] = (code >> j) & 1;
+            x[4] = (code >> 4) & 3;
+            x[5] = (code >> 6) & 3;
+            if (lp.max_row_violation(x) > 1e-9) continue;
+            ++checked;
+            CHECK(!cd.infeasible);
+            for (Index j = 0; j < n; ++j) {
+                CHECK(x[sz_t(j)] >= lo[sz_t(j)] - 1e-9);
+                CHECK(x[sz_t(j)] <= hi[sz_t(j)] + 1e-9);
+            }
+        }
+    }
+    CHECK(checked > 200);
 }
 
 void test_obbt_or_fbbt_tightens_wide_int() {
@@ -372,6 +477,8 @@ int main() {
     test_dual_fixing_counts_small_nonzero_row_coefficient();
     test_dual_fixing_does_not_relax_nearly_redundant_row();
     test_clique_probing_keeps_opt();
+    test_clique_probing_hull_tightens_common_implication();
+    test_clique_probing_retains_every_integer_point();
     test_obbt_or_fbbt_tightens_wide_int();
     test_obbt_only_probes_integer_columns();
     test_obbt_probe_ignores_original_objective_offset();

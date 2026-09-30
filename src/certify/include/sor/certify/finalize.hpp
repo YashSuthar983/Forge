@@ -51,6 +51,25 @@ SafeLpBound safe_lagrangian_lower_bound(const model::LpProblem& problem,
                                         const std::vector<f64>& col_lo,
                                         const std::vector<f64>& col_hi);
 
+// Reduced-cost bound tightening from ONE certified Lagrangian. With L the
+// safe bound above for multipliers y_min over [col_lo, col_hi], and d_j the
+// reduced cost it charged to integer column j's finite bound, every point
+// with x_j moved t units off that bound has objective >= L + |d_j| t. Returns
+// the integer bounds past which that exceeds cutoff_min (minimization sense):
+// x_j <= value when `upper`, x_j >= value otherwise. One O(nnz) pass for all
+// columns instead of one Lagrangian per candidate. bound_out receives L;
+// candidates_out the integer columns with a nonzero reduced cost examined.
+struct RcBoundChange {
+    core::Index col = -1;
+    bool upper = true;
+    f64 value = 0.0;
+};
+std::vector<RcBoundChange> safe_reduced_cost_tightenings(
+    const model::LpProblem& problem, const std::vector<f64>& y_min,
+    const std::vector<f64>& col_lo, const std::vector<f64>& col_hi,
+    f64 cutoff_min, SafeLpBound* bound_out = nullptr,
+    std::uint64_t* candidates_out = nullptr);
+
 // LP-based conflict analysis (plan 3H; Witzig, Berthold & Heinz): from a
 // Farkas ray y proving {row sides, box [col_lo, col_hi]} infeasible, the
 // bounds the proof actually uses that are tighter than the root box

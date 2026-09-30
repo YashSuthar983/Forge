@@ -229,7 +229,9 @@ void test_probing_fixes_column() {
     ConflictGraph cg;
     const auto d = sor::search::build_conflict_graph(lp, lo, hi, cg, {});
     CHECK(!d.infeasible);
-    CHECK(d.probe_fixings >= 1);
+    // The pre-probing propagation fixpoint already forces both columns; a
+    // dead probe side would fix them otherwise. Either way they are fixed.
+    CHECK(d.probe_fixings + d.probe_tightenings >= 1);
     CHECK_NEAR(lo[0], 1.0, 1e-12);
     CHECK_NEAR(lo[1], 1.0, 1e-12);
 }
@@ -603,9 +605,57 @@ void test_random_conflict_propagation_keeps_feasible_points() {
     CHECK(pruned > 0);  // non-vacuous: propagation does prune some boxes
 }
 
+// Probing must not stop at the first few thousand binaries: on drayage-25-23
+// the first 4000 probes fixed nothing and the rest fixed 1162 columns. Here a
+// column that only probing can fix (z = 0 forces p = q = 1, which a third row
+// forbids) sits after 3000 filler binaries.
+void test_probing_budget_reaches_late_binaries() {
+    const int fillers = 3000;
+    const Index n = fillers + 3;   // ..., p, q, z
+    const Index p = fillers, q = fillers + 1, z = fillers + 2;
+    std::vector<Index> rows, cols;
+    std::vector<double> vals;
+    Index m = 0;
+    for (int i = 0; i + 2 < fillers; i += 3) {   // packing rows over the fillers
+        for (int k = 0; k < 3; ++k) { rows.push_back(m); cols.push_back(i + k); vals.push_back(1.0); }
+        ++m;
+    }
+    const Index r_first = m;
+    for (const auto& e : std::vector<std::pair<Index, Index>>{{z, p}, {z, q}}) {
+        rows.push_back(m); cols.push_back(e.first); vals.push_back(1.0);
+        rows.push_back(m); cols.push_back(e.second); vals.push_back(1.0);
+        ++m;
+    }
+    rows.push_back(m); cols.push_back(p); vals.push_back(1.0);
+    rows.push_back(m); cols.push_back(q); vals.push_back(1.0);
+    ++m;
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(m, n, rows, cols, vals);
+    lp.row_lo.assign(static_cast<std::size_t>(m), -sor::model::kInf);
+    lp.row_hi.assign(static_cast<std::size_t>(m), 1.0);
+    for (Index i = r_first; i < r_first + 2; ++i) {   // z + p >= 1, z + q >= 1
+        lp.row_lo[static_cast<std::size_t>(i)] = 1.0;
+        lp.row_hi[static_cast<std::size_t>(i)] = sor::model::kInf;
+    }
+    lp.c.assign(static_cast<std::size_t>(n), 0.0);
+    lp.col_lo.assign(static_cast<std::size_t>(n), 0.0);
+    lp.col_hi.assign(static_cast<std::size_t>(n), 1.0);
+    lp.is_integer.assign(static_cast<std::size_t>(n), true);
+    auto lo = lp.col_lo, hi = lp.col_hi;
+    ConflictGraph g;
+    ProbingOptions po;   // defaults
+    const auto d = build_conflict_graph(lp, lo, hi, g, po);
+    CHECK(!d.infeasible);
+    CHECK(!d.probing_truncated);
+    CHECK(d.probes >= 2 * static_cast<std::uint64_t>(fillers));   // past the old 4000-probe cap
+    CHECK(d.probe_fixings + d.probe_tightenings >= 1);
+    CHECK(lo[static_cast<std::size_t>(z)] == 1.0);
+}
+
 }  // namespace
 
 int main() {
+    test_probing_budget_reaches_late_binaries();
     test_set_packing_row_gives_clique();
     test_precedence_row_gives_implication();
     test_probing_detects_infeasibility();

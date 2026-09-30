@@ -146,6 +146,7 @@ void test_fallback_without_model() {
     opts.feasibility_jump = false;
     opts.sub_mip_lns = false;
     opts.probing = false;
+    opts.root_primal_early = false;   // keep a tree to branch in
     BabDiagnostics diag;
     auto raw = sor::search::solve_milp(lp, opts, diag);
     CHECK(diag.sparse_sb_picks == 0);
@@ -204,7 +205,6 @@ void test_model_pick_fires() {
     opts.lp_rounding_repair = false;
     opts.integer_dive = false;
     opts.integer_neighborhood = false;
-    opts.objective_face = false;  // component test: keep the tree
     opts.integer_row_rounding = false;
     opts.sc_milp.enabled = false;
     opts.lifted.enabled = false;

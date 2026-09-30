@@ -4,6 +4,9 @@
 #include "sor/search/propagate.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <chrono>
 #include <cmath>
 #include <string>
@@ -67,6 +70,129 @@ void ConflictGraph::mark_binaries(const model::LpProblem& lp,
         binary_[sz(j)] = bin;
         if (bin) binary_cols_.push_back(j);
     }
+}
+
+void ConflictGraph::add_new_binaries(const model::LpProblem& lp,
+                                     const std::vector<f64>& col_lo,
+                                     const std::vector<f64>& col_hi) {
+    constexpr f64 tol = 1e-9;
+    if (lp.n_cols() != n_cols_) return;
+    for (Index j = 0; j < n_cols_; ++j) {
+        if (binary_[sz(j)]) continue;
+        const bool bin = !lp.is_integer.empty() && lp.is_integer[sz(j)] &&
+                         std::fabs(col_lo[sz(j)]) <= tol &&
+                         std::fabs(col_hi[sz(j)] - 1.0) <= tol;
+        if (!bin) continue;
+        binary_[sz(j)] = true;
+        binary_cols_.push_back(j);
+    }
+}
+
+ConflictGraph ConflictGraph::remapped(const std::vector<Index>& new_of_old,
+                                      Index new_n) const {
+    ConflictGraph g;
+    g.reset(new_n);
+    const auto mapped = [&](Index j) -> Index {
+        return (j >= 0 && sz(j) < new_of_old.size()) ? new_of_old[sz(j)] : -1;
+    };
+    for (Index j = 0; j < n_cols_; ++j) {
+        const Index f = mapped(j);
+        if (f < 0 || f >= new_n || !binary_[sz(j)]) continue;
+        g.binary_[sz(f)] = true;
+    }
+    for (Index f = 0; f < new_n; ++f)
+        if (g.binary_[sz(f)]) g.binary_cols_.push_back(f);
+    for (Index l = 0; l < 2 * n_cols_; ++l) {
+        const Index fl = mapped(lit_var(l));
+        if (fl < 0) continue;
+        for (const Index b : adj_[sz(l)]) {
+            if (b < l) continue;                       // each edge once
+            const Index fb = mapped(lit_var(b));
+            if (fb < 0) continue;
+            g.add_edge(lit_of(fl, lit_val(l)), lit_of(fb, lit_val(b)));
+        }
+    }
+    for (const Clique& c : cliques_) {
+        Clique m = c;
+        m.lits.clear();
+        for (const Index l : c.lits) {
+            const Index f = mapped(lit_var(l));
+            if (f >= 0) m.lits.push_back(lit_of(f, lit_val(l)));
+        }
+        g.add_clique(std::move(m));
+    }
+    for (const ImpliedBound& ib : implied_) {
+        const Index b = mapped(ib.bin), c = mapped(ib.col);
+        if (b < 0 || c < 0) continue;
+        ImpliedBound m = ib;
+        m.bin = b;
+        m.col = c;
+        g.add_implied_bound(m);
+    }
+    g.sort_adjacency();
+    return g;
+}
+
+ProbingState ProbingState::remapped(const std::vector<Index>& new_of_old,
+                                    Index new_n) const {
+    ProbingState s;
+    s.n_cols = new_n;
+    s.probed.assign(sz(new_n), 0);
+    s.gave_up = gave_up;
+    for (Index j = 0; j < n_cols && sz(j) < new_of_old.size(); ++j) {
+        const Index f = new_of_old[sz(j)];
+        if (f >= 0 && f < new_n && sz(j) < probed.size()) s.probed[sz(f)] = probed[sz(j)];
+    }
+    return s;
+}
+
+std::uint64_t matrix_fingerprint(const model::LpProblem& lp) {
+    std::uint64_t h = 1469598103934665603ull;
+    const auto mix = [&h](std::uint64_t v) {
+        h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        h *= 1099511628211ull;
+    };
+    mix(static_cast<std::uint64_t>(lp.n_rows()));
+    mix(static_cast<std::uint64_t>(lp.n_cols()));
+    const auto& rp = lp.A.pattern.row_ptr();
+    const auto& ci = lp.A.pattern.col_idx();
+    for (const auto v : rp) mix(static_cast<std::uint64_t>(v));
+    for (const auto v : ci) mix(static_cast<std::uint64_t>(v));
+    for (const f64 v : lp.A.vals) {
+        std::uint64_t bits;
+        std::memcpy(&bits, &v, sizeof bits);
+        mix(bits);
+    }
+    for (std::size_t j = 0; j < lp.is_integer.size(); ++j) mix(lp.is_integer[j] ? 1 : 0);
+    return h;
+}
+
+bool ProbingCarry::usable_for(const model::LpProblem& lp) const {
+    if (fingerprint == 0 || lp.n_cols() != graph.n_cols() ||
+        state.n_cols != lp.n_cols() || sz(lp.n_cols()) != lo.size() ||
+        sz(lp.n_cols()) != hi.size()) {
+        if (std::getenv("SOR_DEBUG_CARRY"))
+            std::fprintf(stderr, "carry: shape fp=%llu n=%d graph=%d state=%d\n",
+                         (unsigned long long)fingerprint, (int)lp.n_cols(),
+                         (int)graph.n_cols(), (int)state.n_cols);
+        return false;
+    }
+    if (matrix_fingerprint(lp) != fingerprint) {
+        if (std::getenv("SOR_DEBUG_CARRY")) std::fprintf(stderr, "carry: matrix differs\n");
+        return false;
+    }
+    // The facts hold on the box they were probed in; a consumer whose box is
+    // wider anywhere is a different problem.
+    constexpr f64 tol = 1e-9;
+    for (Index j = 0; j < lp.n_cols(); ++j) {
+        if (lp.col_lo[sz(j)] < lo[sz(j)] - tol || lp.col_hi[sz(j)] > hi[sz(j)] + tol) {
+            if (std::getenv("SOR_DEBUG_CARRY"))
+                std::fprintf(stderr, "carry: box wider at col %d [%g,%g] vs [%g,%g]\n", (int)j,
+                             lp.col_lo[sz(j)], lp.col_hi[sz(j)], lo[sz(j)], hi[sz(j)]);
+            return false;
+        }
+    }
+    return true;
 }
 
 bool ConflictGraph::add_edge(Index l1, Index l2) {
@@ -173,6 +299,82 @@ const std::vector<Index>& ConflictGraph::cliques_of(Index l) const {
     return lit_cliques_[sz(l)];
 }
 
+std::vector<BinaryRelation> binary_equivalences_from_conflicts(
+    const ConflictGraph& graph) {
+    const Index n = graph.n_cols();
+    const Index nv = 2 * n;
+    std::vector<std::vector<Index>> arcs(sz(nv)), reverse(sz(nv));
+    for (Index j = 0; j < n; ++j) {
+        if (!graph.is_binary(j)) continue;
+        for (int value = 0; value != 2; ++value) {
+            const Index from = lit_of(j, value);
+            for (const Index conflict : graph.neighbors(from)) {
+                const Index to = lit_neg(conflict);
+                arcs[sz(from)].push_back(to);
+                reverse[sz(to)].push_back(from);
+            }
+        }
+    }
+    // Iterative Kosaraju avoids recursion depth proportional to a large
+    // implication component. Graph edges only come from globally valid
+    // binary conflicts; no objective-based probe pin is admitted here.
+    std::vector<char> seen(sz(nv), 0);
+    std::vector<Index> order;
+    order.reserve(sz(nv));
+    std::vector<std::pair<Index, std::size_t>> stack;
+    for (Index start = 0; start < nv; ++start) {
+        if (!graph.is_binary(lit_var(start)) || seen[sz(start)]) continue;
+        seen[sz(start)] = 1;
+        stack.emplace_back(start, 0);
+        while (!stack.empty()) {
+            auto& [v, next] = stack.back();
+            if (next == arcs[sz(v)].size()) {
+                order.push_back(v);
+                stack.pop_back();
+            } else {
+                const Index w = arcs[sz(v)][next++];
+                if (!seen[sz(w)]) {
+                    seen[sz(w)] = 1;
+                    stack.emplace_back(w, 0);
+                }
+            }
+        }
+    }
+    std::vector<Index> component(sz(nv), -1);
+    Index nc = 0;
+    std::vector<Index> pending;
+    for (auto it = order.rbegin(); it != order.rend(); ++it) {
+        if (component[sz(*it)] >= 0) continue;
+        component[sz(*it)] = nc;
+        pending.push_back(*it);
+        while (!pending.empty()) {
+            const Index v = pending.back();
+            pending.pop_back();
+            for (const Index w : reverse[sz(v)]) {
+                if (component[sz(w)] >= 0) continue;
+                component[sz(w)] = nc;
+                pending.push_back(w);
+            }
+        }
+        ++nc;
+    }
+    std::vector<std::pair<Index, int>> representative(sz(nc), {-1, 0});
+    std::vector<BinaryRelation> relations;
+    for (Index j = 0; j < n; ++j) {
+        if (!graph.is_binary(j)) continue;
+        if (component[sz(lit_of(j, 0))] ==
+            component[sz(lit_of(j, 1))]) return {};
+        for (int value = 0; value != 2; ++value) {
+            const Index group = component[sz(lit_of(j, value))];
+            auto& rep = representative[sz(group)];
+            if (rep.first < 0) rep = {j, value};
+            else if (rep.first != j)
+                relations.push_back({j, rep.first, value != rep.second});
+        }
+    }
+    return relations;
+}
+
 // ------------------------------------------------------ clique extraction ---
 
 namespace {
@@ -273,7 +475,8 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
                                          std::vector<f64>& col_lo,
                                          std::vector<f64>& col_hi,
                                          ConflictGraph& out,
-                                         const ProbingOptions& opts) {
+                                         const ProbingOptions& opts,
+                                         ProbingState* state) {
     ConflictDiagnostics diag;
     const auto t0 = Clock::now();
     const Index n = lp.n_cols();
@@ -281,11 +484,29 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
         static_cast<Index>(col_hi.size()) != n)
         return diag;
 
-    out.reset(n);
-    out.mark_binaries(lp, col_lo, col_hi);
-    if (out.binaries().empty()) return diag;
+    // Resume: `out` already holds the facts an earlier pass found over these
+    // very columns and `state` says which literals that pass covered. Nothing is
+    // reset; only columns not yet probed are probed.
+    const bool resume = state != nullptr && state->n_cols == n &&
+                        state->probed.size() == sz(n) && out.n_cols() == n;
+    if (resume) {
+        out.add_new_binaries(lp, col_lo, col_hi);
+    } else {
+        out.reset(n);
+        out.mark_binaries(lp, col_lo, col_hi);
+        if (state != nullptr) {
+            state->n_cols = n;
+            state->probed.assign(sz(n), 0);
+            state->complete = false;
+            state->gave_up = false;
+        }
+    }
+    if (out.binaries().empty()) {
+        if (state != nullptr) state->complete = true;
+        return diag;
+    }
 
-    if (opts.row_cliques && lp.nnz() <= opts.max_nnz) {
+    if (!resume && opts.row_cliques && lp.nnz() <= opts.max_nnz) {
         const auto& rp = lp.A.pattern.row_ptr();
         for (Index i = 0; i < lp.n_rows(); ++i) {
             if (out.cliques().size() >= opts.max_cliques) break;
@@ -296,10 +517,177 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
     }
 
     if (opts.enabled && lp.nnz() <= opts.max_nnz) {
-        std::vector<f64> lo0, hi0, lo1, hi1;
+        // Incremental probing. Each side x_j = v is applied to the ONE global
+        // box, propagated through only the rows its fixing reaches (event
+        // queue; same row rule and integer rounding as the full sweep), logged
+        // on a trail and undone. Every output below is a function of the
+        // columns a side changed: a column neither side touched keeps its
+        // global bound on both sides, so it yields no hull tightening, no
+        // implied bound and no implication. A probe therefore costs its own
+        // cascade, not eight O(n) box copies, two full-matrix sweeps and an
+        // O(n) scan (which capped root probing at 128-480 probes in 3 s).
+        const Index m = lp.n_rows();
+        const ColumnRowIndex index = build_column_row_index(lp);
+        PropagationScratch scratch;
+        PropTrail trail;
+        const std::uint64_t visit_cap =
+            static_cast<std::uint64_t>(std::max(1, opts.probe_propagation_rounds)) *
+            static_cast<std::uint64_t>(std::max<Index>(1, m));
+
+        // Dual fixing inside a side (optimality-preserving, never used for
+        // implications). apply_dual_fixing's locks depend on the row SIDES
+        // only, never on the box, so inside a side it can newly fix only a
+        // column whose bounds that side changed; every other column was
+        // settled by the global pass run before probing. Columns whose GLOBAL
+        // box changes during probing are re-checked on the global box right
+        // away (`dirty`), which is what both sides would otherwise repeat.
+        std::vector<int> down_locks, up_locks;
+        if (opts.dual_fix_in_probing) {
+            down_locks.assign(sz(n), 0);
+            up_locks.assign(sz(n), 0);
+            const auto& rp = lp.A.pattern.row_ptr();
+            const auto& ci = lp.A.pattern.col_idx();
+            for (Index i = 0; i < m; ++i) {
+                const bool has_lo = std::isfinite(lp.row_lo[sz(i)]);
+                const bool has_hi = std::isfinite(lp.row_hi[sz(i)]);
+                for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+                    const f64 a = lp.A.vals[sz(k)];
+                    const Index j = ci[sz(k)];
+                    if (a > 0.0) {
+                        if (has_hi) ++up_locks[sz(j)];
+                        if (has_lo) ++down_locks[sz(j)];
+                    } else if (a < 0.0) {
+                        if (has_lo) ++up_locks[sz(j)];
+                        if (has_hi) ++down_locks[sz(j)];
+                    }
+                }
+            }
+        }
+        const bool have_int = !lp.is_integer.empty();
+        // Applies apply_dual_fixing's rule (zero cost allowed) to column k of
+        // (lo, hi), logging changes on `log` when given. False: box emptied.
+        const auto dual_fix_col = [&](Index k, std::vector<f64>& lo,
+                                      std::vector<f64>& hi, PropTrail* log,
+                                      bool& changed) -> bool {
+            changed = false;
+            const f64 l = lo[sz(k)], h = hi[sz(k)];
+            if (std::isfinite(l) && std::isfinite(h) && h - l <= opts.tol) return true;
+            if (!std::isfinite(l) && !std::isfinite(h)) return true;
+            const f64 c = lp.maximize ? -lp.c[sz(k)] : lp.c[sz(k)];
+            f64 nl = l, nh = h;
+            if (down_locks[sz(k)] == 0 && c >= 0.0 && std::isfinite(l)) {
+                if (h > l + opts.tol) nh = l;
+            } else if (up_locks[sz(k)] == 0 && c <= 0.0 && std::isfinite(h)) {
+                if (l < h - opts.tol) nl = h;
+            }
+            if (have_int && lp.is_integer[sz(k)]) {
+                if (std::isfinite(nl)) nl = std::ceil(nl - opts.tol);
+                if (std::isfinite(nh)) nh = std::floor(nh + opts.tol);
+            }
+            if (nl != l) {
+                if (log) log->push(k, BoundDir::Lower, nl, l, ReasonKind::Unknown, -1, 1);
+                lo[sz(k)] = nl;
+                changed = true;
+            }
+            if (nh != h) {
+                if (log) log->push(k, BoundDir::Upper, nh, h, ReasonKind::Unknown, -1, 1);
+                hi[sz(k)] = nh;
+                changed = true;
+            }
+            return !(nl > nh + opts.tol);
+        };
+        std::vector<Index> dirty;
+        std::vector<char> is_dirty(sz(n), 0);
+        const auto mark_dirty = [&](Index k) {
+            if (opts.dual_fix_in_probing && !is_dirty[sz(k)]) {
+                is_dirty[sz(k)] = 1;
+                dirty.push_back(k);
+            }
+        };
+
+        // Per-side record: the feasibility box (pin) and the box after dual
+        // fixing, for every column the side changed.
+        struct SideCol { Index col; f64 pin_lo, pin_hi, lo, hi; };
+        std::vector<SideCol> side[2];
+        std::vector<std::uint32_t> stamp(sz(n), 0), pos_stamp(sz(n), 0);
+        std::vector<std::int32_t> pos0(sz(n), -1);
+        std::uint32_t stamp_id = 0, probe_id = 0;
+        // Bring the global box to its propagation fixpoint first. A side is
+        // then different from the global box only by what its probe causes,
+        // which is what the per-side changed sets below rely on; deductions
+        // every side would re-derive are globally valid and taken once here.
+        {
+            std::vector<Index> all(sz(n));
+            for (Index k = 0; k < n; ++k) all[sz(k)] = k;
+            const auto fr = propagate_bounds_events(lp, index, col_lo, col_hi, all,
+                                                    scratch, &trail, 0, opts.tol,
+                                                    visit_cap);
+            if (!fr.feasible) {
+                diag.infeasible = true;
+                diag.probe_ms = ms_since(t0);
+                out.sort_adjacency();
+                return diag;
+            }
+            diag.probe_tightenings += fr.tightened;
+            for (const auto& e : trail.entries()) mark_dirty(e.var);
+            trail.clear();
+        }
+        std::vector<Index> seeds(1);
+
+        // x_j = v on the global box. Fills `rec`; undoes unless `keep`.
+        const auto run_side = [&](Index j, f64 v, std::vector<SideCol>& rec,
+                                  bool keep) -> bool {
+            const std::size_t mark = trail.size();
+            trail.push(j, BoundDir::Lower, v, col_lo[sz(j)], ReasonKind::Branch, -1, 1);
+            trail.push(j, BoundDir::Upper, v, col_hi[sz(j)], ReasonKind::Branch, -1, 1);
+            col_lo[sz(j)] = v;
+            col_hi[sz(j)] = v;
+            seeds[0] = j;
+            const auto pr = propagate_bounds_events(lp, index, col_lo, col_hi, seeds,
+                                                    scratch, &trail, 1, opts.tol,
+                                                    visit_cap);
+            bool feasible = pr.feasible;
+            rec.clear();
+            if (feasible) {
+                ++stamp_id;
+                const std::size_t end = trail.size();
+                for (std::size_t t = mark; t < end; ++t) {
+                    const Index k = trail.entries()[t].var;
+                    if (stamp[sz(k)] == stamp_id) continue;
+                    stamp[sz(k)] = stamp_id;
+                    rec.push_back({k, col_lo[sz(k)], col_hi[sz(k)],
+                                   col_lo[sz(k)], col_hi[sz(k)]});
+                }
+                if (opts.dual_fix_in_probing) {
+                    for (auto& r : rec) {
+                        bool changed = false;
+                        if (!dual_fix_col(r.col, col_lo, col_hi, &trail, changed)) {
+                            feasible = false;
+                            break;
+                        }
+                        r.lo = col_lo[sz(r.col)];
+                        r.hi = col_hi[sz(r.col)];
+                    }
+                }
+            }
+            if (keep && feasible) {
+                trail.truncate(mark);
+                for (const auto& r : rec) mark_dirty(r.col);
+                return true;
+            }
+            const auto& es = trail.entries();
+            for (std::size_t t = es.size(); t-- > mark;) {
+                const auto& e = es[t];
+                (e.dir == BoundDir::Lower ? col_lo : col_hi)[sz(e.var)] = e.old_bound;
+            }
+            trail.truncate(mark);
+            return feasible;
+        };
+
         const auto& bins = out.binaries();
-        const std::size_t budget =
+        std::size_t budget =
             std::min<std::size_t>(bins.size(), sz(opts.max_binaries_probed));
+        if (state != nullptr && state->gave_up) budget = 0;   // it did not pay last time
         if (budget < bins.size()) diag.probing_truncated = true;
 
         for (std::size_t idx = 0; idx < budget; ++idx) {
@@ -308,42 +696,31 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
                 diag.probing_truncated = true;
                 break;
             }
+            // Slow and unproductive: after a second with nothing fixed or
+            // tightened and under 15% of the binaries probed, the rest of the
+            // budget is unlikely to pay (irp: 6 ms per probe, 2.6M implications
+            // recorded, nothing fixed in 3 s). A model that yields late but
+            // probes fast (drayage: first yield after ~4000 probes, half the
+            // binaries done within a second) is not affected.
+            if ((idx & 0xF) == 0 && opts.give_up_unproductive && ms_since(t0) > 1000.0 &&
+                diag.probe_fixings + diag.probe_tightenings == 0 &&
+                static_cast<f64>(idx) < 0.15 * static_cast<f64>(budget)) {
+                diag.probing_truncated = true;
+                if (state != nullptr) state->gave_up = true;
+                break;
+            }
             const Index j = bins[idx];
+            if (state != nullptr) {
+                if (state->probed[sz(j)]) continue;   // an earlier pass covered it
+                state->probed[sz(j)] = 1;
+            }
             if (col_hi[sz(j)] - col_lo[sz(j)] < 0.5) continue;  // already fixed
 
-            lo0 = col_lo; hi0 = col_hi;
-            lo0[sz(j)] = 0.0; hi0[sz(j)] = 0.0;
-            auto r0 = propagate_bounds(lp, lo0, hi0, opts.tol,
-                                       opts.probe_propagation_rounds);
-            lo1 = col_lo; hi1 = col_hi;
-            lo1[sz(j)] = 1.0; hi1[sz(j)] = 1.0;
-            auto r1 = propagate_bounds(lp, lo1, hi1, opts.tol,
-                                       opts.probe_propagation_rounds);
+            const bool f0 = run_side(j, 0.0, side[0], false);
+            const bool f1 = run_side(j, 1.0, side[1], false);
             diag.probes += 2;
 
-            // Snapshot the FEASIBILITY-derived boxes before objective-based
-            // dual fixing. The latter may discard feasible points while
-            // retaining an optimum; its bounds cannot justify globally valid
-            // implications, variable-bound cuts, or clique edges.
-            std::vector<f64> pin_lo0 = lo0, pin_hi0 = hi0;
-            std::vector<f64> pin_lo1 = lo1, pin_hi1 = hi1;
-
-            if (opts.dual_fix_in_probing) {
-                if (r0.feasible) {
-                    const auto d0 = apply_dual_fixing(
-                        lp, lo0, hi0, opts.tol, opts.dual_fix_probe_rounds,
-                        /*zero_cost_ok=*/true);
-                    if (d0.infeasible) r0.feasible = false;
-                }
-                if (r1.feasible) {
-                    const auto d1 = apply_dual_fixing(
-                        lp, lo1, hi1, opts.tol, opts.dual_fix_probe_rounds,
-                        /*zero_cost_ok=*/true);
-                    if (d1.infeasible) r1.feasible = false;
-                }
-            }
-
-            if (!r0.feasible && !r1.feasible) {
+            if (!f0 && !f1) {
                 diag.infeasible = true;
                 diag.probe_ms = ms_since(t0);
                 out.sort_adjacency();
@@ -352,99 +729,124 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
             // One dead side fixes the column, and the surviving side's whole
             // propagated box comes with it: those bounds were derived under
             // the only assignment x_j can still take.
-            if (!r0.feasible) {
-                col_lo = lo1; col_hi = hi1;
+            if (!f0 || !f1) {
+                (void)run_side(j, f0 ? 0.0 : 1.0, side[f0 ? 0 : 1], true);
+                mark_dirty(j);
                 ++diag.probe_fixings;
-                continue;
-            }
-            if (!r1.feasible) {
-                col_lo = lo0; col_hi = hi0;
-                ++diag.probe_fixings;
-                continue;
-            }
-
-            for (Index k = 0; k < n; ++k) {
-                // Hull of the two sides. A feasible point sets x_j to 0 or to
-                // 1, so it lies in one box or the other, so it lies in their
-                // elementwise hull -- valid for every column, continuous ones
-                // included.
-                const f64 nl = std::min(lo0[sz(k)], lo1[sz(k)]);
-                const f64 nh = std::max(hi0[sz(k)], hi1[sz(k)]);
-                // Accept threshold: integer columns take anything (a tightening
-                // there deletes a whole feasible value), continuous columns
-                // need a gain worth the perturbation. Turning an infinite
-                // bound finite always qualifies.
-                const bool integral =
-                    !lp.is_integer.empty() && lp.is_integer[sz(k)];
-                const f64 width = col_hi[sz(k)] - col_lo[sz(k)];
-                const f64 need = (integral || !std::isfinite(width))
-                                     ? opts.tol
-                                     : std::max(opts.tol,
-                                                opts.hull_min_improve_rel * width);
-                if (nl > col_lo[sz(k)] + need) {
-                    col_lo[sz(k)] = nl;
-                    ++diag.probe_tightenings;
+            } else {
+                ++probe_id;
+                for (std::size_t q = 0; q < side[0].size(); ++q) {
+                    pos_stamp[sz(side[0][q].col)] = probe_id;
+                    pos0[sz(side[0][q].col)] = static_cast<std::int32_t>(q);
                 }
-                if (nh < col_hi[sz(k)] - need) {
-                    col_hi[sz(k)] = nh;
-                    ++diag.probe_tightenings;
+                bool dead = false;
+                // Every column changed by at least one side: side 0's list,
+                // then side 1's columns side 0 did not change.
+                const auto visit = [&](Index k, const SideCol* s0, const SideCol* s1) {
+                    const f64 g_lo = col_lo[sz(k)], g_hi = col_hi[sz(k)];
+                    const f64 width = g_hi - g_lo;
+                    // Hull of the two sides (dual-fixed boxes). A column only
+                    // one side changed has its global bound on the other.
+                    if (s0 && s1) {
+                        const f64 nl = std::min(s0->lo, s1->lo);
+                        const f64 nh = std::max(s0->hi, s1->hi);
+                        const bool integral = have_int && lp.is_integer[sz(k)];
+                        const f64 need = (integral || !std::isfinite(width))
+                                             ? opts.tol
+                                             : std::max(opts.tol,
+                                                        opts.hull_min_improve_rel * width);
+                        if (nl > col_lo[sz(k)] + need) {
+                            col_lo[sz(k)] = nl;
+                            ++diag.probe_tightenings;
+                            mark_dirty(k);
+                        }
+                        if (nh < col_hi[sz(k)] - need) {
+                            col_hi[sz(k)] = nh;
+                            ++diag.probe_tightenings;
+                            mark_dirty(k);
+                        }
+                        if (col_lo[sz(k)] > col_hi[sz(k)] + opts.tol) {
+                            dead = true;
+                            return;
+                        }
+                    }
+                    const f64 p0_lo = s0 ? s0->pin_lo : g_lo, p0_hi = s0 ? s0->pin_hi : g_hi;
+                    const f64 p1_lo = s1 ? s1->pin_lo : g_lo, p1_hi = s1 ? s1->pin_hi : g_hi;
+                    // Implied (variable) bounds from the FEASIBILITY boxes only.
+                    if (k != j && opts.implied_bounds &&
+                        out.implied_bounds().size() < opts.max_implied_bounds) {
+                        const f64 gap_need =
+                            std::isfinite(width)
+                                ? std::max(opts.tol, opts.implied_bound_min_gap_rel * width)
+                                : opts.tol;
+                        if (std::isfinite(p0_hi) && std::isfinite(p1_hi) &&
+                            std::fabs(p1_hi - p0_hi) > gap_need)
+                            out.add_implied_bound({j, k, p0_hi, p1_hi, true});
+                        if (std::isfinite(p0_lo) && std::isfinite(p1_lo) &&
+                            std::fabs(p1_lo - p0_lo) > gap_need)
+                            out.add_implied_bound({j, k, p0_lo, p1_lo, false});
+                    }
+                    // Implications: a side that pins binary k yields an edge
+                    // between the probe literal and the opposite of k's value.
+                    if (k == j || !out.is_binary(k)) return;
+                    if (col_hi[sz(k)] - col_lo[sz(k)] < 0.5) return;
+                    if (s0 && p0_hi - p0_lo < 0.5) {
+                        const int w = p0_lo > 0.5 ? 1 : 0;
+                        if (out.add_edge(lit_of(j, 0), lit_of(k, 1 - w)))
+                            ++diag.probe_implications;
+                    }
+                    if (s1 && p1_hi - p1_lo < 0.5) {
+                        const int w = p1_lo > 0.5 ? 1 : 0;
+                        if (out.add_edge(lit_of(j, 1), lit_of(k, 1 - w)))
+                            ++diag.probe_implications;
+                    }
+                };
+                for (const auto& r1 : side[1]) {
+                    if (dead) break;
+                    const Index k = r1.col;
+                    const SideCol* r0 = pos_stamp[sz(k)] == probe_id
+                                            ? &side[0][sz(pos0[sz(k)])] : nullptr;
+                    visit(k, r0, &r1);
+                    if (r0) pos_stamp[sz(k)] = 0;  // visited as a pair
                 }
-                if (col_lo[sz(k)] > col_hi[sz(k)] + opts.tol) {
+                for (const auto& r0 : side[0]) {
+                    if (dead) break;
+                    if (pos_stamp[sz(r0.col)] != probe_id) continue;
+                    visit(r0.col, &r0, nullptr);
+                }
+                if (dead) {
                     diag.infeasible = true;
                     diag.probe_ms = ms_since(t0);
                     out.sort_adjacency();
                     return diag;
                 }
-
-                // Implied (variable) bounds. Only FBBT boxes are valid for
-                // EVERY feasible point under x_j = 0 and x_j = 1. A bound
-                // changed by dual fixing describes an optimum-preserving
-                // reduction, not a globally valid cut derivation.
-                // pin_hi0[k] and pin_hi1[k] are valid upper bounds, so
-                // whichever value x_j takes, the interpolating inequality holds
-                // -- and unlike the hull above, it does NOT throw away which
-                // side each bound came from. Recorded only when the two sides
-                // disagree by enough to be worth a row.
-                if (k != j && opts.implied_bounds &&
-                    out.implied_bounds().size() < opts.max_implied_bounds) {
-                    const f64 gap_need =
-                        std::isfinite(width)
-                            ? std::max(opts.tol,
-                                       opts.implied_bound_min_gap_rel * width)
-                            : opts.tol;
-                    if (std::isfinite(pin_hi0[sz(k)]) &&
-                        std::isfinite(pin_hi1[sz(k)]) &&
-                        std::fabs(pin_hi1[sz(k)] - pin_hi0[sz(k)]) > gap_need)
-                        out.add_implied_bound(
-                            {j, k, pin_hi0[sz(k)], pin_hi1[sz(k)], true});
-                    if (std::isfinite(pin_lo0[sz(k)]) &&
-                        std::isfinite(pin_lo1[sz(k)]) &&
-                        std::fabs(pin_lo1[sz(k)] - pin_lo0[sz(k)]) > gap_need)
-                        out.add_implied_bound(
-                            {j, k, pin_lo0[sz(k)], pin_lo1[sz(k)], false});
+            }
+            // Global dual fixing of columns whose global box just changed.
+            if (opts.dual_fix_in_probing) {
+                for (const Index k : dirty) {
+                    is_dirty[sz(k)] = 0;
+                    bool changed = false;
+                    if (!dual_fix_col(k, col_lo, col_hi, nullptr, changed)) {
+                        diag.infeasible = true;
+                        diag.probe_ms = ms_since(t0);
+                        out.sort_adjacency();
+                        return diag;
+                    }
+                    if (changed) ++diag.probe_tightenings;
                 }
-
-                // Implications. A binary that both sides leave free tells us
-                // nothing; one that a side pins yields a conflict edge between
-                // the probe literal and the OPPOSITE of the pinned value.
-                // Dual-only pins are excluded regardless of objective cost:
-                // a cost-based pin need not hold for every feasible point.
-                if (k == j || !out.is_binary(k)) continue;
-                if (col_hi[sz(k)] - col_lo[sz(k)] < 0.5) continue;
-                if (pin_hi0[sz(k)] - pin_lo0[sz(k)] < 0.5) {
-                    const int w = pin_lo0[sz(k)] > 0.5 ? 1 : 0;
-                    if (out.add_edge(lit_of(j, 0), lit_of(k, 1 - w)))
-                        ++diag.probe_implications;
-                }
-                if (pin_hi1[sz(k)] - pin_lo1[sz(k)] < 0.5) {
-                    const int w = pin_lo1[sz(k)] > 0.5 ? 1 : 0;
-                    if (out.add_edge(lit_of(j, 1), lit_of(k, 1 - w)))
-                        ++diag.probe_implications;
-                }
+                dirty.clear();
             }
         }
     }
 
+    if (state != nullptr) {
+        // Complete iff every current binary is marked probed (a budget that
+        // stopped short leaves the rest for the next pass).
+        bool all = opts.enabled;
+        for (const Index j : out.binaries())
+            if (!state->probed[sz(j)]) { all = false; break; }
+        state->complete = all;
+    }
     out.sort_adjacency();
     diag.edges = out.n_edges();
     diag.implied_bounds = out.implied_bounds().size();

@@ -660,9 +660,20 @@ void test_latest_bab_learns_nogood() {
     opts.policy = MilpPolicy::Latest;
     opts.conflict_cut.enabled = true;
     opts.conflict_cut.nogood_cuts = true;
+    // The LP-row path (kept as the fallback) ...
+    opts.conflict_cut.conflict_store = false;
     BabDiagnostics diag;
     sor::search::solve_milp(lp, opts, diag);
     CHECK(diag.nogood_cuts_global >= 1);
+    CHECK(diag.conflict_store.added == 0);
+    // ... and the persistent store, which learns the same nogood without
+    // touching the LP.
+    opts.conflict_cut.conflict_store = true;
+    BabDiagnostics stored;
+    sor::search::solve_milp(lp, opts, stored);
+    // A unit clause is applied to the root box instead of being stored.
+    CHECK(stored.conflict_store.added + stored.conflict_store_root_units >= 1);
+    CHECK(stored.nogood_cuts_global == 0);
 }
 
 void test_classical_learns_no_conflict_family() {
@@ -758,7 +769,10 @@ void test_flugpl_latest_dual_not_above_opt() {
 
     if (r.status == Status::Optimal || diag.globally_proved) {
         CHECK_NEAR(diag.incumbent, kOpt, kTol);
-        CHECK_NEAR(diag.dual_bound, kOpt, kTol);
+        // A proof may close on the solver's MIP gap tolerance rather than by
+        // exhausting the tree, so the bound is only within opts.gap_tol of
+        // the optimum (still never above it: dual_ok above).
+        CHECK_NEAR(diag.dual_bound, kOpt, 2.0 * opts.gap_tol);
     } else if (r.status == Status::Feasible) {
         CHECK(std::isfinite(diag.incumbent));
         CHECK(diag.incumbent >= kOpt * (1.0 - kTol));
@@ -804,7 +818,7 @@ void test_misc03_dense_binary_mexi_auto_off() {
     CHECK(diag.conflict_cut_diag.attempts >= 1);
     // The mixed-model Mexi path must execute. Accepted insertion is the
     // enumerable pair model, not this timed solve and not p0033.
-    CHECK(diag.nogood_cuts_global >= 1);
+    CHECK(diag.nogood_cuts_global + diag.conflict_store.added >= 1);
     CHECK(diag.conflict_cuts_global +
               diag.conflict_cut_diag.validation_rejected ==
           diag.conflict_cut_diag.learned);

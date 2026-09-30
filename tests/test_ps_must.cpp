@@ -86,7 +86,10 @@ void test_m3_milp() {
         std::move(raw), sor::search::milp_evidence(diag, opts));
     CHECK(result.status == Status::Optimal);
     CHECK_NEAR(result.objective, 1.0, 1e-8);
-    CHECK(diag.nodes >= 1);
+    // The proof either came from the tree or, when an early incumbent
+    // already matches the certified root LP bound, before any node was
+    // popped -- from that root certificate.
+    CHECK(diag.nodes >= 1 || std::isfinite(diag.root_certified_bound));
 }
 
 void test_m4_qp() {

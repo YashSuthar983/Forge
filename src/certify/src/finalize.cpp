@@ -143,6 +143,7 @@ ProofEvidence check_lp_point(const model::LpProblem& problem,
     const auto m = static_cast<std::size_t>(problem.n_rows());
     const auto n = static_cast<std::size_t>(problem.n_cols());
     if (raw.x.size() != n) return ev;
+    for (f64 v : raw.x) if (!std::isfinite(v)) return ev;
 
     ev.max_primal_violation = std::max(problem.max_row_violation(raw.x),
                                        problem.max_bound_violation(raw.x));
@@ -160,26 +161,30 @@ ProofEvidence check_lp_point(const model::LpProblem& problem,
     // Public row multipliers follow the simplex convention: in minimization
     // form reduced costs are c - A'y.  Transform only objective sense here;
     // HPR/PDHG negate their internal proximal multiplier when exporting it.
+    for (f64 v : raw.y) if (!std::isfinite(v)) {
+        ev.checker_passed = false;
+        return ev;
+    }
     const f64 sense = problem.maximize ? -1.0 : 1.0;
-    std::vector<f64> aty(n, 0.0);
+    std::vector<long double> aty(n, 0.0L);
     std::vector<long double> activity(m, 0.0L);
     const auto& rp = problem.A.pattern.row_ptr();
     const auto& ci = problem.A.pattern.col_idx();
     for (core::Index i = 0; i < problem.n_rows(); ++i) {
         const f64 yi_min = sense * raw.y[sz(i)];
         for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
-            aty[sz(ci[sz(k)])] += yi_min * problem.A.vals[sz(k)];
+            aty[sz(ci[sz(k)])] += static_cast<long double>(yi_min) * problem.A.vals[sz(k)];
             activity[sz(i)] +=
                 static_cast<long double>(problem.A.vals[sz(k)]) *
                 raw.x[sz(ci[sz(k)])];
         }
     }
 
-    std::vector<f64> reduced(n, 0.0);
+    std::vector<long double> reduced(n, 0.0L);
     f64 dres = 0.0;
     for (std::size_t j = 0; j < n; ++j) {
-        const f64 r = sense * problem.c[j] - aty[j];
-        reduced[j] = r;
+        reduced[j] = static_cast<long double>(sense) * problem.c[j] - aty[j];
+        const f64 r = static_cast<f64>(reduced[j]);
         const f64 btol = scaled_tol(primal_feas_tol, raw.x[j]);
         const bool at_lo = std::isfinite(problem.col_lo[j]) &&
                            raw.x[j] <= problem.col_lo[j] + btol;
@@ -208,34 +213,44 @@ ProofEvidence check_lp_point(const model::LpProblem& problem,
 
     bool finite = true;
     long double dmin = 0.0L;
+    long double magnitude = std::fabs(static_cast<long double>(problem.obj_offset));
     for (std::size_t j = 0; j < n && finite; ++j) {
-        const f64 r = reduced[j];
-        const f64 b = r >= 0.0 ? problem.col_lo[j] : problem.col_hi[j];
-        if (!std::isfinite(b)) {
-            // Tolerance is used only to decide whether an infinite-bound
-            // product is the harmless limiting value zero.  On finite bounds
-            // every reduced-cost contribution must be retained; dropping
-            // small terms can manufacture an objective gap on large models.
-            if (std::fabs(r) > dual_feas_tol) finite = false;
-            continue;
-        }
-        dmin += static_cast<long double>(r) * b;
+        const long double r = reduced[j];
+        if (r == 0.0L) continue;
+        const f64 b = r > 0.0L ? problem.col_lo[j] : problem.col_hi[j];
+        if (!std::isfinite(b) || !std::isfinite(r)) { finite = false; break; }
+        const long double term = r * b;
+        dmin += term;
+        magnitude += std::fabs(term);
     }
     for (std::size_t i = 0; i < m && finite; ++i) {
         const f64 yi = sense * raw.y[i];
-        const f64 b = yi >= 0.0 ? problem.row_lo[i] : problem.row_hi[i];
-        if (!std::isfinite(b)) {
-            if (std::fabs(yi) > dual_feas_tol) finite = false;
-            continue;
-        }
-        dmin += static_cast<long double>(yi) * b;
+        if (yi == 0.0) continue;
+        const f64 b = yi > 0.0 ? problem.row_lo[i] : problem.row_hi[i];
+        if (!std::isfinite(b)) { finite = false; break; }
+        const long double term = static_cast<long double>(yi) * b;
+        dmin += term;
+        magnitude += std::fabs(term);
     }
-
+    long double dual_obj = 0.0L;
     if (finite) {
+        dmin -= 1e-12L * (1.0L + magnitude);
+        dual_obj = sense * dmin + problem.obj_offset;
+    } else {
+        // A tolerance-small multiplier times infinity still makes this
+        // Lagrangian unbounded. Recover only through valid implied bounds
+        // or an independently recomputed, chargeable multiplier correction.
+        std::vector<f64> y_min(m);
+        for (std::size_t i = 0; i < m; ++i) y_min[i] = sense * raw.y[i];
+        const auto bound = safe_lagrangian_lower_bound(
+            problem, y_min, problem.col_lo, problem.col_hi);
+        finite = bound.finite;
+        dual_obj = static_cast<long double>(sense) * bound.value;
+    }
+    if (finite && std::isfinite(dual_obj)) {
         const f64 primal_obj = problem.objective(raw.x);
-        const f64 dual_obj = sense * static_cast<f64>(dmin) + problem.obj_offset;
-        ev.gap_rel = std::fabs(primal_obj - dual_obj) /
-                     (1.0 + std::fabs(primal_obj));
+        ev.gap_rel = static_cast<f64>(std::fabs(primal_obj - dual_obj) /
+                     (1.0L + std::fabs(primal_obj)));
     }
     ev.checker_passed = ev.checker_passed &&
                         std::isfinite(ev.max_dual_violation);
@@ -630,10 +645,14 @@ SolveResult finalize_result(RawResult raw, const ProofEvidence& ev) {
 // point); if none exists the bound is -inf -- never treated as zero. The sum
 // is accumulated in long double and reduced by a conservative bound on its
 // own rounding error.
-SafeLpBound safe_lagrangian_lower_bound(const model::LpProblem& problem,
-                                        const std::vector<f64>& y_min,
-                                        const std::vector<f64>& col_lo,
-                                        const std::vector<f64>& col_hi) {
+namespace {
+// The bound itself, optionally exporting the reduced costs d = c - A'y of the
+// (possibly corrected) multipliers it was computed from.
+SafeLpBound lagrangian_bound_impl(const model::LpProblem& problem,
+                                  const std::vector<f64>& y_min,
+                                  const std::vector<f64>& col_lo,
+                                  const std::vector<f64>& col_hi,
+                                  std::vector<long double>* d_out) {
     SafeLpBound out;
     const core::Index m = problem.n_rows(), n = problem.n_cols();
     if (y_min.size() != sz(m) || col_lo.size() != sz(n) || col_hi.size() != sz(n))
@@ -775,6 +794,65 @@ SafeLpBound safe_lagrangian_lower_bound(const model::LpProblem& problem,
     const long double err = 1e-12L * (1.0L + mag);
     out.value = static_cast<f64>(L - err);
     out.finite = std::isfinite(out.value);
+    if (d_out != nullptr) *d_out = std::move(d);
+    return out;
+}
+}  // namespace
+
+SafeLpBound safe_lagrangian_lower_bound(const model::LpProblem& problem,
+                                        const std::vector<f64>& y_min,
+                                        const std::vector<f64>& col_lo,
+                                        const std::vector<f64>& col_hi) {
+    return lagrangian_bound_impl(problem, y_min, col_lo, col_hi, nullptr);
+}
+
+std::vector<RcBoundChange> safe_reduced_cost_tightenings(
+    const model::LpProblem& problem, const std::vector<f64>& y_min,
+    const std::vector<f64>& col_lo, const std::vector<f64>& col_hi,
+    f64 cutoff_min, SafeLpBound* bound_out, std::uint64_t* candidates_out) {
+    std::vector<RcBoundChange> out;
+    if (candidates_out != nullptr) *candidates_out = 0;
+    const core::Index n = problem.n_cols();
+    std::vector<long double> d;
+    const SafeLpBound lb =
+        lagrangian_bound_impl(problem, y_min, col_lo, col_hi, &d);
+    if (bound_out != nullptr) *bound_out = lb;
+    if (!lb.finite || !std::isfinite(cutoff_min) || d.size() != sz(n) ||
+        problem.is_integer.size() != sz(n))
+        return out;
+    // Room between the certified bound and the cutoff. Every excluded region
+    // below must raise the bound by MORE than this.
+    const long double room =
+        static_cast<long double>(cutoff_min) - static_cast<long double>(lb.value);
+    if (room < 0.0L) return out;   // the whole box is already cut off
+    const auto integral = [](f64 v) {
+        return std::isfinite(v) && std::fabs(v) < 0x1p52 && v == std::trunc(v);
+    };
+    for (core::Index j = 0; j < n; ++j) {
+        if (!problem.is_integer[sz(j)]) continue;
+        const long double dj = d[sz(j)];
+        const f64 lo = col_lo[sz(j)], hi = col_hi[sz(j)];
+        if (!(hi > lo)) continue;
+        // lb charged d_j to lo (d_j > 0) or hi (d_j < 0), both finite here.
+        // Restricting x_j to [lo + t, hi] raises that one term by |d_j| t;
+        // every other term can only rise, since a smaller box only tightens
+        // the row-implied bounds charged to columns without declared ones.
+        // So the region is cut off once |d_j| t > room; t is the smallest
+        // integer step past room / |d_j|, with a relative margin for the
+        // long-double product.
+        const long double ad = std::fabs(dj);
+        if (!(ad > 0.0L)) continue;
+        const bool up = dj > 0.0L;
+        const f64 base = up ? lo : hi;
+        if (!integral(base)) continue;
+        if (candidates_out != nullptr) ++*candidates_out;
+        const long double steps = room / (ad * (1.0L - 1e-12L));
+        if (!(steps < static_cast<long double>(hi - lo))) continue;
+        const f64 keep = static_cast<f64>(std::floor(steps + 1e-9L));
+        const f64 nb = up ? base + keep : base - keep;
+        if (up ? !(nb < hi) : !(nb > lo)) continue;
+        out.push_back(RcBoundChange{j, up, nb});
+    }
     return out;
 }
 
@@ -840,4 +918,3 @@ std::vector<FarkasBoundUse> farkas_conflict_bounds(
 }
 
 }  // namespace sor::certify
-
