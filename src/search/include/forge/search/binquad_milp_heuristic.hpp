@@ -44,6 +44,16 @@ struct BinquadMilpHeuristicResult {
     f64 max_violation = 0.0;   // the independent re-check's own number
 };
 
+// Cheap pre-check: true iff `lp`, after structural presolve, would be
+// pure-binary and within max_cols -- i.e. iff try_binquad_milp_heuristic
+// below would set eligible=true. Runs presolve internally (the same cost
+// the full call pays at its own start), but nothing beyond that: no BqData
+// build, no device, no search. Meant to gate device acquisition -- a caller
+// should not pay for a Vulkan (or even CPU) device on a model this
+// heuristic could never use.
+bool binquad_milp_eligible(const model::LpProblem& lp,
+                           const BinquadMilpHeuristicOptions& opts = {});
+
 // GPU proposes, CPU verifies: `x` (when found) is independently re-checked
 // against the ORIGINAL `lp` -- rows, bounds, integrality, in the caller's
 // own space, not the presolved copy the search actually ran on or the

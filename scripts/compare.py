@@ -72,6 +72,7 @@ _PAT = {
         r"cold fallback\s+(yes|no)", re.M),
     "checker_validation": re.compile(r"^validation:\s+(\S+)\s*$", re.M),
     "checker_verified": re.compile(r"^VERIFIED\s*$", re.M),
+    "checker_unverified": re.compile(r"^UNVERIFIED\s*$", re.M),
     "bab_threads": re.compile(r"^bab threads:\s+(\d+)\s*$", re.M),
     "mip_gap_tol": re.compile(r"^mip gap tolerance:\s+(\S+)\s*$", re.M),
 }
@@ -411,10 +412,19 @@ def run_sor(model: Path, engine: str, backend: str, time_limit: float,
                         scope = _PAT["checker_validation"].search(checked.stdout)
                         r.checker_validation_scope = (
                             scope.group(1) if scope else None)
-                        r.checker_verified = bool(
-                            checked.returncode == 0 and scope is not None and
-                            _PAT["checker_verified"].search(checked.stdout))
-                        if not r.checker_verified:
+                        is_unverified = bool(
+                            checked.returncode == 3 and scope is not None and
+                            _PAT["checker_unverified"].search(checked.stdout))
+                        if is_unverified:
+                            r.checker_verified = None
+                            r.checker_error = (
+                                "checker outcome unverified: insufficient "
+                                "certificate for the claim")
+                        else:
+                            r.checker_verified = bool(
+                                checked.returncode == 0 and scope is not None and
+                                _PAT["checker_verified"].search(checked.stdout))
+                        if not is_unverified and not r.checker_verified:
                             r.checker_error = "checker rejected or output was unparseable"
                     except subprocess.TimeoutExpired as e:
                         r.checker_timed_out = True

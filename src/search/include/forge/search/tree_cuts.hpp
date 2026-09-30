@@ -48,6 +48,23 @@ struct TreeCutOptions {
     std::uint64_t stall_skip_nodes = 4000;
     int max_cuts_per_node = 3;
     int max_rounds_per_node = 1;
+    // Re-solve the node LP with the cuts just selected (warm dual simplex from
+    // the node basis, rows appended non-binding). Every cut was derived over
+    // this node's box, so the re-solved objective is a valid bound for the
+    // whole subtree: it is folded into node.bound, which both children
+    // inherit, and a node whose new bound reaches the cutoff is pruned. The
+    // rows themselves are not carried into the children's LPs.
+    bool resolve_with_local = true;
+    // Iteration cap for that re-solve, as a multiple of the node LP's rows.
+    f64 resolve_iter_per_row = 2.0;
+    // A node lineage carries at most this many inherited local rows. Zero (the
+    // default) keeps them out of descendants: measured on exp-1-500-5-5 and
+    // beasleyC3, a subtree solved with inherited rows cannot use the prepared
+    // LP session or the checkpoint cache (their rows differ from global_lp),
+    // and throughput fell 4x (7923 -> 1834 nodes, worse bound in 20 s). The
+    // machinery is complete and oracle-tested; it needs sessions keyed on the
+    // local row set before it can pay.
+    int max_local_rows = 0;
     // --- GCS ---------------------------------------------------------------
     bool gcs_enabled = true;
     int gcs_promote_max = 10;

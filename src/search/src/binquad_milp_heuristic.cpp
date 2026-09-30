@@ -84,6 +84,17 @@ f64 point_max_violation(const model::LpProblem& lp, const std::vector<f64>& x) {
 
 }  // namespace
 
+bool binquad_milp_eligible(const model::LpProblem& lp,
+                           const BinquadMilpHeuristicOptions& opts) {
+    if (lp.n_cols() > opts.max_cols) return false;
+    MilpPresolveStats pstats;
+    MilpPresolveResult pre = run_structural_presolve(lp, opts.presolve, pstats);
+    if (pre.infeasible) return false;
+    const model::LpProblem& reduced = pre.reduced;
+    if (reduced.n_cols() > opts.max_cols) return false;
+    return is_pure_binary(reduced, opts.presolve.tol);
+}
+
 BinquadMilpHeuristicResult
 try_binquad_milp_heuristic(const model::LpProblem& lp,
                            const BinquadMilpHeuristicOptions& opts,

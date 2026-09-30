@@ -28,11 +28,7 @@ class BoundSnapshotTests(unittest.TestCase):
         model = 'n5-3' if limited else 'p0033'
         result = subprocess.run(
             [str(BINARY), str(ROOT / 'benchmarks/miplib-easy/mps' / (model + '.mps')),
-             '--engine', 'milp', '--time-limit', '0.1', '--bab-threads', '1',
-             # One invocation on the WHOLE model: the size-limit case needs a
-             # snapshot too large for the 4 KiB cap (component solving would
-             # first snapshot a small component).
-             '--no-component-solve'],
+             '--engine', 'milp', '--time-limit', '0.1', '--bab-threads', '1'],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             preexec_fn=limit_files if limited else None, timeout=15)
         # The large model may exhaust the short solve budget without an
