@@ -373,12 +373,11 @@ public:
         f64 dval = 0.0;
         for (std::size_t j = 0; j < nc_ && finite; ++j) {
             const f64 r = c_[j] + Aty[j];
-            const f64 r_orig = r / col_scale_[j];
-            const f64 scale = 1.0 + std::fabs(c_[j] / col_scale_[j]);
             const f64 b = (r >= 0.0) ? col_lo_[j] : col_hi_[j];
             if (std::isinf(b)) {
-                // E1: tolerance, not exact-zero (matches cpu_lp_device).
-                if (std::fabs(r_orig) > last_dual_tol_ * scale) finite = false;
+                // Scaling may underflow a nonzero reduced cost. Support on
+                // an infinite endpoint requires exact zero before unscaling.
+                if (r != 0.0) finite = false;
                 continue;
             }
             dval += mul_zero_safe(r, b);
@@ -387,7 +386,7 @@ public:
             const f64 yi = yp[i];
             const f64 b = (yi >= 0.0) ? row_hi_[i] : row_lo_[i];
             if (std::isinf(b)) {
-                if (std::fabs(yi * row_scale_[i]) > last_dual_tol_) finite = false;
+                if (yi != 0.0) finite = false;
                 continue;
             }
             dval -= mul_zero_safe(yi, b);
@@ -585,6 +584,9 @@ private:
 
     Buf create_raw(VkDeviceSize size, VkBufferUsageFlags usage,
                    VkMemoryPropertyFlags mem_props, bool map) {
+        // Vulkan forbids zero-sized buffers. Keep a valid dummy allocation
+        // for empty sparse supports; shaders never access those entries.
+        size = std::max<VkDeviceSize>(size, sizeof(f64));
         Buf b;
         b.size = size;
         VkBufferCreateInfo bi{};
@@ -610,6 +612,10 @@ private:
     }
 
     Buf create_device_buffer(const void* data, VkDeviceSize size) {
+        if (size == 0)
+            return create_raw(sizeof(f64), VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false);
         Buf staging = create_raw(size,
                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
@@ -649,6 +655,7 @@ private:
     }
 
     void upload_vec(Buf& dst, const std::vector<f64>& v) {
+        if (v.empty()) return;
         Buf staging = create_raw(byte_size(v),
                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
@@ -664,6 +671,7 @@ private:
     }
 
     void download_vec(Buf& src, std::vector<f64>& v) {
+        if (v.empty()) return;
         Buf staging = create_raw(byte_size(v),
                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
@@ -679,12 +687,14 @@ private:
     }
 
     void copy_buf(Buf& src, Buf& dst, VkDeviceSize size) {
+        if (size == 0) return;
         VkCommandBuffer cmd = begin_once();
         copy_buf_cmd(cmd, src, dst, size);
         end_submit_wait(cmd);
     }
 
     void copy_buf_cmd(VkCommandBuffer cmd, Buf& src, Buf& dst, VkDeviceSize size) {
+        if (size == 0) return;
         // Compute -> transfer, copy, transfer -> compute.
         VkMemoryBarrier to_xfer{};
         to_xfer.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;

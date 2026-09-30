@@ -63,7 +63,7 @@ f64 parse_num(const std::string& s, std::size_t line_no) {
     try {
         std::size_t used = 0;
         const f64 v = std::stod(s, &used);
-        if (used != s.size()) throw std::invalid_argument("trailing");
+        if (used != s.size() || !std::isfinite(v)) throw std::invalid_argument("nonfinite or trailing");
         return v;
     } catch (...) {
         throw std::runtime_error("MPS line " + std::to_string(line_no) +

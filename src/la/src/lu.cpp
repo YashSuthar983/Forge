@@ -26,6 +26,8 @@ struct Elim {
     std::vector<std::vector<Index>> col_rows;
     std::vector<Index>              col_cnt;
     std::vector<char>               row_live, col_live;
+    std::vector<std::uint64_t>       compact_stamp;
+    std::uint64_t compact_generation = 0;
 
     // Candidate queues. Entries are validated on pop, never removed eagerly.
     std::vector<Index> q_col1, q_row1;
@@ -61,19 +63,23 @@ struct Elim {
     // both the Markowitz cost and the singleton test.
     f64 compact_col(Index j) {
         auto& cr = col_rows[sz(j)];
-        std::sort(cr.begin(), cr.end());
-        cr.erase(std::unique(cr.begin(), cr.end()), cr.end());
+        if (++compact_generation == 0) {
+            std::fill(compact_stamp.begin(), compact_stamp.end(), 0);
+            compact_generation = 1;
+        }
         std::size_t w = 0;
         f64 amax = 0.0;
         for (std::size_t k = 0; k < cr.size(); ++k) {
             const Index i = cr[k];
-            if (!row_live[sz(i)]) continue;
+            if (!row_live[sz(i)] || compact_stamp[sz(i)] == compact_generation) continue;
+            compact_stamp[sz(i)] = compact_generation;
             const f64* v = find(i, j);
             if (v == nullptr) continue;
             cr[w++] = i;
             amax = std::max(amax, std::fabs(*v));
         }
         cr.resize(w);
+        if (!std::is_sorted(cr.begin(), cr.end())) std::sort(cr.begin(), cr.end());
         col_cnt[sz(j)] = static_cast<Index>(w);
         return amax;
     }
@@ -143,6 +149,7 @@ bool BasisFactor::factorize(Index m,
     e.row_cols.resize(sz(m));  e.row_vals.resize(sz(m));
     e.col_rows.resize(sz(m));
     e.col_cnt.assign(sz(m), 0);
+    e.compact_stamp.assign(sz(m), 0);
     e.row_live.assign(sz(m), 1); e.col_live.assign(sz(m), 1);
     e.bucket.resize(sz(m) + 2);
 

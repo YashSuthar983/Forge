@@ -36,6 +36,27 @@ struct SimplexPrepared {
 SimplexPrepared prepare_simplex_model(const model::LpProblem& problem,
                                       const SimplexOptions& opts);
 
+// Tolerances belong to the current solve policy, not the constructor that
+// happened to prepare the numeric matrix for a repeated-LP session.
+inline std::vector<f64> prepared_tolerances(const SimplexPrepared& p,
+                                           const SimplexOptions& opts,
+                                           bool dual) {
+    model::validate_lp_policy(opts.primal_feas_tol, opts.dual_feas_tol, opts.gap_tol, opts.time_limit_s);
+    if (p.factor_scaling_identity->ruiz_iterations != opts.ruiz_iterations ||
+        p.factor_scaling_identity->ruiz_power_of_two != opts.ruiz_power_of_two)
+        throw std::invalid_argument("prepared simplex: scaling policy changed; create a new session");
+    const auto n = static_cast<std::size_t>(p.scaled.n_cols());
+    const auto m = static_cast<std::size_t>(p.scaled.n_rows());
+    std::vector<f64> tolerance(n + m);
+    for (std::size_t j = 0; j < n; ++j)
+        tolerance[j] = std::max(dual ? opts.dual_feas_tol * p.scaling.col_scale[j]
+                                    : opts.primal_feas_tol / p.scaling.col_scale[j], 1e-12);
+    for (std::size_t i = 0; i < m; ++i)
+        tolerance[n + i] = std::max(dual ? opts.dual_feas_tol / p.scaling.row_scale[i]
+                                        : opts.primal_feas_tol * p.scaling.row_scale[i], 1e-12);
+    return tolerance;
+}
+
 // Zero means unlimited. Keep an exhausted finite allowance positive, so the
 // first deadline check interrupts rather than starting an unlimited solve.
 inline SimplexOptions simplex_options_after_elapsed(const SimplexOptions& opts,
@@ -69,6 +90,15 @@ core::RawResult solve_dual_simplex_prepared(
 // hand-off never loses pivots or timings from the profile.
 void accumulate_simplex_work(SimplexDiagnostics& total,
                              const SimplexDiagnostics& stage);
+
+// Shared fallback allowance, further constrained by the caller's pivot limit.
+inline constexpr std::uint64_t simplex_certificate_pivot_allowance = 4096;
+
+bool repair_simplex_dual(const model::LpProblem& problem, core::RawResult& raw,
+                         const SimplexOptions& opts, SimplexDiagnostics& diag);
+
+bool repair_simplex_support(const model::LpProblem& problem, core::RawResult& raw,
+                            const SimplexOptions& opts, SimplexDiagnostics& diag);
 
 // Original-scale dual reporting, shared by primal, dual and postsolve paths.
 // An infinite bound absorbs only an EXACT zero coefficient; otherwise use

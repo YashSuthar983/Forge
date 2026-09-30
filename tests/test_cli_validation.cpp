@@ -633,18 +633,21 @@ void test_auto_budget_split_is_a_closed_protocol_set() {
 
 // forge_check has its own --tol with the same defect.
 void test_forge_check_tolerance_validation() {
-    for (const char* value : {"nan", "inf", "abc", "-1", "0", "1e-7xyz"}) {
-        const Run r = run({check_exe, model, solution_file, "--tol", value});
-        ::forge::test::report(r.exit_code != 0, "forge_check rejects bad --tol",
-                            __FILE__, __LINE__,
-                            std::string(value) + " -> exit " +
-                                std::to_string(r.exit_code) + "\n" + r.output);
-        ::forge::test::report(contains(r.output, value),
-                            "forge_check echoes the bad --tol value", __FILE__,
-                            __LINE__, std::string(value) + " -> " + r.output);
+    for (const char* option : {"--tol", "--gap-tol"}) {
+        for (const char* value : {"nan", "inf", "abc", "-1", "0", "1e-7xyz"}) {
+            const Run r = run({check_exe, model, solution_file, option, value});
+            ::forge::test::report(r.exit_code != 0, "forge_check rejects bad tolerance",
+                                __FILE__, __LINE__,
+                                std::string(value) + " -> exit " +
+                                    std::to_string(r.exit_code) + "\n" + r.output);
+            ::forge::test::report(contains(r.output, value),
+                                "forge_check echoes the bad tolerance value", __FILE__,
+                                __LINE__, std::string(value) + " -> " + r.output);
+        }
+        const Run missing = run({check_exe, model, solution_file, option});
+        CHECK(missing.exit_code != 0);
+
     }
-    const Run missing = run({check_exe, model, solution_file, "--tol"});
-    CHECK(missing.exit_code != 0);
 
     // And a good tolerance still checks the solution.
     const Run ok = run({check_exe, model, solution_file, "--tol", "1e-6"});

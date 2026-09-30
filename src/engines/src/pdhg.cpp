@@ -41,10 +41,16 @@ static f64 nearest_power_of_two(f64 x) {
 }
 
 RuizScaling ruiz_scale(model::LpProblem& p, int iterations,
-                       bool power_of_two) {
+                       bool power_of_two, const std::function<bool()>& stop_requested) {
+    p.validate(/*allow_empty_domains=*/true);
+    if (iterations < 0) throw std::invalid_argument("Ruiz scaling: negative iteration count");
     const auto nr = static_cast<std::size_t>(p.n_rows());
     const auto nc = static_cast<std::size_t>(p.n_cols());
-
+    const auto finite_scaled = [](f64 original, f64 value) {
+        if (!std::isfinite(value) || (original != 0.0 && value == 0.0))
+            throw std::invalid_argument("Ruiz scaling: overflow or underflow");
+        return value;
+    };
     RuizScaling s;
     s.row_scale.assign(nr, 1.0);
     s.col_scale.assign(nc, 1.0);
@@ -52,8 +58,11 @@ RuizScaling ruiz_scale(model::LpProblem& p, int iterations,
     const auto& rp = p.A.pattern.row_ptr();
     const auto& ci = p.A.pattern.col_idx();
 
+    std::vector<f64> rmax(nr), cmax(nc), dr(nr), dc(nc);
     for (int it = 0; it < iterations; ++it) {
-        std::vector<f64> rmax(nr, 0.0), cmax(nc, 0.0);
+        if (stop_requested && stop_requested()) break;
+        std::fill(rmax.begin(), rmax.end(), 0.0);
+        std::fill(cmax.begin(), cmax.end(), 0.0);
         for (std::size_t r = 0; r < nr; ++r) {
             for (core::Offset k = rp[r]; k < rp[r + 1]; ++k) {
                 const f64 a = std::fabs(p.A.vals[static_cast<std::size_t>(k)]);
@@ -63,7 +72,8 @@ RuizScaling ruiz_scale(model::LpProblem& p, int iterations,
             }
         }
         // Ruiz equilibration: divide by sqrt of the row/column max magnitude.
-        std::vector<f64> dr(nr, 1.0), dc(nc, 1.0);
+        std::fill(dr.begin(), dr.end(), 1.0);
+        std::fill(dc.begin(), dc.end(), 1.0);
         for (std::size_t r = 0; r < nr; ++r)
             if (rmax[r] > 0.0) dr[r] = 1.0 / std::sqrt(rmax[r]);
         for (std::size_t j = 0; j < nc; ++j)
@@ -80,24 +90,28 @@ RuizScaling ruiz_scale(model::LpProblem& p, int iterations,
         for (std::size_t r = 0; r < nr; ++r) {
             for (core::Offset k = rp[r]; k < rp[r + 1]; ++k) {
                 const auto j = static_cast<std::size_t>(ci[static_cast<std::size_t>(k)]);
-                p.A.vals[static_cast<std::size_t>(k)] *= dr[r] * dc[j];
+                const auto kk = static_cast<std::size_t>(k);
+                const f64 original = p.A.vals[kk];
+                p.A.vals[kk] = finite_scaled(original, original * (dr[r] * dc[j]));
             }
         }
-        for (std::size_t r = 0; r < nr; ++r) s.row_scale[r] *= dr[r];
-        for (std::size_t j = 0; j < nc; ++j) s.col_scale[j] *= dc[j];
+        for (std::size_t r = 0; r < nr; ++r)
+            s.row_scale[r] = finite_scaled(s.row_scale[r], s.row_scale[r] * dr[r]);
+        for (std::size_t j = 0; j < nc; ++j)
+            s.col_scale[j] = finite_scaled(s.col_scale[j], s.col_scale[j] * dc[j]);
     }
 
     // Apply accumulated scaling to the rest of the problem.
     //   rows:    D_r * (A x) in D_r * [lo, hi]
     //   columns: x = D_c * x_hat  =>  bounds divide by D_c, objective multiplies
     for (std::size_t r = 0; r < nr; ++r) {
-        if (p.row_lo[r] > -kInf) p.row_lo[r] *= s.row_scale[r];
-        if (p.row_hi[r] <  kInf) p.row_hi[r] *= s.row_scale[r];
+        if (p.row_lo[r] > -kInf) p.row_lo[r] = finite_scaled(p.row_lo[r], p.row_lo[r] * s.row_scale[r]);
+        if (p.row_hi[r] <  kInf) p.row_hi[r] = finite_scaled(p.row_hi[r], p.row_hi[r] * s.row_scale[r]);
     }
     for (std::size_t j = 0; j < nc; ++j) {
-        p.c[j] *= s.col_scale[j];
-        if (p.col_lo[j] > -kInf) p.col_lo[j] /= s.col_scale[j];
-        if (p.col_hi[j] <  kInf) p.col_hi[j] /= s.col_scale[j];
+        p.c[j] = finite_scaled(p.c[j], p.c[j] * s.col_scale[j]);
+        if (p.col_lo[j] > -kInf) p.col_lo[j] = finite_scaled(p.col_lo[j], p.col_lo[j] / s.col_scale[j]);
+        if (p.col_hi[j] <  kInf) p.col_hi[j] = finite_scaled(p.col_hi[j], p.col_hi[j] / s.col_scale[j]);
     }
     return s;
 }
@@ -153,8 +167,19 @@ core::RawResult solve_pdhg(const model::LpProblem& problem,
                               const PdhgOptions& opts,
                               KernelBackend& be,
                               PdhgDiagnostics& diag) {
+    problem.validate();
+    model::validate_lp_policy(opts.primal_tol, opts.dual_tol, opts.gap_tol, opts.time_limit_s);
+    if (!std::isfinite(opts.step_safety) || opts.step_safety <= 0 || opts.step_safety >= 1 ||
+        opts.power_iterations < 0 || !std::isfinite(opts.pock_chambolle_alpha) ||
+        opts.pock_chambolle_alpha < 0 || opts.pock_chambolle_alpha > 2)
+        throw std::invalid_argument("PDHG: invalid step or preconditioning policy");
     const auto t_all = Clock::now();
     be.reset_stats();
+    const auto deadline = (opts.time_limit_s > 0.0)
+        ? t_all + std::chrono::duration_cast<Clock::duration>(
+              std::chrono::duration<double>(opts.time_limit_s))
+        : Clock::time_point::max();
+    const auto stop_requested = [&] { return Clock::now() >= deadline; };
 
     // ---- 1. convert to minimize form and scale --------------------------
     model::LpProblem p = problem;
@@ -165,8 +190,8 @@ core::RawResult solve_pdhg(const model::LpProblem& problem,
     }
 
     const auto t_scale = Clock::now();
-    RuizScaling scaling = ruiz_scale(p, opts.ruiz_iterations);
-    if (opts.use_pock_chambolle)
+    RuizScaling scaling = ruiz_scale(p, opts.ruiz_iterations, false, stop_requested);
+    if (opts.use_pock_chambolle && !stop_requested())
         pock_chambolle_scale(p, scaling, opts.pock_chambolle_alpha);
     diag.scaling_ms = ms_since(t_scale);
 
@@ -180,7 +205,7 @@ core::RawResult solve_pdhg(const model::LpProblem& problem,
     // ---- 2. estimate ||A||_2 by power iteration on A'A -------------------
     const auto t_norm = Clock::now();
     f64 norm_est = 1.0;
-    if (nr > 0 && nc > 0 && p.nnz() > 0) {
+    if (nr > 0 && nc > 0 && p.nnz() > 0 && !stop_requested()) {
         DeviceBuffer<f64> v(nc), w, u;
         std::mt19937 rng(20260828u);        // fixed seed: deterministic (C3)
         std::uniform_real_distribution<f64> d(0.5, 1.5);
@@ -191,6 +216,7 @@ core::RawResult solve_pdhg(const model::LpProblem& problem,
 
         f64 lambda = 0.0;
         for (int it = 0; it < opts.power_iterations; ++it) {
+            if (stop_requested()) break;
             be.spmv(p.A.pattern, vals, v, w);      // w = A v
             be.spmv_t(p.A.pattern, vals, w, u);    // u = A' A v
             lambda = std::sqrt(be.dot(u, u));
@@ -207,10 +233,7 @@ core::RawResult solve_pdhg(const model::LpProblem& problem,
 
     // ---- 3. PDHG iteration ----------------------------------------------
     const auto t_loop = Clock::now();
-    const auto deadline = (opts.time_limit_s > 0.0)
-        ? t_all + std::chrono::duration_cast<Clock::duration>(
-              std::chrono::duration<double>(opts.time_limit_s))
-        : Clock::time_point::max();
+
     DeviceBuffer<f64> x(nc), y(nr), x_new(nc), xbar(nc);
     DeviceBuffer<f64> Aty, Axbar;
 
@@ -285,7 +308,7 @@ core::RawResult solve_pdhg(const model::LpProblem& problem,
             const f64 r_orig = r / scaling.col_scale[j];
             const f64 b = (r >= 0.0) ? p.col_lo[j] : p.col_hi[j];
             if (!std::isfinite(b)) {
-                if (std::fabs(r_orig) > opts.dual_tol) finite = false;
+                if (r_orig != 0.0) finite = false;
                 continue;
             }
             // Finite-bound terms are never tolerance-zeroed: even a small
@@ -298,7 +321,7 @@ core::RawResult solve_pdhg(const model::LpProblem& problem,
             const f64 yi_orig = yi * scaling.row_scale[i];
             const f64 b = (yi >= 0.0) ? p.row_hi[i] : p.row_lo[i];
             if (!std::isfinite(b)) {
-                if (std::fabs(yi_orig) > opts.dual_tol) finite = false;
+                if (yi_orig != 0.0) finite = false;
                 continue;
             }
             dval -= yi * b;
@@ -320,7 +343,7 @@ core::RawResult solve_pdhg(const model::LpProblem& problem,
                (!diag.dual_bound_finite || diag.gap_rel <= opts.gap_tol);
     };
 
-    for (; iter < opts.max_iterations; ++iter) {
+    for (; iter < opts.max_iterations && !stop_requested(); ++iter) {
         // x^{k+1} = proj_box( x^k - tau (c + A' y^k) )
         be.spmv_t(p.A.pattern, vals, y, Aty);
         for (std::size_t j = 0; j < nc; ++j)
@@ -339,6 +362,7 @@ core::RawResult solve_pdhg(const model::LpProblem& problem,
         }
         std::swap(x.host(), x_new.host());
 
+        if (Clock::now() >= deadline) { ++iter; break; }
         if (opts.check_every > 0 && ((iter + 1) % opts.check_every == 0)) {
             if (evaluate()) { converged = true; ++iter; break; }
             if (opts.verbose)
@@ -375,7 +399,7 @@ core::RawResult solve_pdhg(const model::LpProblem& problem,
     } else {
         raw.proposed_status = core::Status::Interrupted;
         raw.proposed_level  = core::ProofLevel::None;
-        raw.termination_reason = "iteration limit reached";
+        raw.termination_reason = stop_requested() ? "time limit reached" : "iteration limit reached";
     }
 
     diag.kernel_stats = be.transfer_stats();

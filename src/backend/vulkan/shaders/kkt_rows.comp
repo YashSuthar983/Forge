@@ -75,7 +75,7 @@ void main() {
 
         double bound = yi >= 0.0lf ? rhi : rlo;
         if (isinf(bound)) {
-            if (abs(yi * rs) > pc.dual_tol) nonfin = 1.0lf;
+            if (yi != 0.0lf) nonfin = 1.0lf;
         } else {
             dobj = -yi * bound;
         }

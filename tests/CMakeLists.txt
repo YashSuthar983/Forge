@@ -5,6 +5,7 @@ function(forge_add_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+forge_add_test(test_exact_model         forge_model)
 forge_add_test(test_csr                 forge_sparse)
 forge_add_test(test_csc                 forge_sparse)
 forge_add_test(test_lu                  forge_la_cpu)
