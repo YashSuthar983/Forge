@@ -428,49 +428,52 @@ ENDATA
 )";
     sor::io::MpsReadReport rep;
     std::istringstream in(mps);
-    const auto problem = sor::io::read_mps(in, rep);
+    auto problem = sor::io::read_mps(in, rep);
 
-    SimplexOptions opts;
-    opts.method = sor::engines::SimplexMethod::Dual;
-    opts.presolve = false;
-    // Unscaled, so the reduced costs above are the ones the engine sees and
-    // the per-column dual tolerance is exactly dual_feas_tol.
-    opts.ruiz_iterations = 0;
-    opts.dual_cost_perturbation_multiplier = 1.0;
+    for (const bool boxed_only : {false, true}) {
+        problem.col_hi[1] = boxed_only ? 1.0 : sor::model::kInf;
+        SimplexOptions opts;
+        opts.method = sor::engines::SimplexMethod::Dual;
+        opts.presolve = false;
+        // Unscaled, so the reduced costs above are the ones the engine sees and
+        // the per-column dual tolerance is exactly dual_feas_tol.
+        opts.ruiz_iterations = 0;
+        opts.dual_cost_perturbation_multiplier = 1.0;
 
-    SimplexBasis start;
-    start.n_struct = 4;
-    start.basic = {3};
-    start.status = {NonbasicStatus::AtLower, NonbasicStatus::AtLower,
-                    NonbasicStatus::AtLower, NonbasicStatus::Basic,
-                    NonbasicStatus::AtLower};
+        SimplexBasis start;
+        start.n_struct = 4;
+        start.basic = {3};
+        start.status = {NonbasicStatus::AtLower, NonbasicStatus::AtLower,
+                        NonbasicStatus::AtLower, NonbasicStatus::Basic,
+                        NonbasicStatus::AtLower};
 
-    SimplexDiagnostics diag;
-    SimplexBasis final_basis;
-    auto raw = sor::engines::solve_dual_simplex(problem, opts, diag,
-                                                &final_basis, &start);
-    const auto result = sor::certify::finalize_result(
-        std::move(raw), sor::engines::simplex_evidence(diag, opts));
+        SimplexDiagnostics diag;
+        SimplexBasis final_basis;
+        auto raw = sor::engines::solve_dual_simplex(problem, opts, diag,
+                                                    &final_basis, &start);
+        const auto result = sor::certify::finalize_result(
+            std::move(raw), sor::engines::simplex_evidence(diag, opts));
 
-    CHECK(diag.warm_starts == 1);
-    CHECK(result.status == Status::Optimal);
-    CHECK(result.proof == ProofLevel::ProvedOptimalFP);
-    CHECK_NEAR(result.objective, 5.000045, 1e-9);
+        CHECK(diag.warm_starts == 1);
+        CHECK(result.status == Status::Optimal);
+        CHECK(result.proof == ProofLevel::ProvedOptimalFP);
+        CHECK_NEAR(result.objective, 5.000045, 1e-9);
 
-    // The scenario is the point of the test: if the perturbation ever stops
-    // hiding the two infeasibilities, the dual solves this outright and the
-    // assertions below would pass vacuously.
-    CHECK(diag.perturbed_costs > 0);
-    CHECK(diag.primal_cleanups == 1);
-    CHECK_NEAR(diag.cleanup_dual_infeasibility, 1e-5, 1e-7);
+        // The scenario is the point of the test: if the perturbation ever stops
+        // hiding the two infeasibilities, the dual solves this outright and the
+        // assertions below would pass vacuously.
+        CHECK(diag.perturbed_costs > 0);
+        CHECK(diag.primal_cleanups == 1);
+        CHECK_NEAR(diag.cleanup_dual_infeasibility, 2e-5, 1e-7);
 
-    // The property under test. Before the fix this was 0.5 -- the flip pass
-    // had pushed basic x3 from 5.0 to 4.0, under its lower bound of 4.5.
-    CHECK(diag.cleanup_primal_infeasibility == 0.0);
-    // ...and its consequence: the clean-up starts in phase 2 and stays there.
-    // Neither engine runs a phase-1 pivot on this model.
-    CHECK(diag.phase1_iterations == 0);
-    CHECK(diag.primal_cleanup_iterations <= 4);
+        // The property under test. Before the fix this was 0.5 -- the flip pass
+        // had pushed basic x3 from 5.0 to 4.0, under its lower bound of 4.5.
+        CHECK(diag.cleanup_primal_infeasibility == 0.0);
+        // ...and its consequence: the clean-up starts in phase 2 and stays there.
+        // Neither engine runs a phase-1 pivot on this model.
+        CHECK(diag.phase1_iterations == 0);
+        CHECK(diag.primal_cleanup_iterations <= 4);
+    }
 }
 
 // Partitioned vs full row PRICE, over many random bases.
@@ -905,6 +908,19 @@ ENDATA
     CHECK(dispatched.diag.dual_stages == 1);
     CHECK(dispatched.diag.primal_stages == 1);
     CHECK(dispatched.diag.stages == 2);
+    // Cross-checking the infeasibility candidate must spend the remainder of
+    // the caller's allowance, rather than giving each engine a fresh cap.
+    for (const auto method : {sor::engines::SimplexMethod::Dual,
+                              sor::engines::SimplexMethod::Auto}) {
+        opts.method = method;
+        for (std::uint64_t cap = 1; cap <= dispatched.diag.iterations + 1; ++cap) {
+            opts.max_iterations = cap;
+            const auto limited = solve_text(mps, opts);
+            CHECK(limited.diag.iterations <= cap);
+            CHECK(limited.r.iterations == limited.diag.iterations);
+            CHECK(limited.r.status != Status::Optimal);
+        }
+    }
 }
 
 // An equality row plus a range row, where the optimum is forced to an interior
@@ -1380,11 +1396,9 @@ void test_presolve_chained_singleton_columns_recover_duals_and_basis() {
 void test_presolve_retry_counter_survives_rejected_retry() {
     SOR_FN();
     // At ordinary tolerances this chained singleton model is proved directly.
-    // With a deliberately sub-ulp gap tolerance, reverse substitution leaves
-    // a deterministic ~4e-17 relative gap, so the safety retry is attempted.
-    // Solving the original model has a larger ~2e-16 gap and is not selected;
-    // the presolved candidate remains the result. Diagnostics must nevertheless
-    // include the retry's pivots, stages, and elapsed work.
+    // With a deliberately sub-ulp gap tolerance, conservative dual reporting
+    // cannot prove the gap, so the safety retry is attempted. Diagnostics must
+    // include both stages' work, regardless of which candidate is retained.
     constexpr f64 a = 3.1;
     sor::model::LpProblem lp;
     lp.name = "REJECTED_PRESOLVE_RETRY";
@@ -1412,7 +1426,7 @@ void test_presolve_retry_counter_survives_rejected_retry() {
     CHECK(retained.diag.stages >= 2);
     CHECK(retained.diag.total_ms >= rejected.diag.total_ms);
     CHECK(rejected.diag.gap_rel > opts.gap_tol);
-    CHECK(rejected.diag.gap_rel > retained.diag.gap_rel);
+    CHECK_NEAR(retained.r.objective, rejected.r.objective, 1e-12);
 }
 
 void test_presolve_forcing_rows_lift_primal_dual_and_proof() {

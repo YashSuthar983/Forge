@@ -213,6 +213,9 @@ void test_latest_tree_sep_can_fire() {
     opts.tree_cut.always_depth = 32;
     opts.tree_cut.every_k = 1;
     opts.tree_cut.max_cuts_per_node = 3;
+    // The cut re-solve would settle this tiny model at the root; the test is
+    // about tree separation firing on a branching tree.
+    opts.tree_cut.resolve_with_local = false;
     opts.max_nodes = 200;
     opts.time_limit_s = 5.0;
     opts.feasibility_jump = false;
@@ -223,7 +226,6 @@ void test_latest_tree_sep_can_fire() {
     opts.lp_rounding_repair = false;
     opts.integer_dive = false;
     opts.integer_neighborhood = false;
-    opts.objective_face = false;  // component test: keep the tree
     opts.mip_presolve = false;
     opts.symmetry = false;
     opts.balans.enabled = false;
@@ -254,7 +256,6 @@ void test_classical_root_only() {
     opts.lp_rounding_repair = false;
     opts.integer_dive = false;
     opts.integer_neighborhood = false;
-    opts.objective_face = false;  // component test: keep the tree
     opts.mip_presolve = false;
     opts.symmetry = false;
     opts.balans.enabled = false;
@@ -263,7 +264,8 @@ void test_classical_root_only() {
     sor::search::solve_milp(lp, opts, diag);
     CHECK(diag.policy_used == MilpPolicy::Classical);
     CHECK(diag.tree_cut_nodes == 0);
-    CHECK(diag.tree_local_cuts_added == 0);
+    CHECK(diag.tree_local_cuts_selected == 0);
+    CHECK(diag.tree_local_cuts_inserted == 0);
 }
 
 }  // namespace

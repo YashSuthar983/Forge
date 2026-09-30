@@ -12,6 +12,8 @@
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <stdexcept>
+#include <optional>
 #include <vector>
 
 namespace {
@@ -48,6 +50,224 @@ bool valid_point(const LpProblem& lp, const sor::core::RawResult& raw) {
     return ev.max_primal_violation <= 1e-6;
 }
 
+int test_session_rejects_foreign_factor_and_invalid_bounds() {
+    using namespace sor::engines;
+    auto a = make_lp(1, 1, 12u);
+    a.A = sor::sparse::from_triplets(1, 1, {0}, {0}, {1.0});
+    a.c = {1.0}; a.row_hi = {sor::model::kInf};
+    auto b = a;
+    b.A.vals[0] = 2.0;
+    SimplexOptions opts;
+    opts.presolve = false;
+    opts.ruiz_iterations = 0;
+    DualProbeSession first(a, opts), second(b, opts);
+    SimplexBasis first_basis, second_basis;
+    SimplexDiagnostics da, db, reuse;
+    const auto ra = first.solve(opts, da, &first_basis, nullptr);
+    const FactorCarrier foreign = first.final_factor();
+    const auto rb = second.solve(opts, db, &second_basis, &first_basis, nullptr, &foreign);
+    int failures = 0;
+    if (!foreign.has_factor || first_basis.basic != second_basis.basic ||
+        db.factor_reused || !valid_point(a, ra) || !valid_point(b, rb) ||
+        std::fabs(rb.objective - 0.5) > 1e-9) {
+        std::fprintf(stderr, "session test: foreign numeric factor with matching basis was accepted\n");
+        ++failures;
+    }
+    const FactorCarrier own = second.final_factor();
+    const auto again = second.solve(opts, reuse, nullptr, &second_basis, nullptr, &own);
+    if (!reuse.factor_reused || !valid_point(b, again)) {
+        std::fprintf(stderr, "session test: valid same-session factor was rejected\n");
+        ++failures;
+    }
+    for (Index bad : {Index(-1), b.n_cols()}) {
+        bool threw = false;
+        try { second.probe(bad, 0.0, 1.0, opts, db, second_basis); }
+        catch (const std::out_of_range&) { threw = true; }
+        if (!threw) ++failures;
+    }
+    bool threw = false;
+    try { second.probe(0, std::nan(""), 1.0, opts, db, second_basis); }
+    catch (const std::invalid_argument&) { threw = true; }
+    if (!threw) ++failures;
+
+    // A late invalid bound must not partially replace the earlier columns.
+    auto multi = make_lp(2, 3, 43u);
+    DualProbeSession all(multi, opts);
+    auto lo = multi.col_lo, hi = multi.col_hi;
+    lo[0] = 10.0; hi[1] = std::nan("");
+    threw = false;
+    try { all.set_column_bounds(lo, hi); }
+    catch (const std::invalid_argument&) { threw = true; }
+    if (!threw) ++failures;
+    SimplexDiagnostics before, after;
+    const auto original = solve_dual_simplex(multi, opts, before);
+    const auto unchanged = all.solve(opts, after, nullptr, nullptr);
+    if (!valid_point(multi, unchanged) ||
+        std::fabs(original.objective - unchanged.objective) > 1e-9) ++failures;
+    const auto restored = second.solve(opts, db, nullptr, &second_basis);
+    if (!valid_point(b, restored) || std::fabs(restored.objective - 0.5) > 1e-9) ++failures;
+
+    // Evict/recreate at precisely the same address, as an LRU allocation can
+    // do. The retained checkpoint must keep a distinct preparation lifetime.
+    std::optional<DualProbeSession> slot;
+    slot.emplace(a, opts);
+    slot->solve(opts, da, &first_basis, nullptr);
+    const FactorCarrier evicted = slot->final_factor();
+    slot.reset();
+    slot.emplace(b, opts);
+    const auto recreated = slot->solve(opts, db, nullptr, &first_basis, nullptr, &evicted);
+    if (evicted.matrix != &*slot || db.factor_reused || !valid_point(b, recreated) ||
+        std::fabs(recreated.objective - 0.5) > 1e-9) {
+        std::fprintf(stderr, "session test: evicted identity survived address reuse\n");
+        ++failures;
+    }
+    return failures;
+}
+
+int test_rescaling_same_matrix_rejects_factor() {
+    using namespace sor::engines;
+    auto lp = make_lp(1, 1, 12u);
+    lp.A = sor::sparse::from_triplets(1, 1, {0}, {0}, {8.0});
+    lp.c = {1.0}; lp.row_hi = {sor::model::kInf};
+    SimplexOptions unscaled;
+    unscaled.presolve = false;
+    unscaled.ruiz_iterations = 0;
+    SimplexOptions scaled = unscaled;
+    scaled.ruiz_iterations = 8;
+    FactorCarrier carrier;
+    carrier.matrix = &lp;
+    carrier.rows = lp.n_rows(); carrier.cols = lp.n_cols(); carrier.nnz = lp.nnz();
+    SimplexDiagnostics d;
+    SimplexBasis basis, rescaled_basis;
+    solve_dual_simplex(lp, unscaled, d, &basis, nullptr, nullptr, &carrier);
+    const auto changed = solve_dual_simplex(lp, scaled, d, &rescaled_basis, &basis,
+                                           nullptr, &carrier);
+    int failures = 0;
+    if (d.factor_reused || d.factor_reuse_preparation_mismatch != 1 ||
+        !valid_point(lp, changed) || std::fabs(changed.objective - 0.125) > 1e-9) {
+        std::fprintf(stderr, "scaling test: factor survived a changed numeric basis\n");
+        ++failures;
+    }
+    const auto same = solve_dual_simplex(lp, scaled, d, nullptr, &rescaled_basis,
+                                        nullptr, &carrier);
+    if (!d.factor_reused || !valid_point(lp, same)) {
+        std::fprintf(stderr, "scaling test: equivalent repeated preparation failed reuse\n");
+        ++failures;
+    }
+    return failures;
+}
+
+int test_preparation_spends_first_solve_allowance() {
+    using namespace sor::engines;
+    const auto lp = make_lp(30, 45, 23u);
+    SimplexOptions opts;
+    opts.presolve = false;
+    // Preparation dominates this deadline; the small LP's pivots would fit
+    // in a fresh allowance. Once preparation spends it, no pivot may start.
+    opts.ruiz_iterations = 50000;
+    opts.time_limit_s = 0.002;
+    int failures = 0;
+    const auto expired = [&](const sor::core::RawResult& raw,
+                             const SimplexDiagnostics& d) {
+        if (d.preprocessing_ms <= 1000.0 * opts.time_limit_s || d.iterations != 0 ||
+            raw.proposed_status != sor::core::Status::Interrupted) {
+            std::fprintf(stderr, "deadline test: exhausted preparation started fresh pivot work\n");
+            ++failures;
+        }
+    };
+    for (const auto method : {SimplexMethod::Auto, SimplexMethod::Primal, SimplexMethod::Dual}) {
+        opts.method = method;
+        SimplexDiagnostics d;
+        const auto raw = solve_simplex(lp, opts, d);
+        expired(raw, d);
+    }
+    SimplexDiagnostics d;
+    expired(solve_dual_simplex(lp, opts, d), d);
+    DualProbeSession dual(lp, opts);
+    SimplexBasis first, next;
+    expired(dual.solve(opts, d, &first, nullptr), d);
+    SimplexOptions unlimited = opts;
+    unlimited.time_limit_s = 0.0;
+    auto raw = dual.solve(unlimited, d, &next, &first);
+    if (d.preprocessing_builds != 0 || d.preprocessing_ms != 0.0 ||
+        raw.proposed_status != sor::core::Status::Optimal || !valid_point(lp, raw)) {
+        std::fprintf(stderr, "deadline dual resume: prep builds %llu ms %g status %d residual %g reason %s\n",
+                     static_cast<unsigned long long>(d.preprocessing_builds), d.preprocessing_ms,
+                     static_cast<int>(raw.proposed_status), d.primal_residual,
+                     raw.termination_reason.c_str());
+        ++failures;
+    }
+
+    PrimalCostSession primal(lp, opts);
+    expired(primal.solve(opts, d, &first, nullptr), d);
+    raw = primal.solve(unlimited, d, &next, &first);
+    if (d.preprocessing_builds != 0 || d.preprocessing_ms != 0.0 ||
+        raw.proposed_status != sor::core::Status::Optimal || !valid_point(lp, raw)) {
+        std::fprintf(stderr, "deadline primal resume: prep builds %llu ms %g status %d residual %g reason %s\n",
+                     static_cast<unsigned long long>(d.preprocessing_builds), d.preprocessing_ms,
+                     static_cast<int>(raw.proposed_status), d.primal_residual,
+                     raw.termination_reason.c_str());
+        ++failures;
+    }
+    return failures;
+}
+
+int test_completed_solve_transfers_preparation_without_resolve() {
+    using namespace sor::engines;
+    auto lp = make_lp(1, 1, 71u);
+    lp.A = sor::sparse::from_triplets(1, 1, {0}, {0}, {1.0});
+    lp.c = {1.0};
+    int failures = 0;
+    for (int route = 0; route < 4; ++route) {
+        SimplexOptions opts;
+        opts.presolve = false;
+        opts.pricing = SimplexPricing::DSE;
+        opts.method = route == 1 ? SimplexMethod::Primal :
+                      route == 2 ? SimplexMethod::Dual : SimplexMethod::Auto;
+        std::unique_ptr<DualProbeSession> session;
+        SimplexBasis base;
+        SimplexDiagnostics d;
+        const auto raw = route == 3
+            ? solve_dual_simplex(lp, opts, d, &base, nullptr, nullptr, nullptr, &session)
+            : solve_simplex(lp, opts, d, &base, &session);
+        if (!session || raw.proposed_status != sor::core::Status::Optimal ||
+            !valid_point(lp, raw) || d.preprocessing_builds != 1) {
+            std::fprintf(stderr, "completed preparation transfer failed on route %d\n", route);
+            ++failures;
+            continue;
+        }
+        const auto checkpoint = session->final_factor();
+        auto probe_lp = lp;
+        probe_lp.col_lo[0] = 2.0;
+        const auto trial = session->probe(0, 2.0, lp.col_hi[0], opts, d, base);
+        if (!valid_point(probe_lp, trial) || std::fabs(trial.objective - 2.0) > 1e-9 ||
+            d.preprocessing_builds != 0 || d.preprocessing_ms != 0.0 ||
+            (!checkpoint.has_factor || !d.factor_reused)) {
+            std::fprintf(stderr, "transferred probe lost numeric reuse or changed answer, route %d\n", route);
+            ++failures;
+        }
+        // A probe owns a copy; neither the base's box nor factor lineage moves.
+        const auto restored = session->solve(opts, d, nullptr, &base,
+            &session->final_weights(), &session->final_factor());
+        if (!valid_point(lp, restored) || std::fabs(restored.objective - 1.0) > 1e-9 ||
+            d.preprocessing_builds != 0 || !d.factor_reused) {
+            std::fprintf(stderr, "transferred base was contaminated by probe, route %d\n", route);
+            ++failures;
+        }
+    }
+    // Reduced preparation cannot be represented by an original-space session.
+    SimplexOptions opts;
+    opts.presolve = false;
+    SimplexDiagnostics d;
+    std::unique_ptr<DualProbeSession> old;
+    const auto first = solve_simplex(lp, opts, d, nullptr, &old);
+    if (!old || !valid_point(lp, first)) ++failures;
+    opts.presolve = true;
+    const auto reduced = solve_simplex(lp, opts, d, nullptr, &old);
+    if (old || !valid_point(lp, reduced)) ++failures;
+    return failures;
+}
+
 // A bound-only child of `lp`, warm-started from `parent_basis`, solved with
 // `prepared` (already patched or rebuilt for the child by the caller) and an
 // optional FactorCarrier. Returns the raw result and fills `reused`.
@@ -63,6 +283,65 @@ sor::core::RawResult solve_child(const LpProblem& child,
     if (reused) *reused = d.factor_reused;
     (void)child;
     return raw;
+}
+
+int test_cleanup_exports_returned_basis_factor() {
+    using namespace sor::engines;
+    LpProblem lp;
+    lp.A = sor::sparse::from_triplets(1, 4, {0, 0, 0, 0}, {0, 1, 2, 3},
+                                     {1.0, 1.0, 1.0, 1.0});
+    lp.c = {1.0, 1.0, 100.0, 1.00001};
+    lp.row_lo = lp.row_hi = {5.0};
+    lp.col_lo = {0.0, 0.0, 0.0, 4.5};
+    lp.col_hi = {1.0, sor::model::kInf, 0.0, 5.0};
+    SimplexOptions opts;
+    opts.presolve = false;
+    opts.ruiz_iterations = 0;
+    opts.dual_cost_perturbation_multiplier = 1.0;
+    SimplexBasis start;
+    start.n_struct = 4;
+    start.basic = {3};
+    start.status = {NonbasicStatus::AtLower, NonbasicStatus::AtLower,
+                    NonbasicStatus::AtLower, NonbasicStatus::Basic,
+                    NonbasicStatus::AtLower};
+    FactorCarrier carrier;
+    carrier.matrix = &lp;
+    carrier.rows = lp.n_rows(); carrier.cols = lp.n_cols(); carrier.nnz = lp.nnz();
+    auto prepared = prepare_simplex_model(lp, opts);
+    SimplexDiagnostics cleanup;
+    SimplexBasis after_cleanup;
+    auto raw = solve_dual_simplex_prepared(prepared, opts, cleanup,
+                                          &after_cleanup, &start, nullptr, &carrier);
+    int failures = 0;
+    if (cleanup.primal_cleanups != 1 || !carrier.has_factor || carrier.basis != after_cleanup.basic ||
+        raw.proposed_status != sor::core::Status::Optimal || !valid_point(lp, raw) ||
+        std::fabs(raw.objective - 5.000045) > 1e-9) {
+        std::fprintf(stderr, "cleanup test: expected a valid primal hand-off and its final factor\n");
+        ++failures;
+    }
+    if (carrier.matrix != &lp || carrier.rows != lp.n_rows() ||
+        carrier.cols != lp.n_cols() || carrier.nnz != lp.nnz()) {
+        std::fprintf(stderr, "cleanup test: owner matrix identity was lost\n");
+        ++failures;
+    }
+    // The hand-off exports the new primal factor. Both subsequent solves
+    // must adopt that valid lineage without a preparation or retokening.
+    opts.dual_cost_perturbation_multiplier = 0.0;
+    SimplexDiagnostics refill, reuse;
+    SimplexBasis refilled_basis;
+    auto rebuilt = solve_dual_simplex_prepared(prepared, opts, refill, &refilled_basis,
+                                               &after_cleanup, nullptr, &carrier);
+    auto adopted = solve_dual_simplex_prepared(prepared, opts, reuse, nullptr,
+                                              &refilled_basis, nullptr, &carrier);
+    if (!refill.factor_reused || !reuse.factor_reused ||
+        rebuilt.proposed_status != sor::core::Status::Optimal ||
+        adopted.proposed_status != sor::core::Status::Optimal ||
+        !valid_point(lp, rebuilt) || !valid_point(lp, adopted) ||
+        std::fabs(rebuilt.objective - adopted.objective) > 1e-9) {
+        std::fprintf(stderr, "cleanup test: subsequent valid solves did not recover factor reuse\n");
+        ++failures;
+    }
+    return failures;
 }
 
 int test_adopt_on_matching_basis_is_bit_correct() {
@@ -174,6 +453,13 @@ int test_row_count_mismatch_is_rejected_safely() {
                      "even though it correctly fell back to a cold factorize\n");
         ++failures;
     }
+    // A4: the rejection reason must be counted, and counted as exactly this
+    // reason (not folded into some other bucket).
+    if (d.factor_reuse_rows_mismatch != 1) {
+        std::fprintf(stderr, "row-mismatch test: factor_reuse_rows_mismatch=%llu, want 1\n",
+                     static_cast<unsigned long long>(d.factor_reuse_rows_mismatch));
+        ++failures;
+    }
     return failures;
 }
 
@@ -195,6 +481,14 @@ int test_basis_content_mismatch_is_rejected_safely() {
     sor::engines::SimplexDiagnostics d0;
     sor::engines::solve_dual_simplex_prepared(prepared, opts, d0, &basis_a, nullptr,
                                               nullptr, &carrier_a);
+    // A4: carrier_a starts empty (has_factor defaults to false), so this
+    // first-ever call on it must count as "carrier empty", not silently
+    // fall through some other bucket.
+    if (d0.factor_reuse_carrier_empty != 1) {
+        std::fprintf(stderr, "basis-mismatch test: factor_reuse_carrier_empty=%llu, want 1\n",
+                     static_cast<unsigned long long>(d0.factor_reuse_carrier_empty));
+        ++failures;
+    }
 
     // A DIFFERENT LP (different costs) very likely optimizes to a different
     // basis; solve it to get a basis_b that (with overwhelming likelihood)
@@ -219,6 +513,11 @@ int test_basis_content_mismatch_is_rejected_safely() {
     }
     if (raw.proposed_status != sor::core::Status::Optimal || !valid_point(lp, raw)) {
         std::fprintf(stderr, "basis-mismatch test: solve wrong despite correct fallback\n");
+        ++failures;
+    }
+    if (d2.factor_reuse_basis_mismatch != 1) {
+        std::fprintf(stderr, "basis-mismatch test: factor_reuse_basis_mismatch=%llu, want 1\n",
+                     static_cast<unsigned long long>(d2.factor_reuse_basis_mismatch));
         ++failures;
     }
     return failures;
@@ -301,13 +600,27 @@ int test_null_matrix_token_is_never_adopted() {
     sor::engines::SimplexBasis basis;
     sor::engines::solve_dual_simplex_prepared(prepared, opts, d0, &basis, nullptr,
                                               nullptr, &carrier);
+    // A4: this first call has an empty carrier (has_factor defaults to
+    // false) -- that's what gates it, checked before the matrix token.
+    if (d0.factor_reuse_carrier_empty != 1) {
+        std::fprintf(stderr, "null-token test: factor_reuse_carrier_empty=%llu, want 1\n",
+                     static_cast<unsigned long long>(d0.factor_reuse_carrier_empty));
+        ++failures;
+    }
     // carrier.matrix stays null throughout (never set by the harness), so a
-    // second call reusing it must never adopt.
+    // second call reusing it must never adopt. It DOES have content now (the
+    // first call's normal exit refilled it), so this one is gated by the
+    // null token specifically, not by an empty carrier.
     sor::engines::SimplexDiagnostics d1;
     sor::engines::solve_dual_simplex_prepared(prepared, opts, d1, nullptr, &basis,
                                               nullptr, &carrier);
     if (d1.factor_reused) {
         std::fprintf(stderr, "null-token test: adopted despite matrix == nullptr\n");
+        ++failures;
+    }
+    if (d1.factor_reuse_matrix_null != 1) {
+        std::fprintf(stderr, "null-token test: factor_reuse_matrix_null=%llu, want 1\n",
+                     static_cast<unsigned long long>(d1.factor_reuse_matrix_null));
         ++failures;
     }
     return failures;
@@ -317,6 +630,11 @@ int test_null_matrix_token_is_never_adopted() {
 
 int main() {
     int failures = 0;
+    failures += test_session_rejects_foreign_factor_and_invalid_bounds();
+    failures += test_rescaling_same_matrix_rejects_factor();
+    failures += test_preparation_spends_first_solve_allowance();
+    failures += test_completed_solve_transfers_preparation_without_resolve();
+    failures += test_cleanup_exports_returned_basis_factor();
     failures += test_adopt_on_matching_basis_is_bit_correct();
     failures += test_row_count_mismatch_is_rejected_safely();
     failures += test_basis_content_mismatch_is_rejected_safely();

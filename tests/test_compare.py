@@ -385,6 +385,18 @@ class CheckerExecutionTests(unittest.TestCase):
         self.assertEqual(result.checker_returncode, 1)
         self.assertEqual(result.checker_stderr, "dual residual")
 
+    def test_checker_unverified_is_not_recorded_as_rejected_or_verified(self):
+        checked = compare.subprocess.CompletedProcess(
+            ["sor_check"], 3,
+            stdout=("validation: milp_infeasibility_unverified\n"
+                    "UNVERIFIED\n"), stderr="")
+        result = self.run_case(checked)
+        self.assertIsNone(result.checker_verified)
+        self.assertEqual(result.checker_validation_scope,
+                         "milp_infeasibility_unverified")
+        self.assertIn("outcome unverified", result.checker_error)
+        self.assertFalse(compare.is_certified_success(result))
+
     def test_unparseable_checker_output_fails_closed(self):
         checked = compare.subprocess.CompletedProcess(
             ["sor_check"], 0, stdout="VERIFIED\n", stderr="")

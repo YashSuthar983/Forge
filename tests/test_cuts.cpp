@@ -121,6 +121,66 @@ void test_gmi_separates_and_is_valid() {
 // and check every emitted cut against *all* feasible integer assignments in
 // the finite box. This tests validity, not just whether the cut separates the
 // current fractional LP point.
+// Unequal arc capacities yield a valid GMI with coefficient range 150.
+// c-MIR can recover the unit-coefficient cover without relaxing that limit.
+void test_gmi_dynamism_recovery() {
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(3, 4, {0, 0, 1, 1, 2, 2},
+        {2, 3, 2, 0, 3, 1}, {1.0, 1.0, 1.0, -20.0, 1.0, -3000.0});
+    lp.row_lo = {3.0, -sor::model::kInf, -sor::model::kInf};
+    lp.row_hi = {sor::model::kInf, 0.0, 0.0};
+    lp.col_lo = {0.0, 0.0, 0.0, 0.0};
+    lp.col_hi = {1.0, 1.0, 20.0, 3000.0};
+    lp.c = {1.0, 300.0, 0.0, 0.0};
+    lp.is_integer = {true, true, false, false};
+    sor::engines::SimplexOptions so;
+    so.presolve = false;
+    sor::engines::SimplexDiagnostics sd;
+    sor::engines::SimplexBasis basis;
+    const auto raw = sor::engines::solve_simplex(lp, so, sd, &basis);
+    CHECK(raw.proposed_status == Status::Optimal);
+    sor::search::CutOptions opts;
+    // Isolate the recovery path: the small-term relaxation and the tableau
+    // c-MIR would each resolve this row before recovery is reached.
+    opts.gmi_cmir_recovery = true;
+    opts.relax_small_terms = false;
+    opts.tableau_cmir = false;
+    sor::search::CutDiagnostics diag;
+    const auto cuts = sor::search::separate_gomory_mi(lp, raw.x, basis, opts, diag);
+    CHECK(!cuts.empty());
+    CHECK(diag.cmir_recovered > 0);
+    opts.gmi_cmir_recovery = false;
+    sor::search::CutDiagnostics plain;
+    CHECK(sor::search::separate_gomory_mi(lp, raw.x, basis, opts, plain).empty());
+    CHECK(plain.cmir_attempted == 0);
+    CHECK(plain.rejected_dynamism > 0);
+    for (const auto& cut : cuts) {
+        double activity = 0.0, largest = 0.0, smallest = 1e300;
+        for (std::size_t k = 0; k < cut.cols.size(); ++k) {
+            activity += cut.vals[k] * raw.x[std::size_t(cut.cols[k])];
+            largest = std::max(largest, std::fabs(cut.vals[k]));
+            smallest = std::min(smallest, std::fabs(cut.vals[k]));
+        }
+        CHECK(activity < cut.row_lo - opts.violation_min);
+        CHECK(largest / smallest <= opts.dynamism_max);
+        // Minimize cut activity for every binary assignment. Continuous
+        // flows remain free, so this covers the whole feasible polyhedron.
+        for (int a = 0; a <= 1; ++a) for (int b = 0; b <= 1; ++b) {
+            auto sub = lp;
+            sub.col_lo[0] = sub.col_hi[0] = double(a);
+            sub.col_lo[1] = sub.col_hi[1] = double(b);
+            sub.c.assign(4, 0.0);
+            for (std::size_t k = 0; k < cut.cols.size(); ++k)
+                sub.c[std::size_t(cut.cols[k])] = cut.vals[k];
+            sor::engines::SimplexDiagnostics check;
+            const auto optimum = sor::engines::solve_simplex(sub, so, check);
+            if (optimum.proposed_status == Status::Infeasible) continue;
+            CHECK(optimum.proposed_status == Status::Optimal);
+            CHECK(optimum.objective >= cut.row_lo - 1e-7);
+        }
+    }
+}
+
 void test_integer_activity_gmi_validity() {
     std::uint32_t state = 0x73493b19u;
     const auto draw = [&state]() {
@@ -161,9 +221,13 @@ void test_integer_activity_gmi_validity() {
         sor::search::CutOptions copts;
         copts.integer_slack_gmi = true;
         copts.integer_activity_basic_gmi = true;
+        copts.rank_gmi_candidates = (trial % 2 == 0);
+        copts.gmi_max_tableau_trials = (trial % 2 == 0) ? 1 : 0;
         sor::search::CutDiagnostics cd;
         const auto cuts = sor::search::separate_gomory_mi(
             lp, raw.x, basis, copts, cd);
+        if (copts.gmi_max_tableau_trials > 0)
+            CHECK(cd.candidates_considered <= 1);
         eligible += cd.integral_activity_rows;
         terms += cd.integer_activity_terms;
         for (int x0 = 0; x0 <= 3; ++x0)
@@ -487,7 +551,8 @@ void test_cut_retraction_round_trip() {
     using sor::search::CutRow;
     using sor::search::CutUndo;
 
-    // Two rows: x + y <= 10 and x - y <= 4, both continuous-free boxes.
+    // Two previously appended CUT rows, above an empty original-row prefix:
+    // x + y <= 10 and x - y <= 4, both continuous-free boxes.
     sor::model::LpProblem lp;
     lp.A = sor::sparse::from_triplets(2, 2, {0, 0, 1, 1}, {0, 1, 0, 1},
                                       {1.0, 1.0, 1.0, -1.0});
@@ -500,6 +565,7 @@ void test_cut_retraction_round_trip() {
 
     const sor::model::LpProblem before = lp;
     sor::search::CutOptions opts;
+    opts.original_rows = 0;
 
     // One cut on a NEW shape (appends a row) and one that is a positive
     // rescaling of row 0 with a tighter rhs (folds into row 0's bounds).
@@ -655,8 +721,13 @@ void test_restart_reduced_cost_fixes_integer_not_continuous() {
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = sor::search::MilpPolicy::Latest;
     opts.tree_restart = true;
+    opts.reduced_cost_strengthening = false;  // isolate the restart's RC fallback
     opts.tree_restart_node_gap = 0;
     opts.tree_restart_max = 1;
+    // Keep the tree: node cut re-solves would otherwise close this tiny model.
+    opts.tree_cut.resolve_with_local = false;
+    // The model has two independent parts; keep it one search.
+    opts.component_solve = false;
     opts.max_nodes = 40;
     opts.time_limit_s = 10.0;
     opts.fixprop = false;
@@ -796,9 +867,148 @@ void test_integer_reduced_cost_fix_unit_step() {
     CHECK(integer_reduced_cost_fix(lo, hi, 5.0, -3.0, 3.0, tol));
     CHECK_NEAR(lo, 5.0, tol);
     CHECK_NEAR(hi, 5.0, tol);
+    // Every exclusion must come from the certified Lagrangian: the result has
+    // to retain every point as good as the incumbent.
+    for (bool maximize : {false, true}) {
+        sor::model::LpProblem p;
+        p.A = sor::sparse::from_triplets(0, 2, {}, {}, {});
+        p.c = maximize ? std::vector<double>{-10., -1.} : std::vector<double>{10., 1.};
+        p.col_lo = {0., 0.}; p.col_hi = {3., 3.}; p.is_integer = {1, 1}; p.maximize = maximize;
+        auto lows = p.col_lo, highs = p.col_hi;
+        const auto result = sor::search::certified_reduced_cost_bounds(
+            p, {}, maximize ? -3. : 3., lows, highs, tol);
+        CHECK(result.checked == 2);
+        CHECK(result.fixed == 1);
+        for (int a = 0; a <= 3; ++a) for (int b = 0; b <= 3; ++b) {
+            const auto obj = p.objective({double(a), double(b)});
+            if ((maximize ? -obj : obj) <= 3.) {
+                CHECK(a >= lows[0] && a <= highs[0]);
+                CHECK(b >= lows[1] && b <= highs[1]);
+            }
+        }
+        p.c = maximize ? std::vector<double>{1., 0.} : std::vector<double>{-1., 0.};
+        p.col_hi = {100., 1.}; p.is_integer = {1, 0};
+        lows = p.col_lo; highs = p.col_hi;
+        const auto upper = sor::search::certified_reduced_cost_bounds(
+            p, {}, maximize ? 90. : -90., lows, highs, tol);
+        CHECK(upper.tightened == 1);
+        CHECK(lows[0] == 90. && highs[0] == 100.);
+        CHECK(lows[1] == 0. && highs[1] == 1.);
+    }
+}
+
+// A tiny reduced cost against a large incumbent gap must not turn an INFINITE
+// bound into an astronomical finite one (gap / d = 2e13 here): such a bound
+// tightens nothing, and it makes later Lagrangian dual objectives charge
+// roundoff-sized reduced costs 2e13 each, which failed the primal-dual gap
+// test on every nu25-pr12 node LP. A finite old bound is still tightened.
+void test_rc_tightening_skips_infinite_to_astronomical() {
+    sor::model::LpProblem p;
+    p.A = sor::sparse::from_triplets(1, 1, {0}, {0}, {1.0});
+    p.c = {1e-6};                       // reduced cost 1e-6 with y = 0
+    p.col_lo = {0.0};
+    p.col_hi = {sor::model::kInf};
+    p.row_lo = {-sor::model::kInf};
+    p.row_hi = {1e30};                  // never binding
+    p.is_integer = {1};
+    p.validate();
+    std::vector<double> lows = p.col_lo, highs = p.col_hi;
+    // incumbent 2e7 above the LP value 0: gap / d = 2e13
+    const auto r = sor::search::certified_reduced_cost_bounds(
+        p, {0.0}, 2e7, lows, highs, 1e-7);
+    CHECK(highs[0] == sor::model::kInf);
+    CHECK(r.tightened == 0);
+    // Same reduced cost, finite old bound: tightened as before.
+    highs = {1e15};
+    const auto r2 = sor::search::certified_reduced_cost_bounds(
+        p, {0.0}, 2e7, lows, highs, 1e-7);
+    CHECK(highs[0] < 1e15);
+    CHECK(r2.tightened == 1);
+}
+
+void test_gmi_structural_drop_relaxes_rhs() {
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {2.0, 1e-12});
+    lp.c = {-1.0, 0.0};
+    lp.col_lo = {0.0, -1e6}; lp.col_hi = {2.0, 1e6};
+    lp.is_integer = {true, false};
+    lp.row_lo = {-sor::model::kInf}; lp.row_hi = {3.0};
+    sor::engines::SimplexBasis basis;
+    basis.n_struct = 2; basis.basic = {0};
+    using NB = sor::engines::NonbasicStatus;
+    basis.status = {NB::Basic, NB::AtLower, NB::AtUpper};
+    const std::vector<double> x{(3.0 + 1e-6) / 2.0, -1e6};
+    CHECK(lp.max_row_violation(x) <= 1e-12);
+    sor::search::CutOptions o;
+    sor::search::CutDiagnostics d;
+    const auto cuts = sor::search::separate_gomory_mi(lp, x, basis, o, d);
+    CHECK(cuts.size() == 1);
+    for (int xi = 0; xi <= 2; ++xi)
+        for (double y : {-1e6, 0.0, 1e6}) {
+            const std::vector<double> point{static_cast<double>(xi), y};
+            if (lp.max_row_violation(point) > 1e-12) continue;
+            for (const auto& cut : cuts) {
+                double activity = 0.0;
+                for (std::size_t k = 0; k < cut.cols.size(); ++k)
+                    activity += cut.vals[k] * point[static_cast<std::size_t>(cut.cols[k])];
+                CHECK(activity >= cut.row_lo - 1e-9);
+            }
+        }
+    // The required relaxing bound is infinite: do not emit this candidate.
+    lp.col_lo[1] = -sor::model::kInf;
+    sor::search::CutDiagnostics unbounded;
+    CHECK(sor::search::separate_gomory_mi(lp, x, basis, o, unbounded).empty());
+}
+
+void test_cut_merge_preserves_original_rows() {
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1e-12});
+    lp.c = {0.0, 0.0}; lp.is_integer = {true, false};
+    lp.col_lo = {0.0, -1e6}; lp.col_hi = {1.0, 1e6};
+    lp.row_lo = {-sor::model::kInf}; lp.row_hi = {1.0 + 2e-6};
+    const auto original = lp;
+    sor::search::CutRow cut;
+    cut.cols = {0, 1}; cut.vals = {1.0, 1e-12 * (1.0 - 1e-10)};
+    cut.row_lo = -sor::model::kInf; cut.row_hi = 1.0 + 1e-6;
+    sor::search::CutOptions o;
+    sor::search::apply_cuts_inplace(lp, {cut}, o);
+    CHECK(lp.n_rows() == 2);
+    CHECK(lp.row_hi[0] == original.row_hi[0]);
+    CHECK(lp.row_lo[0] == original.row_lo[0]);
+    for (int x : {0, 1})
+        for (double y : {-1e6, 0.0, 1e6}) {
+            const std::vector<double> point{static_cast<double>(x), y};
+            CHECK(original.max_row_violation(point) <= 1e-12);
+            CHECK(lp.max_row_violation(point) <= 1e-12);
+        }
+}
+
+void test_cut_merge_requires_exact_normalized_coefficients() {
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1e-12});
+    lp.c = {0.0, 0.0}; lp.is_integer = {true, false};
+    lp.col_lo = {0.0, -1e6}; lp.col_hi = {1.0, 1e6};
+    lp.row_lo = {-sor::model::kInf}; lp.row_hi = {1.0 + 2e-6};
+    sor::search::CutOptions o; o.original_rows = 0; // Existing row is a cut.
+    sor::search::CutRow cut;
+    cut.cols = {0, 1}; cut.vals = {1.0, 1e-12 * (1.0 - 1e-10)};
+    cut.row_lo = -sor::model::kInf; cut.row_hi = 1.0 + 1e-6;
+    auto different = lp;
+    sor::search::apply_cuts_inplace(different, {cut}, o);
+    CHECK(different.n_rows() == 2);
+    CHECK(different.row_hi[0] == lp.row_hi[0]);
+    cut.vals = {2.0, 2e-12}; cut.row_hi = 2.0 + 2e-6;
+    sor::search::apply_cuts_inplace(lp, {cut}, o);
+    CHECK(lp.n_rows() == 1);
+    CHECK(lp.row_hi[0] == cut.row_hi / 2.0);
 }
 
 int main() {
+    test_gmi_dynamism_recovery();
+    test_cut_merge_preserves_original_rows();
+    test_cut_merge_requires_exact_normalized_coefficients();
+    test_rc_tightening_skips_infinite_to_astronomical();
+    test_gmi_structural_drop_relaxes_rhs();
     test_cut_retraction_round_trip();
     test_purge_kernel_preserves_survivors();
     test_gmi_separates_and_is_valid();

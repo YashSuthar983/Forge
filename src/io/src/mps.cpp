@@ -3,6 +3,7 @@
 #include <chrono>
 
 #include "sor/io/gzip.hpp"
+#include "sor/io/lp_format.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -469,6 +470,7 @@ model::LpProblem read_mps_file(const std::string& path, MpsReadReport& rep,
 
 model::LpProblem read_mps_file_auto(const std::string& path, MpsReadReport& rep,
                                     const MpsReadOptions& opt) {
+    if (has_lp_extension(path)) return read_lp_file(path, rep, opt);
     MpsReadOptions free_opt = opt;
     free_opt.fixed_format = false;
     try {

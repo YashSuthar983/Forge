@@ -20,6 +20,7 @@
 #include <cmath>
 #include <exception>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -29,11 +30,12 @@ namespace {
 
 void usage() {
     std::fputs(
-        "usage: sor_check MODEL.mps SOLUTION.sol [--tol T] [--strict-mps]\n"
+        "usage: sor_check MODEL.{mps,lp,qps} SOLUTION.sol [--tol T] [--strict-mps]\n"
         "                 [--relax-integrality] [--small-matrix-value V]\n"
         "                 [--fixed-mps|--free-mps]\n"
         "  SOLUTION.sol is written by `sor_solve ... --solution-out FILE`.\n"
-        "  Exit 0: the claim independently verifies. Exit 1: it does not.\n",
+        "  Exit 0: the claim independently verifies. Exit 1: rejected.\n"
+        "  Exit 3: unverified claim (insufficient certificate).\n",
         stderr);
 }
 
@@ -47,24 +49,104 @@ bool pass(const char* what, double residual, double tol) {
     return true;
 }
 
-double diagonal_qp_kkt_residual(const sor::io::QpsProblem& qp,
-                               const sor::io::SolutionFile& sol) {
+// The QPS reader stores both triangles of Q; the objective is
+// c'x + 1/2 x'Qx. Symmetry and one of two sufficient PSD checks are required
+// before a KKT point can prove global optimality. Diagonal dominance handles
+// large sparse matrices; dense Cholesky handles other small positive-definite
+// matrices. A failed sufficient check leaves the claim unverified.
+bool sparse_qp_convexity_proved(const sor::io::QpsProblem& qp) {
+    const auto& Q = qp.q_matrix;
     const auto& lp = qp.linear;
-    if (static_cast<sor::core::Index>(sol.y.size()) != lp.n_rows() ||
-        qp.q_matrix.n_rows() != 0 ||
-        lp.maximize ||
-        static_cast<sor::core::Index>(qp.q_diag.size()) != lp.n_cols())
-        return sor::core::kPosInf;
-    for (double q : qp.q_diag)
-        if (!std::isfinite(q) || q < 0.0) return sor::core::kPosInf;
+    const auto n = lp.n_cols();
+    if (Q.n_rows() != n || Q.n_cols() != n) return false;
+    const auto& rp = Q.pattern.row_ptr();
+    const auto& ci = Q.pattern.col_idx();
+    std::vector<double> diagonal(n, 0.0), off_diagonal(n, 0.0);
+    for (sor::core::Index i = 0; i < n; ++i) {
+        for (sor::core::Offset k = rp[i]; k < rp[i + 1]; ++k) {
+            const auto j = ci[k];
+            const double v = Q.vals[k];
+            if (j < 0 || j >= n || !std::isfinite(v)) return false;
+            const auto mirror = std::lower_bound(ci.begin() + rp[j],
+                                                 ci.begin() + rp[j + 1], i);
+            if (mirror == ci.begin() + rp[j + 1] || *mirror != i ||
+                Q.vals[mirror - ci.begin()] != v)
+                return false;
+            if (i == j) diagonal[i] += v;
+            else off_diagonal[i] += std::fabs(v);
+        }
+        if (!std::isfinite(diagonal[i]) || !std::isfinite(off_diagonal[i]))
+            return false;
+    }
+    bool diagonally_dominant = true;
+    for (sor::core::Index i = 0; i < n; ++i) {
+        const double margin = 64.0 * std::numeric_limits<double>::epsilon() *
+            static_cast<double>(rp[i + 1] - rp[i] + 1) *
+            (1.0 + std::fabs(diagonal[i]) + off_diagonal[i]);
+        diagonally_dominant &=
+            (diagonal[i] == 0.0 && off_diagonal[i] == 0.0) ||
+            diagonal[i] > off_diagonal[i] + margin;
+    }
+    if (diagonally_dominant) return true;  // symmetric Gershgorin PSD bound
 
-    const double sense = lp.maximize ? -1.0 : 1.0;
+    constexpr sor::core::Index kDenseCholeskyLimit = 512;
+    if (n > kDenseCholeskyLimit) return false;
+    const auto size = static_cast<std::size_t>(n);
+    std::vector<double> lower(size * size, 0.0);
+    for (sor::core::Index i = 0; i < n; ++i)
+        for (sor::core::Offset k = rp[i]; k < rp[i + 1]; ++k)
+            lower[static_cast<std::size_t>(i) * size + ci[k]] = Q.vals[k];
+    double scale = 1.0;
+    for (double value : diagonal)
+        scale = std::max(scale, std::fabs(value));
+    const double pivot_margin = 1e-10 * scale;
+    for (sor::core::Index i = 0; i < n; ++i) {
+        for (sor::core::Index j = 0; j <= i; ++j) {
+            double pivot = lower[static_cast<std::size_t>(i) * size + j];
+            for (sor::core::Index k = 0; k < j; ++k)
+                pivot -= lower[static_cast<std::size_t>(i) * size + k] *
+                         lower[static_cast<std::size_t>(j) * size + k];
+            if (!std::isfinite(pivot)) return false;
+            if (i == j) {
+                if (!(pivot > pivot_margin)) return false;
+                lower[static_cast<std::size_t>(i) * size + i] = std::sqrt(pivot);
+            } else {
+                lower[static_cast<std::size_t>(i) * size + j] =
+                    pivot / lower[static_cast<std::size_t>(j) * size + j];
+            }
+        }
+    }
+    return true;
+}
+
+double qp_kkt_residual(const sor::io::QpsProblem& qp,
+                       const sor::io::SolutionFile& sol) {
+    const auto& lp = qp.linear;
+    if (static_cast<sor::core::Index>(sol.y.size()) != lp.n_rows())
+        return sor::core::kPosInf;
+    for (double x : sol.x)
+        if (!std::isfinite(x)) return sor::core::kPosInf;
+    for (double y : sol.y)
+        if (!std::isfinite(y)) return sor::core::kPosInf;
+
+    std::vector<double> qx(lp.n_cols(), 0.0);
+    if (qp.q_matrix.n_rows() != 0) {
+        const auto& Q = qp.q_matrix;
+        const auto& qr = Q.pattern.row_ptr();
+        const auto& qc = Q.pattern.col_idx();
+        for (sor::core::Index i = 0; i < lp.n_cols(); ++i)
+            for (sor::core::Offset k = qr[i]; k < qr[i + 1]; ++k)
+                qx[i] += Q.vals[k] * sol.x[qc[k]];
+    } else {
+        for (sor::core::Index i = 0; i < lp.n_cols(); ++i)
+            qx[i] = qp.q_diag[i] * sol.x[i];
+    }
+
     std::vector<double> ax(lp.n_rows(), 0.0);
     std::vector<double> aty(lp.n_cols(), 0.0);
     const auto& rp = lp.A.pattern.row_ptr();
     const auto& ci = lp.A.pattern.col_idx();
     for (sor::core::Index i = 0; i < lp.n_rows(); ++i) {
-        if (!std::isfinite(sol.y[i])) return sor::core::kPosInf;
         for (sor::core::Offset k = rp[i]; k < rp[i + 1]; ++k) {
             ax[i] += lp.A.vals[k] * sol.x[ci[k]];
             aty[ci[k]] += lp.A.vals[k] * sol.y[i];
@@ -72,20 +154,38 @@ double diagonal_qp_kkt_residual(const sor::io::QpsProblem& qp,
     }
     double residual = 0.0;
     for (sor::core::Index i = 0; i < lp.n_rows(); ++i) {
-        const double y_min = sense * sol.y[i];
-        const double projected = std::clamp(ax[i] + y_min,
+        if (!std::isfinite(ax[i])) return sor::core::kPosInf;
+        const double projected = std::clamp(ax[i] + sol.y[i],
                                             lp.row_lo[i], lp.row_hi[i]);
+        if (!std::isfinite(projected)) return sor::core::kPosInf;
         residual = std::max(residual, std::fabs(ax[i] - projected));
     }
     for (sor::core::Index j = 0; j < lp.n_cols(); ++j) {
-        if (!std::isfinite(sol.x[j])) return sor::core::kPosInf;
-        const double gradient = qp.q_diag[j] * sol.x[j] +
-                                sense * (lp.c[j] + aty[j]);
+        if (!std::isfinite(qx[j]) || !std::isfinite(aty[j]) ||
+            !std::isfinite(lp.c[j])) return sor::core::kPosInf;
+        // Exported sol.y has the solver's sign convention: adding A' sol.y
+        // here is g - A' y_math in the usual KKT notation. Projection onto
+        // column bounds accounts for the bound multiplier z.
+        const double gradient = qx[j] + lp.c[j] + aty[j];
+        if (!std::isfinite(gradient)) return sor::core::kPosInf;
         const double projected = std::clamp(sol.x[j] - gradient,
                                             lp.col_lo[j], lp.col_hi[j]);
+        if (!std::isfinite(projected)) return sor::core::kPosInf;
         residual = std::max(residual, std::fabs(sol.x[j] - projected));
     }
     return std::isfinite(residual) ? residual : sor::core::kPosInf;
+}
+
+double sparse_qp_kkt_residual(const sor::io::QpsProblem& qp,
+                              const sor::io::SolutionFile& sol) {
+    return qp.q_matrix.n_rows() == 0 ? sor::core::kPosInf
+                                     : qp_kkt_residual(qp, sol);
+}
+
+double diagonal_qp_kkt_residual(const sor::io::QpsProblem& qp,
+                                const sor::io::SolutionFile& sol) {
+    return qp.q_matrix.n_rows() != 0 ? sor::core::kPosInf
+                                     : qp_kkt_residual(qp, sol);
 }
 
 }  // namespace
@@ -195,6 +295,7 @@ int main(int argc, char** argv) {
                     sol.objective);
 
         bool ok = true;
+        bool unverified = false;
         const bool has_integer = std::any_of(
             lp.is_integer.begin(), lp.is_integer.end(),
             [](char value) { return value != 0; });
@@ -273,16 +374,33 @@ int main(int argc, char** argv) {
                               ? pass("primal-dual gap", ev.gap_rel, tol)
                               : fail("primal-dual gap", ev.gap_rel, tol);
                 } else if (sol.status == sor::core::Status::Optimal &&
-                           !has_integer && qp &&
-                           qp->q_matrix.n_rows() == 0) {
-                    // For a convex diagonal QP, primal feasibility and KKT
-                    // stationarity/complementarity suffice for global
-                    // optimality. Recompute them from the exported point and
-                    // multipliers; never trust engine diagnostics here.
-                    validation_scope = "qp_kkt_f64";
-                    const double kkt = diagonal_qp_kkt_residual(*qp, sol);
-                    ok &= (kkt <= tol) ? pass("quadratic KKT", kkt, tol)
-                                       : fail("quadratic KKT", kkt, tol);
+                           !has_integer && qp) {
+                    bool convexity_proved = !lp.maximize;
+                    if (qp->q_matrix.n_rows() != 0) {
+                        convexity_proved &= sparse_qp_convexity_proved(*qp);
+                    } else {
+                        convexity_proved &=
+                            static_cast<sor::core::Index>(qp->q_diag.size()) == lp.n_cols();
+                        for (double q : qp->q_diag)
+                            convexity_proved &= std::isfinite(q) && q >= 0.0;
+                    }
+                    if (!convexity_proved) {
+                        validation_scope = "qp_optimality_unverified";
+                        if (ok) {
+                            std::printf("UNVERIFIED  QP maximization or convexity "
+                                        "not independently proved\n");
+                            unverified = true;
+                        }
+                    } else {
+                        // Projected row and column residuals encode multiplier
+                        // signs, stationarity and complementarity.
+                        validation_scope = "qp_kkt_f64";
+                        const double kkt = qp->q_matrix.n_rows() != 0
+                            ? sparse_qp_kkt_residual(*qp, sol)
+                            : diagonal_qp_kkt_residual(*qp, sol);
+                        ok &= (kkt <= tol) ? pass("quadratic KKT", kkt, tol)
+                                           : fail("quadratic KKT", kkt, tol);
+                    }
                 }
                 break;
             }
@@ -295,6 +413,16 @@ int main(int argc, char** argv) {
                 const auto& ray = sol.dual_farkas_ray.empty()
                                       ? sol.ray : sol.dual_farkas_ray;
                 if (ray.empty()) {
+                    if (has_integer) {
+                        validation_scope = is_qps
+                            ? "miqp_infeasibility_unverified"
+                            : "milp_infeasibility_unverified";
+                        std::printf("UNVERIFIED  status=Infeasible but no LP "
+                                    "Farkas certificate was recorded; this "
+                                    "does not refute integer infeasibility\n");
+                        unverified = true;
+                        break;
+                    }
                     std::printf("FAIL  status=Infeasible but no Farkas "
                                 "certificate was recorded\n");
                     ok = false;
@@ -356,8 +484,9 @@ int main(int argc, char** argv) {
         }
 
         std::printf("validation: %s\n", validation_scope);
-        std::printf("%s\n", ok ? "VERIFIED" : "REJECTED");
-        return ok ? 0 : 1;
+        std::printf("%s\n", unverified ? "UNVERIFIED"
+                                        : ok ? "VERIFIED" : "REJECTED");
+        return unverified ? 3 : ok ? 0 : 1;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 2;

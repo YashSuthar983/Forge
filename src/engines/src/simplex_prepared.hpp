@@ -5,6 +5,9 @@
 #include "sor/engines/simplex.hpp"
 #include "sor/sparse/csc.hpp"
 
+#include <algorithm>
+#include <limits>
+
 namespace sor::engines {
 
 // Immutable preprocessing shared by every stage of the Auto dispatcher.
@@ -16,6 +19,7 @@ struct SimplexPrepared {
     model::LpProblem pmin;
     model::LpProblem scaled;
     RuizScaling scaling;
+    std::shared_ptr<const FactorScalingIdentity> factor_scaling_identity;
     sparse::CscMatrix csc;
     std::vector<f64> lo;
     std::vector<f64> hi;
@@ -32,10 +36,22 @@ struct SimplexPrepared {
 SimplexPrepared prepare_simplex_model(const model::LpProblem& problem,
                                       const SimplexOptions& opts);
 
+// Zero means unlimited. Keep an exhausted finite allowance positive, so the
+// first deadline check interrupts rather than starting an unlimited solve.
+inline SimplexOptions simplex_options_after_elapsed(const SimplexOptions& opts,
+                                                    double elapsed_s) {
+    SimplexOptions remaining = opts;
+    if (opts.time_limit_s > 0.0)
+        remaining.time_limit_s = std::max(std::numeric_limits<double>::min(),
+                                          opts.time_limit_s - elapsed_s);
+    return remaining;
+}
+
 core::RawResult solve_primal_simplex_prepared(
     const SimplexPrepared& prepared, const SimplexOptions& opts,
     SimplexDiagnostics& diag, SimplexBasis* out_basis,
-    const SimplexBasis* warm = nullptr);
+    const SimplexBasis* warm = nullptr,
+    FactorCarrier* out_factor = nullptr);
 
 // `factor_carrier` (optional, EXPERIMENTAL -- repeated-LP reuse
 // measurement): see FactorCarrier's own doc comment in dual_simplex.hpp. Read
@@ -53,5 +69,13 @@ core::RawResult solve_dual_simplex_prepared(
 // hand-off never loses pivots or timings from the profile.
 void accumulate_simplex_work(SimplexDiagnostics& total,
                              const SimplexDiagnostics& stage);
+
+// Original-scale dual reporting, shared by primal, dual and postsolve paths.
+// An infinite bound absorbs only an EXACT zero coefficient; otherwise use
+// the independently recomputed/repaired Lagrangian or report no finite bound.
+void report_simplex_dual_bound(const model::LpProblem& pmin, f64 sense,
+                              const std::vector<f64>& y_min,
+                              const std::vector<long double>& aty,
+                              SimplexDiagnostics& diag);
 
 }  // namespace sor::engines

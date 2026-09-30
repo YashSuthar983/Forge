@@ -70,6 +70,7 @@ bool contains(const std::string& haystack, const std::string& needle) {
 
 std::string solve_exe, check_exe, model, solution_file, crash_model;
 std::string checker_milp_model, checker_unbounded_model;
+std::string checker_milp_infeasible_model;
 
 void write_solution_claim(const fs::path& path, const char* status,
                           const char* proof, double objective,
@@ -159,7 +160,8 @@ void test_nonnegative_real_flags() {
 
 void test_integer_flags_reject_malformed_values() {
     for (const char* option : {"--max-iter", "--refactor-interval",
-                               "--dual-resync-interval"}) {
+                               "--dual-resync-interval", "--rb-threshold", "--rb-max-probed",
+                               "--rb-lookahead", "--local-cut-rows", "--conflict-store-max-len"}) {
         reject(option, "abc");
         reject(option, "");
         reject(option, "1.5");      // a real where an integer is required
@@ -283,8 +285,143 @@ void test_sor_check_recomputes_qp_objective_without_claiming_proof() {
     }
     write_solution_claim(qp_claim, "Optimal", "ProvedKKT", 3.0, "2 1 1");
     const Run sparse = run({check_exe, qp_model.string(), qp_claim.string()});
-    CHECK(sparse.exit_code == 0);
-    CHECK(contains(sparse.output, "validation: qp_primal_point"));
+    CHECK(sparse.exit_code != 0);
+    CHECK(contains(sparse.output, "validation: qp_kkt_f64"));
+    CHECK(contains(sparse.output, "quadratic KKT"));
+
+    // QUADOBJ stores one triangle, which the reader expands to the full
+    // Q=[[2,1],[1,2]]. Its 1/2 x'Qx is 3 at x=(1,1). With c=(-3,-3), the
+    // objective is -3 and Qx+c=0: an interior global optimum.
+    {
+        std::ofstream out(qp_model);
+        out << "NAME CHECKQPSPARSE\n"
+               "ROWS\n"
+               " N OBJ\n"
+               "COLUMNS\n"
+               " X OBJ -3\n"
+               " Y OBJ -3\n"
+               "RHS\n"
+               "BOUNDS\n"
+               " LO BND X 0\n"
+               " UP BND X 5\n"
+               " LO BND Y 0\n"
+               " UP BND Y 5\n"
+               "QUADOBJ\n"
+               " X X 2\n"
+               " Y X 1\n"
+               " Y Y 2\n"
+               "ENDATA\n";
+    }
+    write_solution_claim(qp_claim, "Optimal", "ProvedKKT", -3.0, "2 1 1");
+    const Run sparse_optimum = run({check_exe, qp_model.string(), qp_claim.string()});
+    CHECK(sparse_optimum.exit_code == 0);
+    CHECK(contains(sparse_optimum.output, "validation: qp_kkt_f64"));
+    CHECK(contains(sparse_optimum.output, "VERIFIED"));
+
+    write_solution_claim(qp_claim, "Optimal", "ProvedKKT", -2.999999,
+                         "2 1.001 1");
+    const Run sparse_perturbed = run({check_exe, qp_model.string(), qp_claim.string()});
+    CHECK(sparse_perturbed.exit_code != 0);
+    CHECK(contains(sparse_perturbed.output, "quadratic KKT"));
+    CHECK(contains(sparse_perturbed.output, "REJECTED"));
+
+    // Positive definite but not diagonally dominant: Q=[[2,3],[3,5]],
+    // det(Q)=1. This exercises the checker's Cholesky proof path.
+    {
+        std::ofstream out(qp_model);
+        out << "NAME CHECKQPCHOLESKY\n"
+               "ROWS\n"
+               " N OBJ\n"
+               "COLUMNS\n"
+               " X OBJ -5\n"
+               " Y OBJ -8\n"
+               "RHS\n"
+               "BOUNDS\n"
+               " LO BND X 0\n"
+               " UP BND X 5\n"
+               " LO BND Y 0\n"
+               " UP BND Y 5\n"
+               "QUADOBJ\n"
+               " X X 2\n"
+               " Y X 3\n"
+               " Y Y 5\n"
+               "ENDATA\n";
+    }
+    write_solution_claim(qp_claim, "Optimal", "ProvedKKT", -6.5, "2 1 1");
+    const Run sparse_cholesky = run({check_exe, qp_model.string(), qp_claim.string()});
+    CHECK(sparse_cholesky.exit_code == 0);
+    CHECK(contains(sparse_cholesky.output, "validation: qp_kkt_f64"));
+
+    // Equality-row multiplier: at x=y=1 the gradient is (3,3). Exported
+    // y=-3 cancels A' y in the checker's sign convention.
+    {
+        std::ofstream out(qp_model);
+        out << "NAME CHECKQPROW\n"
+               "ROWS\n"
+               " N OBJ\n"
+               " E BAL\n"
+               "COLUMNS\n"
+               " X OBJ 0 BAL 1\n"
+               " Y OBJ 0 BAL 1\n"
+               "RHS\n"
+               " RHS BAL 2\n"
+               "BOUNDS\n"
+               " LO BND X 0\n"
+               " UP BND X 5\n"
+               " LO BND Y 0\n"
+               " UP BND Y 5\n"
+               "QUADOBJ\n"
+               " X X 2\n"
+               " Y X 1\n"
+               " Y Y 2\n"
+               "ENDATA\n";
+    }
+    {
+        std::ofstream out(qp_claim);
+        out << "status Optimal\nproof ProvedKKT\nobjective 3\n"
+               "x 2 1 1\ny 1 -3\nray 0\nprimal_ray 0\n"
+               "dual_farkas_ray 0\n";
+    }
+    const Run row_multiplier = run({check_exe, qp_model.string(), qp_claim.string()});
+    CHECK(row_multiplier.exit_code == 0);
+    CHECK(contains(row_multiplier.output, "validation: qp_kkt_f64"));
+    {
+        std::ofstream out(qp_claim);
+        out << "status Optimal\nproof ProvedKKT\nobjective 3\n"
+               "x 2 1 1\ny 1 0\nray 0\nprimal_ray 0\n"
+               "dual_farkas_ray 0\n";
+    }
+    const Run wrong_multiplier = run({check_exe, qp_model.string(), qp_claim.string()});
+    CHECK(wrong_multiplier.exit_code != 0);
+    CHECK(contains(wrong_multiplier.output, "quadratic KKT"));
+
+    // The stationary origin of Q=[[2,3],[3,2]] is not a global certificate:
+    // one eigenvalue is -1. Both diagonals are positive, so the curvature
+    // check must detect the negative Cholesky pivot.
+    {
+        std::ofstream out(qp_model);
+        out << "NAME CHECKQPINDEF\n"
+               "ROWS\n"
+               " N OBJ\n"
+               "COLUMNS\n"
+               " X OBJ 0\n"
+               " Y OBJ 0\n"
+               "RHS\n"
+               "BOUNDS\n"
+               " LO BND X 0\n"
+               " UP BND X 5\n"
+               " LO BND Y 0\n"
+               " UP BND Y 5\n"
+               "QUADOBJ\n"
+               " X X 2\n"
+               " Y X 3\n"
+               " Y Y 2\n"
+               "ENDATA\n";
+    }
+    write_solution_claim(qp_claim, "Optimal", "ProvedKKT", 0.0, "2 0 0");
+    const Run sparse_indefinite = run({check_exe, qp_model.string(), qp_claim.string()});
+    CHECK(sparse_indefinite.exit_code == 3);
+    CHECK(contains(sparse_indefinite.output, "UNVERIFIED"));
 
     // A direction improving the linear term is not a QP recession ray when
     // its quadratic curvature is positive.
@@ -328,8 +465,8 @@ void test_sor_check_recomputes_qp_objective_without_claiming_proof() {
     }
     write_solution_claim(qp_claim, "Optimal", "ProvedKKT", 0.0, "1 0");
     const Run nonconvex_max = run({check_exe, qp_model.string(), qp_claim.string()});
-    CHECK(nonconvex_max.exit_code != 0);
-    CHECK(contains(nonconvex_max.output, "quadratic KKT"));
+    CHECK(nonconvex_max.exit_code == 3);
+    CHECK(contains(nonconvex_max.output, "UNVERIFIED"));
     std::error_code ec;
     fs::remove(qp_model, ec);
     fs::remove(qp_claim, ec);
@@ -546,6 +683,82 @@ void test_sor_check_milp_incumbent_scope() {
     fs::remove(fractional, ec);
 }
 
+// The solver's --tol is also its integer tolerance (down to 1e-9). The
+// checker must accept the same near-integer incumbent at 1e-6 and reject it
+// when the caller requests the tighter 1e-7 check.
+void test_sor_check_milp_integrality_tolerance_agreement() {
+    const fs::path near_integer =
+        fs::temp_directory_path() / "sor_check_milp_near_integer.sol";
+    {
+        std::ofstream out(near_integer);
+        out << "status Optimal\n"
+               "proof ProvedGlobalEpsilon\n"
+               "objective 1.0000005\n"
+               "x 1 1.0000005\n"
+               "y 0\n"
+               "ray 0\n"
+               "primal_ray 0\n"
+               "dual_farkas_ray 0\n";
+    }
+
+    const Run accepted = run({check_exe, checker_milp_model,
+                              near_integer.string(), "--tol", "1e-6"});
+    CHECK(accepted.exit_code == 0);
+    CHECK(contains(accepted.output, "validation: milp_incumbent"));
+    CHECK(contains(accepted.output, "VERIFIED"));
+
+    const Run rejected = run({check_exe, checker_milp_model,
+                              near_integer.string(), "--tol", "1e-7"});
+    CHECK(rejected.exit_code != 0);
+    CHECK(contains(rejected.output, "FAIL  integrality"));
+    CHECK(contains(rejected.output, "REJECTED"));
+
+    std::error_code ec;
+    fs::remove(near_integer, ec);
+}
+
+// The LP relaxation 2x = 1, 0 <= x <= 1 is feasible at x=0.5, while the
+// integer model is infeasible. With no LP Farkas ray, sor_check cannot
+// independently validate the MILP infeasibility proof; it must say
+// UNVERIFIED rather than reject the solver's claim as false.
+void test_sor_check_milp_infeasible_without_lp_ray_is_unverified() {
+    const fs::path claim =
+        fs::temp_directory_path() / "sor_check_milp_infeasible.sol";
+    const fs::path relaxed_solution =
+        fs::temp_directory_path() / "sor_check_milp_lp_relaxation.sol";
+    const Run lp = run({solve_exe, checker_milp_infeasible_model,
+                        "--engine", "simplex", "--relax-integrality",
+                        "--solution-out", relaxed_solution.string()});
+    CHECK(lp.exit_code == 0);
+    CHECK(contains(lp.output, "status:            Optimal"));
+    const Run checked_lp = run({check_exe, checker_milp_infeasible_model,
+                                relaxed_solution.string(),
+                                "--relax-integrality", "--tol", "1e-7"});
+    CHECK(checked_lp.exit_code == 0);
+    CHECK(contains(checked_lp.output, "validation: lp_optimality_f64"));
+    CHECK(contains(checked_lp.output, "\nVERIFIED\n"));
+
+    const Run integer = run({solve_exe, checker_milp_infeasible_model,
+                             "--engine", "milp", "--bab-threads", "1",
+                             "--tol", "1e-7", "--mip-gap", "0",
+                             "--solution-out", claim.string()});
+    CHECK(contains(integer.output, "status:            Infeasible"));
+    CHECK(fs::is_regular_file(claim));
+
+    const Run checked = run({check_exe, checker_milp_infeasible_model,
+                             claim.string(), "--tol", "1e-7"});
+    CHECK(checked.exit_code == 3);
+    CHECK(contains(checked.output,
+                   "validation: milp_infeasibility_unverified"));
+    CHECK(contains(checked.output, "\nUNVERIFIED\n"));
+    CHECK(!contains(checked.output, "\nREJECTED\n"));
+    CHECK(!contains(checked.output, "\nVERIFIED\n"));
+
+    std::error_code ec;
+    fs::remove(claim, ec);
+    fs::remove(relaxed_solution, ec);
+}
+
 // A recession direction proves only that objective can improve along a ray.
 // An Unbounded claim also needs a feasible point, otherwise an infeasible LP
 // could be mislabeled unbounded.
@@ -695,6 +908,27 @@ void test_zero_column_model_is_refused_by_every_engine() {
     fs::remove(qplib);
 }
 
+void test_lp_file_solver_and_checker() {
+    const auto lp = fs::temp_directory_path() / "sor_cli_format.lp";
+    const auto sol = fs::temp_directory_path() / "sor_cli_format.sol";
+    {
+        std::ofstream out(lp);
+        out << "Maximize\n profit: 3 b + 2 x + 5\nSubject To\n cap: b + x <= 2\n"
+               "Bounds\n b = 1\n 0 <= x <= 2\nBinary\n b\nGeneral\n x\nEnd\n";
+    }
+    const auto solved = run({solve_exe, lp.string(), "--engine", "milp",
+                             "--solution-out", sol.string()});
+    ::sor::test::report(solved.exit_code == 0 && contains(solved.output, "Optimal") &&
+                        contains(solved.output, "1.0000000000e+01"),
+                        "LP MILP solve preserves fixed binary and objective offset",
+                        __FILE__, __LINE__, solved.output);
+    const auto checked = run({check_exe, lp.string(), sol.string()});
+    ::sor::test::report(checked.exit_code == 0 && contains(checked.output, "\nVERIFIED\n"),
+                        "LP input reaches independent checker", __FILE__, __LINE__, checked.output);
+    std::error_code ec;
+    fs::remove(lp, ec); fs::remove(sol, ec);
+}
+
 int main() {
     const fs::path src(SOR_SOURCE_DIR), bin(SOR_BINARY_DIR);
     solve_exe = (bin / "sor_solve").string();
@@ -718,6 +952,8 @@ int main() {
         (fs::temp_directory_path() / "sor_cli_primal_crash.mps").string();
     checker_milp_model =
         (fs::temp_directory_path() / "sor_check_milp.mps").string();
+    checker_milp_infeasible_model =
+        (fs::temp_directory_path() / "sor_check_milp_infeasible.mps").string();
     checker_unbounded_model =
         (fs::temp_directory_path() / "sor_check_unbounded.mps").string();
     {
@@ -746,6 +982,23 @@ int main() {
                "    RHS       CAP        2\n"
                "BOUNDS\n"
                " UP BND       X          2\n"
+               "ENDATA\n";
+    }
+    {
+        std::ofstream out(checker_milp_infeasible_model);
+        out << "NAME          CHECKMILPINFEAS\n"
+               "ROWS\n"
+               " N  COST\n"
+               " E  EQ1\n"
+               "COLUMNS\n"
+               "    MARK0000  'MARKER'                 'INTORG'\n"
+               "    X         COST       0          EQ1        2\n"
+               "    MARK0001  'MARKER'                 'INTEND'\n"
+               "RHS\n"
+               "    RHS       EQ1        1\n"
+               "BOUNDS\n"
+               " LO BND       X          0\n"
+               " UP BND       X          1\n"
                "ENDATA\n";
     }
     {
@@ -786,12 +1039,16 @@ int main() {
     test_auto_budget_split_is_a_closed_protocol_set();
     test_sor_check_tolerance_validation();
     test_sor_check_milp_incumbent_scope();
+    test_sor_check_milp_integrality_tolerance_agreement();
+    test_sor_check_milp_infeasible_without_lp_ray_is_unverified();
     test_sor_check_unbounded_requires_feasible_point();
+    test_lp_file_solver_and_checker();
 
     std::error_code ec;
     fs::remove(solution_file, ec);
     fs::remove(crash_model, ec);
     fs::remove(checker_milp_model, ec);
+    fs::remove(checker_milp_infeasible_model, ec);
     fs::remove(checker_unbounded_model, ec);
     return sor::test::finish("test_cli_validation");
 }

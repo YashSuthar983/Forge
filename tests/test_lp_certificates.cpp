@@ -1,8 +1,10 @@
 #include "sor/certify/finalize.hpp"
 #include "sor/io/mps.hpp"
+#include "sor/engines/dual_simplex.hpp"
 #include "test_helpers.hpp"
 
 #include <sstream>
+#include <limits>
 
 using namespace sor;
 
@@ -68,9 +70,100 @@ ENDATA
     CHECK(!b.finite);
 }
 
+void test_small_cost_cannot_erase_unbounded_direction() {
+    // The cost is inside the KKT tolerance, but its product with the
+    // unbounded upper box is still -infinity. A fake zero gap is unsound.
+    const auto source = read(R"(NAME TINY
+ROWS
+ N OBJ
+COLUMNS
+ X OBJ -0.000000001
+ENDATA
+)");
+    for (bool maximize : {false, true}) {
+        auto lp = source;
+        lp.maximize = maximize;
+        lp.c[0] = maximize ? 1e-9 : -1e-9;
+        lp.obj_offset = 5.0;
+        core::RawResult fake;
+        fake.x = {0.0};
+        fake.objective = fake.dual_bound = 5.0;
+        fake.proposed_status = core::Status::Optimal;
+        fake.proposed_level = core::ProofLevel::ProvedOptimalFP;
+        auto checked = certify::check_lp_point(lp, fake, 1e-7, 1e-7, 1e-9, true);
+        CHECK(checked.checker_passed); // The primal point itself is feasible.
+        CHECK(!std::isfinite(checked.gap_rel));
+        CHECK(certify::finalize_result(fake, checked).status != core::Status::Optimal);
+
+        engines::SimplexOptions opts;
+        opts.presolve = false;
+        opts.ruiz_iterations = 0;
+        opts.method = engines::SimplexMethod::Primal;
+        opts.time_limit_s = 1.0;
+        opts.max_iterations = 32;
+        for (bool dual : {false, true}) {
+            engines::SimplexDiagnostics diag;
+            auto raw = dual ? engines::solve_dual_simplex(lp, opts, diag)
+                            : engines::solve_simplex(lp, opts, diag);
+            CHECK(!diag.dual_bound_finite);
+            checked = certify::check_lp_point(lp, raw, 1e-7, 1e-7, 1e-9, true);
+            CHECK(certify::finalize_result(raw, checked).status != core::Status::Optimal);
+        }
+    }
+}
+
+void test_checked_repair_preserves_sense_and_offset() {
+    auto lp = read(R"(NAME REPAIR
+ROWS
+ N OBJ
+ G R1
+COLUMNS
+ X OBJ 1 R1 1
+RHS
+ RHS R1 2
+ENDATA
+)");
+    for (bool maximize : {false, true}) {
+        lp.maximize = maximize;
+        lp.c[0] = maximize ? -1.0 : 1.0;
+        lp.obj_offset = 5.0;
+        core::RawResult raw;
+        raw.x = {2.0};
+        raw.y = {maximize ? -(1.0 + 1e-14) : 1.0 + 1e-14};
+        raw.objective = maximize ? 3.0 : 7.0;
+        raw.dual_bound = raw.objective;
+        raw.proposed_status = core::Status::Optimal;
+        raw.proposed_level = core::ProofLevel::ProvedOptimalFP;
+        const auto checked = certify::check_lp_point(lp, raw, 1e-7, 1e-7, 1e-9, true);
+        CHECK(checked.checker_passed);
+        CHECK(checked.gap_rel < 1e-9);
+        CHECK(certify::finalize_result(raw, checked).status == core::Status::Optimal);
+        engines::SimplexOptions opts;
+        opts.presolve = false;
+        opts.ruiz_iterations = 0;
+        opts.method = engines::SimplexMethod::Primal;
+        for (bool dual : {false, true}) {
+            engines::SimplexDiagnostics diag;
+            auto solved = dual ? engines::solve_dual_simplex(lp, opts, diag)
+                               : engines::solve_simplex(lp, opts, diag);
+            CHECK(diag.dual_bound_finite);
+            CHECK_NEAR(solved.dual_bound, raw.objective, 1e-9);
+            CHECK(maximize ? solved.dual_bound >= raw.objective
+                           : solved.dual_bound <= raw.objective);
+        }
+    }
+    core::RawResult nonfinite;
+    nonfinite.x = {std::numeric_limits<double>::quiet_NaN()};
+    CHECK(!certify::check_lp_point(lp, nonfinite, 1e-7, 1e-7, 1e-9, false).checker_passed);
+    nonfinite.x = {sor::model::kInf};
+    CHECK(!certify::check_lp_point(lp, nonfinite, 1e-7, 1e-7, 1e-9, false).checker_passed);
+}
+
 int main() {
     test_safe_lagrangian_bound();
     test_safe_bound_refuses_unbounded_direction();
+    test_small_cost_cannot_erase_unbounded_direction();
+    test_checked_repair_preserves_sense_and_offset();
     const auto infeasible = read(R"(NAME INF
 ROWS
  N OBJ

@@ -526,6 +526,89 @@ int test_dse_weight_carrier() {
     return failures;
 }
 
+// SimplexOptions::warm_dse_reset (S3.1): a warm-started child with a
+// non-logical basis must skip the exact rebuild and use weights of 1
+// instead, and must still reach the same answer as the exact rebuild --
+// weights only steer pricing, never correctness.
+int test_warm_dse_reset_skips_rebuild() {
+    using sor::core::Index;
+    using sor::core::f64;
+    using sor::model::LpProblem;
+    int failures = 0;
+
+    constexpr Index m = 40;
+    constexpr Index n = m + 15;
+    std::mt19937 rng(20260928);
+    std::uniform_real_distribution<f64> val(0.5, 2.5);
+    std::vector<Index> rows, cols;
+    std::vector<f64> vals;
+    for (Index i = 0; i < m; ++i)
+        for (int off = 0; off < 3; ++off) {
+            rows.push_back(i);
+            cols.push_back((i + off) % n);
+            vals.push_back(val(rng));
+        }
+
+    LpProblem lp;
+    lp.name = "warm_dse_reset";
+    lp.A = sor::sparse::from_triplets(m, n, rows, cols, vals);
+    lp.c.assign(static_cast<std::size_t>(n), 0.0);
+    for (Index j = 0; j < n; ++j) lp.c[static_cast<std::size_t>(j)] = 1.0 + val(rng);
+    lp.row_lo.assign(static_cast<std::size_t>(m), 1.0);
+    lp.row_hi.assign(static_cast<std::size_t>(m), 40.0);
+    lp.col_lo.assign(static_cast<std::size_t>(n), 0.0);
+    lp.col_hi.assign(static_cast<std::size_t>(n), 15.0);
+
+    sor::engines::SimplexOptions opts;
+    opts.pricing = sor::engines::SimplexPricing::DSE;
+
+    sor::engines::SimplexDiagnostics parent_diag;
+    sor::engines::SimplexBasis parent_basis;
+    const auto parent = sor::engines::solve_dual_simplex(lp, opts, parent_diag,
+                                                          &parent_basis);
+    if (parent.proposed_status != sor::core::Status::Optimal) return 1;
+
+    // Branch: tighten one bound. B does not change, but the parent basis
+    // (captured at B != -I, since the parent itself started logical and
+    // pivoted away from it) is non-logical, so reset_weights() takes the
+    // exact-rebuild branch on a plain warm start.
+    LpProblem child = lp;
+    child.col_hi[3] = 2.0;
+
+    sor::engines::SimplexOptions default_opts = opts;
+    sor::engines::SimplexDiagnostics default_diag;
+    sor::engines::SimplexBasis default_out;
+    const auto default_result = sor::engines::solve_dual_simplex(
+        child, default_opts, default_diag, &default_out, &parent_basis);
+    if (default_diag.dse_weight_rebuilds != 1) {
+        std::fprintf(stderr,
+                     "expected the exact rebuild by default (rebuilds=%llu)\n",
+                     static_cast<unsigned long long>(default_diag.dse_weight_rebuilds));
+        ++failures;
+    }
+
+    sor::engines::SimplexOptions warm_opts = opts;
+    warm_opts.warm_dse_reset = true;
+    sor::engines::SimplexDiagnostics warm_diag;
+    sor::engines::SimplexBasis warm_out;
+    const auto warm_result = sor::engines::solve_dual_simplex(
+        child, warm_opts, warm_diag, &warm_out, &parent_basis);
+    if (warm_diag.dse_weight_rebuilds != 0) {
+        std::fprintf(stderr,
+                     "warm_dse_reset did not skip the rebuild (rebuilds=%llu)\n",
+                     static_cast<unsigned long long>(warm_diag.dse_weight_rebuilds));
+        ++failures;
+    }
+    if (default_result.proposed_status != warm_result.proposed_status ||
+        std::fabs(default_result.objective - warm_result.objective) >
+            1e-7 * (1.0 + std::fabs(default_result.objective))) {
+        std::fprintf(stderr, "warm_dse_reset changed the answer: %.12g vs %.12g\n",
+                     default_result.objective, warm_result.objective);
+        ++failures;
+    }
+    return failures;
+}
+
 // Algebraic regression for the exact rank-one DSE update. End-to-end LP tests
 // prove that pricing cannot change the answer; this independently proves that
 // the propagated weights after every product-form basis replacement equal a
@@ -624,6 +707,7 @@ int main() {
     failures += test_dse_matches_other_pricing_on_larger_lps();
     failures += test_seeded_rebuild_is_bit_identical();
     failures += test_dse_weight_carrier();
+    failures += test_warm_dse_reset_skips_rebuild();
     failures += test_incremental_dse_matches_full_rebuild();
     if (failures) std::fprintf(stderr, "%d failure(s)\n", failures);
     return failures ? 1 : 0;

@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <functional>
+#include <utility>
 #include <vector>
 #include "sor/core/route_debug.hpp"
 
@@ -30,12 +31,20 @@ using core::f64;
 using core::Index;
 
 struct CutOptions {
+    // Rows below this boundary belong to the original working model and
+    // must never be tightened by merging cuts. Unknown protects all rows.
+    Index original_rows = -1;
     // Treat a row-activity variable as integral only if every nonzero term
     // is an exactly integral coefficient of a declared integer column.
     // Experimental until validity and full-set proof ablations pass.
     bool integer_slack_gmi = true;
     bool integer_activity_basic_gmi = false;
-    int max_rounds = 20;
+    // A backstop, not the stopping rule: the loop ends on stalled rounds
+    // (below) or on its share of the time limit. At 20 it was the binding
+    // limit on flow models whose bound still rose ~1% per round: p200x1188c
+    // 12904 at 20 rounds vs 13628 at 39, h80x6320d 6261 vs 6304. With warm
+    // rounds a round costs a few dual pivots, so running on is cheap.
+    int max_rounds = 100;
     f64 min_progress_rel = 1e-4;   // a round gaining less than this is "stalled"
     // Consecutive stalled rounds tolerated before the loop gives up.
     //
@@ -49,7 +58,9 @@ struct CutOptions {
     // Cut loops are not monotone in per-round gain: a round that adds little
     // often exposes structure the next round exploits. Patience is what lets
     // the loop cross that dip.
-    int min_progress_patience = 2;   // plan 3E: stop after two low-yield rounds
+    // Three: a longer loop meets more single dips (sp150x300d gains 5e-5 in
+    // one round and 1.5e-3 in the next).
+    int min_progress_patience = 3;
     // Retract the trailing run of rounds that bought no bound, instead of
     // only stopping once it is long enough.
     //
@@ -97,13 +108,12 @@ struct CutOptions {
     // seeding the root node with the loop's final basis, so the root started
     // cold too. Measured cost of that: p0201's cut loop 241 ms -> 77 ms.
     //
-    // OFF BY DEFAULT, and not part of any recommended combination until it
-    // has had its own 3-rep sweep. Two reasons beyond the usual. It changes
-    // pivot sequences everywhere it fires, so it must be measured alone; and
-    // the basis-EXTENSION block it enables has by construction never executed
-    // in production, so switching this on runs untested code for the first
-    // time.
-    bool warm_start_rounds = false;
+    // On by default. A warm round that fails to prove falls back to the cold
+    // solve, so it can only change pivot paths, not answers. Measured: cut
+    // loop p200x1188c 2.0 s -> 0.8 s, beasleyC3 9.2 s -> 4.0 s (root bound
+    // 674 -> 693), exp-1-500-5-5 0.82 s -> 0.32 s. Cold rounds were what made
+    // the loop hit its time share before its bound stopped rising.
+    bool warm_start_rounds = true;
     // Per-separator MARGINAL contribution gate.
     //
     // The realised-gain gate and the rollback built on it both measure a
@@ -164,10 +174,50 @@ struct CutOptions {
     // instant failure. Verified empirically: 1e2 fixes rgn.mps; 1e3 and
     // above all reproduce the failure identically.
     f64 dynamism_max = 1e2;
+    // A rejected GMI is already integer-valid. Re-round it through SOR's
+    // existing c-MIR transform; accept only within the same dynamism limit.
+    bool gmi_cmir_recovery = false;
+    int max_cmir_attempts_per_round = 64;
+    // A cut whose coefficient range exceeds dynamism_max is repaired before
+    // it is refused: every term smaller than max|coef| / dynamism_max is
+    // replaced by its extreme contribution over the column box (valid because
+    // the needed bound is finite), which weakens the right-hand side and
+    // leaves the range within the limit. The repaired cut is still filtered
+    // on violation; it never bypasses the dynamism limit.
+    // OFF by default: on the 60 s easy60 subset (interleaved A/B, checker-
+    // verified) it lost as often as it won -- nw04 42 s -> 49 s, cbs-cta and
+    // enlight_hard slower, drayage-100-23 root-loop bound 86k -> 74k -- and
+    // helped p200x1188c and sp150x300d. Sound (oracle-tested), not a win yet.
+    bool relax_small_terms = false;
+    // Tableau c-MIR (Marchand & Wolsey 2001 applied to the simplex row of a
+    // fractional basic integer variable, as in Achterberg 2007 sec. 8.2):
+    // the same row that yields the GMI is also rounded as a c-MIR base over
+    // the transformed variables, sweeping the scaling delta, and whichever of
+    // the two cuts is more efficacious (after dynamism repair) is kept. A row
+    // the GMI numerics refuse can still yield a c-MIR cut.
+    // OFF by default: same A/B, the extra c-MIR cuts were net negative on
+    // drayage-25-23 (final dual bound 70.5k -> 53.8k), drayage-100-23, app1-1
+    // (28 s -> 42 s), nw04 and neos-3381206-awhea; they win only on a few
+    // instances (exp-1-500-5-5 bound +0.8%). Kept, oracle-tested, for the
+    // cut-selection work that lets them displace weaker cuts instead of
+    // adding to them.
+    bool tableau_cmir = false;
+    int tableau_cmir_max_scalings = 8;
     f64 violation_min = 1e-4;      // reject a cut that doesn't cut off the current point by this much
     f64 frac_min = 1e-4;           // skip tableau rows whose fractional part is too close to 0/1
     int max_cuts_per_round = 200;
     int max_candidates_per_round = 500;
+    // The prefilter passes on at most this many times max_candidates_per_round
+    // candidates (screened for validity, numerics and near-duplicates); the
+    // selecting pool then applies diversity and the nonzero budget.
+    int prefilter_cap_factor = 4;
+    // Wall-clock allowance for one separation call (0 = none). The separator
+    // stops between candidates once it is spent and returns what it has.
+    double time_limit_s = 0.0;
+    // Charge every BTRAN/tableau attempt, including numerically rejected cuts.
+    // Zero retains the unlimited-attempt behavior for comparison.
+    int gmi_max_tableau_trials = 0;
+    bool rank_gmi_candidates = false;
     std::size_t pool_max_size = 5000;
     int pool_max_age = 5;
     f64 pool_parallelism_max = 0.995;
@@ -272,6 +322,14 @@ struct CutDiagnostics {
     std::uint64_t gmi_invalid_factor = 0;
     std::uint64_t gmi_empty_rows = 0;
     std::uint64_t rejected_dynamism = 0;
+    std::uint64_t dynamism_repaired = 0;    // small terms relaxed away
+    std::uint64_t time_stops = 0;           // separation stopped on its allowance
+    std::uint64_t tableau_cmir_tried = 0;   // rows offered to the tableau c-MIR
+    std::uint64_t tableau_cmir_cuts = 0;    // rows where it produced a cut
+    std::uint64_t tableau_cmir_won = 0;     // ... more efficacious than the GMI
+    std::uint64_t tableau_cmir_only = 0;    // ... where no GMI cut existed
+    std::uint64_t cmir_attempted = 0;
+    std::uint64_t cmir_recovered = 0;
     std::uint64_t rejected_violation = 0;
     std::uint64_t rejected_free_nonbasic = 0;
     // A5: a term whose GMI coefficient rounded to ~0 but whose bound was
@@ -295,6 +353,33 @@ struct CutDiagnostics {
     std::uint64_t pool_selected = 0;
     f64 root_bound_before = core::kNaN;
     f64 root_bound_after = core::kNaN;
+};
+
+// Why filter_cut_candidates_for_round() dropped candidates, one count per
+// dropped cut. Every candidate is either returned or counted in exactly one
+// of these, so generated == returned + total().
+struct CutFilterStats {
+    std::uint64_t rejected_malformed = 0;  // empty/unnormalisable/bad index
+    std::uint64_t rejected_dense = 0;      // above the density cap
+    std::uint64_t rejected_efficacy = 0;   // efficacy below pool_efficacy_min
+    std::uint64_t rejected_parallel = 0;   // penalised below zero by a pick
+    std::uint64_t rejected_duplicate = 0;  // same support and coefficients, no stronger
+    std::uint64_t rejected_dominated = 0;  // same left-hand side, weaker right-hand side
+    std::uint64_t rejected_budget = 0;     // not reached: cap / nnz / score stop
+    std::uint64_t total() const {
+        return rejected_malformed + rejected_dense + rejected_efficacy +
+               rejected_parallel + rejected_budget + rejected_duplicate +
+               rejected_dominated;
+    }
+    void add(const CutFilterStats& o) {
+        rejected_malformed += o.rejected_malformed;
+        rejected_dense += o.rejected_dense;
+        rejected_efficacy += o.rejected_efficacy;
+        rejected_parallel += o.rejected_parallel;
+        rejected_duplicate += o.rejected_duplicate;
+        rejected_dominated += o.rejected_dominated;
+        rejected_budget += o.rejected_budget;
+    }
 };
 
 // A single valid inequality in two-sided row form: row_lo <= sum(vals[k] * x[cols[k]]) <= row_hi.
@@ -381,6 +466,19 @@ private:
     ExternalScoreFn external_score_;
     ExternalBatchScoreFn external_batch_score_;
 };
+
+// Removes from the inequality  sum vals[k] * x[cols[k]]  (>= rhs when `geq`,
+// <= rhs otherwise) every term with |val| < max|val| / dynamism_max, moving
+// its extreme contribution over the box [lo, hi] into `rhs`. The result is a
+// weaker inequality, valid wherever the input was and the box holds. Returns
+// false, leaving the arguments untouched, if a dropped term has no finite
+// bound on the side it needs or nothing would survive. `used_bounds`
+// receives (column, bound) for each substitution so a caller can tell
+// whether a non-root bound was used.
+bool relax_small_terms(std::vector<Index>& cols, std::vector<f64>& vals, f64& rhs,
+                       bool geq, const std::vector<f64>& lo,
+                       const std::vector<f64>& hi, f64 dynamism_max,
+                       std::vector<std::pair<Index, f64>>* used_bounds = nullptr);
 
 // One separation pass over a proved-optimal relaxation of `lp` at point `x`
 // with basis `basis` (as returned by engines::solve_simplex/solve_dual_simplex

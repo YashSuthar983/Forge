@@ -10,6 +10,8 @@
 
 namespace sor::engines {
 
+struct SimplexPrepared;
+
 // Exact dual steepest-edge weights carried BETWEEN solves.
 //
 // w_i = ||B^-T e_i||^2 depends only on the basis matrix B. Changing variable
@@ -52,6 +54,9 @@ struct DualEdgeWeightCarrier {
     }
 };
 
+// See FactorCarrier's own doc comment, below, for `factor`.
+struct FactorCarrier;
+
 // `warm` (optional): a basis captured from an earlier run on the SAME problem
 // (e.g. the Auto dispatcher's dual probe). The engine continues from it
 // instead of the all-logical cold start, so a probe followed by a committed
@@ -59,12 +64,18 @@ struct DualEdgeWeightCarrier {
 //
 // `weights` (optional): see DualEdgeWeightCarrier. Read at the first
 // factorization, overwritten with this run's final weights on exit.
+//
+// `factor` (optional, EXPERIMENTAL): see FactorCarrier. Same take-at-entry,
+// refill-at-the-one-normal-exit discipline as `weights`; forwarded straight
+// through to solve_dual_simplex_prepared, which owns all of the validation.
 core::RawResult solve_dual_simplex(const model::LpProblem& problem,
                                    const SimplexOptions& opts,
                                    SimplexDiagnostics& diag,
                                    SimplexBasis* out_basis = nullptr,
                                    const SimplexBasis* warm = nullptr,
-                                   DualEdgeWeightCarrier* weights = nullptr);
+                                   DualEdgeWeightCarrier* weights = nullptr,
+                                   FactorCarrier* factor = nullptr,
+                                   std::unique_ptr<DualProbeSession>* out_session = nullptr);
 
 // EXPERIMENTAL -- reuse an already-factored basis matrix across a bound/RHS/
 // objective-only reoptimization (repeated-LP reuse measurement, not
@@ -97,32 +108,29 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
 // `matrix == nullptr` is never adopted; that is how a caller invalidates the
 // carrier after a row/column change without needing to know the internals.
 //
-// KNOWN COVERAGE GAP, measured on repeated-LP corpus (agent-1, 2026-09):
-// the carrier is refilled ONLY at the one normal exit, same as
-// DualEdgeWeightCarrier -- an early exit (infeasible, time limit) correctly
-// leaves it empty rather than risk handing back a stale factor. But the
-// dual engine has a THIRD, algorithm-intrinsic exit: a hand-off to
-// solve_primal_simplex_prepared() when a proof-producing point still has
-// residual dual infeasibility after the boxed-column flip pass
-// (`needs_primal_cleanup`, see its own long comment in dual_simplex.cpp).
-// That hand-off is NOT gated by cost perturbation and fires readily on
-// larger/harder models regardless of pivot count -- on Netlib pilot87 it
-// fired on every measured node in the corpus (12/12), so this carrier
-// never got refilled at all for that lineage, and reuse silently never
-// fired for any descendant. Small/well-conditioned models (miplib-easy
-// p0033: 8/8 bound-or-RHS-or-cost nodes) are unaffected. This is a real,
-// unclaimed extension: the primal clean-up runs its own separate
-// solve_primal_simplex_prepared() with its own LU factorization, and
-// nothing here reuses IT either. Extending coverage across that hand-off
-// was judged out of scope for this session (a heavier change to an
-// already-hardened, previously-buggy path -- see the dual clean-up
-// hand-off comment above `needs_primal_cleanup`) and is left for
-// follow-up, not silently assumed solved.
+// Dual-to-primal cleanup exports the primal engine's final factor. Original-
+// bound restoration can adopt it into warm dual and returns that final factor
+// instead. No earlier engine's factor is labeled as the returned basis. DSE
+// weights remain unavailable after a primal-only cleanup; a later dual solve
+// rebuilds those weights while still reusing the basis factor.
+struct FactorScalingIdentity {
+    std::vector<core::f64> row_scale;
+    std::vector<core::f64> col_scale;
+    int ruiz_iterations = 0;
+    bool ruiz_power_of_two = false;
+};
+
 struct FactorCarrier {
     const void* matrix = nullptr;
     core::Index rows = 0;
     core::Index cols = 0;
     core::Offset nnz = 0;
+    // A copied checkpoint retains its session's identity after LRU eviction;
+    // a newly allocated session cannot inherit it by reusing an address.
+    std::shared_ptr<const void> session_identity;
+    // The same original A can produce a different scaled B when preparation
+    // options change. Shared across checkpoints; compared exactly on reuse.
+    std::shared_ptr<const FactorScalingIdentity> scaling_identity;
     std::vector<core::Index> basis;  // basis this factor was captured at
     la::BasisFactor factor;
     bool has_factor = false;
@@ -132,6 +140,8 @@ struct FactorCarrier {
         rows = 0;
         cols = 0;
         nnz = 0;
+        session_identity.reset();
+        scaling_identity.reset();
         basis.clear();
         has_factor = false;
     }
@@ -166,7 +176,7 @@ public:
     // `warm_factor` (optional): an LU factorization of `warm`'s basis
     // matrix taken from THIS session at the same preparation (e.g. the
     // parent node's final factor). Copied in; adopted only if the engine
-    // confirms the basis matches element for element.
+    // confirms session identity, scaling and basis element for element.
     core::RawResult solve(const SimplexOptions& opts, SimplexDiagnostics& diag,
                           SimplexBasis* out_basis, const SimplexBasis* warm,
                           const std::vector<core::f64>* warm_weights = nullptr,
@@ -193,6 +203,18 @@ public:
                           const SimplexBasis& base);
 
 private:
+    // Only engine wrappers may transfer their own exact prepared model and
+    // its numeric carriers. Arbitrary external factors cannot be retokened.
+    DualProbeSession(SimplexPrepared&& prepared,
+                     DualEdgeWeightCarrier&& weights, FactorCarrier&& factor,
+                     const SimplexBasis& base);
+    friend core::RawResult solve_simplex(const model::LpProblem&,
+        const SimplexOptions&, SimplexDiagnostics&, SimplexBasis*,
+        std::unique_ptr<DualProbeSession>*);
+    friend core::RawResult solve_dual_simplex(const model::LpProblem&,
+        const SimplexOptions&, SimplexDiagnostics&, SimplexBasis*,
+        const SimplexBasis*, DualEdgeWeightCarrier*, FactorCarrier*,
+        std::unique_ptr<DualProbeSession>*);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

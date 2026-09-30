@@ -144,7 +144,7 @@ LpProblem make_blend(std::uint32_t seed, int n_crudes, int n_products) {
 }
 
 // ---- refinery scheduling MILP --------------------------------------------
-// periods x units, binary on/off, min up, demand coverage, cost minimize.
+// periods x units; binary on/off and startup; per-period demand and startup-linking rows.
 LpProblem make_schedule(std::uint32_t seed, int periods, int units) {
     std::mt19937 rng(seed);
     std::uniform_real_distribution<f64> cost_d(10.0, 40.0);
