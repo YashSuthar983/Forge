@@ -6,6 +6,10 @@
 
 namespace sor::engines {
 
+struct SimplexOptions;
+struct HprOptions;
+struct PdhgOptions;
+
 using core::LpDiagnostics;
 using core::LpOptions;
 using core::LpStrategy;
@@ -19,7 +23,10 @@ core::LpStructuralFeatures extract_lp_features(
 core::RawResult solve_lp(const model::LpProblem& problem,
                          const LpOptions& options,
                          LpDiagnostics& diagnostics,
-                         core::ProofEvidence* evidence = nullptr);
+                         core::ProofEvidence* evidence = nullptr,
+                         const SimplexOptions* simplex_policy = nullptr,
+                         const HprOptions* hpr_policy = nullptr,
+                         const PdhgOptions* pdhg_policy = nullptr);
 
 namespace detail {
 LpStrategy route_lp_auto(const core::LpStructuralFeatures& features,

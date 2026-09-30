@@ -64,6 +64,59 @@ void test_certificate_rules() {
     CHECK(sor::search::node_bound_after_relaxation(7.0, proved) == 8.0);
 }
 
+// Strong branching closes both child regions although the parent relaxation
+// has an open gap. The child certificates, rather than the weaker parent
+// bound, must survive in the final frontier bound.
+void test_strong_branch_child_certificates_close_gap() {
+    const auto lp = make_random_milp(1526);
+    const auto oracle = solve_oracle(lp);
+    CHECK(oracle.feasible);
+    BabOptions opts;
+    opts.para_bab.threads = 1;
+    opts.structural_presolve.enabled = false;
+    opts.time_limit_s = 0.0;
+    opts.gap_tol = opts.abs_gap_tol = 1e-9;
+    opts.rb_startup_ms = 1e12;
+    BabDiagnostics diag;
+    const auto raw = sor::search::solve_milp(lp, opts, diag);
+    const auto result = sor::certify::finalize_result(raw,
+        sor::search::milp_evidence(diag, opts));
+    CHECK(diag.sb_nodes_closed > 0);
+    CHECK(result.status == sor::core::Status::Optimal);
+    CHECK_NEAR(result.objective, oracle.objective, 1e-7);
+    CHECK(diag.gap_rel <= opts.gap_tol);
+    const double sense = lp.maximize ? -1.0 : 1.0;
+    CHECK(sense * diag.dual_bound <= sense * oracle.objective + 1e-7);
+
+    // Absolute and relative stopping tolerances are alternatives. Preserve
+    // the real open relative gap when the absolute tolerance closes it.
+    sor::model::LpProblem absolute_lp;
+    absolute_lp.A = sor::sparse::from_triplets(1, 3, {0, 0, 0}, {0, 1, 2}, {1., 1., 1.});
+    absolute_lp.c = {1., 1.2, .01};
+    absolute_lp.col_lo = {0., 0., 0.};
+    absolute_lp.col_hi = {1., 1., .1};
+    absolute_lp.row_lo = {.5};
+    absolute_lp.row_hi = {kInf};
+    absolute_lp.is_integer = {true, true, false};
+    const std::vector<double> incumbent = {1., 0., 0.};
+    opts.abs_gap_tol = 0.6;
+    opts.initial_solution = &incumbent;
+    opts.component_solve = false;
+    opts.cuts_enabled = false;
+    opts.probing = opts.mip_presolve = opts.symmetry = false;
+    opts.root_primal_early = opts.root_primal_final = false;
+    opts.feasibility_jump = opts.fixprop = opts.feasibility_pump_root = false;
+    opts.feasibility_pump_improve = false;
+    BabDiagnostics absolute_diag;
+    const auto absolute_raw = sor::search::solve_milp(absolute_lp, opts, absolute_diag);
+    const auto absolute_result = sor::certify::finalize_result(absolute_raw,
+        sor::search::milp_evidence(absolute_diag, opts));
+    CHECK(absolute_result.status == sor::core::Status::Optimal);
+    CHECK(absolute_diag.gap_rel > opts.gap_tol);
+    CHECK(std::fabs(absolute_diag.incumbent - absolute_diag.dual_bound) <= opts.abs_gap_tol);
+    CHECK(absolute_diag.dual_bound <= 1. + 1e-7);
+}
+
 // Every claim must still be true when node LPs are routinely cut off after
 // a handful of pivots: unproved LPs keep their inherited bound, integral
 // points from them do not close their subtree, and no unproved objective
@@ -178,6 +231,7 @@ void test_root_certificate_floors_final_bound() {
 }  // namespace
 
 int main() {
+    test_strong_branch_child_certificates_close_gap();
     test_certificate_rules();
     test_interrupted_node_lps_stay_sound();
     test_root_certificate_floors_final_bound();

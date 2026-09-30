@@ -49,6 +49,7 @@
 // spmv kernel for both forms beats a branch in every kernel.  q*x computed
 // by that CSR is the same single product the CPU forms, so nothing moves.
 #include "sor/backend/pdhcg_device.hpp"
+#include "../pdhcg_lp_diagnostics.hpp"
 #include "sor/sparse/csr.hpp"
 #include "vk_compute.hpp"
 
@@ -141,8 +142,16 @@ public:
         clo_host_ = d.col_lo;
         chi_host_ = d.col_hi;
 
-        // Host copies for CPU-side KKT computation
-        d_host_ = d;  // Keep the full PdhcgData for KKT
+        // Retain only the LP data needed by explicit diagnostic evaluation;
+        // the CSC copy, sparse Q and diagonal Q stay on the device.
+        d_host_.A_csr = d.A_csr;
+        d_host_.c = d.c;
+        d_host_.col_lo = d.col_lo;
+        d_host_.col_hi = d.col_hi;
+        d_host_.row_lo = d.row_lo;
+        d_host_.row_hi = d.row_hi;
+        d_host_.col_scale = d.col_scale;
+        d_host_.row_scale = d.row_scale;
 
         for (Buf* b : {&x_, &x0_, &xprev_, &xc_, &xin_, &trial_, &grad_, &aty_, &qx_,
                        &xbar_, &s1_, &s2_, &s3_, &s4_, &s5_, &s6_, &x_avg_, &x_mark_})
@@ -278,6 +287,15 @@ public:
     }
 
     Eval evaluate(bool at_average) override {
+        return evaluate_impl(at_average, true);
+    }
+
+    Eval evaluate_qp(bool at_average) override {
+        return evaluate_impl(at_average, false);
+    }
+
+private:
+    Eval evaluate_impl(bool at_average, bool with_lp_diagnostics) {
         Buf& xe = at_average ? x_avg_ : x_;
         Buf& ye = at_average ? y_avg_ : y_;
         rec_a(xe, r1_);          // r1 = A x
@@ -314,7 +332,9 @@ public:
         e.support_finite = s[7] == 0.0 && s[9] == 0.0 && std::isfinite(s[6]) &&
                            std::isfinite(s[8]);
 
-        // --- CPU-side LP KKT metrics (mirrors cpu_pdhcg_device exactly) ---
+        if (!with_lp_diagnostics) return e;
+
+        // Optional LP diagnostics share their formulas with the CPU device.
         std::vector<f64> xv(n_), yv(m_);
         vk_.download(xe, xv);
         vk_.download(ye, yv);
@@ -340,75 +360,12 @@ public:
                         av[static_cast<std::size_t>(k)] * yv[i];
         }
 
-        f64 pres = 0.0, dres = 0.0;
-        f64 pobj = 0.0, dobj = 0.0;
-        f64 edx2 = 0.0, edy2 = 0.0;
-        bool nonfin = false;
-        const bool has_col_scale = !d_host_.col_scale.empty();
-        const bool has_row_scale = !d_host_.row_scale.empty();
-        constexpr f64 kInf = std::numeric_limits<f64>::infinity();
-
-        for (std::size_t j = 0; j < n_; ++j) {
-            const f64 cs = has_col_scale ? d_host_.col_scale[j] : 1.0;
-            const f64 xj = xv[j];
-            const f64 l = d_host_.col_lo[j], h = d_host_.col_hi[j];
-            if (xj < l) pres = std::max(pres, (l - xj) * cs);
-            if (xj > h) pres = std::max(pres, (xj - h) * cs);
-            const f64 r_scaled = d_host_.c[j] + atyv[j];
-            const f64 ru = r_scaled / cs;
-            const f64 xu = xj * cs;
-            const f64 at_tol = 1e-9 * (1.0 + std::fabs(xu)) / cs;
-            const bool at_lo = l != -kInf && xj <= l + at_tol;
-            const bool at_hi = h != kInf && xj >= h - at_tol;
-            if (at_lo && !at_hi)       dres = std::max(dres, std::max(0.0, -ru));
-            else if (at_hi && !at_lo)  dres = std::max(dres, std::max(0.0, ru));
-            else if (!at_lo && !at_hi) dres = std::max(dres, std::fabs(ru));
-            pobj += d_host_.c[j] * xj;
-            const f64 bound = r_scaled >= 0.0 ? l : h;
-            if (std::isinf(bound)) {
-                if (std::fabs(ru) > 1e-9 * (1.0 + std::fabs(d_host_.c[j] / cs))) nonfin = true;
-            } else {
-                dobj += r_scaled * bound;
-            }
-            const f64 d = xj - x0h[j];
-            edx2 += d * d;
-        }
-
-        for (std::size_t i = 0; i < m_; ++i) {
-            const f64 a = ax[i];
-            const f64 rs = has_row_scale ? d_host_.row_scale[i] : 1.0;
-            const f64 l = d_host_.row_lo[i], h = d_host_.row_hi[i];
-            if (a < l) pres = std::max(pres, (l - a) / rs);
-            if (a > h) pres = std::max(pres, (a - h) / rs);
-            const f64 yi = yv[i];
-            const f64 au = a / rs;
-            const f64 mu = -yi * rs;
-            const f64 at_tol = 1e-9 * (1.0 + std::fabs(au));
-            const bool at_lo = l != -kInf && au <= l / rs + at_tol;
-            const bool at_hi = h != kInf && au >= h / rs - at_tol;
-            if (at_lo && !at_hi)       dres = std::max(dres, std::max(0.0, -mu));
-            else if (at_hi && !at_lo)  dres = std::max(dres, std::max(0.0, mu));
-            else if (!at_lo && !at_hi) dres = std::max(dres, std::fabs(mu));
-            const f64 bound = yi >= 0.0 ? h : l;
-            if (std::isinf(bound)) {
-                if (std::fabs(yi * rs) > 1e-9) nonfin = true;
-            } else {
-                dobj += -yi * bound;
-            }
-            const f64 d = yi - y0h[i];
-            edy2 += d * d;
-        }
-
-        e.kkt_primal_res = pres;
-        e.kkt_dual_res = dres;
-        e.kkt_primal_obj = pobj;
-        e.kkt_dual_obj = nonfin ? core::kNaN : dobj;
-        e.kkt_epoch_dx_norm = std::sqrt(edx2);
-        e.kkt_epoch_dy_norm = std::sqrt(edy2);
+        detail::fill_lp_kkt(e, d_host_, xv, yv, x0h, y0h, ax, atyv);
 
         return e;
     }
 
+public:
     void download(std::vector<f64>& x, std::vector<f64>& y) override {
         x.assign(n_, 0.0);
         y.assign(m_, 0.0);

@@ -16,6 +16,7 @@ enum class CrossoverVariableClass : std::uint8_t {
 };
 
 struct CrossoverOptions {
+    const SimplexOptions* simplex_policy = nullptr;
     f64 primal_tol = 1e-7;
     f64 dual_tol = 1e-7;
     f64 trigger_primal_dual_tol = 1e-4;

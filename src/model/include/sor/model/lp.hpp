@@ -57,7 +57,12 @@ struct LpProblem {
     f64 max_bound_violation(const std::vector<f64>& x) const;
 
     // Throws std::invalid_argument on inconsistent dimensions or lo > hi.
-    void validate() const;
+    // Internal bound overlays may represent an empty domain. Data/shape and
+    // bound-direction checks remain mandatory when allow_empty_domains is true.
+    void validate(bool allow_empty_domains = false) const;
 };
+
+// Validate policy once before engine setup and numerical hot loops.
+void validate_lp_policy(f64 primal_tol, f64 dual_tol, f64 gap_tol, f64 time_limit_s);
 
 }  // namespace sor::model

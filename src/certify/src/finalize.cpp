@@ -1,4 +1,5 @@
 #include "sor/certify/finalize.hpp"
+#include "sor/model/exact.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -36,21 +37,22 @@ bool lp_optimality_within_tolerance(const ProofEvidence& ev) {
 // The highest level the evidence actually supports.
 ProofLevel supported_level(const ProofEvidence& ev) {
     SOR_FN();
-    if (ev.claimed_level >= ProofLevel::ProvedOptimalFP) {
-        // A basis is what makes an f64 optimality proof meaningful; a
-        // first-order point without crossover does not have one.
-        if (!ev.has_basis || !lp_optimality_within_tolerance(ev))
-            return ProofLevel::FeasibleWithGap;
-        if (ev.vipr_verified)      return ProofLevel::ProvedOptimalCertified;
-        if (ev.rational_verified)  return ProofLevel::ProvedOptimalExact;
+    const bool feasible = ev.checker_passed &&
+        std::isfinite(ev.max_primal_violation) &&
+        ev.max_primal_violation <= ev.primal_feas_tol;
+    if (!feasible) return std::isfinite(ev.checked_dual_bound)
+        ? ProofLevel::BoundOnly : ProofLevel::None;
+    if (ev.claimed_level >= ProofLevel::ProvedOptimalFP &&
+        ev.has_basis && lp_optimality_within_tolerance(ev)) {
+        if (ev.vipr_verified) return ProofLevel::ProvedOptimalCertified;
+        if (ev.rational_verified) return ProofLevel::ProvedOptimalExact;
         return ProofLevel::ProvedOptimalFP;
     }
-    if (ev.claimed_level == ProofLevel::ProvedKKT ||
-        ev.claimed_level == ProofLevel::ProvedGlobalEpsilon) {
-        return residuals_within_tolerance(ev) ? ev.claimed_level
-                                              : ProofLevel::FeasibleOnly;
-    }
-    return ev.claimed_level;
+    if ((ev.claimed_level == ProofLevel::ProvedKKT ||
+         ev.claimed_level == ProofLevel::ProvedGlobalEpsilon) &&
+        residuals_within_tolerance(ev)) return ev.claimed_level;
+    return std::isfinite(ev.gap_rel) ? ProofLevel::FeasibleWithGap
+                                    : ProofLevel::FeasibleOnly;
 }
 
 
@@ -58,7 +60,8 @@ ProofLevel supported_level(const ProofEvidence& ev) {
 // [lo, hi]) satisfies, by bound propagation over the rows to a fixpoint (at
 // most 20 rounds). Each round derives, row by row, bounds implied by the
 // bounds so far, so the limit is valid for every feasible point. Bounds are
-// loosened by a relative 1e-9 so accumulated rounding can only weaken them.
+// computed exactly from binary64 inputs, then converted outward. Approximate
+// screening may decline a tightening; it never supplies a published bound.
 void row_implied_bounds(const model::LpProblem& problem,
                         const std::vector<f64>& lo_in,
                         const std::vector<f64>& hi_in,
@@ -68,38 +71,62 @@ void row_implied_bounds(const model::LpProblem& problem,
     const core::Index m = problem.n_rows();
     imp_lo = lo_in;
     imp_hi = hi_in;
-    const auto loosen = [](long double v, int dir) {
-        return static_cast<f64>(v + dir * 1e-9L * (1.0L + std::fabs(v)));
+    const auto loosen = [](const model::Rational& v, int dir) {
+        return dir < 0 ? model::rounded_down(v) : model::rounded_up(v);
     };
     for (int round = 0; round < 20; ++round) {
         bool changed = false;
         for (core::Index i = 0; i < m; ++i) {
-            long double amin = 0.0L, amax = 0.0L;
+            model::ExactSum min_sum, max_sum;
+            std::vector<f64> row_min, row_max;
+            row_min.reserve(sz(rp[sz(i) + 1] - rp[sz(i)]));
+            row_max.reserve(row_min.capacity());
             int nmin = 0, nmax = 0;
             for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
                 const f64 a = problem.A.vals[sz(k)];
                 const core::Index c = ci[sz(k)];
                 const f64 bmin = a > 0.0 ? imp_lo[sz(c)] : imp_hi[sz(c)];
                 const f64 bmax = a > 0.0 ? imp_hi[sz(c)] : imp_lo[sz(c)];
-                if (std::isfinite(bmin)) amin += static_cast<long double>(a) * bmin; else ++nmin;
-                if (std::isfinite(bmax)) amax += static_cast<long double>(a) * bmax; else ++nmax;
+                row_min.push_back(bmin);
+                row_max.push_back(bmax);
+                if (a == 0.0) continue;
+                if (std::isfinite(bmin)) min_sum.add_product(a, bmin); else ++nmin;
+                if (std::isfinite(bmax)) max_sum.add_product(a, bmax); else ++nmax;
             }
+            const model::Rational amin = min_sum.value(), amax = max_sum.value();
+            const long double amin_hint = amin.convert_to<long double>();
+            const long double amax_hint = amax.convert_to<long double>();
             const f64 lo = problem.row_lo[sz(i)], hi = problem.row_hi[sz(i)];
             for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
                 const f64 a = problem.A.vals[sz(k)];
                 if (a == 0.0) continue;
                 const core::Index c = ci[sz(k)];
-                const f64 bmin = a > 0.0 ? imp_lo[sz(c)] : imp_hi[sz(c)];
-                const f64 bmax = a > 0.0 ? imp_hi[sz(c)] : imp_lo[sz(c)];
-                long double rmin, rmax;
+                const f64 bmin = row_min[static_cast<std::size_t>(k - rp[sz(i)])];
+                const f64 bmax = row_max[static_cast<std::size_t>(k - rp[sz(i)])];
+                // Screening only saves work. A cancellation error here can
+                // miss a useful tightening, but cannot create an invalid one.
+                bool useful = false;
+                const auto screen = [&](long double value, bool lower) {
+                    const long double current = lower ? imp_lo[sz(c)] : imp_hi[sz(c)];
+                    return lower ? value > current + 1e-9L * (1 + std::fabs(value))
+                                 : value < current - 1e-9L * (1 + std::fabs(value));
+                };
+                if (std::isfinite(lo) && (nmax == 0 || (!std::isfinite(bmax) && nmax == 1)))
+                    useful |= screen((static_cast<long double>(lo) - amax_hint +
+                        (std::isfinite(bmax) ? static_cast<long double>(a) * bmax : 0)) / a, a > 0);
+                if (std::isfinite(hi) && (nmin == 0 || (!std::isfinite(bmin) && nmin == 1)))
+                    useful |= screen((static_cast<long double>(hi) - amin_hint +
+                        (std::isfinite(bmin) ? static_cast<long double>(a) * bmin : 0)) / a, a < 0);
+                if (!useful) continue;
+                model::Rational rmin, rmax;
                 bool fmin, fmax;
-                if (std::isfinite(bmin)) { rmin = amin - static_cast<long double>(a) * bmin; fmin = nmin == 0; }
+                if (std::isfinite(bmin)) { rmin = amin - model::Rational(a) * model::Rational(bmin); fmin = nmin == 0; }
                 else { rmin = amin; fmin = nmin == 1; }
-                if (std::isfinite(bmax)) { rmax = amax - static_cast<long double>(a) * bmax; fmax = nmax == 0; }
+                if (std::isfinite(bmax)) { rmax = amax - model::Rational(a) * model::Rational(bmax); fmax = nmax == 0; }
                 else { rmax = amax; fmax = nmax == 1; }
                 // a x_c in [lo - rmax, hi - rmin]
                 if (std::isfinite(lo) && fmax) {
-                    const long double v = (lo - rmax) / a;
+                    const model::Rational v = (model::Rational(lo) - rmax) / model::Rational(a);
                     if (a > 0.0) {
                         const f64 nb = loosen(v, -1);
                         if (nb > imp_lo[sz(c)] + 1e-9 * (1.0 + std::fabs(nb))) { imp_lo[sz(c)] = nb; changed = true; }
@@ -109,7 +136,7 @@ void row_implied_bounds(const model::LpProblem& problem,
                     }
                 }
                 if (std::isfinite(hi) && fmin) {
-                    const long double v = (hi - rmin) / a;
+                    const model::Rational v = (model::Rational(hi) - rmin) / model::Rational(a);
                     if (a > 0.0) {
                         const f64 nb = loosen(v, +1);
                         if (nb < imp_hi[sz(c)] - 1e-9 * (1.0 + std::fabs(nb))) { imp_hi[sz(c)] = nb; changed = true; }
@@ -126,6 +153,13 @@ void row_implied_bounds(const model::LpProblem& problem,
 
 }  // namespace
 
+std::pair<std::vector<f64>, std::vector<f64>> implied_lp_column_bounds(
+    const model::LpProblem& problem) {
+    std::pair<std::vector<f64>, std::vector<f64>> bounds;
+    row_implied_bounds(problem, problem.col_lo, problem.col_hi, bounds.first, bounds.second);
+    return bounds;
+}
+
 ProofEvidence check_lp_point(const model::LpProblem& problem,
                              const core::RawResult& raw,
                              f64 primal_feas_tol,
@@ -139,12 +173,22 @@ ProofEvidence check_lp_point(const model::LpProblem& problem,
     ev.dual_feas_tol = dual_feas_tol;
     ev.gap_tol = gap_tol;
     ev.claimed_level = raw.proposed_level;
+    ev.lp_values_checked = true;
 
     const auto m = static_cast<std::size_t>(problem.n_rows());
     const auto n = static_cast<std::size_t>(problem.n_cols());
     if (raw.x.size() != n) return ev;
     for (f64 v : raw.x) if (!std::isfinite(v)) return ev;
 
+    ev.checked_objective = problem.objective(raw.x);
+    long double objective_magnitude = std::fabs(static_cast<long double>(problem.obj_offset));
+    for (std::size_t j = 0; j < n; ++j)
+        objective_magnitude += std::fabs(static_cast<long double>(problem.c[j]) * raw.x[j]);
+    const long double objective_envelope = 64 * std::numeric_limits<f64>::epsilon() *
+        (1 + objective_magnitude);
+    if (std::isfinite(raw.objective) &&
+        std::fabs(static_cast<long double>(raw.objective) - ev.checked_objective) > objective_envelope)
+        ev.reported_values_consistent = false;
     ev.max_primal_violation = std::max(problem.max_row_violation(raw.x),
                                        problem.max_bound_violation(raw.x));
     ev.checker_passed = std::isfinite(ev.max_primal_violation) &&
@@ -166,25 +210,22 @@ ProofEvidence check_lp_point(const model::LpProblem& problem,
         return ev;
     }
     const f64 sense = problem.maximize ? -1.0 : 1.0;
-    std::vector<long double> aty(n, 0.0L);
-    std::vector<long double> activity(m, 0.0L);
+    std::vector<model::ExactSum> aty(n);
+    std::vector<model::ExactSum> activity(m);
     const auto& rp = problem.A.pattern.row_ptr();
     const auto& ci = problem.A.pattern.col_idx();
     for (core::Index i = 0; i < problem.n_rows(); ++i) {
         const f64 yi_min = sense * raw.y[sz(i)];
         for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
-            aty[sz(ci[sz(k)])] += static_cast<long double>(yi_min) * problem.A.vals[sz(k)];
-            activity[sz(i)] +=
-                static_cast<long double>(problem.A.vals[sz(k)]) *
-                raw.x[sz(ci[sz(k)])];
+            aty[sz(ci[sz(k)])].add_product(yi_min, problem.A.vals[sz(k)]);
+            activity[sz(i)].add_product(problem.A.vals[sz(k)], raw.x[sz(ci[sz(k)])]);
         }
     }
 
-    std::vector<long double> reduced(n, 0.0L);
     f64 dres = 0.0;
     for (std::size_t j = 0; j < n; ++j) {
-        reduced[j] = static_cast<long double>(sense) * problem.c[j] - aty[j];
-        const f64 r = static_cast<f64>(reduced[j]);
+        const model::Rational reduced = model::Rational(sense * problem.c[j]) - aty[j].value();
+        const f64 r = reduced.convert_to<f64>();
         const f64 btol = scaled_tol(primal_feas_tol, raw.x[j]);
         const bool at_lo = std::isfinite(problem.col_lo[j]) &&
                            raw.x[j] <= problem.col_lo[j] + btol;
@@ -195,7 +236,7 @@ ProofEvidence check_lp_point(const model::LpProblem& problem,
         else if (!at_lo && !at_hi) dres = std::max(dres, std::fabs(r));
     }
     for (std::size_t i = 0; i < m; ++i) {
-        const f64 value = static_cast<f64>(activity[i]);
+        const f64 value = activity[i].value().convert_to<f64>();
         const f64 multiplier = sense * raw.y[i];
         const f64 btol = scaled_tol(primal_feas_tol, value);
         const bool at_lo = std::isfinite(problem.row_lo[i]) &&
@@ -211,46 +252,19 @@ ProofEvidence check_lp_point(const model::LpProblem& problem,
     }
     ev.max_dual_violation = dres;
 
-    bool finite = true;
-    long double dmin = 0.0L;
-    long double magnitude = std::fabs(static_cast<long double>(problem.obj_offset));
-    for (std::size_t j = 0; j < n && finite; ++j) {
-        const long double r = reduced[j];
-        if (r == 0.0L) continue;
-        const f64 b = r > 0.0L ? problem.col_lo[j] : problem.col_hi[j];
-        if (!std::isfinite(b) || !std::isfinite(r)) { finite = false; break; }
-        const long double term = r * b;
-        dmin += term;
-        magnitude += std::fabs(term);
+    std::vector<f64> y_min(m);
+    for (std::size_t i = 0; i < m; ++i) y_min[i] = sense * raw.y[i];
+    auto bound = safe_lagrangian_lower_bound(problem, y_min, problem.col_lo, problem.col_hi);
+    if (!raw.exact_dual.empty()) {
+        const auto exact = exact_dual_lower_bound(problem, raw.exact_dual);
+        if (exact.finite && (!bound.finite || exact.value > bound.value)) bound = exact;
     }
-    for (std::size_t i = 0; i < m && finite; ++i) {
-        const f64 yi = sense * raw.y[i];
-        if (yi == 0.0) continue;
-        const f64 b = yi > 0.0 ? problem.row_lo[i] : problem.row_hi[i];
-        if (!std::isfinite(b)) { finite = false; break; }
-        const long double term = static_cast<long double>(yi) * b;
-        dmin += term;
-        magnitude += std::fabs(term);
-    }
-    long double dual_obj = 0.0L;
-    if (finite) {
-        dmin -= 1e-12L * (1.0L + magnitude);
-        dual_obj = sense * dmin + problem.obj_offset;
-    } else {
-        // A tolerance-small multiplier times infinity still makes this
-        // Lagrangian unbounded. Recover only through valid implied bounds
-        // or an independently recomputed, chargeable multiplier correction.
-        std::vector<f64> y_min(m);
-        for (std::size_t i = 0; i < m; ++i) y_min[i] = sense * raw.y[i];
-        const auto bound = safe_lagrangian_lower_bound(
-            problem, y_min, problem.col_lo, problem.col_hi);
-        finite = bound.finite;
-        dual_obj = static_cast<long double>(sense) * bound.value;
-    }
-    if (finite && std::isfinite(dual_obj)) {
-        const f64 primal_obj = problem.objective(raw.x);
-        ev.gap_rel = static_cast<f64>(std::fabs(primal_obj - dual_obj) /
-                     (1.0L + std::fabs(primal_obj)));
+    if (bound.finite) {
+        ev.checked_dual_bound = sense * bound.value;
+        if (std::isfinite(raw.dual_bound) && std::fabs(raw.dual_bound - ev.checked_dual_bound) >
+            std::max(1e-9, gap_tol) * (1 + std::fabs(ev.checked_dual_bound))) ev.reported_values_consistent = false;
+        ev.gap_rel = std::fabs(ev.checked_objective - ev.checked_dual_bound) /
+                     (1.0 + std::fabs(ev.checked_objective));
     }
     ev.checker_passed = ev.checker_passed &&
                         std::isfinite(ev.max_dual_violation);
@@ -265,27 +279,29 @@ core::PrimalRay check_primal_ray(const model::LpProblem& problem,
     if (direction.size() != static_cast<std::size_t>(problem.n_cols())) return out;
 
     f64 norm_inf = 0.0;
-    for (f64 v : direction) norm_inf = std::max(norm_inf, std::fabs(v));
+    for (f64 v : direction) {
+        if (!std::isfinite(v)) return out;
+        norm_inf = std::max(norm_inf, std::fabs(v));
+    }
     if (!(norm_inf > 0.0) || !std::isfinite(norm_inf)) return out;
     out.direction = direction;
     for (f64& v : out.direction) v /= norm_inf;
 
-    std::vector<long double> ad(static_cast<std::size_t>(problem.n_rows()), 0.0L);
+    std::vector<model::ExactSum> ad(static_cast<std::size_t>(problem.n_rows()));
     const auto& rp = problem.A.pattern.row_ptr();
     const auto& ci = problem.A.pattern.col_idx();
     for (core::Index i = 0; i < problem.n_rows(); ++i)
         for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
-            ad[sz(i)] += static_cast<long double>(problem.A.vals[sz(k)]) *
-                         out.direction[sz(ci[sz(k)])];
+            ad[sz(i)].add_product(problem.A.vals[sz(k)], out.direction[sz(ci[sz(k)])]);
 
     f64 row_res = 0.0;
     for (core::Index i = 0; i < problem.n_rows(); ++i) {
-        const f64 v = static_cast<f64>(ad[sz(i)]);
+        const auto v = ad[sz(i)].value();
         const bool has_lo = std::isfinite(problem.row_lo[sz(i)]);
         const bool has_hi = std::isfinite(problem.row_hi[sz(i)]);
-        if (has_lo && has_hi) row_res = std::max(row_res, std::fabs(v));
-        else if (has_hi) row_res = std::max(row_res, std::max(0.0, v));
-        else if (has_lo) row_res = std::max(row_res, std::max(0.0, -v));
+        if (has_lo && has_hi) row_res = std::max(row_res, model::rounded_up(v < 0 ? -v : v));
+        else if (has_hi) row_res = std::max(row_res, model::rounded_up(std::max(model::Rational(0), v)));
+        else if (has_lo) row_res = std::max(row_res, model::rounded_up(std::max(model::Rational(0), model::Rational(-v))));
     }
 
     f64 bound_res = 0.0;
@@ -298,10 +314,11 @@ core::PrimalRay check_primal_ray(const model::LpProblem& problem,
         else if (has_lo) bound_res = std::max(bound_res, std::max(0.0, -v));
     }
 
-    long double slope = 0.0L;
+    model::ExactSum slope;
     for (std::size_t j = 0; j < out.direction.size(); ++j)
-        slope += static_cast<long double>(problem.c[j]) * out.direction[j];
-    out.objective_direction = static_cast<f64>(slope);
+        slope.add_product(problem.c[j], out.direction[j]);
+    out.objective_direction = problem.maximize ? model::rounded_down(slope.value())
+                                               : model::rounded_up(slope.value());
     out.max_row_residual = row_res;
     out.max_bound_sign_residual = bound_res;
     const f64 improving = problem.maximize ? out.objective_direction
@@ -412,10 +429,13 @@ core::DualFarkasRay check_dual_farkas_ray(
 
     f64 sign_res = 0.0;
     bool incompatible_unbounded_support = false;
-    long double lower = 0.0L;
+    std::vector<model::ExactSum> exact_sums(static_cast<std::size_t>(problem.n_cols()));
+    for (core::Index i = 0; i < problem.n_rows(); ++i)
+        for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
+            exact_sums[sz(ci[sz(k)])].add_product(out.multipliers[sz(i)], problem.A.vals[sz(k)]);
+    model::Rational lower = 0;
     for (core::Index j = 0; j < problem.n_cols(); ++j) {
-        const long double d = aty[sz(j)];
-        if (!std::isfinite(d)) return out;
+        const model::Rational d = exact_sums[sz(j)].value();
         if (d > 0.0) {
             f64 b = problem.col_lo[sz(j)];
             if (!std::isfinite(b)) {
@@ -424,13 +444,13 @@ core::DualFarkasRay check_dual_farkas_ray(
             }
             if (!std::isfinite(b)) {
                 incompatible_unbounded_support = true;
-                sign_res = std::max(sign_res, static_cast<f64>(d));
+                sign_res = std::max(sign_res, d.convert_to<f64>());
                 if (std::getenv("SOR_FARKAS_DEBUG"))
                     std::fprintf(stderr, "[farkas] col %d d=%.3Lg bounds [%g,%g]\n",
-                                 (int)j, d, problem.col_lo[sz(j)], problem.col_hi[sz(j)]);
+                                 (int)j, d.convert_to<long double>(), problem.col_lo[sz(j)], problem.col_hi[sz(j)]);
                 continue;
             }
-            lower += d * b;
+            lower += d * model::Rational(b);
         } else if (d < 0.0) {
             f64 b = problem.col_hi[sz(j)];
             if (!std::isfinite(b)) {
@@ -439,31 +459,30 @@ core::DualFarkasRay check_dual_farkas_ray(
             }
             if (!std::isfinite(b)) {
                 incompatible_unbounded_support = true;
-                sign_res = std::max(sign_res, static_cast<f64>(-d));
+                sign_res = std::max(sign_res, (-d).convert_to<f64>());
                 if (std::getenv("SOR_FARKAS_DEBUG"))
                     std::fprintf(stderr, "[farkas] col %d d=%.3Lg bounds [%g,%g]\n",
-                                 (int)j, d, problem.col_lo[sz(j)], problem.col_hi[sz(j)]);
+                                 (int)j, d.convert_to<long double>(), problem.col_lo[sz(j)], problem.col_hi[sz(j)]);
                 continue;
             }
-            lower += d * b;
+            lower += d * model::Rational(b);
         }
     }
 
-    long double upper = 0.0L;
+    model::Rational upper = 0;
     for (core::Index i = 0; i < problem.n_rows(); ++i) {
         const f64 y = out.multipliers[sz(i)];
         if (y > 0.0)
-            upper += static_cast<long double>(y) * problem.row_hi[sz(i)];
+            upper += model::Rational(y) * model::Rational(problem.row_hi[sz(i)]);
         else if (y < 0.0)
-            upper += static_cast<long double>(y) * problem.row_lo[sz(i)];
+            upper += model::Rational(y) * model::Rational(problem.row_lo[sz(i)]);
     }
 
     out.max_homogeneous_residual = sign_res;
     out.max_sign_residual = sign_res;
-    out.contradiction = static_cast<f64>(lower - upper);
-    const f64 separation_tol = tolerance *
-        (1.0 + std::max(std::fabs(static_cast<f64>(lower)),
-                        std::fabs(static_cast<f64>(upper))));
+    out.contradiction = model::rounded_down(lower - upper);
+    const model::Rational scale = 1 + std::max(model::Rational(abs(lower)), model::Rational(abs(upper)));
+    const f64 separation_tol = model::rounded_up(model::Rational(tolerance) * scale);
     out.certified = !incompatible_unbounded_support &&
                     sign_res <= tolerance &&
                     std::isfinite(out.contradiction) &&
@@ -522,13 +541,24 @@ ProofEvidence check_lp_result(const model::LpProblem& problem,
     return checked;
 }
 
+CheckedLpResult check_lp_candidate(const model::LpProblem& problem,
+                                   RawResult raw, const ProofEvidence& proposed) {
+    problem.validate(/*allow_empty_domains=*/true);
+    const auto checked = check_lp_result(problem, raw, proposed);
+    return CheckedLpResult(std::move(raw), checked);
+}
+SolveResult finalize_result(CheckedLpResult checked) {
+    return finalize_result(std::move(checked.raw_), checked.evidence_);
+}
+
 SolveResult finalize_result(RawResult raw, const ProofEvidence& ev) {
     SOR_FN();
     SolveResult r;
-    r.objective          = raw.objective;
-    r.dual_bound         = raw.dual_bound;
+    r.objective          = ev.lp_values_checked ? ev.checked_objective : raw.objective;
+    r.dual_bound         = ev.lp_values_checked ? ev.checked_dual_bound : raw.dual_bound;
     r.x                  = std::move(raw.x);
     r.y                  = std::move(raw.y);
+    r.exact_dual         = std::move(raw.exact_dual);
     r.ray                = std::move(raw.ray);
     r.primal_ray         = std::move(raw.primal_ray);
     r.dual_farkas_ray    = std::move(raw.dual_farkas_ray);
@@ -578,6 +608,7 @@ SolveResult finalize_result(RawResult raw, const ProofEvidence& ev) {
 
     const bool checked_primal_ray =
         r.status == Status::Unbounded && !r.primal_ray.direction.empty() &&
+        ev.checker_passed && ev.max_primal_violation <= ev.primal_feas_tol &&
         std::isfinite(ev.primal_ray_violation) &&
         ev.primal_ray_violation <= ev.primal_feas_tol &&
         std::isfinite(ev.primal_ray_objective) &&
@@ -588,10 +619,11 @@ SolveResult finalize_result(RawResult raw, const ProofEvidence& ev) {
 
     // A globally complete discrete search is a different proof object from
     // an LP Farkas ray.  Preserve that route while refusing an uncertified LP
-    // terminal claim.  The legacy basis escape hatch remains for one release
-    // until every simplex unbounded exit populates PrimalRay.
+    // terminal claim.
     const bool global_proof = ev.claimed_level == ProofLevel::ProvedGlobalEpsilon &&
                               residuals_within_tolerance(ev);
+    if (r.status == Status::Infeasible && global_proof)
+        r.proof = ProofLevel::ProvedGlobalEpsilon;
     if (r.status == Status::Infeasible && !checked_dual_ray && !global_proof) {
         r.status = Status::NoSolutionFound;
         r.ray.clear();
@@ -599,8 +631,7 @@ SolveResult finalize_result(RawResult raw, const ProofEvidence& ev) {
         r.downgrade_reason =
             "Infeasible rejected: no independently checked dual Farkas ray";
     }
-    if (r.status == Status::Unbounded && !checked_primal_ray &&
-        !(ev.has_basis && ev.claimed_level == ProofLevel::BoundOnly)) {
+    if (r.status == Status::Unbounded && !checked_primal_ray) {
         r.status = Status::NoSolutionFound;
         r.primal_ray = core::PrimalRay{};
         r.downgrade_reason =
@@ -632,6 +663,16 @@ SolveResult finalize_result(RawResult raw, const ProofEvidence& ev) {
                 : "Optimal rejected: objective or dual bound is not finite";
         }
     }
+    if (ev.lp_values_checked && !ev.reported_values_consistent &&
+        raw.proposed_status == Status::Optimal) {
+        r.status = Status::NumericalFailure;
+        r.downgrade_reason = "Optimal rejected: reported objective or bound disagrees with checked values";
+    }
+    if (r.status == Status::Feasible &&
+        (!ev.checker_passed || ev.max_primal_violation > ev.primal_feas_tol)) {
+        r.status = Status::NoSolutionFound;
+        r.downgrade_reason = "Feasible rejected: independent primal check failed";
+    }
     return r;
 }
 
@@ -652,7 +693,7 @@ SafeLpBound lagrangian_bound_impl(const model::LpProblem& problem,
                                   const std::vector<f64>& y_min,
                                   const std::vector<f64>& col_lo,
                                   const std::vector<f64>& col_hi,
-                                  std::vector<long double>* d_out) {
+                                  std::vector<model::Rational>* d_out) {
     SafeLpBound out;
     const core::Index m = problem.n_rows(), n = problem.n_cols();
     if (y_min.size() != sz(m) || col_lo.size() != sz(n) || col_hi.size() != sz(n))
@@ -662,21 +703,15 @@ SafeLpBound lagrangian_bound_impl(const model::LpProblem& problem,
     const auto& ci = problem.A.pattern.col_idx();
     std::vector<long double> d(sz(n));
     for (core::Index j = 0; j < n; ++j) d[sz(j)] = sense * problem.c[sz(j)];
-    long double L = sense * problem.obj_offset;
-    long double mag = std::fabs(static_cast<long double>(L));
     for (core::Index i = 0; i < m; ++i) {
         long double yi = y_min[sz(i)];
         if (!std::isfinite(static_cast<double>(yi))) return out;
         if (yi > 0.0L && !std::isfinite(problem.row_lo[sz(i)])) yi = 0.0L;
         if (yi < 0.0L && !std::isfinite(problem.row_hi[sz(i)])) yi = 0.0L;
         if (yi == 0.0L) continue;
-        const long double t = yi * (yi > 0.0L ? problem.row_lo[sz(i)] : problem.row_hi[sz(i)]);
-        L += t;
-        mag += std::fabs(t);
         for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
             const long double t2 = yi * problem.A.vals[sz(k)];
             d[sz(ci[sz(k)])] -= t2;
-            mag += std::fabs(t2);
         }
     }
     std::vector<f64> imp_lo, imp_hi;
@@ -718,7 +753,7 @@ SafeLpBound lagrangian_bound_impl(const model::LpProblem& problem,
                     col_rows[sz(ci[sz(k)])].push_back({i, problem.A.vals[sz(k)]});
         }
         for (const core::Index j : bad) {
-            const long double dj = d[sz(j)];
+            const auto& dj = d[sz(j)];
             if (dj == 0.0L || std::isfinite(needed_bound(j, dj))) continue;
             // Target sign: toward the side that has a finite bound.
             const bool lo_ok = std::isfinite(col_lo[sz(j)]) ||
@@ -754,47 +789,38 @@ SafeLpBound lagrangian_bound_impl(const model::LpProblem& problem,
             }
         }
     }
-    // Recompute L and d from scratch for the final y (no drift from updates).
-    // Without a correction y is exactly the first pass's multipliers, so the
-    // first pass's d, L and mag are already these values (bit for bit).
-    if (out.multiplier_corrections > 0) {
-    for (core::Index j = 0; j < n; ++j) d[sz(j)] = sense * problem.c[sz(j)];
-    L = sense * problem.obj_offset;
-    mag = std::fabs(static_cast<long double>(L));
+    // Only this final exact pass publishes a bound. The rounded arithmetic
+    // above proposes multiplier corrections; it cannot establish a proof.
+    std::vector<model::ExactSum> sums(sz(n));
+    std::vector<model::Rational> exact_d(d_out ? sz(n) : 0);
+    model::ExactSum exact_L;
+    exact_L.add(sense * problem.obj_offset);
+    for (core::Index j = 0; j < n; ++j)
+        sums[sz(j)].add(sense * problem.c[sz(j)]);
     for (core::Index i = 0; i < m; ++i) {
-        const long double yi = y[sz(i)];
-        if (yi == 0.0L) continue;
-        const long double t = yi * (yi > 0.0L ? problem.row_lo[sz(i)] : problem.row_hi[sz(i)]);
-        L += t;
-        mag += std::fabs(t);
-        for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
-            const long double t2 = yi * problem.A.vals[sz(k)];
-            d[sz(ci[sz(k)])] -= t2;
-            mag += std::fabs(t2);
-        }
-    }
+        if (y[sz(i)] == 0.0) continue;
+        const f64 b = y[sz(i)] > 0.0 ? problem.row_lo[sz(i)] : problem.row_hi[sz(i)];
+        if (!std::isfinite(b)) return out;
+        exact_L.add_product(y[sz(i)], b);
+        for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
+            sums[sz(ci[sz(k)])].add_product(-y[sz(i)], problem.A.vals[sz(k)]);
     }
     for (core::Index j = 0; j < n; ++j) {
-        const long double dj = d[sz(j)];
-        if (dj == 0.0L) continue;
-        const f64 b = needed_bound(j, dj);
-        if (!std::isfinite(b)) {             // genuinely unbounded direction
-            if (std::getenv("SOR_SAFE_BOUND_DEBUG"))
-                std::fprintf(stderr, "[safe-bound] col %d d=%.3Lg box [%g,%g]\n",
-                             (int)j, dj, col_lo[sz(j)], col_hi[sz(j)]);
-            return out;
-        }
-        if (!std::isfinite(dj > 0.0L ? col_lo[sz(j)] : col_hi[sz(j)]))
+        if (d_out) exact_d[sz(j)] = sums[sz(j)].value();
+        const int sign = sums[sz(j)].sign();
+        if (sign == 0) continue;
+        f64 b = sign > 0 ? col_lo[sz(j)] : col_hi[sz(j)];
+        if (!std::isfinite(b)) {
+            ensure_implied();
+            b = sign > 0 ? imp_lo[sz(j)] : imp_hi[sz(j)];
             ++out.implied_bound_uses;
-        const long double t = dj * b;
-        L += t;
-        mag += std::fabs(t);
+        }
+        if (!std::isfinite(b)) return out;
+        exact_L.add_sum_product(sums[sz(j)], b);
     }
-    // Rounding error of long-double accumulation, with a wide safety factor.
-    const long double err = 1e-12L * (1.0L + mag);
-    out.value = static_cast<f64>(L - err);
+    out.value = model::rounded_down(exact_L.value());
     out.finite = std::isfinite(out.value);
-    if (d_out != nullptr) *d_out = std::move(d);
+    if (d_out != nullptr) *d_out = std::move(exact_d);
     return out;
 }
 }  // namespace
@@ -813,7 +839,7 @@ std::vector<RcBoundChange> safe_reduced_cost_tightenings(
     std::vector<RcBoundChange> out;
     if (candidates_out != nullptr) *candidates_out = 0;
     const core::Index n = problem.n_cols();
-    std::vector<long double> d;
+    std::vector<model::Rational> d;
     const SafeLpBound lb =
         lagrangian_bound_impl(problem, y_min, col_lo, col_hi, &d);
     if (bound_out != nullptr) *bound_out = lb;
@@ -822,15 +848,14 @@ std::vector<RcBoundChange> safe_reduced_cost_tightenings(
         return out;
     // Room between the certified bound and the cutoff. Every excluded region
     // below must raise the bound by MORE than this.
-    const long double room =
-        static_cast<long double>(cutoff_min) - static_cast<long double>(lb.value);
+    const model::Rational room = model::Rational(cutoff_min) - model::Rational(lb.value);
     if (room < 0.0L) return out;   // the whole box is already cut off
     const auto integral = [](f64 v) {
         return std::isfinite(v) && std::fabs(v) < 0x1p52 && v == std::trunc(v);
     };
     for (core::Index j = 0; j < n; ++j) {
         if (!problem.is_integer[sz(j)]) continue;
-        const long double dj = d[sz(j)];
+        const auto& dj = d[sz(j)];
         const f64 lo = col_lo[sz(j)], hi = col_hi[sz(j)];
         if (!(hi > lo)) continue;
         // lb charged d_j to lo (d_j > 0) or hi (d_j < 0), both finite here.
@@ -838,18 +863,21 @@ std::vector<RcBoundChange> safe_reduced_cost_tightenings(
         // every other term can only rise, since a smaller box only tightens
         // the row-implied bounds charged to columns without declared ones.
         // So the region is cut off once |d_j| t > room; t is the smallest
-        // integer step past room / |d_j|, with a relative margin for the
-        // long-double product.
-        const long double ad = std::fabs(dj);
+        // integer step past room / |d_j|. Both the division and floor are
+        // exact; convert the retained endpoint outward.
+        const model::Rational ad = dj < 0 ? -dj : dj;
         if (!(ad > 0.0L)) continue;
         const bool up = dj > 0.0L;
         const f64 base = up ? lo : hi;
         if (!integral(base)) continue;
         if (candidates_out != nullptr) ++*candidates_out;
-        const long double steps = room / (ad * (1.0L - 1e-12L));
-        if (!(steps < static_cast<long double>(hi - lo))) continue;
-        const f64 keep = static_cast<f64>(std::floor(steps + 1e-9L));
-        const f64 nb = up ? base + keep : base - keep;
+        const model::Rational steps = room / ad;
+        if (std::isfinite(hi) && std::isfinite(lo) &&
+            steps >= model::Rational(hi) - model::Rational(lo)) continue;
+        const boost::multiprecision::cpp_int keep = numerator(steps) / denominator(steps);
+        const model::Rational endpoint = up ? model::Rational(base) + model::Rational(keep)
+                                           : model::Rational(base) - model::Rational(keep);
+        const f64 nb = up ? model::rounded_up(endpoint) : model::rounded_down(endpoint);
         if (up ? !(nb < hi) : !(nb > lo)) continue;
         out.push_back(RcBoundChange{j, up, nb});
     }
@@ -887,7 +915,7 @@ std::vector<FarkasBoundUse> farkas_conflict_bounds(
     struct Use { core::Index col; bool upper; f64 value; long double relax_cost; };
     std::vector<Use> uses;
     for (core::Index j = 0; j < n; ++j) {
-        const long double dj = d[sz(j)];
+        const auto& dj = d[sz(j)];
         if (dj == 0.0L) continue;
         const bool use_hi = dj < 0.0L;
         const f64 b = use_hi ? col_hi[sz(j)] : col_lo[sz(j)];

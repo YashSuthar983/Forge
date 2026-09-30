@@ -10,17 +10,17 @@ void SparsePattern::validate() const {
     SOR_FN();
     if (n_rows_ < 0 || n_cols_ < 0)
         throw std::invalid_argument("SparsePattern: negative dimension");
-    if (row_ptr_.size() != static_cast<std::size_t>(n_rows_) + 1)
+    if (storage_->row_ptr.size() != static_cast<std::size_t>(n_rows_) + 1)
         throw std::invalid_argument("SparsePattern: row_ptr must have n_rows+1 entries");
-    if (row_ptr_.front() != 0)
+    if (storage_->row_ptr.front() != 0)
         throw std::invalid_argument("SparsePattern: row_ptr[0] must be 0");
-    if (row_ptr_.back() != static_cast<Offset>(col_idx_.size()))
+    if (storage_->row_ptr.back() != static_cast<Offset>(storage_->col_idx.size()))
         throw std::invalid_argument("SparsePattern: row_ptr.back() must equal nnz");
     for (Index r = 0; r < n_rows_; ++r) {
-        if (row_ptr_[r] > row_ptr_[r + 1])
+        if (storage_->row_ptr[r] > storage_->row_ptr[r + 1])
             throw std::invalid_argument("SparsePattern: row_ptr not nondecreasing");
     }
-    for (Index c : col_idx_) {
+    for (Index c : storage_->col_idx) {
         if (c < 0 || c >= n_cols_)
             throw std::invalid_argument("SparsePattern: column index out of range");
     }
@@ -28,11 +28,12 @@ void SparsePattern::validate() const {
 
 void SparsePattern::append_row(const std::vector<Index>& cols) {
     SOR_FN();
+    detach_structure();
     // Empty pattern (default-constructed) has no row_ptr sentinel yet.
-    if (row_ptr_.empty()) {
+    if (storage_->row_ptr.empty()) {
         if (n_rows_ != 0)
             throw std::invalid_argument("SparsePattern::append_row: empty row_ptr");
-        row_ptr_.push_back(0);
+        storage_->row_ptr.push_back(0);
     }
     for (const Index c : cols) {
         if (c < 0 || c >= n_cols_)
@@ -43,9 +44,9 @@ void SparsePattern::append_row(const std::vector<Index>& cols) {
             throw std::invalid_argument(
                 "SparsePattern::append_row: cols must be strictly ascending");
     }
-    col_idx_.insert(col_idx_.end(), cols.begin(), cols.end());
+    storage_->col_idx.insert(storage_->col_idx.end(), cols.begin(), cols.end());
     ++n_rows_;
-    row_ptr_.push_back(static_cast<Offset>(col_idx_.size()));
+    storage_->row_ptr.push_back(static_cast<Offset>(storage_->col_idx.size()));
 }
 
 void CsrMatrix::append_row(std::vector<Index> cols, std::vector<f64> row_vals) {
@@ -83,11 +84,12 @@ void SparsePattern::truncate_rows(Index keep) {
     if (keep < 0 || keep > n_rows_)
         throw std::invalid_argument("SparsePattern::truncate_rows: keep out of range");
     if (keep == n_rows_) return;
-    // row_ptr_ is non-decreasing, so the entry at `keep` is exactly the nnz of
+    detach_structure();
+    // storage_->row_ptr is non-decreasing, so the entry at `keep` is exactly the nnz of
     // the retained prefix; everything at or past it belongs to a dropped row.
-    const Offset cut = row_ptr_[static_cast<std::size_t>(keep)];
-    col_idx_.resize(static_cast<std::size_t>(cut));
-    row_ptr_.resize(static_cast<std::size_t>(keep) + 1);
+    const Offset cut = storage_->row_ptr[static_cast<std::size_t>(keep)];
+    storage_->col_idx.resize(static_cast<std::size_t>(cut));
+    storage_->row_ptr.resize(static_cast<std::size_t>(keep) + 1);
     n_rows_ = keep;
 }
 

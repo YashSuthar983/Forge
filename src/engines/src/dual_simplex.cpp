@@ -1,6 +1,8 @@
 #include "sor/engines/dual_simplex.hpp"
 
 #include "sor/core/route_debug.hpp"
+#include "sor/certify/finalize.hpp"
+#include "sor/model/exact.hpp"
 #include "sor/engines/dual_cost_perturbation.hpp"
 #include "sor/engines/dual_ratio_test.hpp"
 #include "sor/engines/dual_edge_weights.hpp"
@@ -22,6 +24,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <set>
 #include <vector>
 
 namespace sor::engines {
@@ -434,13 +437,13 @@ static core::RawResult dual_prepared_pass(
     // |y'| <= tol / row_scale for row logicals (y_unscaled = y' * row_scale).
     // A flat scaled tolerance let pilot (col 3645, d = -1.5e-7 unscaled but
     // -1.0e-7 scaled) terminate "Optimal" with a residual the gate rejects.
-    const auto& dtol = prepared.dual_tolerance;
+    const auto dtol = prepared_tolerances(prepared, opts, true);
 
     // Per-variable primal tolerances in scaled coordinates. Structural
     // variable bounds scale by 1 / D_c; row-logical bounds scale by D_r. The
     // certificate is unscaled, so using opts.primal_feas_tol directly here can
     // accept large original-space violations on ill-scaled rows (dfl001).
-    const auto& ptol = prepared.primal_tolerance;
+    const auto ptol = prepared_tolerances(prepared, opts, false);
 
     // ---- 4. state --------------------------------------------------------
     std::vector<Index> basis(sz(m));
@@ -2456,6 +2459,8 @@ static core::RawResult dual_prepared_pass(
     constexpr std::uint64_t kStagWindow = 512;
     bool stag_have = false;
     f64 stag_obj = 0.0;
+    f64 stag_infeasibility = core::kPosInf;
+    std::set<std::vector<Index>> recent_bases;
     int stag_windows = 0;
     int stag_perturbs = 0;
     const auto working_objective = [&]() {
@@ -2493,14 +2498,14 @@ static core::RawResult dual_prepared_pass(
         SOR_ROUTE(1, "simplex_dual", "stagnation_perturbation");
     };
 
-    // Lagrangian value, under the TRUE costs and bounds, of the multipliers
+    // Heuristic progress estimate, under the TRUE costs and bounds, of the multipliers
     // this function returns: y = B^-T c_B (section 7 recomputes exactly this
-    // vector). Weak duality makes it a lower bound for ANY basis, so it stays
-    // meaningful while perturbation or shifts are active -- which is almost
+    // vector). It remains useful for tracking progress while perturbation or
+    // shifts are active -- which is almost
     // always the case on the degenerate node LPs where an early stop pays.
     // A column whose reduced cost would be charged to an infinite bound makes
     // the bound -inf; round-off on basic columns (d_B = 0 by construction) is
-    // not charged. The caller re-certifies the returned y rigorously.
+    // not charged. It must never authorize an objective-limit exit.
     const auto true_cost_lagrangian = [&]() -> f64 {
         std::vector<f64> yt(sz(m));
         for (Index i = 0; i < m; ++i) yt[sz(i)] = cost[sz(basis[sz(i)])];
@@ -2530,13 +2535,18 @@ static core::RawResult dual_prepared_pass(
         if (phase == 2 && iter > 0 && (iter % 32) == 0 && d_valid &&
             opts.objective_limit < std::numeric_limits<f64>::infinity() &&
             working_objective() + sense * pmin.obj_offset >= opts.objective_limit) {
-            bool reached = !costs_perturbed && !costs_shifted;
-            if (!reached) {
-                ++diag.objective_limit_checks;
-                const f64 margin = 1e-9 * (1.0 + std::fabs(opts.objective_limit));
-                reached = true_cost_lagrangian() + sense * pmin.obj_offset >=
-                          opts.objective_limit + margin;
-            }
+            ++diag.objective_limit_checks;
+            std::vector<f64> multipliers(sz(m));
+            for (Index i = 0; i < m; ++i) multipliers[sz(i)] = cost[sz(basis[sz(i)])];
+            do_btran(multipliers);
+            for (Index i = 0; i < m; ++i) multipliers[sz(i)] *= scaling.row_scale[sz(i)];
+            const auto bound = certify::safe_lagrangian_lower_bound(
+                pmin, multipliers, pmin.col_lo, pmin.col_hi);
+            const f64 margin = 1e-9 * (1.0 + std::fabs(opts.objective_limit));
+            const bool reached = bound.finite &&
+                model::Rational(bound.value) - model::Rational(pmin.obj_offset) +
+                model::Rational(sense) * model::Rational(pmin.obj_offset) >=
+                model::Rational(opts.objective_limit) + model::Rational(margin);
             if (reached) {
                 status = core::Status::Interrupted;
                 reason = "objective limit";
@@ -2545,18 +2555,26 @@ static core::RawResult dual_prepared_pass(
             }
         }
         if (phase == 2 && iter > 0 && (iter % kStagWindow) == 0 && d_valid) {
-            const f64 obj = working_objective();
+            const f64 obj = true_cost_lagrangian();
+            const f64 infeasibility = primal_infeasibility();
+            const bool repeated_basis = !recent_bases.insert(basis).second;
+            if (recent_bases.size() > 128) { recent_bases.clear(); recent_bases.insert(basis); }
             if (opts.trace_degeneracy)
                 std::fprintf(stderr, "[lp-progress] dual m=%d n=%d iter=%llu objective=%.17g improvement=%.9g primal_infeas=%.9g flat_windows=%d perturbations=%d\n",
                              m, ns, (unsigned long long)iter, obj,
                              stag_have ? obj - stag_obj : 0.0,
                              primal_infeasibility(), stag_windows, stag_perturbs);
-            if (stag_have && obj <= stag_obj + 1e-9 * (1.0 + std::fabs(stag_obj))) {
+            const bool bound_progress = std::isfinite(obj) &&
+                (!std::isfinite(stag_obj) || obj - stag_obj > 1e-9);
+            const bool feasibility_progress = infeasibility < stag_infeasibility -
+                opts.primal_feas_tol;
+            if (stag_have && repeated_basis && !bound_progress && !feasibility_progress) {
                 ++stag_windows;
                 if (stag_perturbs < 2 && koberstein_perturbation_on) {
                     perturb_stagnation();
                     ++stag_perturbs;
                     stag_windows = 0;
+                    recent_bases.clear();
                 } else if (stag_windows >= 4) {
                     status = core::Status::Interrupted;
                     reason = "cycling detected (no objective progress over " +
@@ -2570,6 +2588,7 @@ static core::RawResult dual_prepared_pass(
                 stag_windows = 0;
             }
             stag_obj = obj;
+            stag_infeasibility = infeasibility;
             stag_have = true;
         }
         if (iter >= max_iter) {
@@ -3613,6 +3632,7 @@ static core::RawResult dual_prepared_pass(
 
     // ---- 9. report -------------------------------------------------------
     core::RawResult raw;
+    raw.certificate_basis = basis;
     raw.x = std::move(x);
     raw.y.resize(sz(m));
     for (Index i = 0; i < m; ++i) raw.y[sz(i)] = sense * yout[sz(i)];
@@ -3627,6 +3647,20 @@ static core::RawResult dual_prepared_pass(
     raw.termination_reason = reason;
     diag.ray_violation = farkas_ray_violation;
 
+    if (status == core::Status::Optimal && sense == 1.0 && !diag.dual_bound_finite &&
+        (opts.time_limit_s == 0 || ms_since(t_all) < 1000 * opts.time_limit_s))
+        repair_simplex_dual(pmin, raw, simplex_options_after_elapsed(opts, ms_since(t_all) / 1000), diag);
+    if (status == core::Status::Optimal && sense == 1.0 && !diag.dual_bound_finite &&
+        raw.exact_dual.empty() && certify::repair_basis_certificate(pmin, raw,
+            {.time_limit_s = opts.time_limit_s > 0 ? std::max(std::numeric_limits<double>::min(),
+                opts.time_limit_s - ms_since(t_all) / 1000) : 0})) {
+        const auto exact = certify::exact_dual_lower_bound(pmin, raw.exact_dual);
+        if (exact.finite) {
+            raw.dual_bound = diag.dual_objective = exact.value;
+            diag.dual_bound_finite = true;
+            diag.gap_rel = std::fabs(raw.objective - raw.dual_bound) / (1 + std::fabs(raw.objective));
+        }
+    }
     switch (status) {
         case core::Status::Optimal:
             raw.proposed_level = core::ProofLevel::ProvedOptimalFP;
@@ -4021,7 +4055,7 @@ core::RawResult DualProbeSession::probe(Index j, f64 lo, f64 hi,
 
     DualEdgeWeightCarrier weights = im.weights;
     FactorCarrier factor = im.factor;
-    const double prep = im.prep_reported ? pr.total_ms : 0.0;
+    const double prep = im.prep_reported ? 0.0 : pr.total_ms;
     const auto remaining = simplex_options_after_elapsed(
         opts, prep / 1000.0 + std::chrono::duration<double>(Clock::now() - t0).count());
     auto raw = solve_dual_simplex_prepared(
@@ -4035,6 +4069,7 @@ core::RawResult DualProbeSession::probe(Index j, f64 lo, f64 hi,
         diag.preprocessing_builds = 1;
         im.prep_reported = true;
     }
+    diag.preprocessing_ms = prep;
     diag.total_ms = prep + ms_since(t0);
     return raw;
 }

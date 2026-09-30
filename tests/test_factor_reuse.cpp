@@ -628,8 +628,48 @@ int test_null_matrix_token_is_never_adopted() {
 
 }  // namespace
 
+// A rounded multiplier just above 1/3 cannot support an infinite upper
+// bound. Recovery must produce a real exact witness, preserve the original
+// basis identity, and reject the same witness when paired with a bad point.
+int test_exact_support_recovery() {
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {3.0, -1.0});
+    lp.c = {1, 0}; lp.row_lo = lp.row_hi = {1};
+    lp.col_lo = {0, 0}; lp.col_hi = {sor::model::kInf, sor::model::kInf};
+    sor::core::RawResult initial;
+    initial.x = {1.0 / 3, 0}; initial.objective = lp.objective(initial.x);
+    initial.y = {std::nextafter(1.0 / 3, sor::model::kInf)};
+    sor::engines::SimplexOptions options;
+    sor::engines::SimplexDiagnostics work;
+    auto recovered = initial;
+    if (!sor::engines::repair_simplex_support(lp, recovered, options, work)) return 1;
+    const auto checked = sor::certify::check_lp_point(lp, recovered, 1e-7, 1e-7, 1e-9, false);
+    if (!checked.checker_passed || checked.gap_rel > 1e-9 || recovered.exact_dual.empty() ||
+        !recovered.certificate_basis.empty() || work.certificate_iterations == 0) return 1;
+    auto invalid = initial;
+    invalid.x = {0, 0}; invalid.objective = 0;
+    sor::engines::SimplexDiagnostics invalid_work;
+    if (sor::engines::repair_simplex_support(lp, invalid, options, invalid_work) ||
+        !invalid.exact_dual.empty()) return 1;
+    auto large_public_limit = options;
+    large_public_limit.max_iterations = 200000;
+    sor::engines::SimplexDiagnostics exhausted;
+    exhausted.certificate_iterations = sor::engines::simplex_certificate_pivot_allowance;
+    exhausted.iterations = exhausted.certificate_iterations;
+    if (sor::engines::repair_simplex_support(lp, initial, large_public_limit, exhausted) ||
+        exhausted.iterations != sor::engines::simplex_certificate_pivot_allowance ||
+        !initial.exact_dual.empty()) return 1;
+    auto expired = options;
+    expired.time_limit_s = std::numeric_limits<double>::min();
+    sor::engines::SimplexDiagnostics expired_work;
+    if (sor::engines::repair_simplex_support(lp, initial, expired, expired_work) ||
+        expired_work.iterations != 0) return 1;
+    return 0;
+}
+
 int main() {
     int failures = 0;
+    failures += test_exact_support_recovery();
     failures += test_session_rejects_foreign_factor_and_invalid_bounds();
     failures += test_rescaling_same_matrix_rejects_factor();
     failures += test_preparation_spends_first_solve_allowance();
@@ -640,6 +680,30 @@ int main() {
     failures += test_basis_content_mismatch_is_rejected_safely();
     failures += test_sibling_reuse_via_copy_does_not_cross_contaminate();
     failures += test_null_matrix_token_is_never_adopted();
+    {
+        const auto lp = make_lp(4, 8, 91);
+        sor::engines::SimplexOptions options;
+        options.presolve = false;
+        sor::engines::SimplexDiagnostics base_diag;
+        sor::engines::SimplexBasis basis;
+        sor::engines::solve_dual_simplex(lp, options, base_diag, &basis);
+        sor::engines::DualProbeSession session(lp, options);
+        sor::engines::SimplexDiagnostics first, repeated;
+        session.probe(0, lp.col_lo[0], lp.col_hi[0], options, first, basis);
+        session.probe(0, lp.col_lo[0], lp.col_hi[0], options, repeated, basis);
+        if (first.preprocessing_builds != 1 || !(first.preprocessing_ms > 0) ||
+            repeated.preprocessing_builds != 0 || repeated.preprocessing_ms != 0) {
+            std::fprintf(stderr, "probe preparation must be charged exactly once\n");
+            ++failures;
+        }
+        auto tighter = options;
+        tighter.primal_feas_tol = 1e-9; tighter.dual_feas_tol = 2e-9;
+        sor::engines::SimplexDiagnostics changed;
+        const auto raw = session.solve(tighter, changed, nullptr, &basis);
+        const auto checked = sor::certify::check_lp_point(lp, raw, tighter.primal_feas_tol,
+            tighter.dual_feas_tol, tighter.gap_tol, true);
+        if (checked.max_primal_violation > tighter.primal_feas_tol) ++failures;
+    }
     if (failures) std::fprintf(stderr, "%d failure(s)\n", failures);
     return failures ? 1 : 0;
 }

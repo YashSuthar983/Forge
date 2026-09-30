@@ -129,9 +129,8 @@ void route_debug_ledger_emit(const char* scope);
 void route_debug_ledger_format(char* out, std::size_t cap);
 
 // RAII span: times a stage, bills it to a bucket, and emits enter/exit.
-// Nested spans both bill, so a node LP inside a search span appears in both
-// `node_lp` and `search`; the residual is still the authority on what is
-// missing. Without SOR_ROUTE_DEBUG the type has no members and no clock.
+// Events show inclusive durations; ledger buckets receive exclusive time.
+// Nested stages therefore contribute exactly once to the bucket partition. Without SOR_ROUTE_DEBUG the type has no members and no clock.
 #ifndef SOR_ROUTE_DEBUG
 class RouteSpan {
 public:
@@ -159,6 +158,8 @@ private:
     RouteLedgerBucket bucket_;
     int level_;
     bool active_;
+    RouteSpan* parent_ = nullptr;
+    double child_ms_ = 0.0;
     std::chrono::steady_clock::time_point t0_;
 };
 #endif

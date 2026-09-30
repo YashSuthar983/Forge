@@ -30,7 +30,7 @@ namespace {
 
 void usage() {
     std::fputs(
-        "usage: sor_check MODEL.{mps,lp,qps} SOLUTION.sol [--tol T] [--strict-mps]\n"
+        "usage: sor_check MODEL.{mps,lp,qps} SOLUTION.sol [--tol T] [--gap-tol G] [--strict-mps]\n"
         "                 [--relax-integrality] [--small-matrix-value V]\n"
         "                 [--fixed-mps|--free-mps]\n"
         "  SOLUTION.sol is written by `sor_solve ... --solution-out FILE`.\n"
@@ -195,13 +195,14 @@ int main(int argc, char** argv) {
 
     std::string model_path, solution_path;
     double tol = 1e-7;
+    std::optional<double> gap_tol;
     sor::io::MpsReadOptions mps_opts;
     bool mps_format_forced = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
-        if (a == "--tol") {
+        if (a == "--tol" || a == "--gap-tol") {
             if (i + 1 >= argc) {
-                std::fprintf(stderr, "error: --tol needs a value\n");
+                std::fprintf(stderr, "error: %s needs a value\n", a.c_str());
                 return 2;
             }
             // strtod with a null end pointer accepts "abc" as 0 and takes
@@ -209,13 +210,15 @@ int main(int argc, char** argv) {
             // changed what the checker accepts instead of failing.
             const std::string text = argv[++i];
             std::size_t used = 0;
-            try { tol = std::stod(text, &used); } catch (const std::exception&) { used = 0; }
-            if (used != text.size() || !std::isfinite(tol) || !(tol > 0.0)) {
+            double parsed = 0;
+            try { parsed = std::stod(text, &used); } catch (const std::exception&) { used = 0; }
+            if (used != text.size() || !std::isfinite(parsed) || !(parsed > 0.0)) {
                 std::fprintf(stderr,
-                             "error: --tol expects a finite number greater than 0, "
-                             "got '%s'\n", text.c_str());
+                             "error: %s expects a finite number greater than 0, "
+                             "got '%s'\n", a.c_str(), text.c_str());
                 return 2;
             }
+            if (a == "--gap-tol") gap_tol = parsed; else tol = parsed;
         } else if (a == "--relax-integrality") {
             mps_opts.relax_integrality = true;
         } else if (a == "--strict-mps") {
@@ -363,16 +366,17 @@ int main(int argc, char** argv) {
                     raw.objective = sol.objective;
                     raw.x = sol.x;
                     raw.y = sol.y;
+                    raw.exact_dual = sol.exact_dual;
                     const auto ev = sor::certify::check_lp_point(
-                        lp, raw, tol, tol, tol, true);
+                        lp, raw, tol, tol, gap_tol.value_or(tol), true);
                     ok &= (ev.max_dual_violation <= tol)
                               ? pass("dual/reduced costs",
                                      ev.max_dual_violation, tol)
                               : fail("dual/reduced costs",
                                      ev.max_dual_violation, tol);
-                    ok &= (ev.gap_rel <= tol)
-                              ? pass("primal-dual gap", ev.gap_rel, tol)
-                              : fail("primal-dual gap", ev.gap_rel, tol);
+                    ok &= (ev.gap_rel <= gap_tol.value_or(tol))
+                              ? pass("primal-dual gap", ev.gap_rel, gap_tol.value_or(tol))
+                              : fail("primal-dual gap", ev.gap_rel, gap_tol.value_or(tol));
                 } else if (sol.status == sor::core::Status::Optimal &&
                            !has_integer && qp) {
                     bool convexity_proved = !lp.maximize;

@@ -215,6 +215,8 @@ struct PresolveReducedSolve {
 };
 
 struct PresolveRecoveryOptions {
+    // Negative disables certificate generation; zero permits work without a deadline.
+    f64 certificate_time_limit_s = 0;
     f64 primal_feas_tol = 1e-7;
     f64 dual_feas_tol = 1e-7;
     f64 gap_tol = 1e-9;

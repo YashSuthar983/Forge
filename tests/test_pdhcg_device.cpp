@@ -9,6 +9,7 @@
 // reductions stride past kMaxPartials workgroups.  Skips when no fp64
 // Vulkan device exists.
 #include "sor/backend/pdhcg_device.hpp"
+#include "sor/backend/batched_pdhcg_device.hpp"
 #include "sor/engines/qp.hpp"
 #include "sor/sparse/csr.hpp"
 #include "test_helpers.hpp"
@@ -141,18 +142,58 @@ void parity(const std::string& label, const engines::QpProblem& p,
                 static_cast<int>(rv.proposed_status), dv.objective);
 }
 
+// The production lane adapter must not download full vectors for unused
+// LP diagnostics. Legacy evaluate() must still provide meaningful metrics.
+void diagnostic_evaluation(backend::PdhcgDevice& device) {
+    backend::PdhcgData data;
+    data.A_csr = sparse::from_triplets(1, 1, {0}, {0}, {1.0});
+    data.A_csc = sparse::to_csc(data.A_csr);
+    data.diagonal = true;
+    data.q_diag = {0.0};
+    data.c = {-2.0};
+    data.col_lo = {1.0}; data.col_hi = {3.0};
+    data.row_lo = {0.0}; data.row_hi = {5.0};
+    data.col_scale = {2.0}; data.row_scale = {4.0};
+    device.upload(data);
+    device.init();
+    auto lanes = backend::make_lanes_view({&device});
+    for (bool at_average : {false, true}) {
+        device.reset_stats();
+        const auto qp = lanes->evaluate(at_average, {1}).front();
+        const auto qp_bytes = device.transfer_stats().d2h_bytes;
+        device.reset_stats();
+        const auto lp = device.evaluate(at_average);
+        const auto lp_bytes = device.transfer_stats().d2h_bytes;
+        CHECK_NEAR(qp.primal, lp.primal, 1e-12);
+        CHECK_NEAR(qp.dual_res, lp.dual_res, 1e-12);
+        CHECK_NEAR(qp.ctx, lp.ctx, 1e-12);
+        CHECK(qp.support_finite == lp.support_finite);
+        CHECK_NEAR(qp.kkt_primal_obj, 0.0, 1e-12);
+        CHECK_NEAR(lp.kkt_primal_obj, -2.0, 1e-12);
+        CHECK_NEAR(lp.kkt_dual_obj, -6.0, 1e-12);
+        CHECK_NEAR(lp.kkt_dual_res, 1.0, 1e-12);
+        if (device.is_accelerated()) {
+            CHECK(qp_bytes == 10 * sizeof(f64));
+            CHECK(lp_bytes == qp_bytes + 4 * sizeof(f64));
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
     CHECK(backend::make_pdhcg_device("cpu") != nullptr);
     CHECK(backend::make_pdhcg_device("no_such") == nullptr);
 
+    auto cpu = backend::make_cpu_pdhcg_device();
+    diagnostic_evaluation(*cpu);
     auto vk = backend::make_vulkan_pdhcg_device();
     if (!vk) {
         std::printf("SKIP vulkan PDHCG parity: no fp64 Vulkan device\n");
         return ::sor::test::finish("test_pdhcg_device");
     }
     CHECK(vk->is_accelerated());
+    diagnostic_evaluation(*vk);
 
     engines::QpOptions opts;
     opts.max_iterations = 4000;

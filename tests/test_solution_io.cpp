@@ -22,6 +22,7 @@ void test_round_trip_optimal() {
     r.objective = -464.75314285714285;
     r.x = {1.0, 2.5, -3.0, 0.0};
     r.y = {0.1, -0.2};
+    r.exact_dual = {"1/10", "-1/5"};
 
     std::ostringstream out;
     sor::io::write_solution(out, r);
@@ -35,6 +36,7 @@ void test_round_trip_optimal() {
     for (std::size_t i = 0; i < r.x.size(); ++i) CHECK_NEAR(s.x[i], r.x[i], 1e-15);
     CHECK(s.y.size() == r.y.size());
     for (std::size_t i = 0; i < r.y.size(); ++i) CHECK_NEAR(s.y[i], r.y[i], 1e-15);
+    CHECK(s.exact_dual == r.exact_dual);
     CHECK(s.ray.empty());
 }
 

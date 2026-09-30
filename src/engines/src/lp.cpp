@@ -20,6 +20,15 @@
 
 namespace sor::engines {
 namespace {
+// Coordinate identity follows the model object, including row-only reductions.
+// The presolve map and its model stay alive until all candidates are consumed.
+struct CandidateSpace {
+    const model::LpProblem* model;
+    bool is_original(const model::LpProblem& original) const noexcept {
+        return model == &original;
+    }
+};
+
 
 using Clock = std::chrono::steady_clock;
 
@@ -78,7 +87,8 @@ bool certified_terminal(const core::RawResult& raw,
                 (std::isfinite(ev.ray_violation) &&
                  ev.ray_violation <= ev.primal_feas_tol));
     if (raw.proposed_status == core::Status::Unbounded)
-        return !raw.primal_ray.direction.empty() &&
+        return ev.checker_passed && ev.max_primal_violation <= ev.primal_feas_tol &&
+               !raw.primal_ray.direction.empty() &&
                std::isfinite(ev.primal_ray_violation) &&
                ev.primal_ray_violation <= ev.primal_feas_tol &&
                std::isfinite(ev.primal_ray_objective) &&
@@ -204,12 +214,6 @@ void install_reduced_basis(presolve::PresolveReducedSolve& reduced,
     }
 }
 
-bool candidate_in_reduced_space(const model::LpProblem& reduced,
-                                const core::RawResult& raw) {
-    return !raw.x.empty() &&
-           raw.x.size() == static_cast<std::size_t>(reduced.n_cols());
-}
-
 std::pair<core::RawResult, core::ProofEvidence> lift_reduced_candidate(
     const model::LpProblem& original,
     const presolve::PresolveMap& pmap,
@@ -265,20 +269,8 @@ std::pair<core::RawResult, core::ProofEvidence> lift_reduced_candidate(
         ev.has_basis = true;
     else if (producer_ev.has_basis)
         ev.has_basis = true;
-    // recover_solution never writes dual_bound; finalize_result then rejects
-    // ProvedOptimalFP with "objective or dual bound is not finite". When the
-    // independent checker closed the gap, the dual bound equals the objective
-    // at the claimed tolerances - publish it. Otherwise keep any finite value
-    // the reduced engine already had.
-    if (!std::isfinite(lifted.dual_bound)) {
-        if (std::isfinite(lifted.objective) &&
-            std::isfinite(ev.gap_rel) && ev.gap_rel <= ev.gap_tol)
-            lifted.dual_bound = lifted.objective;
-        else if (std::isfinite(raw.dual_bound))
-            lifted.dual_bound = raw.dual_bound;
-    }
-    if (!std::isfinite(lifted.objective) && std::isfinite(raw.objective))
-        lifted.objective = raw.objective;
+    lifted.dual_bound = ev.checked_dual_bound;
+    lifted.objective = ev.checked_objective;
     return {std::move(lifted), ev};
 }
 
@@ -390,7 +382,12 @@ LpStrategy route_lp_auto(const core::LpStructuralFeatures& f,
 core::RawResult solve_lp(const model::LpProblem& problem,
                          const LpOptions& options,
                          LpDiagnostics& diagnostics,
-                         core::ProofEvidence* evidence) {
+                         core::ProofEvidence* evidence,
+                         const SimplexOptions* simplex_policy,
+                         const HprOptions* hpr_policy,
+                         const PdhgOptions* pdhg_policy) {
+    problem.validate();
+    model::validate_lp_policy(options.primal_feas_tol, options.dual_feas_tol, options.gap_tol, options.time_limit_s);
     const auto start = Clock::now();
     diagnostics = LpDiagnostics{};
     diagnostics.requested_strategy = options.strategy;
@@ -463,7 +460,7 @@ core::RawResult solve_lp(const model::LpProblem& problem,
             ev.gap_tol = options.gap_tol;
             return finish(std::move(raw), ev);
         }
-        SimplexOptions simplex_options;
+        SimplexOptions simplex_options = simplex_policy ? *simplex_policy : SimplexOptions{};
         simplex_options.method = route == LpStrategy::PrimalSimplex
             ? SimplexMethod::Primal : route == LpStrategy::DualSimplex
             ? SimplexMethod::Dual : SimplexMethod::Auto;
@@ -473,6 +470,7 @@ core::RawResult solve_lp(const model::LpProblem& problem,
         simplex_options.dual_feas_tol = options.dual_feas_tol;
         simplex_options.gap_tol = options.gap_tol;
         simplex_options.presolve = options.presolve;
+        simplex_options.presolve_implied_slack = options.presolve_implied_slack;
         SimplexDiagnostics simplex_diag;
         const auto simplex_start = Clock::now();
         core::RawResult raw = solve_simplex(problem, simplex_options, simplex_diag);
@@ -484,7 +482,7 @@ core::RawResult solve_lp(const model::LpProblem& problem,
     }
 
     if (route == LpStrategy::Pdhg) {
-        const double stage_time = remaining_seconds(options, start, 1.0);
+        const double stage_time = remaining_seconds(options, start, options.fo_crossover ? diagnostics.fo_budget_fraction : 1.0);
         if (options.time_limit_s > 0.0 && stage_time <= 0.0) {
             core::RawResult raw;
             raw.proposed_status = core::Status::Interrupted;
@@ -499,10 +497,14 @@ core::RawResult solve_lp(const model::LpProblem& problem,
         auto backend = backend::make_backend(options.backend);
         if (!backend) return unsupported(
             "selected backend is unavailable for PDHG", diagnostics, evidence);
-        PdhgOptions pdhg_options;
+        PdhgOptions pdhg_options = pdhg_policy ? *pdhg_policy : PdhgOptions{};
         if (options.max_iterations > 0)
-            pdhg_options.max_iterations = options.max_iterations;
+            pdhg_options.max_iterations = iteration_share(options.max_iterations, options.fo_crossover ? diagnostics.fo_budget_fraction : 1.0, 100000);
         pdhg_options.time_limit_s = stage_time;
+        if (simplex_policy && !pdhg_policy) {
+            pdhg_options.ruiz_iterations = simplex_policy->ruiz_iterations;
+            pdhg_options.use_pock_chambolle = simplex_policy->ruiz_iterations > 0;
+        }
         pdhg_options.primal_tol = options.primal_feas_tol;
         pdhg_options.dual_tol = options.dual_feas_tol;
         pdhg_options.gap_tol = options.gap_tol;
@@ -511,17 +513,50 @@ core::RawResult solve_lp(const model::LpProblem& problem,
         core::RawResult raw = solve_pdhg(
             work_problem, pdhg_options, *backend, pdhg_diag);
         diagnostics.fo_elapsed_s = elapsed_seconds(fo_start);
-        const auto producer_ev = pdhg_evidence(pdhg_diag, pdhg_options);
+        core::ProofEvidence producer_ev = pdhg_evidence(pdhg_diag, pdhg_options);
+        auto checked = independently_checked(work_problem, raw, producer_ev);
+        diagnostics.fo_iterations = pdhg_diag.iterations;
+        SimplexBasis crossed_basis;
+        if (options.fo_crossover && !raw.x.empty()) {
+            const double cleanup_time = remaining_seconds(options, start);
+            const auto remaining_iterations = options.max_iterations == 0 ? 0 :
+                options.max_iterations - std::min(options.max_iterations, raw.iterations);
+            if ((options.time_limit_s <= 0 || cleanup_time > 0) &&
+                (options.max_iterations == 0 || remaining_iterations > 0)) {
+                CrossoverOptions cross;
+                cross.simplex_policy = simplex_policy;
+                cross.primal_tol = options.primal_feas_tol;
+                cross.dual_tol = options.dual_feas_tol;
+                cross.max_iterations = remaining_iterations;
+                cross.time_limit_s = cleanup_time;
+                cross.fo_budget_ended = raw.proposed_status == core::Status::Interrupted;
+                CrossoverDiagnostics cd;
+                const auto cross_start = Clock::now();
+                auto crossed = crossover_to_simplex(work_problem, raw, cross, cd, &crossed_basis);
+                diagnostics.crossover_attempted = true;
+                diagnostics.crossover_elapsed_s = elapsed_seconds(cross_start);
+                diagnostics.crossover_iterations = crossed.iterations;
+                diagnostics.crossover_basis_valid = cd.validated_basis;
+                diagnostics.crossover_cold_fallback = cd.cold_fallback;
+                SimplexOptions policy = simplex_policy ? *simplex_policy : SimplexOptions{};
+                policy.primal_feas_tol = cross.primal_tol;
+                policy.dual_feas_tol = cross.dual_tol;
+                policy.gap_tol = std::min(cross.primal_tol, cross.dual_tol);
+                const auto crossed_proposal = simplex_evidence(cd.simplex, policy);
+                const auto crossed_ev = independently_checked(work_problem, crossed, crossed_proposal);
+                if (proved_basis(crossed, crossed_ev) || candidate_merit(crossed, crossed_ev) < candidate_merit(raw, checked)) {
+                    raw = std::move(crossed);
+                    producer_ev = crossed_proposal;
+                    checked = crossed_ev;
+                } else crossed_basis = SimplexBasis{};
+            }
+        }
         if (presolve_map != nullptr) {
-            const auto lifted = lift_reduced_candidate(
-                problem, *presolve_map, std::move(raw), options, producer_ev);
-            diagnostics.fo_iterations = lifted.first.iterations;
+            auto lifted = lift_reduced_candidate(problem, *presolve_map, std::move(raw), options,
+                producer_ev, crossed_basis.status.empty() ? nullptr : &crossed_basis);
             return finish(std::move(lifted.first), lifted.second);
         }
-        const auto ev = independently_checked(
-            problem, raw, producer_ev);
-        diagnostics.fo_iterations = pdhg_diag.iterations;
-        return finish(std::move(raw), ev);
+        return finish(std::move(raw), checked);
     }
 
     if (route != LpStrategy::Hpr)
@@ -543,9 +578,9 @@ core::RawResult solve_lp(const model::LpProblem& problem,
         (is_auto || want_crossover) ? diagnostics.fo_budget_fraction : 1.0;
     const double fo_time = remaining_seconds(
         options, start, fo_fraction);
-    HprOptions hpr_options;
+    HprOptions hpr_options = hpr_policy ? *hpr_policy : HprOptions{};
     hpr_options.max_iterations = iteration_share(
-        options.max_iterations, fo_fraction, 200000);
+        options.max_iterations, fo_fraction, hpr_options.max_iterations);
     hpr_options.time_limit_s = fo_time;
     hpr_options.primal_tol = is_auto ? diagnostics.fo_target_tolerance
                                      : options.primal_feas_tol;
@@ -553,13 +588,17 @@ core::RawResult solve_lp(const model::LpProblem& problem,
                                    : options.dual_feas_tol;
     hpr_options.gap_tol = is_auto ? diagnostics.fo_target_tolerance
                                   : options.gap_tol;
+    if (simplex_policy && !hpr_policy) {
+        hpr_options.ruiz_iterations = simplex_policy->ruiz_iterations;
+        hpr_options.use_pock_chambolle = simplex_policy->ruiz_iterations > 0;
+    }
     hpr_options.use_polishing = options.fo_polish;
     hpr_options.detect_certificates = options.fo_certificates;
-    hpr_options.abandon_after_stalled_epochs =
-        is_auto ? 3 : 0;
+    if (is_auto) hpr_options.abandon_after_stalled_epochs = 3;
     HprDiagnostics hpr_diag;
     core::RawResult fo_raw;
     core::ProofEvidence fo_ev;
+    CandidateSpace fo_space{&work_problem};
     if (options.time_limit_s > 0.0 && fo_time <= 0.0) {
         fo_raw.proposed_status = core::Status::Interrupted;
         fo_raw.engine = "hpr";
@@ -589,6 +628,7 @@ core::RawResult solve_lp(const model::LpProblem& problem,
                 problem, *presolve_map, std::move(fo_raw), options, producer_ev);
             fo_raw = std::move(lifted.first);
             fo_ev = lifted.second;
+            fo_space = CandidateSpace{&problem};
         } else {
             fo_ev = independently_checked(problem, fo_raw, producer_ev);
         }
@@ -610,7 +650,7 @@ core::RawResult solve_lp(const model::LpProblem& problem,
         certified_terminal(fo_raw, fo_ev) || (!is_auto && !want_crossover);
     if (stop_without_crossover) {
         if (presolve_map != nullptr &&
-            candidate_in_reduced_space(work_problem, fo_raw)) {
+            !fo_space.is_original(problem)) {
             const auto lifted = lift_reduced_candidate(
                 problem, *presolve_map, std::move(fo_raw), options, fo_ev);
             return finish(std::move(lifted.first), lifted.second);
@@ -620,6 +660,7 @@ core::RawResult solve_lp(const model::LpProblem& problem,
 
     core::RawResult best_raw = fo_raw;
     core::ProofEvidence best_ev = fo_ev;
+    CandidateSpace best_space = fo_space;
     const double crossover_time = remaining_seconds(
         options, start, diagnostics.crossover_budget_fraction +
                         diagnostics.fo_budget_fraction);
@@ -639,6 +680,7 @@ core::RawResult solve_lp(const model::LpProblem& problem,
     }
     if (diagnostics.crossover_attempted) {
         CrossoverOptions crossover_options;
+        crossover_options.simplex_policy = simplex_policy;
         crossover_options.primal_tol = std::min(
             options.primal_feas_tol, diagnostics.recovery_target_tolerance);
         crossover_options.dual_tol = std::min(
@@ -682,6 +724,7 @@ core::RawResult solve_lp(const model::LpProblem& problem,
                     crossover_producer, basis_for_lift);
                 best_raw = std::move(lifted.first);
                 best_ev = lifted.second;
+                best_space = CandidateSpace{&problem};
             } else {
                 best_raw = std::move(crossed);
                 best_ev = crossed_ev_reduced;
@@ -703,7 +746,7 @@ core::RawResult solve_lp(const model::LpProblem& problem,
                                                simplex_iteration_budget > 0;
     if ((options.time_limit_s <= 0.0 || simplex_time > 0.0) &&
         have_simplex_iteration_budget) {
-        SimplexOptions simplex_options;
+        SimplexOptions simplex_options = simplex_policy ? *simplex_policy : SimplexOptions{};
         simplex_options.method = SimplexMethod::Auto;
         simplex_options.max_iterations = options.max_iterations == 0
             ? 0 : simplex_iteration_budget;
@@ -724,26 +767,28 @@ core::RawResult solve_lp(const model::LpProblem& problem,
         const core::ProofEvidence simplex_ev_reduced = independently_checked(
             work_problem, simplex_raw, simplex_producer);
         diagnostics.simplex_iterations = simplex_diag.iterations;
-        if (proved_basis(simplex_raw, simplex_ev_reduced) ||
-            certified_terminal(simplex_raw, simplex_ev_reduced) ||
-            candidate_merit(simplex_raw, simplex_ev_reduced) <
-                candidate_merit(best_raw, best_ev)) {
-            if (presolve_map != nullptr) {
-                const SimplexBasis* basis_for_lift =
-                    simplex_basis.status.empty() ? nullptr : &simplex_basis;
-                const auto lifted = lift_reduced_candidate(
-                    problem, *presolve_map, std::move(simplex_raw), options,
-                    simplex_producer, basis_for_lift);
-                best_raw = std::move(lifted.first);
-                best_ev = lifted.second;
-            } else {
-                best_raw = std::move(simplex_raw);
-                best_ev = simplex_ev_reduced;
-            }
+        auto candidate = presolve_map != nullptr
+            ? lift_reduced_candidate(problem, *presolve_map, std::move(simplex_raw),
+                options, simplex_producer, simplex_basis.status.empty() ? nullptr : &simplex_basis)
+            : std::make_pair(std::move(simplex_raw), simplex_ev_reduced);
+        if (!best_space.is_original(problem) && presolve_map != nullptr) {
+            auto lifted = lift_reduced_candidate(problem, *presolve_map,
+                std::move(best_raw), options, best_ev);
+            best_raw = std::move(lifted.first);
+            best_ev = lifted.second;
+            best_space = CandidateSpace{&problem};
+        }
+        if (proved_basis(candidate.first, candidate.second) ||
+            certified_terminal(candidate.first, candidate.second) ||
+            candidate_merit(candidate.first, candidate.second) < candidate_merit(best_raw, best_ev)) {
+            best_raw = std::move(candidate.first);
+            best_ev = candidate.second;
+            best_space = CandidateSpace{&problem};
         }
     }
+
     if (presolve_map != nullptr &&
-        candidate_in_reduced_space(work_problem, best_raw)) {
+        !best_space.is_original(problem)) {
         const auto lifted = lift_reduced_candidate(
             problem, *presolve_map, std::move(best_raw), options, best_ev);
         return finish(std::move(lifted.first), lifted.second);

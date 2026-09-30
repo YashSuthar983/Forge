@@ -501,11 +501,9 @@ public:
         f64 dval = 0.0;
         for (std::size_t j = 0; j < nc_ && finite; ++j) {
             const f64 r = c_[j] + Aty_[j];
-            const f64 r_orig = r / col_scale_[j];
-            const f64 scale = 1.0 + std::fabs(c_[j] / col_scale_[j]);
             const f64 b = (r >= 0.0) ? col_lo_[j] : col_hi_[j];
             if (std::isinf(b)) {
-                if (std::fabs(r_orig) > last_dual_tol_ * scale) finite = false;
+                if (r != 0.0) finite = false;
                 continue;
             }
             dval += r * b;
@@ -514,7 +512,7 @@ public:
             const f64 yi = yp[i];
             const f64 b = (yi >= 0.0) ? row_hi_[i] : row_lo_[i];
             if (std::isinf(b)) {
-                if (std::fabs(yi * row_scale_[i]) > last_dual_tol_) finite = false;
+                if (yi != 0.0) finite = false;
                 continue;
             }
             dval -= yi * b;

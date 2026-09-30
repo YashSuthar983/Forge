@@ -27,6 +27,28 @@ int main() {
         CHECK_NEAR(m.vals[3], 4.0, 1e-15);
     }
 
+    // Bound/cost/scaling copies share structure, but cut edits detach and
+    // preserve every existing snapshot and its version token.
+    {
+        const auto original = sparse::from_triplets(2, 3, {0, 1}, {0, 2}, {1, 2});
+        auto overlay = original;
+        const auto token = original.pattern.structure_token();
+        CHECK(overlay.pattern.structure_token() == token);
+        CHECK(overlay.pattern.row_ptr().data() == original.pattern.row_ptr().data());
+        overlay.vals[0] = 7;
+        CHECK(original.vals[0] == 1);
+        CHECK(overlay.pattern.structure_token() == token);
+        overlay.append_row({1}, {3});
+        CHECK(overlay.pattern.structure_token() != token);
+        CHECK(original.n_rows() == 2 && original.nnz() == 2);
+        auto snapshot = overlay;
+        const auto appended_token = snapshot.pattern.structure_token();
+        overlay.truncate_rows(1);
+        CHECK(overlay.pattern.structure_token() != appended_token);
+        CHECK(snapshot.n_rows() == 3 && snapshot.nnz() == 3);
+        original.pattern.validate(); snapshot.pattern.validate(); overlay.pattern.validate();
+    }
+
     // Malformed patterns must be rejected at construction.
     {
         CHECK_THROWS(sparse::SparsePattern(2, 2, {0, 1}, {0}));          // short row_ptr

@@ -4,6 +4,7 @@
 #include "sor/core/route_debug.hpp"
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -504,6 +505,7 @@ void route_debug_ledger_emit(const char* scope) {
 }
 
 #ifdef SOR_ROUTE_DEBUG
+namespace { thread_local RouteSpan* current_span = nullptr; }
 RouteSpan::RouteSpan(int level, const char* comp, const char* path,
                      const char* event, const char* fields,
                      RouteLedgerBucket bucket)
@@ -513,6 +515,7 @@ RouteSpan::RouteSpan(int level, const char* comp, const char* path,
       // and make the ledger lie about where it went.
       active_(g_level.load(std::memory_order_relaxed) >= 1),
       t0_(std::chrono::steady_clock::now()) {
+    if (active_) { parent_ = current_span; current_span = this; }
     if (route_debug_want(level, comp, path)) {
         char buf[512];
         std::snprintf(buf, sizeof buf, "\"phase\":\"enter\"%s%s",
@@ -530,7 +533,9 @@ double RouteSpan::elapsed_ms() const {
 RouteSpan::~RouteSpan() {
     if (!active_) return;
     const double ms = elapsed_ms();
-    route_debug_ledger_add(bucket_, ms);
+    current_span = parent_;
+    if (parent_) parent_->child_ms_ += ms;
+    route_debug_ledger_add(bucket_, std::max(0.0, ms - child_ms_));
     if (route_debug_want(level_, comp_, path_)) {
         char buf[160];
         std::snprintf(buf, sizeof buf,

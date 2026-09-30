@@ -1,4 +1,5 @@
 #include "sor/presolve/presolve.hpp"
+#include "sor/model/exact.hpp"
 
 #include "live_matrix.hpp"
 
@@ -177,7 +178,7 @@ PresolveMap run_presolve(const model::LpProblem& in,
         // Empty rows after substituting fixed columns.
         for (Index i = 0; i < m; ++i) {
             if (!row_live[sz(i)]) continue;
-            f64 activity = 0.0;
+            model::ExactSum activity_sum;
             bool has_live = false;
             for (Offset k = in.A.pattern.row_ptr()[sz(i)];
                  k < in.A.pattern.row_ptr()[sz(i) + 1]; ++k) {
@@ -186,13 +187,16 @@ PresolveMap run_presolve(const model::LpProblem& in,
                     has_live = true;
                     break;
                 }
-                activity += in.A.vals[sz(k)] * fixed[sz(j)];
+                activity_sum.add_product(in.A.vals[sz(k)], fixed[sz(j)]);
             }
             if (!has_live) {
-                const f64 scale = 1.0 + std::fabs(activity);
+                const auto activity = activity_sum.value();
+                const f64 scale = 1.0 + std::fabs(activity.convert_to<f64>());
                 const f64 tol = options.feasibility_tol * scale;
-                if (activity < in.row_lo[sz(i)] - tol ||
-                    activity > in.row_hi[sz(i)] + tol) {
+                if ((std::isfinite(in.row_lo[sz(i)]) &&
+                     activity < model::Rational(in.row_lo[sz(i)]) - model::Rational(tol)) ||
+                    (std::isfinite(in.row_hi[sz(i)]) &&
+                     activity > model::Rational(in.row_hi[sz(i)]) + model::Rational(tol))) {
                     status = PresolveStatus::Infeasible;
                     witness_row = i;
                     reason = "empty row " + std::to_string(i) +
@@ -217,19 +221,18 @@ PresolveMap run_presolve(const model::LpProblem& in,
         // the lifted multiplier is zero, which is valid by construction.
         for (Index i = 0; i < m; ++i) {
             if (!row_live[sz(i)]) continue;
-            f64 act_lo = 0.0, act_hi = 0.0;
+            model::ExactIntervalSum activity;
             for (Offset k = in.A.pattern.row_ptr()[sz(i)];
                  k < in.A.pattern.row_ptr()[sz(i) + 1]; ++k) {
                 const Index j = in.A.pattern.col_idx()[sz(k)];
                 const f64 a = in.A.vals[sz(k)];
                 if (!col_live[sz(j)]) {
-                    act_lo += a * fixed[sz(j)];
-                    act_hi += a * fixed[sz(j)];
+                    activity.add(a, fixed[sz(j)], fixed[sz(j)]);
                 } else {
-                    add_interval(act_lo, act_hi, a, work_lo[sz(j)], work_hi[sz(j)]);
+                    activity.add(a, work_lo[sz(j)], work_hi[sz(j)]);
                 }
             }
-            if (act_lo >= in.row_lo[sz(i)] && act_hi <= in.row_hi[sz(i)]) {
+            if (activity.lower() >= in.row_lo[sz(i)] && activity.upper() <= in.row_hi[sz(i)]) {
                 row_live[sz(i)] = 0;
                 ++out.stats.rows_removed;
                 changed = true;
@@ -239,46 +242,33 @@ PresolveMap run_presolve(const model::LpProblem& in,
         // Multi-entry forcing rows. If a finite lower bound equals the exact
         // maximum possible row activity, every live variable must sit at the
         // bound that maximizes its contribution. The upper/minimum case is
-        // symmetric. Use long-double arithmetic and require exact equality:
+        // symmetric. Use exact binary64 products and sums and require equality:
         // a rounded near miss still has feasible alternatives and must not be
         // eliminated. Columns are fixed immediately so later rows in this
         // same pass see the transformed problem and cascades remain ordered.
         for (Index i = 0; i < m; ++i) {
             if (!row_live[sz(i)]) continue;
-            long double act_lo = 0.0L;
-            long double act_hi = 0.0L;
+            model::ExactIntervalSum activity;
             Index live_count = 0;
             for (Offset k = in.A.pattern.row_ptr()[sz(i)];
                  k < in.A.pattern.row_ptr()[sz(i) + 1]; ++k) {
                 const Index j = in.A.pattern.col_idx()[sz(k)];
                 const f64 a = in.A.vals[sz(k)];
-                if (a == 0.0) continue;
-                if (!col_live[sz(j)]) {
-                    const long double term =
-                        static_cast<long double>(a) * fixed[sz(j)];
-                    act_lo += term;
-                    act_hi += term;
-                    continue;
-                }
-                ++live_count;
-                const f64 lo = work_lo[sz(j)];
-                const f64 hi = work_hi[sz(j)];
-                if (a > 0.0) {
-                    act_lo += static_cast<long double>(a) * lo;
-                    act_hi += static_cast<long double>(a) * hi;
-                } else {
-                    act_lo += static_cast<long double>(a) * hi;
-                    act_hi += static_cast<long double>(a) * lo;
+                if (a == 0) continue;
+                if (!col_live[sz(j)]) activity.add(a, fixed[sz(j)], fixed[sz(j)]);
+                else {
+                    ++live_count;
+                    activity.add(a, work_lo[sz(j)], work_hi[sz(j)]);
                 }
             }
             if (live_count < 2) continue;  // singleton rule below owns this case
 
             const bool at_max =
-                std::isfinite(in.row_lo[sz(i)]) && std::isfinite(act_hi) &&
-                act_hi == static_cast<long double>(in.row_lo[sz(i)]);
+                std::isfinite(in.row_lo[sz(i)]) && activity.finite_maximum() &&
+                activity.exact_maximum() == model::Rational(in.row_lo[sz(i)]);
             const bool at_min =
-                std::isfinite(in.row_hi[sz(i)]) && std::isfinite(act_lo) &&
-                act_lo == static_cast<long double>(in.row_hi[sz(i)]);
+                std::isfinite(in.row_hi[sz(i)]) && activity.finite_minimum() &&
+                activity.exact_minimum() == model::Rational(in.row_hi[sz(i)]);
             if (!at_max && !at_min) continue;
 
             DualRecoveryStep step;
@@ -407,7 +397,7 @@ PresolveMap run_presolve(const model::LpProblem& in,
             }
             if (elim < 0) continue;
 
-            f64 fixed_shift = 0.0;
+            model::ExactSum fixed_shift;
             SingletonColumnElimination rec;
             rec.row = i;
             rec.col = elim;
@@ -423,11 +413,11 @@ PresolveMap run_presolve(const model::LpProblem& in,
                 rec.other_cols.push_back(j);
                 rec.other_coeffs.push_back(a);
                 if (!col_live[sz(j)])
-                    fixed_shift += a * fixed[sz(j)];
+                    fixed_shift.add_product(a, fixed[sz(j)]);
             }
 
             const f64 eliminated_cost = work_cost[sz(elim)];
-            const f64 effective_rhs = in.row_lo[sz(i)] - fixed_shift;
+            const f64 effective_rhs = (model::Rational(in.row_lo[sz(i)]) - fixed_shift.value()).convert_to<f64>();
             work_obj_offset += eliminated_cost * effective_rhs / a_elim;
             for (Offset k = in.A.pattern.row_ptr()[sz(i)];
                  k < in.A.pattern.row_ptr()[sz(i) + 1]; ++k) {
@@ -472,12 +462,12 @@ PresolveMap run_presolve(const model::LpProblem& in,
             Index col = -1;
             f64 a = 0.0;
             int cnt = 0;
-            f64 shift = 0.0;   // contribution of already-fixed columns
+            model::ExactSum shift; // exact contribution of fixed columns
             for (Offset k = in.A.pattern.row_ptr()[sz(i)];
                  k < in.A.pattern.row_ptr()[sz(i) + 1]; ++k) {
                 const Index j = in.A.pattern.col_idx()[sz(k)];
                 if (!col_live[sz(j)]) {
-                    shift += in.A.vals[sz(k)] * fixed[sz(j)];
+                    shift.add_product(in.A.vals[sz(k)], fixed[sz(j)]);
                     continue;
                 }
                 ++cnt;
@@ -488,8 +478,8 @@ PresolveMap run_presolve(const model::LpProblem& in,
             const f64 clo = work_lo[sz(col)];
             const f64 chi = work_hi[sz(col)];
             if (in.row_lo[sz(i)] == in.row_hi[sz(i)]) {
-                const f64 rhs = in.row_lo[sz(i)] - shift;
-                const f64 v = rhs / a;
+                const model::Rational quotient = (model::Rational(in.row_lo[sz(i)]) - shift.value()) / model::Rational(a);
+                const f64 v = quotient.convert_to<f64>();
                 const f64 feasibility_band = options.feasibility_tol *
                     (1.0 + std::max(std::fabs(v),
                                     std::max(std::fabs(clo), std::fabs(chi))));
@@ -524,14 +514,14 @@ PresolveMap run_presolve(const model::LpProblem& in,
             f64 implied_lo = -model::kInf, implied_hi = model::kInf;
             if (a > 0.0) {
                 if (in.row_lo[sz(i)] > -model::kInf)
-                    implied_lo = (in.row_lo[sz(i)] - shift) / a;
+                    implied_lo = model::rounded_down((model::Rational(in.row_lo[sz(i)]) - shift.value()) / model::Rational(a));
                 if (in.row_hi[sz(i)] <  model::kInf)
-                    implied_hi = (in.row_hi[sz(i)] - shift) / a;
+                    implied_hi = model::rounded_up((model::Rational(in.row_hi[sz(i)]) - shift.value()) / model::Rational(a));
             } else {
                 if (in.row_hi[sz(i)] <  model::kInf)
-                    implied_lo = (in.row_hi[sz(i)] - shift) / a;
+                    implied_lo = model::rounded_down((model::Rational(in.row_hi[sz(i)]) - shift.value()) / model::Rational(a));
                 if (in.row_lo[sz(i)] > -model::kInf)
-                    implied_hi = (in.row_lo[sz(i)] - shift) / a;
+                    implied_hi = model::rounded_up((model::Rational(in.row_lo[sz(i)]) - shift.value()) / model::Rational(a));
             }
             const f64 new_lo = std::max(clo, implied_lo);
             const f64 new_hi = std::min(chi, implied_hi);
@@ -1230,46 +1220,42 @@ std::vector<f64> postsolve(const PresolveMap& map, const std::vector<f64>& x_red
         if (nj < 0 || nj >= n_red) x[sz(j)] = map.fixed_value[sz(j)];
         else                       x[sz(j)] = x_reduced[sz(nj)];
     }
-    for (std::size_t t = map.doubleton_equalities.size(); t-- > 0;) {
-        const auto& rec = map.doubleton_equalities[t];
-        if (rec.elim_col < 0 || rec.elim_col >= n || rec.elim_coeff == 0.0)
-            continue;
-        f64 residual = rec.rhs;
-        if (rec.keep_col >= 0 && rec.keep_col < n)
-            residual -= rec.keep_coeff * x[sz(rec.keep_col)];
-        for (std::size_t k = 0; k < rec.other_cols.size(); ++k) {
-            const Index j = rec.other_cols[k];
-            if (j >= 0 && j < n)
-                residual -= rec.other_coeffs[k] * x[sz(j)];
+    for (std::size_t t = map.recovery_steps.size(); t-- > 0;) {
+        const auto& step = map.recovery_steps[t];
+        if (step.kind == DualRecoveryKind::ParallelColumnMerge) {
+            const auto rem = sz(step.col), keep = sz(step.record);
+            const model::Rational z(x[keep]), scale(step.coeff);
+            model::Rational lower(step.new_lo), upper(step.new_hi);
+            const model::Rational a = (z - model::Rational(step.old_hi)) / scale;
+            const model::Rational b = (z - model::Rational(step.old_lo)) / scale;
+            lower = std::max(lower, model::Rational(step.coeff > 0 ? a : b));
+            upper = std::min(upper, model::Rational(step.coeff > 0 ? b : a));
+            const model::Rational split = lower <= upper ? lower : upper;
+            x[rem] = split.convert_to<f64>();
+            x[keep] = (z - scale * model::Rational(x[rem])).convert_to<f64>();
+        } else if (step.kind == DualRecoveryKind::DoubletonEquality) {
+            const auto& rec = map.doubleton_equalities[sz(step.record)];
+            model::ExactSum residual;
+            residual.add(rec.rhs);
+            residual.add_product(-rec.keep_coeff, x[sz(rec.keep_col)]);
+            for (std::size_t k = 0; k < rec.other_cols.size(); ++k)
+                residual.add_product(-rec.other_coeffs[k], x[sz(rec.other_cols[k])]);
+            x[sz(rec.elim_col)] = (residual.value() / model::Rational(rec.elim_coeff)).convert_to<f64>();
+        } else if (step.kind == DualRecoveryKind::EqualityAggregation) {
+            const auto& rec = map.equality_aggregations[sz(step.record)];
+            model::ExactSum residual;
+            residual.add(rec.rhs);
+            for (std::size_t k = 0; k < rec.other_cols.size(); ++k)
+                residual.add_product(-rec.other_coeffs[k], x[sz(rec.other_cols[k])]);
+            x[sz(rec.col)] = (residual.value() / model::Rational(rec.coeff)).convert_to<f64>();
+        } else if (step.kind == DualRecoveryKind::SingletonColumnElimination) {
+            const auto& rec = map.singleton_columns[sz(step.record)];
+            model::ExactSum residual;
+            residual.add(rec.rhs);
+            for (std::size_t k = 0; k < rec.other_cols.size(); ++k)
+                residual.add_product(-rec.other_coeffs[k], x[sz(rec.other_cols[k])]);
+            x[sz(rec.col)] = (residual.value() / model::Rational(rec.coeff)).convert_to<f64>();
         }
-        x[sz(rec.elim_col)] = residual / rec.elim_coeff;
-    }
-    for (std::size_t t = map.equality_aggregations.size(); t-- > 0;) {
-        const auto& rec = map.equality_aggregations[t];
-        if (rec.col < 0 || rec.col >= n || rec.coeff == 0.0 ||
-            rec.other_cols.size() != rec.other_coeffs.size())
-            continue;
-        long double residual = rec.rhs;
-        for (std::size_t k = 0; k < rec.other_cols.size(); ++k) {
-            const Index j = rec.other_cols[k];
-            if (j >= 0 && j < n)
-                residual -= static_cast<long double>(rec.other_coeffs[k]) *
-                            x[sz(j)];
-        }
-        x[sz(rec.col)] = static_cast<f64>(residual / rec.coeff);
-    }
-    for (std::size_t t = map.singleton_columns.size(); t-- > 0;) {
-        const auto& rec = map.singleton_columns[t];
-        if (rec.col < 0 || rec.col >= n || rec.coeff == 0.0 ||
-            rec.other_cols.size() != rec.other_coeffs.size())
-            continue;
-        f64 residual = rec.rhs;
-        for (std::size_t k = 0; k < rec.other_cols.size(); ++k) {
-            const Index j = rec.other_cols[k];
-            if (j >= 0 && j < n)
-                residual -= rec.other_coeffs[k] * x[sz(j)];
-        }
-        x[sz(rec.col)] = residual / rec.coeff;
     }
     return x;
 }

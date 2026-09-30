@@ -1,6 +1,7 @@
 add_library(sor_engines
   src/pdhg.cpp
   src/simplex.cpp
+  src/dual_certificate_repair.cpp
   src/dual_simplex.cpp
   src/dual_edge_weights.cpp
   src/dual_cost_perturbation.cpp

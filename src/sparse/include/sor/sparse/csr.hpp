@@ -10,6 +10,7 @@
 #include "sor/core/result.hpp"
 
 #include <cstddef>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -30,17 +31,21 @@ public:
                   std::vector<Offset> row_ptr,
                   std::vector<Index> col_idx)
         : n_rows_(n_rows), n_cols_(n_cols),
-          row_ptr_(std::move(row_ptr)), col_idx_(std::move(col_idx)) {
+          storage_(std::make_shared<Storage>(Storage{std::move(row_ptr), std::move(col_idx)})) {
         SOR_FN();
         validate();
     }
 
     Index n_rows() const noexcept { SOR_FN(); return n_rows_; }
     Index n_cols() const noexcept { SOR_FN(); return n_cols_; }
-    Offset nnz()   const noexcept { SOR_FN(); return static_cast<Offset>(col_idx_.size()); }
+    Offset nnz()   const noexcept { SOR_FN(); return static_cast<Offset>(storage_->col_idx.size()); }
 
-    const std::vector<Offset>& row_ptr() const noexcept { SOR_FN(); return row_ptr_; }
-    const std::vector<Index>&  col_idx() const noexcept { SOR_FN(); return col_idx_; }
+    const std::vector<Offset>& row_ptr() const noexcept { SOR_FN(); return storage_->row_ptr; }
+    const std::vector<Index>&  col_idx() const noexcept { SOR_FN(); return storage_->col_idx; }
+
+    // Copies/scaled models share immutable incidence. Keeping a token pins
+    // this version; structural mutation detaches without changing snapshots.
+    std::shared_ptr<const void> structure_token() const noexcept { return storage_; }
 
     // Append one row. `cols` must already be sorted ascending with no
     // duplicates, and every index in [0, n_cols_). O(|cols|).
@@ -59,8 +64,14 @@ public:
 private:
     Index n_rows_ = 0;
     Index n_cols_ = 0;
-    std::vector<Offset> row_ptr_;
-    std::vector<Index>  col_idx_;
+    struct Storage {
+        std::vector<Offset> row_ptr;
+        std::vector<Index> col_idx;
+    };
+    std::shared_ptr<Storage> storage_ = std::make_shared<Storage>();
+    void detach_structure() {
+        if (!storage_.unique()) storage_ = std::make_shared<Storage>(*storage_);
+    }
 };
 
 // A CSR matrix is a pattern plus values, in pattern order.

@@ -1,4 +1,5 @@
 #include "live_matrix.hpp"
+#include "sor/model/exact.hpp"
 
 #include <chrono>
 #include <map>
@@ -138,31 +139,15 @@ void LiveMatrix::queue_col(Index j) {
 void LiveMatrix::recompute_row_activity(Index i) {
     SOR_FN();
     if (!row_active[sz(i)]) return;
-    f64 lo = 0.0, hi = 0.0;
-    Index inf_lo = 0, inf_hi = 0;
+    model::ExactIntervalSum activity;
     for (const auto& [j, a] : rows[sz(i)]) {
-        if (!col_active[sz(j)]) {
-            lo += a * fixed[sz(j)];
-            hi += a * fixed[sz(j)];
-            continue;
-        }
-        const f64 cl = col_lo[sz(j)], ch = col_hi[sz(j)];
-        if (!std::isfinite(cl) || !std::isfinite(ch)) {
-            if (a > 0.0) {
-                if (!std::isfinite(cl)) ++inf_lo;
-                if (!std::isfinite(ch)) ++inf_hi;
-            } else if (a < 0.0) {
-                if (!std::isfinite(ch)) ++inf_lo;
-                if (!std::isfinite(cl)) ++inf_hi;
-            }
-            continue;
-        }
-        add_interval(lo, hi, a, cl, ch);
+        if (!col_active[sz(j)]) activity.add(a, fixed[sz(j)], fixed[sz(j)]);
+        else activity.add(a, col_lo[sz(j)], col_hi[sz(j)]);
     }
-    act_min[sz(i)] = lo;
-    act_max[sz(i)] = hi;
-    act_min_inf[sz(i)] = inf_lo;
-    act_max_inf[sz(i)] = inf_hi;
+    act_min[sz(i)] = activity.lower();
+    act_max[sz(i)] = activity.upper();
+    act_min_inf[sz(i)] = !activity.finite_minimum();
+    act_max_inf[sz(i)] = !activity.finite_maximum();
 }
 
 void LiveMatrix::recompute_col_locks(Index j) {
@@ -262,27 +247,26 @@ bool LiveMatrix::apply_implied_bounds_row(Index i) {
     bool changed = false;
     for (const auto& [j, a] : rows[sz(i)]) {
         if (!col_active[sz(j)] || a == 0.0 || !std::isfinite(a)) continue;
-        f64 other_lo = 0.0, other_hi = 0.0;
+        model::ExactIntervalSum activity;
         for (const auto& [h, b] : rows[sz(i)]) {
             if (h == j) continue;
-            if (!col_active[sz(h)]) {
-                other_lo += b * fixed[sz(h)];
-                other_hi += b * fixed[sz(h)];
-            } else {
-                add_interval(other_lo, other_hi, b, col_lo[sz(h)], col_hi[sz(h)]);
-            }
+            if (!col_active[sz(h)]) activity.add(b, fixed[sz(h)], fixed[sz(h)]);
+            else activity.add(b, col_lo[sz(h)], col_hi[sz(h)]);
         }
         f64 implied_lo = -model::kInf, implied_hi = model::kInf;
-        if (a > 0.0) {
-            if (row_lo[sz(i)] > -model::kInf)
-                implied_lo = (row_lo[sz(i)] - other_hi) / a;
-            if (row_hi[sz(i)] < model::kInf)
-                implied_hi = (row_hi[sz(i)] - other_lo) / a;
+        const auto imply = [&](f64 side, bool maximum, bool lower) {
+            if (!std::isfinite(side) || (maximum ? !activity.finite_maximum() : !activity.finite_minimum()))
+                return lower ? -model::kInf : model::kInf;
+            const model::Rational quotient = (model::Rational(side) -
+                (maximum ? activity.exact_maximum() : activity.exact_minimum())) / model::Rational(a);
+            return lower ? model::rounded_down(quotient) : model::rounded_up(quotient);
+        };
+        if (a > 0) {
+            implied_lo = imply(row_lo[sz(i)], true, true);
+            implied_hi = imply(row_hi[sz(i)], false, false);
         } else {
-            if (row_hi[sz(i)] < model::kInf)
-                implied_lo = (row_hi[sz(i)] - other_lo) / a;
-            if (row_lo[sz(i)] > -model::kInf)
-                implied_hi = (row_lo[sz(i)] - other_hi) / a;
+            implied_lo = imply(row_hi[sz(i)], false, true);
+            implied_hi = imply(row_lo[sz(i)], true, false);
         }
         const f64 clo = col_lo[sz(j)], chi = col_hi[sz(j)];
         // Do not tighten (fully) free or semi-bounded columns into a finite
@@ -301,7 +285,11 @@ bool LiveMatrix::apply_implied_bounds_row(Index i) {
             *reason = "activity implied empty bounds on column " + std::to_string(j);
             return true;
         }
-        if (new_lo != clo || new_hi != chi) {
+        const bool meaningful_lower = new_lo > clo &&
+            (!std::isfinite(clo) || new_lo - clo > 1e-12 * (1 + std::fabs(clo)));
+        const bool meaningful_upper = new_hi < chi &&
+            (!std::isfinite(chi) || chi - new_hi > 1e-12 * (1 + std::fabs(chi)));
+        if (new_lo <= new_hi && (meaningful_lower || meaningful_upper)) {
             col_lo[sz(j)] = new_lo;
             col_hi[sz(j)] = new_hi;
             BoundChange bc{j, i, a, clo, chi, new_lo, new_hi};
@@ -320,6 +308,9 @@ bool LiveMatrix::apply_implied_bounds_row(Index i) {
             ++out->stats.bounds_tightened;
             recompute_col_locks(j);
             queue_col(j);
+            // A bound affects every incident row, including ones already
+            // consumed from the queue in this pass.
+            for (Index affected : col_rows[sz(j)]) queue_row(affected);
             changed = true;
         }
     }
@@ -528,46 +519,28 @@ bool LiveMatrix::try_dominated_columns() {
                 if (!col_active[sz(k)]) continue;
                 
                 const f64 ck = in->maximize ? -cost[sz(k)] : cost[sz(k)];
-                if (ck < cj) continue;
-                
-                bool parallel = true;
-                f64 ratio = 1.0;
-                bool ratio_set = false;
+                if (col_lo[sz(j)] != 0.0 || col_hi[sz(j)] != model::kInf ||
+                    col_lo[sz(k)] != 0.0) continue;
+                if (!in->is_integer.empty() && (in->is_integer[sz(j)] || in->is_integer[sz(k)])) continue;
+                f64 ratio = 0.0;
+                bool parallel = !support.empty();
                 for (const Index i : support) {
-                    const f64 aj = rows[sz(i)].at(j);
-                    const f64 ak = rows[sz(i)].at(k);
-                    if (aj == 0.0 || ak == 0.0) {
-                        parallel = false;
-                        break;
-                    }
-                    const f64 r = aj / ak;
-                    if (!ratio_set) {
-                        ratio = r;
-                        ratio_set = true;
-                    } else if (std::fabs(r - ratio) >
-                               stability_tol(std::max(std::fabs(aj), std::fabs(ak)))) {
-                        parallel = false;
-                        break;
+                    const f64 aj = rows[sz(i)].at(j), ak = rows[sz(i)].at(k);
+                    if (aj == 0.0) { parallel = false; break; }
+                    if (ratio == 0.0) ratio = ak / aj;
+                    if (!std::isfinite(ratio) || ratio <= 0 ||
+                        model::Rational(ak) != model::Rational(ratio) * model::Rational(aj)) {
+                        parallel = false; break;
                     }
                 }
-                if (!parallel || !ratio_set) continue;
-                
-                const f64 lo_j = col_lo[sz(j)], hi_j = col_hi[sz(j)];
-                const f64 lo_k = col_lo[sz(k)], hi_k = col_hi[sz(k)];
-                const f64 imp_lo_k = ratio > 0.0 ? lo_j / ratio : hi_j / ratio;
-                const f64 imp_hi_k = ratio > 0.0 ? hi_j / ratio : lo_j / ratio;
-                if (imp_lo_k < lo_k - stability_tol(lo_k) ||
-                    imp_hi_k > hi_k + stability_tol(hi_k))
-                    continue;
-                if (ck > cj) continue;
-                
+                if (!parallel || model::Rational(cj) * model::Rational(ratio) > model::Rational(ck)) continue;
                 auto k_rows = col_rows[sz(k)];
                 for (const Index i : k_rows) {
                     rows[sz(i)].erase(k);
                     col_rows[sz(k)].erase(i);
                     queue_row(i);
                 }
-                fix_column(k, lo_k, DualRecoveryKind::DominatedColumn, -1, 0.0, j);
+                fix_column(k, 0.0, DualRecoveryKind::DominatedColumn, -1, 0.0, j);
                 ++out->stats.dominated_columns_removed;
                 any = true;
             }
@@ -619,8 +592,22 @@ bool LiveMatrix::try_duplicate_rows() {
                 if (scale == 1.0 && a_keep != 0.0) scale = it->second / a_keep;
             }
             if (!ok || scale == 0.0) continue;
-            row_lo[sz(keep)] = std::max(row_lo[sz(keep)], row_lo[sz(rem)] / scale);
-            row_hi[sz(keep)] = std::min(row_hi[sz(keep)], row_hi[sz(rem)] / scale);
+            bool exact = std::isfinite(scale);
+            for (const auto& [j, a] : rows[sz(keep)])
+                if (model::Rational(rows[sz(rem)].at(j)) != model::Rational(scale) * model::Rational(a)) exact = false;
+            if (!exact) continue;
+            const f64 implied_lo = (scale > 0 ? row_lo[sz(rem)] : row_hi[sz(rem)]) / scale;
+            const f64 implied_hi = (scale > 0 ? row_hi[sz(rem)] : row_lo[sz(rem)]) / scale;
+            // A rounded quotient would change the feasible set. Decline the
+            // optional merge when its finite endpoints are not representable.
+            const f64 source_lo = scale > 0 ? row_lo[sz(rem)] : row_hi[sz(rem)];
+            const f64 source_hi = scale > 0 ? row_hi[sz(rem)] : row_lo[sz(rem)];
+            if ((std::isfinite(source_lo) && (!std::isfinite(implied_lo) ||
+                 model::Rational(implied_lo) * model::Rational(scale) != model::Rational(source_lo))) ||
+                (std::isfinite(source_hi) && (!std::isfinite(implied_hi) ||
+                 model::Rational(implied_hi) * model::Rational(scale) != model::Rational(source_hi)))) continue;
+            row_lo[sz(keep)] = std::max(row_lo[sz(keep)], implied_lo);
+            row_hi[sz(keep)] = std::min(row_hi[sz(keep)], implied_hi);
             for (const auto& [j, a] : rows[sz(rem)]) {
                 (void)a;
                 col_rows[sz(j)].erase(rem);
@@ -679,22 +666,35 @@ bool LiveMatrix::try_duplicate_columns() {
                 if (scale == 1.0 && a_keep != 0.0) scale = it->second / a_keep;
             }
             if (!ok || scale == 0.0) continue;
-            const f64 c_tol = stability_tol(
-                std::max(std::fabs(cost[sz(keep)]), std::fabs(cost[sz(rem)])));
-            if (std::fabs(cost[sz(rem)] - cost[sz(keep)] * scale) > c_tol)
-                continue;
-            const f64 c_keep = cost[sz(keep)] + cost[sz(rem)] * scale;
-            cost[sz(keep)] = c_keep;
-            col_lo[sz(keep)] = std::max(col_lo[sz(keep)], col_lo[sz(rem)] / scale);
-            col_hi[sz(keep)] = std::min(col_hi[sz(keep)], col_hi[sz(rem)] / scale);
-            for (const Index i : col_rows[sz(rem)]) {
-                rows[sz(i)].erase(rem);
-                col_rows[sz(rem)].erase(i);
-                queue_row(i);
-            }
-            const f64 fix_val = col_lo[sz(rem)];
-            fix_column(rem, fix_val, DualRecoveryKind::ParallelColumnMerge, -1,
-                       scale, keep);
+            if (!in->is_integer.empty() && (in->is_integer[sz(keep)] || in->is_integer[sz(rem)])) continue;
+            if (!std::isfinite(scale) ||
+                model::Rational(cost[sz(rem)]) != model::Rational(cost[sz(keep)]) * model::Rational(scale)) continue;
+            bool exact = true;
+            for (const Index i : col_rows[sz(keep)])
+                if (model::Rational(rows[sz(i)].at(rem)) !=
+                    model::Rational(scale) * model::Rational(rows[sz(i)].at(keep))) exact = false;
+            if (!exact) continue;
+            // Finite boxes with exactly representable interval sums. Wider
+            // cases remain unreduced until their lift/ray contract is supported.
+            const f64 kl = col_lo[sz(keep)], kh = col_hi[sz(keep)];
+            const f64 rl = col_lo[sz(rem)], rh = col_hi[sz(rem)];
+            if (!std::isfinite(kl) || !std::isfinite(kh) || !std::isfinite(rl) || !std::isfinite(rh)) continue;
+            const model::Rational sumlo = model::Rational(kl) + model::Rational(scale) * model::Rational(scale > 0 ? rl : rh);
+            const model::Rational sumhi = model::Rational(kh) + model::Rational(scale) * model::Rational(scale > 0 ? rh : rl);
+            const f64 newlo = sumlo.convert_to<f64>(), newhi = sumhi.convert_to<f64>();
+            if (!std::isfinite(newlo) || !std::isfinite(newhi) ||
+                model::Rational(newlo) != sumlo || model::Rational(newhi) != sumhi) continue;
+            DualRecoveryStep step;
+            step.kind = DualRecoveryKind::ParallelColumnMerge;
+            step.col = rem; step.record = keep; step.coeff = scale;
+            step.old_lo = kl; step.old_hi = kh; step.new_lo = rl; step.new_hi = rh;
+            out->recovery_steps.push_back(std::move(step));
+            col_lo[sz(keep)] = newlo; col_hi[sz(keep)] = newhi;
+            const auto removed_rows = col_rows[sz(rem)];
+            for (const Index i : removed_rows) { rows[sz(i)].erase(rem); queue_row(i); }
+            col_rows[sz(rem)].clear();
+            col_active[sz(rem)] = 0; fixed[sz(rem)] = 0;
+            // The merged variable z=x_keep+scale*x_rem retains cost c_keep.
             ++out->stats.duplicate_columns_merged;
             queue_col(keep);
             any = true;

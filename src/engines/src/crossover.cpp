@@ -2,6 +2,7 @@
 
 #include "sor/certify/finalize.hpp"
 #include "sor/engines/dual_simplex.hpp"
+#include "simplex_prepared.hpp"
 #include "sor/la/lu.hpp"
 #include "sor/sparse/csc.hpp"
 
@@ -109,7 +110,7 @@ bool factor_and_repair(const model::LpProblem& problem,
                        SimplexBasis& basis,
                        f64 pivot_tol,
                        Clock::time_point deadline,
-                       CrossoverDiagnostics& diag) {
+                       CrossoverDiagnostics& diag, la::BasisFactor& factor) {
     SOR_FN();
     const core::Index m = problem.n_rows();
     const core::Index n = problem.n_cols();
@@ -124,7 +125,6 @@ bool factor_and_repair(const model::LpProblem& problem,
         std::vector<core::Index> ri, singular, vacant;
         std::vector<f64> vals;
         basis_matrix(problem, basis, cp, ri, vals);
-        la::BasisFactor factor;
         if (factor.factorize(m, cp, ri, vals, lu_opts, &singular, &vacant))
             return true;
         if (singular.empty()) return false;
@@ -185,7 +185,8 @@ void spiral_push_superbasics(
     f64 basis_pivot_tol,
     Clock::time_point deadline,
     SimplexBasis& basis,
-    CrossoverDiagnostics& diag) {
+    CrossoverDiagnostics& diag,
+    const SimplexPrepared* prepared, la::BasisFactor& factor, bool& factor_valid) {
     SOR_FN();
     const core::Index m = problem.n_rows();
     const core::Index n = problem.n_cols();
@@ -208,6 +209,13 @@ void spiral_push_superbasics(
         resolved[sz(j)] = static_cast<char>(
             classes[sz(j)] != CrossoverVariableClass::Superbasic);
 
+    const auto& factor_model = prepared ? prepared->scaled : problem;
+    const auto variable_scale = [&](core::Index variable) {
+        if (!prepared) return 1.0;
+        return variable < n ? prepared->scaling.col_scale[sz(variable)]
+                            : 1.0 / prepared->scaling.row_scale[sz(variable - n)];
+    };
+    std::vector<f64> alpha(sz(m)), scaled_alpha(sz(m));
     for (const core::Index entering : order) {
         if (Clock::now() >= deadline) {
             diag.time_limit_reached = true;
@@ -216,17 +224,21 @@ void spiral_push_superbasics(
         if (classes[sz(entering)] != CrossoverVariableClass::Superbasic)
             continue;
 
-        la::BasisFactor factor;
-        if (!factor_basis(problem, basis, basis_pivot_tol, factor)) {
+        if (!factor_valid && !factor_basis(factor_model, basis, basis_pivot_tol, factor)) {
             ++diag.spiral_failed_pushes;
             continue;
         }
 
-        std::vector<f64> alpha(sz(m), 0.0);
+        factor_valid = true;
+        std::fill(alpha.begin(), alpha.end(), 0.0);
         for (core::Offset k = csc.pattern.col_ptr()[sz(entering)];
              k < csc.pattern.col_ptr()[sz(entering) + 1]; ++k)
             alpha[sz(csc.pattern.row_idx()[sz(k)])] = csc.vals[sz(k)];
+        if (prepared)
+            for (core::Index i = 0; i < m; ++i) alpha[sz(i)] *= prepared->scaling.row_scale[sz(i)];
         factor.ftran(alpha);
+        if (prepared)
+            for (core::Index i = 0; i < m; ++i) alpha[sz(i)] *= variable_scale(basis.basic[sz(i)]);
         ++diag.spiral_ftran_calls;
 
         const f64 x = value[sz(entering)];
@@ -309,8 +321,14 @@ void spiral_push_superbasics(
                     value[sz(leaving)] = leave_hi;
                     basis.status[sz(leaving)] = NonbasicStatus::AtUpper;
                 }
+                for (core::Index slot = 0; slot < m; ++slot)
+                    scaled_alpha[sz(slot)] = alpha[sz(slot)] * variable_scale(entering) /
+                                             variable_scale(basis.basic[sz(slot)]);
+                factor_valid = factor.update(leaving_slot, scaled_alpha);
                 basis.basic[sz(leaving_slot)] = entering;
                 basis.status[sz(entering)] = NonbasicStatus::Basic;
+                if (factor.needs_refactor(50, 2.0) ||
+                    std::fabs(scaled_alpha[sz(leaving_slot)]) < basis_pivot_tol) factor_valid = false;
                 ++diag.spiral_basis_pivots;
             } else {
                 continue;
@@ -365,11 +383,12 @@ std::vector<CrossoverVariableClass> classify_crossover_variables(
     return classes;
 }
 
-bool build_crossover_basis(const model::LpProblem& problem,
+static bool build_crossover_basis_impl(const model::LpProblem& problem,
                            const core::RawResult& fo_result,
                            const CrossoverOptions& opts,
                            SimplexBasis& basis,
-                           CrossoverDiagnostics& diag) {
+                           CrossoverDiagnostics& diag,
+                           const SimplexPrepared* prepared, FactorCarrier* carrier) {
     SOR_FN();
     const auto t0 = Clock::now();
     const auto deadline = opts.time_limit_s > 0.0
@@ -452,18 +471,37 @@ bool build_crossover_basis(const model::LpProblem& problem,
         return false;
     }
 
+    la::BasisFactor factor;
+    bool factor_valid = false;
     spiral_push_superbasics(problem, fo_result, classes, reduced, order,
                             opts.primal_tol, opts.basis_pivot_tol, deadline,
-                            basis, diag);
+                            basis, diag, prepared, factor, factor_valid);
     if (diag.time_limit_reached) {
         diag.basis_build_ms = ms_since(t0);
         return false;
     }
     diag.basis_candidate_built = true;
-    diag.basis_candidate_factorized = factor_and_repair(
-        problem, basis, opts.basis_pivot_tol, deadline, diag);
+    diag.basis_candidate_factorized = factor_valid || factor_and_repair(
+        prepared ? prepared->scaled : problem, basis, opts.basis_pivot_tol, deadline, diag, factor);
+    if (diag.basis_candidate_factorized && carrier && prepared) {
+        carrier->matrix = &problem;
+        carrier->rows = m; carrier->cols = n;
+        carrier->nnz = static_cast<core::Offset>(problem.A.vals.size());
+        carrier->scaling_identity = prepared->factor_scaling_identity;
+        carrier->basis = basis.basic;
+        carrier->factor = std::move(factor);
+        carrier->has_factor = true;
+    }
     diag.basis_build_ms = ms_since(t0);
     return diag.basis_candidate_factorized;
+}
+
+bool build_crossover_basis(const model::LpProblem& problem,
+                           const core::RawResult& fo_result,
+                           const CrossoverOptions& opts,
+                           SimplexBasis& basis,
+                           CrossoverDiagnostics& diag) {
+    return build_crossover_basis_impl(problem, fo_result, opts, basis, diag, nullptr, nullptr);
 }
 
 core::RawResult crossover_to_simplex(const model::LpProblem& problem,
@@ -520,16 +558,22 @@ core::RawResult crossover_to_simplex(const model::LpProblem& problem,
         return raw;
     }
 
-    SimplexBasis candidate;
-    const bool basis_ok = build_crossover_basis(problem, fo_result, opts,
-                                                 candidate, diag);
-    SimplexOptions simplex_opts;
+    SimplexOptions simplex_opts = opts.simplex_policy ? *opts.simplex_policy : SimplexOptions{};
     simplex_opts.method = SimplexMethod::Dual;
     simplex_opts.presolve = false;
     simplex_opts.primal_feas_tol = opts.primal_tol;
     simplex_opts.dual_feas_tol = opts.dual_tol;
     simplex_opts.gap_tol = std::min(opts.primal_tol, opts.dual_tol);
     simplex_opts.max_iterations = opts.max_iterations;
+    const auto prepared = prepare_simplex_model(problem, simplex_opts);
+    FactorCarrier carrier;
+    SimplexBasis candidate;
+    CrossoverOptions construction_opts = opts;
+    if (opts.time_limit_s > 0)
+        construction_opts.time_limit_s = std::max(std::numeric_limits<double>::min(),
+            opts.time_limit_s - std::chrono::duration<double>(Clock::now() - t0).count());
+    const bool basis_ok = build_crossover_basis_impl(problem, fo_result, construction_opts,
+        candidate, diag, &prepared, &carrier);
     const double construction_s =
         std::chrono::duration<double>(Clock::now() - t0).count();
     const double cleanup_time = opts.time_limit_s > 0.0
@@ -543,8 +587,8 @@ core::RawResult crossover_to_simplex(const model::LpProblem& problem,
     core::RawResult raw;
     if (basis_ok && (opts.time_limit_s <= 0.0 || cleanup_time > 0.0)) {
         diag.warm_cleanup_attempted = true;
-        raw = solve_dual_simplex(problem, simplex_opts, diag.simplex, &cleaned,
-                                 &candidate);
+        raw = solve_dual_simplex_prepared(prepared, simplex_opts, diag.simplex, &cleaned,
+                                          &candidate, nullptr, &carrier);
         diag.warm_cleanup_iterations = raw.iterations;
     } else if (basis_ok || diag.time_limit_reached) {
         raw.proposed_status = core::Status::Interrupted;
@@ -577,8 +621,8 @@ core::RawResult crossover_to_simplex(const model::LpProblem& problem,
                 ? 0 : remaining_iterations;
             SimplexDiagnostics cold_diag;
             SimplexBasis cold_basis;
-            core::RawResult cold = solve_dual_simplex(
-                problem, cold_opts, cold_diag, &cold_basis, nullptr);
+            core::RawResult cold = solve_dual_simplex_prepared(
+                prepared, cold_opts, cold_diag, &cold_basis, nullptr);
             diag.cold_fallback_iterations = cold.iterations;
             const bool take_cold = cold.proposed_status == core::Status::Optimal ||
                 raw.proposed_status != core::Status::Optimal;
