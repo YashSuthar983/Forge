@@ -1,24 +1,75 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
 
+// Dual half-step (Moreau prox of the row-box indicator), plus the two
+// workgroup partials the operator inequality needs: ||dy||^2 and
+// <A dx, dy>.
+//
+// ax holds A*xbar = A(2*T_x - x) and ax_cur holds A*x, so A*dx is
+// (ax - ax_cur)/2 -- recovering the interaction term costs no extra SpMV.
+// ax_fixed = (ax + ax_cur)/2 = A*T_x is the activity that belongs to the
+// un-reflected T(z); keeping it lets the Halpern mix propagate A*x forward
+// recursively instead of re-multiplying every iteration.
+
 layout(local_size_x = 256) in;
 
 layout(push_constant) uniform PC {
     uint n_rows;
+    uint stride;
     double sigma;
 } pc;
 
-layout(std430, binding = 0) buffer YBuf { double y[]; };
-layout(std430, binding = 1) readonly buffer AxBuf { double ax[]; };
-layout(std430, binding = 2) readonly buffer LoBuf { double lo[]; };
-layout(std430, binding = 3) readonly buffer HiBuf { double hi[]; };
+layout(std430, binding = 0) readonly  buffer YBuf       { double y[]; };
+layout(std430, binding = 1) readonly  buffer AxBuf      { double ax[]; };
+layout(std430, binding = 2) readonly  buffer LoBuf      { double lo[]; };
+layout(std430, binding = 3) readonly  buffer HiBuf      { double hi[]; };
+layout(std430, binding = 4) writeonly buffer YFixedBuf  { double y_fixed[]; };
+layout(std430, binding = 5) readonly  buffer AxCurBuf   { double ax_cur[]; };
+layout(std430, binding = 6) writeonly buffer AxFixedBuf { double ax_fixed[]; };
+layout(std430, binding = 7) buffer PartBuf              { double part[]; };
+
+const uint SLOT_DY2   = 12u;
+const uint SLOT_INTER = 13u;
+
+shared double s_red[256];
+
+double wg_sum(double v) {
+    uint t = gl_LocalInvocationID.x;
+    barrier();
+    s_red[t] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) s_red[t] += s_red[t + s];
+        barrier();
+    }
+    double r = s_red[0];
+    barrier();
+    return r;
+}
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
-    if (i >= pc.n_rows) return;
-    double v = y[i] + pc.sigma * ax[i];
-    double z = v / pc.sigma;
-    if (z < lo[i]) z = lo[i];
-    if (z > hi[i]) z = hi[i];
-    y[i] = v - pc.sigma * z;
+    bool live = i < pc.n_rows;
+    double d = 0.0lf;
+    double inter = 0.0lf;
+    if (live) {
+        double yi = y[i];
+        double axi = ax[i];
+        double v = yi + pc.sigma * axi;
+        double z = v / pc.sigma;
+        if (z < lo[i]) z = lo[i];
+        if (z > hi[i]) z = hi[i];
+        double yn = v - pc.sigma * z;
+        d = yn - yi;
+        double cur = ax_cur[i];
+        inter = 0.5lf * (axi - cur) * d;
+        y_fixed[i] = yn;
+        ax_fixed[i] = 0.5lf * (axi + cur);
+    }
+    double dy2 = wg_sum(d * d);
+    double si = wg_sum(inter);
+    if (gl_LocalInvocationID.x == 0u) {
+        part[SLOT_DY2 * pc.stride + gl_WorkGroupID.x] = dy2;
+        part[SLOT_INTER * pc.stride + gl_WorkGroupID.x] = si;
+    }
 }

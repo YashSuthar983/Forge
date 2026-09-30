@@ -192,6 +192,17 @@ public:
 
     void sort_adjacency();
 
+    // Forget every fact about the flagged columns: their literals' edges,
+    // their implied bounds (as either side), and their literals in cliques
+    // (a clique minus some literals is still a clique). Used when a later
+    // reformulation changes what those columns MEAN -- symmetry folding
+    // turns a representative into a sum and fixes the other members to 0,
+    // so a fact probed on the original columns is no longer about them.
+    // Facts among the remaining columns stay valid: every solution of the
+    // reformulated model lifts to one of the original with the same values
+    // on those columns.
+    void forget_columns(const std::vector<char>& drop);
+
 private:
     Index n_cols_ = 0;
     std::vector<bool> binary_;

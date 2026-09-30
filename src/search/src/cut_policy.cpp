@@ -159,7 +159,9 @@ void apply_auto_cuts_policy(BabOptions& o) {
     o.mir_cuts = true;
     o.lifted_cover_cuts = true;
     o.zerohalf_cuts = true;
-    o.flow_cover_cuts = true;
+    // Flow-cover derivation has a known, gross counterexample on blend2.
+    // Auto policy must never make an unverified separator available.
+    o.flow_cover_cuts = false;
     // Clique cuts: valid but regressed misc03 node LP cost; keep opt-in only.
 }
 

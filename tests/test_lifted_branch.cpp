@@ -117,6 +117,7 @@ void test_save_load_and_fit() {
 void test_bab_lifted_collects_and_refits() {
     auto lp = read_text(kFracBranch);
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.branch_strategy = BranchStrategy::Lifted;
     opts.lifted.enabled = true;
@@ -160,6 +161,7 @@ void test_bab_lifted_collects_and_refits() {
 void test_classical_ignores_lifted() {
     auto lp = read_text(kFracBranch);
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Classical;
     opts.branch_strategy = BranchStrategy::Lifted;
     opts.max_nodes = 200;

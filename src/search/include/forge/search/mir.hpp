@@ -49,6 +49,9 @@ using core::Index;
 struct MirOptions {
     bool enabled = true;
     int max_cuts = 150;
+    // Candidates generated per call, as a multiple of max_cuts, before the
+    // most efficacious max_cuts are kept (see separate_mir).
+    int candidate_factor = 8;
     std::size_t max_row_len = 2048;
     f64 violation_min = 1e-4;
     f64 tol = 1e-9;
@@ -62,7 +65,10 @@ struct MirOptions {
     // different fractional part and therefore a different -- often much
     // stronger -- cut. Scaling matters more than any other single choice here:
     // 0.5x <= 0.7 yields nothing at delta = 1 and yields x <= 1 at delta = 2.
-    int max_scalings = 5;
+    // Cap on the step-3 candidates 1/|a'_j| (Achterberg 2007, Alg. 8.2:
+    // integer terms strictly inside their bounds); 1 and 1/max|a'_j| are
+    // always tried, then delta*/2, /4, /8 around the best.
+    int max_scalings = 16;
 
     // --- Row aggregation (Marchand & Wolsey 2001, Algorithm 2 as presented in
     // Xu, Mexi & Bestuzheva, arXiv:2502.01192, 2025).
@@ -84,6 +90,15 @@ struct MirOptions {
     // bounds on lseu (1050.9 -> 1038.8) and p0201 (7275 -> 7125): the extra
     // candidates crowd the selection rather than improve it. Opt-in.
     bool aggregate = false;
+    // Variable-bound substitution (Marchand & Wolsey 2001 §3): a continuous
+    // x with a model row x <= u*y (y integer, u > 0) may be written
+    // x = u*y - s, s >= 0, when the LP point is closer to that variable
+    // upper bound than to x's simple bounds. The rounded base then carries
+    // u*y as an integer term, which is what makes c-MIR cover the flow-cover
+    // family on fixed-charge network and lot-sizing models; with simple
+    // bounds only, such an x has a positive continuous coefficient and is
+    // simply dropped from the base.
+    bool variable_bounds = true;
     int max_aggregations = 4;      // rows combined into one base
     int max_start_rows = 200;      // starting rows tried per separation call
     f64 bad_variable_min_distance = 1e-4;
@@ -98,6 +113,8 @@ struct MirDiagnostics {
     std::uint64_t rejected_not_violated = 0;
     std::uint64_t rejected_unbounded_var = 0;
     std::uint64_t aggregations = 0;
+    std::uint64_t variable_bound_rows = 0;      // x <= u*y rows found
+    std::uint64_t variable_bound_substitutions = 0;
 };
 
 // Separates violated MIR cuts from the rows of `lp` at `x`, under the box

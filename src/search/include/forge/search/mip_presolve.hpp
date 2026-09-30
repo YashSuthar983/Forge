@@ -68,10 +68,10 @@ struct MipPresolveOptions {
     // search.
     double time_limit_s = 0.0;
     int fbbt_deepen_rounds = 20;
-    // BatchLP FO probes for OBBT min/max x_j (shared A, per-slot c=±e_j).
-    // Tightenings apply only when residuals look feasible; otherwise the
-    // existing simplex / FBBT path runs. Default on.
-    bool batch_lp_obbt = true;
+    // Retained for API compatibility. Approximate BatchLP probe objectives
+    // cannot certify OBBT domain reductions, so this path is disabled until
+    // a checked dual bound is available. Simplex / FBBT remains active.
+    bool batch_lp_obbt = false;
     std::uint32_t batch_lp_obbt_steps = 200;
     // Restart: if the fraction of columns with a finite domain shrink
     // (or newly fixed) meets tau, re-run the full dual-fix / FBBT / clique
@@ -141,13 +141,17 @@ struct MipPresolveDiagnostics {
 // under maximize). Rows redundant under the current box contribute no locks.
 // When `zero_cost_ok` is false, columns with |c_j| <= tol are skipped (safe
 // for implication extraction inside probing).
+// candidate_cols restricts fixings to columns whose governing rows are
+// present in lp. This matters when component presolve temporarily relaxes
+// all other components' rows.
 DualFixDiagnostics apply_dual_fixing(const model::LpProblem& lp,
                                       std::vector<f64>& col_lo,
                                       std::vector<f64>& col_hi,
                                       f64 tol = 1e-9,
                                       int max_rounds = 4,
                                       bool zero_cost_ok = true,
-                                     double time_limit_s = 0.0);
+                                     double time_limit_s = 0.0,
+                                     const std::vector<Index>* candidate_cols = nullptr);
 
 // Clique probing over `cg.cliques()`: for each AMO clique, propagate the
 // all-zero assignment and each single-1 assignment; take the hull of feasible

@@ -277,6 +277,7 @@ void test_paper_mode_without_model_still_mcts() {
 void test_bab_planbb_fires() {
     auto lp = read_text(kFracBranch);
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.branch_strategy = BranchStrategy::PlanBb;
     opts.planbb.enabled = true;
@@ -303,6 +304,7 @@ void test_bab_planbb_fires() {
 void test_bab_planbb_paper_fires() {
     auto lp = read_text(kFracBranch);
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.branch_strategy = BranchStrategy::PlanBb;
     opts.planbb.enabled = true;
@@ -332,6 +334,7 @@ void test_bab_planbb_paper_fires() {
 void test_classical_ignores_planbb() {
     auto lp = read_text(kFracBranch);
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Classical;
     opts.branch_strategy = BranchStrategy::PlanBb;
     opts.max_nodes = 200;

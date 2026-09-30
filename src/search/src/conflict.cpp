@@ -124,6 +124,49 @@ void ConflictGraph::sort_adjacency() {
     sorted_ = true;
 }
 
+void ConflictGraph::forget_columns(const std::vector<char>& drop) {
+    const auto dropped = [&](Index j) {
+        return j >= 0 && sz(j) < drop.size() && drop[sz(j)] != 0;
+    };
+    for (Index j = 0; j < n_cols_; ++j) {
+        if (!dropped(j)) continue;
+        for (int v = 0; v < 2; ++v) {
+            const Index l = lit_of(j, v);
+            for (const Index b : adj_[sz(l)]) {
+                auto& bv = adj_[sz(b)];
+                const auto it = std::find(bv.begin(), bv.end(), l);
+                if (it != bv.end()) {
+                    bv.erase(it);
+                    --n_edges_;
+                }
+            }
+            adj_[sz(l)].clear();
+        }
+        binary_[sz(j)] = false;
+    }
+    binary_cols_.erase(std::remove_if(binary_cols_.begin(), binary_cols_.end(),
+                                      dropped),
+                       binary_cols_.end());
+    std::vector<Clique> kept;
+    kept.reserve(cliques_.size());
+    for (auto& c : cliques_) {
+        c.lits.erase(std::remove_if(c.lits.begin(), c.lits.end(),
+                                    [&](Index l) { return dropped(lit_var(l)); }),
+                     c.lits.end());
+        if (c.lits.size() >= 2) kept.push_back(std::move(c));
+    }
+    cliques_ = std::move(kept);
+    lit_cliques_.assign(sz(2 * n_cols_), {});
+    for (std::size_t id = 0; id < cliques_.size(); ++id)
+        for (const Index l : cliques_[id].lits)
+            lit_cliques_[sz(l)].push_back(static_cast<Index>(id));
+    implied_.erase(std::remove_if(implied_.begin(), implied_.end(),
+                                  [&](const ImpliedBound& ib) {
+                                      return dropped(ib.bin) || dropped(ib.col);
+                                  }),
+                   implied_.end());
+}
+
 const std::vector<Index>& ConflictGraph::cliques_of(Index l) const {
     static const std::vector<Index> empty;
     if (l < 0 || l >= 2 * n_cols_) return empty;
@@ -278,9 +321,10 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
                                        opts.probe_propagation_rounds);
             diag.probes += 2;
 
-            // Snapshot binary pins from FBBT only - dual-fix pins with
-            // zero objective must not become conflict implications
-            // (Wang-Chen-Dai §2.3 inconsistency).
+            // Snapshot the FEASIBILITY-derived boxes before objective-based
+            // dual fixing. The latter may discard feasible points while
+            // retaining an optimum; its bounds cannot justify globally valid
+            // implications, variable-bound cuts, or clique edges.
             std::vector<f64> pin_lo0 = lo0, pin_hi0 = hi0;
             std::vector<f64> pin_lo1 = lo1, pin_hi1 = hi1;
 
@@ -352,8 +396,11 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
                     return diag;
                 }
 
-                // Implied (variable) bounds. hi0[k] and hi1[k] are valid upper
-                // bounds on column k under x_j = 0 and x_j = 1 respectively, so
+                // Implied (variable) bounds. Only FBBT boxes are valid for
+                // EVERY feasible point under x_j = 0 and x_j = 1. A bound
+                // changed by dual fixing describes an optimum-preserving
+                // reduction, not a globally valid cut derivation.
+                // pin_hi0[k] and pin_hi1[k] are valid upper bounds, so
                 // whichever value x_j takes, the interpolating inequality holds
                 // -- and unlike the hull above, it does NOT throw away which
                 // side each bound came from. Recorded only when the two sides
@@ -365,40 +412,32 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
                             ? std::max(opts.tol,
                                        opts.implied_bound_min_gap_rel * width)
                             : opts.tol;
-                    if (std::isfinite(hi0[sz(k)]) && std::isfinite(hi1[sz(k)]) &&
-                        std::fabs(hi1[sz(k)] - hi0[sz(k)]) > gap_need)
+                    if (std::isfinite(pin_hi0[sz(k)]) &&
+                        std::isfinite(pin_hi1[sz(k)]) &&
+                        std::fabs(pin_hi1[sz(k)] - pin_hi0[sz(k)]) > gap_need)
                         out.add_implied_bound(
-                            {j, k, hi0[sz(k)], hi1[sz(k)], true});
-                    if (std::isfinite(lo0[sz(k)]) && std::isfinite(lo1[sz(k)]) &&
-                        std::fabs(lo1[sz(k)] - lo0[sz(k)]) > gap_need)
+                            {j, k, pin_hi0[sz(k)], pin_hi1[sz(k)], true});
+                    if (std::isfinite(pin_lo0[sz(k)]) &&
+                        std::isfinite(pin_lo1[sz(k)]) &&
+                        std::fabs(pin_lo1[sz(k)] - pin_lo0[sz(k)]) > gap_need)
                         out.add_implied_bound(
-                            {j, k, lo0[sz(k)], lo1[sz(k)], false});
+                            {j, k, pin_lo0[sz(k)], pin_lo1[sz(k)], false});
                 }
 
                 // Implications. A binary that both sides leave free tells us
                 // nothing; one that a side pins yields a conflict edge between
                 // the probe literal and the OPPOSITE of the pinned value.
-                // Dual-only pins with zero objective are excluded (2607.10767
-                // §2.3): stacking them across probes can wipe all optima.
+                // Dual-only pins are excluded regardless of objective cost:
+                // a cost-based pin need not hold for every feasible point.
                 if (k == j || !out.is_binary(k)) continue;
                 if (col_hi[sz(k)] - col_lo[sz(k)] < 0.5) continue;
-                const f64 ck = lp.maximize ? -lp.c[sz(k)] : lp.c[sz(k)];
-                const bool weak_dual_ok = std::fabs(ck) > opts.tol;
-                auto allow_pin = [&](const std::vector<f64>& lo,
-                                    const std::vector<f64>& hi,
-                                    const std::vector<f64>& plo,
-                                    const std::vector<f64>& phi) {
-                    if (hi[sz(k)] - lo[sz(k)] >= 0.5) return false;
-                    if (phi[sz(k)] - plo[sz(k)] < 0.5) return true;  // FBBT
-                    return weak_dual_ok;
-                };
-                if (allow_pin(lo0, hi0, pin_lo0, pin_hi0)) {
-                    const int w = lo0[sz(k)] > 0.5 ? 1 : 0;
+                if (pin_hi0[sz(k)] - pin_lo0[sz(k)] < 0.5) {
+                    const int w = pin_lo0[sz(k)] > 0.5 ? 1 : 0;
                     if (out.add_edge(lit_of(j, 0), lit_of(k, 1 - w)))
                         ++diag.probe_implications;
                 }
-                if (allow_pin(lo1, hi1, pin_lo1, pin_hi1)) {
-                    const int w = lo1[sz(k)] > 0.5 ? 1 : 0;
+                if (pin_hi1[sz(k)] - pin_lo1[sz(k)] < 0.5) {
+                    const int w = pin_lo1[sz(k)] > 0.5 ? 1 : 0;
                     if (out.add_edge(lit_of(j, 1), lit_of(k, 1 - w)))
                         ++diag.probe_implications;
                 }

@@ -805,7 +805,9 @@ std::uint64_t apply_folding_symmetry(model::LpProblem& lp,
                 ++k;
                 while (k < end && centry[sz(k)].first == row)
                     val += centry[sz(k++)].second;
-                if (std::fabs(val) > tol) return true;
+                // Exact (plan 3I): folding asserts the columns are
+                // IDENTICAL, so no coefficient is dropped as "tiny".
+                if (val != 0.0) return true;
             }
             return false;
         };
@@ -818,7 +820,7 @@ std::uint64_t apply_folding_symmetry(model::LpProblem& lp,
             const bool hb = next(kb, eb, rb, vb);
             if (!ha && !hb) return true;
             if (ha != hb) return false;
-            if (ra != rb || !near(va, vb, tol)) return false;
+            if (ra != rb || va != vb) return false;
         }
     };
 
@@ -837,9 +839,11 @@ std::uint64_t apply_folding_symmetry(model::LpProblem& lp,
         // Require identical parallel columns + matching obj/bounds.
         for (std::size_t t = 1; t < o.cols.size(); ++t) {
             const Index j = o.cols[t];
-            if (!near(lp.c[sz(j)], lp.c[sz(rep)], tol) ||
-                !near(lp.col_lo[sz(j)], lp.col_lo[sz(rep)], tol) ||
-                !near(lp.col_hi[sz(j)], lp.col_hi[sz(rep)], tol) ||
+            // Exact equality: a merge of columns that differ by even 1e-10
+            // is not an equivalence when the columns' domains are wide.
+            if (lp.c[sz(j)] != lp.c[sz(rep)] ||
+                lp.col_lo[sz(j)] != lp.col_lo[sz(rep)] ||
+                lp.col_hi[sz(j)] != lp.col_hi[sz(rep)] ||
                 !columns_equal_sparse(rep, j))
                 return false;
         }

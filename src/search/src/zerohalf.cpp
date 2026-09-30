@@ -20,15 +20,18 @@ struct BaseRow {
     f64 slack = 0.0;        // rhs − a·x* at build time
 };
 
-inline bool nearly_integer(f64 v, f64 tol) {
-    return std::fabs(v - std::round(v)) <= tol;
+inline bool exact_integer(f64 v) {
+    return std::isfinite(v) && std::fabs(v) <= 9007199254740992.0 &&
+           v == std::round(v);
 }
 
-// Build ∑ a_j x_j ≤ b over integer columns; continuous terms move to the RHS
-// at their minimum contribution (safe relaxation).
+// Build ∑ a_j x_j ≤ b from an exact-integer, nonnegative-variable row.
+// Mixed rows and nonintegral coefficients require a directed-rounding
+// derivation that this separator does not yet provide; abstain instead of
+// rounding small coefficients away or promoting a cut with a false premise.
 bool build_integer_base(const model::LpProblem& lp, Index row, f64 sign,
-                        const std::vector<f64>& lo, const std::vector<f64>& hi,
-                        const std::vector<f64>& x, const ZeroHalfOptions& opts,
+                        const std::vector<f64>& lo,
+                        const std::vector<f64>& x,
                         BaseRow& out, ZeroHalfDiagnostics& diag) {
     const f64 bound = sign > 0.0 ? lp.row_hi[sz(row)] : -lp.row_lo[sz(row)];
     if (!std::isfinite(bound)) return false;
@@ -45,27 +48,20 @@ bool build_integer_base(const model::LpProblem& lp, Index row, f64 sign,
     for (core::Offset k = rp[sz(row)]; k < rp[sz(row) + 1]; ++k) {
         const Index j = ci[sz(k)];
         const f64 a = sign * av[sz(k)];
-        if (std::fabs(a) <= opts.tol) continue;
+        if (a == 0.0) continue;
 
         const bool is_int =
             !lp.is_integer.empty() && lp.is_integer[sz(j)];
-        if (!is_int) {
-            const f64 at_min = a > 0.0 ? lo[sz(j)] : hi[sz(j)];
-            if (!std::isfinite(at_min)) {
-                ++diag.rejected_unbounded_term;
-                return false;
-            }
-            out.rhs -= a * at_min;
-            continue;
-        }
-        if (!nearly_integer(a, opts.integer_coef_tol)) return false;
+        if (!is_int) return false;
+        // floor(a/2) x <= floor(b/2) uses x >= 0 when rounding a downward.
+        if (!std::isfinite(lo[sz(j)]) || lo[sz(j)] < 0.0) return false;
+        if (!exact_integer(a)) return false;
         out.cols.push_back(j);
-        out.coef.push_back(std::round(a));
-        activity += std::round(a) * x[sz(j)];
+        out.coef.push_back(a);
+        activity += a * x[sz(j)];
     }
     if (out.cols.empty()) return false;
-    if (!nearly_integer(out.rhs, opts.integer_coef_tol)) return false;
-    out.rhs = std::round(out.rhs);
+    if (!exact_integer(out.rhs)) return false;
     out.slack = out.rhs - activity;
     ++diag.bases_built;
     return true;
@@ -110,14 +106,17 @@ bool aggregate_selected(const std::vector<BaseRow>& bases,
 // CG cut with λ = 1/2 on an integer base ∑ a x ≤ b.
 bool emit_half_cg(const BaseRow& base, const std::vector<f64>& x,
                   const ZeroHalfOptions& opts, CutRow& cut, f64& viol) {
+    if (!exact_integer(base.rhs)) return false;
+    for (const f64 aj : base.coef)
+        if (!exact_integer(aj)) return false;
     cut.cols.clear();
     cut.vals.clear();
-    f64 rhs = std::floor(base.rhs * 0.5 + 1e-12);
+    f64 rhs = std::floor(base.rhs * 0.5);
     f64 lhs = 0.0;
     f64 cmin = kInf, cmax = 0.0;
     for (std::size_t t = 0; t < base.cols.size(); ++t) {
         const f64 aj = base.coef[t];
-        const f64 cj = std::floor(aj * 0.5 + 1e-12);
+        const f64 cj = std::floor(aj * 0.5);
         if (std::fabs(cj) <= opts.tol) continue;
         cut.cols.push_back(base.cols[t]);
         cut.vals.push_back(cj);
@@ -237,7 +236,7 @@ std::vector<CutRow> separate_zerohalf(const model::LpProblem& lp,
         ++diag.rows_scanned;
         for (const f64 sign : {1.0, -1.0}) {
             BaseRow b;
-            if (!build_integer_base(lp, i, sign, col_lo, col_hi, x, opts, b,
+            if (!build_integer_base(lp, i, sign, col_lo, x, b,
                                     diag))
                 continue;
             bases.push_back(std::move(b));

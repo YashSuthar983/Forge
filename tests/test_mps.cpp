@@ -148,6 +148,35 @@ int main() {
         CHECK(rep.had_objsense_max);
     }
 
+    // Integer markers default to binary only when no BOUNDS record is present.
+    {
+        const std::string mps =
+            "NAME MARKERBOUNDS\n"
+            "ROWS\n"
+            " N OBJ\n"
+            " L R1\n"
+            "COLUMNS\n"
+            " MARK1 'MARKER' 'INTORG'\n"
+            " BINARY OBJ 1 R1 1\n"
+            " GENERAL OBJ 1 R1 1\n"
+            " MARK2 'MARKER' 'INTEND'\n"
+            "RHS\n"
+            " RHS1 R1 2\n"
+            "BOUNDS\n"
+            " LO BND GENERAL 0\n"
+            "ENDATA\n";
+        std::istringstream in(mps);
+        io::MpsReadReport rep;
+        const auto p = io::read_mps(in, rep);
+        const int binary = index_of(p.col_names, "BINARY");
+        const int general = index_of(p.col_names, "GENERAL");
+        CHECK(binary >= 0 && general >= 0);
+        CHECK_NEAR(p.col_hi[static_cast<std::size_t>(binary)], 1.0, 1e-15);
+        CHECK(std::isinf(p.col_hi[static_cast<std::size_t>(general)]));
+        CHECK(p.is_integer[static_cast<std::size_t>(binary)]);
+        CHECK(p.is_integer[static_cast<std::size_t>(general)]);
+    }
+
     // ---- malformed input must throw with a line number, not be guessed at ----
     {
         const std::string bad =
