@@ -235,6 +235,25 @@ std::uint64_t infer_network(model::LpProblem& p, f64 tol,
                             const Index q = ci[sz(k)];
                             if (std::fabs(av[sz(k)]) <= tol) continue;
                             if (!col_network[sz(q)] || seen[sz(q)]) continue;
+                            // A2: the seeding scan above only bounds-checks
+                            // ONE hop out from j. This BFS reaches columns
+                            // two or more equality rows away, and without the
+                            // same guard it marked them integer unconditionally
+                            // -- e.g. q with bounds [0.3, 0.7], reachable only
+                            // via some other verified column two hops out,
+                            // got declared integer despite containing no
+                            // integer at all, making the model falsely
+                            // infeasible. Require exactly what the seed check
+                            // required: already integer/fixed, or bounds that
+                            // are themselves near-integer.
+                            if (!p.is_integer[sz(q)] && !fixed_int(p, q, tol)) {
+                                if (std::isfinite(p.col_lo[sz(q)]) &&
+                                    !nearly_int(p.col_lo[sz(q)], tol))
+                                    continue;
+                                if (std::isfinite(p.col_hi[sz(q)]) &&
+                                    !nearly_int(p.col_hi[sz(q)], tol))
+                                    continue;
+                            }
                             seen[sz(q)] = 1;
                             stack.push_back(q);
                         }
@@ -816,29 +835,35 @@ ImpliedIntDiagnostics infer_implied_integers_ex(
                    opts.time_limit_s;
     };
     if (ii_over()) { diag.aborted_on_time = 1; return diag; }
+    // These rules change the discrete feasible set. A near-zero coefficient,
+    // near-unit matrix entry, near-integer RHS, or near-equality is not an
+    // exact TU/equality pattern: over a wide domain the discarded difference
+    // can force a fractional value. Use exact representable data for the
+    // structural proof; opts.tol remains only for conservative bound snaps.
+    constexpr f64 proof_tol = 0.0;
     if (opts.equality_pm1)
-        diag.equality_pm1 = infer_equality_pm1(lp, opts.tol, dl);
+        diag.equality_pm1 = infer_equality_pm1(lp, proof_tol, dl);
     if (ii_over()) { diag.aborted_on_time = 1; return diag; }
-    if (opts.network) diag.network = infer_network(lp, opts.tol, dl);
+    if (opts.network) diag.network = infer_network(lp, proof_tol, dl);
     if (ii_over()) { diag.aborted_on_time = 1; return diag; }
     if (opts.consecutive_ones)
-        diag.consecutive_ones = infer_consecutive_ones(lp, opts.tol, dl);
+        diag.consecutive_ones = infer_consecutive_ones(lp, proof_tol, dl);
     if (ii_over()) { diag.aborted_on_time = 1; return diag; }
     if (opts.dual_rational)
-        diag.dual_rational = infer_dual_rational(lp, opts.tol, dl);
+        diag.dual_rational = infer_dual_rational(lp, proof_tol, dl);
     if (ii_over()) { diag.aborted_on_time = 1; return diag; }
     if (opts.tu_network_block) {
-        diag.tu_network_block = infer_tu_network_block(lp, opts.tol, dl);
-        diag.tu_network_transpose = infer_tu_network_transpose(lp, opts.tol, dl);
+        diag.tu_network_block = infer_tu_network_block(lp, proof_tol, dl);
+        diag.tu_network_transpose = infer_tu_network_transpose(lp, proof_tol, dl);
     }
     // Cascade: TU marks may unlock more ±1 / dual inferences.
     const std::uint64_t tu_extra = diag.network + diag.consecutive_ones +
                                    diag.tu_network_block +
                                    diag.tu_network_transpose;
     if (opts.equality_pm1 && tu_extra > 0)
-        diag.equality_pm1 += infer_equality_pm1(lp, opts.tol, dl);
+        diag.equality_pm1 += infer_equality_pm1(lp, proof_tol, dl);
     if (opts.dual_rational && tu_extra > 0)
-        diag.dual_rational += infer_dual_rational(lp, opts.tol, dl);
+        diag.dual_rational += infer_dual_rational(lp, proof_tol, dl);
     diag.total = diag.equality_pm1 + diag.network + diag.consecutive_ones +
                  diag.dual_rational + diag.tu_network_block +
                  diag.tu_network_transpose;

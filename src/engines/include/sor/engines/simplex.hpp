@@ -2,6 +2,7 @@
 // Forrest-Tomlin; EXPAND). solve_simplex() optionally presolves, then
 // dispatches Dual / Primal / Auto (dual first, primal fallback).
 #pragma once
+#include <limits>
 
 #include "sor/core/cancel.hpp"
 #include "sor/core/result.hpp"
@@ -45,7 +46,7 @@ struct SimplexBasis {
 
 struct SimplexOptions {
     std::uint64_t max_iterations = 0;
-    double time_limit_s = 0.0;
+    double time_limit_s = 900.0;
 
     // Cooperative cancellation, polled alongside time_limit_s every 64
     // iterations. Null on every serial path. Set by the concurrent racer so a
@@ -80,9 +81,40 @@ struct SimplexOptions {
     // and are always removed before an optimality conclusion. A phase-1-only
     // variant is intentionally NOT the default: measured Netlib gains from
     // perturbation are concentrated in phase 2 (e.g. nesm), so gating to
-    // phase 1 would be a no-op on the models that benefit; see
-    // the earlier handoff notes.
+    // phase 1 would be a no-op on the models that benefit.
     f64 dual_cost_perturbation_multiplier = 0.0;
+
+    // Dual cost perturbation exactly as in Koberstein (2005 thesis §6.3.1):
+    // perturb all structural non-fixed, non-free costs before the first
+    // iteration when the structural cost vector has fewer than n/4 distinct
+    // values; otherwise, once the dual objective has not improved for
+    // 3*phi consecutive iterations (phi = min(100 + m/200, 2000), eq. 6.26),
+    // perturb only the degenerate positions (|d_j| within tolerance) of that
+    // subset. Magnitudes follow steps 1-4 of §6.3.1. The perturbation is
+    // removed before any optimality conclusion (primal clean-up, §6.3.1).
+    // Ignored when dual_cost_perturbation_multiplier > 0 (legacy ablation).
+    bool dual_perturbation = true;
+    // Lower bound on an UPDATED dual steepest-edge weight. Koberstein (2005
+    // thesis §8.2.2.1, following Forrest & Goldfarb 1992) sets
+    // beta_i = max(beta_i, 1e-4): cancellation in the update can drive a
+    // weight toward zero, and a near-zero weight makes that row's pricing
+    // score infeasibility^2 / beta explode. Exactly recomputed weights
+    // (beta_r = rho'rho) are not floored by this.
+    f64 dse_weight_floor = 1e-4;
+    // Dual simplex: stop in phase 2 once the objective (minimization sense,
+    // including the offset) reaches this value -- a branch-and-bound node
+    // that will be pruned by bound need not be solved to optimality. The
+    // caller must prove the prune itself (e.g. a weak-duality bound from the
+    // returned multipliers); the early stop is reported as Interrupted with
+    // termination_reason "objective limit".
+    f64 objective_limit = std::numeric_limits<f64>::infinity();
+    // §6.3.1's first branch (perturb everything before the first iteration
+    // when costs have few distinct values). Off by default on measurement,
+    // 2026-09-25, 120 s MIPLIB root LPs: with it mzzv42z needed 43,746
+    // iterations (39.7 s), with the stalling branch alone 8,455 (2.4 s);
+    // supportcase7 finished only without it. The stalling branch is kept
+    // exactly as the thesis specifies.
+    bool dual_perturbation_at_start = false;
 
     // Refactor after this many basis updates. Product-form etas are as dense
     // as the FTRAN'd entering columns, so the file has to be recycled on the
@@ -134,8 +166,8 @@ struct SimplexOptions {
     // Forrest-Tomlin refactorization cadence. The eta-nnz trigger above is
     // calibrated for product-form etas and cannot serve FT, whose row etas are
     // ~12x sparser: it fires about ten times less often, refactor_interval
-    // never binds, and FT accuracy decays roughly a decade per 45 updates. See
-    // the earlier measurement notes. Inert on the product-form path.
+    // never binds, and FT accuracy decays roughly a decade per 45 updates.
+    // Inert on the product-form path.
     // Chosen by sweeping {50, 100, 200} x {1.5, 2, 3} on d2q06c, pilot87,
     // dfl001, greenbea and 25fv47 by pivots and DSE log error. Every setting
     // removed the non-convergence outright; 50 gives the lowest pivot total of
@@ -155,8 +187,8 @@ struct SimplexOptions {
     // 100, 0.76x at 200) and is also the one whose DSE log error the old
     // comment flagged, so re-check that pair together if this is retuned.
     int ft_update_limit = 200;
-    // Collective FT (Huangfu & Hall 2015 Phase 2, item 2 of
-    // the problem-statement notes §5): when the product-form eta file hits
+    // Collective FT (Huangfu & Hall 2015, phase 2): when the product-form
+    // eta file hits
     // refactor_eta_ratio, try BasisFactor::collapse_pending_into_ft() (fold
     // the pending etas into L/U via sequential update_ft() calls, verified
     // representation-transparent in tests/test_lu.cpp) before falling back
@@ -212,7 +244,7 @@ struct SimplexOptions {
     bool presolve_implied_slack = false;
     // Round every Ruiz factor to the nearest power of two, which makes the
     // scaling exact in floating point (see ruiz_scale). Off by default until
-    // it clears the 93-model gate; see the earlier measurement notes.
+    // it clears the 93-model gate.
     bool ruiz_power_of_two = false;
     bool verbose = false;
 };
@@ -321,6 +353,10 @@ struct SimplexDiagnostics {
     // Solves that started from a caller-carried weight vector instead of
     // paying the m-BTRAN rebuild (see DualEdgeWeightCarrier).
     std::uint64_t dse_weight_reuses = 0;
+    std::uint64_t stagnation_perturbations = 0;  // objective-window detector
+    std::uint64_t cycling_exits = 0;             // gave up: cycling detected
+    std::uint64_t objective_limit_exits = 0;
+    std::uint64_t factor_adoptions = 0;   // carried LU adopted instead of factorizing
     std::uint64_t dse_weight_rebuilds = 0;
     // Choose-mode drift recovery: exact DSE weight rebuilds that replace the
     // old one-way handoff to Devex (see dual_simplex Choose policy).
@@ -342,6 +378,8 @@ struct SimplexDiagnostics {
     f64 dse_log_weight_error = 0.0;
     std::uint64_t perturbed_costs = 0;
     std::uint64_t perturbation_cleanups = 0;
+    // Times dual phase 2 perturbed nonbasic costs after a degenerate window.
+    std::uint64_t stall_perturbations = 0;
     // Dual working-cost management (Koberstein 2005 §6.2.2.3). cost_shifts
     // counts every shift applied to a nonbasic working cost: the entering
     // column's wrong-sign reduced cost zeroed before a pivot, and the phase-2
@@ -454,6 +492,18 @@ struct SimplexDiagnostics {
     // feasibility tolerances. This is shared by every Auto stage.
     double preprocessing_ms = 0.0;
     double factor_ms  = 0.0;
+    // EXPERIMENTAL (repeated-LP reuse). Time spent adopting a carried
+    // factorization instead of running do_factorize() from scratch: the
+    // BasisFactor copy plus the validity check, NOT included in factor_ms.
+    // Kept separate deliberately -- the reuse/copy tradeoff must be visible,
+    // not assumed. Zero when no FactorCarrier was supplied or adopted.
+    double factor_reuse_ms = 0.0;
+    // 1 if this solve adopted a carried factorization (skipped the initial
+    // do_factorize()), 0 otherwise. Distinguishes "carrier supplied but
+    // rejected" (basis/dims/token mismatch -> fell back to a full factorize,
+    // factor_ms paid as normal) from "no carrier supplied" -- both leave
+    // factor_reuse_ms at 0, so this flag is what a reader actually needs.
+    bool factor_reused = false;
     // Total pricing time. It is the SUM of the two counters below, which
     // measure entirely different scans and were indistinguishable until
     // 2026-09-10: on pilot87 "pricing" read 3.0 s of 11.9 s, which invited the
@@ -511,6 +561,12 @@ struct SimplexDiagnostics {
     std::uint64_t btran_calls = 0;
     std::uint64_t basis_update_calls = 0;
     double loop_ms    = 0.0;
+    // Always-on coarse timers (a few clock reads per solve) for the parts of
+    // a warm re-solve outside the pivot loop.
+    double first_factor_ms = 0.0;       // initial factorization (0 if adopted)
+    double after_first_factor_ms = 0.0; // xB/duals/weights/phase set-up
+    double dse_rebuild_ms = 0.0;        // all-row DSE weight rebuilds
+    double post_solve_ms = 0.0;         // unscale, residuals, dual bound
     double total_ms   = 0.0;
     // One for solve_simplex()/direct primal/dual calls. Auto used to report
     // up to four because every stage rebuilt scaling and CSC independently.

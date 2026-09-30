@@ -33,4 +33,24 @@ bool build_dual_perturbed_costs(
     std::vector<core::f64>& perturbed,
     DualCostPerturbationStats* stats = nullptr);
 
+// Koberstein (2005 thesis, §6.3.1) cost perturbation magnitude and sign for
+// one structural column, steps 1-4 of the thesis:
+//   1. xi = 100*eps_D + psi*|c_j|, psi = 1e-5;
+//   2. xi <- -0.5 xi (1+mu) if the column's dual-feasible direction is
+//      downward (thesis: u_j < inf), +0.5 xi (1+mu) otherwise, mu in [0,1];
+//   3. xi <- w[nu_j] xi, w = (1e-2,1e-1,1,2,5,10,20,30,40,100) indexed by the
+//      column's nonzero count nu_j (w_10 for nu_j >= 10);
+//   4. |xi| multiplied by 0.1 or 10 until it lies in [xi_min, xi_max],
+//      xi_min = min(1e-2 eps_D, psi), xi_max = max(1e3 eps_D, psi*10*mean|c|).
+// `downward` selects the sign; `mu` is the random number of step 2.
+core::f64 koberstein_perturbation(core::f64 cost, bool downward, core::f64 mu,
+                                  core::Index column_nonzeros,
+                                  core::f64 dual_tol, core::f64 mean_abs_cost);
+
+// Thesis §6.3.1 up-front test: the problem is treated as significantly dual
+// degenerate when the structural cost vector has fewer than n/4 distinct
+// values.
+bool koberstein_perturb_at_start(const std::vector<core::f64>& cost,
+                                 core::Index n_struct);
+
 }  // namespace sor::engines

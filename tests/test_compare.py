@@ -8,6 +8,8 @@ import io
 import json
 import sys
 import math
+import tempfile
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -22,6 +24,121 @@ SPEC.loader.exec_module(compare)
 
 
 class CommandTests(unittest.TestCase):
+    def test_solver_timeout_kills_descendants_holding_output_pipes(self) -> None:
+        child = "import time; time.sleep(4)"
+        parent = ("import subprocess,sys,time; "
+                  f"subprocess.Popen([sys.executable,'-c',{child!r}]); "
+                  "time.sleep(4)")
+        start = time.monotonic()
+        with self.assertRaises(compare.subprocess.TimeoutExpired):
+            compare.run_solver_process([sys.executable, "-c", parent], 0.2)
+        self.assertLess(time.monotonic() - start, 2.0)
+
+    def test_recursive_duplicate_models_fail_before_writing_results(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            nested = root / "nested"
+            nested.mkdir()
+            (root / "same.mps.gz").write_bytes(b"model")
+            (nested / "same.mps.gz").write_bytes(b"model")
+            output = root / "result.jsonl"
+            solutions = root / "solutions"
+            argv = ["compare.py", str(root), "--solvers", "highs",
+                    "--jsonl", str(output), "--solutions-dir", str(solutions)]
+            with mock.patch.object(sys, "argv", argv):
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(compare.main(), 2)
+            self.assertIn("duplicate model identities", err.getvalue())
+            self.assertFalse(output.exists())
+            self.assertFalse(solutions.exists())
+
+    def test_existing_jsonl_is_not_appended(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "result.jsonl"
+            path.write_text("old evidence\n")
+            model = Path(td) / "model.mps"
+            model.write_text("NAME X\nENDATA\n")
+            argv = ["compare.py", str(model), "--solvers", "highs",
+                    "--jsonl", str(path)]
+            with mock.patch.object(sys, "argv", argv):
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(compare.main(), 2)
+            self.assertEqual(path.read_text(), "old evidence\n")
+            self.assertIn("refusing to mix campaigns", err.getvalue())
+
+    def test_frozen_binaries_are_copied_and_detect_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source"
+            source.mkdir()
+            (source / "sor_solve").write_bytes(b"solver-1")
+            (source / "sor_check").write_bytes(b"checker-1")
+            frozen, digest = compare.freeze_sor_binaries(
+                source / "sor_solve", root / "evidence")
+            self.assertEqual(frozen.read_bytes(), b"solver-1")
+            self.assertEqual(digest, compare.sha256_file(frozen))
+            (source / "sor_solve").write_bytes(b"solver-2")
+            with self.assertRaisesRegex(RuntimeError, "executable changed"):
+                compare.verify_executable(source / "sor_solve", digest)
+            with self.assertRaisesRegex(RuntimeError, "executable changed"):
+                compare.freeze_sor_binaries(source / "sor_solve", root / "evidence")
+
+    def test_qps_reference_reads_identical_mps_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            model = Path(td) / "problem.qps"
+            model.write_bytes(b"NAME TEST\nQUADOBJ\n X X 1\nENDATA\n")
+            observed = []
+            class FakeHighs:
+                def setOptionValue(self, *_args):
+                    return "HighsStatus.kOk"
+                def readModel(self, path):
+                    alias = Path(path)
+                    observed.append((alias.suffix, alias.read_bytes()))
+                    return "HighsStatus.kOk"
+                def getRunTime(self):
+                    return 0.0
+                def run(self):
+                    pass
+                def getModelStatus(self):
+                    return "HighsModelStatus.kOptimal"
+                def getObjectiveValue(self):
+                    return 1.0
+                def version(self):
+                    return "test"
+                def getInfo(self):
+                    return type("Info", (), {"simplex_iteration_count": 0})()
+            with mock.patch.dict(sys.modules, {"highspy": type("Module", (), {"Highs": FakeHighs})()}):
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    compare.highs_worker(model, 1.0)
+            row = json.loads(output.getvalue().splitlines()[-1])
+            self.assertEqual(observed, [(".mps", model.read_bytes())])
+            self.assertEqual(row["status"], "Optimal")
+            self.assertEqual(row["reference_model_sha256"], compare.sha256_file(model))
+
+    def test_qp_primal_check_never_counts_as_optimality_proof(self) -> None:
+        r = compare.Result(solver="sor:qp", instance="x.qps",
+                           status="Optimal", proof="ProvedKKT",
+                           checker_verified=True,
+                           checker_validation_scope="qp_primal_point")
+        self.assertFalse(compare.is_certified_success(r))
+        r.checker_validation_scope = "qp_kkt_f64"
+        self.assertTrue(compare.is_certified_success(r))
+
+    def test_pinned_milp_uses_one_worker_unless_explicitly_overridden(self) -> None:
+        fake = compare.subprocess.CompletedProcess(
+            [], 0, stdout="status: Feasible\n", stderr="")
+        with mock.patch.object(compare, "run_solver_process", return_value=fake):
+            serial = compare.run_sor(
+                Path("model.mps"), "milp", "cpu", 1.0, 1e-7,
+                Path("sor_solve"), "sor:milp", cpu=0)
+            self.assertEqual(serial.command[serial.command.index("--bab-threads") + 1], "1")
+            parallel = compare.run_sor(
+                Path("model.mps"), "milp", "cpu", 1.0, 1e-7,
+                Path("sor_solve"), "sor:milp", cpu=0,
+                sor_extra=["--bab-threads", "3"])
+            self.assertEqual(parallel.command.count("--bab-threads"), 1)
+            self.assertEqual(parallel.command[parallel.command.index("--bab-threads") + 1], "3")
+
     def test_dual_is_a_simplex_method(self) -> None:
         cmd = compare.build_sor_command(
             Path("model.mps"), "dual", "cpu", 30.0, 1e-6,
@@ -71,7 +188,11 @@ class CorrectnessTests(unittest.TestCase):
                status: str = "Optimal", proof: str | None = None,
                seconds: float = 0.1) -> object:
         return compare.Result(solver=solver, instance="x.mps", status=status,
-                              objective=objective, proof=proof, seconds=seconds)
+                              objective=objective, proof=proof, seconds=seconds,
+                              checker_verified=(True if solver.startswith("sor")
+                                                else None),
+                              checker_validation_scope=("lp_optimality_f64"
+                                                        if solver.startswith("sor") else None))
 
     def test_zero_objective_uses_absolute_tolerance(self) -> None:
         # At the shipped defaults (abs == rel == 1e-7) the band at a zero
@@ -112,7 +233,29 @@ class CorrectnessTests(unittest.TestCase):
         self.assertFalse(compare.is_certified_success(self.result("sor:simplex")))
         self.assertTrue(compare.is_certified_success(
             self.result("sor:simplex", proof="ProvedOptimalFP")))
+        unchecked = self.result("sor:simplex", proof="ProvedOptimalFP")
+        unchecked.checker_verified = None
+        self.assertFalse(compare.is_certified_success(unchecked))
+        rejected = self.result("sor:simplex", proof="ProvedOptimalFP")
+        rejected.checker_verified = False
+        self.assertFalse(compare.is_certified_success(rejected))
+        incumbent_only = self.result("sor:milp", proof="ProvedGlobalEpsilon")
+        incumbent_only.checker_validation_scope = "milp_incumbent"
+        self.assertFalse(compare.is_certified_success(incumbent_only))
         self.assertTrue(compare.is_certified_success(self.result("highs")))
+
+    def test_stage_attribution_is_machine_parseable(self) -> None:
+        text = (
+            "iterations:        123 (FO 100, crossover 20, simplex 3)\n"
+            "stage time (ms):    FO 1.250, crossover 0.500, simplex 0.125\n"
+            "crossover:         attempted yes, basis valid no, cold fallback yes\n"
+        )
+        iters = compare._PAT["stage_iters"].search(text)
+        times = compare._PAT["stage_ms"].search(text)
+        flags = compare._PAT["crossover"].search(text)
+        self.assertEqual(iters.groups(), ("100", "20", "3"))
+        self.assertEqual(times.groups(), ("1.250", "0.500", "0.125"))
+        self.assertEqual(flags.groups(), ("yes", "no", "yes"))
 
     def test_reference_is_not_first_solver_objective(self) -> None:
         interrupted = self.result("sor:simplex", 999.0, status="Interrupted")
@@ -161,6 +304,104 @@ class CorrectnessTests(unittest.TestCase):
         self.assertIn("claim status      : INCOMPLETE", text)
 
 
+class CheckerExecutionTests(unittest.TestCase):
+    SOLVER_OUTPUT = (
+        "status:            Optimal\n"
+        "proof_level:       ProvedOptimalFP\n"
+        "objective:         1.0000000000e+00\n"
+        "dual bound:        1.0000000000e+00\n"
+        "max primal viol:   0.000e+00\n"
+        "iterations:        1\n"
+        "timing (ms)\n"
+        "  total                 1.000\n"
+    )
+
+    def run_case(self, checker_result=None, *, make_solution=True,
+                 make_checker=True):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            exe = root / "sor_solve"
+            checker = root / "sor_check"
+            model = root / "model.mps"
+            solution = root / "result.sol"
+            exe.write_bytes(b"solver")
+            model.write_text("NAME X\nENDATA\n")
+            if make_checker:
+                checker.write_bytes(b"checker")
+            solver_result = compare.subprocess.CompletedProcess(
+                [str(exe)], 0, stdout=self.SOLVER_OUTPUT, stderr="")
+            def solver_mock(*args, **kwargs):
+                if make_solution:
+                    solution.write_text("solution")
+                return solver_result
+            def checker_mock(*args, **kwargs):
+                if isinstance(checker_result, BaseException):
+                    raise checker_result
+                return checker_result
+            with mock.patch.object(compare, "run_solver_process",
+                                   side_effect=solver_mock):
+                with mock.patch.object(compare.subprocess, "run",
+                                       side_effect=checker_mock):
+                    return compare.run_sor(
+                        model, "dual", "cpu", 1.0, 1e-7, exe, "sor:dual",
+                        method=None, basis_update="default", max_iter=None,
+                        cpu=0, pricing="choose", dual_cost_perturbation=0.0,
+                        sor_extra=[], solution_out=solution)
+
+    def test_checker_success_requires_parseable_scope_and_records_evidence(self):
+        checked = compare.subprocess.CompletedProcess(
+            ["sor_check"], 0,
+            stdout="validation: lp_optimality_f64\nVERIFIED\n", stderr="")
+        result = self.run_case(checked)
+        self.assertTrue(result.checker_verified)
+        self.assertEqual(result.checker_validation_scope, "lp_optimality_f64")
+        self.assertEqual(result.checker_returncode, 0)
+        self.assertEqual(result.checker_stdout, checked.stdout)
+        self.assertIsNotNone(result.checker_executable_sha256)
+        self.assertTrue(compare.is_certified_success(result))
+
+    def test_missing_solution_fails_validation(self):
+        result = self.run_case(make_solution=False)
+        self.assertFalse(result.checker_verified)
+        self.assertIn("did not write", result.checker_error)
+        self.assertFalse(compare.is_certified_success(result))
+
+    def test_missing_checker_fails_validation(self):
+        result = self.run_case(make_checker=False)
+        self.assertFalse(result.checker_verified)
+        self.assertIn("not found", result.checker_error)
+
+    def test_checker_failure_is_distinct_from_solver_failure(self):
+        checked = compare.subprocess.CompletedProcess(
+            ["sor_check"], 1,
+            stdout="validation: lp_optimality_f64\nREJECTED\n",
+            stderr="dual residual")
+        result = self.run_case(checked)
+        self.assertEqual(result.status, "Optimal")
+        self.assertEqual(result.solver_returncode, 0)
+        self.assertEqual(result.solver_stdout, self.SOLVER_OUTPUT)
+        self.assertEqual(result.solver_stderr, "")
+        self.assertFalse(result.checker_verified)
+        self.assertEqual(result.checker_returncode, 1)
+        self.assertEqual(result.checker_stderr, "dual residual")
+
+    def test_unparseable_checker_output_fails_closed(self):
+        checked = compare.subprocess.CompletedProcess(
+            ["sor_check"], 0, stdout="VERIFIED\n", stderr="")
+        result = self.run_case(checked)
+        self.assertFalse(result.checker_verified)
+        self.assertIsNone(result.checker_validation_scope)
+
+    def test_checker_timeout_fails_closed_and_retains_output(self):
+        timeout = compare.subprocess.TimeoutExpired(
+            ["sor_check"], 31, output="partial stdout", stderr="partial stderr")
+        result = self.run_case(timeout)
+        self.assertFalse(result.checker_verified)
+        self.assertTrue(result.checker_timed_out)
+        self.assertEqual(result.checker_stdout, "partial stdout")
+        self.assertEqual(result.checker_stderr, "partial stderr")
+
+
 
 
 class PublicClaimGateTests(unittest.TestCase):
@@ -178,7 +419,11 @@ class PublicClaimGateTests(unittest.TestCase):
         return compare.Result(solver=solver, instance=instance, status=status,
                               objective=objective, proof=proof,
                               seconds=seconds, wall_s=wall if wall is not None else seconds,
-                              mad_s=mad, median_s=seconds, noisy=False)
+                              mad_s=mad, median_s=seconds, noisy=False,
+                              checker_verified=(True if solver.startswith("sor")
+                                                else None),
+                              checker_validation_scope=("lp_optimality_f64"
+                                                        if solver.startswith("sor") else None))
 
     def suite(self, rows):
         """rows: [(instance, sor_seconds, highs_seconds)]"""
@@ -327,7 +572,11 @@ class FailClosedTests(unittest.TestCase):
                               wall_s=wall if wall is not None else seconds,
                               median_wall_s=wall if wall is not None else seconds,
                               median_s=seconds, mad_s=0.0, noisy=False,
-                              error=error)
+                              error=error,
+                              checker_verified=(True if solver.startswith("sor")
+                                                else None),
+                              checker_validation_scope=("lp_optimality_f64"
+                                                        if solver.startswith("sor") else None))
 
     def suite(self, rows):
         return {i: {"sor:simplex": self.r("sor:simplex", i, c),
@@ -549,7 +798,9 @@ class NativeSourceRunnerTests(unittest.TestCase):
     def test_empty_allow_entry_cannot_waive_three_x_tail(self):
         candidate = compare.Result(
             solver="sor:simplex", instance="a.mps", status="Optimal",
-            proof="ProvedOptimalFP", objective=1.0, seconds=3.0, wall_s=3.0)
+            proof="ProvedOptimalFP", objective=1.0, seconds=3.0, wall_s=3.0,
+            checker_verified=True,
+            checker_validation_scope="lp_optimality_f64")
         reference = compare.Result(
             solver="highs", instance="a.mps", status="Optimal",
             objective=1.0, seconds=4.0, wall_s=4.0)

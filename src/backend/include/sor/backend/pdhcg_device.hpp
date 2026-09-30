@@ -47,6 +47,7 @@ struct PdhcgData {
     sparse::CsrMatrix Q_csr;
     std::vector<f64> q_diag;
     std::vector<f64> c, col_lo, col_hi, row_lo, row_hi;
+    std::vector<f64> col_scale, row_scale;
 };
 
 class PdhcgDevice {
@@ -135,7 +136,7 @@ public:
 
     // Everything the convergence check needs at (x, y), or at the running
     // average when `at_average`.  r = Qx + c + A'y.
-    struct Eval {
+struct Eval {
         f64 primal = 0.0;     // max(col bound violation, row violation of Ax)
         f64 dual_res = 0.0;   // natural-map residual, columns and rows
         f64 xqx = 0.0;        // x'Qx
@@ -143,6 +144,16 @@ public:
         f64 px = 0.0;         // support of the box at -r   (finite only if ok)
         f64 py = 0.0;         // support of the row box at y
         bool support_finite = false;
+
+        // LP KKT fields (unscaled)
+        f64 kkt_primal_res = 0.0;
+        f64 kkt_dual_res = 0.0;
+        f64 kkt_primal_obj = 0.0;
+        f64 kkt_dual_obj = 0.0;
+        f64 kkt_operator_lhs = 0.0;
+        f64 kkt_operator_rhs = 0.0;
+        f64 kkt_epoch_dx_norm = 0.0;
+        f64 kkt_epoch_dy_norm = 0.0;
     };
     virtual Eval evaluate(bool at_average) = 0;
 

@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -32,25 +33,39 @@ using model::kInf;
 
 using Clock = std::chrono::steady_clock;
 inline double ms_since(Clock::time_point t0) {
+    SOR_FN();
     return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 }
 
 inline f64 mul_zero_safe(f64 a, f64 b) {
+    SOR_FN();
     if (a == 0.0) return 0.0;
     return a * b;
 }
 
-inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
-inline std::size_t sz(Offset i) { return static_cast<std::size_t>(i); }
+inline std::size_t sz(Index i) { SOR_FN(); return static_cast<std::size_t>(i); }
+inline std::size_t sz(Offset i) { SOR_FN(); return static_cast<std::size_t>(i); }
 
 inline bool route_sample_pivot(std::uint64_t iter) noexcept {
+#ifndef SOR_ROUTE_DEBUG
+    (void)iter;
+    return false;
+#else
     const int every = ::sor::core::route_debug_pivot_every();
     if (every <= 0) return true;
     return iter % static_cast<std::uint64_t>(every) == 0;
+#endif
 }
 
 void route_simplex_dual_terminal(const char* event, core::Status st,
                                  std::uint64_t iter, int phase) noexcept {
+#ifndef SOR_ROUTE_DEBUG
+    (void)event;
+    (void)st;
+    (void)iter;
+    (void)phase;
+#else
+    SOR_FN();
     const auto s = core::to_string(st);
     char l1[96];
     std::snprintf(l1, sizeof(l1), "\"status\":\"%.*s\"",
@@ -62,6 +77,7 @@ void route_simplex_dual_terminal(const char* event, core::Status st,
                   static_cast<int>(s.size()), s.data(),
                   static_cast<unsigned long long>(iter), phase);
     SOR_ROUTE(2, "simplex_dual", event, l2);
+#endif
 }
 
 constexpr f64 kAtBound = 1e-9;
@@ -73,9 +89,10 @@ constexpr f64 kAtBound = 1e-9;
 class IndexedRowHeap {
 public:
     explicit IndexedRowHeap(Index size = 0)
-        : position_(sz(size), -1), score_(sz(size), 0.0) {}
+        : position_(sz(size), -1), score_(sz(size), 0.0) { SOR_FN();}
 
     void clear() {
+        SOR_FN();
         heap_.clear();
         std::fill(position_.begin(), position_.end(), -1);
         std::fill(score_.begin(), score_.end(), 0.0);
@@ -88,6 +105,7 @@ public:
     // tie-breaking, O(m) work, and sequential writes to the backing arrays.
     template <class Score>
     void rebuild(Index size, Score&& score) {
+        SOR_FN();
         heap_.clear();
         std::fill(position_.begin(), position_.end(), -1);
         std::fill(score_.begin(), score_.end(), 0.0);
@@ -105,6 +123,7 @@ public:
     }
 
     void update(Index row, f64 score) {
+        SOR_FN();
         if (row < 0 || sz(row) >= position_.size()) return;
         const Index old_position = position_[sz(row)];
         if (!(score > 0.0) || std::isnan(score)) {
@@ -123,19 +142,22 @@ public:
         sift_down(position_[sz(row)]);
     }
 
-    Index top() const { return heap_.empty() ? -1 : heap_.front(); }
+    Index top() const { SOR_FN(); return heap_.empty() ? -1 : heap_.front(); }
     f64 score(Index row) const {
+        SOR_FN();
         return row >= 0 && sz(row) < score_.size() ? score_[sz(row)] : 0.0;
     }
-    std::size_t size() const { return heap_.size(); }
+    std::size_t size() const { SOR_FN(); return heap_.size(); }
 
 private:
     bool higher(Index lhs, Index rhs) const {
+        SOR_FN();
         const f64 a = score_[sz(lhs)], b = score_[sz(rhs)];
         return a > b || (a == b && lhs < rhs);
     }
 
     void swap_positions(Index a, Index b) {
+        SOR_FN();
         if (a == b) return;
         std::swap(heap_[sz(a)], heap_[sz(b)]);
         position_[sz(heap_[sz(a)])] = a;
@@ -143,6 +165,7 @@ private:
     }
 
     void sift_up(Index at) {
+        SOR_FN();
         while (at > 0) {
             const Index parent = (at - 1) / 2;
             if (!higher(heap_[sz(at)], heap_[sz(parent)])) break;
@@ -152,6 +175,7 @@ private:
     }
 
     void sift_down(Index at) {
+        SOR_FN();
         const Index count = static_cast<Index>(heap_.size());
         for (;;) {
             Index best = at;
@@ -168,6 +192,7 @@ private:
     }
 
     void erase_at(Index at) {
+        SOR_FN();
         const Index removed = heap_[sz(at)];
         const Index last_position = static_cast<Index>(heap_.size() - 1);
         if (at != last_position) swap_positions(at, last_position);
@@ -190,7 +215,9 @@ private:
 core::RawResult solve_dual_simplex_prepared(
     const SimplexPrepared& prepared, const SimplexOptions& opts,
     SimplexDiagnostics& diag, SimplexBasis* out_basis,
-    const SimplexBasis* warm, DualEdgeWeightCarrier* carrier) {
+    const SimplexBasis* warm, DualEdgeWeightCarrier* carrier,
+    FactorCarrier* factor_carrier) {
+    SOR_FN();
     const auto t_all = Clock::now();
 
     // Take the incoming weights and leave the carrier EMPTY: every early exit
@@ -207,6 +234,32 @@ core::RawResult solve_dual_simplex_prepared(
         carried_weights = std::move(carrier->weights);
         carrier->basis.clear();
         carrier->weights.clear();
+    }
+
+    // Same move-in discipline for the EXPERIMENTAL factor carrier: take it at
+    // entry (leaving factor_carrier empty for the duration -- every early
+    // exit then correctly reports "nothing to hand back"), validate it
+    // against the actual starting basis right before the initial
+    // factorization (the one place it is eligible), and refill on the one
+    // normal exit alongside the weights.
+    la::BasisFactor carried_factor;
+    std::vector<Index> carried_factor_basis;
+    bool have_carried_factor = false;
+    const void* factor_carrier_matrix = nullptr;
+    core::Index factor_carrier_rows = 0;
+    core::Index factor_carrier_cols = 0;
+    core::Offset factor_carrier_nnz = 0;
+    if (factor_carrier != nullptr) {
+        factor_carrier_matrix = factor_carrier->matrix;
+        factor_carrier_rows = factor_carrier->rows;
+        factor_carrier_cols = factor_carrier->cols;
+        factor_carrier_nnz = factor_carrier->nnz;
+        if (factor_carrier->has_factor) {
+            carried_factor = std::move(factor_carrier->factor);
+            carried_factor_basis = std::move(factor_carrier->basis);
+            have_carried_factor = true;
+        }
+        factor_carrier->clear();
     }
 
     // Fine-grained timers cost one clock read each, and this loop has fourteen
@@ -226,9 +279,11 @@ core::RawResult solve_dual_simplex_prepared(
     // produces the full timing breakdown.
     const bool time_detail = opts.verbose;
     const auto tick = [time_detail]() {
+        SOR_FN();
         return time_detail ? Clock::now() : Clock::time_point{};
     };
     const auto tock = [time_detail](Clock::time_point t) {
+        SOR_FN();
         return time_detail ? ms_since(t) : 0.0;
     };
 
@@ -286,6 +341,7 @@ core::RawResult solve_dual_simplex_prepared(
     const auto& ari = ac.pattern.row_idx();
 
     const auto for_col = [&](Index j, auto&& fn) {
+        SOR_FN();
         if (j < ns) {
             for (Offset k = acp[sz(j)]; k < acp[sz(j) + 1]; ++k)
                 fn(ari[sz(k)], ac.vals[sz(k)]);
@@ -329,6 +385,38 @@ core::RawResult solve_dual_simplex_prepared(
             perturbation_stats.changed_structural +
             perturbation_stats.changed_logical;
     }
+    // Koberstein §6.3.1 inputs: column nonzero counts nu_j, mean |c_j|.
+    const bool koberstein_perturbation_on =
+        opts.dual_perturbation && opts.dual_cost_perturbation_multiplier == 0.0;
+    f64 mean_abs_cost = 0.0;
+    for (Index j = 0; j < ns; ++j) mean_abs_cost += std::fabs(cost[sz(j)]);
+    if (ns > 0) mean_abs_cost /= static_cast<f64>(ns);
+    const auto perturbable = [&](Index j) {
+        const f64 l = prepared.lo[sz(j)], u = prepared.hi[sz(j)];
+        return !(l == u) && !(l <= -kInf && u >= kInf);   // non-fixed, non-free
+    };
+    const auto column_nonzeros = [&](Index j) {
+        return static_cast<Index>(prepared.csc.pattern.col_ptr()[sz(j) + 1] -
+                                  prepared.csc.pattern.col_ptr()[sz(j)]);
+    };
+    if (koberstein_perturbation_on && opts.dual_perturbation_at_start &&
+        koberstein_perturb_at_start(cost, ns)) {
+        std::uint64_t changed = 0;
+        for (Index j = 0; j < ns; ++j) {
+            if (!perturbable(j)) continue;
+            // Thesis eq. (6.36): negative when u_j < inf.
+            const bool downward = prepared.hi[sz(j)] < kInf;
+            work_cost[sz(j)] += koberstein_perturbation(
+                cost[sz(j)], downward,
+                deterministic_fraction(static_cast<std::uint64_t>(j)),
+                column_nonzeros(j), opts.dual_feas_tol, mean_abs_cost);
+            ++changed;
+        }
+        if (changed > 0) {
+            costs_perturbed = true;
+            diag.perturbed_costs += changed;
+        }
+    }
 
     // Per-column dual-feasibility thresholds in SCALED space, chosen so that
     // "d_j within tolerance" means the same thing on the UNSCALED model the
@@ -355,6 +443,7 @@ core::RawResult solve_dual_simplex_prepared(
     // Park a nonbasic on a bound that is dual-feasible for its (unreduced)
     // cost when both ends exist. At the all-logical start π = 0, so d_j = c_j.
     const auto park = [&](Index j) {
+        SOR_FN();
         const f64 l = lo[sz(j)], u = hi[sz(j)], cj = work_cost[sz(j)];
         if (l == u && l > -kInf) {
             st[sz(j)] = NonbasicStatus::AtLower;
@@ -443,11 +532,13 @@ core::RawResult solve_dual_simplex_prepared(
         pivotal_active[sz(j)] =
             static_cast<std::uint8_t>(permanently_fixed[sz(j)] == 0);
     const auto add_nonbasic = [&](Index j) {
+        SOR_FN();
         if (j < 0 || j >= nt || nonbasic_pos[sz(j)] >= 0) return;
         nonbasic_pos[sz(j)] = static_cast<Index>(nonbasic.size());
         nonbasic.push_back(j);
     };
     const auto remove_nonbasic = [&](Index j) {
+        SOR_FN();
         if (j < 0 || j >= nt) return;
         const Index pos = nonbasic_pos[sz(j)];
         if (pos < 0) return;
@@ -466,6 +557,7 @@ core::RawResult solve_dual_simplex_prepared(
     la::SpikeCapture entering_spike;
     const bool want_spike = opts.update_method == la::UpdateMethod::ForrestTomlin;
     const auto do_ftran = [&](std::vector<f64>& v, bool capture = false) {
+        SOR_FN();
         const auto t0 = tick();
         factor.ftran(v, capture ? &entering_spike : nullptr);
         const double dt = tock(t0);
@@ -479,6 +571,7 @@ core::RawResult solve_dual_simplex_prepared(
     const auto do_ftran_pair = [&](std::vector<f64>& a,
                                    std::vector<f64>& b,
                                    bool capture = false) {
+        SOR_FN();
         const auto t0 = tick();
         factor.ftran_pair(a, b, capture ? &entering_spike : nullptr);
         const double dt = tock(t0);
@@ -489,6 +582,7 @@ core::RawResult solve_dual_simplex_prepared(
         ++diag.dual_paired_ftrans;
     };
     const auto do_btran = [&](std::vector<f64>& v) {
+        SOR_FN();
         const auto t0 = tick();
         factor.btran(v);
         const double dt = tock(t0);
@@ -507,6 +601,7 @@ core::RawResult solve_dual_simplex_prepared(
                                      const std::vector<Index>& seed,
                                      std::vector<Index>& support,
                                      bool capture = false) {
+        SOR_FN();
         const auto t0 = tick();
         const bool sparse = factor.ftran_seeded_with_support(
             v, seed, support, capture ? &entering_spike : nullptr);
@@ -541,6 +636,7 @@ core::RawResult solve_dual_simplex_prepared(
     Index previous_btran_seed = -1;
     const auto do_btran_seeded = [&](std::vector<f64>& v, Index seed_slot,
                                      std::vector<Index>& support) {
+        SOR_FN();
         // Sparse BTRAN writes only its output support. The previous unit input
         // is not necessarily part of that output, so clear it explicitly to
         // uphold BasisFactor's reset contract. If the same slot is reused the
@@ -565,6 +661,7 @@ core::RawResult solve_dual_simplex_prepared(
     std::vector<Index> dse_seed(1, 0);
     const auto dse_rebuild_btran = [&](std::vector<f64>& v, Index seed_slot,
                                        std::vector<Index>& support) {
+        SOR_FN();
         dse_seed[0] = seed_slot;
         const auto t0 = tick();
         const bool sparse = factor.btran_seeded_with_support(v, dse_seed, support);
@@ -602,10 +699,12 @@ core::RawResult solve_dual_simplex_prepared(
     std::uint32_t leave_heap_dirty_generation = 1;
     bool leave_heap_all_dirty = true;
     const auto invalidate_leave_heap = [&]() {
+        SOR_FN();
         leave_heap_all_dirty = true;
         leave_heap_dirty_rows.clear();
     };
     const auto mark_leave_row_dirty = [&](Index row) {
+        SOR_FN();
         if (leave_heap_all_dirty || row < 0 || row >= m) return;
         if (leave_heap_dirty_stamp[sz(row)] == leave_heap_dirty_generation)
             return;
@@ -819,6 +918,7 @@ core::RawResult solve_dual_simplex_prepared(
             pr_centry[sz(fill[sz(aci[sz(k)])]++)] = k;
     }
     const auto pr_swap = [&](Offset a, Offset b) {
+        SOR_FN();
         if (a == b) return;
         std::swap(pr_col[sz(a)], pr_col[sz(b)]);
         std::swap(pr_val[sz(a)], pr_val[sz(b)]);
@@ -828,6 +928,7 @@ core::RawResult solve_dual_simplex_prepared(
     };
     // Column j joins the active prefix of each of its rows.
     const auto pr_activate = [&](Index j) {
+        SOR_FN();
         if (j < 0 || j >= ns) return;
         for (Offset t = pr_cstart[sz(j)]; t < pr_cstart[sz(j) + 1]; ++t) {
             const Offset k = pr_centry[sz(t)];
@@ -840,6 +941,7 @@ core::RawResult solve_dual_simplex_prepared(
         }
     };
     const auto pr_deactivate = [&](Index j) {
+        SOR_FN();
         if (j < 0 || j >= ns) return;
         for (Offset t = pr_cstart[sz(j)]; t < pr_cstart[sz(j) + 1]; ++t) {
             const Offset k = pr_centry[sz(t)];
@@ -854,6 +956,7 @@ core::RawResult solve_dual_simplex_prepared(
     // Rebuild from pivotal_active. Used once at start-up and after a
     // singular-basis repair, both O(nnz).
     const auto pr_rebuild = [&]() {
+        SOR_FN();
         for (Index i = 0; i < m; ++i) {
             Offset w = arp[sz(i)];
             for (Offset k = arp[sz(i)]; k < arp[sz(i) + 1]; ++k)
@@ -874,6 +977,7 @@ core::RawResult solve_dual_simplex_prepared(
 
     // alpha_r = rho' [A | -I], visiting only rows where rho is nonzero.
     const auto build_pivotal_row = [&]() {
+        SOR_FN();
         const auto t0 = tick();
         prow_idx.clear();
         prow_full_size = 0;
@@ -892,6 +996,7 @@ core::RawResult solve_dual_simplex_prepared(
         // the DSE cost controller. That is a deliberate behaviour change, not
         // an accident; see the report.
         const auto add_rho_row_active = [&](Index i) {
+            SOR_FN();
             const f64 r = rho[sz(i)];
             if (r == 0.0) return;
             const Offset beg = arp[sz(i)];
@@ -924,6 +1029,7 @@ core::RawResult solve_dual_simplex_prepared(
             }
         };
         const auto add_rho_row = [&](Index i) {
+            SOR_FN();
             const f64 r = rho[sz(i)];
             if (r == 0.0) return;
             for (Offset k = arp[sz(i)]; k < arp[sz(i) + 1]; ++k) {
@@ -1018,6 +1124,7 @@ core::RawResult solve_dual_simplex_prepared(
     };
 
     const auto reset_devex_framework = [&]() {
+        SOR_FN();
         std::fill(devex_reference.begin(), devex_reference.end(), 0);
         for (const Index v : basis) devex_reference[sz(v)] = 1;
         std::fill(row_w.begin(), row_w.end(), 1.0);
@@ -1027,6 +1134,7 @@ core::RawResult solve_dual_simplex_prepared(
     };
 
     const auto reset_weights = [&]() {
+        SOR_FN();
         if (dse_active) {
             // At the logical basis B=-I, every exact DSE weight is one. A
             // nonlogical warm/repaired basis needs the expensive all-row
@@ -1042,9 +1150,11 @@ core::RawResult solve_dual_simplex_prepared(
                 std::fill(row_w.begin(), row_w.end(), 1.0);
             } else {
                 ++diag.dse_weight_rebuilds;
+                const auto t_dse = Clock::now();
                 if (!rebuild_dual_edge_weights(m, do_btran, row_w,
                                                dse_rebuild_btran))
                     std::fill(row_w.begin(), row_w.end(), 1.0);
+                diag.dse_rebuild_ms += ms_since(t_dse);
             }
         } else if (use_devex) {
             reset_devex_framework();
@@ -1058,6 +1168,7 @@ core::RawResult solve_dual_simplex_prepared(
     // the live basis to a fresh Devex framework mid-solve. Resets the log-
     // error / cost counters so the same burst does not immediately re-fire.
     const auto rebuild_dse_on_drift = [&](const char* reason_json) {
+        SOR_FN();
         ++diag.dse_weight_rebuilds;
         ++diag.dse_drift_rebuilds;
         if (!rebuild_dual_edge_weights(m, do_btran, row_w, dse_rebuild_btran))
@@ -1069,6 +1180,9 @@ core::RawResult solve_dual_simplex_prepared(
         dse_switch_pending = false;
         dse_accuracy_switch_pending = false;
         invalidate_leave_heap();
+#ifndef SOR_ROUTE_DEBUG
+        (void)reason_json;
+#endif
         SOR_ROUTE(1, "simplex_dual", "dse_drift_rebuild", reason_json);
     };
 
@@ -1080,6 +1194,7 @@ core::RawResult solve_dual_simplex_prepared(
     // weight that is not a usable positive number -- declines and the caller
     // pays the rebuild as before.
     const auto adopt_carried_weights = [&]() {
+        SOR_FN();
         if (!dse_active) return false;
         if (carried_weights.size() != sz(m) || carried_basis.size() != sz(m))
             return false;
@@ -1101,6 +1216,7 @@ core::RawResult solve_dual_simplex_prepared(
     };
 
     const auto repair_weights = [&]() -> bool {
+        SOR_FN();
         bool bad = false;
         f64 max_row = 0.0;
         for (const f64 w : row_w) {
@@ -1118,32 +1234,36 @@ core::RawResult solve_dual_simplex_prepared(
     };
 
     const auto build_basis_matrix = [&]() {
+        SOR_FN();
         bcp.assign(1, 0);
         bri.clear();
         bvals.clear();
         for (Index s = 0; s < m; ++s) {
-            for_col(basis[sz(s)], [&](Index i, f64 v) { bri.push_back(i); bvals.push_back(v); });
+            for_col(basis[sz(s)], [&](Index i, f64 v) { SOR_FN(); bri.push_back(i); bvals.push_back(v); });
             bcp.push_back(static_cast<Offset>(bri.size()));
         }
     };
 
     const auto refresh_slot_bounds = [&](Index i) {
+        SOR_FN();
         const Index v = basis[sz(i)];
         slot_lo[sz(i)]   = lo[sz(v)];
         slot_hi[sz(i)]   = hi[sz(v)];
         slot_ptol[sz(i)] = ptol[sz(v)];
     };
     const auto sync_slot_bounds = [&]() {
+        SOR_FN();
         for (Index i = 0; i < m; ++i) refresh_slot_bounds(i);
     };
 
     const auto recompute_xB = [&]() {
+        SOR_FN();
         std::fill(rhs.begin(), rhs.end(), 0.0);
         for (const Index j : nonbasic) {
             if (st[sz(j)] == NonbasicStatus::Basic) continue;
             const f64 vj = value[sz(j)];
             if (vj == 0.0) continue;
-            for_col(j, [&](Index i, f64 v) { rhs[sz(i)] -= v * vj; });
+            for_col(j, [&](Index i, f64 v) { SOR_FN(); rhs[sz(i)] -= v * vj; });
         }
         do_ftran(rhs);
         xB = rhs;
@@ -1158,6 +1278,7 @@ core::RawResult solve_dual_simplex_prepared(
     // on flip-heavy runs dominated the dual's phase 1 (maros-r7: 3783
     // phase-1 iterations, 12.9s -> under a second of flip maintenance).
     const auto apply_flip_shift = [&](const std::vector<Index>& flipped) {
+        SOR_FN();
         if (flipped.empty()) return;
         const auto flip_t0 = tick();
         ++diag.flip_batches;
@@ -1169,7 +1290,7 @@ core::RawResult solve_dual_simplex_prepared(
                                   ? hi[sz(j)] - lo[sz(j)]
                                   : lo[sz(j)] - hi[sz(j)];
             if (delta == 0.0) continue;
-            for_col(j, [&](Index i, f64 v) { rhs[sz(i)] -= v * delta; });
+            for_col(j, [&](Index i, f64 v) { SOR_FN(); rhs[sz(i)] -= v * delta; });
         }
         do_ftran(rhs);
         for (Index i = 0; i < m; ++i) xB[sz(i)] += rhs[sz(i)];
@@ -1181,6 +1302,7 @@ core::RawResult solve_dual_simplex_prepared(
     };
 
     const auto primal_infeasibility = [&]() {
+        SOR_FN();
         f64 s = 0.0;
         for (Index i = 0; i < m; ++i) {
             const Index v = basis[sz(i)];
@@ -1191,6 +1313,7 @@ core::RawResult solve_dual_simplex_prepared(
     };
 
     const auto rebuild_redcost = [&]() {
+        SOR_FN();
         // Traverse structural CSC columns directly and exploit the augmented
         // logical block's exact -I structure. This avoids generic visitor
         // overhead on m logical columns while keeping each structural dot
@@ -1206,7 +1329,7 @@ core::RawResult solve_dual_simplex_prepared(
         d_valid = true;
         ++diag.dual_rebuilds;
     };
-    const auto reduced_cost = [&](Index j) { return redcost[sz(j)]; };
+    const auto reduced_cost = [&](Index j) { SOR_FN(); return redcost[sz(j)]; };
 
     // Dual infeasibility against the ACTUAL model bounds, independent of which
     // bounds are currently installed. Reduced costs come from `work_cost`, so
@@ -1222,6 +1345,7 @@ core::RawResult solve_dual_simplex_prepared(
     // way, or free with d != 0) are real dual infeasibilities, and they are
     // exactly what the phase-1 subproblem is built to drive out.
     const auto true_dual_infeasibility = [&]() {
+        SOR_FN();
         f64 s = 0.0;
         for (const Index j : nonbasic) {
             if (st[sz(j)] == NonbasicStatus::Basic) continue;
@@ -1242,6 +1366,7 @@ core::RawResult solve_dual_simplex_prepared(
     // max tells you which single column is holding the run, which is the
     // question a trace is opened to answer.
     const auto true_dual_infeasibility_inf = [&]() {
+        SOR_FN();
         f64 worst = 0.0;
         for (const Index j : nonbasic) {
             if (st[sz(j)] == NonbasicStatus::Basic) continue;
@@ -1262,6 +1387,7 @@ core::RawResult solve_dual_simplex_prepared(
     // value[] moves. Returns whether anything moved; both callers follow up
     // with a full recompute_xB(), so the list of movers is not worth keeping.
     const auto flip_boxed_to_dual_feasible = [&]() {
+        SOR_FN();
         bool moved = false;
         for (const Index j : nonbasic) {
             if (st[sz(j)] == NonbasicStatus::Basic) continue;
@@ -1285,6 +1411,7 @@ core::RawResult solve_dual_simplex_prepared(
     // working bounds. Both phase transitions rewrite lo/hi under the statuses,
     // so this is what puts value[] back in agreement with them.
     const auto set_values_from_status = [&]() {
+        SOR_FN();
         for (const Index j : nonbasic) {
             if (st[sz(j)] == NonbasicStatus::Basic) continue;
             const f64 l = lo[sz(j)], u = hi[sz(j)];
@@ -1315,6 +1442,7 @@ core::RawResult solve_dual_simplex_prepared(
     };
 
     const auto recompute_pi = [&]() {
+        SOR_FN();
         for (Index i = 0; i < m; ++i)
             cB[sz(i)] = work_cost[sz(basis[sz(i)])];
         y = cB;
@@ -1347,6 +1475,7 @@ core::RawResult solve_dual_simplex_prepared(
     // symptom of a broken factorization, so it is refused and reported as
     // numerical trouble instead of being written into the working costs.
     const auto shift_cost = [&](Index j, f64 delta) -> bool {
+        SOR_FN();
         if (delta == 0.0 || !std::isfinite(delta)) return false;
         // Ablation hook for pilot87 H2: refuse every shift and count it.
         if (std::getenv("SOR_DUAL_NO_COST_SHIFT") != nullptr) {
@@ -1382,6 +1511,7 @@ core::RawResult solve_dual_simplex_prepared(
     // re-derive pi and every reduced cost exactly. Returns whether anything
     // had to change, so callers can skip the follow-up repairs otherwise.
     const auto restore_true_costs = [&]() {
+        SOR_FN();
         if (!costs_perturbed && !costs_shifted) return false;
         work_cost = cost;
         if (costs_shifted)
@@ -1440,6 +1570,7 @@ core::RawResult solve_dual_simplex_prepared(
     // to basic and nonbasic alike: chuzr measures primal infeasibility of the
     // SUBPROBLEM, so a basic variable needs the subproblem's bounds too.
     const auto phase1_bounds_of = [&](Index j, f64& l1, f64& u1) {
+        SOR_FN();
         const f64 l = true_lo[sz(j)], u = true_hi[sz(j)];
         if (l <= -kInf && u >= kInf)      { l1 = -1000.0; u1 = 1000.0; }  // free
         else if (l <= -kInf)              { l1 =    -1.0; u1 =    0.0; }  // (-inf, u]
@@ -1457,6 +1588,7 @@ core::RawResult solve_dual_simplex_prepared(
     // This is the ENTRY parking: it re-derives every status from scratch, which
     // is what makes the subproblem dual feasible to begin with.
     const auto park_phase1_nonbasics = [&]() {
+        SOR_FN();
         for (const Index j : nonbasic) {
             if (st[sz(j)] == NonbasicStatus::Basic) continue;
             st[sz(j)] = (reduced_cost(j) >= 0.0) ? NonbasicStatus::AtLower
@@ -1482,6 +1614,7 @@ core::RawResult solve_dual_simplex_prepared(
     // (Optimal) to 197 180 (time limit) and 25fv47 from 3 475 to 62 040.
     // Returns whether anything moved, so the caller can skip a needless FTRAN.
     const auto repair_phase1_parking = [&]() {
+        SOR_FN();
         bool moved = false;
         for (const Index j : nonbasic) {
             if (st[sz(j)] == NonbasicStatus::Basic) continue;
@@ -1501,6 +1634,7 @@ core::RawResult solve_dual_simplex_prepared(
     };
 
     const auto enter_phase1 = [&]() {
+        SOR_FN();
         for (Index j = 0; j < nt; ++j) phase1_bounds_of(j, lo[sz(j)], hi[sz(j)]);
         artificial_bounds_active = true;
         park_phase1_nonbasics();
@@ -1515,6 +1649,7 @@ core::RawResult solve_dual_simplex_prepared(
     // MODEL has to go through this first: while phase 1 is installed they
     // describe the artificial subproblem instead. Idempotent.
     const auto restore_true_bounds = [&]() {
+        SOR_FN();
         lo = true_lo;
         hi = true_hi;
         artificial_bounds_active = false;
@@ -1524,6 +1659,7 @@ core::RawResult solve_dual_simplex_prepared(
     };
 
     const auto enter_phase2 = [&]() {
+        SOR_FN();
         lo = true_lo;
         hi = true_hi;
         artificial_bounds_active = false;
@@ -1548,6 +1684,7 @@ core::RawResult solve_dual_simplex_prepared(
     // it does not immediately become a zero-ratio breakpoint. Returns whether
     // any status changed (the caller then refreshes xB).
     const auto correct_dual_infeasibilities = [&]() {
+        SOR_FN();
         bool flipped = false;
         for (const Index j : nonbasic) {
             if (st[sz(j)] == NonbasicStatus::Basic) continue;
@@ -1596,6 +1733,7 @@ core::RawResult solve_dual_simplex_prepared(
     // exit (no leaving row and no entering column). Returns whether anything
     // changed; the caller must then re-evaluate rather than conclude.
     const auto cleanup_working_costs = [&]() {
+        SOR_FN();
         if (!restore_true_costs()) return false;
         if (phase == 1) {
             if (repair_phase1_parking()) recompute_xB();
@@ -1669,9 +1807,18 @@ core::RawResult solve_dual_simplex_prepared(
     bool expand_active = opts.use_expand;
     f64 expand_eps = expand_start;
 
-    const auto do_factorize = [&]() {
+    // Split so an EXPERIMENTAL adopted factor can skip ONLY the LU work
+    // (factorize_only) while still running everything that depends on the
+    // (possibly changed) bounds/costs rather than on B itself
+    // (after_factorize_common) -- recompute_xB/pi, weight init, phase
+    // routing. Adopting a factor says "B is unchanged"; it says nothing
+    // about bounds or costs, which a bound/RHS/objective reoptimization
+    // changes by construction. do_factorize() below is exactly the
+    // pre-existing behavior (factorize_only then after_factorize_common) for
+    // every call site except the new adopt-aware first call.
+    const auto factorize_only = [&]() {
+        SOR_FN();
         const auto t0 = tick();
-        const auto repairs_before = diag.basis_repairs;
         build_basis_matrix();
         if (!factor.factorize(m, bcp, bri, bvals, lu_opts, &bad_slots, &vacant_rows)) {
             const auto n = std::min(bad_slots.size(), vacant_rows.size());
@@ -1706,6 +1853,9 @@ core::RawResult solve_dual_simplex_prepared(
                           static_cast<unsigned long long>(diag.basis_repairs));
             SOR_ROUTE_PATH(1, "simplex_dual", "factor", "refactor", l1);
         }
+    };
+    const auto after_factorize_common = [&](std::uint64_t repairs_before) {
+        SOR_FN();
         // A repair moved columns in and out of the basis without going through
         // the pivot path, so the partitioned row store is rebuilt rather than
         // tracked. Repairs are rare and bounded by max_basis_repairs.
@@ -1726,7 +1876,9 @@ core::RawResult solve_dual_simplex_prepared(
         // ||B^-T e_r||^2 from its mandatory BTRAN every pivot. Recomputing all
         // m weights here costs m extra BTRANs per reinversion and was the main
         // reason the first exact-DSE prototype lost despite fewer pivots.
-        if (diag.refactorizations == 1 || diag.basis_repairs != repairs_before) {
+        const bool first_factor_event =
+            diag.refactorizations + diag.factor_adoptions == 1;
+        if (first_factor_event || diag.basis_repairs != repairs_before) {
             // Carried weights describe a basis, not a factorization, so they
             // survive the reinversion that brought us here; adopt_carried_
             // weights() re-checks the basis itself, which is what a repair
@@ -1738,7 +1890,7 @@ core::RawResult solve_dual_simplex_prepared(
             // Restore the subproblem's dual-feasibility invariant against the
             // freshly rebuilt reduced costs; see repair_phase1_parking().
             if (repair_phase1_parking()) recompute_xB();
-        } else if (diag.refactorizations == 1) {
+        } else if (first_factor_event) {
             // The FIRST factorization routes the run: a starting basis that is
             // dual infeasible for one-sided or free columns needs phase 1.
             // Boxed columns are parked by sign first, since a flip is free.
@@ -1764,12 +1916,54 @@ core::RawResult solve_dual_simplex_prepared(
             }
         }
     };
+    // Unchanged behavior for every call site except the new adopt-aware
+    // first call below: factorize, then run everything that depends on it.
+    const auto do_factorize = [&]() {
+        SOR_FN();
+        const auto repairs_before = diag.basis_repairs;
+        factorize_only();
+        after_factorize_common(repairs_before);
+    };
 
-    do_factorize();
-    // do_factorize() runs with phase == 2 and therefore already installed
-    // phase 1 if this starting basis is dual infeasible. Nothing more to do.
+    // EXPERIMENTAL factor reuse: the ONLY point a carried factor is eligible.
+    // Adopt only under the exact condition that makes it bit-identical to
+    // what factorize_only() would compute here -- same row count and the
+    // same basis vector (columns AND slot order) it was captured at.
+    // Anything else (no carrier, mismatched basis, wrong dimensions) falls
+    // through to the normal cold factorization; correctness never depends on
+    // this path firing. after_factorize_common ALWAYS runs either way -- it
+    // is what re-derives xB/duals/phase from the (possibly changed)
+    // bounds/costs, which adopting a factor says nothing about.
+    {
+        const auto repairs_before = diag.basis_repairs;
+        bool factor_adopted = false;
+        if (have_carried_factor && factor_carrier_matrix != nullptr &&
+            factor_carrier_rows == m &&
+            carried_factor_basis.size() == static_cast<std::size_t>(m) &&
+            carried_factor_basis == basis) {
+            const auto t0 = tick();
+            factor = std::move(carried_factor);
+            diag.factor_reuse_ms += tock(t0);
+            diag.factor_reused = true;
+            ++diag.factor_adoptions;  // not a factorization (plan 3K)
+            factor_adopted = true;
+        }
+        const auto t_first = Clock::now();
+        if (!factor_adopted) {
+            factorize_only();
+        }
+        diag.first_factor_ms = ms_since(t_first);
+        const auto t_after = Clock::now();
+        after_factorize_common(repairs_before);
+        diag.after_first_factor_ms = ms_since(t_after);
+    }
+    // Phase 1 was already installed above if this starting basis (adopted or
+    // freshly factored) is dual infeasible for the CURRENT costs/bounds --
+    // after_factorize_common's phase routing runs regardless of how `factor`
+    // became valid, so nothing downstream distinguishes the two paths.
 
     const auto leave_row_score = [&](Index i, bool* to_lower = nullptr) -> f64 {
+        SOR_FN();
         const f64 x = xB[sz(i)], t = slot_ptol[sz(i)];
         f64 violation = 0.0;
         bool lower = true;
@@ -1788,6 +1982,7 @@ core::RawResult solve_dual_simplex_prepared(
     };
 
     const auto refresh_leave_heap = [&]() {
+        SOR_FN();
         if (leave_heap_all_dirty) {
             leave_heap.rebuild(m, leave_row_score);
             diag.chuzr_rows_scanned += static_cast<std::uint64_t>(m);
@@ -1817,6 +2012,7 @@ core::RawResult solve_dual_simplex_prepared(
     };
 
     const auto apply_pivot = [&](Index q, int qdir, f64 t, Index leave) {
+        SOR_FN();
         const f64 xp_before = (leave < 0) ? 0.0 : xB[sz(leave)];
         // xB is slot-indexed, alpha is slot-indexed: iterate alpha's
         // touched set when the last FTRAN stayed hypersparse (entries with
@@ -1969,6 +2165,7 @@ core::RawResult solve_dual_simplex_prepared(
                 dse_switch_pending = dse_switch_pending ||
                                      dse_accuracy_switch_pending;
                 const auto w_iter = [&](auto&& fn) {
+                    SOR_FN();
                     if (alpha_is_sparse) {
                         for (const Index i : alpha_support) {
                             if (i == leave || alpha[sz(i)] == 0.0) continue;
@@ -1982,11 +2179,12 @@ core::RawResult solve_dual_simplex_prepared(
                     }
                 };
                 w_iter([&](Index i) {
+                    SOR_FN();
                     const f64 r = alpha[sz(i)] / ap;
                     const f64 candidate =
                         row_w[sz(i)] - 2.0 * r * tau[sz(i)] + r * r * wr;
                     if (std::isfinite(candidate))
-                        row_w[sz(i)] = std::max(candidate, 1e-10);
+                        row_w[sz(i)] = std::max(candidate, opts.dse_weight_floor);
                 });
             } else {
                 // Dual Devex row weights (Forrest & Goldfarb):
@@ -1999,6 +2197,7 @@ core::RawResult solve_dual_simplex_prepared(
                 // alpha_iq == 0 leaves w_i unchanged in both update rules, so the
                 // loop may run over alpha's support only.
                 const auto w_iter = [&](auto&& fn) {
+                    SOR_FN();
                     if (alpha_is_sparse) {
                         for (const Index i : alpha_support) {
                             if (i == leave) continue;
@@ -2012,6 +2211,7 @@ core::RawResult solve_dual_simplex_prepared(
                     }
                 };
                 w_iter([&](Index i) {
+                    SOR_FN();
                     const f64 r = alpha[sz(i)] / ap;
                     const f64 candidate = r * r * wr;
                     if (std::isfinite(candidate))
@@ -2027,7 +2227,7 @@ core::RawResult solve_dual_simplex_prepared(
             const f64 leaving_w = wr / ap2;
             if (dse_active) {
                 row_w[sz(leave)] = std::isfinite(leaving_w)
-                                       ? std::max(leaving_w, 1e-10) : 1.0;
+                                       ? std::max(leaving_w, opts.dse_weight_floor) : 1.0;
             } else {
                 row_w[sz(leave)] = std::isfinite(leaving_w)
                                        ? std::max(1.0, leaving_w) : 1.0;
@@ -2037,6 +2237,7 @@ core::RawResult solve_dual_simplex_prepared(
     };
 
     const auto maybe_update_factor = [&](Index leave, int& since_refactor) {
+        SOR_FN();
         if (leave < 0) return;
         const f64 ap = (sz(leave) < alpha.size()) ? std::fabs(alpha[sz(leave)]) : 0.0;
         const f64 mult = (ap > 0.0) ? 1.0 / ap : std::numeric_limits<f64>::infinity();
@@ -2123,6 +2324,14 @@ core::RawResult solve_dual_simplex_prepared(
     // in at the primal-infeasible-with-no-entering-column termination below.
     std::vector<f64> farkas_ray;
     f64 farkas_ray_violation = core::kPosInf;
+    // A rejected DSE row causes a repricing pass without a basis change, so it
+    // intentionally does not consume a simplex iteration.  Track those passes
+    // separately: otherwise the ordinary iter%64 deadline/cancellation poll
+    // can be skipped indefinitely at an unlucky iteration number.  With an
+    // unchanged basis, repairing one exact row weight must prevent that same
+    // row from being rejected again; more than m rejections is therefore a
+    // broken cache/selection invariant rather than useful work.
+    std::uint64_t dse_rejections_same_basis = 0;
 
     // ---- stall detection --------------------------------------------------
     // The dual simplex drives the total primal infeasibility monotonically to
@@ -2143,9 +2352,129 @@ core::RawResult solve_dual_simplex_prepared(
     constexpr int kMeritEvery = 64;      // merit is O(m) (phase 2) / O(nt) (phase 1)
     constexpr int kFlatLimit  = 32;      // ~2048 iterations with no improvement
 
+    // ---- stalling perturbation (Koberstein 2005 §6.3.1) --------------------
+    // If the problem was not perturbed at the start and the dual objective
+    // has not improved for maxcycle = 3*phi consecutive iterations, perturb
+    // the degenerate positions of the structural non-fixed, non-free costs.
+    // Mid-run the sign is the one that keeps the column dual feasible for
+    // its current bound (step 2, "the right sign w.r.t. dual feasibility"),
+    // so |d_j| grows and no phase restarts.
+    const f64 phi = std::min(100.0 + static_cast<f64>(m) / 200.0, 2000.0);
+    const std::uint64_t maxcycle = static_cast<std::uint64_t>(3.0 * phi);
+    std::uint64_t no_improvement = 0;
+    bool stall_perturbation_done = costs_perturbed;
+    const auto perturb_degenerate_positions = [&]() {
+        SOR_FN();
+        stall_perturbation_done = true;
+        std::uint64_t changed = 0;
+        for (Index j = 0; j < ns; ++j) {
+            const NonbasicStatus s_j = st[sz(j)];
+            if (s_j != NonbasicStatus::AtLower && s_j != NonbasicStatus::AtUpper)
+                continue;
+            if (!perturbable(j)) continue;
+            if (std::fabs(redcost[sz(j)]) > dtol[sz(j)]) continue;   // degenerate only
+            const f64 delta = koberstein_perturbation(
+                cost[sz(j)], s_j == NonbasicStatus::AtUpper,
+                deterministic_fraction(static_cast<std::uint64_t>(j)),
+                column_nonzeros(j), opts.dual_feas_tol, mean_abs_cost);
+            work_cost[sz(j)] += delta;
+            redcost[sz(j)] += delta;
+            ++changed;
+        }
+        if (changed == 0) return;
+        costs_perturbed = true;
+        diag.perturbed_costs += changed;
+        ++diag.stall_perturbations;
+        SOR_ROUTE(1, "simplex_dual", "stall_perturbation");
+    };
+
+    // ---- objective-stagnation detector -----------------------------------
+    // no_improvement above counts CONSECUTIVE theta_dual = 0 pivots. A cycle
+    // that alternates degenerate and tiny nonzero steps (Harris/bound-flip
+    // steps can cancel) never reaches maxcycle while the objective never
+    // moves: measured on misc03 with learned nogood rows, 135k pivots over
+    // an identical objective until the time limit. So also measure the
+    // working objective every kStagWindow phase-2 pivots. No progress over a
+    // window: perturb the degenerate positions, logical columns included
+    // (such cycles run through cut/nogood slacks, which the structural-only
+    // stall perturbation never touches); at most two such perturbations.
+    // Still no progress four windows later: stop with "cycling detected" so
+    // the caller can re-solve differently instead of burning its budget.
+    constexpr std::uint64_t kStagWindow = 512;
+    bool stag_have = false;
+    f64 stag_obj = 0.0;
+    int stag_windows = 0;
+    int stag_perturbs = 0;
+    const auto working_objective = [&]() {
+        long double obj = 0.0L;
+        for (Index i = 0; i < m; ++i)
+            obj += static_cast<long double>(work_cost[sz(basis[sz(i)])]) * xB[sz(i)];
+        for (Index j = 0; j < nt; ++j)
+            if (st[sz(j)] != NonbasicStatus::Basic)
+                obj += static_cast<long double>(work_cost[sz(j)]) * value[sz(j)];
+        return static_cast<f64>(obj);
+    };
+    const auto perturb_stagnation = [&]() {
+        SOR_FN();
+        std::uint64_t changed = 0;
+        for (Index j = 0; j < nt; ++j) {
+            const NonbasicStatus s_j = st[sz(j)];
+            if (s_j != NonbasicStatus::AtLower && s_j != NonbasicStatus::AtUpper)
+                continue;
+            if (!perturbable(j)) continue;
+            if (std::fabs(redcost[sz(j)]) > dtol[sz(j)]) continue;   // degenerate only
+            const Index nz = j < ns ? column_nonzeros(j) : 1;
+            const f64 delta = koberstein_perturbation(
+                cost[sz(j)], s_j == NonbasicStatus::AtUpper,
+                deterministic_fraction(static_cast<std::uint64_t>(j) + 7919u * (stag_perturbs + 1)),
+                nz, opts.dual_feas_tol, mean_abs_cost);
+            work_cost[sz(j)] += delta;
+            redcost[sz(j)] += delta;
+            ++changed;
+        }
+        stall_perturbation_done = true;
+        if (changed == 0) return;
+        costs_perturbed = true;
+        diag.perturbed_costs += changed;
+        ++diag.stagnation_perturbations;
+        SOR_ROUTE(1, "simplex_dual", "stagnation_perturbation");
+    };
+
     const auto t_loop = Clock::now();
     for (;;) {
         dse_tau_precomputed = false;
+        if (phase == 2 && iter > 0 && (iter % 32) == 0 && d_valid &&
+            opts.objective_limit < std::numeric_limits<f64>::infinity() &&
+            !costs_perturbed && !costs_shifted &&
+            working_objective() + sense * pmin.obj_offset >= opts.objective_limit) {
+            status = core::Status::Interrupted;
+            reason = "objective limit";
+            ++diag.objective_limit_exits;
+            break;
+        }
+        if (phase == 2 && iter > 0 && (iter % kStagWindow) == 0 && d_valid) {
+            const f64 obj = working_objective();
+            if (stag_have && obj <= stag_obj + 1e-9 * (1.0 + std::fabs(stag_obj))) {
+                ++stag_windows;
+                if (stag_perturbs < 2 && koberstein_perturbation_on) {
+                    perturb_stagnation();
+                    ++stag_perturbs;
+                    stag_windows = 0;
+                } else if (stag_windows >= 4) {
+                    status = core::Status::Interrupted;
+                    reason = "cycling detected (no objective progress over " +
+                             std::to_string(4 * kStagWindow) + " pivots after " +
+                             std::to_string(stag_perturbs) + " perturbations)";
+                    ++diag.cycling_exits;
+                    route_simplex_dual_terminal("terminal_status", status, iter, phase);
+                    break;
+                }
+            } else {
+                stag_windows = 0;
+            }
+            stag_obj = obj;
+            stag_have = true;
+        }
         if (iter >= max_iter) {
             status = core::Status::Interrupted;
             reason = "iteration limit (" + std::to_string(max_iter) + ")";
@@ -2234,6 +2563,7 @@ core::RawResult solve_dual_simplex_prepared(
             bool leave_to_lower = true;
             const auto exhaustive_leave = [&](bool count_work,
                                                bool* direction) -> Index {
+                SOR_FN();
                 f64 best = 0.0;
                 Index selected = -1;
                 bool selected_to_lower = true;
@@ -2419,11 +2749,14 @@ core::RawResult solve_dual_simplex_prepared(
                 mark_leave_row_dirty(leave);
                 if (!dual_dse_accept_weight(updated_weight, computed_weight)) {
                     ++diag.dse_weight_rejections;
-                    // A rejected row proves the propagated weights made an
-                    // unsafe row look artificially attractive. Default Choose
-                    // policy rebuilds exact DSE from the unchanged basis;
-                    // SOR_DUAL_CHOOSE_DEVEX_FALLBACK restores the old immediate
-                    // Devex handoff used for A/B.
+                    ++dse_rejections_same_basis;
+                    // The exact BTRAN norm above has already repaired this
+                    // candidate. Reprice from the unchanged basis instead of
+                    // rebuilding all m edge weights: one bad candidate is not
+                    // evidence that every propagated weight is stale, and an
+                    // all-row rebuild costs m additional BTRANs. The aggregate
+                    // error controller below still requests a full rebuild (or
+                    // the A/B Devex handoff) when drift persists.
                     if (allow_dse_to_devex_switch) {
                         dse_active = false;
                         dse_switch_pending = false;
@@ -2433,9 +2766,32 @@ core::RawResult solve_dual_simplex_prepared(
                         ++diag.dse_accuracy_switches;
                         SOR_ROUTE(1, "simplex_dual", "dse_to_devex",
                                   "\"reason\":\"weight_rejection\"");
-                    } else if (allow_dse_adaptive) {
-                        rebuild_dse_on_drift(
-                            "\"reason\":\"weight_rejection\"");
+                    }
+                    if (dse_rejections_same_basis >
+                        static_cast<std::uint64_t>(std::max<Index>(m, 0))) {
+                        status = core::Status::NumericalFailure;
+                        reason = "DSE repricing repeated a repaired row without "
+                                 "a basis change";
+                        route_simplex_dual_terminal("numerical_failure", status,
+                                                    iter, phase);
+                        break;
+                    }
+                    if (opts.time_limit_s > 0.0 &&
+                        std::chrono::duration<double>(Clock::now() - t_all)
+                                .count() > opts.time_limit_s) {
+                        status = core::Status::Interrupted;
+                        reason = "time limit (" +
+                                 std::to_string(opts.time_limit_s) + "s)";
+                        route_simplex_dual_terminal("terminal_status", status,
+                                                    iter, phase);
+                        break;
+                    }
+                    if (core::cancel_requested(opts.cancel)) {
+                        status = core::Status::Interrupted;
+                        reason = "cancelled (concurrent race lost)";
+                        route_simplex_dual_terminal("terminal_status", status,
+                                                    iter, phase);
+                        break;
                     }
                     continue;
                 }
@@ -2468,6 +2824,7 @@ core::RawResult solve_dual_simplex_prepared(
             const bool check_devex_weight = use_devex && !dse_active;
             f64 computed_devex_weight = 0.0;
             const auto add_candidate = [&](Index j, f64 aj) {
+                SOR_FN();
                 const f64 sa = srow * aj;
                 bool elig = false;
                 switch (st[sz(j)]) {
@@ -2705,6 +3062,7 @@ core::RawResult solve_dual_simplex_prepared(
             }
             ftran_seed.clear();
             for_col(q, [&](Index i, f64 v) {
+                SOR_FN();
                 alpha[sz(i)] += v;
                 ftran_seed.push_back(i);
             });
@@ -2747,6 +3105,7 @@ core::RawResult solve_dual_simplex_prepared(
                 ++alpha_stamp_gen;
                 for (const Index s : alpha_support) alpha_stamp[sz(s)] = alpha_stamp_gen;
                 for_col(q, [&](Index i, f64) {
+                    SOR_FN();
                     if (alpha_stamp[sz(i)] != alpha_stamp_gen) alpha[sz(i)] = 0.0;
                 });
             } else {
@@ -2830,6 +3189,7 @@ core::RawResult solve_dual_simplex_prepared(
                     for (const Index i : rho_support)
                         y[sz(i)] += theta * rho[sz(i)];
                 } else {
+#pragma omp simd
                     for (Index i = 0; i < m; ++i) y[sz(i)] += theta * rho[sz(i)];
                 }
                 if (prow_active_only) {
@@ -2874,6 +3234,10 @@ core::RawResult solve_dual_simplex_prepared(
             if (renew_devex_framework) reset_devex_framework();
         }
 
+        // The dual objective changes by theta_dual * (primal infeasibility of
+        // the leaving row); it does not improve exactly when theta_dual = 0.
+        if (std::fabs(theta_dual) <= 1e-12) ++no_improvement;
+        else no_improvement = 0;
         if (t_step <= 1e-12) {
             ++diag.degenerate_steps;
             if (expand_active) {
@@ -2884,6 +3248,10 @@ core::RawResult solve_dual_simplex_prepared(
         }
 
         ++iter;
+        dse_rejections_same_basis = 0;
+        if (koberstein_perturbation_on && phase == 2 &&
+            !stall_perturbation_done && no_improvement >= maxcycle)
+            perturb_degenerate_positions();
         if (phase == 1) ++diag.phase1_iterations;
         else            ++diag.phase2_iterations;
 
@@ -3026,6 +3394,7 @@ core::RawResult solve_dual_simplex_prepared(
     // bounds back and re-derive the point before any of that runs.
     if (phase == 1 && !true_bounds_restored) restore_true_bounds();
 
+    const auto t_post = Clock::now();
     // ---- 7. assemble the solution and unscale ---------------------------
     std::vector<f64> x(sz(ns), 0.0);
     for (Index j = 0; j < ns; ++j) {
@@ -3079,6 +3448,7 @@ core::RawResult solve_dual_simplex_prepared(
     // inconsistent one.
     const f64 at_tol = std::max(kAtBound, opts.primal_feas_tol);
     const auto accum_dual = [&](f64 v, f64 l, f64 u, f64 d) {
+        SOR_FN();
         const bool at_lo = (l > -kInf) && (v <= l + at_tol * (1.0 + std::fabs(l)));
         const bool at_hi = (u <  kInf) && (v >= u - at_tol * (1.0 + std::fabs(u)));
         if (at_lo && at_hi) return;
@@ -3142,6 +3512,22 @@ core::RawResult solve_dual_simplex_prepared(
         carrier->weights.assign(row_w.begin(), row_w.end());
     }
 
+    // EXPERIMENTAL: hand this run's factorization to the next solve on the
+    // same matrix. Unlike DSE weights this does not depend on which pricing
+    // ran -- `factor` describes B alone. Identity fields are echoed back
+    // exactly as the caller supplied them; a lineage is the caller's to
+    // maintain, the engine only tracks "still describes the matrix I was
+    // told this is."
+    if (factor_carrier != nullptr) {
+        factor_carrier->matrix = factor_carrier_matrix;
+        factor_carrier->rows = factor_carrier_rows;
+        factor_carrier->cols = factor_carrier_cols;
+        factor_carrier->nnz = factor_carrier_nnz;
+        factor_carrier->basis.assign(basis.begin(), basis.end());
+        factor_carrier->factor = std::move(factor);
+        factor_carrier->has_factor = true;
+    }
+
     // ---- 9. report -------------------------------------------------------
     core::RawResult raw;
     raw.x = std::move(x);
@@ -3176,6 +3562,7 @@ core::RawResult solve_dual_simplex_prepared(
             break;
     }
 
+    diag.post_solve_ms = ms_since(t_post);
     diag.total_ms = ms_since(t_all);
     return raw;
 }
@@ -3186,6 +3573,7 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
                                    SimplexBasis* out_basis,
                                    const SimplexBasis* warm,
                                    DualEdgeWeightCarrier* weights) {
+    SOR_FN();
     const auto t0 = Clock::now();
     // Dimension check against the problem in hand. The caller owns the matrix
     // token (see DualEdgeWeightCarrier); this only catches the case where the
@@ -3221,6 +3609,145 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
     diag.csc_ms = prepared.csc_ms;
     diag.preprocessing_ms = prepared.total_ms;
     diag.preprocessing_builds = 1;
+    diag.total_ms = ms_since(t0);
+    return raw;
+}
+
+struct DualProbeSession::Impl {
+    SimplexPrepared prepared;
+    bool prep_reported = false;  // preparation cost charged to one solve only
+    DualEdgeWeightCarrier weights;
+    FactorCarrier factor;
+};
+
+DualProbeSession::DualProbeSession(const model::LpProblem& problem,
+                                   const SimplexOptions& opts)
+    : impl_(std::make_unique<Impl>()) {
+    SOR_FN();
+    impl_->prepared = prepare_simplex_model(problem, opts);
+}
+
+DualProbeSession::~DualProbeSession() = default;
+
+void DualProbeSession::set_column_bounds(const std::vector<f64>& lo,
+                                         const std::vector<f64>& hi) {
+    auto& pr = impl_->prepared;
+    const Index n = pr.scaled.n_cols();
+    if (static_cast<Index>(lo.size()) != n || static_cast<Index>(hi.size()) != n)
+        throw std::invalid_argument("DualProbeSession::set_column_bounds: size");
+    for (Index j = 0; j < n; ++j) {
+        const auto jj = sz(j);
+        const f64 s = pr.scaling.col_scale[jj];
+        pr.pmin.col_lo[jj] = lo[jj];
+        pr.pmin.col_hi[jj] = hi[jj];
+        const f64 slo = lo[jj] > -kInf ? lo[jj] / s : lo[jj];
+        const f64 shi = hi[jj] < kInf ? hi[jj] / s : hi[jj];
+        pr.scaled.col_lo[jj] = slo;
+        pr.scaled.col_hi[jj] = shi;
+        pr.lo[jj] = slo;
+        pr.hi[jj] = shi;
+    }
+}
+
+const FactorCarrier& DualProbeSession::final_factor() const {
+    return impl_->factor;
+}
+
+const std::vector<f64>& DualProbeSession::final_weights() const {
+    return impl_->weights.weights;
+}
+const std::vector<Index>& DualProbeSession::final_weights_basis() const {
+    return impl_->weights.basis;
+}
+
+core::RawResult DualProbeSession::solve(const SimplexOptions& opts,
+                                        SimplexDiagnostics& diag,
+                                        SimplexBasis* out_basis,
+                                        const SimplexBasis* warm,
+                                        const std::vector<f64>* warm_weights,
+                                        const FactorCarrier* warm_factor) {
+    SOR_FN();
+    const auto t0 = Clock::now();
+    auto& im = *impl_;
+    const auto& p = im.prepared.scaled;
+    im.weights.clear();
+    im.weights.matrix = this;
+    if (warm != nullptr && warm_weights != nullptr &&
+        warm_weights->size() == warm->basic.size()) {
+        im.weights.basis = warm->basic;
+        im.weights.weights = *warm_weights;
+    }
+    im.factor.clear();
+    if (warm != nullptr && warm_factor != nullptr && warm_factor->has_factor &&
+        warm_factor->basis == warm->basic) {
+        im.factor.factor = warm_factor->factor;   // copy: the engine updates it
+        im.factor.basis = warm_factor->basis;
+        im.factor.has_factor = true;
+    }
+    im.factor.matrix = this;
+    im.factor.rows = p.n_rows();
+    im.factor.cols = p.n_cols();
+    im.factor.nnz = static_cast<Offset>(p.A.vals.size());
+    auto raw = solve_dual_simplex_prepared(im.prepared, opts, diag, out_basis,
+                                           warm, &im.weights, &im.factor);
+    // Charge the one-time preparation to the first solve that uses it; a
+    // reused workspace prepared nothing.
+    const double prep = im.prep_reported ? 0.0 : im.prepared.total_ms;
+    if (!im.prep_reported) {
+        diag.scaling_ms = im.prepared.scaling_ms;
+        diag.csc_ms = im.prepared.csc_ms;
+        diag.preprocessing_builds = 1;
+        im.prep_reported = true;
+    }
+    diag.preprocessing_ms = prep;
+    diag.total_ms = prep + ms_since(t0);
+    return raw;
+}
+
+core::RawResult DualProbeSession::probe(Index j, f64 lo, f64 hi,
+                                        const SimplexOptions& opts,
+                                        SimplexDiagnostics& diag,
+                                        const SimplexBasis& base) {
+    SOR_FN();
+    const auto t0 = Clock::now();
+    auto& im = *impl_;
+    auto& pr = im.prepared;
+    const auto jj = sz(j);
+    // Same transformation prepare_simplex_model applies: the minimization
+    // copy keeps bounds as given, Ruiz divides them by the column scale.
+    const f64 s = pr.scaling.col_scale[jj];
+    const f64 slo = lo > -kInf ? lo / s : lo;
+    const f64 shi = hi < kInf ? hi / s : hi;
+    struct Saved { f64 plo, phi, qlo, qhi, alo, ahi; };
+    const Saved saved{pr.pmin.col_lo[jj], pr.pmin.col_hi[jj],
+                      pr.scaled.col_lo[jj], pr.scaled.col_hi[jj],
+                      pr.lo[jj], pr.hi[jj]};
+    struct Restore {
+        SimplexPrepared& pr;
+        std::size_t jj;
+        const Saved& v;
+        ~Restore() {
+            pr.pmin.col_lo[jj] = v.plo;
+            pr.pmin.col_hi[jj] = v.phi;
+            pr.scaled.col_lo[jj] = v.qlo;
+            pr.scaled.col_hi[jj] = v.qhi;
+            pr.lo[jj] = v.alo;
+            pr.hi[jj] = v.ahi;
+        }
+    } restore{pr, jj, saved};
+    pr.pmin.col_lo[jj] = lo;
+    pr.pmin.col_hi[jj] = hi;
+    pr.scaled.col_lo[jj] = slo;
+    pr.scaled.col_hi[jj] = shi;
+    pr.lo[jj] = slo;
+    pr.hi[jj] = shi;
+
+    DualEdgeWeightCarrier weights = im.weights;
+    FactorCarrier factor = im.factor;
+    auto raw = solve_dual_simplex_prepared(
+        pr, opts, diag, nullptr, &base,
+        weights.weights.empty() ? nullptr : &weights,
+        factor.has_factor ? &factor : nullptr);
     diag.total_ms = ms_since(t0);
     return raw;
 }

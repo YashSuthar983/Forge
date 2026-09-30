@@ -37,10 +37,16 @@ core::RawResult solve_primal_simplex_prepared(
     SimplexDiagnostics& diag, SimplexBasis* out_basis,
     const SimplexBasis* warm = nullptr);
 
+// `factor_carrier` (optional, EXPERIMENTAL -- repeated-LP reuse
+// measurement): see FactorCarrier's own doc comment in dual_simplex.hpp. Read
+// (and copied) at the initial factorization when it validates against `warm`;
+// overwritten with this run's final factor on the one normal exit, same
+// discipline as `carrier`.
 core::RawResult solve_dual_simplex_prepared(
     const SimplexPrepared& prepared, const SimplexOptions& opts,
     SimplexDiagnostics& diag, SimplexBasis* out_basis,
-    const SimplexBasis* warm, DualEdgeWeightCarrier* carrier = nullptr);
+    const SimplexBasis* warm, DualEdgeWeightCarrier* carrier = nullptr,
+    FactorCarrier* factor_carrier = nullptr);
 
 // Add one stage's work counters and timers into `total` (and count a stage).
 // Shared by the Auto dispatcher and by the dual engine's primal clean-up so a

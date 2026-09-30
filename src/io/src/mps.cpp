@@ -371,6 +371,13 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
     const Index n_cols = static_cast<Index>(b.col_names.size());
     const Index n_rows = static_cast<Index>(b.rhs.size());
 
+    // An INTORG/INTEND column with no BOUNDS record defaults to binary in
+    // MPS. An explicit bound record instead gives it general integer bounds.
+    for (std::size_t j = 0; j < b.integer_flag.size(); ++j) {
+        if (b.integer_flag[j] && !b.lo_set[j] && !b.hi_set[j])
+            b.col_hi[j] = 1.0;
+    }
+
     model::LpProblem p;
     p.name = name;
     p.maximize = maximize;

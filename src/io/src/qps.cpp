@@ -31,7 +31,7 @@ QpsProblem read_qps_file(const std::string& path, QpsReadReport& rep,
     // Linear part via the existing MPS reader (QUADOBJ is warned/ignored there).
     MpsReadReport mrep;
     QpsProblem qp;
-    qp.linear = read_mps_file_auto(path, mrep, opt.strict);
+    qp.linear = read_mps_file_auto(path, mrep, opt);
     static_cast<MpsReadReport&>(rep) = mrep;
     // QUADOBJ is re-parsed below; drop the LP-only ignore warning.
     rep.warnings.erase(

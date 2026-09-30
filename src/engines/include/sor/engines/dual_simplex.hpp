@@ -4,6 +4,9 @@
 #pragma once
 
 #include "sor/engines/simplex.hpp"
+#include "sor/core/route_debug.hpp"
+
+#include <memory>
 
 namespace sor::engines {
 
@@ -39,6 +42,7 @@ struct DualEdgeWeightCarrier {
     std::vector<core::f64> weights;  // ||B^-T e_i||^2 per basis slot
 
     void clear() {
+        SOR_FN();
         matrix = nullptr;
         rows = 0;
         cols = 0;
@@ -61,5 +65,136 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
                                    SimplexBasis* out_basis = nullptr,
                                    const SimplexBasis* warm = nullptr,
                                    DualEdgeWeightCarrier* weights = nullptr);
+
+// EXPERIMENTAL -- reuse an already-factored basis matrix across a bound/RHS/
+// objective-only reoptimization (repeated-LP reuse measurement, not
+// yet wired into any production caller).
+//
+// B is unchanged by a bound, RHS or cost change: A itself is untouched, so a
+// completed solve's LU factorization is bit-for-bit what a child node's
+// initial do_factorize() would recompute, PROVIDED the child's warm basis is
+// exactly the parent's final basis (same columns, same slot order). Adding or
+// removing a row/column changes B and invalidates the factor -- this carrier
+// must be cleared (or simply not passed) across such a change.
+//
+// SAME MOVE-IN / MOVE-OUT DISCIPLINE AS DualEdgeWeightCarrier, deliberately:
+// the engine takes the carrier's factor at entry (leaving the carrier empty
+// for the duration) and refills it with THIS run's final factor on the one
+// normal exit. A carrier therefore describes exactly one lineage (parent ->
+// this child), not a fan-out.
+//
+// SIBLING REUSE IS THE CALLER'S JOB, not the engine's: BasisFactor::update()/
+// update_ft() mutate in place, so two sibling solves must not consume the
+// same carrier object. Copy it once per sibling before calling --
+// `FactorCarrier child = parent;` is a legitimate O(nnz(L)+nnz(U)) copy
+// (BasisFactor is default-copyable over std::vector) -- and pass each copy to
+// its own call. Time that copy in the caller; it is real cost and belongs
+// next to the do_factorize() it is meant to avoid, not hidden inside the
+// engine where a reader would miss it.
+//
+// Same identity-token discipline as DualEdgeWeightCarrier: the caller sets
+// `matrix` to a token stable for exactly as long as A itself is unchanged.
+// `matrix == nullptr` is never adopted; that is how a caller invalidates the
+// carrier after a row/column change without needing to know the internals.
+//
+// KNOWN COVERAGE GAP, measured on repeated-LP corpus (agent-1, 2026-09):
+// the carrier is refilled ONLY at the one normal exit, same as
+// DualEdgeWeightCarrier -- an early exit (infeasible, time limit) correctly
+// leaves it empty rather than risk handing back a stale factor. But the
+// dual engine has a THIRD, algorithm-intrinsic exit: a hand-off to
+// solve_primal_simplex_prepared() when a proof-producing point still has
+// residual dual infeasibility after the boxed-column flip pass
+// (`needs_primal_cleanup`, see its own long comment in dual_simplex.cpp).
+// That hand-off is NOT gated by cost perturbation and fires readily on
+// larger/harder models regardless of pivot count -- on Netlib pilot87 it
+// fired on every measured node in the corpus (12/12), so this carrier
+// never got refilled at all for that lineage, and reuse silently never
+// fired for any descendant. Small/well-conditioned models (miplib-easy
+// p0033: 8/8 bound-or-RHS-or-cost nodes) are unaffected. This is a real,
+// unclaimed extension: the primal clean-up runs its own separate
+// solve_primal_simplex_prepared() with its own LU factorization, and
+// nothing here reuses IT either. Extending coverage across that hand-off
+// was judged out of scope for this session (a heavier change to an
+// already-hardened, previously-buggy path -- see the dual clean-up
+// hand-off comment above `needs_primal_cleanup`) and is left for
+// follow-up, not silently assumed solved.
+struct FactorCarrier {
+    const void* matrix = nullptr;
+    core::Index rows = 0;
+    core::Index cols = 0;
+    core::Offset nnz = 0;
+    std::vector<core::Index> basis;  // basis this factor was captured at
+    la::BasisFactor factor;
+    bool has_factor = false;
+
+    void clear() {
+        matrix = nullptr;
+        rows = 0;
+        cols = 0;
+        nnz = 0;
+        basis.clear();
+        has_factor = false;
+    }
+};
+
+// One LP, many single-column bound changes: strong branching (Achterberg
+// 2007, section 5.4) solves a node LP and then, for each candidate, the same
+// LP with one bound moved. An LP solver keeps the model, its factorization
+// and its pricing weights alive across those probes; B does not change when
+// a bound does, so they are exact at every probe's starting basis. Without
+// this, each probe re-prepared the model (Ruiz scaling, CSC) and rebuilt all
+// m DSE weights with m BTRANs -- 63% of probe time on nu25-pr12.
+//
+// solve() runs the base LP exactly as solve_dual_simplex would (same
+// preparation, same prepared engine; the carriers start empty, so the path
+// is unchanged) and keeps its final factor and DSE weights. probe() re-solves
+// with column j's bounds replaced, starting from `base` (normally solve()'s
+// final basis) and from COPIES of that factor and those weights -- the
+// engine updates both in place. The engine adopts either only after
+// checking it was captured at exactly `base`; otherwise the probe factors
+// and rebuilds as usual, so correctness never depends on the reuse.
+class DualProbeSession {
+public:
+    DualProbeSession(const model::LpProblem& problem, const SimplexOptions& opts);
+    ~DualProbeSession();
+    DualProbeSession(const DualProbeSession&) = delete;
+    DualProbeSession& operator=(const DualProbeSession&) = delete;
+
+    // `warm_weights` (optional): DSE weights valid for `warm` (e.g. the
+    // parent node's final weights, since a child starts from its parent's
+    // final basis). Adopted only if the engine confirms the basis matches.
+    // `warm_factor` (optional): an LU factorization of `warm`'s basis
+    // matrix taken from THIS session at the same preparation (e.g. the
+    // parent node's final factor). Copied in; adopted only if the engine
+    // confirms the basis matches element for element.
+    core::RawResult solve(const SimplexOptions& opts, SimplexDiagnostics& diag,
+                          SimplexBasis* out_basis, const SimplexBasis* warm,
+                          const std::vector<core::f64>* warm_weights = nullptr,
+                          const FactorCarrier* warm_factor = nullptr);
+
+    // The factorization at solve()'s final basis (has_factor false when the
+    // solve left early). Identity fields describe this session.
+    const FactorCarrier& final_factor() const;
+
+    // Replace all column bounds of the prepared model (O(n), same transform
+    // as prepare: bounds unchanged by minimization, divided by the Ruiz
+    // column scale). This is what lets one session serve every node of a
+    // tree whose matrix is unchanged: no re-preparation per node.
+    void set_column_bounds(const std::vector<core::f64>& lo,
+                           const std::vector<core::f64>& hi);
+
+    // DSE weights at solve()'s final basis (empty when DSE was not the live
+    // pricing at exit, or the solve ended early).
+    const std::vector<core::f64>& final_weights() const;
+    const std::vector<core::Index>& final_weights_basis() const;
+
+    core::RawResult probe(core::Index j, core::f64 lo, core::f64 hi,
+                          const SimplexOptions& opts, SimplexDiagnostics& diag,
+                          const SimplexBasis& base);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 }  // namespace sor::engines

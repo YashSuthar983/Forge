@@ -53,6 +53,7 @@ struct CrossoverDiagnostics {
     bool triggered_by_useful_budget_point = false;
     bool basis_candidate_built = false;
     bool basis_candidate_factorized = false;
+    bool time_limit_reached = false;
     bool warm_cleanup_attempted = false;
     bool cold_fallback = false;
     bool validated_basis = false;

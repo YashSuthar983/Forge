@@ -138,6 +138,7 @@ void test_save_load_roundtrip() {
 void test_fallback_without_model() {
     auto lp = read_text(kKnap);
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.sparse_sb.enabled = true;
     opts.sparse_sb.model_path.clear();  // no model → fallback
@@ -176,6 +177,7 @@ void test_model_pick_fires() {
 
     auto lp = read_text(kFracBranch);
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.branch_strategy = sor::search::BranchStrategy::SparseSb;
     opts.sparse_sb.enabled = true;
@@ -202,6 +204,7 @@ void test_model_pick_fires() {
     opts.lp_rounding_repair = false;
     opts.integer_dive = false;
     opts.integer_neighborhood = false;
+    opts.objective_face = false;  // component test: keep the tree
     opts.integer_row_rounding = false;
     opts.sc_milp.enabled = false;
     opts.lifted.enabled = false;
@@ -228,6 +231,7 @@ void test_classical_ignores_model() {
 
     auto lp = read_text(kKnap);
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Classical;
     opts.sparse_sb.enabled = true;
     opts.sparse_sb.model_path = path;
@@ -247,6 +251,7 @@ void test_collect_out_fit_and_warm_starts() {
     sor::search::SparseSbCollector pool;
     pool.max_samples = 10000;
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.max_nodes = 200;
     opts.time_limit_s = 2.0;

@@ -5,19 +5,12 @@ function(sor_add_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
-sor_add_test(test_options             sor_search sor_engines sor_core)
-sor_add_test(test_qplib               sor_search sor_io)
-target_compile_definitions(test_qplib PRIVATE
-  SOR_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/benchmarks")
-sor_add_test(test_pooling             sor_search sor_io sor_engines)
-target_compile_definitions(test_pooling PRIVATE
-  SOR_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/benchmarks")
 sor_add_test(test_csr                 sor_sparse)
 sor_add_test(test_csc                 sor_sparse)
 sor_add_test(test_lu                  sor_la_cpu)
 sor_add_test(test_lu_ft               sor_la_cpu)
-sor_add_test(test_ldlt               sor_la_cpu)
 sor_add_test(test_backend_parity      sor_backend)
+sor_add_test(test_pdhcg_device        sor_backend sor_engines sor_io)
 sor_add_test(test_no_unproved_optimal sor_certify)
 sor_add_test(test_lp_certificates      sor_certify sor_io)
 sor_add_test(test_mps                 sor_io)
@@ -26,26 +19,36 @@ sor_add_test(test_pdhg                sor_engines sor_certify sor_io)
 sor_add_test(test_simplex             sor_engines sor_certify sor_io)
 sor_add_test(test_dispatch_regressions sor_engines sor_certify sor_io)
 sor_add_test(test_dual_edge_weights   sor_engines)
+sor_add_test(test_factor_reuse        sor_engines sor_certify sor_sparse)
 sor_add_test(test_dual_ratio_test     sor_engines)
 sor_add_test(test_dual_cost_perturbation sor_engines)
 sor_add_test(test_presolve            sor_presolve)
 sor_add_test(test_hpr                 sor_engines sor_certify sor_io)
 sor_add_test(test_lp_device           sor_backend sor_engines sor_io)
-sor_add_test(test_qp_device           sor_backend sor_sparse)
-sor_add_test(test_pdhcg_device        sor_engines sor_backend sor_sparse)
-sor_add_test(test_batched_pdhcg       sor_engines sor_backend sor_sparse)
+sor_add_test(test_binquad_device      sor_backend sor_search sor_io)
+sor_add_test(test_binquad_milp_heuristic sor_backend sor_search sor_certify sor_io)
+target_compile_definitions(test_binquad_device PRIVATE
+  SOR_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 sor_add_test(test_lp_batched          sor_backend sor_engines sor_io)
 sor_add_test(test_r2hpdg              sor_backend sor_engines)
 sor_add_test(test_hpr_integration     sor_engines sor_certify sor_io)
 sor_add_test(test_crossover           sor_engines sor_certify sor_io)
 sor_add_test(test_lp_auto             sor_engines sor_certify sor_io)
 sor_add_test(test_milp                sor_search sor_certify sor_io)
+sor_add_test(test_milp_oracle         sor_search sor_certify sor_io)
+sor_add_test(test_milp_presolve       sor_search sor_certify sor_io)
+sor_add_test(test_milp_random_oracle  sor_search sor_certify sor_io)
+sor_add_test(test_milp_portfolio      sor_search sor_certify sor_io)
+sor_add_test(test_spp_repair  sor_search)
+target_compile_definitions(test_milp PRIVATE
+  SOR_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 sor_add_test(test_milp_policy         sor_search sor_certify sor_io)
 sor_add_test(test_sparse_sb           sor_search sor_certify sor_io)
 sor_add_test(test_sc_milp_branch      sor_search sor_certify sor_io)
 sor_add_test(test_lifted_branch       sor_search sor_certify sor_io)
 sor_add_test(test_planbb              sor_search sor_certify sor_io)
 sor_add_test(test_tree_cuts           sor_search sor_certify sor_io)
+sor_add_test(test_cut_scope           sor_search sor_certify sor_io)
 sor_add_test(test_conflict_trail      sor_search)
 sor_add_test(test_conflict_cut        sor_search sor_certify sor_io)
 sor_add_test(test_lattice_reform      sor_search sor_certify sor_io)
@@ -58,6 +61,8 @@ sor_add_test(test_gf2_presolve        sor_search)
 sor_add_test(test_implied_int         sor_search)
 sor_add_test(test_symmetry            sor_search sor_certify sor_io)
 sor_add_test(test_feasjump            sor_search)
+sor_add_test(test_fixprop             sor_search)
+sor_add_test(test_primal_polish       sor_search)
 sor_add_test(test_lns                 sor_search)
 sor_add_test(test_balans              sor_search)
 sor_add_test(test_kernel_pump         sor_search)
@@ -76,7 +81,6 @@ sor_add_test(test_qps                 sor_io sor_engines sor_certify)
 sor_add_test(test_ps_must             sor_search sor_engines sor_certify sor_io
                                       sor_la_cpu)
 sor_add_test(test_extensions          sor_search sor_engines sor_certify)
-sor_add_test(test_miqp_bb             sor_search sor_engines sor_certify)
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
@@ -93,7 +97,12 @@ endfunction()
 sor_add_python_test(test_compare)
 sor_add_python_test(test_fetch_benchmarks)
 sor_add_python_test(test_qplib_eval)
+sor_add_python_test(test_python_api)
+sor_add_python_test(test_bound_snapshots)
 sor_add_python_test(test_forbidden_dependencies)
+set_tests_properties(test_python_api test_bound_snapshots PROPERTIES
+  ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1;SOR_BINARY_DIR=${CMAKE_BINARY_DIR}"
+  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 set_tests_properties(test_forbidden_dependencies PROPERTIES
   ENVIRONMENT
     "PYTHONDONTWRITEBYTECODE=1;SOR_SOURCE_DIR=${CMAKE_SOURCE_DIR};SOR_BINARY_DIR=${CMAKE_BINARY_DIR}")
@@ -111,16 +120,33 @@ target_compile_definitions(test_dispatch_regressions PRIVATE
 target_compile_definitions(test_hpr_integration PRIVATE
   SOR_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
+# Conflict-cut regressions use real MIPLIB fixtures. Resolve them from the
+# source tree so CTest's build/tests directory cannot silently skip them.
+target_compile_definitions(test_conflict_cut PRIVATE
+  SOR_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
 # Argument validation runs the real CLIs and checks their exit codes, so it
 # needs both binaries and the repo's models.
 sor_add_test(test_cli_validation)
 target_compile_definitions(test_cli_validation PRIVATE
   SOR_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-  SOR_BINARY_DIR="${CMAKE_BINARY_DIR}")
+  SOR_BINARY_DIR="${CMAKE_BINARY_DIR}"
+  $<$<BOOL:${SOR_ROUTE_FN}>:SOR_ROUTE_DEBUG=1>)
 add_dependencies(test_cli_validation sor_solve sor_check)
 
-# --engine auto (.qplib) dispatch table: also drives the real CLI, plus
-# needs the checked-in QPLIB samples the repo already ships.
+# Restored from origin/main
+sor_add_test(test_options             sor_search sor_engines sor_core)
+sor_add_test(test_qplib               sor_search sor_io)
+target_compile_definitions(test_qplib PRIVATE
+  SOR_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/benchmarks")
+sor_add_test(test_pooling             sor_search sor_io sor_engines)
+target_compile_definitions(test_pooling PRIVATE
+  SOR_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/benchmarks")
+sor_add_test(test_ldlt               sor_la_cpu)
+sor_add_test(test_qp_device           sor_backend sor_sparse)
+sor_add_test(test_batched_pdhcg       sor_engines sor_backend sor_sparse)
+sor_add_test(test_miqp_bb             sor_search sor_engines sor_certify)
+
 sor_add_test(test_qplib_auto_engine)
 target_compile_definitions(test_qplib_auto_engine PRIVATE
   SOR_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
@@ -130,14 +156,9 @@ add_dependencies(test_qplib_auto_engine sor_solve)
 sor_add_test(test_qcr                 sor_search sor_io)
 target_compile_definitions(test_qcr PRIVATE
   SOR_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/benchmarks")
-sor_add_test(test_binquad_device      sor_search sor_backend sor_io)
-target_compile_definitions(test_binquad_device PRIVATE
-  SOR_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/benchmarks")
 sor_add_test(test_bqp_bab             sor_search sor_io)
 sor_add_test(test_qp_ipm              sor_engines sor_certify)
 sor_add_test(test_qcqp_ipm            sor_search sor_engines sor_certify)
-# Quadratic constraints in the model layer; shells out to sor_solve for the
-# "every engine reports Unsupported on a QC instance" check.
 sor_add_test(test_qcqp                sor_search sor_engines sor_certify sor_io)
 target_compile_definitions(test_qcqp PRIVATE
   SOR_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
@@ -145,9 +166,6 @@ target_compile_definitions(test_qcqp PRIVATE
 add_dependencies(test_qcqp sor_solve)
 sor_add_test(test_global_qp          sor_search)
 
-# The same device tests with SOR_VK_PROFILE on: timestamp queries bracket
-# every dispatch, and must change nothing the tests check.  (Without a Vulkan
-# device these reduce to the CPU runs, as the unprofiled tests do.)
 foreach(_t test_pdhcg_device test_batched_pdhcg test_lp_device test_qp_device)
   add_test(NAME ${_t}_profiled COMMAND ${_t})
   set_tests_properties(${_t}_profiled PROPERTIES ENVIRONMENT SOR_VK_PROFILE=1)

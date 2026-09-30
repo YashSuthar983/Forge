@@ -4,13 +4,30 @@
 #include "sor/core/route_debug.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace sor::core {
+
+struct RouteFnRec {
+    std::string file;
+    std::string func;
+    std::string path;
+    int line = 0;
+    std::atomic<std::uint64_t> calls{0};
+    std::atomic<std::uint64_t> total_ns{0};
+};
+
 namespace {
 
 // Level is read on every SOR_ROUTE in hot loops, so it is a plain relaxed
@@ -19,6 +36,21 @@ namespace {
 std::atomic<int> g_level{0};
 std::atomic<int> g_pivot_every{0};
 std::atomic<unsigned long long> g_seq{0};
+std::atomic<unsigned long long> g_fn_entered{0};
+std::atomic<int> g_fn_flushed{0};
+
+std::mutex& fn_mutex() {
+    static std::mutex m;
+    return m;
+}
+std::vector<std::string>& fn_filter() {
+    static std::vector<std::string> v;
+    return v;
+}
+std::vector<std::unique_ptr<RouteFnRec>>& fn_recs() {
+    static std::vector<std::unique_ptr<RouteFnRec>> v;
+    return v;
+}
 
 std::mutex& sink_mutex() {
     static std::mutex m;
@@ -86,7 +118,144 @@ const char* bucket_name(RouteLedgerBucket b) {
     }
 }
 
+std::string json_escape(std::string_view in) {
+    std::string out;
+    out.reserve(in.size());
+    for (unsigned char c : in) {
+        if (c == '"' || c == '\\') {
+            out.push_back('\\');
+            out.push_back(static_cast<char>(c));
+        } else if (c >= 0x20) {
+            out.push_back(static_cast<char>(c));
+        }
+    }
+    return out;
+}
+
+std::string shorten_file(std::string_view file) {
+    // Header paths look like .../sor/src/sparse/include/sor/sparse/csr.hpp, so
+    // the last "/sor/" is the include prefix, not the repository root.
+    const auto root = file.find("/sor/");
+    if (root != std::string_view::npos) {
+        const auto rest = file.substr(root + 5);
+        if (rest.starts_with("src/") || rest.starts_with("apps/") ||
+            rest.starts_with("tests/"))
+            return std::string(rest);
+    }
+    for (const char* prefix : {"src/", "apps/", "tests/"}) {
+        const auto pos = file.find(prefix);
+        if (pos != std::string_view::npos)
+            return std::string(file.substr(pos));
+    }
+    return std::string(file);
+}
+
+std::string subsystem_of(std::string_view file) {
+    const std::string short_file = shorten_file(file);
+    std::string_view rest(short_file);
+    if (rest.size() >= 4 && rest.substr(0, 4) == "src/") {
+        rest.remove_prefix(4);
+        const auto slash = rest.find('/');
+        if (slash != std::string_view::npos && slash > 0)
+            return std::string(rest.substr(0, slash));
+    }
+    if (rest.size() >= 5 && rest.substr(0, 5) == "apps/") return "apps";
+    if (rest.size() >= 6 && rest.substr(0, 6) == "tests/") return "tests";
+    return "other";
+}
+
+bool fn_allowed(const char* func) {
+    if (fn_filter().empty()) return true;
+    if (func == nullptr) return false;
+    const std::string_view name(func);
+    for (const auto& f : fn_filter())
+        if (name.find(f) != std::string_view::npos) return true;
+    return false;
+}
+
+// Lines written before --debug-routes-file is parsed. Flag order must not
+// drop main: --debug-routes-fns is often the earlier argument.
+std::vector<std::string>& early_lines() {
+    static std::vector<std::string> v;
+    return v;
+}
+bool g_sink_chosen = false;
+
+void write_raw(std::FILE* out, const std::string& line) {
+    std::fwrite(line.data(), 1, line.size(), out);
+    std::fputc('\n', out);
+}
+
+void write_line_unlocked(const std::string& line) {
+    if (std::FILE* out = sink_file()) {
+        write_raw(out, line);
+        return;
+    }
+    if (g_sink_chosen) {
+        write_raw(stderr, line);
+        return;
+    }
+    early_lines().push_back(line);
+}
+
+void drain_early_unlocked(std::FILE* out) {
+    for (const auto& line : early_lines()) write_raw(out, line);
+    early_lines().clear();
+    g_sink_chosen = true;
+}
+
+const char* g_pending_main_file = nullptr;
+int g_pending_main_line = 0;
+const char* g_pending_main_func = nullptr;
+RouteFnRec* g_pending_main_rec = nullptr;
+std::chrono::steady_clock::time_point g_pending_main_t0{};
+
+void route_debug_fn_commit_pending_main() {
+    if (g_pending_main_func == nullptr) return;
+    const char* file = g_pending_main_file;
+    const int line = g_pending_main_line;
+    const char* func = g_pending_main_func;
+    g_pending_main_func = nullptr;
+    RouteFnRec* rec = route_fn_enter(file, line, func);
+    if (rec == nullptr) return;
+    route_fn_note_enter(rec);
+    g_pending_main_rec = rec;
+}
+
+void route_debug_fn_account_pending_main() {
+    RouteFnRec* rec = g_pending_main_rec;
+    if (rec == nullptr) return;
+    g_pending_main_rec = nullptr;
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - g_pending_main_t0)
+                        .count();
+    route_fn_leave(rec, static_cast<std::uint64_t>(ns < 0 ? 0 : ns));
+}
+
 }  // namespace
+
+void route_debug_set_fns(bool on) noexcept {
+    route_debug_fns_flag().store(on ? 1 : 0, std::memory_order_relaxed);
+    if (on) route_debug_fn_commit_pending_main();
+}
+
+void route_debug_fn_watch_main(const char* file, int line, const char* func) {
+    g_pending_main_file = file;
+    g_pending_main_line = line;
+    g_pending_main_func = func;
+    g_pending_main_t0 = std::chrono::steady_clock::now();
+}
+
+// SOR_DEBUG_ROUTES_FNS=1 turns probes on before main, so test mains and every
+// function they call are visible without a CLI flag.
+struct FnTraceEnv {
+    FnTraceEnv() {
+        const char* env = std::getenv("SOR_DEBUG_ROUTES_FNS");
+        if (env != nullptr && env[0] != '\0' && env[0] != '0')
+            route_debug_set_fns(true);
+    }
+};
+FnTraceEnv g_fn_trace_env;
 
 int  route_debug_level() { return g_level.load(std::memory_order_relaxed); }
 void route_debug_set_level(int level) {
@@ -102,12 +271,19 @@ void route_debug_set_file(const char* path) {
     std::lock_guard<std::mutex> lock(sink_mutex());
     std::FILE*& f = sink_file();
     if (f != nullptr) { std::fclose(f); f = nullptr; }
-    if (path == nullptr || *path == '\0') return;
-    f = std::fopen(path, "a");
-    if (f == nullptr)
+    if (path == nullptr || *path == '\0') {
+        drain_early_unlocked(stderr);
+        return;
+    }
+    f = std::fopen(path, "w");
+    if (f == nullptr) {
         std::fprintf(stderr,
                      "warning: --debug-routes-file: cannot open %s; "
                      "falling back to stderr\n", path);
+        drain_early_unlocked(stderr);
+        return;
+    }
+    drain_early_unlocked(f);
 }
 
 void route_debug_set_comp_filter(const char* csv) {
@@ -117,6 +293,111 @@ void route_debug_set_comp_filter(const char* csv) {
 void route_debug_set_path_filter(const char* csv) {
     std::lock_guard<std::mutex> lock(sink_mutex());
     split_csv(csv, path_filter());
+}
+
+void route_debug_set_fn_filter(const char* csv) {
+    std::lock_guard<std::mutex> lock(fn_mutex());
+    split_csv(csv, fn_filter());
+}
+
+std::uint64_t route_debug_fn_entered() {
+    return g_fn_entered.load(std::memory_order_relaxed);
+}
+
+RouteFnRec* route_fn_skip() noexcept {
+    static RouteFnRec skip;
+    return &skip;
+}
+
+RouteFnRec* route_fn_enter(const char* file, int line, const char* func) {
+    struct Key {
+        std::string file;
+        int line = 0;
+        bool operator==(const Key& o) const {
+            return line == o.line && file == o.file;
+        }
+    };
+    struct Hash {
+        std::size_t operator()(const Key& k) const noexcept {
+            return std::hash<std::string>{}(k.file) ^
+                   (std::hash<int>{}(k.line) << 1);
+        }
+    };
+    static std::unordered_map<Key, RouteFnRec*, Hash> index;
+    std::lock_guard<std::mutex> lock(fn_mutex());
+    Key key{file ? file : "", line};
+    if (const auto it = index.find(key); it != index.end())
+        return it->second == route_fn_skip() ? nullptr : it->second;
+    if (!fn_allowed(func)) {
+        index.emplace(std::move(key), route_fn_skip());
+        return nullptr;
+    }
+    auto rec = std::make_unique<RouteFnRec>();
+    rec->file = shorten_file(file ? file : "");
+    rec->func = func ? func : "";
+    rec->path = subsystem_of(file ? file : "");
+    rec->line = line;
+    RouteFnRec* p = rec.get();
+    fn_recs().push_back(std::move(rec));
+    index.emplace(std::move(key), p);
+    return p;
+}
+
+void route_fn_note_enter(RouteFnRec* rec) {
+    if (rec == nullptr || rec == route_fn_skip()) return;
+    if (rec->calls.fetch_add(1, std::memory_order_relaxed) != 0) return;
+    g_fn_entered.fetch_add(1, std::memory_order_relaxed);
+    const unsigned long long seq = g_seq.fetch_add(1, std::memory_order_relaxed);
+    const std::string line =
+        std::string("{\"seq\":") + std::to_string(seq) +
+        ",\"lvl\":1,\"comp\":\"fn\",\"path\":\"" + json_escape(rec->path) +
+        "\",\"event\":\"" + json_escape(rec->func) +
+        "\",\"phase\":\"enter\",\"file\":\"" + json_escape(rec->file) +
+        "\",\"line\":" + std::to_string(rec->line) + "}";
+    std::lock_guard<std::mutex> lock(sink_mutex());
+    write_line_unlocked(line);
+}
+
+void route_fn_leave(RouteFnRec* rec, std::uint64_t ns) {
+    if (rec == nullptr || rec == route_fn_skip()) return;
+    rec->total_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+void route_debug_fn_flush() {
+    if (!route_debug_fns_on()) return;
+    int expected = 0;
+    if (!g_fn_flushed.compare_exchange_strong(expected, 1,
+                                              std::memory_order_relaxed))
+        return;
+    // main's probe was built before the flag flipped. Fold its time in
+    // before the summaries are written.
+    route_debug_fn_account_pending_main();
+    std::vector<RouteFnRec*> recs;
+    {
+        std::lock_guard<std::mutex> lock(fn_mutex());
+        recs.reserve(fn_recs().size());
+        for (const auto& r : fn_recs()) recs.push_back(r.get());
+    }
+    std::lock_guard<std::mutex> lock(sink_mutex());
+    for (RouteFnRec* r : recs) {
+        const unsigned long long seq =
+            g_seq.fetch_add(1, std::memory_order_relaxed);
+        const double ms =
+            static_cast<double>(r->total_ns.load(std::memory_order_relaxed)) /
+            1e6;
+        const auto calls = r->calls.load(std::memory_order_relaxed);
+        char tail[96];
+        std::snprintf(tail, sizeof tail, ",\"calls\":%llu,\"total_ms\":%.3f}",
+                      static_cast<unsigned long long>(calls), ms);
+        const std::string line =
+            std::string("{\"seq\":") + std::to_string(seq) +
+            ",\"lvl\":1,\"comp\":\"fn\",\"path\":\"" + json_escape(r->path) +
+            "\",\"event\":\"" + json_escape(r->func) +
+            "\",\"phase\":\"summary\",\"file\":\"" + json_escape(r->file) +
+            "\",\"line\":" + std::to_string(r->line) + tail;
+        write_line_unlocked(line);
+    }
+    if (sink_file() == nullptr && !g_sink_chosen) drain_early_unlocked(stderr);
 }
 
 bool route_debug_want(int level, const char* comp, const char* path) {
@@ -135,20 +416,18 @@ void route_debug_emit(int level, const char* comp, const char* path,
                       const char* event, const char* fields) {
     if (!route_debug_want(level, comp, path)) return;
     const unsigned long long seq = g_seq.fetch_add(1, std::memory_order_relaxed);
+    std::string line =
+        std::string("{\"seq\":") + std::to_string(seq) + ",\"lvl\":" +
+        std::to_string(level) + ",\"comp\":\"" + (comp ? comp : "") +
+        "\",\"path\":\"" + (path ? path : "") + "\",\"event\":\"" +
+        (event ? event : "") + "\"";
+    if (fields != nullptr && *fields != '\0') {
+        line += ',';
+        line += fields;
+    }
+    line += '}';
     std::lock_guard<std::mutex> lock(sink_mutex());
-    std::FILE* out = sink_file() ? sink_file() : stderr;
-    if (fields != nullptr && *fields != '\0')
-        std::fprintf(out,
-                     "{\"seq\":%llu,\"lvl\":%d,\"comp\":\"%s\",\"path\":\"%s\","
-                     "\"event\":\"%s\",%s}\n",
-                     seq, level, comp ? comp : "", path ? path : "",
-                     event ? event : "", fields);
-    else
-        std::fprintf(out,
-                     "{\"seq\":%llu,\"lvl\":%d,\"comp\":\"%s\",\"path\":\"%s\","
-                     "\"event\":\"%s\"}\n",
-                     seq, level, comp ? comp : "", path ? path : "",
-                     event ? event : "");
+    write_line_unlocked(line);
 }
 
 void route_debug_ledger_reset() {
@@ -224,6 +503,7 @@ void route_debug_ledger_emit(const char* scope) {
     route_debug_emit(1, "ledger", "ledger", "ledger", fields);
 }
 
+#ifdef SOR_ROUTE_DEBUG
 RouteSpan::RouteSpan(int level, const char* comp, const char* path,
                      const char* event, const char* fields,
                      RouteLedgerBucket bucket)
@@ -258,5 +538,6 @@ RouteSpan::~RouteSpan() {
         route_debug_emit(level_, comp_, path_, event_, buf);
     }
 }
+#endif
 
 }  // namespace sor::core

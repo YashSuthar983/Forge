@@ -119,6 +119,20 @@ void parity(const std::string& label, const engines::QpProblem& p,
          "objective parity");
     fail(dc.gap_finite == dv.gap_finite, "Wolfe-bound finiteness parity");
     fail(dv.used_general_path, "device run took the PDHCG path");
+
+    auto vk_eval = vk.evaluate(false);
+    auto cpu_eval = cpu->evaluate(false);
+    auto rel_diff = [](f64 a, f64 b) {
+        if (std::isnan(a) && std::isnan(b)) return 0.0;
+        return std::fabs(a - b) / (1.0 + std::fabs(a));
+    };
+    fail(rel_diff(vk_eval.kkt_primal_res, cpu_eval.kkt_primal_res) < 1e-9, "kkt_primal_res parity");
+    fail(rel_diff(vk_eval.kkt_dual_res, cpu_eval.kkt_dual_res) < 1e-9, "kkt_dual_res parity");
+    fail(rel_diff(vk_eval.kkt_primal_obj, cpu_eval.kkt_primal_obj) < 1e-9, "kkt_primal_obj parity");
+    fail(rel_diff(vk_eval.kkt_dual_obj, cpu_eval.kkt_dual_obj) < 1e-9, "kkt_dual_obj parity");
+    fail(rel_diff(vk_eval.kkt_epoch_dx_norm, cpu_eval.kkt_epoch_dx_norm) < 1e-9, "kkt_epoch_dx_norm parity");
+    fail(rel_diff(vk_eval.kkt_epoch_dy_norm, cpu_eval.kkt_epoch_dy_norm) < 1e-9, "kkt_epoch_dy_norm parity");
+
     std::printf("  %-22s iters %llu/%llu  inner %llu/%llu  status %d  obj %.12e\n",
                 label.c_str(), static_cast<unsigned long long>(dc.iterations),
                 static_cast<unsigned long long>(dv.iterations),

@@ -7,6 +7,7 @@
 #include "test_helpers.hpp"
 
 #include <sstream>
+#include <limits>
 
 using sor::core::ProofLevel;
 using sor::core::SolveResult;
@@ -100,6 +101,24 @@ void test_malformed_file_throws() {
     CHECK_THROWS(sor::io::read_solution(in2));
 }
 
+void test_subnormal_and_complete_number_parsing() {
+    SolveResult r;
+    r.status = Status::Feasible;
+    r.proof = ProofLevel::FeasibleOnly;
+    r.objective = 0.0;
+    r.x = {std::numeric_limits<double>::denorm_min()};
+    std::ostringstream out;
+    sor::io::write_solution(out, r);
+    std::istringstream in(out.str());
+    const auto s = sor::io::read_solution(in);
+    CHECK(s.x.size() == 1);
+    CHECK(s.x[0] == r.x[0]);
+
+    std::istringstream malformed("status Feasible\nproof FeasibleOnly\n"
+        "objective 0\nx 1 1junk\ny 0\nray 0\n");
+    CHECK_THROWS(sor::io::read_solution(malformed));
+}
+
 }  // namespace
 
 int main() {
@@ -108,5 +127,6 @@ int main() {
     test_round_trip_unbounded_with_primal_ray();
     test_round_trip_empty_vectors();
     test_malformed_file_throws();
+    test_subnormal_and_complete_number_parsing();
     return sor::test::finish("test_solution_io");
 }
