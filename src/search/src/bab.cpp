@@ -3898,6 +3898,11 @@ bool solve_milp_by_components(const model::LpProblem& problem,
         total.lp_iterations += sd.lp_iterations;
         total.lp_ms += sd.lp_ms;
         total.cut_rounds += sd.cut_rounds;
+        total.invalid_cuts_detected += sd.invalid_cuts_detected;
+        total.node_cuts_invalid_generated += sd.node_cuts_invalid_generated;
+        total.node_cuts_invalid_rejected += sd.node_cuts_invalid_rejected;
+        total.node_cuts_invalid_inserted += sd.node_cuts_invalid_inserted;
+        total.node_cuts_ref_outside_node += sd.node_cuts_ref_outside_node;
         if (r.proposed_status == core::Status::Infeasible && sd.globally_proved) {
             infeasible = true;
             infeasible_raw = std::move(r);
@@ -3932,6 +3937,11 @@ bool solve_milp_by_components(const model::LpProblem& problem,
     diag.lp_iterations = total.lp_iterations;
     diag.lp_ms = total.lp_ms;
     diag.cut_rounds = total.cut_rounds;
+    diag.invalid_cuts_detected = total.invalid_cuts_detected;
+    diag.node_cuts_invalid_generated = total.node_cuts_invalid_generated;
+    diag.node_cuts_invalid_rejected = total.node_cuts_invalid_rejected;
+    diag.node_cuts_invalid_inserted = total.node_cuts_invalid_inserted;
+    diag.node_cuts_ref_outside_node = total.node_cuts_ref_outside_node;
     diag.component_count = cols.size();
     diag.component_isolated = static_cast<std::uint64_t>(isolated);
     diag.components_solved = proved_components;
@@ -5375,6 +5385,14 @@ core::RawResult solve_milp(const model::LpProblem& problem,
         // rival arm winning the outer race must not abort it mid-repair.
         so.pool = nullptr;
         so.cancel = nullptr;
+        // Neighborhood and objective-face restrictions may exclude the
+        // parent's reference point. Such a point cannot validate cuts for
+        // this child model. Retain the diagnostic only when it is feasible
+        // in the child's unchanged column coordinates and restricted domain.
+        if (so.cut_reference_point &&
+            (sub.max_row_violation(*so.cut_reference_point) > opts.primal_feas_tol ||
+             sub.max_bound_violation(*so.cut_reference_point) > opts.primal_feas_tol))
+            so.cut_reference_point = nullptr;
         so.time_limit_s = budget;
         so.max_nodes = node_budget;
         so.verbose = false;
@@ -11078,6 +11096,7 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                         // Certified dead direction?
                         bool is_dead = false;
                         bool infeasible_direction = false;
+                        f64 direction_bound = core::kNaN;
                         if (!proved) {
                             std::vector<f64> save_lo = node_lp.col_lo, save_hi = node_lp.col_hi;
                             node_lp.col_lo[sz(j)] = plo;
@@ -11101,17 +11120,29 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                                     y_min[i] = sense * praw.y[i];
                                 const auto safe = certify::safe_lagrangian_lower_bound(
                                     node_lp, y_min, node_lp.col_lo, node_lp.col_hi);
-                                if (safe.finite && safe.value >= cutoff_probe)
+                                if (safe.finite && safe.value >= cutoff_probe) {
                                     is_dead = true;
+                                    direction_bound = safe.value;
+                                }
                             }
                             node_lp.col_lo = std::move(save_lo);
                             node_lp.col_hi = std::move(save_hi);
                         } else if (cutoff_known() &&
                                    node_lp_bound_min(praw, sense) >= cutoff_probe) {
                             is_dead = true;  // proved optimum already past the cutoff
+                            direction_bound = node_lp_bound_min(praw, sense);
                         }
                         if (is_dead) {
                             dead[dir] = true;
+                            // The discarded child has its own certificate.
+                            // Its parent's weaker bound does not describe why
+                            // this direction was closed. Preserve cutoff
+                            // certificates even when the other side survives.
+                            if (!infeasible_direction && std::isfinite(direction_bound)) {
+                                pruned_floor = std::min(pruned_floor,
+                                    std::max(node.bound, direction_bound));
+                                ++diag.gap_prunes;
+                            }
                             ++diag.strong_branch_infeasible;
                             const bool recorded = bstats.record(j, dir == 0 ? -1 : 1,
                                 dir == 0 ? xv - fl : ce - xv,
@@ -11279,12 +11310,8 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                                 static_cast<int>(node_closed ? -1 : dead_col), probed);
                 if (node_closed) {
                     ++diag.sb_nodes_closed;
-                    // Both sides certified dead for the current cutoff: the
-                    // node is pruned exactly like a bound prune.
-                    if (have_incumbent && node.bound < sense * best_incumbent) {
-                        ++diag.gap_prunes;
-                        pruned_floor = std::min(pruned_floor, node.bound);
-                    }
+                    // Every cutoff-closed direction retained its certificate
+                    // above. Infeasible directions contain no feasible point.
                     diag.ms_exit_b += ms_since(t_loop_iter); ++diag.n_exit_b;
                     continue;
                 }
@@ -12586,7 +12613,8 @@ core::RawResult solve_milp(const model::LpProblem& problem,
     // its subtree on an integral point -- now keeps the subtree by bound, and
     // stopped_early keeps the tree from counting as exhausted.
     const bool gap_proved = have_incumbent && std::isfinite(dual_orig) &&
-                            diag.gap_rel <= opts.gap_tol;
+        (diag.gap_rel <= opts.gap_tol ||
+         std::fabs(best_incumbent - dual_orig) <= opts.abs_gap_tol);
     // Correctness gate: never claim Optimal if the dual bound crosses the
     // incumbent (would require an invalid cut / bound). Keep Feasible.
     bool dual_crosses_incumbent = false;
@@ -12600,8 +12628,14 @@ core::RawResult solve_milp(const model::LpProblem& problem,
                 reason += "; dual crossed incumbent (refused Optimal)";
         }
     }
+    // Empty queues do not erase regions removed by a cutoff or an earlier
+    // gap tolerance. Their retained floor still limits the final proof.
+    // For an incumbent, only the final bound can establish the requested gap.
     diag.globally_proved = !dual_crosses_incumbent &&
-                           (tree_exhausted || gap_proved);
+                           (have_incumbent ? gap_proved : tree_exhausted);
+    if (tree_exhausted && have_incumbent && !gap_proved)
+        reason += "; retained pruned-region bound leaves the requested gap open";
+    diag.termination_reason = reason;
     diag.root_certified_bound =
         std::isfinite(root_cert.value) ? sense * root_cert.value : core::kNaN;
 

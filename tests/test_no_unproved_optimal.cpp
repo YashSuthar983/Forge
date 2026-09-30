@@ -61,7 +61,7 @@ int main() {
         ProofEvidence ev = good_evidence();
         ev.checker_passed = false;
         const auto r = finalize_result(claim_optimal(), ev);
-        CHECK(r.status == Status::NumericalFailure);
+        CHECK(r.status == Status::NoSolutionFound);
     }
 
     // 4. No evidence at all -> not even Feasible.
@@ -98,13 +98,14 @@ int main() {
         raw.proposed_level  = ProofLevel::FeasibleOnly;
         ProofEvidence ev;
         ev.claimed_level        = ProofLevel::FeasibleOnly;
+        ev.checker_passed       = true;
         ev.max_primal_violation = 1e-8;
         ev.max_dual_violation   = 1e-8;
         const auto r = finalize_result(std::move(raw), ev);
         CHECK(r.status == Status::Feasible);
         CHECK(r.proof == ProofLevel::FeasibleOnly);
         CHECK(sor::core::human_line(r.status, r.proof) ==
-              "feasible (no dual bound - first-order method)");
+              "feasible (no finite checked dual bound)");
     }
 
     // 8. LP optimality needs a finite, closed duality gap at the final gate,

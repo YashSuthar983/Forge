@@ -913,7 +913,7 @@ int main() {
             p.row_lo = {-sor::model::kInf};
             p.row_hi = {4.0};
             p.col_lo = {0.0, 0.0};
-            p.col_hi = {4.0, 10.0};
+            p.col_hi = {sor::model::kInf, 10.0};
             const auto out = sor::presolve::presolve(p, dom);
             CHECK(out.stats().dominated_columns_removed >= 1);
             bool saw_dom = false;
@@ -996,6 +996,47 @@ int main() {
             CHECK(rec.evidence.max_primal_violation <= 1e-9);
         }
 
+        // F4: aggregate costs and nonzero lower bounds must preserve the
+        // original optimum (the audit counterexample has optimum 1).
+        {
+            PresolveOptions par = v2;
+            par.parallel_columns = true;
+            LpProblem p;
+            p.A = sor::sparse::from_triplets(1, 2, {0,0}, {0,1}, {1.0,1.0});
+            p.c = {1.0,1.0}; p.col_lo = {0.0,1.0}; p.col_hi = {2.0,2.0};
+            p.row_lo = {1.0}; p.row_hi = {sor::model::kInf};
+            const auto out = sor::presolve::presolve(p, par);
+            std::vector<double> reduced = out.map.problem.col_lo;
+            const auto lifted = postsolve(out.map, reduced);
+            CHECK(p.max_bound_violation(lifted) <= 1e-12);
+            CHECK(p.max_row_violation(lifted) <= 1e-12);
+            CHECK_NEAR(p.objective(lifted), 1.0, 1e-12);
+            CHECK_NEAR(out.map.problem.objective(reduced), 1.0, 1e-12);
+        }
+        // A receiver with finite capacity cannot absorb a dominated column.
+        {
+            PresolveOptions dom = v2; dom.dominated_columns = true;
+            LpProblem p;
+            p.A = sor::sparse::from_triplets(1,2,{0,0},{0,1},{1.0,1.0});
+            p.c = {1.0,2.0}; p.col_lo = {0.0,0.0}; p.col_hi = {1.0,2.0};
+            p.row_lo = {2.0}; p.row_hi = {sor::model::kInf};
+            const auto out = sor::presolve::presolve(p, dom);
+            CHECK(out.stats().dominated_columns_removed == 0);
+        }
+        // Negative proportional rows reverse lower/upper endpoints.
+        {
+            PresolveOptions par = v2; par.parallel_rows = true;
+            LpProblem p;
+            p.A = sor::sparse::from_triplets(2,2,{0,0,1,1},{0,1,0,1},{1.0,1.0,-1.0,-1.0});
+            p.c = {1.0,1.0}; p.col_lo = {0.0,0.0}; p.col_hi = {10.0,10.0};
+            p.row_lo = {1.0,-3.0}; p.row_hi = {5.0,-2.0};
+            const auto out = sor::presolve::presolve(p, par);
+            CHECK(out.map.problem.n_rows() == 1);
+            for (const auto& x : {std::vector<double>{2.0,0.0}, std::vector<double>{3.0,0.0}})
+                CHECK(out.map.problem.max_row_violation(x) <= 1e-12);
+            CHECK(out.map.problem.max_row_violation({1.0,0.0}) >= 1.0);
+        }
+
         // Doubleton equality: free x appears in two rows so the singleton
         // column rule cannot take it; the live doubleton must. The remaining
         // column may then dual-fix once its row becomes redundant.
@@ -1038,5 +1079,22 @@ int main() {
         }
     }
 
+    // Cancelling fixed terms leave an exact unit contribution. Neither the
+    // singleton substitution nor redundant-row check may lose it.
+    {
+        LpProblem p;
+        p.A = sor::sparse::from_triplets(1, 4, {0,0,0,0}, {0,1,2,3}, {1e10,1,-1e10,1});
+        p.c = {0,0,0,1};
+        p.col_lo = {1e10,1,1e10,-sor::model::kInf};
+        p.col_hi = {1e10,1,1e10,sor::model::kInf};
+        p.row_lo = p.row_hi = {0};
+        const auto reduced = presolve_lp(p);
+        CHECK(reduced.problem.n_cols() == 0);
+        const auto x = postsolve(reduced, {});
+        CHECK(x.size() == 4);
+        CHECK(x[3] == -1);
+        CHECK(p.max_row_violation(x) == 0);
+        CHECK(p.objective(x) == -1);
+    }
     return sor::test::finish("test_presolve");
 }

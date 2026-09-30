@@ -1996,11 +1996,12 @@ void test_simplex_consumes_terminal_presolve_outcome() {
     SimplexBasis basis;
     const auto raw = sor::engines::solve_simplex(lp, opts, diag, &basis);
     CHECK(raw.proposed_status == Status::Unbounded);
-    CHECK(raw.proposed_level == ProofLevel::None);
-    CHECK(raw.engine == "simplex_presolve");
-    CHECK(raw.termination_reason.find("empty column") != std::string::npos);
+    CHECK(!raw.primal_ray.direction.empty());
+    const auto ev = sor::certify::check_lp_result(lp, raw, sor::engines::simplex_evidence(diag, opts));
+    const auto result = sor::certify::finalize_result(raw, ev);
+    CHECK(result.status == Status::Unbounded);
+    CHECK(result.primal_ray.certified);
     CHECK(diag.status == Status::Unbounded);
-    CHECK(basis.basic.empty());
 }
 
 }  // namespace

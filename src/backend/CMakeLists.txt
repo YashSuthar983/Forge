@@ -41,6 +41,7 @@ set(SOR_BACKEND_SOURCES
   src/cpu_lp_device.cpp
   src/cpu_qp_device.cpp
   src/cpu_pdhcg_device.cpp
+  src/pdhcg_lp_diagnostics.cpp
   src/cpu_binquad_device.cpp
   src/lanes_pdhcg_device.cpp
   src/lp_device_batch.cpp)

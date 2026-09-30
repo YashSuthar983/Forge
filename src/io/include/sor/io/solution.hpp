@@ -22,6 +22,7 @@ struct SolutionFile {
     f64 objective = core::kNaN;
     std::vector<f64> x;
     std::vector<f64> y;
+    std::vector<std::string> exact_dual;
     std::vector<f64> ray;  // Farkas certificate; empty unless status == Infeasible
     std::vector<f64> primal_ray;
     std::vector<f64> dual_farkas_ray;

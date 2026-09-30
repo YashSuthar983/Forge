@@ -8,6 +8,7 @@
 // see the layering note in sor/core/result.hpp.
 #pragma once
 #include <vector>
+#include <utility>
 #include <cstdint>
 #include <limits>
 
@@ -46,6 +47,30 @@ struct SafeLpBound {
     std::uint64_t implied_bound_uses = 0;
     std::uint64_t multiplier_corrections = 0;
 };
+// Generate a sparse exact dual witness from original-space basis equations.
+// A resource-limited failure leaves the proposal unproved. Consumers verify
+// the witness by recomputing stationarity and the bound on their own model.
+struct ExactCertificatePolicy {
+    std::uint64_t max_operations = 2000000;
+    unsigned max_bits = 32768;
+    double time_limit_s = 0; // Zero means no deadline; work/size caps still apply.
+    bool perturb_inward = true; // Pricing needs the pure B-transpose solution.
+};
+bool repair_basis_certificate(const model::LpProblem& problem, core::RawResult& raw,
+                               const ExactCertificatePolicy& policy = {});
+// Exact, outward-converted row implications. Used lazily when a dual term
+// requires a column endpoint absent from its declared box.
+std::pair<std::vector<f64>, std::vector<f64>> implied_lp_column_bounds(
+    const model::LpProblem& problem);
+struct ExactDualSupportFailure {
+    core::Index variable = -1; // Structural column, or n_cols + logical row.
+    int improving_direction = 0;
+};
+ExactDualSupportFailure exact_dual_support_failure(
+    const model::LpProblem& problem, const std::vector<std::string>& witness,
+    const std::vector<int>& allowed_directions = {});
+SafeLpBound exact_dual_lower_bound(const model::LpProblem& problem,
+                                   const std::vector<std::string>& witness);
 SafeLpBound safe_lagrangian_lower_bound(const model::LpProblem& problem,
                                         const std::vector<f64>& y_min,
                                         const std::vector<f64>& col_lo,
@@ -100,6 +125,21 @@ core::DualFarkasRay check_dual_farkas_ray(
 ProofEvidence check_lp_result(const model::LpProblem& problem,
                               const core::RawResult& raw,
                               const ProofEvidence& proposed);
+
+class CheckedLpResult {
+public:
+    const ProofEvidence& evidence() const noexcept { return evidence_; }
+private:
+    RawResult raw_;
+    ProofEvidence evidence_;
+    CheckedLpResult(RawResult raw, ProofEvidence evidence)
+        : raw_(std::move(raw)), evidence_(std::move(evidence)) {}
+    friend CheckedLpResult check_lp_candidate(const model::LpProblem&, RawResult, const ProofEvidence&);
+    friend SolveResult finalize_result(CheckedLpResult);
+};
+CheckedLpResult check_lp_candidate(const model::LpProblem& problem,
+                                   RawResult raw, const ProofEvidence& proposed);
+SolveResult finalize_result(CheckedLpResult checked);
 
 // Rejects any Optimal claim not backed by evidence, and lifts the proof level
 // when exact/certified verification actually ran.

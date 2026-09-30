@@ -30,6 +30,7 @@
 #include "sor/model/lp.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace sor::engines {
@@ -38,8 +39,8 @@ using core::f64;
 
 struct PdhgOptions {
     std::uint64_t max_iterations = 100000;
-    // 0 = unlimited (max_iterations is the only cap); checked every
-    // check_every iterations, same cadence as the residual evaluation.
+    // 0 = unlimited (max_iterations is the only cap). Deadline checks run
+    // independently of residual cadence, including between setup passes.
     // Without this, a caller-supplied wall-clock budget (e.g. sor_solve's
     // --time-limit) had no way to reach PDHG at all: max_iterations=100000
     // iterations take well under a second on most Netlib instances, so PDHG
@@ -91,7 +92,8 @@ struct RuizScaling {
 // scaled row spans a factor of 2 rather than being flat. Standard practice in
 // production simplex codes for exactly this trade.
 RuizScaling ruiz_scale(model::LpProblem& p, int iterations,
-                       bool power_of_two = false);
+                       bool power_of_two = false,
+                       const std::function<bool()>& stop_requested = {});
 
 // One diagonal Pock--Chambolle pass composed onto an existing scaling.
 // alpha=1 gives inverse-square-root row/column l1 scaling.

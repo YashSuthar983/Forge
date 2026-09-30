@@ -2,6 +2,8 @@
 #include "sor/io/mps.hpp"
 #include "sor/engines/dual_simplex.hpp"
 #include "test_helpers.hpp"
+#include "sor/model/exact.hpp"
+#include <random>
 
 #include <sstream>
 #include <limits>
@@ -159,7 +161,120 @@ ENDATA
     CHECK(!certify::check_lp_point(lp, nonfinite, 1e-7, 1e-7, 1e-9, false).checker_passed);
 }
 
+// Compare the common-denominator implementation with independent, per-term
+// rational arithmetic. Coprime denominators force the LCM path; finite boxes
+// make every arbitrary multiplier a valid lower bound, for either sense.
+void test_exact_dual_rational_reference() {
+    auto lp = read(R"(NAME FRACTIONS
+ROWS
+ N OBJ
+ E R1
+ E R2
+ E R3
+COLUMNS
+ X OBJ 0.125 R1 10000000000
+ X R2 1 R3 -10000000000
+ Y OBJ -0.75 R1 0.0625
+ Y R2 -2.75 R3 0.2
+RHS
+ RHS R1 3 R2 -7
+ RHS R3 0.25
+BOUNDS
+ LO BND X -2
+ UP BND X 5
+ LO BND Y -3
+ UP BND Y 7
+ENDATA
+)");
+    std::mt19937 rng(26202);
+    const int denominators[] = {3, 7, 11};
+    using model::Rational;
+    for (bool maximize : {false, true}) {
+        lp.maximize = maximize;
+        lp.obj_offset = 9.25;
+        const int sense = maximize ? -1 : 1;
+        for (int trial = 0; trial < 40; ++trial) {
+            std::vector<Rational> y;
+            std::vector<std::string> witness;
+            for (int den : denominators) {
+                y.push_back(Rational(static_cast<int>(rng() % 21) - 10) / den);
+                witness.push_back(y.back().str());
+            }
+            Rational reference = Rational(sense) * Rational(lp.obj_offset);
+            std::vector<Rational> reduced;
+            for (double cost : lp.c) reduced.push_back(Rational(sense) * Rational(cost));
+            const auto& rp = lp.A.pattern.row_ptr();
+            const auto& ci = lp.A.pattern.col_idx();
+            for (std::size_t i = 0; i < y.size(); ++i) {
+                reference += y[i] * Rational(y[i] >= 0 ? lp.row_lo[i] : lp.row_hi[i]);
+                for (auto k = rp[i]; k < rp[i+1]; ++k)
+                    reduced[static_cast<std::size_t>(ci[static_cast<std::size_t>(k)])] -=
+                        y[i] * Rational(lp.A.vals[static_cast<std::size_t>(k)]);
+            }
+            for (std::size_t j = 0; j < reduced.size(); ++j)
+                reference += reduced[j] * Rational(reduced[j] >= 0 ? lp.col_lo[j] : lp.col_hi[j]);
+            const auto bound = certify::exact_dual_lower_bound(lp, witness);
+            CHECK(bound.finite);
+            CHECK(bound.value == model::rounded_down(reference));
+            CHECK(Rational(bound.value) <= reference);
+        }
+    }
+    for (const auto& bad : {"", "--1", "1/0", "1/-3", "1/2/3", "nan", "/2"}) {
+        CHECK(!certify::exact_dual_lower_bound(lp, {bad, "0", "0"}).finite);
+        CHECK(certify::exact_dual_support_failure(lp, {bad, "0", "0"}).variable == -1);
+    }
+}
+
+void test_sparse_integer_basis_certificate() {
+    std::mt19937 rng(26207);
+    for (int trial = 0; trial < 20; ++trial) {
+        model::LpProblem lp;
+        constexpr int n = 9;
+        std::vector<core::Index> rows, cols;
+        std::vector<double> vals, expected;
+        lp.c.assign(n, 0);
+        lp.col_lo.assign(n, -1); lp.col_hi.assign(n, 1);
+        lp.row_lo.assign(n, 0); lp.row_hi.assign(n, 0);
+        for (int i = 0; i < n; ++i)
+            expected.push_back((static_cast<int>(rng() % 17) - 8) / 16.0);
+        for (int i = 0; i < n; ++i)
+            for (int j = 0; j < n; ++j) {
+                const double a = i == j ? 100.0 : static_cast<int>(rng() % 7) - 3;
+                if (a == 0) continue;
+                rows.push_back(i); cols.push_back(j); vals.push_back(a);
+                lp.c[static_cast<std::size_t>(j)] += a * expected[static_cast<std::size_t>(i)];
+            }
+        lp.A = sparse::from_triplets(n, n, rows, cols, vals);
+        core::RawResult raw;
+        for (int j = 0; j < n; ++j) raw.certificate_basis.push_back(j);
+        CHECK(certify::repair_basis_certificate(lp, raw));
+        CHECK(raw.exact_dual.size() == expected.size());
+        for (std::size_t i = 0; i < expected.size() && i < raw.exact_dual.size(); ++i)
+            CHECK(model::Rational(raw.exact_dual[i]) == model::Rational(expected[i]));
+        CHECK(certify::exact_dual_lower_bound(lp, raw.exact_dual).finite);
+        CHECK(!certify::repair_basis_certificate(lp, raw, {.max_operations = 0}));
+        CHECK(raw.exact_dual.empty());
+        CHECK(!certify::repair_basis_certificate(lp, raw, {.time_limit_s = std::numeric_limits<double>::min()}));
+    }
+    const auto third = read(R"(NAME THIRD
+ROWS
+ N OBJ
+ E R1
+COLUMNS
+ X OBJ 1 R1 3
+RHS
+ RHS R1 1
+ENDATA
+)");
+    core::RawResult raw;
+    raw.certificate_basis = {0};
+    CHECK(certify::repair_basis_certificate(third, raw));
+    CHECK(raw.exact_dual.size() == 1);
+    if (!raw.exact_dual.empty()) CHECK(model::Rational(raw.exact_dual[0]) == model::Rational(1) / 3);
+}
+
 int main() {
+    test_sparse_integer_basis_certificate();    test_exact_dual_rational_reference();
     test_safe_lagrangian_bound();
     test_safe_bound_refuses_unbounded_direction();
     test_small_cost_cannot_erase_unbounded_direction();
@@ -226,8 +341,11 @@ ENDATA
         raw.proposed_status = core::Status::Unbounded;
         raw.proposed_level = core::ProofLevel::BoundOnly;
         raw.primal_ray = primal;
+        raw.x = {0.0};
         core::ProofEvidence ev;
         ev.claimed_level = core::ProofLevel::BoundOnly;
+        ev.checker_passed = true;
+        ev.max_primal_violation = 0.0;
         ev.primal_ray_violation = std::max(primal.max_row_residual,
                                            primal.max_bound_sign_residual);
         ev.primal_ray_objective = primal.objective_direction;
@@ -257,6 +375,7 @@ ENDATA
         raw.proposed_status = core::Status::Unbounded;
         raw.proposed_level = core::ProofLevel::BoundOnly;
         raw.primal_ray.direction = {1.0};
+        raw.x = {0.0};
         core::ProofEvidence proposed;
         proposed.claimed_level = core::ProofLevel::BoundOnly;
         proposed.primal_feas_tol = 1e-7;
@@ -274,6 +393,7 @@ ENDATA
         raw.proposed_status = core::Status::Unbounded;
         raw.proposed_level = core::ProofLevel::BoundOnly;
         raw.primal_ray.direction = {1.0};
+        raw.x = {0.0};
         core::ProofEvidence proposed;
         proposed.claimed_level = core::ProofLevel::BoundOnly;
         auto checked = certify::check_lp_result(
@@ -422,5 +542,77 @@ ENDATA
             ranged, {-1.0}, 1e-7).certified);
     }
 
+    // Audit F1/F2: raw numbers and an invalid point cannot create a proof.
+    {
+        model::LpProblem box;
+        box.A = sparse::from_triplets(0, 1, {}, {}, {});
+        box.c = {1}; box.col_lo = {0}; box.col_hi = {1};
+        core::RawResult raw;
+        raw.x = {0}; raw.objective = 123; raw.dual_bound = 456;
+        raw.proposed_status = core::Status::Optimal;
+        raw.proposed_level = core::ProofLevel::ProvedOptimalFP;
+        core::ProofEvidence proposed;
+        proposed.has_basis = true;
+        proposed.claimed_level = raw.proposed_level;
+        auto checked = certify::check_lp_result(box, raw, proposed);
+        auto result = certify::finalize_result(raw, checked);
+        CHECK_NEAR(result.objective, 0, 0);
+        CHECK_NEAR(result.dual_bound, 0, 0);
+        CHECK(result.status == core::Status::NumericalFailure);
+        raw.x = {2};
+        for (const auto status : {core::Status::Optimal, core::Status::Feasible}) {
+            raw.proposed_status = status;
+            checked = certify::check_lp_result(box, raw, proposed);
+            result = certify::finalize_result(raw, checked);
+            CHECK(result.status != core::Status::Feasible);
+            CHECK(result.status != core::Status::Optimal);
+            CHECK(result.proof < core::ProofLevel::FeasibleOnly);
+        }
+    }
+    // Audit F3: an improving direction on an empty polyhedron has no anchor.
+    {
+        model::LpProblem p;
+        p.A = sparse::from_triplets(2, 2, {0,1}, {0,0}, {1,1});
+        p.c = {0,-1}; p.col_lo = {-model::kInf,0};
+        p.col_hi = {model::kInf,model::kInf};
+        p.row_lo = {1,-model::kInf}; p.row_hi = {model::kInf,0};
+        core::RawResult raw;
+        raw.x = {0,0}; raw.y = {0,0};
+        raw.proposed_status = core::Status::Unbounded;
+        raw.primal_ray.direction = {0,1};
+        const auto ev = certify::check_lp_result(p, raw, {});
+        const auto result = certify::finalize_result(raw, ev);
+        CHECK(result.status == core::Status::NoSolutionFound);
+        CHECK(!result.primal_ray.certified);
+    }
+    // Audit F16: exact binary64 cancellation must retain the unit term.
+    {
+        model::LpProblem p;
+        p.A = sparse::from_triplets(1, 4, {0,0,0,0}, {0,1,2,3}, {1e10,1,-1e10,1});
+        p.c = {0,0,0,1}; p.col_lo = {1e10,1,1e10,-model::kInf};
+        p.col_hi = {1e10,1,1e10,model::kInf}; p.row_lo = {0}; p.row_hi = {0};
+        CHECK_NEAR(p.max_row_violation({1e10,1,1e10,0}), 1, 0);
+        CHECK_NEAR(p.max_row_violation({1e10,1,1e10,-1}), 0, 0);
+        const auto bound = certify::safe_lagrangian_lower_bound(p, {0}, p.col_lo, p.col_hi);
+        CHECK(bound.finite);
+        CHECK(bound.value <= -1);
+        CHECK(bound.value >= -1.00000001);
+    }
+    // Model boundaries reject each category of nonfinite data.
+    {
+        model::LpProblem box;
+        box.A = sparse::from_triplets(0, 1, {}, {}, {});
+        box.c = {1}; box.col_lo = {0}; box.col_hi = {1};
+        for (int kind = 0; kind < 4; ++kind) {
+            auto invalid = box;
+            if (kind == 0) invalid.c[0] = core::kNaN;
+            if (kind == 1) invalid.obj_offset = core::kPosInf;
+            if (kind == 2) invalid.col_lo[0] = core::kPosInf;
+            if (kind == 3) invalid.col_hi[0] = -core::kPosInf;
+            bool rejected = false;
+            try { invalid.validate(); } catch (const std::invalid_argument&) { rejected = true; }
+            CHECK(rejected);
+        }
+    }
     return test::finish("test_lp_certificates");
 }

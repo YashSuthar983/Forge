@@ -4129,9 +4129,9 @@ int main(int argc, char** argv) {
             lp_opts.backend = backend_name;
             sor::core::LpDiagnostics diag;
             sor::core::ProofEvidence ev;
-            auto raw = sor::engines::solve_lp(problem, lp_opts, diag, &ev);
-            ev = sor::certify::check_lp_result(problem, raw, ev);
-            const auto r = sor::certify::finalize_result(std::move(raw), ev);
+            auto raw = sor::engines::solve_lp(problem, lp_opts, diag, &ev, &sx_opts, &hpr_opts, &pdhg_opts);
+            const auto r = sor::certify::finalize_result(
+                sor::certify::check_lp_candidate(problem, std::move(raw), ev));
             print_result(r);
             write_solution_out(solution_out, r);
             std::printf("route:             %s (%s)\n",
@@ -4171,8 +4171,8 @@ int main(int argc, char** argv) {
             sor::engines::SimplexDiagnostics diag;
             auto raw = sor::engines::solve_simplex(problem, sx_opts, diag, nullptr);
             auto ev = sor::engines::simplex_evidence(diag, sx_opts);
-            ev = sor::certify::check_lp_result(problem, raw, ev);
-            const auto r = sor::certify::finalize_result(std::move(raw), ev);
+            const auto r = sor::certify::finalize_result(
+                sor::certify::check_lp_candidate(problem, std::move(raw), ev));
             print_result(r);
             write_solution_out(solution_out, r);
             if (diag.dual_bound_finite) {
@@ -4185,6 +4185,10 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(diag.iterations),
                         static_cast<unsigned long long>(diag.phase1_iterations),
                         static_cast<unsigned long long>(diag.phase2_iterations));
+            std::printf("certificate work:  %llu pivots, %llu stages, %llu preparations\n",
+                        static_cast<unsigned long long>(diag.certificate_iterations),
+                        static_cast<unsigned long long>(diag.certificate_stages),
+                        static_cast<unsigned long long>(diag.certificate_preprocessing_builds));
             std::printf("termination:       %s\n", r.termination_reason.c_str());
             std::printf("\ntiming (ms)\n");
             std::printf("  total            %10.3f\n", diag.total_ms);
@@ -4353,22 +4357,9 @@ int main(int argc, char** argv) {
         }
 
         if (engine_name == "hpr" || engine_name == "pdhg") {
-            // Default explicit FO engines go through solve_lp so they share
-            // Auto's FO presolve probe and recover_solution lift. Ablation
-            // flags that mutate HprOptions/PdhgOptions beyond what LpOptions
-            // can express keep the direct engine path.
-            const sor::engines::HprOptions hpr_defaults{};
-            const bool hpr_ablation =
-                hpr_opts.use_primal_weight != hpr_defaults.use_primal_weight ||
-                hpr_opts.use_restart != hpr_defaults.use_restart ||
-                hpr_opts.use_halpern != hpr_defaults.use_halpern ||
-                hpr_opts.use_reflection != hpr_defaults.use_reflection ||
-                hpr_opts.use_adaptive_step != hpr_defaults.use_adaptive_step;
-            const bool use_solve_lp =
-                engine_name == "pdhg" ||
-                (engine_name == "hpr" && !hpr_ablation);
-
-            if (use_solve_lp) {
+            // Explicit and ablated FO engines share the same model preparation,
+            // original-space recovery, and crossover policy.
+            {
                 if (rep.n_integer > 0 && !mps_opts.relax_integrality) {
                     std::printf("NOTE:              solving the LP RELAXATION "
                                 "(use --engine milp for branch-and-bound)\n");
@@ -4397,9 +4388,9 @@ int main(int argc, char** argv) {
                 lp_opts.backend = backend_name;
                 sor::core::LpDiagnostics diag;
                 sor::core::ProofEvidence ev;
-                auto raw = sor::engines::solve_lp(problem, lp_opts, diag, &ev);
-                ev = sor::certify::check_lp_result(problem, raw, ev);
-                const auto r = sor::certify::finalize_result(std::move(raw), ev);
+                auto raw = sor::engines::solve_lp(problem, lp_opts, diag, &ev, &sx_opts, &hpr_opts, &pdhg_opts);
+                const auto r = sor::certify::finalize_result(
+                    sor::certify::check_lp_candidate(problem, std::move(raw), ev));
                 print_result(r);
                 write_solution_out(solution_out, r);
                 std::printf("backend:           %s\n", backend_name.c_str());
@@ -4431,44 +4422,7 @@ int main(int argc, char** argv) {
                 return exit_code_for(r.status);
             }
 
-            auto dev = sor::backend::make_lp_device(backend_name);
-            if (!dev) {
-                sor::core::RawResult raw;
-                raw.proposed_status = sor::core::Status::Unsupported;
-                raw.engine = "hpr";
-                raw.backend = backend_name;
-                raw.termination_reason =
-                    "requested LP device '" + backend_name +
-                    "' is unavailable for HPR";
-                const auto r = sor::certify::finalize_result(
-                    std::move(raw), sor::core::ProofEvidence{});
-                print_result(r);
-                std::printf("termination:       %s\n",
-                            r.termination_reason.c_str());
-                return exit_code_for(r.status);
-            }
-            std::printf("backend:           %s (accelerated=%s)\n",
-                        std::string(dev->name()).c_str(),
-                        dev->is_accelerated() ? "yes" : "no");
-            std::printf("NOTE:              HPR ablation flags bypass FO "
-                        "presolve probe; use default --engine hpr for "
-                        "identical-model recovery\n");
-            sor::engines::HprDiagnostics diag;
-            auto raw = sor::engines::solve_hpr(problem, hpr_opts, *dev, diag);
-            auto ev = sor::engines::hpr_evidence(diag, hpr_opts);
-            ev = sor::certify::check_lp_result(problem, raw, ev);
-            const auto r = sor::certify::finalize_result(std::move(raw), ev);
-            print_result(r);
-            write_solution_out(solution_out, r);
-            std::printf("max row violation: %.3e\n", r.max_primal_violation);
-            std::printf("dual residual:     %.3e\n", r.max_dual_violation);
-            std::printf("iterations:        %llu\n",
-                        static_cast<unsigned long long>(r.iterations));
-            std::printf("termination:       %s\n", r.termination_reason.c_str());
-            std::printf("\ntiming (ms)\n");
-            std::printf("  total            %10.3f\n", diag.total_ms);
-            print_transfer(diag.device_stats);
-            return exit_code_for(r.status);
+
         }
 
         std::fprintf(stderr, "error: unreachable engine dispatch\n");

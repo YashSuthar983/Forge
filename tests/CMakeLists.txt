@@ -5,6 +5,7 @@ function(sor_add_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+sor_add_test(test_exact_model         sor_model)
 sor_add_test(test_csr                 sor_sparse)
 sor_add_test(test_csc                 sor_sparse)
 sor_add_test(test_lu                  sor_la_cpu)

@@ -85,8 +85,7 @@ void main() {
 
         double bound = r_scaled >= 0.0lf ? clo : chi;
         if (isinf(bound)) {
-            double limit = pc.dual_tol * (1.0lf + abs(c[j] / cs));
-            if (abs(r) > limit) nonfin = 1.0lf;
+            if (r_scaled != 0.0lf) nonfin = 1.0lf;
         } else {
             dobj = r_scaled * bound;
         }

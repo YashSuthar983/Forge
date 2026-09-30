@@ -370,7 +370,12 @@ void test_monotone_pairs_preserve_optimum_and_postsolve() {
     MilpPresolveStats stats;
     auto pre = run_structural_presolve(lp, opts, stats);
     CHECK(stats.monotone_pairs_saturated == 0);
-    CHECK(pre.reduced.max_row_violation({0., 0.}) == 0.);
+    const std::vector<double> reduced_zero(pre.reduced.n_cols(), 0.);
+    CHECK(pre.reduced.max_row_violation(reduced_zero) == 0.);
+    const auto original_zero = postsolve_point(pre, reduced_zero);
+    CHECK(lp.max_row_violation(original_zero) == 0.);
+    CHECK(lp.max_bound_violation(original_zero) == 0.);
+    CHECK_NEAR(lp.objective(original_zero), 0., 0.);
     opts.monotone_binary_pairs = false; lp.c = {0., 0.};
     opts.merge_duplicate_columns = false;
     pre = run_structural_presolve(lp, opts, stats);

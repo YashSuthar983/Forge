@@ -46,6 +46,9 @@ struct SimplexBasis {
 };
 
 struct SimplexOptions {
+    // Targeted continuation may price an exact unsupported dual term even
+    // when its numerical reduced cost lies below the search tolerance.
+    bool certificate_pricing = false;
     std::uint64_t max_iterations = 0;
     double time_limit_s = 900.0;
 
@@ -617,6 +620,9 @@ struct SimplexDiagnostics {
     // One for solve_simplex()/direct primal/dual calls. Auto used to report
     // up to four because every stage rebuilt scaling and CSC independently.
     std::uint64_t preprocessing_builds = 0;
+    std::uint64_t certificate_stages = 0;
+    std::uint64_t certificate_iterations = 0;
+    std::uint64_t certificate_preprocessing_builds = 0;
 
     // Structural summary of the presolved model, for the LP Auto layer above
     // this one. Populated on every Auto solve; left at its defaults when the

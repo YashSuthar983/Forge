@@ -2,6 +2,7 @@
 #include "sor/engines/dual_simplex.hpp"
 #include "simplex_prepared.hpp"
 #include "sor/certify/finalize.hpp"
+#include "sor/model/exact.hpp"
 
 // Ruiz equilibration is declared in pdhg.hpp and defined in pdhg.cpp. Both
 // engines want it and it is the same algorithm; a third translation unit for one
@@ -89,6 +90,25 @@ public:
         }
         sift_up(old_position);
         sift_down(position_[sz(column)]);
+    }
+
+    template<class Score>
+    void rebuild(const std::vector<Index>& columns, Score score) {
+        clear();
+        heap_.reserve(columns.size());
+        for (std::size_t k = 0; k < columns.size(); ++k) {
+            const Index column = columns[k];
+            const f64 value = score(column);
+            if (!(value > 0) || std::isnan(value)) continue;
+            score_[sz(column)] = value;
+            tie_[sz(column)] = static_cast<Index>(k);
+            position_[sz(column)] = static_cast<Index>(heap_.size());
+            heap_.push_back(column);
+        }
+        // Floyd heapification is linear after a global repricing. Incremental
+        // sift-up remains appropriate for a small dirty support.
+        for (std::size_t k = heap_.size() / 2; k-- > 0;)
+            sift_down(static_cast<Index>(k));
     }
 
     Index top() const { SOR_FN(); return heap_.empty() ? -1 : heap_.front(); }
@@ -248,6 +268,14 @@ void rematerialize_original(const model::LpProblem& original,
                      dres_value, dres_lo, dres_hi, dres_reduced, dres);
     }
     report_simplex_dual_bound(pmin, sense, yout, aty, diag);
+    if (!raw.exact_dual.empty()) {
+        const auto bound = certify::exact_dual_lower_bound(original, raw.exact_dual);
+        if (bound.finite && (!diag.dual_bound_finite || sense * bound.value > sense * diag.dual_objective)) {
+            diag.dual_objective = sense * bound.value;
+            diag.dual_bound_finite = true;
+            diag.gap_rel = std::fabs(raw.objective - diag.dual_objective) / (1 + std::fabs(raw.objective));
+        }
+    }
     raw.dual_bound = diag.dual_objective;
 }
 
@@ -407,6 +435,9 @@ void accumulate_work(SimplexDiagnostics& total,
     total.loop_ms           += stage.loop_ms;
     total.total_ms          += stage.total_ms;
     total.preprocessing_builds += stage.preprocessing_builds;
+    total.certificate_stages += stage.certificate_stages;
+    total.certificate_iterations += stage.certificate_iterations;
+    total.certificate_preprocessing_builds += stage.certificate_preprocessing_builds;
     total.largest_update_multiplier = std::max(total.largest_update_multiplier,
                                                stage.largest_update_multiplier);
     ++total.stages;
@@ -564,6 +595,9 @@ void install_work_totals(SimplexDiagnostics& chosen,
     chosen.loop_ms            = total.loop_ms;
     chosen.total_ms           = total.total_ms;
     chosen.preprocessing_builds = total.preprocessing_builds;
+    chosen.certificate_stages = total.certificate_stages;
+    chosen.certificate_iterations = total.certificate_iterations;
+    chosen.certificate_preprocessing_builds = total.certificate_preprocessing_builds;
     chosen.largest_update_multiplier = total.largest_update_multiplier;
 }
 
@@ -592,43 +626,18 @@ void report_simplex_dual_bound(const model::LpProblem& pmin, f64 sense,
                               const std::vector<long double>& aty,
                               SimplexDiagnostics& diag) {
     SOR_FN();
-    bool finite = true;
-    long double value = 0.0L, magnitude = std::fabs(static_cast<long double>(pmin.obj_offset));
-    for (Index j = 0; j < pmin.n_cols() && finite; ++j) {
-        const long double d = static_cast<long double>(pmin.c[sz(j)]) - aty[sz(j)];
-        if (d == 0.0L) continue;
-        const f64 b = d > 0.0L ? pmin.col_lo[sz(j)] : pmin.col_hi[sz(j)];
-        if (!std::isfinite(b) || !std::isfinite(d)) { finite = false; break; }
-        const long double term = d * b;
-        value += term;
-        magnitude += std::fabs(term);
+    (void)aty; // Rounded stationarity is a diagnostic, never a bound producer.
+    const auto bound = certify::safe_lagrangian_lower_bound(
+        pmin, y_min, pmin.col_lo, pmin.col_hi);
+    diag.dual_bound_finite = bound.finite;
+    diag.dual_objective = std::numeric_limits<f64>::quiet_NaN();
+    if (bound.finite) {
+        const model::Rational reported = model::Rational(sense) *
+            (model::Rational(bound.value) - model::Rational(pmin.obj_offset)) +
+            model::Rational(pmin.obj_offset);
+        diag.dual_objective = sense > 0 ? model::rounded_down(reported) : model::rounded_up(reported);
+        diag.dual_bound_finite = std::isfinite(diag.dual_objective);
     }
-    for (Index i = 0; i < pmin.n_rows() && finite; ++i) {
-        const f64 y = y_min[sz(i)];
-        if (y == 0.0) continue;
-        const f64 b = y > 0.0 ? pmin.row_lo[sz(i)] : pmin.row_hi[sz(i)];
-        if (!std::isfinite(b) || !std::isfinite(y)) { finite = false; break; }
-        const long double term = static_cast<long double>(y) * b;
-        value += term;
-        magnitude += std::fabs(term);
-    }
-    if (finite) value -= 1e-12L * (1.0L + magnitude);
-    if (!finite) {
-        // A tiny wrong-sign cost against infinity is still -infinity. Only
-        // actual row-implied bounds or a checked multiplier correction can
-        // recover a finite bound; feasibility tolerance cannot erase the term.
-        const auto bound = certify::safe_lagrangian_lower_bound(
-            pmin, y_min, pmin.col_lo, pmin.col_hi);
-        finite = bound.finite;
-        value = static_cast<long double>(bound.value) - pmin.obj_offset;
-    }
-    const long double reported = sense * value + pmin.obj_offset;
-    f64 objective = static_cast<f64>(reported);
-    if (finite && std::isfinite(objective))
-        objective = std::nextafter(objective, sense > 0.0 ? -kInf : kInf);
-    diag.dual_bound_finite = finite && std::isfinite(objective);
-    diag.dual_objective = diag.dual_bound_finite ? objective
-        : std::numeric_limits<f64>::quiet_NaN();
     diag.gap_rel = diag.dual_bound_finite
         ? std::fabs(diag.primal_objective - diag.dual_objective) /
               (1.0 + std::fabs(diag.primal_objective))
@@ -868,6 +877,8 @@ bool detail::prefer_simplex_candidate(const core::RawResult& candidate,
 SimplexPrepared prepare_simplex_model(const model::LpProblem& problem,
                                       const SimplexOptions& opts) {
     SOR_FN();
+    problem.validate(/*allow_empty_domains=*/true);
+    model::validate_lp_policy(opts.primal_feas_tol, opts.dual_feas_tol, opts.gap_tol, opts.time_limit_s);
     const auto t_all = Clock::now();
     SimplexPrepared out;
     out.sense = problem.maximize ? -1.0 : 1.0;
@@ -1003,14 +1014,14 @@ core::RawResult solve_primal_simplex_prepared(
     // engine). Without this, pilot/etamacro terminated with a wrong-sign
     // reduced cost of 1.2-1.5e-7 unscaled -- inside the 1e-7 SCALED slack,
     // outside the certificate gate's tolerance.
-    const auto& dtol = prepared.dual_tolerance;
+    const auto dtol = prepared_tolerances(prepared, opts, true);
 
     // Primal feasibility is checked in the scaled working model but certified
     // after unscaling. For x = D_c x_hat, an original-space tolerance maps to
     // tol / D_c in x_hat; for row activity D_r A x, it maps to tol * D_r.
     // A single absolute scaled tolerance accepted large original violations on
     // badly scaled rows (dfl001 stopped with 76 units of row error).
-    const auto& ptol = prepared.primal_tolerance;
+    const auto ptol = prepared_tolerances(prepared, opts, false);
 
     // ---- 4. state --------------------------------------------------------
     std::vector<Index> basis(sz(m));
@@ -1296,10 +1307,11 @@ core::RawResult solve_primal_simplex_prepared(
     const auto do_ftran = [&](std::vector<f64>& v) { SOR_FN(); ++diag.solve_calls; factor.ftran(v); };
     const auto do_ftran_seeded = [&](std::vector<f64>& v,
                                      const std::vector<Index>& seed,
-                                     std::vector<Index>& support) {
+                                     std::vector<Index>& support,
+                                     la::SpikeCapture* spike = nullptr) {
         SOR_FN();
         ++diag.solve_calls;
-        return factor.ftran_seeded_with_support(v, seed, support);
+        return factor.ftran_seeded_with_support(v, seed, support, spike);
     };
     const auto do_btran = [&](std::vector<f64>& v) { SOR_FN(); ++diag.solve_calls; factor.btran(v); };
     const auto do_btran_seeded = [&](std::vector<f64>& v,
@@ -1316,6 +1328,9 @@ core::RawResult solve_primal_simplex_prepared(
     std::vector<Index>  bri, bad_slots, vacant_rows;
     std::vector<f64>    bvals;
     std::vector<f64>    rhs(sz(m), 0.0), y(sz(m), 0.0), alpha(sz(m), 0.0), cB(sz(m), 0.0);
+    std::vector<f64> primal_direction;
+    la::SpikeCapture primal_spike;
+    bool alpha_previous_sparse = false;
     std::vector<Index>  alpha_support, alpha_input_rows;
     std::vector<char>   alpha_support_mark(sz(m), 0);
     bool allow_sparse_primal_ftran = m >= 512;
@@ -1400,9 +1415,7 @@ core::RawResult solve_primal_simplex_prepared(
     };
     const auto rebuild_candidates = [&]() {
         SOR_FN();
-        cand_heap.clear();
-        for (const Index j : nonbasic)
-            cand_heap.update(j, candidate_score(j), nonbasic_pos[sz(j)]);
+        cand_heap.rebuild(nonbasic, candidate_score);
         diag.primal_price_columns_scored += nonbasic.size();
         ++diag.primal_price_heap_rebuilds;
         diag.primal_price_heap_max_size = std::max(
@@ -1499,6 +1512,37 @@ core::RawResult solve_primal_simplex_prepared(
         }
         do_ftran(rhs);
         xB = rhs;                     // ftran leaves the result slot-indexed
+        if (opts.certificate_pricing) {
+            // Compute residuals with exact products in the stored scaled
+            // system, then use the existing LU for correction proposals.
+            // Final acceptance still uses the original model checker.
+            for (int round = 0; round < 3; ++round) {
+                std::vector<model::ExactSum> residual(sz(m));
+                for (const Index j : nonbasic)
+                    if (value[sz(j)] != 0)
+                        for_col(j, [&](Index i, double a) {
+                            residual[sz(i)].add_product(-a, value[sz(j)]);
+                        });
+                for (Index s = 0; s < m; ++s)
+                    for_col(basis[sz(s)], [&](Index i, double a) {
+                        residual[sz(i)].add_product(-a, xB[sz(s)]);
+                    });
+                double largest = 0;
+                for (Index i = 0; i < m; ++i) {
+                    rhs[sz(i)] = residual[sz(i)].value().convert_to<double>();
+                    largest = std::max(largest, std::fabs(rhs[sz(i)]));
+                }
+                if (largest == 0 || !std::isfinite(largest)) break;
+                do_ftran(rhs);
+                bool changed = false;
+                for (Index s = 0; s < m; ++s) {
+                    const double corrected = xB[sz(s)] + rhs[sz(s)];
+                    changed |= corrected != xB[sz(s)];
+                    xB[sz(s)] = corrected;
+                }
+                if (!changed) break;
+            }
+        }
     };
 
     // Sum of bound violations over the basic variables. Zero exactly when the
@@ -1720,7 +1764,8 @@ core::RawResult solve_primal_simplex_prepared(
         const auto update_t0 = Clock::now();
         const bool updated =
             opts.update_method == la::UpdateMethod::ForrestTomlin
-                ? factor.update_ft(leave, alpha, la::LuOptions{}, opts.pivot_tol)
+                ? factor.update_ft(leave, alpha, lu_opts, opts.pivot_tol,
+                    alpha_previous_sparse ? &alpha_support : nullptr, &primal_spike)
                 : factor.update(leave, alpha, opts.pivot_tol);
         diag.basis_update_ms += ms_since(update_t0);
         ++diag.basis_update_calls;
@@ -1823,6 +1868,7 @@ core::RawResult solve_primal_simplex_prepared(
 
     core::Status status = core::Status::NotSolved;
     std::string reason;
+    std::vector<std::string> terminal_exact_dual;
     int since_refactor = 0;
      int polish_reprices = 0;
      // Cleanup escalation: dtol is divided by this factor when the final basis
@@ -2082,14 +2128,67 @@ core::RawResult solve_primal_simplex_prepared(
             // final basis actually puts them, which the complementarity check
             // in the residual computation measures.
             recompute_xB();
-            status = core::Status::Optimal;   // proposed only; the gate decides
-            reason = "no improving nonbasic column";
-            break;
+            if (opts.certificate_pricing) {
+                core::RawResult certificate;
+                certificate.certificate_basis = basis;
+                if (certify::repair_basis_certificate(pmin, certificate,
+                    {.time_limit_s = opts.time_limit_s > 0 ? std::max(std::numeric_limits<double>::min(),
+                        opts.time_limit_s - ms_since(t_all) / 1000) : 0,
+                     .perturb_inward = false})) {
+                    // A verified bound within the requested gap is sufficient.
+                    // Exact pricing must not chase harmless finite-support
+                    // reduced costs after that stopping condition is met.
+                    const auto bound = certify::exact_dual_lower_bound(pmin, certificate.exact_dual);
+                    std::vector<double> point(sz(ns));
+                    for (Index j = 0; j < ns; ++j)
+                        point[sz(j)] = scaling.col_scale[sz(j)] *
+                            (st[sz(j)] == NonbasicStatus::Basic ? xB[sz(slot_of[sz(j)])] : value[sz(j)]);
+                    const double objective = pmin.objective(point);
+                    if (bound.finite && std::isfinite(objective) &&
+                        std::fabs(objective - bound.value) <= opts.gap_tol * (1 + std::fabs(objective)) &&
+                        pmin.max_row_violation(point) <= opts.primal_feas_tol &&
+                        pmin.max_bound_violation(point) <= opts.primal_feas_tol) {
+                        terminal_exact_dual = std::move(certificate.exact_dual);
+                        status = core::Status::Optimal;
+                        reason = "checked original-model gap reached";
+                        break;
+                    }
+                    std::vector<int> permitted(sz(nt), 0);
+                    for (Index j = 0; j < nt; ++j) {
+                        if (lo[sz(j)] == hi[sz(j)]) continue;
+                        permitted[sz(j)] = st[sz(j)] == NonbasicStatus::AtLower ? 1 :
+                            st[sz(j)] == NonbasicStatus::AtUpper ? -1 :
+                            st[sz(j)] == NonbasicStatus::AtZeroFree ? 2 : 0;
+                    }
+                    const auto failure = certify::exact_dual_support_failure(pmin, certificate.exact_dual, permitted);
+                    const Index candidate = failure.variable;
+                    if (candidate >= 0 && candidate < nt &&
+                        st[sz(candidate)] != NonbasicStatus::Basic &&
+                        (st[sz(candidate)] == NonbasicStatus::AtZeroFree ||
+                         (failure.improving_direction > 0 && st[sz(candidate)] == NonbasicStatus::AtLower) ||
+                         (failure.improving_direction < 0 && st[sz(candidate)] == NonbasicStatus::AtUpper))) {
+                        q = candidate;
+                        qdir = failure.improving_direction;
+                        // Preserve the exact sign decision through numerical
+                        // pricing. Ratio tests and original-model checks still
+                        // decide whether this continuation is useful.
+                        polish_reprices = 0;
+                    }
+                }
+            }
+            if (q < 0) {
+                status = core::Status::Optimal;   // proposed only; the gate decides
+                reason = "no improving nonbasic column";
+                break;
+            }
         }
 
         // ---- ratio test ---------------------------------------------------
         Index vl_refresh = -1;   // leaving var, captured pre-apply_pivot for the refresh
-        std::fill(alpha.begin(), alpha.end(), 0.0);
+        if (alpha_previous_sparse) {
+            for (Index i : alpha_support) alpha[sz(i)] = 0.0;
+        } else std::fill(alpha.begin(), alpha.end(), 0.0);
+        primal_spike.clear();
         alpha_input_rows.clear();
         for_col(q, [&](Index i, f64 v) {
             SOR_FN();
@@ -2099,9 +2198,12 @@ core::RawResult solve_primal_simplex_prepared(
         if (time_detail) t_part = Clock::now();
         const bool alpha_sparse = allow_sparse_primal_ftran &&
             !force_dense_primal_ftran &&
-            do_ftran_seeded(alpha, alpha_input_rows, alpha_support);
-        if (!allow_sparse_primal_ftran || force_dense_primal_ftran)
-            do_ftran(alpha);
+            do_ftran_seeded(alpha, alpha_input_rows, alpha_support, &primal_spike);
+        if (!allow_sparse_primal_ftran || force_dense_primal_ftran) {
+            ++diag.solve_calls;
+            factor.ftran(alpha, &primal_spike);
+        }
+        alpha_previous_sparse = alpha_sparse;
         if (time_detail) diag.solve_ms += ms_since(t_part);
         if (alpha_sparse) {
             // ftran_with_support is deliberately partial-write: output slots
@@ -2190,6 +2292,12 @@ core::RawResult solve_primal_simplex_prepared(
             // unbounded -- observed on 80bau3b (true optimum 987224.19).
             if (since_refactor > 0) { do_factorize(); since_refactor = 0; continue; }
             if (phase == 2) {
+                primal_direction.assign(sz(ns), 0.0);
+                if (q < ns) primal_direction[sz(q)] = static_cast<f64>(qdir) * scaling.col_scale[sz(q)];
+                for (Index i = 0; i < m; ++i)
+                    if (basis[sz(i)] < ns)
+                        primal_direction[sz(basis[sz(i)])] = -static_cast<f64>(qdir) *
+                            alpha[sz(i)] * scaling.col_scale[sz(basis[sz(i)])];
                 status = core::Status::Unbounded;
                 reason = "improving column with no blocking bound";
                 break;
@@ -2676,6 +2784,9 @@ core::RawResult solve_primal_simplex_prepared(
 
     // ---- 9. report -------------------------------------------------------
     core::RawResult raw;
+    raw.primal_ray.direction = std::move(primal_direction);
+    raw.certificate_basis = basis;
+    raw.exact_dual = std::move(terminal_exact_dual);
     raw.x = std::move(x);
     raw.y.resize(sz(m));
     for (Index i = 0; i < m; ++i) raw.y[sz(i)] = sense * yout[sz(i)];
@@ -2709,6 +2820,20 @@ core::RawResult solve_primal_simplex_prepared(
             break;
     }
 
+    if (status == core::Status::Optimal && sense == 1.0 && !diag.dual_bound_finite &&
+        (opts.time_limit_s == 0 || ms_since(t_all) < 1000 * opts.time_limit_s))
+        repair_simplex_dual(pmin, raw, simplex_options_after_elapsed(opts, ms_since(t_all) / 1000), diag);
+    if (status == core::Status::Optimal && sense == 1.0 && !diag.dual_bound_finite &&
+        raw.exact_dual.empty() && certify::repair_basis_certificate(pmin, raw,
+            {.time_limit_s = opts.time_limit_s > 0 ? std::max(std::numeric_limits<double>::min(),
+                opts.time_limit_s - ms_since(t_all) / 1000) : 0})) {
+        const auto exact = certify::exact_dual_lower_bound(pmin, raw.exact_dual);
+        if (exact.finite) {
+            raw.dual_bound = diag.dual_objective = sense * exact.value;
+            diag.dual_bound_finite = true;
+            diag.gap_rel = std::fabs(raw.objective - raw.dual_bound) / (1 + std::fabs(raw.objective));
+        }
+    }
     export_factor();
     diag.total_ms = ms_since(t_all);
     return raw;
@@ -2740,6 +2865,9 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
                               SimplexBasis* out_basis,
                               std::unique_ptr<DualProbeSession>* out_session) {
     SOR_FN();
+    core::RouteSpan solve_span(1, "simplex", "solve", "solve", "", core::RouteLedgerBucket::Engine);
+    problem.validate(/*allow_empty_domains=*/true);
+    model::validate_lp_policy(opts.primal_feas_tol, opts.dual_feas_tol, opts.gap_tol, opts.time_limit_s);
     const model::LpProblem* work = &problem;
     presolve::PresolveMap pmap;
     bool used_presolve = false;
@@ -2776,6 +2904,14 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         d.presolve_equality_aggregations = pmap.stats.equality_aggregations;
         d.presolve_aggregation_fill = pmap.stats.aggregation_fill;
     };
+    if (opts.presolve && presolve_status == presolve::PresolveStatus::Unbounded) {
+        SimplexOptions continuation = simplex_options_after_elapsed(opts, presolve_ms / 1000.0);
+        continuation.presolve = false;
+        auto terminal = solve_simplex(problem, continuation, diag, out_basis, out_session);
+        diag.presolve_ms += presolve_ms;
+        diag.total_ms += presolve_ms;
+        return terminal;
+    }
     if (opts.presolve &&
         (presolve_status == presolve::PresolveStatus::Infeasible ||
          presolve_status == presolve::PresolveStatus::Unbounded)) {
@@ -2831,7 +2967,7 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
     // two most common outcomes (the primary proves it; fallback wins)
     // with no call at all, so out_basis came back empty -- which is what
     // test_basis_wellformed caught.
-    SimplexBasis dual_basis, esc_basis, prim_basis, reduced_winner_basis;
+    SimplexBasis dual_basis, esc_basis, prim_basis, reduced_winner_basis, original_winner_basis;
     SimplexDiagnostics cumulative;
     const auto have_pivot_allowance = [&]() {
         return opts.max_iterations == 0 || cumulative.iterations < opts.max_iterations;
@@ -2876,11 +3012,12 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
     const auto install_basis = [&](const SimplexBasis& b) {
         SOR_FN();
         if (!used_presolve) {
+            original_winner_basis = b;
             if (out_basis) *out_basis = b;
             if (retain_prepared) retained_basis = b;
             return;
         }
-        if (out_basis) reduced_winner_basis = b;
+        reduced_winner_basis = b;
     };
 
 
@@ -3053,6 +3190,71 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
     diag.total_ms += presolve_ms;
     copy_presolve_diag(diag);
     raw.iterations = diag.iterations;
+    // Both presolved and original-space solves use the same checked recovery.
+    const auto continue_original_certificate = [&](const SimplexBasis& warm_basis) {
+        if (raw.proposed_status != core::Status::Optimal ||
+            (diag.dual_bound_finite && diag.gap_rel <= opts.gap_tol) ||
+            warm_basis.status.empty() ||
+            diag.certificate_iterations >= simplex_certificate_pivot_allowance ||
+            (opts.max_iterations != 0 && diag.iterations >= opts.max_iterations) ||
+            (opts.time_limit_s > 0 && ms_since(presolve_t0) >= 1000 * opts.time_limit_s)) return false;
+        SimplexOptions continuation = simplex_options_after_elapsed(opts, ms_since(presolve_t0) / 1000);
+        continuation.presolve = false;
+        continuation.method = SimplexMethod::Primal;
+        continuation.certificate_pricing = true;
+        const auto certificate_available = simplex_certificate_pivot_allowance - diag.certificate_iterations;
+        continuation.max_iterations = opts.max_iterations == 0 ? certificate_available
+            : std::min(certificate_available, opts.max_iterations - diag.iterations);
+        SimplexDiagnostics continuation_work;
+        SimplexBasis repaired_basis;
+        auto candidate = solve_primal_simplex(problem, continuation, continuation_work,
+                                              &repaired_basis, &warm_basis);
+        auto checked = certify::check_lp_result(problem, candidate, simplex_evidence(continuation_work, continuation));
+        if (!checked.checker_passed && candidate.proposed_status == core::Status::Optimal &&
+            std::isfinite(candidate.dual_bound) && !raw.x.empty()) {
+            // Primal points and dual bounds are independent witnesses in
+            // the same model. Cleanup may improve the certificate while
+            // slightly worsening feasibility. Keep the earlier point only
+            // if the independent checker accepts the combined witnesses.
+            candidate.x = raw.x;
+            candidate.objective = problem.objective(candidate.x);
+            checked = certify::check_lp_result(problem, candidate,
+                simplex_evidence(continuation_work, continuation));
+        }
+        if (std::getenv("SOR_CERTIFICATE_DEBUG"))
+            std::fprintf(stderr, "[certificate-continuation] status=%s reason=%s pivots=%llu primal=%.9g dual=%.9g gap=%.9g\n",
+                core::to_string(candidate.proposed_status).data(), candidate.termination_reason.c_str(),
+                static_cast<unsigned long long>(continuation_work.iterations),
+                checked.max_primal_violation, checked.max_dual_violation, checked.gap_rel);
+        continuation_work.certificate_stages = std::max<std::uint64_t>(1, continuation_work.stages);
+        continuation_work.certificate_iterations = continuation_work.iterations;
+        continuation_work.certificate_preprocessing_builds = continuation_work.preprocessing_builds;
+        accumulate_simplex_work(diag, continuation_work);
+        if (checked.checker_passed && checked.reported_values_consistent &&
+            checked.max_dual_violation <= opts.dual_feas_tol &&
+            std::isfinite(checked.gap_rel) && checked.gap_rel <= opts.gap_tol &&
+            candidate.proposed_status == core::Status::Optimal) {
+            const auto totals = diag;
+            diag = continuation_work;
+            install_work_totals(diag, totals);
+            diag.primal_residual = checked.max_primal_violation;
+            diag.dual_residual = checked.max_dual_violation;
+            diag.primal_objective = candidate.objective;
+            diag.dual_objective = checked.checked_dual_bound;
+            diag.dual_bound_finite = std::isfinite(checked.checked_dual_bound);
+            diag.gap_rel = checked.gap_rel;
+            raw = std::move(candidate);
+            raw.engine = "simplex+certificate-continuation";
+            if (retain_prepared) {
+                retained_basis = repaired_basis;
+                retained_factor.clear();
+                retained_weights.clear();
+            }
+            if (out_basis) *out_basis = std::move(repaired_basis);
+            return true;
+        }
+        return false;
+    };
     bool presolve_recovery_validated = false;
     if (used_presolve) {
         presolve::PresolveReducedSolve rs;
@@ -3071,11 +3273,17 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         ropts.primal_feas_tol = opts.primal_feas_tol;
         ropts.dual_feas_tol = opts.dual_feas_tol;
         ropts.gap_tol = opts.gap_tol;
+        ropts.certificate_time_limit_s = opts.time_limit_s > 0
+            ? std::max(-1.0, opts.time_limit_s - ms_since(presolve_t0) / 1000) : 0;
+        if (opts.time_limit_s > 0 && ropts.certificate_time_limit_s <= 0)
+            ropts.certificate_time_limit_s = -1;
         const auto recovered =
             presolve::recover_solution(problem, pmap, rs, ropts);
         raw.x = recovered.raw.x;
         raw.y = recovered.raw.y;
         raw.objective = recovered.raw.objective;
+        raw.certificate_basis = recovered.basis.basic;
+        raw.exact_dual = recovered.raw.exact_dual;
         if (raw.proposed_status == core::Status::Infeasible &&
             !raw.dual_farkas_ray.multipliers.empty()) {
             raw.dual_farkas_ray = presolve::recover_dual_farkas_ray(
@@ -3083,8 +3291,33 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         }
         presolve_recovery_validated = recovered.validated;
         rematerialize_original(problem, raw, diag, opts);
+        if (raw.proposed_status == core::Status::Optimal && !problem.maximize &&
+            !diag.dual_bound_finite &&
+            (opts.time_limit_s == 0 || diag.total_ms < 1000 * opts.time_limit_s)) {
+            const auto repair_started = Clock::now();
+            repair_simplex_dual(problem, raw,
+                simplex_options_after_elapsed(opts, diag.total_ms / 1000), diag);
+            diag.total_ms += ms_since(repair_started);
+        }
+        // A finite but loose bound benefits from support selection. When the
+        // basis has unsupported terms, retain the warm exact-pricing route;
+        // a cold support LP can spend its whole allowance without progress.
+        if (raw.proposed_status == core::Status::Optimal &&
+            diag.dual_bound_finite && diag.gap_rel > opts.gap_tol &&
+            (opts.time_limit_s == 0 || ms_since(presolve_t0) < 1000 * opts.time_limit_s)) {
+            const auto repair_started = Clock::now();
+            repair_simplex_support(problem, raw,
+                simplex_options_after_elapsed(opts, ms_since(presolve_t0) / 1000), diag);
+            diag.total_ms += ms_since(repair_started);
+        }
+        SimplexBasis continuation_basis;
+        continuation_basis.n_struct = recovered.basis.n_struct;
+        continuation_basis.basic = recovered.basis.basic;
+        for (auto status : recovered.basis.status)
+            continuation_basis.status.push_back(static_cast<NonbasicStatus>(status));
+        if (continue_original_certificate(continuation_basis)) presolve_recovery_validated = true;
         raw.iterations = diag.iterations;
-        if (out_basis && !recovered.basis.status.empty()) {
+        if (out_basis && raw.engine != "simplex+certificate-continuation" && !recovered.basis.status.empty()) {
             SimplexBasis lifted;
             lifted.n_struct = recovered.basis.n_struct;
             lifted.basic = recovered.basis.basic;
@@ -3105,7 +3338,11 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
             ? opts.time_limit_s -
                   std::chrono::duration<double>(Clock::now() - presolve_t0).count()
             : 0.0;
-        if (used_presolve && !presolved_proved &&
+        const bool search_or_lift_needs_retry =
+            diag.primal_residual > opts.primal_feas_tol ||
+            diag.dual_residual > opts.dual_feas_tol ||
+            (diag.dual_bound_finite && diag.gap_rel > opts.gap_tol);
+        if (used_presolve && !presolved_proved && search_or_lift_needs_retry &&
             (opts.max_iterations == 0 || diag.iterations < opts.max_iterations) &&
             std::getenv("SOR_PRESOLVE_NO_RETRY") == nullptr &&
             (opts.time_limit_s <= 0.0 || retry_time_left > 0.0) &&
@@ -3172,6 +3409,18 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
             raw.iterations = diag.iterations;
         }
     }
+    if (!used_presolve) {
+        if (raw.proposed_status == core::Status::Optimal &&
+            diag.dual_bound_finite && diag.gap_rel > opts.gap_tol &&
+            (opts.time_limit_s == 0 || ms_since(presolve_t0) < 1000 * opts.time_limit_s)) {
+            const auto repair_started = Clock::now();
+            repair_simplex_support(problem, raw,
+                simplex_options_after_elapsed(opts, ms_since(presolve_t0) / 1000), diag);
+            diag.total_ms += ms_since(repair_started);
+        }
+        continue_original_certificate(original_winner_basis);
+        raw.iterations = diag.iterations;
+    }
     if (retain_prepared &&
         retained_basis.n_struct == problem.n_cols() &&
         retained_basis.basic.size() == sz(problem.n_rows()) &&
@@ -3214,7 +3463,8 @@ core::ProofEvidence simplex_evidence(const SimplexDiagnostics& diag,
     switch (diag.status) {
         case core::Status::Optimal:
             ev.claimed_level = gap_closed ? core::ProofLevel::ProvedOptimalFP
-                                          : core::ProofLevel::FeasibleWithGap;
+                : diag.dual_bound_finite && std::isfinite(diag.gap_rel)
+                ? core::ProofLevel::FeasibleWithGap : core::ProofLevel::FeasibleOnly;
             break;
         case core::Status::Infeasible:
         case core::Status::Unbounded:

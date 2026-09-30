@@ -35,6 +35,8 @@ BabOptions deterministic_options(std::uint64_t nodes) {
     BabOptions o;
     o.max_nodes = nodes;
     o.time_limit_s = 1000.0;
+    o.strong_branch_time_s = 0.0;
+    o.rb_startup_ms = 1e12; // The deterministic test uses pivot/node budgets.
     o.para_bab.threads = 1;
     o.feasibility_jump = false;
     o.fixprop = false;

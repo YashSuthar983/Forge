@@ -104,6 +104,11 @@ void write_solution(std::ostream& out, const core::SolveResult& r) {
     write_vec(out, "ray", r.ray);
     write_vec(out, "primal_ray", r.primal_ray.direction);
     write_vec(out, "dual_farkas_ray", r.dual_farkas_ray.multipliers);
+    if (!r.exact_dual.empty()) {
+        out << "exact_dual " << r.exact_dual.size();
+        for (const auto& value : r.exact_dual) out << ' ' << value;
+        out << '\n';
+    }
 }
 
 SolutionFile read_solution(std::istream& in) {
@@ -131,6 +136,16 @@ SolutionFile read_solution(std::istream& in) {
     if (in.peek() != std::char_traits<char>::eof()) {
         s.primal_ray = read_vec(in, "primal_ray");
         s.dual_farkas_ray = read_vec(in, "dual_farkas_ray");
+        in >> std::ws;
+        if (in.peek() != std::char_traits<char>::eof()) {
+            std::size_t count = 0;
+            if (!(in >> tag >> count) || tag != "exact_dual" || count != s.y.size())
+                throw std::runtime_error("solution file: invalid exact_dual count");
+            s.exact_dual.resize(count);
+            for (auto& rational : s.exact_dual)
+                if (!(in >> rational) || !core::valid_exact_dual_token(rational))
+                    throw std::runtime_error("solution file: invalid exact_dual rational");
+        }
     }
     return s;
 }

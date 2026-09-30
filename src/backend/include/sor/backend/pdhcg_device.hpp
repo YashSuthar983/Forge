@@ -136,7 +136,7 @@ public:
 
     // Everything the convergence check needs at (x, y), or at the running
     // average when `at_average`.  r = Qx + c + A'y.
-struct Eval {
+    struct Eval {
         f64 primal = 0.0;     // max(col bound violation, row violation of Ax)
         f64 dual_res = 0.0;   // natural-map residual, columns and rows
         f64 xqx = 0.0;        // x'Qx
@@ -155,7 +155,12 @@ struct Eval {
         f64 kkt_epoch_dx_norm = 0.0;
         f64 kkt_epoch_dy_norm = 0.0;
     };
+    // Includes the legacy LP diagnostic fields above; these ignore Q.
     virtual Eval evaluate(bool at_average) = 0;
+    // Production QP convergence needs only the QP residuals and supports.
+    // Devices may skip LP diagnostics and their full-vector readbacks here.
+    // The fallback preserves compatibility with existing device subclasses.
+    virtual Eval evaluate_qp(bool at_average) { return evaluate(at_average); }
 
     virtual void download(std::vector<f64>& x, std::vector<f64>& y) = 0;
     virtual TransferStats transfer_stats() const = 0;
