@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <functional>
 #include <vector>
+#include "sor/core/route_debug.hpp"
 
 namespace sor::search {
 
@@ -29,6 +30,11 @@ using core::f64;
 using core::Index;
 
 struct CutOptions {
+    // Treat a row-activity variable as integral only if every nonzero term
+    // is an exactly integral coefficient of a declared integer column.
+    // Experimental until validity and full-set proof ablations pass.
+    bool integer_slack_gmi = true;
+    bool integer_activity_basic_gmi = false;
     int max_rounds = 20;
     f64 min_progress_rel = 1e-4;   // a round gaining less than this is "stalled"
     // Consecutive stalled rounds tolerated before the loop gives up.
@@ -43,7 +49,110 @@ struct CutOptions {
     // Cut loops are not monotone in per-round gain: a round that adds little
     // often exposes structure the next round exploits. Patience is what lets
     // the loop cross that dip.
-    int min_progress_patience = 3;
+    int min_progress_patience = 2;   // plan 3E: stop after two low-yield rounds
+    // Retract the trailing run of rounds that bought no bound, instead of
+    // only stopping once it is long enough.
+    //
+    // min_progress_rel / min_progress_patience above are a STOPPING rule: they
+    // decide when to stop adding rounds. They never remove a round that was
+    // already appended and gained nothing, so on blend2 thirty MIR cuts rode
+    // into every one of 9,382 node LPs for a root bound identical to the one
+    // the loop had without them (6.9214204824 -> 7.0439990704 either way).
+    //
+    // What this adds is the retraction the gate lacked, and only for rounds
+    // the loop's own measure says were free: when the loop exits, the rounds
+    // added SINCE THE LAST REALISED BOUND IMPROVEMENT are removed. The bound
+    // is by construction unchanged by removing them -- it is the bound those
+    // rounds failed to move -- so patience keeps its job (the loop still
+    // crosses a dip to reach a later gain, and a dip round that leads to a
+    // gain is kept), and only cuts that provably bought nothing are dropped.
+    bool rollback_stalled_rounds = false;
+    // Drop root cuts that carry no dual price at the final root LP optimum.
+    //
+    // Round-level rollback can only remove a round that bought no bound. It
+    // says nothing about a round that DID buy bound with two of its thirty
+    // cuts, which is the shape the per-round trace actually shows: on blend2
+    // round 0 adds 28 MIR cuts and gains 1.55%, and the run without MIR
+    // reaches the identical bound -- so the cuts are redundant, not from a
+    // stalled round, and no round-level rule can see that.
+    //
+    // A row whose optimal multiplier is zero is not holding the bound up:
+    // (x*, y with that entry deleted) is primal-feasible, dual-feasible and
+    // complementary for the model without the row, so the LP value is
+    // unchanged by construction. Requiring slack as well is belt-and-braces
+    // against a degenerate zero multiplier at a tight row.
+    //
+    // Cannot produce a wrong answer in either direction: this only REMOVES
+    // rows, so the result is a relaxation of a relaxation and still contains
+    // every integer-feasible point. The risk it carries is a weaker bound in
+    // the tree (a cut slack at the root can be tight deeper down), which is a
+    // performance question, not a soundness one.
+    // Carry the cut loop's basis from one round to the next.
+    //
+    // The loop has a warm-continuation path (bab.cpp: extend the previous
+    // round's basis by one logical per new row and re-solve with the dual).
+    // Before this flag existed it could not run: the guard it tests,
+    // have_cut_loop_basis, was initialised false and assigned nowhere, so
+    // every cut round paid a COLD solve_simplex. The same guard also gates
+    // seeding the root node with the loop's final basis, so the root started
+    // cold too. Measured cost of that: p0201's cut loop 241 ms -> 77 ms.
+    //
+    // OFF BY DEFAULT, and not part of any recommended combination until it
+    // has had its own 3-rep sweep. Two reasons beyond the usual. It changes
+    // pivot sequences everywhere it fires, so it must be measured alone; and
+    // the basis-EXTENSION block it enables has by construction never executed
+    // in production, so switching this on runs untested code for the first
+    // time.
+    bool warm_start_rounds = false;
+    // Per-separator MARGINAL contribution gate.
+    //
+    // The realised-gain gate and the rollback built on it both measure a
+    // ROUND. A round is the wrong unit when several families share it: on
+    // blend2 round 0 gains 1.55% and the run with MIR disabled reaches the
+    // identical bound to eleven significant digits, so MIR's marginal
+    // contribution is exactly zero while its round's gain is not. No
+    // round-level rule can see that, and neither can purging -- purging pays
+    // the separation, pays the rows for every round before it fires, and then
+    // pays the purge. A marginal test pays one probe and then stops
+    // generating the cuts at all.
+    //
+    // At `marginal_gate_round`, re-solve the root once with all selected cuts
+    // and once per optional family with that family's cuts held out. A family
+    // whose held-out bound matches the full bound is contributing nothing;
+    // drop its cuts from that round and stop running it for the rest of the
+    // loop. GMI is never gated: it is the base separator the others are
+    // measured against.
+    //
+    // Costs one LP re-solve per optional family present, all at the root.
+    // marginal_gate_probe_ms / _probe_solves report that so it can be
+    // weighed against the rows it removes.
+    // MEASURED UNSAFE 2026-09-22 -- DO NOT ENABLE. Keeping the code because
+    // it is the evidence for a latent defect elsewhere, not because it works.
+    //
+    // On blend2 the gate correctly prices MIR's marginal contribution at
+    // exactly 0 and drops 31 of 32 root cuts. That leaves the root model
+    // nearly cut-free, and the tree separator then derives MIR cuts at nodes
+    // still sitting at root bounds. Those cuts PASS both promotion gates
+    // (node_at_root_bounds, used_local_bound) and are stamped globally valid
+    // while excluding blend2's true optimum: 23 of them with GCS on, 72 with
+    // --no-gcs. Controls: 0 for default, cover, mir, cover+mir, cover+mir at
+    // 1 and 2 rounds, and 0 across the other 13 reference models. The gate is
+    // the trigger.
+    //
+    // No wrong answer was observed (the run stayed Feasible at 7.69 against a
+    // true optimum of 7.598985), but a globally-promoted cut that excludes the
+    // optimum is the precursor to a false Optimal, which this codebase has
+    // shipped before. The underlying hole is documented in bab.cpp's own node
+    // promotion comment: node_lp is global_lp PLUS the node's local cut rows,
+    // so a cut derived from a local row touches no tightened bound and the
+    // bound-provenance test cannot see it. Fixing that needs source-row
+    // provenance, which no separator reports yet.
+    bool marginal_gate = false;
+    int marginal_gate_round = 0;
+    f64 marginal_gate_min_rel = 1e-6;
+    bool purge_nonbinding_cuts = false;
+    f64 purge_dual_tol = 1e-9;
+    f64 purge_slack_tol = 1e-7;
     // Reject a cut whose max|coef|/min|coef| exceeds this. 1e6 (the old
     // default) is far too permissive: on rgn.mps (MIPLIB-easy) a GMI cut
     // with dynamism in [1e3, 1e6) made the ROOT node's post-cut LP return
@@ -154,10 +263,23 @@ struct CutOptions {
 struct CutDiagnostics {
     int rounds = 0;
     std::uint64_t candidates_considered = 0;
+    std::uint64_t integral_activity_rows = 0;
+    std::uint64_t integer_activity_candidates = 0;
+    std::uint64_t integer_activity_terms = 0;
+    std::uint64_t fractional_integer_bound_terms = 0;
     std::uint64_t gmi_cuts_added = 0;
+    std::uint64_t gmi_missing_basis = 0;
+    std::uint64_t gmi_invalid_factor = 0;
+    std::uint64_t gmi_empty_rows = 0;
     std::uint64_t rejected_dynamism = 0;
     std::uint64_t rejected_violation = 0;
     std::uint64_t rejected_free_nonbasic = 0;
+    // A5: a term whose GMI coefficient rounded to ~0 but whose bound was
+    // nonzero (finite or infinite) -- the coeff*bound contribution that
+    // dropping it silently omits from the RHS is not itself negligible in
+    // that case, so the candidate cut is refused instead of risking an
+    // unsound (too-tight) inequality.
+    std::uint64_t rejected_dropped_term_bound = 0;
     std::uint64_t pool_inserted = 0;
     std::uint64_t pool_duplicates = 0;
     std::uint64_t pool_dominated = 0;
@@ -210,7 +332,7 @@ struct CutRow {
 // the same LP row again.
 class CutPool {
 public:
-    explicit CutPool(const CutOptions& opts) : opts_(opts) {}
+    explicit CutPool(const CutOptions& opts) : opts_(opts) { SOR_FN();}
 
     void start_round(CutDiagnostics& diag);
     // Supplies what the composite score needs: the objective direction cuts are
@@ -234,7 +356,7 @@ public:
     void add(const std::vector<CutRow>& candidates, CutDiagnostics& diag);
     std::vector<CutRow> select_violated(const std::vector<f64>& x,
                                         CutDiagnostics& diag);
-    std::size_t size() const { return entries_.size(); }
+    std::size_t size() const { SOR_FN(); return entries_.size(); }
     std::size_t active_size() const;
 
 private:
@@ -272,16 +394,57 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
                                        const CutOptions& opts,
                                        CutDiagnostics& diag);
 
+// Everything one apply_cuts_inplace() call changed about an LpProblem, in the
+// form needed to put it back. Recorded so a root cut ROUND can be retracted
+// when the re-solve shows it bought no bound.
+//
+// Two kinds of change have to be captured, not one. A round APPENDS rows, and
+// it also TIGHTENS pre-existing rows: a cut whose linear form the model
+// already has is folded into that row's bounds rather than added as a second,
+// linearly dependent row. Undoing only the appends would silently keep the
+// second kind.
+struct CutUndo {
+    Index rows_before = 0;          // lp.n_rows() before the round
+    bool names_were_empty = false;  // lp.row_names was empty before the round
+    // Pre-existing rows the round tightened, with the bounds they had before.
+    // Recorded at a row's FIRST tightening in the round, so replaying these
+    // restores the pre-round state even when several cuts hit the same row.
+    std::vector<Index> tightened_rows;
+    std::vector<f64> tightened_lo;
+    std::vector<f64> tightened_hi;
+
+    bool empty() const {
+        SOR_FN();
+        return tightened_rows.empty() && rows_added_ == 0;
+    }
+    Index rows_added() const { SOR_FN(); return rows_added_; }
+
+    // Set by apply_cuts_inplace.
+    Index rows_added_ = 0;
+};
+
 // Append accepted cuts as new rows (or tighten an existing row of the same
 // shape). Mutates `lp` in place: CSR grows by push_back, so a single learned
 // nogood costs O(row nnz) rather than a full-matrix rebuild.
 void apply_cuts_inplace(model::LpProblem& lp,
                         const std::vector<CutRow>& cuts,
-                        const CutOptions& opts);
+                        const CutOptions& opts,
+                        CutUndo* undo = nullptr);
 
 // Copy-then-inplace convenience for callers that hold a const LP.
 model::LpProblem apply_cuts(const model::LpProblem& lp,
                             const std::vector<CutRow>& cuts,
                             const CutOptions& opts);
+
+// Undo exactly what the apply_cuts_inplace() call that filled `undo` did to
+// `lp`. `lp` must not have been structurally changed since (this is a strict
+// LIFO: retract the most recent round first).
+//
+// Restoring the tightened bounds is not optional. A cut whose linear form the
+// model already carries is folded into THAT row's bounds instead of being
+// appended (see apply_cuts_inplace), so a round can strengthen the model
+// without adding a single row; truncating the appended rows alone would leave
+// that strengthening in place and the "retracted" round still active.
+void retract_cuts_inplace(model::LpProblem& lp, const CutUndo& undo);
 
 }  // namespace sor::search

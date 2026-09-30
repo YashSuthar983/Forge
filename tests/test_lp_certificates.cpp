@@ -16,7 +16,61 @@ model::LpProblem read(const char* text) {
 
 }  // namespace
 
+// certify::safe_lagrangian_lower_bound: weak duality from ANY multipliers.
+void test_safe_lagrangian_bound() {
+    // min x + y  s.t.  x + y >= 2,  x in [0, inf), y in [0, 3].
+    const auto lp = read(R"(NAME SAFE
+ROWS
+ N OBJ
+ G R1
+COLUMNS
+    X OBJ 1 R1 1
+    Y OBJ 1 R1 1
+RHS
+    RHS R1 2
+BOUNDS
+ UP BND Y 3
+ENDATA
+)");
+    // Exact dual y = 1: d = 0 everywhere, bound = 2.
+    auto b = certify::safe_lagrangian_lower_bound(lp, {1.0}, lp.col_lo, lp.col_hi);
+    CHECK(b.finite);
+    CHECK_NEAR(b.value, 2.0, 1e-9);
+    CHECK(b.value <= 2.0);
+    // Round-off dual y = 1 + 1e-14 leaves d_x = -1e-14 on [0, inf): the
+    // multiplier correction must restore a finite bound (not wave it through).
+    b = certify::safe_lagrangian_lower_bound(lp, {1.0 + 1e-14}, lp.col_lo, lp.col_hi);
+    CHECK(b.finite);
+    CHECK(b.value <= 2.0);
+    CHECK(b.value >= 2.0 - 1e-6);
+    // Any y is valid: y = 0.5 gives L = 1 + 0.5*0 ... = 1 (weak duality).
+    b = certify::safe_lagrangian_lower_bound(lp, {0.5}, lp.col_lo, lp.col_hi);
+    CHECK(b.finite);
+    CHECK(b.value <= 1.0 + 1e-12);
+}
+
+void test_safe_bound_refuses_unbounded_direction() {
+    // min -x  s.t.  y - x >= -1 (never caps x),  x, y in [0, inf).
+    // LP is unbounded below; y = 1e-8 leaves d_x = -1 + 1e-8 < 0 on x with
+    // no finite upper bound anywhere: the bound must be -inf.
+    const auto lp = read(R"(NAME UNB
+ROWS
+ N OBJ
+ G R1
+COLUMNS
+    X OBJ -1 R1 -1
+    Y OBJ 0 R1 1
+RHS
+    RHS R1 -1
+ENDATA
+)");
+    const auto b = certify::safe_lagrangian_lower_bound(lp, {1e-8}, lp.col_lo, lp.col_hi);
+    CHECK(!b.finite);
+}
+
 int main() {
+    test_safe_lagrangian_bound();
+    test_safe_bound_refuses_unbounded_direction();
     const auto infeasible = read(R"(NAME INF
 ROWS
  N OBJ
@@ -205,6 +259,46 @@ ENDATA
         const auto result = certify::finalize_result(std::move(raw), checked);
         CHECK(result.status == core::Status::NoSolutionFound);
         CHECK(!result.ray_certified);
+    }
+
+    // Even a coefficient below feasibility tolerance cannot be discarded
+    // when its variable is unbounded: x=-1e8 satisfies 1e-8*x <= -1.
+    // Ignoring that term would fabricate a positive Farkas contradiction.
+    {
+        model::LpProblem unbounded_support;
+        unbounded_support.name = "unbounded-support-near-certificate";
+        unbounded_support.A = sparse::from_triplets(
+            1, 1, {0}, {0}, {1e-8});
+        unbounded_support.c = {0.0};
+        unbounded_support.col_lo = {-model::kInf};
+        unbounded_support.col_hi = {model::kInf};
+        unbounded_support.row_lo = {-model::kInf};
+        unbounded_support.row_hi = {-1.0};
+        CHECK(!certify::check_dual_farkas_ray(
+            unbounded_support, {1.0}, 1e-7).certified);
+    }
+
+    // An approximate ray for x >= 1, x <= 0 with x free leaves a small A'y
+    // residual on the free column. The checker may repair it into the exact
+    // certificate, but it must re-verify the repaired ray, and it must not
+    // repair into a multiplier whose sign faces an infinite row side.
+    {
+        model::LpProblem near_free;
+        near_free.name = "near-free-column-farkas";
+        near_free.A = sparse::from_triplets(2, 1, {0, 1}, {0, 0}, {1.0, 1.0});
+        near_free.c = {0.0};
+        near_free.col_lo = {-model::kInf};
+        near_free.col_hi = {model::kInf};
+        near_free.row_lo = {1.0, -model::kInf};
+        near_free.row_hi = {model::kInf, 0.0};
+        const auto repaired = certify::check_dual_farkas_ray(
+            near_free, {-1.0, 1.0 - 1e-11}, 1e-7);
+        CHECK(repaired.certified);
+        // The feasible variant (x >= 0, x <= 1) has no certificate at all.
+        near_free.row_lo = {0.0, -model::kInf};
+        near_free.row_hi = {model::kInf, 1.0};
+        CHECK(!certify::check_dual_farkas_ray(
+            near_free, {-1.0, 1.0 - 1e-11}, 1e-7).certified);
     }
 
     // Ranged rows and free columns need the same original-space separation

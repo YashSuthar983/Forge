@@ -5,9 +5,10 @@ set(SOR_SHADER_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders)
 set(SOR_SHADER_BINARY_DIR ${CMAKE_BINARY_DIR}/shaders)
 set(SOR_SHADER_NAMES
   spmv_csr spmv_csc primal_step dual_step halpern_mix avg_update
+  step_reduce kkt_cols kkt_rows kkt_final
   qp_x_step qp_v_build qp_y_step qp_w_halpern
   vec_axpby vec_reduce qp_kkt_rows qp_kkt_cols
-  pdhcg_diag_prox pdhcg_grad pdhcg_trial pdhcg_bb pdhcg_advance_x pdhcg_advance_y
+  pdhcg_init pdhcg_diag_prox pdhcg_grad pdhcg_trial pdhcg_bb pdhcg_advance_x pdhcg_advance_y
   pdhcg_eval_cols pdhcg_eval_rows
   bq_gain bq_select bq_apply bq_save_best bq_perturb bq_rebuild_h bq_rebuild_r bq_rescore
   spmvb_csr spmvb_csc vec_copy_lanes vec_reduce_lanes

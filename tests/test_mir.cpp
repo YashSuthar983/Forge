@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <random>
 #include <functional>
+#include <iostream>
 #include <vector>
 
 using sor::core::f64;
@@ -217,6 +218,39 @@ void test_nonzero_lower_bound_is_substituted() {
             }
 }
 
+// An integer variable shifted by a fractional active bound is not an
+// integer MIR term. The old implementation treated x-0.5 as integral and
+// emitted 5x+2y <= 4.5, excluding the feasible integer point (1,0).
+void test_fractional_integer_bound_uses_continuous_term() {
+    LpProblem lp;
+    lp.name = "fractional-integer-bound";
+    lp.A = from_triplets(1, 2, {0, 0}, {0, 1}, {5.0, 2.0});
+    lp.c = {0.0, -1.0};
+    lp.row_lo = {-kInf};
+    lp.row_hi = {5.0};
+    lp.col_lo = {0.5, 0.0};
+    lp.col_hi = {2.0, 3.0};
+    lp.is_integer = {true, true};
+    MirOptions o;
+    MirDiagnostics d;
+    const auto cuts = separate_mir(
+        lp, {0.5, 1.25}, lp.col_lo, lp.col_hi, o, d);
+    CHECK(!cuts.empty());
+    for (const auto& cut : cuts) {
+        f64 lhs = 0.0;
+        for (std::size_t k = 0; k < cut.cols.size(); ++k)
+            lhs += cut.vals[k] * (cut.cols[k] == 0 ? 1.0 : 0.0);
+        if (lhs > cut.row_hi + 1e-9) {
+            std::cerr << "invalid fractional-bound MIR: lhs=" << lhs
+                      << " rhs=" << cut.row_hi;
+            for (std::size_t k = 0; k < cut.cols.size(); ++k)
+                std::cerr << " (" << cut.cols[k] << "," << cut.vals[k] << ")";
+            std::cerr << '\n';
+        }
+        CHECK(lhs <= cut.row_hi + 1e-9);
+    }
+}
+
 // ----------------------------------------------------------- randomized ----
 
 // THE test. Random mixed models; for every feasible integer assignment the cut
@@ -266,12 +300,146 @@ void test_random_mixed_cuts_are_valid_by_lp() {
     CHECK(checked_points > 500);
 }
 
+// Fixed-charge structure: continuous flows x_k with x_k <= u_k * y_k (y
+// binary or small integer), coupled by random demand/capacity rows. These are
+// exactly the rows the variable-bound substitution rewrites, so every cut is
+// checked by maximising it over the continuous directions at every integer
+// assignment, as above.
+LpProblem random_fixed_charge_lp(std::mt19937& rng, Index k, Index m_extra) {
+    const Index n = 2 * k;   // y_0..y_{k-1}, then x_0..x_{k-1}
+    std::uniform_int_distribution<int> cap(1, 6), coef(-3, 4);
+    std::uniform_real_distribution<double> pick(0.0, 1.0);
+    LpProblem lp;
+    lp.name = "mir-vub";
+    lp.col_lo.assign(static_cast<std::size_t>(n), 0.0);
+    lp.col_hi.assign(static_cast<std::size_t>(n), 0.0);
+    lp.is_integer.assign(static_cast<std::size_t>(n), false);
+    std::vector<Index> rows, cols;
+    std::vector<f64> vals;
+    Index r = 0;
+    for (Index q = 0; q < k; ++q) {
+        const auto y = static_cast<std::size_t>(q), x = static_cast<std::size_t>(k + q);
+        lp.is_integer[y] = true;
+        lp.col_hi[y] = pick(rng) < 0.7 ? 1.0 : 2.0;
+        lp.col_hi[x] = 20.0;
+        const f64 u = cap(rng) + (pick(rng) < 0.5 ? 0.5 : 0.0);
+        // x - u y <= 0, written in either orientation.
+        const f64 sgn = pick(rng) < 0.5 ? 1.0 : -1.0;
+        rows.push_back(r); cols.push_back(static_cast<Index>(x)); vals.push_back(sgn);
+        rows.push_back(r); cols.push_back(static_cast<Index>(y)); vals.push_back(-sgn * u);
+        if (sgn > 0.0) { lp.row_lo.push_back(-kInf); lp.row_hi.push_back(0.0); }
+        else           { lp.row_lo.push_back(0.0);   lp.row_hi.push_back(kInf); }
+        ++r;
+    }
+    for (Index e = 0; e < m_extra; ++e, ++r) {
+        f64 hi_act = 0.0;
+        for (Index j = 0; j < n; ++j) {
+            if (pick(rng) > 0.6) continue;
+            int a = coef(rng);
+            if (a == 0) a = 1;
+            rows.push_back(r); cols.push_back(j); vals.push_back(f64(a));
+            if (a > 0) hi_act += a * lp.col_hi[static_cast<std::size_t>(j)];
+        }
+        const f64 rhs = std::floor(pick(rng) * hi_act * 0.5) + 0.5;
+        if (pick(rng) < 0.5) { lp.row_lo.push_back(-kInf); lp.row_hi.push_back(rhs); }
+        else { lp.row_lo.push_back(rhs); lp.row_hi.push_back(kInf); }
+    }
+    lp.A = from_triplets(r, n, rows, cols, vals);
+    lp.c.assign(static_cast<std::size_t>(n), 1.0);
+    return lp;
+}
+
+void test_variable_bound_cuts_are_valid_by_lp() {
+    std::mt19937 rng(31337u);
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+    int total_cuts = 0, vb_cuts = 0, checked = 0;
+    for (int trial = 0; trial < 200; ++trial) {
+        const Index k = 3 + static_cast<Index>(trial % 2);
+        const LpProblem lp = random_fixed_charge_lp(rng, k, 2);
+        const Index n = lp.n_cols();
+        std::vector<int> span(static_cast<std::size_t>(n), 1);
+        for (Index j = 0; j < k; ++j)
+            span[static_cast<std::size_t>(j)] =
+                static_cast<int>(lp.col_hi[static_cast<std::size_t>(j)]) + 1;
+        // LP-like point: fractional y, flows at or near their variable bound.
+        std::vector<f64> x(static_cast<std::size_t>(n));
+        for (Index j = 0; j < k; ++j)
+            x[static_cast<std::size_t>(j)] =
+                unit(rng) * lp.col_hi[static_cast<std::size_t>(j)];
+        for (Index j = k; j < n; ++j) x[static_cast<std::size_t>(j)] = unit(rng) * 5.0;
+        MirOptions o;
+        MirDiagnostics d;
+        const auto cuts = separate_mir(lp, x, lp.col_lo, lp.col_hi, o, d);
+        vb_cuts += d.variable_bound_substitutions > 0 ? 1 : 0;
+        total_cuts += static_cast<int>(cuts.size());
+        for (const auto& c : cuts)
+            for_each_integer_point(lp, span, [&](const std::vector<f64>& p) {
+                f64 best = 0.0;
+                if (!max_cut_over_continuous(lp, c, p, best)) return;
+                ++checked;
+                CHECK(best <= c.row_hi + 1e-6);
+            });
+    }
+    CHECK(vb_cuts > 20);
+    CHECK(total_cuts > 40);
+    CHECK(checked > 500);
+}
+
+// Single-node fixed-charge flow: x1 + x2 >= 3, x_k <= 2 y_k, y binary. The LP
+// point y = (0.75, 0.75), x = (1.5, 1.5) satisfies every row. With simple
+// bounds only, both flows have positive coefficients in the <= orientation
+// (-x1 - x2 <= -3) ... and the continuous terms carry no integer information.
+// Substituting x_k = 2 y_k - s_k gives -2y1 - 2y2 + s1 + s2 <= -3, whose MIR
+// cut y1 + y2 >= 2 is violated at the point and valid (both arcs must open).
+void test_single_node_flow_needs_variable_bounds() {
+    LpProblem lp;
+    lp.name = "flow";
+    // cols: y1, y2, x1, x2
+    lp.A = from_triplets(3, 4, {0, 0, 1, 1, 2, 2}, {2, 3, 2, 0, 3, 1},
+                         {1.0, 1.0, 1.0, -2.0, 1.0, -2.0});
+    lp.row_lo = {3.0, -kInf, -kInf};
+    lp.row_hi = {kInf, 0.0, 0.0};
+    lp.col_lo = {0.0, 0.0, 0.0, 0.0};
+    lp.col_hi = {1.0, 1.0, 10.0, 10.0};
+    lp.is_integer = {true, true, false, false};
+    lp.c = {1.0, 1.0, 0.0, 0.0};
+    const std::vector<f64> x = {0.75, 0.75, 1.5, 1.5};
+
+    MirOptions plain;
+    plain.variable_bounds = false;
+    MirDiagnostics d0;
+    const auto without = separate_mir(lp, x, lp.col_lo, lp.col_hi, plain, d0);
+
+    MirOptions o;
+    MirDiagnostics d;
+    const auto cuts = separate_mir(lp, x, lp.col_lo, lp.col_hi, o, d);
+    CHECK(d.variable_bound_rows >= 2);
+    CHECK(d.variable_bound_substitutions >= 2);
+    CHECK(cuts.size() > without.size());
+    bool violated = false;
+    for (const auto& c : cuts) {
+        f64 act = 0.0;
+        for (std::size_t q = 0; q < c.cols.size(); ++q)
+            act += c.vals[q] * x[static_cast<std::size_t>(c.cols[q])];
+        violated |= act > c.row_hi + 1e-6;
+        for_each_integer_point(lp, {2, 2, 1, 1}, [&](const std::vector<f64>& p) {
+            f64 best = 0.0;
+            if (!max_cut_over_continuous(lp, c, p, best)) return;
+            CHECK(best <= c.row_hi + 1e-6);
+        });
+    }
+    CHECK(violated);
+}
+
 }  // namespace
 
 int main() {
+    test_variable_bound_cuts_are_valid_by_lp();
+    test_single_node_flow_needs_variable_bounds();
     test_textbook_mixed_example();
     test_scaling_finds_the_cut();
     test_nonzero_lower_bound_is_substituted();
+    test_fractional_integer_bound_uses_continuous_term();
     test_random_mixed_cuts_are_valid_by_lp();
     return sor::test::finish("test_mir");
 }

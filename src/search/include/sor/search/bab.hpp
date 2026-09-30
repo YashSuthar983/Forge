@@ -10,7 +10,9 @@
 #include "sor/core/result.hpp"
 #include "sor/engines/simplex.hpp"
 #include "sor/model/lp.hpp"
+#include "sor/search/milp_presolve.hpp"
 #include "sor/search/conflict.hpp"
+#include "sor/search/conflict_store.hpp"
 #include "sor/search/conflict_cut.hpp"
 #include "sor/search/covers.hpp"
 #include "sor/search/cuts.hpp"
@@ -37,10 +39,14 @@
 #include "sor/search/tree_cuts.hpp"
 #include "sor/search/zerohalf.hpp"
 
+#include <array>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
+#include "sor/core/route_debug.hpp"
 
 namespace sor::search {
 
@@ -54,6 +60,7 @@ enum class BranchStrategy : std::uint8_t {
     ScMilp = 2,
     Lifted = 3,
     PlanBb = 4,
+    Reliability = 5,  // pseudocost/strong-branch baseline under latest policy
 };
 
 inline const char* branch_strategy_name(BranchStrategy s) noexcept {
@@ -63,6 +70,7 @@ inline const char* branch_strategy_name(BranchStrategy s) noexcept {
     case BranchStrategy::ScMilp: return "sc-milp";
     case BranchStrategy::Lifted: return "lifted";
     case BranchStrategy::PlanBb: return "planbb";
+    case BranchStrategy::Reliability: return "reliability";
     }
     return "auto";
 }
@@ -84,6 +92,10 @@ inline bool parse_branch_strategy(std::string_view s, BranchStrategy& out) {
     }
     if (t == "sc-milp" || t == "scmilp" || t == "sc_milp") {
         out = BranchStrategy::ScMilp;
+        return true;
+    }
+    if (t == "reliability" || t == "pseudocost") {
+        out = BranchStrategy::Reliability;
         return true;
     }
     if (t == "lifted" || t == "lifted-branch" || t == "lifted_branch") {
@@ -125,6 +137,9 @@ struct BabOptions {
     PlanBbCollector* planbb_collect_out = nullptr;
     HgtsmCollector* hgtsm_collect_out = nullptr;
     GcsCollector* gcs_collect_out = nullptr;
+    // Structured JSONL events of the main search (plan 3K); empty = off.
+    std::string events_path;
+    std::string proof_ledger_path;
     LiftedBranchOptions lifted;
     PlanBbOptions planbb;
     TreeCutOptions tree_cut;
@@ -147,6 +162,8 @@ struct BabOptions {
     //
     // Diagnostic only: it reports, it does not alter the search.
     const std::vector<f64>* cut_reference_point = nullptr;
+    // Print why the reference point was judged outside a node's subtree.
+    bool cut_reference_debug = false;
 
     const core::CancelToken* cancel = nullptr;
     // Shared incumbent/bound channel. Null = no exchange. When set, this
@@ -166,10 +183,13 @@ struct BabOptions {
     std::uint64_t tree_restart_node_gap = 5000;
     int tree_restart_max = 1;  // cap restarts per solve (default one)
     f64 tree_restart_improve_rel = 1e-3;  // "significant" incumbent jump
-    std::uint64_t max_nodes = 100000;
-    double time_limit_s = 0.0;
+    // With no explicit node limit, search until proof or another resource
+    // limit rather than silently stopping at 100,000 nodes.
+    std::uint64_t max_nodes = std::numeric_limits<std::uint64_t>::max();
+    double time_limit_s = 900.0;
     f64 int_tol = 1e-6;
-    f64 gap_tol = 1e-4;          // relative MIP gap for "Optimal"
+    f64 gap_tol = 1e-4;
+    f64 abs_gap_tol = 1e-8;          // relative MIP gap for "Optimal"
     f64 primal_feas_tol = 1e-7;
     // Feasibility Jump (Luteberget & Sandvik, MPC 2023; see
     // sor/search/feasjump.hpp). The only primal heuristic here that does not
@@ -220,6 +240,9 @@ struct BabOptions {
     // LNS of its own, so the nesting is exactly one level deep and the budgets
     // in LnsOptions bound the total cost.
     int sub_mip_depth = 0;
+    // Invocation that spawned this solve. 0 means this call is not a child of
+    // another solve_milp in the same process. Diagnostic only.
+    std::uint64_t parent_invocation_id = 0;
     // Ceiling on the share of wall clock the WHOLE heuristic layer may consume
     // -- dives, pumps, rounding repair, neighbourhood search, Feasibility Jump
     // and the LNS portfolio together. Measured here before this existed: node
@@ -232,16 +255,15 @@ struct BabOptions {
     // tree search over Balans/KP (HiGHS-easy proofs). Measured squeeze 2026-09-13.
     double heuristic_budget_frac_proof = 0.08;
     f64 heuristic_proof_gap = 0.15;
-    // The same ceiling before any incumbent exists. Deliberately much looser:
-    // with nothing in hand the tree cannot prune and the heuristics are the
-    // only route to a solution at all.
-    // Deliberately near-total. With no incumbent the tree cannot prune and its
-    // only product is a dual bound that, on an instance this hard, will not
-    // close anything inside the budget either -- while the heuristics are the
-    // difference between returning an answer and returning nothing. Measured:
-    // at 0.80 two instances the uncapped run solved (csched008, timtab1) went
-    // back to no-incumbent.
-    double heuristic_budget_frac_no_incumbent = 0.95;
+    // Before an incumbent exists, reserve most of the wall-clock budget for
+    // branching. A 0.95 share spent about 20 of 30 seconds in unsuccessful
+    // heuristics on app1-1; 0.30 found an incumbent and reported a closed
+    // dual gap in 19 seconds. The 20-model 10-second easy set retained all 12
+    // reported proofs, while a separate eight-model 30-second holdout gained
+    // none. Keep the share explicit so larger campaigns can assess the
+    // incumbent/proof tradeoff; a found point still needs original-model
+    // checking and an independently replayed tree proof remains unavailable.
+    double heuristic_budget_frac_no_incumbent = 0.30;
     // ... and again once the dual bound has STOPPED MOVING. This is the
     // measurement that forced an adaptive rule rather than a constant. On
     // miplib-easy, where 12 of 20 instances prove, a tight ceiling is a clear
@@ -273,6 +295,11 @@ struct BabOptions {
     std::uint64_t integer_dive_max_nodes = 1024;
     double integer_dive_time_s = 1.5;
     double integer_dive_lp_time_s = 0.02;
+    // Root dive runs a ranking portfolio (fractional, coefficient,
+    // vector-length) instead of fractional alone.
+    bool dive_rankings = true;
+    // Set-partitioning / assignment ejection repair (spp_repair.hpp).
+    bool spp_repair = true;
     // Bounded RINS/local-neighborhood search around the first feasible
     // incumbent. Each trial fixes the integer assignment and re-solves the LP.
     bool integer_neighborhood = true;
@@ -287,6 +314,28 @@ struct BabOptions {
     // number of strong-branching LP probes until directional pseudocosts are
     // reliable, then score candidates from the learned gains.
     bool reliability_branching = true;
+    // Achterberg 2007 thesis, Algorithm 5.2 (the default under
+    // BranchStrategy::Auto/Reliability): all fractional candidates sorted by
+    // pseudocost product score (5.2), dual-simplex strong branching on the
+    // unreliable ones (min(eta-,eta+) < eta_rel), lookahead lambda, at most
+    // kappa evaluations, gamma = clamp(2*avg node-LP iterations, 10, 500).
+    // eta_rel is steered by the SB/LP iteration ratio as in section 5.7.
+    // The fields below (reliability_threshold .. strong_branch_time_s) only
+    // drive the older capped path that the learned branchers still use.
+    bool paper_reliability = true;
+    // Structural presolve of the model handed to solve_milp (Achterberg
+    // 2007, section 10.1): rows and columns removed before branch-and-cut,
+    // incumbent postsolved and re-verified on the original model.
+    MilpPresolveOptions structural_presolve;
+    double rb_eta_rel = 8.0;
+    int rb_lookahead = 8;
+    int rb_max_candidates = 100;
+    // Strong-branching wall-clock budget (see bab.cpp): share of node-LP time
+    // added to the startup allowance, the cap as a share of the time limit,
+    // and the per-probe limit in seconds.
+    double rb_sb_lp_share = 0.2;
+    double rb_sb_total_share = 0.2;
+    double rb_probe_time_s = 0.25;
     int reliability_threshold = 2;
     int strong_branch_candidates = 6;
     std::uint64_t strong_branch_nodes = 128;
@@ -304,7 +353,9 @@ struct BabOptions {
     // Turner et al. (arXiv:2307.07322) pool scoring + pre-filter and the
     // measured-safe optional separators (MIR, cover, ZH, flow cover). Clique
     // cuts remain opt-in. Ignored under milp.policy=classical.
-    bool auto_cuts = false;
+    // Latest uses the bounded multi-family selector by default. Classical
+    // ignores it; callers can opt out for controlled ablations.
+    bool auto_cuts = true;
     CutOptions cut;
     // NOTE: a gap gate on the root cutting loop was tried here and REMOVED.
     // The idea was to stop cutting when the gap showed the instance would not
@@ -414,8 +465,62 @@ struct BabOptions {
     // correct, tested, opt-in option rather than force a default that isn't
     // an honest net improvement yet.
     bool hybrid_node_selection = false;
+    // Achterberg 2007, chapter 6 default: interleaved best-estimate /
+    // best-first search with plunging. Plunges follow the child, then the
+    // sibling, run at least plunge_min_frac * d_max and at most
+    // plunge_max_frac * d_max steps and stop once the local gap
+    // (bound - global)/(incumbent - global) exceeds plunge_max_gap; every
+    // best_first_freq-th leaf selection is best-bound, the others take the
+    // best pseudocost estimate. Children are ordered by Martin's rule
+    // (away from the root LP value). Ablation: --legacy-node-selection.
+    // MEASURED OFF (2026-09-25, easy60 at 60 s, same binary): dual gap
+    // better on 2 models, worse on 14, solved 5 vs 6 -- estimate-driven leaf
+    // selection delays the global bound, as section 6.6 itself warns.
+    bool paper_node_selection = false;
+    // Reduced cost strengthening at every node with an incumbent (thesis
+    // section 8.8); bounds are local to the node's subtree.
+    bool reduced_cost_strengthening = true;
+    // Objective-face feasibility search (plan 3G): sub-MIP on the full model
+    // plus c'x <= T just above the proved bound.
+    bool objective_face = true;
+    // Heuristic budget as a share of ELAPSED work (plan 3G) rather than of
+    // the whole time limit (the heuristic_budget_frac_* fields).
+    bool heuristic_budget_elapsed = true;
+    // Post-root allowance (s, capped at 5% of the limit) on top of the
+    // LP-free startup allowance, before the elapsed share governs.
+    double heuristic_root_allowance_s = 3.0;
+    double heuristic_elapsed_share = 0.15;
+    double heuristic_elapsed_share_no_incumbent = 0.25;
+    // Bound-disjunction conflict store propagated at nodes (plan 3H).
+    bool conflict_store = true;
+    bool infeasibility_mode = true;   // plan 3H, from observed behaviour
+    // Solve disconnected components with >= 2 integer columns as separate
+    // MILPs and combine (plan 3I).
+    bool component_decomposition = true;
+    // Root cut loop wall-clock allowance: min(root_cut_max_s,
+    // root_cut_share * time_limit_s) (plan 3E; was a flat 35% of the limit).
+    double root_cut_share = 0.10;
+    double root_cut_max_s = 60.0;
+    // Optional expensive root reductions (implied integrality, probing /
+    // MIP presolve, symmetry): shared cap min(root_reduction_cap_s,
+    // root_reduction_share * time limit) (plan 3D). <= 0 restores 20%.
+    double root_reduction_cap_s = 10.0;
+    double root_reduction_share = 0.02;
+    double objective_face_time_s = 4.0;   // first call; doubles, capped x8
+    int objective_face_max_attempts = 6;
+    int best_first_freq = 10;
+    double plunge_min_frac = 0.1;
+    double plunge_max_frac = 0.5;
+    double plunge_max_gap = 0.25;
     int plunge_max_depth = 30;
     f64 plunge_bound_slack_rel = 0.02;
+    // Plan 3F hybrid selector: best-bound plus bounded dives (at most
+    // dive_max_nodes consecutive children; a dive continues only while the
+    // child's bound uses at most dive_max_gap of the global gap), for every
+    // model size. Ablation: --no-bounded-dives restores the n <= 500 plunge.
+    bool bounded_dives = true;
+    int dive_max_nodes = 20;
+    f64 dive_max_gap = 0.25;
     bool verbose = false;
 
     // Node LP options (dual preferred for bound changes).
@@ -439,6 +544,10 @@ struct BabDiagnostics {
     std::uint64_t nodes = 0;
     std::uint64_t lp_solves = 0;
     std::uint64_t lp_fallbacks = 0;
+    // Root LPs already proved by the cut loop and reused unchanged by search.
+    std::uint64_t root_lp_reuses = 0;
+    // Incomplete cut-loop phase-2 bases handed to the first node as hints.
+    std::uint64_t root_lp_warm_handoffs = 0;
     // WP-J: node LPs that supplied a parent SimplexBasis to dual warm-start,
     // and how many of those the engine actually accepted (sd.warm_starts).
     std::uint64_t warm_start_attempts = 0;
@@ -483,9 +592,56 @@ struct BabDiagnostics {
     // fixes; iterations-per-node separates them.
     std::uint64_t lp_iterations = 0;
     double lp_ms = 0.0;
+    // Breakdown of node-LP simplex time (summed SimplexDiagnostics).
+    double node_lp_prep_ms = 0.0;     // min-copy + Ruiz + CSC
+    double node_lp_loop_ms = 0.0;     // pivoting loop
+    double node_lp_simplex_ms = 0.0;  // the solves' own total_ms
+    std::uint64_t node_lp_dse_rebuilds = 0;
+    double node_lp_first_factor_ms = 0.0;
+    std::uint64_t dse_checkpoints = 0;
+    std::uint64_t lp_workspace_builds = 0;
+    std::uint64_t conflict_store_prunes = 0;
+    std::uint64_t farkas_conflicts = 0;
+    std::uint64_t components_solved = 0;
+    std::uint64_t infeasibility_mode_nodes = 0;
+    ConflictStoreStats conflict_store_stats;
+    std::uint64_t face_attempts = 0;
+    std::uint64_t face_hits = 0;
+    std::uint64_t face_exhausted = 0;
+    double face_ms = 0.0;
+    std::uint64_t event_propagations = 0;
+    std::uint64_t objective_limit_prunes = 0;    // node LP stopped at cutoff, prune certified
+    std::uint64_t objective_limit_unproved = 0;  // stopped at cutoff, certificate fell short
+    std::uint64_t factor_checkpoints = 0;
+    std::uint64_t node_lp_factor_reuses = 0;
+    std::uint64_t lp_workspace_reuses = 0;
+    std::uint64_t node_lp_dse_reuses = 0;
+    double node_lp_after_factor_ms = 0.0;
+    double node_lp_dse_ms = 0.0;
+    double node_lp_post_ms = 0.0;
+    double node_lp_safe_bound_ms = 0.0;
+    std::uint64_t node_lp_refactorizations = 0;
     std::uint64_t integer_row_roundings = 0;
     std::uint64_t binary_cover_cuts = 0;
+    MilpPresolveStats structural_presolve;
+    bool structural_presolve_applied = false;
+    std::uint64_t structural_postsolve_failures = 0;
     std::uint64_t strong_branch_solves = 0;
+    std::uint64_t strong_branch_iterations = 0;
+    double strong_branch_ms = 0.0;
+    // Where a probe's time goes, summed from each probe's SimplexDiagnostics.
+    double strong_branch_prep_ms = 0.0;    // scaling + CSC + preprocessing
+    double strong_branch_factor_ms = 0.0;
+    double strong_branch_loop_ms = 0.0;
+    double strong_branch_simplex_ms = 0.0; // the probe's own total_ms
+    std::uint64_t strong_branch_factor_reuses = 0;
+    std::uint64_t strong_branch_dse_rebuilds = 0;
+    std::uint64_t strong_branch_sessions_rebuilt = 0;  // node LP had none
+    std::uint64_t strong_branch_infeasible = 0;
+    std::uint64_t rb_nodes = 0;          // nodes branched by Algorithm 5.2
+    std::uint64_t sb_domain_reductions = 0;  // certified one-sided SB deductions
+    std::uint64_t sb_nodes_closed = 0;       // both sides certified infeasible
+    std::uint64_t rb_nodes_with_sb = 0;  // ... of which ran any strong branching
     std::uint64_t batch_lp_sb_probes = 0;
     std::uint64_t batch_lp_sb_batches = 0;
     // Columns that root TU/network implied integrality marked integer. If this
@@ -509,6 +665,11 @@ struct BabDiagnostics {
     // Node cuts refused promotion to the global pool because their support
     // touched a branch-tightened bound. Non-zero here is the guard working.
     std::uint64_t local_cuts_kept_local = 0;
+    // Subset of local_cuts_kept_local refused for the ROW half of the scope
+    // test: the node was at root bounds, so the old bounds-only gate would
+    // have promoted it, but node_lp carried a subtree-local row the
+    // derivation could have consumed. Non-zero here is the n5-3 hole shut.
+    std::uint64_t cuts_kept_local_unknown_rows = 0;
     // Cuts refused entry to the global pool because they excluded the
     // incumbent. Non-zero means a separator emitted an invalid cut: the guard
     // caught it, but the separator still needs fixing.
@@ -517,9 +678,51 @@ struct BabDiagnostics {
     // that is a multiple of g. 0 when none could be established.
     f64 objective_granularity = 0.0;
     std::uint64_t granularity_tightenings = 0;
+    // Node reduced-cost strengthening (thesis section 8.8).
+    std::uint64_t rc_strengthen_nodes = 0;
+    // Uncertified warm-dual Infeasible -> cold dual re-solve.
+    std::uint64_t lp_cold_retries = 0;
+    // Node bounds from certify::safe_lagrangian_lower_bound.
+    std::uint64_t safe_bound_evaluations = 0;
+    std::uint64_t safe_bound_unbounded = 0;      // no valid finite bound
+    std::uint64_t safe_bound_implied_uses = 0;   // row-implied bounds used
+    double safe_bound_max_loss = 0.0;            // vs simplex bound, relative
+    std::uint64_t abandoned_unproved_nodes = 0;
+    std::uint64_t unresolved_requeued = 0;
+    std::uint64_t lp_cold_retry_hits = 0;
+    std::uint64_t rc_bounds_tightened = 0;
+    std::uint64_t rc_columns_fixed = 0;
     // Cuts that excluded BabOptions::cut_reference_point. Any non-zero value
     // is a separator bug.
     std::uint64_t invalid_cuts_detected = 0;
+    // Node-cut validity, as THREE separate populations. Reporting only the
+    // post-gate count conflates "no invalid cut was derived" with "an invalid
+    // cut was derived and then refused", and a parser that watched the wrong
+    // one reported a vacuous zero for a whole campaign.
+    //
+    //   generated -- a separator emitted it, before any gate
+    //   rejected  -- ...and a promotion gate refused it (contained)
+    //   inserted  -- ...and it nonetheless entered a relaxation (NOT contained)
+    //
+    // inserted is the only one that can produce a wrong answer. It must be 0.
+    std::uint64_t node_cuts_invalid_generated = 0;
+    std::uint64_t node_cuts_invalid_rejected = 0;
+    std::uint64_t node_cuts_invalid_inserted = 0;
+    // Candidates whose validity could not be judged because the reference
+    // point does not lie in the generating node's subtree. A local cut may
+    // legitimately exclude a point outside its own subtree, so counting those
+    // as invalid would cry wolf. Non-zero means the check abstained.
+    std::uint64_t node_cuts_ref_outside_node = 0;
+    // Local cuts actually APPLIED to a node relaxation. Distinct from
+    // tree_local_cuts_added, which counts cuts selected and then handed to a
+    // list; this counts rows that really reached an LP.
+    std::uint64_t node_cuts_locally_applied = 0;
+    // Process-local identity of this solve_milp call and of the call that
+    // spawned it. 0 parent means a top-level entry. Dump files are shared
+    // across recursive heuristic sub-MIPs, so these ids are what distinguish
+    // a real root box from a depth-0 box of a transformed subproblem.
+    std::uint64_t invocation_id = 0;
+    std::uint64_t parent_invocation_id = 0;
     std::uint64_t foreign_cutoff_prunes = 0;
     std::uint64_t incumbents_published = 0;
     std::uint64_t incumbents_adopted = 0;
@@ -560,6 +763,9 @@ struct BabDiagnostics {
     MilpPolicy policy_used = kDefaultMilpPolicy;
     std::uint64_t integer_feasible = 0;
     std::uint64_t heuristic_hits = 0;
+    // Candidate incumbents refused because integer snapping (the check every
+    // reported solution must pass) failed on them.
+    std::uint64_t incumbents_rejected_unsnappable = 0;
     std::uint64_t lp_repair_attempts = 0;
     std::uint64_t lp_repair_hits = 0;
     std::uint64_t feasibility_pump_attempts = 0;
@@ -588,6 +794,14 @@ struct BabDiagnostics {
     std::uint64_t integer_dive_attempts = 0;
     std::uint64_t integer_dive_lp_solves = 0;
     std::uint64_t integer_dive_hits = 0;
+    std::uint64_t integer_dive_workspace_reuses = 0;
+    std::uint64_t spp_repair_attempts = 0;
+    std::uint64_t spp_repair_hits = 0;
+    std::uint64_t spp_repair_moves = 0;
+    double ms_spp_repair = 0.0;
+    // Successful dives by ranking: fractional, coefficient, vector-length,
+    // guided (distance from the root LP point).
+    std::array<std::uint64_t, 4> integer_dive_ranking_hits{};
     std::uint64_t rens_attempts = 0;
     std::uint64_t rens_lp_solves = 0;
     std::uint64_t rens_hits = 0;
@@ -602,6 +816,11 @@ struct BabDiagnostics {
     // Wall time in every heuristic, and how often the ceiling above refused a
     // heuristic that would otherwise have run.
     double heuristic_ms = 0.0;
+    // Direct integer-rounding work inside the broader heuristic timer.
+    double rounding_ms = 0.0;
+    std::uint64_t rounding_calls = 0;
+    // Node-rounding block executions after success-driven backoff.
+    std::uint64_t node_rounding_rounds = 0;
     std::uint64_t heuristic_budget_blocks = 0;  // denial events
     // Sum of intended budgets (ms) for heuristic calls skipped by the ceiling.
     double heuristic_budget_blocked_ms = 0.0;
@@ -613,7 +832,68 @@ struct BabDiagnostics {
     // here before the tree starts, and again on every node LP that carries the
     // extra rows -- and only the second is visible in node counts.
     double cut_loop_ms = 0.0;
+    // Root cut ROLLBACK (CutOptions::rollback_stalled_rounds). The realised
+    // gain gate was a stopping rule only: it decided when to stop adding
+    // rounds and never removed a round that had already been appended and
+    // gained nothing. These count what the retraction path actually did.
+    int cut_rounds_rolled_back = 0;
+    std::uint64_t cut_rows_retracted = 0;
+    std::uint64_t cut_rows_retightened = 0;
+    // Root bound the loop would have ended on had nothing been retracted.
+    // Equal to root_bound_after_cuts when no rollback happened; a rollback
+    // that changes this is retracting a round that DID buy bound, which is a
+    // bug in the gate, not in the retraction.
+    f64 root_bound_before_rollback = core::kNaN;
+    // Wall time in the retract/purge pass alone, so the cost of EDITING the
+    // model can be separated from the cost of the rounds that built it.
+    double cut_retract_ms = 0.0;
+    // Per-separator marginal-contribution gate (CutOptions::marginal_gate).
+    // marginal_rel[f] is family f's realised contribution: the relative gap
+    // between the root bound with every selected cut and the root bound with
+    // family f's cuts held out. NaN = never probed.
+    struct MarginalGateDiagnostics {
+        // Indexed by CutFamily (gmi, mir, cover, clique, vub, zerohalf).
+        f64 marginal_rel[6] = {core::kNaN, core::kNaN, core::kNaN,
+                               core::kNaN, core::kNaN, core::kNaN};
+        int cuts_offered[6] = {0, 0, 0, 0, 0, 0};
+        bool disabled[6] = {false, false, false, false, false, false};
+        int probe_solves = 0;      // extra root LPs the probe cost
+        double probe_ms = 0.0;     // wall time inside the probe
+        int cuts_dropped = 0;      // cuts removed from the probe round itself
+        bool ran = false;
+        bool aborted = false;      // a probe LP did not prove; gate stood down
+    };
+    MarginalGateDiagnostics marginal_gate;
+    // Root cut purging (CutOptions::purge_nonbinding_cuts).
+    std::uint64_t cut_rows_purged = 0;
+    // Purge passes skipped because a rollback invalidated the duals it judges
+    // rows with. Non-zero means the two mechanisms collided on that run.
+    std::uint64_t cut_purge_skipped_stale_duals = 0;
+    std::uint64_t cut_rows_kept = 0;
+    // Per-round trace of the root cut loop: what each round cost and bought.
+    struct CutRoundRecord {
+        int round = 0;
+        f64 bound = core::kNaN;   // LP bound this round STARTED from
+        f64 gain_rel = core::kNaN;  // realised relative gain over the previous
+        int rows_added = 0;       // rows apply_cuts actually appended
+        int rows_tightened = 0;   // pre-existing rows it folded a cut into
+        int cuts_selected = 0;    // cuts the pool handed to apply_cuts
+        int gmi = 0, mir = 0, cover = 0, clique = 0, vub = 0, zerohalf = 0;
+        bool rolled_back = false;
+    };
+    std::vector<CutRoundRecord> cut_round_trace;
     std::uint64_t gmi_cuts_added = 0;
+    std::uint64_t gmi_candidates_considered = 0;
+    std::uint64_t gmi_integral_activity_rows = 0;
+    std::uint64_t gmi_integer_activity_candidates = 0;
+    std::uint64_t gmi_integer_activity_terms = 0;
+    std::uint64_t gmi_fractional_integer_bound_terms = 0;
+    std::uint64_t gmi_missing_basis = 0;
+    std::uint64_t gmi_invalid_factor = 0;
+    std::uint64_t gmi_empty_rows = 0;
+    std::uint64_t gmi_rejected_free = 0;
+    std::uint64_t gmi_rejected_dynamism = 0;
+    std::uint64_t gmi_rejected_violation = 0;
     std::uint64_t tree_cut_nodes = 0;
     std::uint64_t tree_local_cuts_added = 0;
     std::uint64_t gcs_promoted = 0;
@@ -665,10 +945,25 @@ struct BabDiagnostics {
     double nogood_apply_ms = 0.0;
     double conflict_analysis_ms = 0.0;
     std::uint64_t tree_restarts = 0;
+    // Root column bounds immediately after a tree-restart reduced-cost pass
+    // that had a proved root LP. Empty when that pass did not run. A test
+    // reads these to see which columns the caller actually tightened.
+    std::vector<f64> restart_rc_col_lo;
+    std::vector<f64> restart_rc_col_hi;
+    std::uint64_t restart_rc_integer_fixed = 0;
     std::uint64_t plunge_nodes = 0;
     f64 incumbent = core::kPosInf;
     f64 dual_bound = core::kNaN;
     f64 gap_rel = core::kPosInf;
+    // A3: max(row, bound, integrality) violation of the point actually
+    // reported (raw.x, in the CALLER's original space), re-checked once
+    // against `problem` right before solve_milp() returns -- not trusted
+    // from whichever of the incumbent-setting call sites last touched
+    // best_x. milp_evidence() reads this instead of assuming 0. Defaults to
+    // +inf (unverified / no incumbent), matching ProofEvidence's own
+    // fail-closed default, so a path that never reaches the final check
+    // cannot silently look feasible.
+    f64 final_primal_violation = core::kPosInf;
     // True iff the incumbent is proved optimal to within opts.gap_tol: EITHER
     // the tree was fully exhausted, OR the drained dual bound already closes
     // the gap (both require every node visited to have had a certified LP --
@@ -684,11 +979,55 @@ struct BabDiagnostics {
     std::string termination_reason;
 };
 
+// Total heuristic wall time (heuristic_ms + FJ + fix-propagate-repair +
+// sub-MIPs), the one figure used for heuristic budgets and reports.
+double heuristic_spent_ms(const BabDiagnostics& d);
+
 core::RawResult solve_milp(const model::LpProblem& problem,
                            const BabOptions& opts,
                            BabDiagnostics& diag);
 
 core::ProofEvidence milp_evidence(const BabDiagnostics& diag,
                                   const BabOptions& opts);
+
+// Classify statuses eligible for infeasibility proof checking. This predicate
+// alone NEVER closes a node: a Farkas witness must be checked against the
+// node's current LP by node_lp_infeasibility_proved().
+inline bool node_lp_status_proves_infeasible(core::Status status,
+                                            bool root_relaxation_bounded) {
+    return status == core::Status::Infeasible ||
+           (status == core::Status::InfeasibleOrUnbounded &&
+            root_relaxation_bounded);
+}
+
+bool node_lp_infeasibility_proved(const model::LpProblem& node_lp,
+                                 const core::RawResult& raw, f64 tolerance,
+                                 bool root_relaxation_bounded);
+
+// Exact-fix one integer column. The caller must pass only columns declared
+// integer: |rc| >= gap proves that a move of one full unit cannot improve the
+// incumbent, which is the next feasible value only when the occupied bound is
+// itself integral. A continuous column can move a fraction of a unit and stay
+// inside the gap, so this function must not be applied to one.
+inline bool integer_reduced_cost_fix(double& lo, double& hi, double x,
+                                     double rc, double gap, double tol) {
+    if (!(hi > lo + tol)) return false;
+    if (!std::isfinite(rc) || !std::isfinite(gap) || gap < 0.0) return false;
+    const auto near = [tol](double a, double b) {
+        return std::fabs(a - b) <= tol;
+    };
+    const auto integral = [tol](double v) {
+        return std::isfinite(v) && std::fabs(v - std::round(v)) <= tol;
+    };
+    if (near(x, lo) && integral(lo) && rc >= gap - tol) {
+        hi = lo;
+        return true;
+    }
+    if (near(x, hi) && integral(hi) && rc <= -(gap - tol)) {
+        lo = hi;
+        return true;
+    }
+    return false;
+}
 
 }  // namespace sor::search

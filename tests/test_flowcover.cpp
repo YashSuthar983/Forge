@@ -240,6 +240,203 @@ void test_no_vub_means_no_cut() {
     CHECK(cuts.empty());
 }
 
+void test_unlinked_negative_continuous_term_keeps_cut_valid() {
+    // z can contribute -1 to the capacity row. Omitting it without moving
+    // that minimum activity into the capacity invents an invalid cover.
+    LpProblem lp;
+    lp.name = "fc_negative_unlinked";
+    lp.A = from_triplets(
+        3, 5,
+        {0, 0, 0, 1, 1, 2, 2},
+        {0, 1, 4, 0, 2, 1, 3},
+        {1, 1, 1, 1, -5, 1, -5});
+    lp.c.assign(5, 0.0);
+    lp.row_lo.assign(3, -kInf);
+    lp.row_hi = {6, 0, 0};
+    lp.col_lo = {0, 0, 0, 0, -1};
+    lp.col_hi = {5, 5, 1, 1, 0};
+    lp.is_integer = {false, false, true, true, false};
+    const std::vector<f64> fractional = {3, 3, 0.6, 0.6, 0};
+    const std::vector<f64> witness = {5, 2, 1, 1, -1};
+    CHECK(model_feasible(lp, witness));
+
+    FlowCoverOptions opts;
+    FlowCoverDiagnostics diag;
+    const auto cuts = separate_flow_covers(
+        lp, fractional, lp.col_lo, lp.col_hi, opts, diag);
+    CHECK(!cuts.empty());
+    for (const auto& cut : cuts)
+        CHECK(cut_lhs(cut, witness) <= cut.row_hi + 1e-8);
+}
+
+void test_projected_vub_uses_minimum_other_activity() {
+    // y1 - 5*x1 + z <= 0, z in [-1,0], allows y1=6 when x1=1.
+    // Projecting at max(z)=0 would falsely infer y1 <= 5*x1.
+    LpProblem lp;
+    lp.name = "fc_projected_negative";
+    lp.A = from_triplets(
+        3, 5,
+        {0, 0, 1, 1, 1, 2, 2},
+        {0, 1, 0, 2, 4, 1, 3},
+        {1, 1, 1, -5, 1, 1, -5});
+    lp.c.assign(5, 0.0);
+    lp.row_lo.assign(3, -kInf);
+    lp.row_hi = {6, 0, 0};
+    lp.col_lo = {0, 0, 0, 0, -1};
+    lp.col_hi = {6, 5, 1, 1, 0};
+    lp.is_integer = {false, false, true, true, false};
+    const std::vector<f64> fractional = {3, 3, 0.6, 0.6, 0};
+    const std::vector<f64> witness = {6, 0, 1, 0, -1};
+    CHECK(model_feasible(lp, witness));
+
+    FlowCoverOptions opts;
+    opts.project_vubs = true;
+    FlowCoverDiagnostics diag;
+    const auto cuts = separate_flow_covers(
+        lp, fractional, lp.col_lo, lp.col_hi, opts, diag);
+    CHECK(cuts.empty());
+    for (const auto& cut : cuts)
+        CHECK(cut_lhs(cut, witness) <= cut.row_hi + 1e-8);
+}
+
+void test_positive_vub_slack_is_not_discarded() {
+    // Even a small positive rhs gives y <= u*x + epsilon, not y <= u*x.
+    // A cut proof cannot silently discard epsilon because it may be added
+    // across many arcs or amplified by later transformations.
+    LpProblem lp;
+    lp.name = "fc_positive_vub_slack";
+    lp.A = from_triplets(
+        3, 4,
+        {0, 0, 1, 1, 2, 2},
+        {0, 1, 0, 2, 1, 3},
+        {1, 1, 1, -5, 1, -5});
+    lp.c.assign(4, 0.0);
+    lp.row_lo.assign(3, -kInf);
+    lp.row_hi = {6, 5e-9, 5e-9};
+    lp.col_lo = {0, 0, 0, 0};
+    lp.col_hi = {6, 6, 1, 1};
+    lp.is_integer = {false, false, true, true};
+    const std::vector<f64> fractional = {3, 3, 0.6, 0.6};
+    FlowCoverOptions opts;
+    FlowCoverDiagnostics diag;
+    const auto cuts = separate_flow_covers(
+        lp, fractional, lp.col_lo, lp.col_hi, opts, diag);
+    CHECK(diag.vubs_found == 0);
+    CHECK(cuts.empty());
+}
+
+void test_scaled_flow_row_keeps_flow_coefficients() {
+    // The capacity row is 0.5*y1 + 0.5*y2 <= 3. A cover derived using
+    // 0.5*y must emit 0.5 on each y, not silently replace it with 1.
+    LpProblem lp;
+    lp.name = "fc_scaled_row";
+    lp.A = from_triplets(
+        3, 4,
+        {0, 0, 1, 1, 2, 2},
+        {0, 1, 0, 2, 1, 3},
+        {0.5, 0.5, 1, -5, 1, -5});
+    lp.c.assign(4, 0.0);
+    lp.row_lo.assign(3, -kInf);
+    lp.row_hi = {3, 0, 0};
+    lp.col_lo = {0, 0, 0, 0};
+    lp.col_hi = {5, 5, 1, 1};
+    lp.is_integer = {false, false, true, true};
+    const std::vector<f64> fractional = {3, 3, 0.6, 0.6};
+    const std::vector<f64> witness = {5, 1, 1, 1};
+    CHECK(model_feasible(lp, witness));
+    FlowCoverOptions opts;
+    FlowCoverDiagnostics diag;
+    const auto cuts = separate_flow_covers(
+        lp, fractional, lp.col_lo, lp.col_hi, opts, diag);
+    CHECK(!cuts.empty());
+    for (const auto& cut : cuts)
+        CHECK(cut_lhs(cut, witness) <= cut.row_hi + 1e-8);
+}
+
+void test_random_small_flow_cuts_against_all_vertices() {
+    // For fixed binary indicators, a single capacity row intersected with
+    // flow boxes has vertices at box corners or at a capacity-plane crossing
+    // with all but one flow fixed to a box bound. Exhausting those vertices
+    // checks each generated cut against the entire small feasible polytope.
+    std::mt19937 rng(81);
+    const std::vector<f64> scales = {0.25, 0.5, 1.0, 2.0, 3.0};
+    std::size_t checked_cuts = 0;
+    for (int seed = 0; seed < 128; ++seed) {
+        const int n = 2 + static_cast<int>(rng() % 2);
+        std::vector<f64> a(n), u(n);
+        f64 total_capacity = 0.0;
+        for (int j = 0; j < n; ++j) {
+            a[j] = scales[rng() % scales.size()];
+            u[j] = 3.0 + static_cast<f64>(rng() % 6);
+            total_capacity += a[j] * u[j];
+        }
+        const f64 fraction = 0.45 + 0.05 * static_cast<f64>(rng() % 8);
+        const f64 cap = fraction * total_capacity;
+
+        std::vector<Index> rows, cols;
+        std::vector<f64> vals;
+        for (int j = 0; j < n; ++j) {
+            rows.insert(rows.end(), {0, j + 1, j + 1});
+            cols.insert(cols.end(), {j, j, n + j});
+            vals.insert(vals.end(), {a[j], 1.0, -u[j]});
+        }
+        LpProblem lp;
+        lp.name = "fc_vertex_oracle";
+        lp.A = from_triplets(n + 1, 2 * n, rows, cols, vals);
+        lp.c.assign(2 * n, 0.0);
+        lp.row_lo.assign(n + 1, -kInf);
+        lp.row_hi.assign(n + 1, 0.0);
+        lp.row_hi[0] = cap;
+        lp.col_lo.assign(2 * n, 0.0);
+        lp.col_hi.assign(2 * n, 1.0);
+        lp.is_integer.assign(2 * n, false);
+        std::vector<f64> fractional(2 * n, fraction);
+        for (int j = 0; j < n; ++j) {
+            lp.col_hi[j] = u[j];
+            lp.is_integer[n + j] = true;
+            fractional[j] = u[j] * fraction;
+        }
+
+        FlowCoverOptions opts;
+        FlowCoverDiagnostics diag;
+        const auto cuts = separate_flow_covers(
+            lp, fractional, lp.col_lo, lp.col_hi, opts, diag);
+        checked_cuts += cuts.size();
+        for (const CutRow& cut : cuts) {
+            for (int mask = 0; mask < (1 << n); ++mask) {
+                std::vector<f64> max_y(n, 0.0);
+                std::vector<f64> point(2 * n, 0.0);
+                for (int j = 0; j < n; ++j) {
+                    point[n + j] = static_cast<f64>((mask >> j) & 1);
+                    max_y[j] = u[j] * point[n + j];
+                }
+                const auto check_point = [&] {
+                    if (!model_feasible(lp, point)) return;
+                    CHECK(cut_lhs(cut, point) <= cut.row_hi + 1e-7);
+                };
+                for (int corner = 0; corner < (1 << n); ++corner) {
+                    for (int j = 0; j < n; ++j)
+                        point[j] = ((corner >> j) & 1) ? max_y[j] : 0.0;
+                    check_point();
+                }
+                for (int free_col = 0; free_col < n; ++free_col) {
+                    for (int corner = 0; corner < (1 << n); ++corner) {
+                        f64 used = 0.0;
+                        for (int j = 0; j < n; ++j) {
+                            if (j == free_col) continue;
+                            point[j] = ((corner >> j) & 1) ? max_y[j] : 0.0;
+                            used += a[j] * point[j];
+                        }
+                        point[free_col] = (cap - used) / a[free_col];
+                        check_point();
+                    }
+                }
+            }
+        }
+    }
+    CHECK(checked_cuts >= 25);
+}
+
 }  // namespace
 
 int main() {
@@ -247,5 +444,10 @@ int main() {
     test_si_lift_three_arcs();
     test_projected_vub();
     test_no_vub_means_no_cut();
+    test_unlinked_negative_continuous_term_keeps_cut_valid();
+    test_projected_vub_uses_minimum_other_activity();
+    test_positive_vub_slack_is_not_discarded();
+    test_scaled_flow_row_keeps_flow_coefficients();
+    test_random_small_flow_cuts_against_all_vertices();
     return sor::test::finish("test_flowcover");
 }

@@ -5,11 +5,13 @@
 #include <set>
 #include <tuple>
 #include <utility>
+#include "sor/core/route_debug.hpp"
 
 namespace sor::presolve::detail {
 
 void LiveMatrix::record_column_dual_state(DualRecoveryStep& step, Index row,
                                           Index col) {
+    SOR_FN();
     step.stage_cost = cost[sz(col)];
     for (const auto& [other_row, coefficient] : original_column_entries[sz(col)]) {
         if (other_row == row || !row_active[sz(other_row)]) continue;
@@ -32,6 +34,7 @@ void LiveMatrix::build(const model::LpProblem& problem,
                        std::vector<f64>& work_cost,
                        std::vector<f64>& fixed_vals,
                        f64& work_obj_offset) {
+    SOR_FN();
     in = &problem;
     options = opts;
     out = &map_out;
@@ -107,6 +110,7 @@ void LiveMatrix::build(const model::LpProblem& problem,
 }
 
 void LiveMatrix::seed_all_queues() {
+    SOR_FN();
     changed_rows.clear();
     changed_cols.clear();
     std::fill(row_queued.begin(), row_queued.end(), 0);
@@ -118,18 +122,21 @@ void LiveMatrix::seed_all_queues() {
 }
 
 void LiveMatrix::queue_row(Index i) {
+    SOR_FN();
     if (i < 0 || i >= m || !row_active[sz(i)] || row_queued[sz(i)]) return;
     row_queued[sz(i)] = 1;
     changed_rows.push_back(i);
 }
 
 void LiveMatrix::queue_col(Index j) {
+    SOR_FN();
     if (j < 0 || j >= n || !col_active[sz(j)] || col_queued[sz(j)]) return;
     col_queued[sz(j)] = 1;
     changed_cols.push_back(j);
 }
 
 void LiveMatrix::recompute_row_activity(Index i) {
+    SOR_FN();
     if (!row_active[sz(i)]) return;
     f64 lo = 0.0, hi = 0.0;
     Index inf_lo = 0, inf_hi = 0;
@@ -159,6 +166,7 @@ void LiveMatrix::recompute_row_activity(Index i) {
 }
 
 void LiveMatrix::recompute_col_locks(Index j) {
+    SOR_FN();
     if (!col_active[sz(j)]) return;
     down_lock[sz(j)] = 0;
     up_lock[sz(j)] = 0;
@@ -203,6 +211,7 @@ void LiveMatrix::recompute_col_locks(Index j) {
 
 bool LiveMatrix::fix_column(Index j, f64 value, DualRecoveryKind kind, Index row,
                             f64 coeff, Index record) {
+    SOR_FN();
     if (!col_active[sz(j)]) return false;
     col_active[sz(j)] = 0;
     fixed[sz(j)] = value;
@@ -230,6 +239,7 @@ bool LiveMatrix::fix_column(Index j, f64 value, DualRecoveryKind kind, Index row
 }
 
 bool LiveMatrix::remove_redundant_row(Index i) {
+    SOR_FN();
     if (!row_active[sz(i)]) return false;
     recompute_row_activity(i);
     if (act_min_inf[sz(i)] > 0 || act_max_inf[sz(i)] > 0) return false;
@@ -247,6 +257,7 @@ bool LiveMatrix::remove_redundant_row(Index i) {
 }
 
 bool LiveMatrix::apply_implied_bounds_row(Index i) {
+    SOR_FN();
     if (!row_active[sz(i)]) return false;
     bool changed = false;
     for (const auto& [j, a] : rows[sz(i)]) {
@@ -316,6 +327,7 @@ bool LiveMatrix::apply_implied_bounds_row(Index i) {
 }
 
 bool LiveMatrix::apply_dual_fixing_col(Index j) {
+    SOR_FN();
     if (!col_active[sz(j)]) return false;
     if (!col_rows[sz(j)].empty()) return false;
     recompute_col_locks(j);
@@ -351,6 +363,7 @@ bool LiveMatrix::apply_dual_fixing_col(Index j) {
 }
 
 bool LiveMatrix::try_doubleton_equality(Index i) {
+    SOR_FN();
     if (!row_active[sz(i)] || row_lo[sz(i)] != row_hi[sz(i)]) return false;
     const auto& entries = rows[sz(i)];
     if (entries.size() != 2) return false;
@@ -429,11 +442,9 @@ bool LiveMatrix::try_doubleton_equality(Index i) {
     rec.keep_coeff = a_keep;
     rec.rhs = rhs;
     rec.dual_value = cost[sz(elim)] / a_elim;
-    for (const auto& [h, b] : entries) {
-        if (h == elim) continue;
-        rec.other_cols.push_back(h);
-        rec.other_coeffs.push_back(b);
-    }
+    // This is a doubleton: keep_col/keep_coeff already record the only
+    // non-eliminated term.  Duplicating it in other_cols makes postsolve
+    // subtract that term twice and reconstruct the wrong primal value.
 
     const f64 elim_cost = cost[sz(elim)];
     *obj_offset += elim_cost * rhs / a_elim;
@@ -492,69 +503,81 @@ bool LiveMatrix::try_doubleton_equality(Index i) {
 }
 
 bool LiveMatrix::try_dominated_columns() {
+    SOR_FN();
     constexpr std::size_t kMaxShared = 8;
     bool any = false;
+    
+    std::map<std::vector<Index>, std::vector<Index>> buckets;
     for (Index j = 0; j < n; ++j) {
         if (!col_active[sz(j)]) continue;
         if (col_rows[sz(j)].size() > kMaxShared) continue;
-        const f64 cj = in->maximize ? -cost[sz(j)] : cost[sz(j)];
-        for (Index k = j + 1; k < n; ++k) {
-            if (!col_active[sz(k)]) continue;
-            if (col_rows[sz(k)].size() != col_rows[sz(j)].size() ||
-                col_rows[sz(k)].size() > kMaxShared)
-                continue;
-            const f64 ck = in->maximize ? -cost[sz(k)] : cost[sz(k)];
-            if (ck < cj) continue;
-
-            bool parallel = true;
-            f64 ratio = 1.0;
-            bool ratio_set = false;
-            for (const Index i : col_rows[sz(j)]) {
-                if (!col_rows[sz(k)].contains(i)) {
-                    parallel = false;
-                    break;
+        std::vector<Index> support;
+        for (const Index i : col_rows[sz(j)]) support.push_back(i);
+        buckets[support].push_back(j);
+    }
+    
+    for (const auto& [support, group] : buckets) {
+        if (group.size() < 2) continue;
+        for (std::size_t j_idx = 0; j_idx < group.size(); ++j_idx) {
+            const Index j = group[j_idx];
+            if (!col_active[sz(j)]) continue;
+            
+            const f64 cj = in->maximize ? -cost[sz(j)] : cost[sz(j)];
+            for (std::size_t k_idx = j_idx + 1; k_idx < group.size(); ++k_idx) {
+                const Index k = group[k_idx];
+                if (!col_active[sz(k)]) continue;
+                
+                const f64 ck = in->maximize ? -cost[sz(k)] : cost[sz(k)];
+                if (ck < cj) continue;
+                
+                bool parallel = true;
+                f64 ratio = 1.0;
+                bool ratio_set = false;
+                for (const Index i : support) {
+                    const f64 aj = rows[sz(i)].at(j);
+                    const f64 ak = rows[sz(i)].at(k);
+                    if (aj == 0.0 || ak == 0.0) {
+                        parallel = false;
+                        break;
+                    }
+                    const f64 r = aj / ak;
+                    if (!ratio_set) {
+                        ratio = r;
+                        ratio_set = true;
+                    } else if (std::fabs(r - ratio) >
+                               stability_tol(std::max(std::fabs(aj), std::fabs(ak)))) {
+                        parallel = false;
+                        break;
+                    }
                 }
-                const f64 aj = rows[sz(i)].at(j);
-                const f64 ak = rows[sz(i)].at(k);
-                if (aj == 0.0 || ak == 0.0) {
-                    parallel = false;
-                    break;
+                if (!parallel || !ratio_set) continue;
+                
+                const f64 lo_j = col_lo[sz(j)], hi_j = col_hi[sz(j)];
+                const f64 lo_k = col_lo[sz(k)], hi_k = col_hi[sz(k)];
+                const f64 imp_lo_k = ratio > 0.0 ? lo_j / ratio : hi_j / ratio;
+                const f64 imp_hi_k = ratio > 0.0 ? hi_j / ratio : lo_j / ratio;
+                if (imp_lo_k < lo_k - stability_tol(lo_k) ||
+                    imp_hi_k > hi_k + stability_tol(hi_k))
+                    continue;
+                if (ck > cj) continue;
+                
+                auto k_rows = col_rows[sz(k)];
+                for (const Index i : k_rows) {
+                    rows[sz(i)].erase(k);
+                    col_rows[sz(k)].erase(i);
+                    queue_row(i);
                 }
-                const f64 r = aj / ak;
-                if (!ratio_set) {
-                    ratio = r;
-                    ratio_set = true;
-                } else if (std::fabs(r - ratio) >
-                           stability_tol(std::max(std::fabs(aj), std::fabs(ak)))) {
-                    parallel = false;
-                    break;
-                }
+                fix_column(k, lo_k, DualRecoveryKind::DominatedColumn, -1, 0.0, j);
+                ++out->stats.dominated_columns_removed;
+                any = true;
             }
-            if (!parallel || !ratio_set) continue;
-
-            const f64 lo_j = col_lo[sz(j)], hi_j = col_hi[sz(j)];
-            const f64 lo_k = col_lo[sz(k)], hi_k = col_hi[sz(k)];
-            const f64 imp_lo_k = ratio > 0.0 ? lo_j / ratio : hi_j / ratio;
-            const f64 imp_hi_k = ratio > 0.0 ? hi_j / ratio : lo_j / ratio;
-            if (imp_lo_k < lo_k - stability_tol(lo_k) ||
-                imp_hi_k > hi_k + stability_tol(hi_k))
-                continue;
-            if (ck > cj) continue;
-
-            for (const Index i : col_rows[sz(k)]) {
-                rows[sz(i)].erase(k);
-                col_rows[sz(k)].erase(i);
-                queue_row(i);
-            }
-            fix_column(k, lo_k, DualRecoveryKind::DominatedColumn, -1, 0.0, j);
-            ++out->stats.dominated_columns_removed;
-            any = true;
         }
     }
     return any;
 }
 
 bool LiveMatrix::try_duplicate_rows() {
+    SOR_FN();
     std::map<std::vector<std::pair<Index, f64>>, std::vector<Index>> buckets;
     for (Index i = 0; i < m; ++i) {
         if (!row_active[sz(i)]) continue;
@@ -620,6 +643,7 @@ bool LiveMatrix::try_duplicate_rows() {
 }
 
 bool LiveMatrix::try_duplicate_columns() {
+    SOR_FN();
     std::map<std::vector<std::pair<Index, f64>>, std::vector<Index>> buckets;
     for (Index j = 0; j < n; ++j) {
         if (!col_active[sz(j)]) continue;
@@ -680,6 +704,7 @@ bool LiveMatrix::try_duplicate_columns() {
 }
 
 bool LiveMatrix::run_until_stable() {
+    SOR_FN();
     seed_all_queues();
     int inner = 0;
     while ((!changed_rows.empty() || !changed_cols.empty()) &&
@@ -755,6 +780,7 @@ bool run_live_presolve_passes(
     std::vector<f64>& fixed,
     f64& work_obj_offset,
     LiveMatrix& lm) {
+    SOR_FN();
     lm.build(in, options, out, status, witness_row, witness_col, reason,
              row_live, col_live, work_lo, work_hi, work_cost, fixed,
              work_obj_offset);

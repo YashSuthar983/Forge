@@ -319,6 +319,24 @@ void test_folding_does_not_cut_sum_optima() {
     CHECK(hi[0] >= 2.0 - 1e-9);
 }
 
+// Plan 3I: folding asserts IDENTICAL columns. A coefficient 5e-10 apart is
+// not identical (times a wide domain it moves a row's activity by O(1)), so
+// the pair must not fold; exactly equal columns still must.
+void test_folding_requires_exact_identity() {
+    auto lp = fold_parallel();
+    lp.A = from_triplets(1, 3, {0, 0, 0}, {0, 1, 2}, {1.0, 1.0 + 5e-10, 1.0});
+    auto lo = lp.col_lo, hi = lp.col_hi;
+    SymmetryOptions opts;
+    opts.reflection = false;
+    const auto d = sor::search::apply_symmetry(lp, nullptr, lo, hi, opts);
+    for (const auto& g : d.folds)
+        for (const auto j : g.members) CHECK(j != 1);   // column 1 never folded
+    auto exact = fold_parallel();
+    auto lo2 = exact.col_lo, hi2 = exact.col_hi;
+    const auto d2 = sor::search::apply_symmetry(exact, nullptr, lo2, hi2, opts);
+    CHECK(d2.folding_applied);
+}
+
 void test_packing_orbitopal_preserves_opt() {
     auto lp = packing3();
     auto lo = lp.col_lo, hi = lp.col_hi;
@@ -496,6 +514,7 @@ void test_enigma_not_falsely_infeasible() {
 }  // namespace
 
 int main() {
+    test_folding_requires_exact_identity();
     test_color_refinement_finds_twin_orbit();
     test_asymmetric_not_orbited_together();
     test_orbital_fixing_on_amo_orbit();

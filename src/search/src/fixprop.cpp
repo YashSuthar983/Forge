@@ -3,6 +3,7 @@
 
 #include "sor/search/fixprop.hpp"
 
+#include "sor/core/route_debug.hpp"
 #include "sor/engines/simplex.hpp"
 #include "sor/search/propagate.hpp"
 #include "sor/search/prop_trail.hpp"
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <random>
 
 namespace sor::search {
@@ -143,6 +145,25 @@ private:
         return work_limit_ > 0 && diag_.work > work_limit_;
     }
 
+    bool abort_if_over_budget() {
+        if (!over_budget(run_start_)) return false;
+        if (!aborted_) {
+#ifdef SOR_ROUTE_DEBUG
+            char fields[160];
+            const bool time_exhausted = opts_.time_limit_s > 0.0 &&
+                ms_since(run_start_) > opts_.time_limit_s * 1000.0;
+            std::snprintf(fields, sizeof fields,
+                          "\"reason\":\"%s\",\"elapsed_ms\":%.3f,\"work\":%llu",
+                          time_exhausted ? "deadline" : "work_limit",
+                          ms_since(run_start_),
+                          static_cast<unsigned long long>(diag_.work));
+            SOR_ROUTE_PATH(1, "fixprop", "heuristic", "abort", fields);
+#endif
+        }
+        aborted_ = true;
+        return true;
+    }
+
     void undo_to(std::size_t mark) {
         const auto& e = trail_.entries();
         for (std::size_t k = e.size(); k-- > mark;) {
@@ -204,6 +225,8 @@ private:
     std::vector<f64> lo_, hi_;
     PropTrail trail_;
     std::uint64_t work_limit_ = 0;
+    Clock::time_point run_start_{};
+    bool aborted_ = false;
 
 public:
     void set_work_limit(std::uint64_t w) { work_limit_ = w; }
@@ -220,10 +243,13 @@ public:
 // dirty-row queue and the activity bounds it needs, updating both in place.
 
 void Dive::bump_activities(Index j, f64 old_lo, f64 old_hi) {
+    SOR_FN();
     const f64 dlo = lo_[sz(j)] - old_lo;
     const f64 dhi = hi_[sz(j)] - old_hi;
     if (dlo == 0.0 && dhi == 0.0) return;
     for (core::Offset k = col_ptr_[sz(j)]; k < col_ptr_[sz(j) + 1]; ++k) {
+        if ((k - col_ptr_[sz(j)]) % 1024 == 0 && abort_if_over_budget())
+            return;
         const Index i = col_row_[sz(k)];
         const f64 a = col_val_[sz(k)];
         if (a > 0.0) { minact_[sz(i)] += a * dlo; maxact_[sz(i)] += a * dhi; }
@@ -237,6 +263,7 @@ void Dive::bump_activities(Index j, f64 old_lo, f64 old_hi) {
 // Derive bounds for every column of row i from the residual activity of the
 // others. Returns false when the row cannot be satisfied inside the box.
 bool Dive::tighten_row(Index i) {
+    SOR_FN();
     const f64 rl = lp_.row_lo[sz(i)], rh = lp_.row_hi[sz(i)];
     if (!std::isfinite(rl) && !std::isfinite(rh)) return true;
     if (std::isfinite(rh) && minact_[sz(i)] > rh + 1e-7) return false;
@@ -248,6 +275,8 @@ bool Dive::tighten_row(Index i) {
     diag_.work += static_cast<std::uint64_t>(rp[sz(i) + 1] - rp[sz(i)]);
 
     for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+        if ((k - rp[sz(i)]) % 1024 == 0 && abort_if_over_budget())
+            return false;
         const f64 a = av[sz(k)];
         if (a == 0.0) continue;
         const Index j = ci[sz(k)];
@@ -289,21 +318,27 @@ bool Dive::tighten_row(Index i) {
                 hi_[sz(j)] = new_hi;
             }
             bump_activities(j, old_l, old_h);
+            if (aborted_) return false;
         }
     }
     return true;
 }
 
 bool Dive::propagate_incremental(int depth) {
+    SOR_FN();
     ++diag_.propagations;
     cur_depth_ = depth;
     std::size_t head = 0;
     bool ok = true;
     while (head < queue_.size()) {
+        if ((head & 63u) == 0 && abort_if_over_budget()) {
+            ok = false;
+            break;
+        }
         const Index i = queue_[head++];
         queued_[sz(i)] = 0;
         if (!tighten_row(i)) { ok = false; break; }
-        if (work_limit_ > 0 && diag_.work > work_limit_) break;
+        if (abort_if_over_budget()) { ok = false; break; }
     }
     for (std::size_t k = head; k < queue_.size(); ++k)
         queued_[sz(queue_[k])] = 0;
@@ -457,6 +492,7 @@ bool Dive::repair_walk(std::mt19937_64& rng, Clock::time_point t0) {
         const Index j = take_random ? rand_j : best_j;
         const f64 val = take_random ? rand_val : best_val;
         shift_fixed(j, val);
+        if (aborted_) return false;
         collect_violations();
     }
     return viol_rows_.empty();
@@ -605,12 +641,16 @@ inline std::size_t lv_trail_mark_of(const std::vector<Level>& levels) {
 bool Dive::run(const Strategy& s, const std::vector<f64>& base_lo,
                const std::vector<f64>& base_hi, std::uint64_t seed,
                Clock::time_point t0, std::vector<f64>& x_out) {
+    SOR_FN();
+    run_start_ = t0;
+    aborted_ = false;
     lo_ = base_lo;
     hi_ = base_hi;
     base_lo_ = base_lo;
     base_hi_ = base_hi;
     trail_.clear();
     compute_activities();
+    if (abort_if_over_budget()) return false;
     for (Index i = 0; i < m_; ++i) { queued_[sz(i)] = 1; queue_.push_back(i); }
     if (!propagate_incremental(0)) return false;   // root box already empty
     std::mt19937_64 rng(seed);
@@ -620,7 +660,7 @@ bool Dive::run(const Strategy& s, const std::vector<f64>& base_lo,
     std::uint64_t backtracks = 0;
 
     for (;;) {
-        if (over_budget(t0)) return false;
+        if (aborted_ || over_budget(t0)) return false;
 
         const Index j = pick_var(s.var, rng);
         if (j < 0) {
@@ -646,6 +686,7 @@ bool Dive::run(const Strategy& s, const std::vector<f64>& base_lo,
         levels.push_back(lv);
 
         if (!propagate_incremental(static_cast<int>(levels.size()))) {
+            if (aborted_) return false;
             ++diag_.conflicts;
             if (s.repair) {
                 // Undo only what propagation deduced; the decision itself
@@ -694,6 +735,7 @@ bool Dive::resolve_conflict(std::vector<Level>& levels,
                 }
                 if (propagate_incremental(static_cast<int>(levels.size())))
                     return true;
+                if (aborted_) return false;
                 ++diag_.conflicts;
                 continue;  // alternative also failed; the level is now spent
             }
@@ -715,6 +757,8 @@ bool fix_and_propagate(const model::LpProblem& lp,
                        const FixPropOptions& opts,
                        std::vector<f64>& x_out,
                        FixPropDiagnostics& diag) {
+    SOR_FN();
+    SOR_ROUTE_PATH(1, "fixprop", "heuristic", "start");
     diag = FixPropDiagnostics{};
     const auto t0 = Clock::now();
     const Index n = lp.n_cols();
@@ -748,8 +792,11 @@ bool fix_and_propagate(const model::LpProblem& lp,
 
     const int dives = std::max(1, opts.max_dives);
     for (int d = 0; d < dives; ++d) {
-        if (opts.time_limit_s > 0.0 &&
-            ms_since(t0) > opts.time_limit_s * 1000.0)
+        if ((opts.time_limit_s > 0.0 &&
+             ms_since(t0) > opts.time_limit_s * 1000.0) ||
+            (opts.work_limit_nnz_multiple > 0 &&
+             diag.work > opts.work_limit_nnz_multiple *
+                             static_cast<std::uint64_t>(lp.nnz())))
             break;
         ++diag.dives;
         const Strategy& s = kPortfolio[d % kPortfolioSize];
@@ -780,10 +827,12 @@ bool fix_and_propagate(const model::LpProblem& lp,
         x_out = std::move(cand);
         diag.found = true;
         diag.ms = ms_since(t0);
+        SOR_ROUTE_PATH(1, "fixprop", "heuristic", "found");
         return true;
     }
 
     diag.ms = ms_since(t0);
+    SOR_ROUTE_PATH(1, "fixprop", "heuristic", "stop");
     return false;
 }
 

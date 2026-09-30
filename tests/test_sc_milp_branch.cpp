@@ -138,6 +138,7 @@ void test_load_rejects_nan_poisoned_model() {
 void test_bab_sc_milp_fires() {
     auto lp = read_text(kFracBranch);
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.branch_strategy = BranchStrategy::ScMilp;
     opts.sparse_sb.enabled = false;
@@ -174,6 +175,7 @@ void test_bab_sc_milp_fires() {
 void test_classical_ignores_sc_milp() {
     auto lp = read_text(kFracBranch);
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Classical;
     opts.branch_strategy = BranchStrategy::ScMilp;
     opts.max_nodes = 200;
@@ -188,8 +190,12 @@ void test_classical_ignores_sc_milp() {
 void test_auto_prefers_sc_without_sparse_model() {
     auto lp = read_text(kFracBranch);
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.branch_strategy = BranchStrategy::Auto;
+    // The learned-scorer auto resolution is the legacy path; the default
+    // Auto is Achterberg's reliability branching (see the test below).
+    opts.paper_reliability = false;
     opts.sparse_sb.enabled = true;
     opts.sparse_sb.model_path.clear();
     opts.sc_milp.enabled = true;
@@ -219,14 +225,66 @@ void test_auto_prefers_sc_without_sparse_model() {
     CHECK(diag.sc_milp_picks > 0);
 }
 
+void test_explicit_reliability_bypasses_untrained_sc_heuristic() {
+    BranchStrategy parsed = BranchStrategy::Auto;
+    CHECK(sor::search::parse_branch_strategy("reliability", parsed));
+    CHECK(parsed == BranchStrategy::Reliability);
+    auto lp = read_text(kFracBranch);
+    BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
+    opts.policy = MilpPolicy::Latest;
+    opts.branch_strategy = BranchStrategy::Reliability;
+    opts.max_nodes = 300;
+    opts.feasibility_jump = false;
+    opts.sub_mip_lns = false;
+    opts.balans.enabled = false;
+    opts.kernel_pump.enabled = false;
+    opts.mrens.enabled = false;
+    opts.probing = false;
+    opts.mip_presolve = false;
+    opts.symmetry = false;
+    opts.cuts_enabled = false;
+    opts.tree_cut.enabled = false;
+    opts.dynsep.enabled = false;
+    opts.conflict_cut.enabled = false;
+    opts.rounding_heuristic = false;
+    opts.lp_rounding_repair = false;
+    opts.integer_dive = false;
+    opts.integer_neighborhood = false;
+    opts.integer_row_rounding = false;
+    BabDiagnostics diag;
+    sor::search::solve_milp(lp, opts, diag);
+    CHECK(diag.branch_strategy_resolved == BranchStrategy::Reliability);
+    CHECK(diag.sc_milp_picks == 0);
+    CHECK(diag.last_branch_policy == "reliability" ||
+          diag.last_branch_policy == "batch-sb");
+}
+
+void test_auto_defaults_to_paper_reliability() {
+    auto lp = read_text(kFracBranch);
+    BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
+    opts.policy = MilpPolicy::Latest;
+    opts.branch_strategy = BranchStrategy::Auto;
+    opts.sc_milp.enabled = true;
+    opts.max_nodes = 300;
+    BabDiagnostics diag;
+    sor::search::solve_milp(lp, opts, diag);
+    CHECK(diag.branch_strategy_resolved == BranchStrategy::Auto);
+    CHECK(diag.sc_milp_picks == 0);
+    if (diag.nodes > 1) CHECK(diag.rb_nodes > 0);
+}
+
 }  // namespace
 
 int main() {
     test_stratum_and_heuristic();
+    test_auto_defaults_to_paper_reliability();
     test_fit_rank_and_roundtrip();
     test_load_rejects_nan_poisoned_model();
     test_bab_sc_milp_fires();
     test_classical_ignores_sc_milp();
     test_auto_prefers_sc_without_sparse_model();
+    test_explicit_reliability_bypasses_untrained_sc_heuristic();
     return sor::test::finish("test_sc_milp_branch");
 }

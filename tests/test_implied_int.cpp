@@ -104,6 +104,28 @@ void test_equality_pm1() {
     CHECK(lp.is_integer[1]);
 }
 
+void test_small_nonzero_coefficient_blocks_implied_integrality() {
+    // x + 5e-10*y = 0, y integer in [0,1e9]. The feasible point
+    // (x,y)=(-0.5,1e9) proves that x is NOT implied integer. Rounding the
+    // small coefficient to zero would falsely mark it as integer.
+    LpProblem lp;
+    lp.name = "implied_int_small_coef";
+    lp.c = {1.0, 0.0};
+    lp.col_lo = {-1.0, 0.0};
+    lp.col_hi = {0.0, 1e9};
+    lp.is_integer = {false, true};
+    lp.row_lo = {0.0};
+    lp.row_hi = {0.0};
+    lp.A = from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 5e-10});
+    search::ImpliedIntOptions o;
+    o.network = false;
+    o.consecutive_ones = false;
+    o.dual_rational = false;
+    const auto d = search::infer_implied_integers_ex(lp, o);
+    CHECK(d.total == 0);
+    CHECK(!lp.is_integer[0]);
+}
+
 void test_network_marks_flow() {
     auto lp = network_flow_model();
     sor::search::ImpliedIntOptions o;
@@ -159,6 +181,7 @@ void test_tu_network_block_pair() {
 
 int main() {
     test_equality_pm1();
+    test_small_nonzero_coefficient_blocks_implied_integrality();
     test_network_marks_flow();
     test_c1_marks();
     test_dual_rational_marks_z();

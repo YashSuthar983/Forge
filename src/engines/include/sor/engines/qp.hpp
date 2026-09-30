@@ -33,8 +33,9 @@ struct QpProblem {
 
 struct QpOptions {
     std::uint64_t max_iterations = 50000;
-    // 0 = unlimited (max_iterations is the only cap); checked at the same
-    // check_every cadence as the KKT/Wolfe-gap evaluation. Without this, a
+    // 0 = unlimited (max_iterations is the only cap). Both the diagonal
+    // active-set path and the general path poll this independently of the
+    // KKT/Wolfe-gap evaluation cadence. Without this, a
     // caller-supplied wall-clock budget had nowhere to go: PDHCG-II on a
     // genuinely coupled (non-diagonal) PSD QP can need well more than 50000
     // iterations to converge tightly (measured: n=3000/4000 general-Q QPs

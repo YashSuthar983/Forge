@@ -21,6 +21,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include "sor/core/route_debug.hpp"
 
 using sor::core::f64;
 using sor::core::Index;
@@ -43,6 +44,7 @@ struct Run {
 class ScopedEnvironment {
 public:
     ScopedEnvironment(const char* name, const char* value) : name_(name) {
+        SOR_FN();
         if (const char* old = std::getenv(name)) {
             had_old_ = true;
             old_ = old;
@@ -51,6 +53,7 @@ public:
     }
 
     ~ScopedEnvironment() {
+        SOR_FN();
         if (had_old_) ::setenv(name_.c_str(), old_.c_str(), 1);
         else ::unsetenv(name_.c_str());
     }
@@ -65,28 +68,33 @@ private:
 };
 
 Run solve_text(const std::string& mps, SimplexOptions opts = {}) {
+    SOR_FN();
     Run out;
     sor::io::MpsReadReport rep;
     std::istringstream in(mps);
     out.problem = sor::io::read_mps(in, rep);
     auto raw = sor::engines::solve_simplex(out.problem, opts, out.diag, &out.basis);
-    const auto ev = sor::engines::simplex_evidence(out.diag, opts);
+    auto ev = sor::engines::simplex_evidence(out.diag, opts);
+    ev = sor::certify::check_lp_result(out.problem, raw, ev);
     out.r = sor::certify::finalize_result(std::move(raw), ev);
     return out;
 }
 
 Run solve_problem(const sor::model::LpProblem& problem,
                   SimplexOptions opts = {}) {
+    SOR_FN();
     Run out;
     out.problem = problem;
     auto raw = sor::engines::solve_simplex(
         out.problem, opts, out.diag, &out.basis);
-    const auto ev = sor::engines::simplex_evidence(out.diag, opts);
+    auto ev = sor::engines::simplex_evidence(out.diag, opts);
+    ev = sor::certify::check_lp_result(out.problem, raw, ev);
     out.r = sor::certify::finalize_result(std::move(raw), ev);
     return out;
 }
 
 void test_fixture_lp() {
+    SOR_FN();
     const auto run = solve_text(sor::test::kTestLpMps);
     CHECK(run.r.status == Status::Optimal);
     CHECK(run.r.proof == ProofLevel::ProvedOptimalFP);
@@ -111,6 +119,7 @@ void test_fixture_lp() {
 }
 
 void test_auto_commits_to_one_engine_without_a_discarded_probe() {
+    SOR_FN();
     // Auto must reach a proved result in ONE stage, on ONE shared
     // preprocessing build. Two regressions are fenced off here: the old
     // dispatcher that ran and then discarded a 256-iteration probe of the
@@ -151,6 +160,7 @@ void test_auto_commits_to_one_engine_without_a_discarded_probe() {
 }
 
 void test_route_features_describe_the_model() {
+    SOR_FN();
     using sor::engines::detail::route_features;
 
     // Two rows, four columns, and one nonzero per position we care about:
@@ -220,6 +230,7 @@ void test_route_features_describe_the_model() {
 }
 
 void test_dual_periodic_resync_is_not_tied_to_verbose() {
+    SOR_FN();
     SimplexOptions opts;
     opts.method = sor::engines::SimplexMethod::Dual;
     opts.presolve = false;
@@ -232,6 +243,7 @@ void test_dual_periodic_resync_is_not_tied_to_verbose() {
 }
 
 void test_pruned_basic_pivotal_entries_match_full_path() {
+    SOR_FN();
     // Basic columns cannot enter the dual ratio test and their reduced costs
     // are not maintained. The optimized pivotal-row support omits them unless
     // a Devex reference framework needs them. Compare against the retained
@@ -303,6 +315,7 @@ void test_pruned_basic_pivotal_entries_match_full_path() {
 }
 
 void test_pruned_fixed_pivotal_entries_match_retained_path() {
+    SOR_FN();
     // The first equality is deliberately the first leaving row. Once X0
     // replaces its fixed logical, the second BTRAN reaches both rows, so that
     // now-nonbasic fixed logical is present in the mathematical pivotal row.
@@ -343,6 +356,7 @@ void test_pruned_fixed_pivotal_entries_match_retained_path() {
 }
 
 void test_dual_cost_perturbation_cleans_before_optimality() {
+    SOR_FN();
     SimplexOptions exact_opts;
     exact_opts.method = sor::engines::SimplexMethod::Dual;
     exact_opts.presolve = false;
@@ -393,6 +407,7 @@ void test_dual_cost_perturbation_cleans_before_optimality() {
 // Flipping x0 to its upper bound puts x3 at 4.0, half a unit below its lower
 // bound. That is exactly the damage under test.
 void test_dual_cleanup_hands_over_a_primal_feasible_basis() {
+    SOR_FN();
     const std::string mps = R"(NAME          WSA2CLEAN
 ROWS
  N  COST
@@ -469,6 +484,7 @@ ENDATA
 // SOR_DUAL_FILTER_ACTIVE_PIVOTAL forces the unpartitioned scan with the same
 // keep filter, which is the reference implementation for this.
 void test_partitioned_price_matches_full_scan_on_random_bases() {
+    SOR_FN();
     ScopedEnvironment verify_heap("SOR_DUAL_VERIFY_CHUZR_HEAP", "1");
     std::mt19937 rng(20260909u);
     std::uniform_real_distribution<double> unit(0.0, 1.0);
@@ -552,6 +568,7 @@ void test_partitioned_price_matches_full_scan_on_random_bases() {
 // accumulated error in the factorization -- only a disagreement between two
 // computations of the same number can.
 void test_numerical_trouble_trigger_and_shift_bound() {
+    SOR_FN();
     SimplexOptions opts;
     opts.method = sor::engines::SimplexMethod::Dual;
     opts.presolve = false;
@@ -596,6 +613,7 @@ void test_numerical_trouble_trigger_and_shift_bound() {
 }
 
 void test_auto_candidate_order_uses_feasibility_before_gap() {
+    SOR_FN();
     SimplexOptions opts;
     sor::core::RawResult early, later;
     early.proposed_status = Status::Interrupted;
@@ -647,6 +665,7 @@ void test_auto_candidate_order_uses_feasibility_before_gap() {
 // permutation of distinct variables. A duplicated basic variable is the classic
 // symptom of a mishandled leaving-variable update.
 void test_basis_wellformed() {
+    SOR_FN();
     const auto run = solve_text(sor::test::kTestLpMps);
     const Index m = run.problem.n_rows();
     CHECK(static_cast<Index>(run.basis.basic.size()) == m);
@@ -666,6 +685,7 @@ void test_basis_wellformed() {
 }
 
 void test_features_mps_agrees_with_model() {
+    SOR_FN();
     const auto run = solve_text(sor::test::kFeaturesMps);
     // RANGES / MI / FR / FX and an objective constant all have to survive the
     // augmented-form conversion. The assertion is self-consistency: whatever the
@@ -682,6 +702,7 @@ void test_features_mps_agrees_with_model() {
 // x1 + x2 <= 1 with x1, x2 >= 2 has no feasible point. Phase 1 must terminate
 // with positive infeasibility and the result must NOT be labelled Optimal.
 void test_infeasible() {
+    SOR_FN();
     const std::string mps = R"(NAME          INFEAS
 ROWS
  N  COST
@@ -701,12 +722,44 @@ ENDATA
     CHECK(run.r.proof < ProofLevel::ProvedOptimalFP);
 }
 
+void test_primal_phase1_exports_checked_farkas_certificate() {
+    SOR_FN();
+    const std::string mps = R"(NAME          PINF
+ROWS
+ N  COST
+ L  R1
+COLUMNS
+    X1        COST      0.0        R1        1.0
+    X2        COST      0.0        R1        1.0
+RHS
+    RHS       R1        1.0
+BOUNDS
+ LO BND       X1        2.0
+ LO BND       X2        2.0
+ENDATA
+)";
+    SimplexOptions opts;
+    opts.method = sor::engines::SimplexMethod::Primal;
+    opts.presolve = false;
+    const auto run = solve_text(mps, opts);
+    CHECK(run.r.status == Status::Infeasible);
+    CHECK(run.r.ray_certified);
+    CHECK(run.r.dual_farkas_ray.certified);
+    CHECK(run.r.ray.size() == static_cast<std::size_t>(run.problem.n_rows()));
+    const f64 v = sor::engines::farkas_violation(run.problem, run.r.ray);
+    ::sor::test::report(std::isfinite(v) && v <= opts.primal_feas_tol,
+                        "primal phase-I independent farkas re-check",
+                        __FILE__, __LINE__,
+                        "violation=" + std::to_string(v));
+}
+
 // Same infeasible LP as test_infeasible(), forced through the dual engine
 // (where Farkas capture lives) and checked two ways: finalize_result()'s own
 // gate (ray_certified) and an INDEPENDENTLY re-run farkas_violation() call in
 // this test, so a bug shared between the capture code and the verification
 // code inside finalize_result can't hide.
 void test_infeasible_farkas_certificate() {
+    SOR_FN();
     const std::string mps = R"(NAME          INFEAS
 ROWS
  N  COST
@@ -738,6 +791,7 @@ ENDATA
 // and the ray sign conditions depend on those statuses even though feasibility
 // itself does not depend on the objective.
 void test_dual_cost_perturbation_cleans_before_farkas_proof() {
+    SOR_FN();
     const std::string mps = R"(NAME          PERTINF
 ROWS
  N  COST
@@ -769,6 +823,7 @@ ENDATA
 // is keyed on Status::Infeasible, not on whatever an engine happens to leave
 // in raw.ray.
 void test_feasible_lp_has_no_ray() {
+    SOR_FN();
     const auto run = solve_text(sor::test::kTestLpMps);
     CHECK(run.r.status == Status::Optimal);
     CHECK(!run.r.ray_certified);
@@ -777,6 +832,7 @@ void test_feasible_lp_has_no_ray() {
 
 // min -x with x >= 0 and no constraint on growth.
 void test_unbounded() {
+    SOR_FN();
     const std::string mps = R"(NAME          UNBND
 ROWS
  N  COST
@@ -816,6 +872,7 @@ ENDATA
 // cross-checked by primal in the public forced-dual dispatcher. This covers
 // the dual-failed fallback without relying on Auto's routing policy.
 void test_dual_phase1_infeasible_falls_back_to_primal() {
+    SOR_FN();
     const std::string mps = R"(NAME          DP1UNDET
 ROWS
  N  COST
@@ -854,6 +911,7 @@ ENDATA
 // point of one variable's box. Exercises a basic structural variable rather than
 // a vertex made only of bounds.
 void test_equality_and_range() {
+    SOR_FN();
     //  min  x1 + 2*x2
     //  s.t. x1 + x2 == 3
     //       1 <= x1 <= 2
@@ -882,6 +940,7 @@ ENDATA
 
 // A free variable must be able to go negative. min x s.t. x >= -5, x free.
 void test_free_variable() {
+    SOR_FN();
     const std::string mps = R"(NAME          FREEV
 ROWS
  N  COST
@@ -913,6 +972,7 @@ ENDATA
 // gives every column two finite artificial bounds, so that state is
 // unreachable and `--method dual` must solve this by itself.
 void test_dual_phase1_recovers_dual_infeasible_start() {
+    SOR_FN();
     const std::string mps = R"(NAME          DP1
 ROWS
  N  COST
@@ -952,6 +1012,7 @@ ENDATA
 // This model mixes a free column, a one-sided column and an equality row so
 // that leaving variables with an infinite bound on one side actually occur.
 void test_dual_leaving_variable_never_parks_on_an_infinite_bound() {
+    SOR_FN();
     const std::string mps = R"(NAME          DPINF
 ROWS
  N  COST
@@ -991,6 +1052,7 @@ ENDATA
 // maximize must produce the same point as the equivalent minimize, with the
 // objective reported in the original sense.
 void test_maximize() {
+    SOR_FN();
     const std::string mps = R"(NAME          MAXP
 ROWS
  N  COST
@@ -1033,6 +1095,7 @@ ENDATA
 // check for the rebuild, while the proof checks that the final answer remains
 // independently certifiable.
 void test_primal_phase1_pivot_rebuilds_phase2_reduced_costs() {
+    SOR_FN();
     const std::string mps = R"(NAME          P1P2RC
 ROWS
  N  COST
@@ -1066,6 +1129,7 @@ ENDATA
 // A time limit of zero-ish must interrupt rather than run to completion, and the
 // interrupted result must never carry an Optimal claim.
 void test_time_limit_is_honoured() {
+    SOR_FN();
     SimplexOptions opts;
     opts.method = sor::engines::SimplexMethod::Primal;
     opts.max_iterations = 1;          // force a limit hit on a non-trivial LP
@@ -1080,6 +1144,7 @@ void test_time_limit_is_honoured() {
 // A degenerate LP with many ties. The requirement is termination with a correct
 // objective (Harris tie-break plus EXPAND on zero-length steps).
 void test_degenerate() {
+    SOR_FN();
     //  min -x1 - x2 - x3
     //  s.t. three identical rows  x1 + x2 + x3 <= 1
     //       0 <= xi <= 1
@@ -1114,6 +1179,7 @@ ENDATA
 // Badly scaled coefficients: Ruiz equilibration plus threshold pivoting have to
 // keep this accurate enough that the claim gate still accepts it.
 void test_ill_conditioned() {
+    SOR_FN();
     //  min  -x1 - x2
     //  s.t. 1e6*x1 +   1e-6*x2 <= 1e6
     //          x1  +      x2   <= 1.5
@@ -1141,6 +1207,7 @@ ENDATA
 // No rows at all: the LP is a box, and the answer is each variable at its
 // cheapest bound. Exercises the m == 0 path through the factorization.
 void test_no_rows() {
+    SOR_FN();
     const std::string mps = R"(NAME          BOXONLY
 ROWS
  N  COST
@@ -1165,6 +1232,7 @@ ENDATA
 // for the original variable bounds (x=1 is interior to x>=0 here), so the
 // solver must retry without presolve before claiming a proof.
 void test_presolve_certificate_fallback() {
+    SOR_FN();
     const std::string mps = R"(NAME          PRECERT
 ROWS
  N  COST
@@ -1184,6 +1252,7 @@ ENDATA
 }
 
 void test_presolve_singleton_column_elimination_lifts_proof_and_basis() {
+    SOR_FN();
     // x occurs only in an equality and is free, so its bounds cannot induce a
     // hidden constraint when x is substituted out:
     //   x + 2y = 5, 0 <= y <= 2, min 3x+y
@@ -1248,6 +1317,7 @@ ENDATA
 }
 
 void test_presolve_chained_singleton_columns_recover_duals_and_basis() {
+    SOR_FN();
     // Both free columns are equality singletons, but they share bounded y:
     //   x + y = 3
     //       y + z = 2
@@ -1308,12 +1378,13 @@ void test_presolve_chained_singleton_columns_recover_duals_and_basis() {
 }
 
 void test_presolve_retry_counter_survives_rejected_retry() {
+    SOR_FN();
     // At ordinary tolerances this chained singleton model is proved directly.
     // With a deliberately sub-ulp gap tolerance, reverse substitution leaves
     // a deterministic ~4e-17 relative gap, so the safety retry is attempted.
     // Solving the original model has a larger ~2e-16 gap and is not selected;
-    // the returned zero-iteration diagnostics therefore belong to the retained
-    // presolved candidate. The retry counter must nevertheless record the work.
+    // the presolved candidate remains the result. Diagnostics must nevertheless
+    // include the retry's pivots, stages, and elapsed work.
     constexpr f64 a = 3.1;
     sor::model::LpProblem lp;
     lp.name = "REJECTED_PRESOLVE_RETRY";
@@ -1329,8 +1400,6 @@ void test_presolve_retry_counter_survives_rejected_retry() {
     opts.gap_tol = 1e-18;
     const auto retained = solve_problem(lp, opts);
     CHECK(retained.diag.presolve_retries == 1);
-    CHECK(retained.diag.iterations == 0);
-    CHECK(retained.diag.stages == 1);
     CHECK(retained.diag.gap_rel > opts.gap_tol);
     CHECK(retained.r.status == Status::Feasible);
     CHECK(retained.r.proof == ProofLevel::FeasibleWithGap);
@@ -1339,11 +1408,15 @@ void test_presolve_retry_counter_survives_rejected_retry() {
     original_opts.presolve = false;
     const auto rejected = solve_problem(lp, original_opts);
     CHECK(rejected.diag.iterations > 0);
+    CHECK(retained.diag.iterations >= rejected.diag.iterations);
+    CHECK(retained.diag.stages >= 2);
+    CHECK(retained.diag.total_ms >= rejected.diag.total_ms);
     CHECK(rejected.diag.gap_rel > opts.gap_tol);
     CHECK(rejected.diag.gap_rel > retained.diag.gap_rel);
 }
 
 void test_presolve_forcing_rows_lift_primal_dual_and_proof() {
+    SOR_FN();
     // Maximum-activity forcing: x-y >= 3 with x in [0,2], y in [-1,4]
     // has only x=2,y=-1. For min 2x+y, the recovered lower-row multiplier
     // is +2; the upper x has zero reduced cost and lower y has positive
@@ -1416,6 +1489,7 @@ void test_presolve_forcing_rows_lift_primal_dual_and_proof() {
 }
 
 void test_presolve_cross_kind_recovery_and_lifted_basis_statuses() {
+    SOR_FN();
     // R0 forces upper-bound x=2,y=3. R1 then becomes empty, R2 fixes the
     // interior z=4 through a singleton equality, and R3 tightens w<=3 before
     // negative cost fixes it at that implied upper bound. Reverse dual recovery
@@ -1469,6 +1543,7 @@ void test_presolve_cross_kind_recovery_and_lifted_basis_statuses() {
 }
 
 void test_presolve_equality_aggregation_chain_lifts_proof_and_basis() {
+    SOR_FN();
     // Substitution chain:
     //   x + y = 3, x + z = 4  ->  z-y=1,
     // followed by z elimination.  The reduced problem is
@@ -1549,6 +1624,7 @@ void test_presolve_equality_aggregation_chain_lifts_proof_and_basis() {
 }
 
 void test_singletons_before_aggregation_replay_stored_duals() {
+    SOR_FN();
     // The first two equality rows eliminate singleton columns a and b.  Both
     // rows also contain s, so their substitutions change s's working cost
     // from 7 to 7-2-2*3=-1.  The later aggregation eliminates bounded but
@@ -1623,6 +1699,7 @@ void test_singletons_before_aggregation_replay_stored_duals() {
 }
 
 void test_singleton_then_equality_fix_replays_stage_state() {
+    SOR_FN();
     // Eliminating singleton a from a-2x=0 changes x's working cost from 1 to
     // 7.  Only then does the singleton equality x=3 fix x at an interior point
     // of its original [0,10] bounds.  Row 2 is still live at that instant and
@@ -1683,6 +1760,7 @@ void test_singleton_then_equality_fix_replays_stage_state() {
 }
 
 void test_singleton_then_negative_bound_tightening_replays_stage_state() {
+    SOR_FN();
     // The same first elimination changes x's working cost to 7, but now the
     // negative singleton inequality -x<=-3 tightens x's lower bound from 0 to
     // 3.  The optimum x=3 is interior to its ORIGINAL bounds, so the restored
@@ -1747,6 +1825,7 @@ void test_singleton_then_negative_bound_tightening_replays_stage_state() {
 }
 
 void test_primal_crash_builds_a_feasible_triangular_basis() {
+    SOR_FN();
     // Standalone CLI policy is applied by the app; internal callers (notably
     // MILP node LPs) retain the conservative library default.
     CHECK(!SimplexOptions{}.primal_crash);
@@ -1785,6 +1864,7 @@ void test_primal_crash_builds_a_feasible_triangular_basis() {
 }
 
 void test_primal_crash_rejects_a_net_harmful_pivot() {
+    SOR_FN();
     // Making row 0 feasible through x would create 1000 units of violation in
     // row 1. The ordinary simplex can later use free y to repair it, but the
     // crash must not call a 10 -> 1000 move progress.
@@ -1813,6 +1893,7 @@ void test_primal_crash_rejects_a_net_harmful_pivot() {
 }
 
 void test_primal_crash_rejects_columns_that_destroy_triangularity() {
+    SOR_FN();
     // Row 0 is deliberately the larger violation, so x is installed there.
     // The remaining candidate y could repair row 1, but it has a nonzero in
     // the claimed row and would turn the structural block into an unverified
@@ -1844,6 +1925,7 @@ void test_primal_crash_rejects_columns_that_destroy_triangularity() {
 }
 
 void test_primal_crash_rejects_an_unstable_or_out_of_bounds_pivot() {
+    SOR_FN();
     // With scaling disabled, x's 1e-6 pivot is tiny relative to the row's
     // fixed unit coefficient. It would also need x=1e6. The crash rejects the
     // unstable diagonal; the proof-preserving ordinary iteration remains free
@@ -1884,6 +1966,7 @@ void test_primal_crash_rejects_an_unstable_or_out_of_bounds_pivot() {
 }
 
 void test_simplex_consumes_terminal_presolve_outcome() {
+    SOR_FN();
     sor::model::LpProblem lp;
     lp.name = "PRESOLVE_EMPTY_UNBOUNDED";
     lp.A = sor::sparse::from_triplets(1, 1, {}, {}, {});
@@ -1909,6 +1992,7 @@ void test_simplex_consumes_terminal_presolve_outcome() {
 }  // namespace
 
 int main() {
+    SOR_FN();
     test_fixture_lp();
     test_auto_commits_to_one_engine_without_a_discarded_probe();
     test_route_features_describe_the_model();
@@ -1923,6 +2007,7 @@ int main() {
     test_basis_wellformed();
     test_features_mps_agrees_with_model();
     test_infeasible();
+    test_primal_phase1_exports_checked_farkas_certificate();
     test_infeasible_farkas_certificate();
     test_dual_cost_perturbation_cleans_before_farkas_proof();
     test_feasible_lp_has_no_ray();

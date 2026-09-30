@@ -49,6 +49,7 @@
 // spmv kernel for both forms beats a branch in every kernel.  q*x computed
 // by that CSR is the same single product the CPU forms, so nothing moves.
 #include "sor/backend/pdhcg_device.hpp"
+#include "sor/sparse/csr.hpp"
 #include "vk_compute.hpp"
 
 #include <cmath>
@@ -80,6 +81,7 @@ public:
         k_prox_ = vk_.make_kernel("pdhcg_diag_prox", 7, 16);
         k_grad_ = vk_.make_kernel("pdhcg_grad", 9, 16);
         k_trial_ = vk_.make_kernel("pdhcg_trial", 5, 16);
+        k_init_ = vk_.make_kernel("pdhcg_init", 5, 16);
         k_bb_ = vk_.make_kernel("pdhcg_bb", 9, 16);
         k_adv_x_ = vk_.make_kernel("pdhcg_advance_x", 6, 24);
         k_adv_y_ = vk_.make_kernel("pdhcg_advance_y", 6, 32);
@@ -89,7 +91,7 @@ public:
     ~VulkanPdhcgDevice() override {
         vk_.flush();
         destroy_problem_bufs();
-        for (Kernel* k : {&k_csr_, &k_csc_, &k_prox_, &k_grad_, &k_trial_, &k_bb_,
+        for (Kernel* k : {&k_csr_, &k_csc_, &k_prox_, &k_grad_, &k_trial_, &k_bb_, &k_init_,
                           &k_adv_x_, &k_adv_y_, &k_ev_c_, &k_ev_r_})
             vk_.kill_kernel(*k);
     }
@@ -139,6 +141,9 @@ public:
         clo_host_ = d.col_lo;
         chi_host_ = d.col_hi;
 
+        // Host copies for CPU-side KKT computation
+        d_host_ = d;  // Keep the full PdhcgData for KKT
+
         for (Buf* b : {&x_, &x0_, &xprev_, &xc_, &xin_, &trial_, &grad_, &aty_, &qx_,
                        &xbar_, &s1_, &s2_, &s3_, &s4_, &s5_, &s6_, &x_avg_, &x_mark_})
             *b = vk_.dev_zero(n_);
@@ -151,12 +156,8 @@ public:
 
     void init() override {
         require_up();
-        std::vector<f64> x(n_);
-        for (std::size_t j = 0; j < n_; ++j)
-            x[j] = std::max(clo_host_[j], std::min(0.0, chi_host_[j]));
-        vk_.upload(x_, x);
-        vk_.copy(x_, x0_);
-        vk_.copy(x_, xprev_);
+        struct { uint32_t n, pad[3]; } pn{u32(n_), {0, 0, 0}};
+        vk_.rec(k_init_, {&clo_, &chi_, &x_, &x0_, &xprev_}, &pn, sizeof(pn), n_);
         for (Buf* b : {&y_, &y0_, &yprev_}) vk_.fill_zero(*b);
         average_reset();
         vk_.flush();
@@ -312,6 +313,99 @@ public:
         e.py = s[8];
         e.support_finite = s[7] == 0.0 && s[9] == 0.0 && std::isfinite(s[6]) &&
                            std::isfinite(s[8]);
+
+        // --- CPU-side LP KKT metrics (mirrors cpu_pdhcg_device exactly) ---
+        std::vector<f64> xv(n_), yv(m_);
+        vk_.download(xe, xv);
+        vk_.download(ye, yv);
+        std::vector<f64> x0h(n_), y0h(m_);
+        vk_.download(x0_, x0h);
+        vk_.download(y0_, y0h);
+
+        // A*x and A'*y on the host
+        std::vector<f64> ax(m_, 0.0), atyv(n_, 0.0);
+        {
+            const auto& rp = d_host_.A_csr.pattern.row_ptr();
+            const auto& ci = d_host_.A_csr.pattern.col_idx();
+            const auto& av = d_host_.A_csr.vals;
+            for (std::size_t i = 0; i < m_; ++i) {
+                f64 sum = 0.0;
+                for (auto k = rp[i]; k < rp[i + 1]; ++k)
+                    sum += av[static_cast<std::size_t>(k)] * xv[static_cast<std::size_t>(ci[k])];
+                ax[i] = sum;
+            }
+            for (std::size_t i = 0; i < m_; ++i)
+                for (auto k = rp[i]; k < rp[i + 1]; ++k)
+                    atyv[static_cast<std::size_t>(ci[k])] +=
+                        av[static_cast<std::size_t>(k)] * yv[i];
+        }
+
+        f64 pres = 0.0, dres = 0.0;
+        f64 pobj = 0.0, dobj = 0.0;
+        f64 edx2 = 0.0, edy2 = 0.0;
+        bool nonfin = false;
+        const bool has_col_scale = !d_host_.col_scale.empty();
+        const bool has_row_scale = !d_host_.row_scale.empty();
+        constexpr f64 kInf = std::numeric_limits<f64>::infinity();
+
+        for (std::size_t j = 0; j < n_; ++j) {
+            const f64 cs = has_col_scale ? d_host_.col_scale[j] : 1.0;
+            const f64 xj = xv[j];
+            const f64 l = d_host_.col_lo[j], h = d_host_.col_hi[j];
+            if (xj < l) pres = std::max(pres, (l - xj) * cs);
+            if (xj > h) pres = std::max(pres, (xj - h) * cs);
+            const f64 r_scaled = d_host_.c[j] + atyv[j];
+            const f64 ru = r_scaled / cs;
+            const f64 xu = xj * cs;
+            const f64 at_tol = 1e-9 * (1.0 + std::fabs(xu)) / cs;
+            const bool at_lo = l != -kInf && xj <= l + at_tol;
+            const bool at_hi = h != kInf && xj >= h - at_tol;
+            if (at_lo && !at_hi)       dres = std::max(dres, std::max(0.0, -ru));
+            else if (at_hi && !at_lo)  dres = std::max(dres, std::max(0.0, ru));
+            else if (!at_lo && !at_hi) dres = std::max(dres, std::fabs(ru));
+            pobj += d_host_.c[j] * xj;
+            const f64 bound = r_scaled >= 0.0 ? l : h;
+            if (std::isinf(bound)) {
+                if (std::fabs(ru) > 1e-9 * (1.0 + std::fabs(d_host_.c[j] / cs))) nonfin = true;
+            } else {
+                dobj += r_scaled * bound;
+            }
+            const f64 d = xj - x0h[j];
+            edx2 += d * d;
+        }
+
+        for (std::size_t i = 0; i < m_; ++i) {
+            const f64 a = ax[i];
+            const f64 rs = has_row_scale ? d_host_.row_scale[i] : 1.0;
+            const f64 l = d_host_.row_lo[i], h = d_host_.row_hi[i];
+            if (a < l) pres = std::max(pres, (l - a) / rs);
+            if (a > h) pres = std::max(pres, (a - h) / rs);
+            const f64 yi = yv[i];
+            const f64 au = a / rs;
+            const f64 mu = -yi * rs;
+            const f64 at_tol = 1e-9 * (1.0 + std::fabs(au));
+            const bool at_lo = l != -kInf && au <= l / rs + at_tol;
+            const bool at_hi = h != kInf && au >= h / rs - at_tol;
+            if (at_lo && !at_hi)       dres = std::max(dres, std::max(0.0, -mu));
+            else if (at_hi && !at_lo)  dres = std::max(dres, std::max(0.0, mu));
+            else if (!at_lo && !at_hi) dres = std::max(dres, std::fabs(mu));
+            const f64 bound = yi >= 0.0 ? h : l;
+            if (std::isinf(bound)) {
+                if (std::fabs(yi * rs) > 1e-9) nonfin = true;
+            } else {
+                dobj += -yi * bound;
+            }
+            const f64 d = yi - y0h[i];
+            edy2 += d * d;
+        }
+
+        e.kkt_primal_res = pres;
+        e.kkt_dual_res = dres;
+        e.kkt_primal_obj = pobj;
+        e.kkt_dual_obj = nonfin ? core::kNaN : dobj;
+        e.kkt_epoch_dx_norm = std::sqrt(edx2);
+        e.kkt_epoch_dy_norm = std::sqrt(edy2);
+
         return e;
     }
 
@@ -350,8 +444,8 @@ private:
     void destroy_problem_bufs() {
         for (Buf* b : {&a_rp_, &a_ci_, &a_v_, &at_cp_, &at_ri_, &at_v_, &q_rp_, &q_ci_,
                        &q_v_, &qd_, &c_, &clo_, &chi_, &rlo_, &rhi_,
-                       &x_, &x0_, &xprev_, &xc_, &xin_, &trial_, &grad_, &aty_, &qx_,
-                       &xbar_, &s1_, &s2_, &s3_, &s4_, &s5_, &s6_, &x_avg_, &x_mark_,
+                       &x_, &x0_, &xprev_, &xc_, &xin_, &trial_, &grad_, &aty_,
+                       &qx_, &xbar_, &x_avg_, &x_mark_, &s1_, &s2_, &s3_, &s4_, &s5_, &s6_,
                        &y_, &y0_, &yprev_, &axbar_, &r1_, &r2_, &r3_, &r4_, &y_avg_, &y_mark_})
             vk_.destroy_buf(*b);
         uploaded_ = false;
@@ -361,8 +455,10 @@ private:
     bool uploaded_ = false, diagonal_ = false;
     std::size_t n_ = 0, m_ = 0, avg_n_ = 1;
     std::vector<f64> clo_host_, chi_host_;
+    PdhcgData d_host_;  // Host copy of problem data for CPU-side KKT
 
     Kernel k_csr_, k_csc_, k_prox_, k_grad_, k_trial_, k_bb_, k_adv_x_, k_adv_y_,
+           k_init_,
         k_ev_c_, k_ev_r_;
 
     Buf a_rp_, a_ci_, a_v_, at_cp_, at_ri_, at_v_, q_rp_, q_ci_, q_v_, qd_;
@@ -370,6 +466,7 @@ private:
     Buf x_, x0_, xprev_, xc_, xin_, trial_, grad_, aty_, qx_, xbar_, x_avg_, x_mark_;
     Buf s1_, s2_, s3_, s4_, s5_, s6_;
     Buf y_, y0_, yprev_, axbar_, r1_, r2_, r3_, r4_, y_avg_, y_mark_;
+
 };
 
 }  // namespace

@@ -1,6 +1,7 @@
 #include "sor/io/solution.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <istream>
 #include <ostream>
 #include <sstream>
@@ -29,11 +30,14 @@ f64 read_f64_token(const std::string& tok) {
     if (tok == "nan" || tok == "-nan") return core::kNaN;
     if (tok == "inf" || tok == "+inf") return core::kPosInf;
     if (tok == "-inf") return -core::kPosInf;
-    try {
-        return std::stod(tok);
-    } catch (const std::exception&) {
+    // std::stod throws out_of_range for ERANGE, including a representable
+    // subnormal. Such values are emitted by the solver and must reach the
+    // checker unchanged; reject malformed and overflowing tokens instead.
+    char* end = nullptr;
+    const f64 value = std::strtod(tok.c_str(), &end);
+    if (end == tok.c_str() || *end != '\0' || !std::isfinite(value))
         throw std::runtime_error("solution file: not a number '" + tok + "'");
-    }
+    return value;
 }
 
 Status status_from_string(const std::string& s) {

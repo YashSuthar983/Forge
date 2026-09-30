@@ -183,11 +183,34 @@ void test_random_zh_valid_by_enumeration() {
     CHECK(total_cuts > 0);
 }
 
+void test_small_nonzero_integer_term_is_not_dropped() {
+    LpProblem lp;
+    lp.name = "zh_small_term";
+    lp.A = from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 5e-10});
+    lp.c = {1.0, 0.0};
+    lp.row_lo = {1.0};
+    lp.row_hi = {1.0};
+    lp.col_lo = {0.0, 0.0};
+    lp.col_hi = {1.0, 2e9};
+    lp.is_integer = {true, true};
+    const std::vector<f64> candidate = {0.0, 0.0};
+    const std::vector<f64> feasible_optimum = {0.0, 2e9};
+    CHECK(row_feasible(lp, feasible_optimum));
+    ZeroHalfOptions o;
+    ZeroHalfDiagnostics d;
+    const auto cuts = separate_zerohalf(
+        lp, candidate, lp.col_lo, lp.col_hi, o, d);
+    CHECK(cuts.empty());
+    for (const auto& c : cuts)
+        CHECK(cut_lhs(c, feasible_optimum) <= c.row_hi + 1e-9);
+}
+
 }  // namespace
 
 int main() {
     test_textbook_odd_knapsack();
     test_mod2_gaussian_nonvacuous();
     test_random_zh_valid_by_enumeration();
+    test_small_nonzero_integer_term_is_not_dropped();
     return sor::test::finish("test_zerohalf");
 }

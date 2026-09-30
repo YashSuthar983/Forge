@@ -207,6 +207,7 @@ void test_gcs_fit_save_load_policy() {
 void test_latest_tree_sep_can_fire() {
     auto lp = read_text(kFrac);
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.tree_cut.enabled = true;
     opts.tree_cut.always_depth = 32;
@@ -222,6 +223,7 @@ void test_latest_tree_sep_can_fire() {
     opts.lp_rounding_repair = false;
     opts.integer_dive = false;
     opts.integer_neighborhood = false;
+    opts.objective_face = false;  // component test: keep the tree
     opts.mip_presolve = false;
     opts.symmetry = false;
     opts.balans.enabled = false;
@@ -240,6 +242,7 @@ void test_latest_tree_sep_can_fire() {
 void test_classical_root_only() {
     auto lp = read_text(kFrac);
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Classical;
     opts.tree_cut.enabled = true;  // ignored / forced off
     opts.tree_cut.always_depth = 32;
@@ -251,6 +254,7 @@ void test_classical_root_only() {
     opts.lp_rounding_repair = false;
     opts.integer_dive = false;
     opts.integer_neighborhood = false;
+    opts.objective_face = false;  // component test: keep the tree
     opts.mip_presolve = false;
     opts.symmetry = false;
     opts.balans.enabled = false;

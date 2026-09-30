@@ -22,7 +22,10 @@ inline bool is_binary_col(const model::LpProblem& lp, Index j,
 }
 
 inline bool nearly_integer(f64 v, f64 tol) {
-    return std::fabs(v - std::round(v)) <= tol;
+    // Beyond 2^53 binary64 cannot distinguish adjacent integers (or parity),
+    // and llround may overflow. Decline a parity derivation there.
+    return std::isfinite(v) && std::fabs(v) <= 9007199254740992.0 &&
+           std::fabs(v - std::round(v)) <= tol;
 }
 
 // Odd integer coefficient? Even coeffs vanish mod 2.
@@ -117,7 +120,10 @@ Gf2PresolveDiagnostics apply_gf2_presolve(const model::LpProblem& lp,
                 break;
             }
             Eq e;
-            if (!collect_equation(lp, i, col_lo, col_hi, opts.tol, e))
+            // Modular arithmetic is valid only for exact integer data and
+            // exact equalities. A coefficient below feasibility tolerance
+            // can still have unit activity on a wide integer domain.
+            if (!collect_equation(lp, i, col_lo, col_hi, 0.0, e))
                 continue;
             if (e.cols.empty()) {
                 if (e.rhs != 0) {

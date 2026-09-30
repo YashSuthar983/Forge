@@ -69,6 +69,22 @@ bool contains(const std::string& haystack, const std::string& needle) {
 }
 
 std::string solve_exe, check_exe, model, solution_file, crash_model;
+std::string checker_milp_model, checker_unbounded_model;
+
+void write_solution_claim(const fs::path& path, const char* status,
+                          const char* proof, double objective,
+                          const std::string& x,
+                          const std::string& primal_ray = "0") {
+    std::ofstream out(path);
+    out << "status " << status << "\n"
+        << "proof " << proof << "\n"
+        << "objective " << objective << "\n"
+        << "x " << x << "\n"
+        << "y 0\n"
+        << "ray 0\n"
+        << "primal_ray " << primal_ray << "\n"
+        << "dual_farkas_ray 0\n";
+}
 
 // A rejected value must exit nonzero AND say which option and which value.
 void reject(const char* option, const std::string& value) {
@@ -177,6 +193,148 @@ void test_valid_values_still_run() {
     accept("--dual-cost-perturbation", "1e-7");
 }
 
+void test_unsafe_batch_obbt_is_rejected() {
+    const Run r = run({solve_exe, model, "--batch-lp-obbt"});
+    CHECK(r.exit_code != 0);
+    CHECK(contains(r.output, "--batch-lp-obbt"));
+    CHECK(contains(r.output, "cannot certify bound tightening"));
+}
+
+void test_route_trace_requires_instrumented_build() {
+#ifndef SOR_ROUTE_DEBUG
+    const Run r = run({solve_exe, model, "--debug-routes=1"});
+    CHECK(r.exit_code != 0);
+    CHECK(contains(r.output, "-DSOR_ROUTE_FN=ON"));
+#else
+    const Run r = run({solve_exe, model, "--debug-routes=1"});
+    CHECK(r.exit_code == 0);
+#endif
+}
+
+void test_mip_gap_is_explicit_and_validated() {
+    for (const char* invalid : {"nan", "abc", "-1", "1.01"}) {
+        const Run r = run({solve_exe, model, "--mip-gap", invalid});
+        CHECK(r.exit_code != 0);
+        CHECK(contains(r.output, "--mip-gap"));
+    }
+    const Run r = run({solve_exe, checker_milp_model, "--engine", "milp",
+                       "--mip-gap", "0", "--bab-threads", "1",
+                       "--time-limit", "5"});
+    CHECK(r.exit_code == 0);
+    CHECK(contains(r.output, "mip gap tolerance: 0"));
+}
+
+void test_sor_check_recomputes_qp_objective_without_claiming_proof() {
+    const fs::path qp_model = fs::temp_directory_path() / "sor_check_qp.qps";
+    const fs::path qp_claim = fs::temp_directory_path() / "sor_check_qp.sol";
+    {
+        std::ofstream out(qp_model);
+        out << "NAME CHECKQP\n"
+               "ROWS\n"
+               " N OBJ\n"
+               "COLUMNS\n"
+               " X OBJ -4\n"
+               "RHS\n"
+               "BOUNDS\n"
+               " LO BND X 0\n"
+               " UP BND X 5\n"
+               "QUADOBJ\n"
+               " X X 2\n"
+               "ENDATA\n";
+    }
+    write_solution_claim(qp_claim, "Optimal", "ProvedKKT", -4.0, "1 2");
+    const Run valid = run({check_exe, qp_model.string(), qp_claim.string()});
+    CHECK(valid.exit_code == 0);
+    CHECK(contains(valid.output, "validation: qp_kkt_f64"));
+    CHECK(contains(valid.output, "VERIFIED"));
+
+    write_solution_claim(qp_claim, "Optimal", "ProvedKKT", -3.0, "1 2");
+    const Run wrong = run({check_exe, qp_model.string(), qp_claim.string()});
+    CHECK(wrong.exit_code != 0);
+    CHECK(contains(wrong.output, "objective (recomputed)"));
+
+    // The same feasible point with a wrong multiplier/stationarity must not
+    // pass the independent optimality check.
+    write_solution_claim(qp_claim, "Optimal", "ProvedKKT", 0.0, "1 0");
+    const Run wrong_kkt = run({check_exe, qp_model.string(), qp_claim.string()});
+    CHECK(wrong_kkt.exit_code != 0);
+    CHECK(contains(wrong_kkt.output, "quadratic KKT"));
+
+    // Exercise the full symmetric sparse Hessian representation too.
+    {
+        std::ofstream out(qp_model);
+        out << "NAME CHECKQP2\n"
+               "ROWS\n"
+               " N OBJ\n"
+               "COLUMNS\n"
+               " X OBJ 0\n"
+               " Y OBJ 0\n"
+               "RHS\n"
+               "BOUNDS\n"
+               " LO BND X 0\n"
+               " UP BND X 5\n"
+               " LO BND Y 0\n"
+               " UP BND Y 5\n"
+               "QUADOBJ\n"
+               " X X 2\n"
+               " Y X 1\n"
+               " Y Y 2\n"
+               "ENDATA\n";
+    }
+    write_solution_claim(qp_claim, "Optimal", "ProvedKKT", 3.0, "2 1 1");
+    const Run sparse = run({check_exe, qp_model.string(), qp_claim.string()});
+    CHECK(sparse.exit_code == 0);
+    CHECK(contains(sparse.output, "validation: qp_primal_point"));
+
+    // A direction improving the linear term is not a QP recession ray when
+    // its quadratic curvature is positive.
+    {
+        std::ofstream out(qp_model);
+        out << "NAME CHECKQPRAY\n"
+               "ROWS\n"
+               " N OBJ\n"
+               "COLUMNS\n"
+               " X OBJ -4\n"
+               "RHS\n"
+               "BOUNDS\n"
+               " LO BND X 0\n"
+               "QUADOBJ\n"
+               " X X 2\n"
+               "ENDATA\n";
+    }
+    write_solution_claim(qp_claim, "Unbounded", "None", 0.0, "1 0", "1 1");
+    const Run false_ray = run({check_exe, qp_model.string(), qp_claim.string()});
+    CHECK(false_ray.exit_code != 0);
+    CHECK(contains(false_ray.output, "validation: qp_unbounded_unverified"));
+
+    // A stationary point of a convex objective is not a certificate for
+    // maximizing it. x=0 is stationary but x=5 is strictly better here.
+    {
+        std::ofstream out(qp_model);
+        out << "NAME CHECKQPMAX\n"
+               "OBJSENSE\n"
+               " MAX\n"
+               "ROWS\n"
+               " N OBJ\n"
+               "COLUMNS\n"
+               " X OBJ 0\n"
+               "RHS\n"
+               "BOUNDS\n"
+               " LO BND X 0\n"
+               " UP BND X 5\n"
+               "QUADOBJ\n"
+               " X X 2\n"
+               "ENDATA\n";
+    }
+    write_solution_claim(qp_claim, "Optimal", "ProvedKKT", 0.0, "1 0");
+    const Run nonconvex_max = run({check_exe, qp_model.string(), qp_claim.string()});
+    CHECK(nonconvex_max.exit_code != 0);
+    CHECK(contains(nonconvex_max.output, "quadratic KKT"));
+    std::error_code ec;
+    fs::remove(qp_model, ec);
+    fs::remove(qp_claim, ec);
+}
+
 // A flag at the very end of the command line has no value to consume. This
 // must be a usage error, not a read past the end of argv.
 void test_missing_values_at_end_of_argv() {
@@ -186,7 +344,7 @@ void test_missing_values_at_end_of_argv() {
                                "--dual-cost-perturbation", "--engine", "--method",
                                "--pricing", "--basis-update", "--backend",
                                "--solution-out",
-                               "--small-matrix-value", "--q-diag",
+                               "--small-matrix-value", "--q-diag", "--mip-gap",
                                "--auto-budget-split"}) {
         const Run r = run({solve_exe, model, option});
         ::sor::test::report(r.exit_code != 0, "missing value exits nonzero",
@@ -357,6 +515,68 @@ void test_sor_check_tolerance_validation() {
                         __FILE__, __LINE__, ok.output);
 }
 
+// For an integer model sor_check validates only the incumbent: original-model
+// rows, bounds, integrality and recomputed objective.  In particular, it must
+// neither demand an LP dual vector nor imply that the MILP search bound/tree
+// was independently proved.
+void test_sor_check_milp_incumbent_scope() {
+    const fs::path valid = fs::temp_directory_path() / "sor_check_milp_valid.sol";
+    const fs::path fractional =
+        fs::temp_directory_path() / "sor_check_milp_fractional.sol";
+    write_solution_claim(valid, "Optimal", "ProvedGlobalEpsilon", 1.0,
+                         "1 1");
+    write_solution_claim(fractional, "Optimal", "ProvedGlobalEpsilon", 1.5,
+                         "1 1.5");
+
+    const Run accepted = run({check_exe, checker_milp_model, valid.string(),
+                              "--tol", "1e-7"});
+    CHECK(accepted.exit_code == 0);
+    CHECK(contains(accepted.output, "validation: milp_incumbent"));
+    CHECK(contains(accepted.output, "VERIFIED"));
+    CHECK(!contains(accepted.output, "dual/reduced costs"));
+
+    const Run rejected = run({check_exe, checker_milp_model,
+                              fractional.string(), "--tol", "1e-7"});
+    CHECK(rejected.exit_code != 0);
+    CHECK(contains(rejected.output, "integrality"));
+    CHECK(contains(rejected.output, "REJECTED"));
+
+    std::error_code ec;
+    fs::remove(valid, ec);
+    fs::remove(fractional, ec);
+}
+
+// A recession direction proves only that objective can improve along a ray.
+// An Unbounded claim also needs a feasible point, otherwise an infeasible LP
+// could be mislabeled unbounded.
+void test_sor_check_unbounded_requires_feasible_point() {
+    const fs::path valid =
+        fs::temp_directory_path() / "sor_check_unbounded_valid.sol";
+    const fs::path missing_point =
+        fs::temp_directory_path() / "sor_check_unbounded_no_point.sol";
+    write_solution_claim(valid, "Unbounded", "BoundOnly", 0.0, "1 0",
+                         "1 1");
+    write_solution_claim(missing_point, "Unbounded", "BoundOnly", 0.0, "0",
+                         "1 1");
+
+    const Run accepted = run({check_exe, checker_unbounded_model,
+                              valid.string(), "--tol", "1e-7"});
+    CHECK(accepted.exit_code == 0);
+    CHECK(contains(accepted.output,
+                   "validation: lp_unbounded_point_and_ray_f64"));
+    CHECK(contains(accepted.output, "VERIFIED"));
+
+    const Run rejected = run({check_exe, checker_unbounded_model,
+                              missing_point.string(), "--tol", "1e-7"});
+    CHECK(rejected.exit_code != 0);
+    CHECK(contains(rejected.output, "no full primal feasible point"));
+    CHECK(contains(rejected.output, "REJECTED"));
+
+    std::error_code ec;
+    fs::remove(valid, ec);
+    fs::remove(missing_point, ec);
+}
+
 }  // namespace
 
 
@@ -496,6 +716,10 @@ int main() {
     solution_file = (fs::temp_directory_path() / "sor_cli_validation.sol").string();
     crash_model =
         (fs::temp_directory_path() / "sor_cli_primal_crash.mps").string();
+    checker_milp_model =
+        (fs::temp_directory_path() / "sor_check_milp.mps").string();
+    checker_unbounded_model =
+        (fs::temp_directory_path() / "sor_check_unbounded.mps").string();
     {
         std::ofstream out(crash_model);
         out << "NAME          CRASHCLI\n"
@@ -506,6 +730,34 @@ int main() {
                "    X1        COST      0.0        R1        1.0\n"
                "RHS\n"
                "    RHS       R1        1.0\n"
+               "ENDATA\n";
+    }
+    {
+        std::ofstream out(checker_milp_model);
+        out << "NAME          CHECKMILP\n"
+               "ROWS\n"
+               " N  COST\n"
+               " L  CAP\n"
+               "COLUMNS\n"
+               "    MARK0000  'MARKER'                 'INTORG'\n"
+               "    X         COST       1          CAP        1\n"
+               "    MARK0001  'MARKER'                 'INTEND'\n"
+               "RHS\n"
+               "    RHS       CAP        2\n"
+               "BOUNDS\n"
+               " UP BND       X          2\n"
+               "ENDATA\n";
+    }
+    {
+        std::ofstream out(checker_unbounded_model);
+        out << "NAME          CHECKUNB\n"
+               "ROWS\n"
+               " N  COST\n"
+               "COLUMNS\n"
+               "    X         COST      -1\n"
+               "RHS\n"
+               "BOUNDS\n"
+               " LO BND       X          0\n"
                "ENDATA\n";
     }
     const Run seed = run({solve_exe, model, "--no-presolve", "--solution-out",
@@ -519,6 +771,10 @@ int main() {
     test_integer_flags_reject_malformed_values();
     test_max_iter_rejects_zero_but_intervals_accept_it();
     test_valid_values_still_run();
+    test_unsafe_batch_obbt_is_rejected();
+    test_route_trace_requires_instrumented_build();
+    test_mip_gap_is_explicit_and_validated();
+    test_sor_check_recomputes_qp_objective_without_claiming_proof();
     test_missing_values_at_end_of_argv();
     test_enum_flags_reject_unknown_names();
     test_q_diag_rejects_malformed_entries();
@@ -529,9 +785,13 @@ int main() {
     test_unavailable_backends_are_not_silently_replaced();
     test_auto_budget_split_is_a_closed_protocol_set();
     test_sor_check_tolerance_validation();
+    test_sor_check_milp_incumbent_scope();
+    test_sor_check_unbounded_requires_feasible_point();
 
     std::error_code ec;
     fs::remove(solution_file, ec);
     fs::remove(crash_model, ec);
+    fs::remove(checker_milp_model, ec);
+    fs::remove(checker_unbounded_model, ec);
     return sor::test::finish("test_cli_validation");
 }

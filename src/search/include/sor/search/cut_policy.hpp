@@ -12,8 +12,9 @@
 namespace sor::search {
 
 // When true, BabOptions::auto_cuts enables the Turner pool weights, pre-pool
-// candidate filtering, and the measured-safe optional separator subset (MIR,
-// lifted cover, zero-half, flow cover). Clique cuts stay off unless explicitly
+// candidate filtering, and the optional separator subset (MIR, lifted cover,
+// zero-half). Flow cover has a known validity counterexample and stays off.
+// Clique cuts stay off unless explicitly
 // requested (--clique-cuts).
 void apply_auto_cuts_policy(BabOptions& o);
 

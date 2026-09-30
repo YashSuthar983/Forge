@@ -23,6 +23,7 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
+#include "sor/core/route_debug.hpp"
 
 namespace sor::search {
 
@@ -65,6 +66,52 @@ struct TreeCutOptions {
     bool gcs_use_gnn = true;
 };
 
+// The COMPLETE derivation scope of a node-generated cut: every way it can
+// depend on the subtree it was born in. A cut may leave that subtree only when
+// all four hold, and each is recorded separately so a failure names its cause.
+//
+// The historical bug was testing only the first: bounds were checked, rows were
+// not, and the separator's own derivation was trusted by name.
+struct CutScopeConditions {
+    // No column the derivation touched was branch-tightened: node bounds are
+    // still the root bounds.
+    bool bounds_are_root = false;
+    // The model it was derived from carried no subtree-local row. node_lp is
+    // global_lp plus the node's active local cuts, so a separator can consume
+    // a locally-valid row while touching no tightened bound at all -- support
+    // and bound provenance are both blind to that.
+    bool rows_are_global = false;
+    // The separator's derivation is established for global use. Name-based,
+    // but a whitelist of what has been PROVEN, not an assumption that a family
+    // is sound because it is row-derived.
+    bool derivation_trusted = false;
+    // Cheap last-line necessary condition: a globally valid cut admits every
+    // integer-feasible point, so it admits the incumbent. Never sufficient.
+    bool admits_incumbent = true;
+};
+
+// Single decision point for "may this cut leave the subtree that made it".
+inline bool cut_may_leave_subtree(const CutScopeConditions& s) {
+    return s.bounds_are_root && s.rows_are_global && s.derivation_trusted &&
+           s.admits_incumbent;
+}
+
+// Whether a separator family's NODE-side derivation is established enough to
+// hand a cut to the global model.
+//
+// ZH_ / MIR_ / FC_ / GMI_ stay off this whitelist. An earlier n5-3 campaign
+// reported cuts that excluded a reference optimum, but that campaign is not a
+// derivation proof: one sweep deleted the detector, and the later flags were
+// references lying outside the generating node's bounds. A local cut may
+// exclude a point outside its subtree. A node-feasible point excluded by a
+// cut would refute that cut; failing to find one does not prove validity.
+// These families stay quarantined until their derivations and scope are
+// established for global use.
+inline bool cut_family_derivation_trusted(const std::string& name) {
+    return name.rfind("COV_", 0) == 0 || name.rfind("COVPC_", 0) == 0 ||
+           name.rfind("COVGNS_", 0) == 0;
+}
+
 struct ManagedCut {
     CutRow row;
     bool global = false;
@@ -96,7 +143,13 @@ bool local_cut_present(const std::vector<ManagedCut>& active,
 // Extract CutRows for apply_cuts().
 std::vector<CutRow> managed_to_rows(const std::vector<ManagedCut>& cuts);
 
-// Content-stable id so the same inequality accumulates multi-node stats.
+// Content key so the same inequality accumulates multi-node stats.
+// Printed with six significant digits, so it is not an exact identity.
+// GcsPool treats a disagreement on this key as "keep the weaker scope".
+// That is a conservative policy: a later local sighting does not
+// mathematically invalidate an earlier global derivation of a truly
+// identical inequality. Relaxing the policy needs an exact comparison
+// and retained provenance.
 std::string cut_content_id(const CutRow& row);
 
 // --- GCS (global selection over tree-collected candidates) -----------------

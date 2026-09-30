@@ -1,26 +1,68 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
 
+// Primal half-step of the HPR fixed-point operator T, plus the workgroup
+// partial of ||dx||^2 that the adaptive-step controller needs.
+//
+// The step no longer writes x in place: the reflected Halpern update needs
+// BOTH z (=x) and T(z) (=x_fixed) alive at the same time, so T's output goes
+// to its own buffer and halpern_mix collapses the pair afterwards.  With
+// gamma = 0 and beta = 0 that collapse is the identity x <- x_fixed, which is
+// exactly what the previous in-place step did.
+//
+// ||dx||^2 is reduced here rather than in a separate pass because the deltas
+// are already in registers; a standalone reduction would re-read x twice.
+
 layout(local_size_x = 256) in;
 
 layout(push_constant) uniform PC {
     uint n_cols;
+    uint stride;     // partials are laid out [slot][stride]
     double tau;
 } pc;
 
-layout(std430, binding = 0) buffer XBuf { double x[]; };
-layout(std430, binding = 1) readonly buffer CBuf { double c[]; };
-layout(std430, binding = 2) readonly buffer AtyBuf { double aty[]; };
-layout(std430, binding = 3) readonly buffer LoBuf { double lo[]; };
-layout(std430, binding = 4) readonly buffer HiBuf { double hi[]; };
-layout(std430, binding = 5) writeonly buffer XbarBuf { double xbar[]; };
+layout(std430, binding = 0) readonly  buffer XBuf      { double x[]; };
+layout(std430, binding = 1) readonly  buffer CBuf      { double c[]; };
+layout(std430, binding = 2) readonly  buffer AtyBuf    { double aty[]; };
+layout(std430, binding = 3) readonly  buffer LoBuf     { double lo[]; };
+layout(std430, binding = 4) readonly  buffer HiBuf     { double hi[]; };
+layout(std430, binding = 5) writeonly buffer XFixedBuf { double x_fixed[]; };
+layout(std430, binding = 6) writeonly buffer XbarBuf   { double xbar[]; };
+layout(std430, binding = 7) buffer PartBuf             { double part[]; };
+
+const uint SLOT_DX2 = 11u;
+
+shared double s_red[256];
+
+double wg_sum(double v) {
+    uint t = gl_LocalInvocationID.x;
+    barrier();
+    s_red[t] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) s_red[t] += s_red[t + s];
+        barrier();
+    }
+    double r = s_red[0];
+    barrier();
+    return r;
+}
 
 void main() {
     uint j = gl_GlobalInvocationID.x;
-    if (j >= pc.n_cols) return;
-    double xn = x[j] - pc.tau * (c[j] + aty[j]);
-    if (xn < lo[j]) xn = lo[j];
-    if (xn > hi[j]) xn = hi[j];
-    xbar[j] = 2.0lf * xn - x[j];
-    x[j] = xn;
+    // No early return: every invocation must reach the barriers in wg_sum.
+    bool live = j < pc.n_cols;
+    double d = 0.0lf;
+    if (live) {
+        double xj = x[j];
+        double xn = xj - pc.tau * (c[j] + aty[j]);
+        if (xn < lo[j]) xn = lo[j];
+        if (xn > hi[j]) xn = hi[j];
+        d = xn - xj;
+        x_fixed[j] = xn;
+        xbar[j] = 2.0lf * xn - xj;
+    }
+    double dx2 = wg_sum(d * d);
+    if (gl_LocalInvocationID.x == 0u)
+        part[SLOT_DX2 * pc.stride + gl_WorkGroupID.x] = dx2;
 }

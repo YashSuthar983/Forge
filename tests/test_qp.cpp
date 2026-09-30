@@ -153,6 +153,50 @@ void test_general_qp_with_free_variables() {
     CHECK(!diag.gap_finite);  // KKT natural map is the certificate in this case.
 }
 
+void test_diagonal_qp_honours_time_limit() {
+    QpProblem qp;
+    qp.linear.A = sor::sparse::from_triplets(0, 2, {}, {}, {});
+    qp.linear.c = {-1.0, -2.0};
+    qp.linear.col_lo = {0.0, 0.0};
+    qp.linear.col_hi = {10.0, 10.0};
+    qp.q_diag = {1.0, 1.0};
+
+    QpOptions opts;
+    opts.time_limit_s = 1e-12;
+    QpDiagnostics diag;
+    auto raw = sor::engines::solve_qp(qp, opts, diag);
+    CHECK(raw.proposed_status == Status::Interrupted);
+    CHECK(raw.termination_reason == "QP time limit");
+    const auto r = sor::certify::finalize_result(
+        std::move(raw), sor::engines::qp_evidence(diag, opts));
+    CHECK(r.status == Status::Interrupted);
+    CHECK(r.proof == ProofLevel::None);
+}
+
+void test_general_qp_honours_time_limit_between_kkt_checks() {
+    QpProblem qp;
+    qp.linear.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
+    qp.linear.c = {-3.0, -3.0};
+    qp.linear.row_lo = {3.0};
+    qp.linear.row_hi = {sor::model::kInf};
+    qp.linear.col_lo = {0.0, 0.0};
+    qp.linear.col_hi = {5.0, 5.0};
+    qp.q_matrix = sor::sparse::from_triplets(
+        2, 2, {0, 0, 1, 1}, {0, 1, 0, 1}, {2.0, 1.0, 1.0, 2.0});
+
+    QpOptions opts;
+    opts.time_limit_s = 1e-12;
+    opts.check_every = opts.max_iterations;
+    QpDiagnostics diag;
+    auto raw = sor::engines::solve_qp(qp, opts, diag);
+    CHECK(raw.proposed_status == Status::Interrupted);
+    CHECK(raw.termination_reason == "PDHCG-II time limit");
+    const auto r = sor::certify::finalize_result(
+        std::move(raw), sor::engines::qp_evidence(diag, opts));
+    CHECK(r.status == Status::Interrupted);
+    CHECK(r.proof == ProofLevel::None);
+}
+
 }  // namespace
 
 int main() {
@@ -162,5 +206,7 @@ int main() {
     test_positive_semidefinite_qp();
     test_indefinite_q_is_refused();
     test_general_qp_with_free_variables();
+    test_diagonal_qp_honours_time_limit();
+    test_general_qp_honours_time_limit_between_kkt_checks();
     return sor::test::finish("test_qp");
 }

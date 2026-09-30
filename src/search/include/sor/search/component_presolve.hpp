@@ -3,7 +3,8 @@
 // Columns are connected when they share a constraint with nonzero coefficient.
 // Independent components can be tightened separately (dual-fix + FBBT, and
 // optional hull enumeration on tiny pure-binary components) and the resulting
-// boxes merged. Never removes a globally feasible integer point.
+// boxes merged. Dual fixing can remove suboptimal feasible points but must
+// retain an optimum; FBBT and enumeration preserve every feasible point.
 #pragma once
 
 #include "sor/core/result.hpp"

@@ -42,11 +42,26 @@ void test_auto_policy_enables_safe_separators_not_clique() {
     CHECK(o.mir_cuts);
     CHECK(o.lifted_cover_cuts);
     CHECK(o.zerohalf_cuts);
-    CHECK(o.flow_cover_cuts);
+    CHECK(!o.flow_cover_cuts);
     CHECK(!o.clique_cuts);
     CHECK(o.cut.pool_nnz_budget_factor > 0.0);
     CHECK(o.cut.pool_weight_sparsity > 0.0);
     CHECK(!o.cut.pool_parallel_hard_filter);
+}
+
+void test_known_invalid_flow_cover_option_fails_closed() {
+    sor::model::LpProblem lp;
+    lp.c = {1.0};
+    lp.col_lo = {0.0};
+    lp.col_hi = {1.0};
+    lp.is_integer = {true};
+    lp.A = from_triplets(0, 1, {}, {}, {});
+    BabOptions opts;
+    opts.flow_cover_cuts = true;
+    sor::search::BabDiagnostics diag;
+    const auto result = sor::search::solve_milp(lp, opts, diag);
+    CHECK(result.proposed_status == sor::core::Status::Unsupported);
+    CHECK(result.termination_reason.find("known invalid-cut") != std::string::npos);
 }
 
 void test_filter_drops_parallel_low_value() {
@@ -85,6 +100,7 @@ void test_filter_drops_parallel_low_value() {
 
 int main() {
     test_auto_policy_enables_safe_separators_not_clique();
+    test_known_invalid_flow_cover_option_fails_closed();
     test_filter_drops_parallel_low_value();
     return sor::test::finish("test_cut_policy");
 }

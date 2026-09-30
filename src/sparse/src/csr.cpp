@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <numeric>
+#include "sor/core/route_debug.hpp"
 
 namespace sor::sparse {
 
 void SparsePattern::validate() const {
+    SOR_FN();
     if (n_rows_ < 0 || n_cols_ < 0)
         throw std::invalid_argument("SparsePattern: negative dimension");
     if (row_ptr_.size() != static_cast<std::size_t>(n_rows_) + 1)
@@ -25,6 +27,7 @@ void SparsePattern::validate() const {
 }
 
 void SparsePattern::append_row(const std::vector<Index>& cols) {
+    SOR_FN();
     // Empty pattern (default-constructed) has no row_ptr sentinel yet.
     if (row_ptr_.empty()) {
         if (n_rows_ != 0)
@@ -46,6 +49,7 @@ void SparsePattern::append_row(const std::vector<Index>& cols) {
 }
 
 void CsrMatrix::append_row(std::vector<Index> cols, std::vector<f64> row_vals) {
+    SOR_FN();
     if (cols.size() != row_vals.size())
         throw std::invalid_argument("CsrMatrix::append_row: mismatched lengths");
     // Sort by column and sum duplicates, same contract as from_triplets.
@@ -53,7 +57,7 @@ void CsrMatrix::append_row(std::vector<Index> cols, std::vector<f64> row_vals) {
     std::vector<std::size_t> order(cols.size());
     std::iota(order.begin(), order.end(), std::size_t{0});
     std::sort(order.begin(), order.end(),
-              [&](std::size_t a, std::size_t b) { return cols[a] < cols[b]; });
+              [&](std::size_t a, std::size_t b) { SOR_FN(); return cols[a] < cols[b]; });
     std::vector<Index> out_cols;
     std::vector<f64> out_vals;
     out_cols.reserve(cols.size());
@@ -74,10 +78,30 @@ void CsrMatrix::append_row(std::vector<Index> cols, std::vector<f64> row_vals) {
     vals.insert(vals.end(), out_vals.begin(), out_vals.end());
 }
 
+void SparsePattern::truncate_rows(Index keep) {
+    SOR_FN();
+    if (keep < 0 || keep > n_rows_)
+        throw std::invalid_argument("SparsePattern::truncate_rows: keep out of range");
+    if (keep == n_rows_) return;
+    // row_ptr_ is non-decreasing, so the entry at `keep` is exactly the nnz of
+    // the retained prefix; everything at or past it belongs to a dropped row.
+    const Offset cut = row_ptr_[static_cast<std::size_t>(keep)];
+    col_idx_.resize(static_cast<std::size_t>(cut));
+    row_ptr_.resize(static_cast<std::size_t>(keep) + 1);
+    n_rows_ = keep;
+}
+
+void CsrMatrix::truncate_rows(Index keep) {
+    SOR_FN();
+    pattern.truncate_rows(keep);
+    vals.resize(static_cast<std::size_t>(pattern.nnz()));
+}
+
 CsrMatrix from_triplets(Index n_rows, Index n_cols,
                         const std::vector<Index>& rows,
                         const std::vector<Index>& cols,
                         const std::vector<f64>& vals) {
+    SOR_FN();
     if (rows.size() != cols.size() || rows.size() != vals.size())
         throw std::invalid_argument("from_triplets: mismatched triplet lengths");
 
@@ -117,7 +141,7 @@ CsrMatrix from_triplets(Index n_rows, Index n_cols,
         order.resize(static_cast<std::size_t>(e - b));
         std::iota(order.begin(), order.end(), static_cast<std::size_t>(b));
         std::sort(order.begin(), order.end(),
-                  [&](std::size_t a, std::size_t c) { return col_idx[a] < col_idx[c]; });
+                  [&](std::size_t a, std::size_t c) { SOR_FN(); return col_idx[a] < col_idx[c]; });
 
         for (std::size_t i = 0; i < order.size();) {
             const Index c = col_idx[order[i]];

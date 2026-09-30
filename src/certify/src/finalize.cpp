@@ -3,19 +3,24 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
+#include "sor/core/route_debug.hpp"
 
 namespace sor::certify {
 namespace {
 
-inline std::size_t sz(core::Index i) { return static_cast<std::size_t>(i); }
+inline std::size_t sz(core::Index i) { SOR_FN(); return static_cast<std::size_t>(i); }
 
 f64 scaled_tol(f64 tol, f64 magnitude) {
+    SOR_FN();
     return tol * (1.0 + std::fabs(magnitude));
 }
 
 bool residuals_within_tolerance(const ProofEvidence& ev) {
+    SOR_FN();
     return std::isfinite(ev.max_primal_violation) &&
            std::isfinite(ev.max_dual_violation) &&
            ev.max_primal_violation <= ev.primal_feas_tol &&
@@ -23,12 +28,14 @@ bool residuals_within_tolerance(const ProofEvidence& ev) {
 }
 
 bool lp_optimality_within_tolerance(const ProofEvidence& ev) {
+    SOR_FN();
     return residuals_within_tolerance(ev) &&
            std::isfinite(ev.gap_rel) && ev.gap_rel <= ev.gap_tol;
 }
 
 // The highest level the evidence actually supports.
 ProofLevel supported_level(const ProofEvidence& ev) {
+    SOR_FN();
     if (ev.claimed_level >= ProofLevel::ProvedOptimalFP) {
         // A basis is what makes an f64 optimality proof meaningful; a
         // first-order point without crossover does not have one.
@@ -46,6 +53,77 @@ ProofLevel supported_level(const ProofEvidence& ev) {
     return ev.claimed_level;
 }
 
+
+// Column bounds every feasible point of `problem` (with column bounds
+// [lo, hi]) satisfies, by bound propagation over the rows to a fixpoint (at
+// most 20 rounds). Each round derives, row by row, bounds implied by the
+// bounds so far, so the limit is valid for every feasible point. Bounds are
+// loosened by a relative 1e-9 so accumulated rounding can only weaken them.
+void row_implied_bounds(const model::LpProblem& problem,
+                        const std::vector<f64>& lo_in,
+                        const std::vector<f64>& hi_in,
+                        std::vector<f64>& imp_lo, std::vector<f64>& imp_hi) {
+    const auto& rp = problem.A.pattern.row_ptr();
+    const auto& ci = problem.A.pattern.col_idx();
+    const core::Index m = problem.n_rows();
+    imp_lo = lo_in;
+    imp_hi = hi_in;
+    const auto loosen = [](long double v, int dir) {
+        return static_cast<f64>(v + dir * 1e-9L * (1.0L + std::fabs(v)));
+    };
+    for (int round = 0; round < 20; ++round) {
+        bool changed = false;
+        for (core::Index i = 0; i < m; ++i) {
+            long double amin = 0.0L, amax = 0.0L;
+            int nmin = 0, nmax = 0;
+            for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+                const f64 a = problem.A.vals[sz(k)];
+                const core::Index c = ci[sz(k)];
+                const f64 bmin = a > 0.0 ? imp_lo[sz(c)] : imp_hi[sz(c)];
+                const f64 bmax = a > 0.0 ? imp_hi[sz(c)] : imp_lo[sz(c)];
+                if (std::isfinite(bmin)) amin += static_cast<long double>(a) * bmin; else ++nmin;
+                if (std::isfinite(bmax)) amax += static_cast<long double>(a) * bmax; else ++nmax;
+            }
+            const f64 lo = problem.row_lo[sz(i)], hi = problem.row_hi[sz(i)];
+            for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+                const f64 a = problem.A.vals[sz(k)];
+                if (a == 0.0) continue;
+                const core::Index c = ci[sz(k)];
+                const f64 bmin = a > 0.0 ? imp_lo[sz(c)] : imp_hi[sz(c)];
+                const f64 bmax = a > 0.0 ? imp_hi[sz(c)] : imp_lo[sz(c)];
+                long double rmin, rmax;
+                bool fmin, fmax;
+                if (std::isfinite(bmin)) { rmin = amin - static_cast<long double>(a) * bmin; fmin = nmin == 0; }
+                else { rmin = amin; fmin = nmin == 1; }
+                if (std::isfinite(bmax)) { rmax = amax - static_cast<long double>(a) * bmax; fmax = nmax == 0; }
+                else { rmax = amax; fmax = nmax == 1; }
+                // a x_c in [lo - rmax, hi - rmin]
+                if (std::isfinite(lo) && fmax) {
+                    const long double v = (lo - rmax) / a;
+                    if (a > 0.0) {
+                        const f64 nb = loosen(v, -1);
+                        if (nb > imp_lo[sz(c)] + 1e-9 * (1.0 + std::fabs(nb))) { imp_lo[sz(c)] = nb; changed = true; }
+                    } else {
+                        const f64 nb = loosen(v, +1);
+                        if (nb < imp_hi[sz(c)] - 1e-9 * (1.0 + std::fabs(nb))) { imp_hi[sz(c)] = nb; changed = true; }
+                    }
+                }
+                if (std::isfinite(hi) && fmin) {
+                    const long double v = (hi - rmin) / a;
+                    if (a > 0.0) {
+                        const f64 nb = loosen(v, +1);
+                        if (nb < imp_hi[sz(c)] - 1e-9 * (1.0 + std::fabs(nb))) { imp_hi[sz(c)] = nb; changed = true; }
+                    } else {
+                        const f64 nb = loosen(v, -1);
+                        if (nb > imp_lo[sz(c)] + 1e-9 * (1.0 + std::fabs(nb))) { imp_lo[sz(c)] = nb; changed = true; }
+                    }
+                }
+            }
+        }
+        if (!changed) break;
+    }
+}
+
 }  // namespace
 
 ProofEvidence check_lp_point(const model::LpProblem& problem,
@@ -54,6 +132,7 @@ ProofEvidence check_lp_point(const model::LpProblem& problem,
                              f64 dual_feas_tol,
                              f64 gap_tol,
                              bool has_basis) {
+    SOR_FN();
     ProofEvidence ev;
     ev.has_basis = has_basis;
     ev.primal_feas_tol = primal_feas_tol;
@@ -166,6 +245,7 @@ ProofEvidence check_lp_point(const model::LpProblem& problem,
 core::PrimalRay check_primal_ray(const model::LpProblem& problem,
                                  const std::vector<f64>& direction,
                                  f64 tolerance) {
+    SOR_FN();
     core::PrimalRay out;
     if (direction.size() != static_cast<std::size_t>(problem.n_cols())) return out;
 
@@ -220,58 +300,147 @@ core::DualFarkasRay check_dual_farkas_ray(
     const model::LpProblem& problem,
     const std::vector<f64>& multipliers,
     f64 tolerance) {
+    SOR_FN();
     core::DualFarkasRay out;
     if (multipliers.size() != static_cast<std::size_t>(problem.n_rows())) return out;
     f64 norm_inf = 0.0;
-    for (f64 v : multipliers) norm_inf = std::max(norm_inf, std::fabs(v));
+    for (f64 v : multipliers) {
+        if (!std::isfinite(v)) return out;
+        norm_inf = std::max(norm_inf, std::fabs(v));
+    }
     if (!(norm_inf > 0.0) || !std::isfinite(norm_inf)) return out;
     out.multipliers = multipliers;
     for (f64& v : out.multipliers) v /= norm_inf;
+    // A multiplier facing an infinite row side can never contribute to a
+    // valid proof. Rather than rejecting the whole ray for round-off noise
+    // there, drop such entries: the result is a different candidate ray,
+    // and everything below checks that candidate exactly.
+    for (core::Index i = 0; i < problem.n_rows(); ++i) {
+        f64& y = out.multipliers[sz(i)];
+        if ((y > 0.0 && !std::isfinite(problem.row_hi[sz(i)])) ||
+            (y < 0.0 && !std::isfinite(problem.row_lo[sz(i)])))
+            y = 0.0;
+    }
 
-    std::vector<long double> aty(static_cast<std::size_t>(problem.n_cols()), 0.0L);
     const auto& rp = problem.A.pattern.row_ptr();
     const auto& ci = problem.A.pattern.col_idx();
-    for (core::Index i = 0; i < problem.n_rows(); ++i)
-        for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
-            aty[sz(ci[sz(k)])] +=
-                static_cast<long double>(out.multipliers[sz(i)]) *
-                problem.A.vals[sz(k)];
+    std::vector<long double> aty;
+    const auto compute_aty = [&]() {
+        aty.assign(static_cast<std::size_t>(problem.n_cols()), 0.0L);
+        for (core::Index i = 0; i < problem.n_rows(); ++i)
+            for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
+                aty[sz(ci[sz(k)])] +=
+                    static_cast<long double>(out.multipliers[sz(i)]) *
+                    problem.A.vals[sz(k)];
+    };
+    compute_aty();
+
+    // A'y must vanish exactly in every unbounded direction. An approximate
+    // ray (first-order iterate, or simplex round-off) leaves tiny residuals
+    // there. Repair: for each such column, shift the largest multiplier in
+    // that column to cancel the residual, provided the shifted multiplier
+    // still faces a finite row side. The repaired ray is a new candidate and
+    // is checked exactly below; the repair itself is never trusted.
+    const auto unbounded_residual = [&](core::Index j) {
+        const long double d = aty[sz(j)];
+        return (d > 0.0L && !std::isfinite(problem.col_lo[sz(j)])) ||
+               (d < 0.0L && !std::isfinite(problem.col_hi[sz(j)]));
+    };
+    constexpr int kMaxRepairColumns = 64;
+    for (int pass = 0; pass < 2; ++pass) {
+        std::vector<char> bad(static_cast<std::size_t>(problem.n_cols()), 0);
+        int n_bad = 0;
+        for (core::Index j = 0; j < problem.n_cols(); ++j)
+            if (unbounded_residual(j)) { bad[sz(j)] = 1; ++n_bad; }
+        if (n_bad == 0 || n_bad > kMaxRepairColumns) break;
+        // Best row per offending column: largest |y_i| with a_ij != 0.
+        std::vector<core::Index> best_row(static_cast<std::size_t>(problem.n_cols()), -1);
+        std::vector<f64> best_a(static_cast<std::size_t>(problem.n_cols()), 0.0);
+        for (core::Index i = 0; i < problem.n_rows(); ++i)
+            for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+                const core::Index j = ci[sz(k)];
+                if (!bad[sz(j)] || problem.A.vals[sz(k)] == 0.0) continue;
+                const core::Index b = best_row[sz(j)];
+                if (b < 0 || std::fabs(out.multipliers[sz(i)]) >
+                                 std::fabs(out.multipliers[sz(b)])) {
+                    best_row[sz(j)] = i;
+                    best_a[sz(j)] = problem.A.vals[sz(k)];
+                }
+            }
+        for (core::Index j = 0; j < problem.n_cols(); ++j) {
+            const core::Index i = best_row[sz(j)];
+            if (i < 0) continue;
+            const f64 y = static_cast<f64>(
+                out.multipliers[sz(i)] - aty[sz(j)] / best_a[sz(j)]);
+            const bool compatible =
+                y == 0.0 ||
+                (y > 0.0 && std::isfinite(problem.row_hi[sz(i)])) ||
+                (y < 0.0 && std::isfinite(problem.row_lo[sz(i)]));
+            if (compatible) out.multipliers[sz(i)] = y;
+        }
+        compute_aty();
+    }
+
+    // A residual left on a column with no bound on the side it needs cannot
+    // be charged to the column's declared bounds. It can be charged to a
+    // bound the ROWS imply: for a_ij x_j + sum_{k!=j} a_ik x_k in [lo, hi],
+    // every feasible point satisfies x_j >= (lo - max rest)/a_ij (a_ij > 0)
+    // etc., using only declared bounds of the other columns. That keeps the
+    // certificate exact (the contribution d_j x_j is bounded for every
+    // feasible x) instead of waving the residual through as round-off; a
+    // column with no finite implied bound on the needed side still refutes
+    // the ray. One pass, no propagation chains.
+    std::vector<f64> imp_lo, imp_hi;
+    const auto implied_bounds = [&]() {
+        row_implied_bounds(problem, problem.col_lo, problem.col_hi, imp_lo, imp_hi);
+    };
 
     f64 sign_res = 0.0;
+    bool incompatible_unbounded_support = false;
     long double lower = 0.0L;
     for (core::Index j = 0; j < problem.n_cols(); ++j) {
-        const f64 d = static_cast<f64>(aty[sz(j)]);
+        const long double d = aty[sz(j)];
+        if (!std::isfinite(d)) return out;
         if (d > 0.0) {
-            if (!std::isfinite(problem.col_lo[sz(j)])) {
-                if (d > tolerance) sign_res = std::max(sign_res, d);
+            f64 b = problem.col_lo[sz(j)];
+            if (!std::isfinite(b)) {
+                if (imp_lo.empty()) implied_bounds();
+                b = imp_lo[sz(j)];
+            }
+            if (!std::isfinite(b)) {
+                incompatible_unbounded_support = true;
+                sign_res = std::max(sign_res, static_cast<f64>(d));
+                if (std::getenv("SOR_FARKAS_DEBUG"))
+                    std::fprintf(stderr, "[farkas] col %d d=%.3Lg bounds [%g,%g]\n",
+                                 (int)j, d, problem.col_lo[sz(j)], problem.col_hi[sz(j)]);
                 continue;
             }
-            lower += static_cast<long double>(d) * problem.col_lo[sz(j)];
+            lower += d * b;
         } else if (d < 0.0) {
-            if (!std::isfinite(problem.col_hi[sz(j)])) {
-                if (-d > tolerance) sign_res = std::max(sign_res, -d);
+            f64 b = problem.col_hi[sz(j)];
+            if (!std::isfinite(b)) {
+                if (imp_hi.empty()) implied_bounds();
+                b = imp_hi[sz(j)];
+            }
+            if (!std::isfinite(b)) {
+                incompatible_unbounded_support = true;
+                sign_res = std::max(sign_res, static_cast<f64>(-d));
+                if (std::getenv("SOR_FARKAS_DEBUG"))
+                    std::fprintf(stderr, "[farkas] col %d d=%.3Lg bounds [%g,%g]\n",
+                                 (int)j, d, problem.col_lo[sz(j)], problem.col_hi[sz(j)]);
                 continue;
             }
-            lower += static_cast<long double>(d) * problem.col_hi[sz(j)];
+            lower += d * b;
         }
     }
 
     long double upper = 0.0L;
     for (core::Index i = 0; i < problem.n_rows(); ++i) {
         const f64 y = out.multipliers[sz(i)];
-        if (y > 0.0) {
-            if (!std::isfinite(problem.row_hi[sz(i)])) {
-                if (y > tolerance) sign_res = std::max(sign_res, y);
-                continue;
-            }
+        if (y > 0.0)
             upper += static_cast<long double>(y) * problem.row_hi[sz(i)];
-        } else if (y < 0.0) {
-            if (!std::isfinite(problem.row_lo[sz(i)])) {
-                if (-y > tolerance) sign_res = std::max(sign_res, -y);
-                continue;
-            }
+        else if (y < 0.0)
             upper += static_cast<long double>(y) * problem.row_lo[sz(i)];
-        }
     }
 
     out.max_homogeneous_residual = sign_res;
@@ -280,7 +449,8 @@ core::DualFarkasRay check_dual_farkas_ray(
     const f64 separation_tol = tolerance *
         (1.0 + std::max(std::fabs(static_cast<f64>(lower)),
                         std::fabs(static_cast<f64>(upper))));
-    out.certified = sign_res <= tolerance &&
+    out.certified = !incompatible_unbounded_support &&
+                    sign_res <= tolerance &&
                     std::isfinite(out.contradiction) &&
                     out.contradiction > separation_tol;
     return out;
@@ -289,6 +459,7 @@ core::DualFarkasRay check_dual_farkas_ray(
 ProofEvidence check_lp_result(const model::LpProblem& problem,
                               const core::RawResult& raw,
                               const ProofEvidence& proposed) {
+    SOR_FN();
     ProofEvidence checked = check_lp_point(
         problem, raw, proposed.primal_feas_tol, proposed.dual_feas_tol,
         proposed.gap_tol, proposed.has_basis);
@@ -337,6 +508,7 @@ ProofEvidence check_lp_result(const model::LpProblem& problem,
 }
 
 SolveResult finalize_result(RawResult raw, const ProofEvidence& ev) {
+    SOR_FN();
     SolveResult r;
     r.objective          = raw.objective;
     r.dual_bound         = raw.dual_bound;
@@ -405,22 +577,7 @@ SolveResult finalize_result(RawResult raw, const ProofEvidence& ev) {
     // until every simplex unbounded exit populates PrimalRay.
     const bool global_proof = ev.claimed_level == ProofLevel::ProvedGlobalEpsilon &&
                               residuals_within_tolerance(ev);
-    // One-release bridge for the primal simplex Phase-I terminal basis.  That
-    // path predates exported Farkas multipliers, but its freshly optimized
-    // auxiliary basis is still an infeasibility proof.  Keep the exception
-    // narrow and do not mark a ray certified; the simplex path should export
-    // its multiplier before this bridge is removed.
-    const bool legacy_phase1_basis_proof =
-        r.status == Status::Infeasible && r.engine == "simplex_primal" &&
-        r.termination_reason ==
-            "phase 1 minimum has positive primal infeasibility" &&
-        ev.has_basis && ev.claimed_level == ProofLevel::BoundOnly &&
-        std::isfinite(ev.max_primal_violation) &&
-        ev.max_primal_violation > ev.primal_feas_tol &&
-        std::isfinite(ev.max_dual_violation) &&
-        ev.max_dual_violation <= ev.dual_feas_tol;
-    if (r.status == Status::Infeasible && !checked_dual_ray && !global_proof &&
-        !legacy_phase1_basis_proof) {
+    if (r.status == Status::Infeasible && !checked_dual_ray && !global_proof) {
         r.status = Status::NoSolutionFound;
         r.ray.clear();
         r.dual_farkas_ray = core::DualFarkasRay{};
@@ -463,4 +620,224 @@ SolveResult finalize_result(RawResult raw, const ProofEvidence& ev) {
     return r;
 }
 
+// Rigorous lower bound for min{c'x : row_lo <= Ax <= row_hi, lo <= x <= hi}
+// from ANY multipliers y (weak duality, no optimality assumed):
+//   c'x = (c - A'y)'x + y'Ax >= sum_j min_{x_j in box} d_j x_j
+//                               + sum_i min_{a_i in [row_lo,row_hi]} y_i a_i.
+// y_i facing an infinite side is set to 0 (still a valid multiplier) and d is
+// recomputed from the y actually used. A nonzero d_j that needs an infinite
+// column bound is charged to a row-implied bound (valid for every feasible
+// point); if none exists the bound is -inf -- never treated as zero. The sum
+// is accumulated in long double and reduced by a conservative bound on its
+// own rounding error.
+SafeLpBound safe_lagrangian_lower_bound(const model::LpProblem& problem,
+                                        const std::vector<f64>& y_min,
+                                        const std::vector<f64>& col_lo,
+                                        const std::vector<f64>& col_hi) {
+    SafeLpBound out;
+    const core::Index m = problem.n_rows(), n = problem.n_cols();
+    if (y_min.size() != sz(m) || col_lo.size() != sz(n) || col_hi.size() != sz(n))
+        return out;
+    const f64 sense = problem.maximize ? -1.0 : 1.0;
+    const auto& rp = problem.A.pattern.row_ptr();
+    const auto& ci = problem.A.pattern.col_idx();
+    std::vector<long double> d(sz(n));
+    for (core::Index j = 0; j < n; ++j) d[sz(j)] = sense * problem.c[sz(j)];
+    long double L = sense * problem.obj_offset;
+    long double mag = std::fabs(static_cast<long double>(L));
+    for (core::Index i = 0; i < m; ++i) {
+        long double yi = y_min[sz(i)];
+        if (!std::isfinite(static_cast<double>(yi))) return out;
+        if (yi > 0.0L && !std::isfinite(problem.row_lo[sz(i)])) yi = 0.0L;
+        if (yi < 0.0L && !std::isfinite(problem.row_hi[sz(i)])) yi = 0.0L;
+        if (yi == 0.0L) continue;
+        const long double t = yi * (yi > 0.0L ? problem.row_lo[sz(i)] : problem.row_hi[sz(i)]);
+        L += t;
+        mag += std::fabs(t);
+        for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+            const long double t2 = yi * problem.A.vals[sz(k)];
+            d[sz(ci[sz(k)])] -= t2;
+            mag += std::fabs(t2);
+        }
+    }
+    std::vector<f64> imp_lo, imp_hi;
+    const auto ensure_implied = [&]() {
+        if (imp_lo.empty()) row_implied_bounds(problem, col_lo, col_hi, imp_lo, imp_hi);
+    };
+    // The finite bound column j's reduced cost d would be charged to, or
+    // +/-inf when there is none (declared first, then row-implied).
+    const auto needed_bound = [&](core::Index j, long double dj) -> f64 {
+        if (dj == 0.0L) return 0.0;
+        f64 b = dj > 0.0L ? col_lo[sz(j)] : col_hi[sz(j)];
+        if (std::isfinite(b)) return b;
+        ensure_implied();
+        return dj > 0.0L ? imp_lo[sz(j)] : imp_hi[sz(j)];
+    };
+    // Multiplier correction. The simplex's y leaves round-off reduced costs
+    // (|d| ~ 1e-14) on basic columns; where such a column has no finite bound
+    // on the side its sign needs, the bound for THIS y is -inf. Choose a
+    // different y instead: shift one y_i, in a row whose other columns all
+    // stay chargeable to finite bounds, so d_j lands just on the side j's
+    // finite bound can absorb. Weak duality holds for any y; the bound below
+    // is computed exactly from the corrected y and d.
+    std::vector<std::vector<std::pair<core::Index, f64>>> col_rows;
+    std::vector<f64> y(y_min.begin(), y_min.end());
+    for (core::Index i = 0; i < m; ++i) {
+        if (y[sz(i)] > 0.0 && !std::isfinite(problem.row_lo[sz(i)])) y[sz(i)] = 0.0;
+        if (y[sz(i)] < 0.0 && !std::isfinite(problem.row_hi[sz(i)])) y[sz(i)] = 0.0;
+    }
+    for (int pass = 0; pass < 3; ++pass) {
+        std::vector<core::Index> bad;
+        for (core::Index j = 0; j < n; ++j)
+            if (d[sz(j)] != 0.0L && !std::isfinite(needed_bound(j, d[sz(j)])))
+                bad.push_back(j);
+        if (bad.empty() || bad.size() > 256) break;
+        if (col_rows.empty()) {
+            col_rows.resize(sz(n));
+            for (core::Index i = 0; i < m; ++i)
+                for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
+                    col_rows[sz(ci[sz(k)])].push_back({i, problem.A.vals[sz(k)]});
+        }
+        for (const core::Index j : bad) {
+            const long double dj = d[sz(j)];
+            if (dj == 0.0L || std::isfinite(needed_bound(j, dj))) continue;
+            // Target sign: toward the side that has a finite bound.
+            const bool lo_ok = std::isfinite(col_lo[sz(j)]) ||
+                               (ensure_implied(), std::isfinite(imp_lo[sz(j)]));
+            const bool hi_ok = std::isfinite(col_hi[sz(j)]) ||
+                               (ensure_implied(), std::isfinite(imp_hi[sz(j)]));
+            for (const auto& [i, aij] : col_rows[sz(j)]) {
+                if (aij == 0.0) continue;
+                const long double scale = 1.0L + std::fabs(static_cast<long double>(y[sz(i)]) * aij);
+                const long double eta = 1e-11L * scale;
+                const long double target = lo_ok ? eta : hi_ok ? -eta : 0.0L;
+                // d_j - delta * a_ij = target
+                const long double delta = (dj - target) / aij;
+                const long double yi = y[sz(i)] + delta;
+                if (yi > 0.0L && !std::isfinite(problem.row_lo[sz(i)])) continue;
+                if (yi < 0.0L && !std::isfinite(problem.row_hi[sz(i)])) continue;
+                bool ok = true;
+                for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1] && ok; ++k) {
+                    const core::Index c = ci[sz(k)];
+                    if (c == j) continue;
+                    const long double nd = d[sz(c)] - delta * problem.A.vals[sz(k)];
+                    if (nd != 0.0L && !std::isfinite(needed_bound(c, nd))) ok = false;
+                }
+                if (!ok) continue;
+                y[sz(i)] = static_cast<f64>(yi);
+                // Recompute this row's contribution to d exactly from the
+                // stored (rounded) multiplier.
+                const long double applied = static_cast<long double>(y[sz(i)]) - (yi - delta);
+                for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
+                    d[sz(ci[sz(k)])] -= applied * problem.A.vals[sz(k)];
+                ++out.multiplier_corrections;
+                break;
+            }
+        }
+    }
+    // Recompute L and d from scratch for the final y (no drift from updates).
+    // Without a correction y is exactly the first pass's multipliers, so the
+    // first pass's d, L and mag are already these values (bit for bit).
+    if (out.multiplier_corrections > 0) {
+    for (core::Index j = 0; j < n; ++j) d[sz(j)] = sense * problem.c[sz(j)];
+    L = sense * problem.obj_offset;
+    mag = std::fabs(static_cast<long double>(L));
+    for (core::Index i = 0; i < m; ++i) {
+        const long double yi = y[sz(i)];
+        if (yi == 0.0L) continue;
+        const long double t = yi * (yi > 0.0L ? problem.row_lo[sz(i)] : problem.row_hi[sz(i)]);
+        L += t;
+        mag += std::fabs(t);
+        for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+            const long double t2 = yi * problem.A.vals[sz(k)];
+            d[sz(ci[sz(k)])] -= t2;
+            mag += std::fabs(t2);
+        }
+    }
+    }
+    for (core::Index j = 0; j < n; ++j) {
+        const long double dj = d[sz(j)];
+        if (dj == 0.0L) continue;
+        const f64 b = needed_bound(j, dj);
+        if (!std::isfinite(b)) {             // genuinely unbounded direction
+            if (std::getenv("SOR_SAFE_BOUND_DEBUG"))
+                std::fprintf(stderr, "[safe-bound] col %d d=%.3Lg box [%g,%g]\n",
+                             (int)j, dj, col_lo[sz(j)], col_hi[sz(j)]);
+            return out;
+        }
+        if (!std::isfinite(dj > 0.0L ? col_lo[sz(j)] : col_hi[sz(j)]))
+            ++out.implied_bound_uses;
+        const long double t = dj * b;
+        L += t;
+        mag += std::fabs(t);
+    }
+    // Rounding error of long-double accumulation, with a wide safety factor.
+    const long double err = 1e-12L * (1.0L + mag);
+    out.value = static_cast<f64>(L - err);
+    out.finite = std::isfinite(out.value);
+    return out;
+}
+
+
+std::vector<FarkasBoundUse> farkas_conflict_bounds(
+    const model::LpProblem& problem, const std::vector<f64>& multipliers,
+    const std::vector<f64>& col_lo, const std::vector<f64>& col_hi,
+    const std::vector<f64>& root_lo, const std::vector<f64>& root_hi,
+    f64 tolerance) {
+    std::vector<FarkasBoundUse> out;
+    const core::Index m = problem.n_rows(), n = problem.n_cols();
+    if (multipliers.size() != sz(m) || col_lo.size() != sz(n) ||
+        root_lo.size() != sz(n))
+        return out;
+    // Proof: for all x in the box, y'Ax >= sum_j min(d_j x_j) =: lower, while
+    // the rows force y'Ax <= sum_i max over row sides of y_i a_i =: upper.
+    // lower > upper is the contradiction.
+    std::vector<long double> d(sz(n), 0.0L);
+    long double upper = 0.0L;
+    const auto& rp = problem.A.pattern.row_ptr();
+    const auto& ci = problem.A.pattern.col_idx();
+    for (core::Index i = 0; i < m; ++i) {
+        const long double yi = multipliers[sz(i)];
+        if (yi == 0.0L) continue;
+        const f64 side = yi > 0.0L ? problem.row_hi[sz(i)] : problem.row_lo[sz(i)];
+        if (!std::isfinite(side)) return out;
+        upper += yi * side;
+        for (auto k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
+            d[sz(ci[sz(k)])] += yi * problem.A.vals[sz(k)];
+    }
+    long double lower = 0.0L;
+    struct Use { core::Index col; bool upper; f64 value; long double relax_cost; };
+    std::vector<Use> uses;
+    for (core::Index j = 0; j < n; ++j) {
+        const long double dj = d[sz(j)];
+        if (dj == 0.0L) continue;
+        const bool use_hi = dj < 0.0L;
+        const f64 b = use_hi ? col_hi[sz(j)] : col_lo[sz(j)];
+        if (!std::isfinite(b)) return out;
+        lower += dj * b;
+        const f64 rb = use_hi ? root_hi[sz(j)] : root_lo[sz(j)];
+        if (b == rb) continue;               // root bound: not an assumption
+        // Relaxing to the root bound lowers `lower` by |d_j| * |rb - b|
+        // (infinite when the root bound is infinite: essential).
+        const long double cost = std::isfinite(rb)
+            ? std::fabs(dj) * std::fabs(static_cast<long double>(rb) - b)
+            : std::numeric_limits<long double>::infinity();
+        uses.push_back({j, use_hi, b, cost});
+    }
+    long double slack = lower - upper;
+    const long double margin = tolerance * (1.0L + std::fabs(lower) + std::fabs(upper));
+    if (!(slack > margin)) return out;       // ray does not certify here
+    std::sort(uses.begin(), uses.end(),
+              [](const Use& a, const Use& b) { return a.relax_cost < b.relax_cost; });
+    for (const auto& u : uses) {
+        if (slack - u.relax_cost > margin) {
+            slack -= u.relax_cost;           // this bound is not needed
+            continue;
+        }
+        out.push_back({u.col, u.upper, u.value});
+    }
+    return out;
+}
+
 }  // namespace sor::certify
+

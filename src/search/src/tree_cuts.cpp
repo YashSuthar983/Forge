@@ -97,6 +97,8 @@ std::vector<CutRow> managed_to_rows(const std::vector<ManagedCut>& cuts) {
     return rows;
 }
 
+// Six significant digits, not an exact encoding of the inequality. Callers
+// must not treat an id match as proof that two cuts are the same cut.
 std::string cut_content_id(const CutRow& row) {
     std::ostringstream os;
     os << "c";
@@ -506,7 +508,13 @@ void GcsPool::observe(const CutRow& row,
             c.efficacy_sum += efficacy;
             ++c.seen_nodes;
             if (violated) ++c.violation_nodes;
-            c.globally_valid = c.globally_valid || globally_valid;
+            // Conservative policy, not a theorem. One exact global derivation
+            // of an identical inequality is enough to keep it global; a later
+            // local derivation does not cancel that. cut_content_id uses only
+            // six significant digits, so an id match is not exact identity.
+            // Until provenance is stored against an exact comparison, a
+            // disagreement keeps the weaker scope.
+            c.globally_valid = c.globally_valid && globally_valid;
             if (c.row.cols.empty()) c.row = row;
             c.depth_sum += static_cast<f64>(std::max(0, depth));
             if (c.first_depth < 0) c.first_depth = depth;

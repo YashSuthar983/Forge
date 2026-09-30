@@ -1,6 +1,5 @@
 #include "sor/search/mip_presolve.hpp"
 
-#include "sor/engines/lp_batched.hpp"
 #include "sor/search/component_presolve.hpp"
 #include "sor/search/gf2_presolve.hpp"
 #include "sor/search/implied_int.hpp"
@@ -31,42 +30,6 @@ inline bool nearly_fixed(f64 lo, f64 hi, f64 tol) {
     return std::isfinite(lo) && std::isfinite(hi) && hi - lo <= tol;
 }
 
-// Activity range of row i under the current box.
-void row_activity_bounds(const model::LpProblem& lp, Index i,
-                         const std::vector<f64>& col_lo,
-                         const std::vector<f64>& col_hi, f64& amin, f64& amax) {
-    const auto& rp = lp.A.pattern.row_ptr();
-    const auto& ci = lp.A.pattern.col_idx();
-    const auto& av = lp.A.vals;
-    amin = 0.0;
-    amax = 0.0;
-    for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
-        const Index j = ci[sz(k)];
-        const f64 a = av[sz(k)];
-        const f64 lo = col_lo[sz(j)];
-        const f64 hi = col_hi[sz(j)];
-        if (a >= 0.0) {
-            amin += a * lo;
-            amax += a * hi;
-        } else {
-            amin += a * hi;
-            amax += a * lo;
-        }
-    }
-}
-
-bool row_redundant(const model::LpProblem& lp, Index i,
-                   const std::vector<f64>& col_lo,
-                   const std::vector<f64>& col_hi, f64 tol) {
-    f64 amin = 0.0, amax = 0.0;
-    row_activity_bounds(lp, i, col_lo, col_hi, amin, amax);
-    const f64 rlo = lp.row_lo[sz(i)];
-    const f64 rhi = lp.row_hi[sz(i)];
-    const bool lo_ok = !std::isfinite(rlo) || amin >= rlo - tol;
-    const bool hi_ok = !std::isfinite(rhi) || amax <= rhi + tol;
-    return lo_ok && hi_ok;
-}
-
 // Effective objective coeff in minimize sense.
 inline f64 min_sense_c(const model::LpProblem& lp, Index j) {
     const f64 c = lp.c[sz(j)];
@@ -81,7 +44,8 @@ DualFixDiagnostics apply_dual_fixing(const model::LpProblem& lp,
                                       f64 tol,
                                       int max_rounds,
                                       bool zero_cost_ok,
-                                      double time_limit_s) {
+                                      double time_limit_s,
+                                      const std::vector<Index>* candidate_cols) {
     DualFixDiagnostics diag;
     // Dual fixing is the non-optional core of root MIP presolve and, on large
     // models, its dominant cost: 5.6 s on atlanta-ip (48738 cols) with every
@@ -109,7 +73,12 @@ DualFixDiagnostics apply_dual_fixing(const model::LpProblem& lp,
         std::vector<int> down_locks(sz(n), 0), up_locks(sz(n), 0);
 
         for (Index i = 0; i < m; ++i) {
-            if (row_redundant(lp, i, col_lo, col_hi, tol)) continue;
+            // Every nonzero row coefficient can lock a direction, even when
+            // its magnitude is below the feasibility tolerance: its activity
+            // over a wide domain can still be large. Likewise, a row that is
+            // only nearly redundant must retain its locks. Counting extra
+            // locks is conservative; dropping a real lock can remove the
+            // optimum.
             const f64 rlo = lp.row_lo[sz(i)];
             const f64 rhi = lp.row_hi[sz(i)];
             const bool has_lo = std::isfinite(rlo);
@@ -117,7 +86,7 @@ DualFixDiagnostics apply_dual_fixing(const model::LpProblem& lp,
             for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
                 const Index j = ci[sz(k)];
                 const f64 a = av[sz(k)];
-                if (std::fabs(a) <= tol) continue;
+                if (a == 0.0) continue;
                 if (a > 0.0) {
                     if (has_hi) ++up_locks[sz(j)];
                     if (has_lo) ++down_locks[sz(j)];
@@ -128,22 +97,25 @@ DualFixDiagnostics apply_dual_fixing(const model::LpProblem& lp,
             }
         }
 
-        for (Index j = 0; j < n; ++j) {
+        const Index n_candidates = candidate_cols
+            ? static_cast<Index>(candidate_cols->size()) : n;
+        for (Index t = 0; t < n_candidates; ++t) {
+            const Index j = candidate_cols ? (*candidate_cols)[sz(t)] : t;
             if (nearly_fixed(col_lo[sz(j)], col_hi[sz(j)], tol)) continue;
             if (!std::isfinite(col_lo[sz(j)]) && !std::isfinite(col_hi[sz(j)]))
                 continue;
             const f64 c = min_sense_c(lp, j);
-            if (!zero_cost_ok && std::fabs(c) <= tol) continue;
+            if (!zero_cost_ok && c == 0.0) continue;
 
             // Never dual-fix a free (two-sided infinite) direction to ±inf.
-            if (down_locks[sz(j)] == 0 && c >= -tol &&
+            if (down_locks[sz(j)] == 0 && c >= 0.0 &&
                 std::isfinite(col_lo[sz(j)])) {
                 if (col_hi[sz(j)] > col_lo[sz(j)] + tol) {
                     col_hi[sz(j)] = col_lo[sz(j)];
                     ++diag.fixings;
                     any = true;
                 }
-            } else if (up_locks[sz(j)] == 0 && c <= tol &&
+            } else if (up_locks[sz(j)] == 0 && c <= 0.0 &&
                        std::isfinite(col_hi[sz(j)])) {
                 if (col_lo[sz(j)] < col_hi[sz(j)] - tol) {
                     col_lo[sz(j)] = col_hi[sz(j)];
@@ -353,77 +325,16 @@ ObbtDiagnostics apply_obbt_lite(const model::LpProblem& lp,
 
     bool any_lp = false;
 
-    // BatchLP FO min/max x_j probes (shared A). Apply only confident
-    // tightenings; remaining vars fall through to simplex / FBBT.
-    std::vector<char> batch_done(cands.size(), 0);
-    if (opts.batch_lp_obbt && !cands.empty()) {
-        std::vector<engines::BatchBoundProbe> probes;
-        struct Meta { std::size_t ci; Index j; int sense; };
-        std::vector<Meta> meta;
-        probes.reserve(cands.size() * 2);
-        meta.reserve(cands.size() * 2);
-        for (std::size_t ci = 0; ci < cands.size(); ++ci) {
-            const Index j = cands[ci].j;
-            for (int sense = 0; sense < 2; ++sense) {
-                engines::BatchBoundProbe pr;
-                pr.col_lo = col_lo;
-                pr.col_hi = col_hi;
-                pr.c.assign(sz(n), 0.0);
-                // Minimize sense: sense 0 → min x_j, sense 1 → min -x_j.
-                pr.c[sz(j)] = (sense == 0) ? 1.0 : -1.0;
-                probes.push_back(std::move(pr));
-                meta.push_back({ci, j, sense});
-            }
-        }
-        try {
-            engines::BatchProbeOptions bopt;
-            bopt.hpr_steps = opts.batch_lp_obbt_steps;
-            model::LpProblem base = lp;
-            base.col_lo = col_lo;
-            base.col_hi = col_hi;
-            base.maximize = false;
-            base.obj_offset = 0.0;
-            const auto results =
-                engines::batch_bound_probes_hpr(base, probes, bopt);
-            diag.batch_lp_probes += results.size();
-            for (std::size_t pi = 0; pi < results.size(); ++pi) {
-                const auto& r = results[pi];
-                const auto& m = meta[pi];
-                if (!r.looks_feasible || !std::isfinite(r.primal_obj))
-                    continue;
-                // Objective was ±x_j (+ offset 0); undo the sign for max.
-                const f64 val =
-                    (m.sense == 0) ? r.primal_obj : -r.primal_obj;
-                if (m.sense == 0) {
-                    f64 nl = is_int_col(lp, m.j) ? std::ceil(val - tol) : val;
-                    if (nl > col_lo[sz(m.j)] + tol) {
-                        col_lo[sz(m.j)] = std::min(nl, col_hi[sz(m.j)]);
-                        ++diag.batch_lp_tightenings;
-                        ++diag.lp_tightenings;
-                        batch_done[m.ci] = 1;
-                        any_lp = true;
-                    }
-                } else {
-                    f64 nh = is_int_col(lp, m.j) ? std::floor(val + tol) : val;
-                    if (nh < col_hi[sz(m.j)] - tol) {
-                        col_hi[sz(m.j)] = std::max(nh, col_lo[sz(m.j)]);
-                        ++diag.batch_lp_tightenings;
-                        ++diag.lp_tightenings;
-                        batch_done[m.ci] = 1;
-                        any_lp = true;
-                    }
-                }
-            }
-        } catch (...) {
-            // Fall through to simplex / FBBT.
-        }
-    }
+    // Only certified LP optima may tighten a domain. The former BatchLP
+    // path used an approximate primal objective, which is the wrong bound
+    // direction for OBBT and can remove feasible or optimal assignments.
+    // Keep the BatchLP option disabled until it returns a checked dual bound.
+    (void)opts.batch_lp_obbt;
 
     for (std::size_t ci = 0; ci < cands.size(); ++ci) {
         const Cand& c = cands[ci];
         ++diag.vars_tried;
         const Index j = c.j;
-        if (batch_done[ci]) continue;
         if (lp_opts != nullptr) {
             bool tightened = false;
             for (int sense = 0; sense < 2; ++sense) {
@@ -433,6 +344,11 @@ ObbtDiagnostics apply_obbt_lite(const model::LpProblem& lp,
                 sub.maximize = (sense == 1);
                 sub.c.assign(sz(n), 0.0);
                 sub.c[sz(j)] = 1.0;
+                // This probe optimizes x_j, not the model's original
+                // objective. Retaining obj_offset would shift the reported
+                // extremum before integer rounding and could exclude an
+                // optimal assignment (including a false Optimal proof).
+                sub.obj_offset = 0.0;
                 engines::SimplexOptions so = *lp_opts;
                 so.presolve = false;
                 so.time_limit_s = opts.obbt_lp_time_s;
@@ -441,26 +357,40 @@ ObbtDiagnostics apply_obbt_lite(const model::LpProblem& lp,
                 const core::RawResult raw =
                     engines::solve_simplex(sub, so, sd, nullptr);
                 ++diag.lp_solves;
-                if (raw.proposed_status != core::Status::Optimal) continue;
+                if (raw.proposed_status != core::Status::Optimal ||
+                    !sd.dual_bound_finite ||
+                    !std::isfinite(sd.dual_objective) ||
+                    sd.primal_residual > so.primal_feas_tol ||
+                    sd.dual_residual > so.dual_feas_tol ||
+                    sd.gap_rel > so.gap_tol)
+                    continue;
                 any_lp = true;
-                const f64 val = raw.objective;
+                // OBBT needs a relaxation bound: a lower bound on min x_j
+                // or an upper bound on max x_j. The primal objective has the
+                // opposite guarantee. Use the checked simplex dual value.
+                const f64 val = sd.dual_objective;
+                const f64 margin = std::max(tol,
+                    std::max(so.primal_feas_tol, so.dual_feas_tol) *
+                    (1.0 + std::fabs(val)));
                 if (sense == 0) {
                     // minimize x_j
-                    f64 nl = std::ceil(val - tol);
+                    f64 nl = std::ceil(val - margin);
                     if (is_int_col(lp, j)) {
                         // already ceil
                     } else {
                         nl = val;
                     }
-                    if (nl > col_lo[sz(j)] + tol) {
+                    if (nl > col_lo[sz(j)] + tol &&
+                        nl <= col_hi[sz(j)] + margin) {
                         col_lo[sz(j)] = std::min(nl, col_hi[sz(j)]);
                         ++diag.lp_tightenings;
                         tightened = true;
                     }
                 } else {
-                    f64 nh = std::floor(val + tol);
+                    f64 nh = std::floor(val + margin);
                     if (!is_int_col(lp, j)) nh = val;
-                    if (nh < col_hi[sz(j)] - tol) {
+                    if (nh < col_hi[sz(j)] - tol &&
+                        nh >= col_lo[sz(j)] - margin) {
                         col_hi[sz(j)] = std::max(nh, col_lo[sz(j)]);
                         ++diag.lp_tightenings;
                         tightened = true;
