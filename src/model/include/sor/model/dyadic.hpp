@@ -114,11 +114,28 @@ public:
     // value / divisor rounded toward -inf / +inf (divisor finite, nonzero).
     double quotient_down(double divisor) const { return quotient(divisor, Mode::Down); }
     double quotient_up(double divisor) const { return quotient(divisor, Mode::Up); }
-    // True when the exact value is a binary64 number (stored in `out`).
+    // True when the exact value is a binary64 number (stored in `out`;
+    // unspecified otherwise): its significant bits span at most 53 positions,
+    // none below 2^-1074 and none above 2^1023.
     bool representable(double& out) const {
-        out = nearest();
-        if (!std::isfinite(out)) return false;
-        return compare(out) == 0;
+        DyadicSum copy = *this;
+        copy.normalize();
+        const int s = copy.normalized_sign();
+        if (s == 0) { out = 0.0; return true; }
+        if (s < 0) { copy.negate(); copy.normalize(); }
+        const auto n = static_cast<int>(copy.limbs_.size());
+        if (n > 3) return false;                  // nonzero top and bottom limbs: > 64 bits
+        const int low = kLimbBits * copy.base_ +
+            std::countr_zero(static_cast<std::uint64_t>(copy.limbs_.front()));
+        const int high = kLimbBits * (copy.base_ + n - 1) + 63 -
+            std::countl_zero(static_cast<std::uint64_t>(copy.limbs_.back()));
+        if (high - low >= 53 || low < -1074 || high > 1023) return false;
+        u128 window = 0;
+        for (int q = n; q-- > 0;) window = (window << kLimbBits) | static_cast<std::uint64_t>(copy.limbs_[static_cast<std::size_t>(q)]);
+        const auto mantissa = static_cast<std::uint64_t>(window >> (low - kLimbBits * copy.base_));
+        out = std::ldexp(static_cast<double>(mantissa), low);
+        if (s < 0) out = -out;
+        return true;
     }
     // A screening hint only: the value truncated to 63 significant bits,
     // the same long double ExactSum::approx() gives for the same sum.

@@ -123,6 +123,10 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
                 equality_nnz += matrix.rows[sz(i)].size();
         std::uint64_t operations = 0;
         const std::uint64_t operation_cap = 32 * equality_nnz + 100'000;
+        // Provenance of the trial row: original rows its reduction used, as
+        // an unsorted list deduplicated by stamp (sorted when it is read).
+        std::vector<std::uint32_t> provenance_stamp(sz(matrix.m), 0);
+        std::uint32_t stamp = 0;
         // Exact: is row i a rational combination of rows `support`, rhs included?
         const auto exactly_dependent = [&](Index i, const std::vector<Index>& support) {
             struct Equation { std::map<Index, Rational> entries; Rational rhs; };
@@ -194,6 +198,7 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
             clear_trial();
             for (const auto& [j, a] : matrix.rows[sz(i)]) set_entry(j, to_mod(a));
             std::vector<Index> provenance;
+            ++stamp;
             bool certifiable = true, filled = false;
             const std::size_t fill_cap = matrix.rows[sz(i)].size() +
                 static_cast<std::size_t>(std::max<Offset>(0, options.max_substitution_fill));
@@ -209,15 +214,17 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
                 }
                 certifiable = certifiable && row.certifiable;
                 if (certifiable) {
-                    std::vector<Index> merged;
-                    std::set_union(provenance.begin(), provenance.end(), row.provenance.begin(),
-                                   row.provenance.end(), std::back_inserter(merged));
-                    provenance = std::move(merged);
+                    for (const Index r : row.provenance)
+                        if (provenance_stamp[sz(r)] != stamp) {
+                            provenance_stamp[sz(r)] = stamp;
+                            provenance.push_back(r);
+                        }
                     if (provenance.size() > kProvenanceCap) { certifiable = false; provenance.clear(); }
                 }
                 if (live_entries > fill_cap) { filled = true; break; }
             }
             if (filled) continue;
+            std::sort(provenance.begin(), provenance.end());
             if (live_entries == 0) {
                 // Candidate: verify exactly over the rows the reduction used.
                 if (!certifiable || !exactly_dependent(i, provenance)) continue;
@@ -259,6 +266,20 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
                     const auto& old = matrix.rows[sz(target)];
                     const auto it = old.find(pivot);
                     if (it == old.end()) continue;
+                    // Structural screen: every source entry absent from the
+                    // target becomes a new nonzero (multiplier and coefficient
+                    // are nonzero), and only shared entries can cancel, so a
+                    // sparser row needs more shared entries than new ones.
+                    {
+                        std::size_t shared = 0;
+                        auto o = old.begin();
+                        for (const auto& [j, a] : equation) {
+                            (void)a;
+                            while (o != old.end() && o->first < j) ++o;
+                            if (o != old.end() && o->first == j) ++shared;
+                        }
+                        if (shared <= equation.size() - shared) continue;
+                    }
                     // The multiplier must be a binary64 number exactly. When
                     // the ratio is representable, IEEE division returns it;
                     // the exact product check confirms it.
@@ -306,8 +327,12 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
                         return t.representable(side);
                     };
                     if (!shifted(lower) || !shifted(upper)) continue;
+                    // Only the source's columns can change: record the ones
+                    // that cancel or appear, so the column incidence update
+                    // does not rescan a long target row.
                     FlatMap rewritten;
                     rewritten.v.reserve(old.size());
+                    std::vector<Index> cancelled, appeared;
                     {
                         auto o = old.begin();
                         for (const auto& [j, a] : equation) {
@@ -316,19 +341,15 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
                             f64 value = 0;
                             combined(present ? o->second : 0.0, a, value);
                             if (value != 0) rewritten.v.emplace_back(j, value);
+                            if (present && value == 0) cancelled.push_back(j);
+                            if (!present && value != 0) appeared.push_back(j);
                             if (present) ++o;
                         }
                         for (; o != old.end(); ++o) rewritten.v.push_back(*o);
                     }
                     const auto removed = old.size()-rewritten.size();
-                    for (const auto& [j, a] : old) {
-                        (void)a;
-                        if (rewritten.find(j) == rewritten.end()) matrix.col_rows[sz(j)].erase(target);
-                    }
-                    for (const auto& [j, a] : rewritten) {
-                        (void)a;
-                        if (old.find(j) == old.end()) matrix.col_rows[sz(j)].insert(target);
-                    }
+                    for (const Index j : cancelled) matrix.col_rows[sz(j)].erase(target);
+                    for (const Index j : appeared) matrix.col_rows[sz(j)].insert(target);
                     matrix.rows[sz(target)] = std::move(rewritten);
                     matrix.row_lo[sz(target)] = lower; matrix.row_hi[sz(target)] = upper;
                     DualRecoveryStep journal;
