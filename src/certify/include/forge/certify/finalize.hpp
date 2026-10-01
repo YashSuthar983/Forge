@@ -87,6 +87,9 @@ SafeLpBound exact_dual_lower_bound(const model::LpProblem& problem,
 struct ExactDualAssessment {
     SafeLpBound bound;
     ExactDualSupportFailure failure;
+    // With allowed directions: every permitted improving variable, largest
+    // exact violation first (failure == violations.front() when nonempty).
+    std::vector<ExactDualSupportFailure> violations;
 };
 ExactDualAssessment assess_exact_dual(const model::LpProblem& problem,
                                       const std::vector<std::string>& witness,

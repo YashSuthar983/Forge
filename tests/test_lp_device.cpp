@@ -6,6 +6,7 @@
 #include "test_helpers.hpp"
 
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <sstream>
 
@@ -108,13 +109,89 @@ int main() {
     auto vk = backend::make_vulkan_lp_device();
     if (vk) {
         CHECK(vk->is_accelerated());
-        vk->upload(scaled);
-        vk->init_zero();
-        vk->hpr_steps(10, sp);
-        auto k2 = vk->reduce_kkt();
-        CHECK(std::isfinite(k2.primal_res));
-        // Parity vs CPU on a short run: relative agreement on residuals order.
-        CHECK(std::fabs(k2.primal_res - kkt.primal_res) < 1.0 + 10.0 * kkt.primal_res);
+        // Term-by-term parity with the CPU device: the same operator,
+        // Halpern mix, recursive A x and original-coordinate KKT, so only
+        // summation order may differ.
+        const auto close = [](double a, double b) {
+            if (std::isnan(a) || std::isnan(b)) return std::isnan(a) && std::isnan(b);
+            return std::fabs(a - b) <= 1e-9 * (1.0 + std::fabs(a) + std::fabs(b));
+        };
+        const auto same_kkt = [&](const backend::LpDevice::Kkt& a, const backend::LpDevice::Kkt& b) {
+            CHECK(close(a.primal_res, b.primal_res));
+            CHECK(close(a.dual_res, b.dual_res));
+            CHECK(close(a.primal_obj, b.primal_obj));
+            CHECK(a.dual_bound_finite == b.dual_bound_finite);
+            if (a.dual_bound_finite && b.dual_bound_finite) CHECK(close(a.dual_obj, b.dual_obj));
+            CHECK(close(a.dx_norm, b.dx_norm));
+            CHECK(close(a.dy_norm, b.dy_norm));
+            CHECK(close(a.epoch_dx_norm, b.epoch_dx_norm));
+            CHECK(close(a.epoch_dy_norm, b.epoch_dy_norm));
+            CHECK(close(a.restart_metric, b.restart_metric));
+            const double ra = a.operator_rhs > 0 ? a.operator_lhs / a.operator_rhs : 0;
+            const double rb = b.operator_rhs > 0 ? b.operator_lhs / b.operator_rhs : 0;
+            CHECK(close(ra, rb));
+        };
+        const auto same_iterate = [&](backend::LpDevice& a, backend::LpDevice& b) {
+            backend::LpSolution sa, sb;
+            a.download(sa); b.download(sb);
+            CHECK(sa.x.size() == sb.x.size() && sa.y.size() == sb.y.size());
+            for (std::size_t j = 0; j < sa.x.size() && j < sb.x.size(); ++j) {
+                CHECK(close(sa.x[j], sb.x[j]));
+                CHECK(close(sa.x_avg[j], sb.x_avg[j]));
+            }
+            for (std::size_t i = 0; i < sa.y.size() && i < sb.y.size(); ++i) {
+                CHECK(close(sa.y[i], sb.y[i]));
+                CHECK(close(sa.y_avg[i], sb.y_avg[i]));
+            }
+        };
+        backend::StepParams hp = sp;
+        hp.use_halpern = true;
+        hp.use_reflection = true;
+        hp.reflection_gamma = 1.0;
+        hp.primal_weight = 2.0;
+        for (backend::LpDevice* d : {cpu.get(), vk.get()}) {
+            d->upload(scaled);
+            d->init_zero();
+            d->hpr_steps(10, sp);
+        }
+        same_kkt(cpu->reduce_kkt(), vk->reduce_kkt());
+        // Halpern epoch, restart to T(z), checkpoint and rollback.
+        for (backend::LpDevice* d : {cpu.get(), vk.get()}) {
+            d->snapshot_anchor();
+            d->hpr_steps(15, hp);
+        }
+        same_kkt(cpu->reduce_kkt(), vk->reduce_kkt());
+        same_iterate(*cpu, *vk);
+        for (backend::LpDevice* d : {cpu.get(), vk.get()}) {
+            d->restart_to(backend::RestartPoint::Current);
+            CHECK(d->snapshot_step_checkpoint());
+            d->hpr_steps(7, hp);
+            CHECK(d->restore_step_checkpoint());
+            d->hpr_steps(5, hp);
+        }
+        same_kkt(cpu->reduce_kkt(), vk->reduce_kkt());
+        same_iterate(*cpu, *vk);
+        // Averages restart and warm start.
+        for (backend::LpDevice* d : {cpu.get(), vk.get()}) {
+            sp.update_average = true;
+            d->hpr_steps(6, sp);
+            d->restart_to(backend::RestartPoint::Average);
+            d->hpr_steps(4, hp);
+        }
+        same_kkt(cpu->reduce_kkt(), vk->reduce_kkt());
+        backend::LpSolution start;
+        cpu->download(start);
+        for (backend::LpDevice* d : {cpu.get(), vk.get()}) {
+            CHECK(d->init_iterate(start.x, start.y));
+            d->hpr_steps(8, hp);
+        }
+        same_kkt(cpu->reduce_kkt(), vk->reduce_kkt());
+        same_iterate(*cpu, *vk);
+        CHECK(vk->capabilities().transactional_step);
+        // A KKT check moves only its scalars across the bus.
+        vk->reset_stats();
+        (void)vk->reduce_kkt();
+        CHECK(vk->transfer_stats().d2h_bytes <= 128);
     }
 
     // A negative nonzero scaled cost on an unbounded column has no finite

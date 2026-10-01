@@ -1,10 +1,10 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
 
-// Folds every workgroup partial into the eight doubles that are the ONLY
+// Folds every workgroup partial into the ten doubles that are the ONLY
 // thing the KKT check moves across the bus.  Everything the HPR engine reads
-// off LpDevice::Kkt is either one of these eight or derivable from them on
-// the host, so a convergence check costs 64 bytes regardless of problem size.
+// off LpDevice::Kkt is either one of these ten or derivable from them on
+// the host, so a convergence check costs 80 bytes regardless of problem size.
 
 layout(local_size_x = 256) in;
 
@@ -91,4 +91,6 @@ void main() {
     kkt[5] = sqrt(edy2);
     kkt[6] = sqrt(w * acc[ACC_DX2] + acc[ACC_DY2] / w);
     kkt[7] = acc[ACC_RATIO];
+    kkt[8] = sqrt(acc[ACC_DX2]);   // last step's fixed-point movement
+    kkt[9] = sqrt(acc[ACC_DY2]);
 }
