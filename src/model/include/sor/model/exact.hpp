@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <limits>
+#include <string_view>
 
 namespace sor::model {
 // Exact arithmetic on the parsed binary64 model, independent of rounding mode.
@@ -13,6 +14,27 @@ using Rational = boost::multiprecision::cpp_rational;
 // A binary64 product has at most 106 significand bits and exponent >= -2148.
 // Align only to the smallest exponent actually encountered, avoiding a fixed
 // 2148-bit shift for ordinary LP coefficients. Normalize once per completed sum.
+// Decimal integer text (optional leading '-', digits only; the caller
+// validates the token). Eighteen digits per big-integer step: the digit-at-a-
+// time form is quadratic in the digit count, and exact certificate tokens run
+// to thousands of digits (certificate pricing re-reads every token per check).
+inline boost::multiprecision::cpp_int parse_decimal_integer(std::string_view digits) {
+    boost::multiprecision::cpp_int value = 0;
+    const bool negative = !digits.empty() && digits.front() == '-';
+    std::uint64_t chunk = 0, scale = 1;
+    for (std::size_t k = negative ? 1 : 0; k < digits.size(); ++k) {
+        chunk = chunk * 10 + static_cast<std::uint64_t>(digits[k] - '0');
+        scale *= 10;
+        if (scale == 1000000000000000000ull) {
+            value = value * scale + chunk;
+            chunk = 0;
+            scale = 1;
+        }
+    }
+    if (scale != 1) value = value * scale + chunk;
+    return negative ? boost::multiprecision::cpp_int(-value) : value;
+}
+
 class ExactSum {
     static_assert(std::numeric_limits<double>::is_iec559 &&
                   std::numeric_limits<double>::digits == 53);
@@ -49,6 +71,9 @@ public:
         else if (exponent_ < other.exponent_) right <<= other.exponent_ - exponent_;
         return left > right;
     }
+    // value() == mantissa() * 2^exponent(), without normalization.
+    const boost::multiprecision::cpp_int& mantissa() const { return sum_; }
+    int exponent() const { return exponent_; }
     Rational value() const {
         if (exponent_ >= 0) return Rational(sum_ << exponent_);
         return Rational(sum_) / Rational(boost::multiprecision::cpp_int(1) << -exponent_);

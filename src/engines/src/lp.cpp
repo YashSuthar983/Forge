@@ -6,8 +6,10 @@
 #include "sor/engines/crossover.hpp"
 #include "sor/engines/hpr.hpp"
 #include "sor/engines/pdhg.hpp"
+#include "sor/engines/qp.hpp"
 #include "sor/engines/simplex.hpp"
 #include "sor/presolve/presolve.hpp"
+#include "simplex_prepared.hpp"
 
 #include <algorithm>
 #include <optional>
@@ -189,7 +191,8 @@ std::optional<core::RawResult> presolve_terminal_raw(
 }
 
 bool route_uses_fo_presolve_probe(core::LpStrategy route) {
-    return route == LpStrategy::Hpr || route == LpStrategy::Pdhg;
+    return route == LpStrategy::Hpr || route == LpStrategy::Pdhg ||
+           route == LpStrategy::Barrier;
 }
 
 presolve::PresolveRecoveryOptions recovery_options(
@@ -220,7 +223,8 @@ std::pair<core::RawResult, core::ProofEvidence> lift_reduced_candidate(
     core::RawResult raw,
     const core::LpOptions& options,
     const core::ProofEvidence& producer_ev,
-    const SimplexBasis* reduced_basis = nullptr) {
+    const SimplexBasis* reduced_basis = nullptr,
+    SimplexBasis* lifted_basis = nullptr) {
     if (raw.proposed_status == core::Status::Unbounded &&
         !raw.primal_ray.direction.empty()) {
         raw.primal_ray = presolve::recover_primal_ray(
@@ -239,6 +243,15 @@ std::pair<core::RawResult, core::ProofEvidence> lift_reduced_candidate(
         install_reduced_basis(reduced, *reduced_basis);
     const auto recovered = presolve::recover_solution(
         original, pmap, reduced, recovery_options(options));
+    if (lifted_basis != nullptr) {
+        *lifted_basis = SimplexBasis{};
+        if (!recovered.basis.status.empty()) {
+            lifted_basis->n_struct = recovered.basis.n_struct;
+            lifted_basis->basic = recovered.basis.basic;
+            for (const auto status : recovered.basis.status)
+                lifted_basis->status.push_back(static_cast<NonbasicStatus>(status));
+        }
+    }
     core::RawResult lifted = std::move(recovered.raw);
     lifted.proposed_status = raw.proposed_status;
     lifted.proposed_level = raw.proposed_level;
@@ -274,6 +287,77 @@ std::pair<core::RawResult, core::ProofEvidence> lift_reduced_candidate(
     return {std::move(lifted), ev};
 }
 
+// A lifted crossover candidate can be primal and dual feasible on the
+// original model while its postsolved duals leave a loose Lagrangian bound
+// (80bau3b through barrier: residuals 1e-12, gap 0.16). The simplex route
+// closes the same situation after its own postsolve; this is that closure
+// for the FO and barrier routes: the exact basis dual repair, the support
+// repair, then a bounded warm primal continuation with exact certificate
+// pricing from the lifted basis. Every candidate is accepted only through the
+// independent original-model check.
+std::pair<core::RawResult, core::ProofEvidence> close_lifted_certificate(
+    const model::LpProblem& problem, const core::LpOptions& options,
+    const SimplexOptions* simplex_policy, double time_limit_s,
+    std::uint64_t iteration_limit, core::RawResult raw, core::ProofEvidence ev,
+    const SimplexBasis& basis) {
+    if (proved_basis(raw, ev) || basis.status.empty() ||
+        raw.proposed_status != core::Status::Optimal ||
+        (options.time_limit_s > 0 && time_limit_s <= 0)) return {std::move(raw), ev};
+    const auto started = Clock::now();
+    SimplexOptions policy = simplex_policy ? *simplex_policy : SimplexOptions{};
+    policy.presolve = false;
+    policy.primal_feas_tol = options.primal_feas_tol;
+    policy.dual_feas_tol = options.dual_feas_tol;
+    policy.gap_tol = options.gap_tol;
+    policy.time_limit_s = time_limit_s;
+    policy.max_iterations = iteration_limit;
+    const auto remaining = [&] {
+        return time_limit_s > 0 ? std::max(std::numeric_limits<double>::min(),
+            time_limit_s - elapsed_seconds(started)) : 0.0;
+    };
+    const auto accept = [&](const core::RawResult& candidate, const SimplexDiagnostics& diag) {
+        auto proposal = simplex_evidence(diag, policy);
+        proposal.has_basis = true;
+        proposal.claimed_level = std::max(proposal.claimed_level, ev.claimed_level);
+        const auto checked = independently_checked(problem, candidate, proposal);
+        return std::make_pair(proved_basis(candidate, checked), checked);
+    };
+    SimplexDiagnostics diag;
+    diag.primal_residual = ev.max_primal_violation;
+    diag.dual_residual = ev.max_dual_violation;
+    diag.dual_bound_finite = std::isfinite(raw.dual_bound);
+    diag.gap_rel = ev.gap_rel;
+    raw.certificate_basis = basis.basic;
+    if (!problem.maximize) {
+        auto repaired = raw;
+        policy.time_limit_s = remaining();
+        if (!diag.dual_bound_finite || diag.gap_rel > policy.gap_tol)
+            repair_simplex_dual(problem, repaired, policy, diag);
+        if (diag.dual_bound_finite && diag.gap_rel > policy.gap_tol &&
+            (time_limit_s <= 0 || elapsed_seconds(started) < time_limit_s)) {
+            policy.time_limit_s = remaining();
+            repair_simplex_support(problem, repaired, policy, diag);
+        }
+        if (auto [proved, checked] = accept(repaired, diag); proved)
+            return {std::move(repaired), checked};
+    }
+    if (time_limit_s > 0 && elapsed_seconds(started) >= time_limit_s) return {std::move(raw), ev};
+    SimplexOptions continuation = policy;
+    continuation.method = SimplexMethod::Primal;
+    continuation.certificate_pricing = true;
+    continuation.time_limit_s = remaining();
+    continuation.max_iterations = iteration_limit == 0 ? simplex_certificate_pivot_allowance
+        : std::min<std::uint64_t>(iteration_limit, simplex_certificate_pivot_allowance);
+    SimplexDiagnostics continuation_diag;
+    SimplexBasis repaired_basis;
+    auto candidate = solve_primal_simplex(problem, continuation, continuation_diag,
+                                          &repaired_basis, &basis);
+    candidate.iterations += raw.iterations;
+    if (auto [proved, checked] = accept(candidate, continuation_diag); proved)
+        return {std::move(candidate), checked};
+    return {std::move(raw), ev};
+}
+
 void install_budget_split(core::LpAutoBudgetSplit split,
                           core::LpDiagnostics& diagnostics) {
     switch (split) {
@@ -293,6 +377,52 @@ void install_budget_split(core::LpAutoBudgetSplit split,
             diagnostics.simplex_budget_fraction = 0.05;
             break;
     }
+}
+
+// LP barrier: the convex-QP interior point (Mehrotra predictor-corrector with
+// Gondzio correctors over a quasi-definite LDL') applied with Q = 0. The IPM
+// only minimizes and reports duals in the opposite sign to this module's LP
+// convention; both are mapped here. Its claim is advisory: only the
+// independent LP checker and crossover decide what the point proves.
+core::RawResult solve_lp_barrier(const model::LpProblem& problem,
+                                 const core::LpOptions& options, double time_limit_s,
+                                 core::ProofEvidence& producer) {
+    QpProblem qp;
+    qp.linear = problem;
+    qp.q_diag.assign(static_cast<std::size_t>(problem.n_cols()), 0.0);   // Q = 0, diagonal form
+    const double sense = problem.maximize ? -1.0 : 1.0;
+    if (problem.maximize) {
+        qp.linear.maximize = false;
+        for (auto& c : qp.linear.c) c = -c;
+        qp.linear.obj_offset = -qp.linear.obj_offset;
+    }
+    QpOptions ipm;
+    ipm.time_limit_s = time_limit_s;
+    if (options.max_iterations > 0) ipm.max_iterations = options.max_iterations;
+    ipm.feas_tol = options.primal_feas_tol;
+    ipm.stationarity_tol = options.dual_feas_tol;
+    ipm.gap_tol = options.gap_tol;
+    ipm.assume_psd = true;   // Q = 0
+    QpDiagnostics diag;
+    core::RawResult raw = solve_qp_ipm(qp, ipm, diag);
+    raw.engine = "barrier";
+    for (auto& y : raw.y) y = -sense * y;
+    if (std::isfinite(raw.objective)) raw.objective = sense * raw.objective;
+    if (std::isfinite(raw.dual_bound)) raw.dual_bound = sense * raw.dual_bound;
+    if (raw.proposed_status == core::Status::Optimal) raw.proposed_status = core::Status::Feasible;
+    raw.proposed_level = core::ProofLevel::None;
+    producer = core::ProofEvidence{};
+    producer.has_basis = false;
+    producer.claimed_level = diag.gap_finite ? core::ProofLevel::FeasibleWithGap
+                                             : core::ProofLevel::FeasibleOnly;
+    producer.checker_passed = diag.primal_residual <= options.primal_feas_tol;
+    producer.max_primal_violation = diag.primal_residual;
+    producer.max_dual_violation = diag.stationarity;
+    producer.gap_rel = diag.gap_rel;
+    producer.primal_feas_tol = options.primal_feas_tol;
+    producer.dual_feas_tol = options.dual_feas_tol;
+    producer.gap_tol = options.gap_tol;
+    return raw;
 }
 
 }  // namespace
@@ -388,6 +518,10 @@ core::RawResult solve_lp(const model::LpProblem& problem,
                          const PdhgOptions* pdhg_policy) {
     problem.validate();
     model::validate_lp_policy(options.primal_feas_tol, options.dual_feas_tol, options.gap_tol, options.time_limit_s);
+    if (options.concurrent_solves < 1 || options.concurrent_solves > 16)
+        throw std::invalid_argument("LP concurrent_solves must be in [1,16]");
+    if (options.concurrent_solves > 1)
+        return solve_lp_concurrent(problem, options, diagnostics, evidence, simplex_policy);
     const auto start = Clock::now();
     diagnostics = LpDiagnostics{};
     diagnostics.requested_strategy = options.strategy;
@@ -481,41 +615,52 @@ core::RawResult solve_lp(const model::LpProblem& problem,
         return finish(std::move(raw), ev);
     }
 
-    if (route == LpStrategy::Pdhg) {
-        const double stage_time = remaining_seconds(options, start, options.fo_crossover ? diagnostics.fo_budget_fraction : 1.0);
+    if (route == LpStrategy::Pdhg || route == LpStrategy::Barrier) {
+        const bool barrier = route == LpStrategy::Barrier;
+        // An interior point is a second-order method: it converges in tens
+        // of Newton steps or not at all, so it keeps the budget it needs and
+        // crossover takes what is left.
+        const double stage_time = remaining_seconds(options, start,
+            options.fo_crossover && !barrier ? diagnostics.fo_budget_fraction : 1.0);
         if (options.time_limit_s > 0.0 && stage_time <= 0.0) {
             core::RawResult raw;
             raw.proposed_status = core::Status::Interrupted;
-            raw.engine = "pdhg";
-            raw.termination_reason = "global time limit reached before PDHG";
+            raw.engine = barrier ? "barrier" : "pdhg";
+            raw.termination_reason = barrier ? "global time limit reached before barrier"
+                                             : "global time limit reached before PDHG";
             core::ProofEvidence ev;
             ev.primal_feas_tol = options.primal_feas_tol;
             ev.dual_feas_tol = options.dual_feas_tol;
             ev.gap_tol = options.gap_tol;
             return finish(std::move(raw), ev);
         }
-        auto backend = backend::make_backend(options.backend);
-        if (!backend) return unsupported(
-            "selected backend is unavailable for PDHG", diagnostics, evidence);
-        PdhgOptions pdhg_options = pdhg_policy ? *pdhg_policy : PdhgOptions{};
-        if (options.max_iterations > 0)
-            pdhg_options.max_iterations = iteration_share(options.max_iterations, options.fo_crossover ? diagnostics.fo_budget_fraction : 1.0, 100000);
-        pdhg_options.time_limit_s = stage_time;
-        if (simplex_policy && !pdhg_policy) {
-            pdhg_options.ruiz_iterations = simplex_policy->ruiz_iterations;
-            pdhg_options.use_pock_chambolle = simplex_policy->ruiz_iterations > 0;
-        }
-        pdhg_options.primal_tol = options.primal_feas_tol;
-        pdhg_options.dual_tol = options.dual_feas_tol;
-        pdhg_options.gap_tol = options.gap_tol;
-        PdhgDiagnostics pdhg_diag;
+        core::RawResult raw;
+        core::ProofEvidence producer_ev;
         const auto fo_start = Clock::now();
-        core::RawResult raw = solve_pdhg(
-            work_problem, pdhg_options, *backend, pdhg_diag);
+        if (barrier) {
+            raw = solve_lp_barrier(work_problem, options, stage_time, producer_ev);
+        } else {
+            auto backend = backend::make_backend(options.backend);
+            if (!backend) return unsupported(
+                "selected backend is unavailable for PDHG", diagnostics, evidence);
+            PdhgOptions pdhg_options = pdhg_policy ? *pdhg_policy : PdhgOptions{};
+            if (options.max_iterations > 0)
+                pdhg_options.max_iterations = iteration_share(options.max_iterations, options.fo_crossover ? diagnostics.fo_budget_fraction : 1.0, 100000);
+            pdhg_options.time_limit_s = stage_time;
+            if (simplex_policy && !pdhg_policy) {
+                pdhg_options.ruiz_iterations = simplex_policy->ruiz_iterations;
+                pdhg_options.use_pock_chambolle = simplex_policy->ruiz_iterations > 0;
+            }
+            pdhg_options.primal_tol = options.primal_feas_tol;
+            pdhg_options.dual_tol = options.dual_feas_tol;
+            pdhg_options.gap_tol = options.gap_tol;
+            PdhgDiagnostics pdhg_diag;
+            raw = solve_pdhg(work_problem, pdhg_options, *backend, pdhg_diag);
+            producer_ev = pdhg_evidence(pdhg_diag, pdhg_options);
+        }
         diagnostics.fo_elapsed_s = elapsed_seconds(fo_start);
-        core::ProofEvidence producer_ev = pdhg_evidence(pdhg_diag, pdhg_options);
         auto checked = independently_checked(work_problem, raw, producer_ev);
-        diagnostics.fo_iterations = pdhg_diag.iterations;
+        diagnostics.fo_iterations = raw.iterations;
         SimplexBasis crossed_basis;
         if (options.fo_crossover && !raw.x.empty()) {
             const double cleanup_time = remaining_seconds(options, start);
@@ -530,6 +675,7 @@ core::RawResult solve_lp(const model::LpProblem& problem,
                 cross.max_iterations = remaining_iterations;
                 cross.time_limit_s = cleanup_time;
                 cross.fo_budget_ended = raw.proposed_status == core::Status::Interrupted;
+                cross.interior_point_start = barrier;
                 CrossoverDiagnostics cd;
                 const auto cross_start = Clock::now();
                 auto crossed = crossover_to_simplex(work_problem, raw, cross, cd, &crossed_basis);
@@ -552,8 +698,20 @@ core::RawResult solve_lp(const model::LpProblem& problem,
             }
         }
         if (presolve_map != nullptr) {
+            SimplexBasis lifted_basis;
             auto lifted = lift_reduced_candidate(problem, *presolve_map, std::move(raw), options,
-                producer_ev, crossed_basis.status.empty() ? nullptr : &crossed_basis);
+                producer_ev, crossed_basis.status.empty() ? nullptr : &crossed_basis,
+                &lifted_basis);
+            if (!crossed_basis.status.empty()) {
+                const auto closure_start = Clock::now();
+                const auto iterations_used = diagnostics.fo_iterations + diagnostics.crossover_iterations;
+                lifted = close_lifted_certificate(problem, options, simplex_policy,
+                    remaining_seconds(options, start),
+                    options.max_iterations == 0 ? 0 : options.max_iterations -
+                        std::min(options.max_iterations, iterations_used),
+                    std::move(lifted.first), lifted.second, lifted_basis);
+                diagnostics.simplex_elapsed_s = elapsed_seconds(closure_start);
+            }
             return finish(std::move(lifted.first), lifted.second);
         }
         return finish(std::move(raw), checked);

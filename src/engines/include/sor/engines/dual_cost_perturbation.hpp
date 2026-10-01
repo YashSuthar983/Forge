@@ -31,7 +31,7 @@ bool build_dual_perturbed_costs(
     core::f64 multiplier,
     core::f64 infinity,
     std::vector<core::f64>& perturbed,
-    DualCostPerturbationStats* stats = nullptr);
+    DualCostPerturbationStats* stats = nullptr, std::uint64_t seed = 0);
 
 // Koberstein (2005 thesis, §6.3.1) cost perturbation magnitude and sign for
 // one structural column, steps 1-4 of the thesis:

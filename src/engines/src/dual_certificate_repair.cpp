@@ -4,6 +4,8 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 namespace sor::engines {
 
@@ -57,13 +59,29 @@ bool refined_basis_dual(const model::LpProblem& p, core::RawResult& raw,
     const auto refine = [&](const std::vector<Rational>& target, std::vector<Rational>& y) {
         std::vector<Rational> residual(m);
         std::vector<double> correction(m);
+        using Integer = boost::multiprecision::cpp_int;
+        std::vector<Integer> scaled_y(m);
         for (int round = 0; round < 8; ++round) {
             if (expired()) return false;
+            // Every iterate is dyadic: it starts from binary64 values and
+            // receives products of binary64 corrections. Share its largest
+            // denominator instead of normalizing a rational product at every
+            // matrix entry. ExactSum retains the identical exact residual.
+            Integer common = 1;
+            for (const auto& value : y)
+                common = std::max(common, Integer(denominator(value)));
+            for (std::size_t i = 0; i < m; ++i)
+                scaled_y[i] = numerator(y[i]) * (common / denominator(y[i]));
             double scale = 0;
             for (std::size_t k = 0; k < m; ++k) {
-                residual[k] = target[k];
+                if ((k % 64) == 0 && expired()) return false;
+                model::ExactSum sum;
+                // Targets are original binary64 costs or integer sign costs.
+                sum.add_scaled_product(target[k].convert_to<double>(), common);
                 for (auto z = bp[k]; z < bp[k+1]; ++z)
-                    residual[k] -= Rational(bv[static_cast<std::size_t>(z)]) * y[static_cast<std::size_t>(br[static_cast<std::size_t>(z)])];
+                    sum.add_scaled_product(-bv[static_cast<std::size_t>(z)],
+                        scaled_y[static_cast<std::size_t>(br[static_cast<std::size_t>(z)])]);
+                residual[k] = sum.value() / Rational(common);
                 scale = std::max(scale, std::fabs(residual[k].convert_to<double>()));
             }
             if (scale == 0) return true;
@@ -143,7 +161,13 @@ bool repair_simplex_dual(const model::LpProblem& p, core::RawResult& raw,
             std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() : 0;
     };
     if (raw.exact_dual.empty()) {
-        if (refined_basis_dual(p, raw, opts, diag)) return true;
+        const auto refinement_started = std::chrono::steady_clock::now();
+        const bool refined = refined_basis_dual(p, raw, opts, diag);
+        if (std::getenv("SOR_CERTIFICATE_DEBUG"))
+            std::fprintf(stderr, "certificate dyadic refinement: m=%zu n=%zu accepted=%d elapsed=%.6f\n",
+                m, n, refined ? 1 : 0,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - refinement_started).count());
+        if (refined) return true;
         if (opts.time_limit_s > 0 && remaining() <= 0) return false;
         certify::repair_basis_certificate(p, raw,
             {.time_limit_s = remaining()});

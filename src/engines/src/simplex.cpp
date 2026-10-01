@@ -1,6 +1,8 @@
 #include "sor/engines/simplex.hpp"
+#include "sor/la/basis_numerics.hpp"
 #include "sor/engines/dual_simplex.hpp"
 #include "simplex_prepared.hpp"
+#include "triangular_crash.hpp"
 #include "sor/certify/finalize.hpp"
 #include "sor/model/exact.hpp"
 
@@ -14,6 +16,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string_view>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -287,6 +290,9 @@ void accumulate_work(SimplexDiagnostics& total,
     total.phase2_iterations += stage.phase2_iterations;
     total.bound_flips       += stage.bound_flips;
     total.refactorizations  += stage.refactorizations;
+    total.residual_refactors += stage.residual_refactors;
+    total.numerical_zero_dual_steps += stage.numerical_zero_dual_steps;
+    total.refinement_corrections += stage.refinement_corrections;
     total.factor_adoptions  += stage.factor_adoptions;
     total.objective_limit_exits += stage.objective_limit_exits;
     total.objective_limit_checks += stage.objective_limit_checks;
@@ -323,6 +329,7 @@ void accumulate_work(SimplexDiagnostics& total,
         total.primal_price_heap_max_size, stage.primal_price_heap_max_size);
     total.primal_ftran_dense_switches += stage.primal_ftran_dense_switches;
     total.primal_crash_columns += stage.primal_crash_columns;
+    total.dual_crash_columns += stage.dual_crash_columns;
     total.primal_crash_infeasibility_before +=
         stage.primal_crash_infeasibility_before;
     total.primal_crash_infeasibility_after +=
@@ -451,6 +458,9 @@ void install_work_totals(SimplexDiagnostics& chosen,
     chosen.phase2_iterations = total.phase2_iterations;
     chosen.bound_flips        = total.bound_flips;
     chosen.refactorizations   = total.refactorizations;
+    chosen.residual_refactors = total.residual_refactors;
+    chosen.numerical_zero_dual_steps = total.numerical_zero_dual_steps;
+    chosen.refinement_corrections = total.refinement_corrections;
     chosen.factor_adoptions = total.factor_adoptions;
     chosen.objective_limit_exits = total.objective_limit_exits;
     chosen.objective_limit_checks = total.objective_limit_checks;
@@ -484,6 +494,7 @@ void install_work_totals(SimplexDiagnostics& chosen,
     chosen.primal_price_heap_max_size = total.primal_price_heap_max_size;
     chosen.primal_ftran_dense_switches = total.primal_ftran_dense_switches;
     chosen.primal_crash_columns = total.primal_crash_columns;
+    chosen.dual_crash_columns = total.dual_crash_columns;
     chosen.primal_crash_infeasibility_before =
         total.primal_crash_infeasibility_before;
     chosen.primal_crash_infeasibility_after =
@@ -876,6 +887,7 @@ bool detail::prefer_simplex_candidate(const core::RawResult& candidate,
 
 SimplexPrepared prepare_simplex_model(const model::LpProblem& problem,
                                       const SimplexOptions& opts) {
+    validate_simplex_numerics(opts);
     SOR_FN();
     problem.validate(/*allow_empty_domains=*/true);
     model::validate_lp_policy(opts.primal_feas_tol, opts.dual_feas_tol, opts.gap_tol, opts.time_limit_s);
@@ -889,14 +901,27 @@ SimplexPrepared prepare_simplex_model(const model::LpProblem& problem,
     }
     out.scaled = out.pmin;
     const auto t_scale = Clock::now();
-    out.scaling = ruiz_scale(out.scaled, opts.ruiz_iterations,
-                             opts.ruiz_power_of_two);
+    try {
+        out.scaling = ruiz_scale(out.scaled, opts.ruiz_iterations,
+                                 opts.ruiz_power_of_two);
+    } catch (const std::invalid_argument& error) {
+        if (std::string_view(error.what()) != "Ruiz scaling: overflow or underflow") throw;
+        // Equilibration is optional. A valid finite model can have an endpoint
+        // whose scaled representation overflows or loses a nonzero value.
+        // Discard the entire partial transformation rather than changing that
+        // endpoint or allowing a heuristic LP to abort the enclosing solve.
+        out.scaled = out.pmin;
+        out.scaling.row_scale.assign(sz(problem.n_rows()), 1.0);
+        out.scaling.col_scale.assign(sz(problem.n_cols()), 1.0);
+    }
     out.factor_scaling_identity = std::make_shared<const FactorScalingIdentity>(
         FactorScalingIdentity{out.scaling.row_scale, out.scaling.col_scale,
                               opts.ruiz_iterations, opts.ruiz_power_of_two});
     out.scaling_ms = ms_since(t_scale);
     const auto t_csc = Clock::now();
     out.csc = sparse::to_csc(out.scaled.A);
+    out.pricing_plan.build(out.scaled.n_cols(), out.scaled.n_rows(),
+        out.csc.pattern.col_ptr(), out.csc.pattern.row_idx(), out.csc.vals);
     out.csc_ms = ms_since(t_csc);
 
     const Index m = out.scaled.n_rows();
@@ -947,8 +972,19 @@ SimplexPrepared prepare_simplex_model(const model::LpProblem& problem,
 core::RawResult solve_primal_simplex_prepared(
     const SimplexPrepared& prepared, const SimplexOptions& opts,
     SimplexDiagnostics& diag, SimplexBasis* out_basis,
-    const SimplexBasis* warm, FactorCarrier* out_factor) {
+    const SimplexBasis* warm, FactorCarrier* out_factor,
+    const PrimalCleanupState* cleanup_state) {
     SOR_FN();
+    la::BasisFactor incoming_factor;
+    bool incoming_valid = false;
+    if (out_factor && out_factor->has_factor && warm &&
+        out_factor->basis == warm->basic &&
+        out_factor->scaling_identity == prepared.factor_scaling_identity &&
+        out_factor->factor.is_valid() &&
+        out_factor->factor.dimension() == prepared.scaled.n_rows()) {
+        incoming_factor = std::move(out_factor->factor);
+        incoming_valid = true;
+    }
     if (out_factor) {
         out_factor->has_factor = false;
         out_factor->basis.clear();
@@ -1123,150 +1159,12 @@ core::RawResult solve_primal_simplex_prepared(
     std::vector<f64> crash_value_save;
     bool crash_snapshot_valid = false;
     if (!warm_installed && opts.primal_crash && m > 0 && ns > 0) {
-        const auto& rp = p.A.pattern.row_ptr();
-        const auto& ci = p.A.pattern.col_idx();
-        const auto& vv = p.A.vals;
-        std::vector<f64> activity(sz(m), 0.0);
-        std::vector<f64> row_max(sz(m), 0.0), col_max(sz(ns), 0.0);
-        for (Index i = 0; i < m; ++i) {
-            for (Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
-                const Index j = ci[sz(k)];
-                const f64 a = vv[sz(k)];
-                activity[sz(i)] += a * value[sz(j)];
-                row_max[sz(i)] = std::max(row_max[sz(i)], std::fabs(a));
-                col_max[sz(j)] = std::max(col_max[sz(j)], std::fabs(a));
-            }
-        }
-        const auto row_violation = [&](Index i, f64 a) {
-            SOR_FN();
-            const f64 l = lo[sz(ns + i)], u = hi[sz(ns + i)];
-            const f64 t = ptol[sz(ns + i)];
-            if (l > -kInf && a < l - t) return l - a;
-            if (u <  kInf && a > u + t) return a - u;
-            return 0.0;
-        };
-        const auto total_violation = [&]() {
-            SOR_FN();
-            f64 total = 0.0;
-            for (Index i = 0; i < m; ++i)
-                if (st[sz(ns + i)] == NonbasicStatus::Basic)
-                    total += row_violation(i, activity[sz(i)]);
-            return total;
-        };
-
-        diag.primal_crash_infeasibility_before = total_violation();
-        // Snapshot the all-logical start so a crash that does not improve
-        // total merit (or that later fails factorization) can be refused.
-        crash_basis_save = basis;
-        crash_slot_save = slot_of;
-        crash_st_save = st;
-        crash_value_save = value;
-        crash_snapshot_valid = true;
-        const std::vector<f64> crash_activity_save = activity;
-        std::vector<Index> order(sz(m));
-        for (Index i = 0; i < m; ++i) order[sz(i)] = i;
-        std::stable_sort(order.begin(), order.end(), [&](Index a, Index b) {
-            SOR_FN();
-            return row_violation(a, activity[sz(a)]) >
-                   row_violation(b, activity[sz(b)]);
-        });
-        std::vector<char> claimed_row(sz(m), 0);
-
-        for (const Index i : order) {
-            const f64 old_i = row_violation(i, activity[sz(i)]);
-            if (!(old_i > 0.0)) continue;
-            const f64 target = activity[sz(i)] < lo[sz(ns + i)]
-                                   ? lo[sz(ns + i)]
-                                   : hi[sz(ns + i)];
-            Index best_j = -1;
-            f64 best_delta = 0.0;
-            f64 best_gain = 0.0;
-            f64 best_score = 0.0;
-
-            for (Offset rk = rp[sz(i)]; rk < rp[sz(i) + 1]; ++rk) {
-                const Index j = ci[sz(rk)];
-                const f64 aij = vv[sz(rk)];
-                if (st[sz(j)] == NonbasicStatus::Basic ||
-                    lo[sz(j)] == hi[sz(j)])
-                    continue;
-                const f64 scale = std::max(row_max[sz(i)], col_max[sz(j)]);
-                if (!(std::fabs(aij) >= 1e-4 * scale)) continue;
-
-                // Preserve the triangular construction exactly: numerical
-                // smallness is insufficient because factorization sees the
-                // stored coefficient, not our intent.
-                bool touches_claimed = false;
-                for (Offset ck = acp[sz(j)]; ck < acp[sz(j) + 1]; ++ck) {
-                    if (claimed_row[sz(ari[sz(ck)])]) {
-                        touches_claimed = true;
-                        break;
-                    }
-                }
-                if (touches_claimed) continue;
-
-                const f64 delta = (target - activity[sz(i)]) / aij;
-                const f64 next = value[sz(j)] + delta;
-                if (!std::isfinite(next) ||
-                    (lo[sz(j)] > -kInf && next < lo[sz(j)] - ptol[sz(j)]) ||
-                    (hi[sz(j)] <  kInf && next > hi[sz(j)] + ptol[sz(j)]))
-                    continue;
-
-                f64 gain = 0.0;
-                for (Offset ck = acp[sz(j)]; ck < acp[sz(j) + 1]; ++ck) {
-                    const Index r = ari[sz(ck)];
-                    if (claimed_row[sz(r)]) continue;
-                    const f64 before = row_violation(r, activity[sz(r)]);
-                    const f64 after = row_violation(
-                        r, activity[sz(r)] + ac.vals[sz(ck)] * delta);
-                    gain += before - after;
-                }
-                if (!(gain > 1e-12 * (1.0 + old_i))) continue;
-                const f64 score = gain /
-                    (1.0 + 0.02 * static_cast<f64>(
-                        acp[sz(j) + 1] - acp[sz(j)] - 1));
-                if (score > best_score ||
-                    (score == best_score && (best_j < 0 || j < best_j))) {
-                    best_j = j;
-                    best_delta = delta;
-                    best_gain = gain;
-                    best_score = score;
-                }
-            }
-            if (best_j < 0 || !(best_gain > 0.0)) continue;
-
-            for (Offset ck = acp[sz(best_j)]; ck < acp[sz(best_j) + 1]; ++ck)
-                activity[sz(ari[sz(ck)])] += ac.vals[sz(ck)] * best_delta;
-            const Index logical = ns + i;
-            basis[sz(i)] = best_j;
-            slot_of[sz(best_j)] = i;
-            st[sz(best_j)] = NonbasicStatus::Basic;
-            slot_of[sz(logical)] = -1;
-            if (target == lo[sz(logical)]) {
-                st[sz(logical)] = NonbasicStatus::AtLower;
-                value[sz(logical)] = lo[sz(logical)];
-            } else {
-                st[sz(logical)] = NonbasicStatus::AtUpper;
-                value[sz(logical)] = hi[sz(logical)];
-            }
-            claimed_row[sz(i)] = 1;
-            ++diag.primal_crash_columns;
-        }
-        diag.primal_crash_infeasibility_after = total_violation();
-        // Refuse the whole crash if total primal infeasibility did not
-        // strictly improve. Per-column gains can sum to a non-improvement
-        // once claimed-row interactions are accounted for at the end.
-        if (!(diag.primal_crash_infeasibility_after <
-              diag.primal_crash_infeasibility_before -
-                  1e-12 * (1.0 + diag.primal_crash_infeasibility_before))) {
-            basis = crash_basis_save;
-            slot_of = crash_slot_save;
-            st = crash_st_save;
-            value = crash_value_save;
-            activity = crash_activity_save;
-            diag.primal_crash_columns = 0;
-            diag.primal_crash_infeasibility_after =
-                diag.primal_crash_infeasibility_before;
-        }
+        crash_basis_save = basis; crash_slot_save = slot_of;
+        crash_st_save = st; crash_value_save = value; crash_snapshot_valid = true;
+        const auto crash = detail::triangular_crash(p, ac, lo, hi, ptol, basis,slot_of,st,value);
+        diag.primal_crash_columns = crash.columns;
+        diag.primal_crash_infeasibility_before = crash.infeasibility_before;
+        diag.primal_crash_infeasibility_after = crash.infeasibility_after;
     }
 
     std::vector<Index> nonbasic;
@@ -1321,7 +1219,7 @@ core::RawResult solve_primal_simplex_prepared(
         ++diag.solve_calls;
         return factor.btran_seeded_with_support(v, seed, support);
     };
-    la::LuOptions lu_opts;
+    la::LuOptions lu_opts = opts.basis_lu;
     lu_opts.pivot_tol = std::min(opts.pivot_tol, 1e-11);
 
     std::vector<Offset> bcp;
@@ -1329,6 +1227,8 @@ core::RawResult solve_primal_simplex_prepared(
     std::vector<f64>    bvals;
     std::vector<f64>    rhs(sz(m), 0.0), y(sz(m), 0.0), alpha(sz(m), 0.0), cB(sz(m), 0.0);
     std::vector<f64> primal_direction;
+    Index ray_entering_variable = -1;
+    int ray_entering_sign = 0;
     la::SpikeCapture primal_spike;
     bool alpha_previous_sparse = false;
     std::vector<Index>  alpha_support, alpha_input_rows;
@@ -1510,8 +1410,15 @@ core::RawResult solve_primal_simplex_prepared(
             if (vj == 0.0) continue;
             for_col(j, [&](Index i, f64 v) { SOR_FN(); rhs[sz(i)] -= v * vj; });
         }
+        const auto saved_rhs = opts.iterative_refinement ? rhs : std::vector<f64>{};
         do_ftran(rhs);
         xB = rhs;                     // ftran leaves the result slot-indexed
+        if (opts.iterative_refinement && factor.is_valid()) {
+            build_basis_matrix();
+            const auto refinement = la::refine_basis_solution(factor, m, bcp, bri,
+                bvals, saved_rhs, xB, false, opts.refinement_steps, opts.refinement_target);
+            diag.refinement_corrections += static_cast<std::uint64_t>(refinement.corrections);
+        }
         if (opts.certificate_pricing) {
             // Compute residuals with exact products in the stored scaled
             // system, then use the existing LU for correction proposals.
@@ -1641,7 +1548,33 @@ core::RawResult solve_primal_simplex_prepared(
         }
     };
 
-    do_factorize();
+    if (incoming_valid && warm_installed && basis == warm->basic) {
+        factor = std::move(incoming_factor);
+        ++diag.factor_adoptions;
+        bool retain_point = cleanup_state && cleanup_state->basic_values.size() == sz(m) &&
+            cleanup_state->nonbasic_values.size() == sz(nt);
+        if (retain_point) {
+            std::vector<long double> residual(sz(m), 0);
+            for (Index j = 0; j < nt; ++j) {
+                const f64 x = st[sz(j)] == NonbasicStatus::Basic
+                    ? cleanup_state->basic_values[sz(slot_of[sz(j)])]
+                    : cleanup_state->nonbasic_values[sz(j)];
+                if (!std::isfinite(x) ||
+                    (st[sz(j)] != NonbasicStatus::Basic && x != value[sz(j)])) {
+                    retain_point = false; break;
+                }
+                for_col(j, [&](Index i, f64 a) { residual[sz(i)] += static_cast<long double>(a)*x; });
+            }
+            for (const long double r : residual)
+                if (!std::isfinite(r) || std::fabs(r) > 1e-10L) retain_point = false;
+        }
+        if (retain_point) xB = cleanup_state->basic_values;
+        else recompute_xB();
+        reset_weights();
+        d_valid = false;
+    } else {
+        do_factorize();
+    }
     // A crash basis that required singular repair is not the triangular
     // construction we claimed. Restore the all-logical start and refactor.
     if (crash_snapshot_valid && diag.primal_crash_columns > 0 &&
@@ -1782,7 +1715,7 @@ core::RawResult solve_primal_simplex_prepared(
                 factor.n_updates() <= kCollectiveMaxUpdates) {
                 const auto collapse_t0 = Clock::now();
                 const bool collapsed = factor.collapse_pending_into_ft(
-                    la::LuOptions{}, opts.pivot_tol);
+                    lu_opts, opts.pivot_tol);
                 diag.basis_update_ms += ms_since(collapse_t0);
                 if (collapsed) {
                     ++diag.collective_ft_collapses;
@@ -1869,6 +1802,33 @@ core::RawResult solve_primal_simplex_prepared(
     core::Status status = core::Status::NotSolved;
     std::string reason;
     std::vector<std::string> terminal_exact_dual;
+
+
+    std::vector<long double> equation_residual(sz(m));
+    const auto drift_exceeds_limit = [&]() {
+        std::fill(equation_residual.begin(), equation_residual.end(), 0.0L);
+        for (Index j = 0; j < nt; ++j) {
+            const f64 x = st[sz(j)] == NonbasicStatus::Basic
+                ? xB[sz(slot_of[sz(j)])] : value[sz(j)];
+            if (x == 0) continue;
+            for_col(j, [&](Index i, f64 a) {
+                equation_residual[sz(i)] += static_cast<long double>(a) * x;
+            });
+        }
+        for (const long double r : equation_residual)
+            if (!std::isfinite(r) || std::fabs(r) > opts.residual_refactor_tol) return true;
+        if (phase == 2 && d_valid) {
+            for (Index slot = 0; slot < m; ++slot) {
+                long double residual = -cost[sz(basis[sz(slot)])];
+                for_col(basis[sz(slot)], [&](Index i, f64 a) {
+                    residual += static_cast<long double>(a) * y[sz(i)];
+                });
+                if (!std::isfinite(residual) || std::fabs(residual) > opts.residual_refactor_tol)
+                    return true;
+            }
+        }
+        return false;
+    };
     int since_refactor = 0;
      int polish_reprices = 0;
      // Cleanup escalation: dtol is divided by this factor when the final basis
@@ -1910,6 +1870,11 @@ core::RawResult solve_primal_simplex_prepared(
             reason = "time limit (" + std::to_string(opts.time_limit_s) + "s)";
             break;
         }
+        if ((iter % 64) == 0 && core::cancel_requested(opts.cancel)) {
+            status = core::Status::Interrupted;
+            reason = "cancelled (concurrent race lost)";
+            break;
+        }
         if ((iter & 127u) == 0u) repair_weights();
         if ((opts.primal_bound_perturbation || opts.trace_degeneracy) && !bounds_perturbed && phase == 2) {
             if ((iter & 127u) == 0u) {
@@ -1945,6 +1910,15 @@ core::RawResult solve_primal_simplex_prepared(
             d_valid) {
             d_valid = false;
             ++diag.dual_resyncs;
+        }
+
+        if (opts.residual_refactor_tol > 0 && opts.residual_check_interval > 0 &&
+            since_refactor > 0 && (iter % static_cast<std::uint64_t>(opts.residual_check_interval)) == 0 &&
+            drift_exceeds_limit()) {
+            do_factorize();
+            since_refactor = 0;
+            ++diag.residual_refactors;
+            continue;
         }
 
         // ---- reduced costs ------------------------------------------------
@@ -2138,7 +2112,17 @@ core::RawResult solve_primal_simplex_prepared(
                     // A verified bound within the requested gap is sufficient.
                     // Exact pricing must not chase harmless finite-support
                     // reduced costs after that stopping condition is met.
-                    const auto bound = certify::exact_dual_lower_bound(pmin, certificate.exact_dual);
+                    std::vector<int> permitted(sz(nt), 0);
+                    for (Index j = 0; j < nt; ++j) {
+                        if (lo[sz(j)] == hi[sz(j)]) continue;
+                        permitted[sz(j)] = st[sz(j)] == NonbasicStatus::AtLower ? 1 :
+                            st[sz(j)] == NonbasicStatus::AtUpper ? -1 :
+                            st[sz(j)] == NonbasicStatus::AtZeroFree ? 2 : 0;
+                    }
+                    // One parse and one set of exact reduced costs serve both
+                    // the stopping bound and the exact pricing decision.
+                    const auto assessment = certify::assess_exact_dual(pmin, certificate.exact_dual, permitted);
+                    const auto& bound = assessment.bound;
                     std::vector<double> point(sz(ns));
                     for (Index j = 0; j < ns; ++j)
                         point[sz(j)] = scaling.col_scale[sz(j)] *
@@ -2153,14 +2137,7 @@ core::RawResult solve_primal_simplex_prepared(
                         reason = "checked original-model gap reached";
                         break;
                     }
-                    std::vector<int> permitted(sz(nt), 0);
-                    for (Index j = 0; j < nt; ++j) {
-                        if (lo[sz(j)] == hi[sz(j)]) continue;
-                        permitted[sz(j)] = st[sz(j)] == NonbasicStatus::AtLower ? 1 :
-                            st[sz(j)] == NonbasicStatus::AtUpper ? -1 :
-                            st[sz(j)] == NonbasicStatus::AtZeroFree ? 2 : 0;
-                    }
-                    const auto failure = certify::exact_dual_support_failure(pmin, certificate.exact_dual, permitted);
+                    const auto& failure = assessment.failure;
                     const Index candidate = failure.variable;
                     if (candidate >= 0 && candidate < nt &&
                         st[sz(candidate)] != NonbasicStatus::Basic &&
@@ -2298,6 +2275,7 @@ core::RawResult solve_primal_simplex_prepared(
                     if (basis[sz(i)] < ns)
                         primal_direction[sz(basis[sz(i)])] = -static_cast<f64>(qdir) *
                             alpha[sz(i)] * scaling.col_scale[sz(basis[sz(i)])];
+                ray_entering_variable = q; ray_entering_sign = qdir;
                 status = core::Status::Unbounded;
                 reason = "improving column with no blocking bound";
                 break;
@@ -2360,6 +2338,16 @@ core::RawResult solve_primal_simplex_prepared(
 
             if (row_ok) {
                 const f64 theta_d = redcost[sz(q)] / arq;
+                // Keep the multiplier in the same basis as the incremental
+                // reduced costs. Residual monitoring must not compare a new
+                // B with the multiplier from the last full BTRAN.
+                if (rho_sparse) {
+                    for (const Index i : rho_support)
+                        y[sz(i)] += theta_d * rho[sz(i)];
+                } else {
+                    for (Index i = 0; i < m; ++i)
+                        y[sz(i)] += theta_d * rho[sz(i)];
+                }
                 for (const Index j : prow_idx) {
                     if (st[sz(j)] == NonbasicStatus::Basic) continue;
                     redcost[sz(j)] -= theta_d * prow[sz(j)];
@@ -2476,6 +2464,16 @@ core::RawResult solve_primal_simplex_prepared(
                     const bool delta_sparse = do_btran_seeded(
                         phase_delta, phase_delta_seed, phase_delta_support);
                     if (time_detail) diag.solve_ms += ms_since(t_part);
+
+                    // The phase-1 piece changes the basic costs as well as
+                    // the reduced costs: pi' = pi + B'^-T delta_cB.
+                    if (delta_sparse) {
+                        for (const Index i : phase_delta_support)
+                            y[sz(i)] += phase_delta[sz(i)];
+                    } else {
+                        for (Index i = 0; i < m; ++i)
+                            y[sz(i)] += phase_delta[sz(i)];
+                    }
 
                     if (delta_sparse) {
                         ++diag.phase1_composite_sparse;
@@ -2666,7 +2664,7 @@ core::RawResult solve_primal_simplex_prepared(
     // -B^-T c_B separates the row box from the structural-column box. Export
     // that candidate before normal extraction restores the real objective;
     // the public original-model checker independently verifies it.
-    std::vector<f64> phase1_farkas;
+    std::vector<f64> phase1_farkas, phase1_farkas_rhs;
     if (status == core::Status::Infeasible && phase == 1 &&
         reason == "phase 1 minimum has positive primal infeasibility") {
         for (Index i = 0; i < m; ++i) {
@@ -2679,6 +2677,12 @@ core::RawResult solve_primal_simplex_prepared(
                 cB[sz(i)] = 0.0;
         }
         phase1_farkas = cB;
+        phase1_farkas_rhs.resize(sz(m));
+        for (Index i = 0; i < m; ++i) {
+            const Index v = basis[sz(i)];
+            phase1_farkas_rhs[sz(i)] = v < ns ? -cB[sz(i)] / scaling.col_scale[sz(v)]
+                : -cB[sz(i)] * scaling.row_scale[sz(v-ns)];
+        }
         do_btran(phase1_farkas);
         for (Index i = 0; i < m; ++i)
             phase1_farkas[sz(i)] *= -scaling.row_scale[sz(i)];
@@ -2798,8 +2802,21 @@ core::RawResult solve_primal_simplex_prepared(
     raw.proposed_status = status;
     raw.termination_reason = reason;
 
+    if (status == core::Status::Unbounded && ray_entering_variable >= 0 &&
+        (opts.time_limit_s <= 0 || ms_since(t_all) < 1000*opts.time_limit_s))
+        certify::repair_basis_primal_ray(pmin, raw, ray_entering_variable, ray_entering_sign,
+            {.time_limit_s = opts.time_limit_s > 0
+                ? std::max(std::numeric_limits<double>::min(), opts.time_limit_s-ms_since(t_all)/1000) : 0,
+             .ray_tolerance = opts.primal_feas_tol});
+
     if (!phase1_farkas.empty())
         raw.dual_farkas_ray.multipliers = std::move(phase1_farkas);
+    if (!phase1_farkas_rhs.empty() &&
+        (opts.time_limit_s <= 0 || ms_since(t_all) < 1000*opts.time_limit_s))
+        certify::repair_basis_farkas_certificate(pmin, raw, phase1_farkas_rhs,
+            {.time_limit_s = opts.time_limit_s > 0
+                ? std::max(std::numeric_limits<double>::min(), opts.time_limit_s-ms_since(t_all)/1000) : 0,
+             .ray_tolerance = opts.primal_feas_tol});
 
     switch (status) {
         case core::Status::Optimal:
@@ -2820,17 +2837,24 @@ core::RawResult solve_primal_simplex_prepared(
             break;
     }
 
-    if (status == core::Status::Optimal && sense == 1.0 && !diag.dual_bound_finite &&
+    if (status == core::Status::Optimal && sense == 1.0 &&
+        (!diag.dual_bound_finite || diag.gap_rel > opts.gap_tol) &&
         (opts.time_limit_s == 0 || ms_since(t_all) < 1000 * opts.time_limit_s))
         repair_simplex_dual(pmin, raw, simplex_options_after_elapsed(opts, ms_since(t_all) / 1000), diag);
-    if (status == core::Status::Optimal && sense == 1.0 && !diag.dual_bound_finite &&
+    if (status == core::Status::Optimal &&
+        (!diag.dual_bound_finite || (sense < 0 && diag.gap_rel > opts.gap_tol)) &&
+        (opts.time_limit_s <= 0 || ms_since(t_all) < 1000 * opts.time_limit_s) &&
         raw.exact_dual.empty() && certify::repair_basis_certificate(pmin, raw,
             {.time_limit_s = opts.time_limit_s > 0 ? std::max(std::numeric_limits<double>::min(),
                 opts.time_limit_s - ms_since(t_all) / 1000) : 0})) {
         const auto exact = certify::exact_dual_lower_bound(pmin, raw.exact_dual);
         if (exact.finite) {
-            raw.dual_bound = diag.dual_objective = sense * exact.value;
-            diag.dual_bound_finite = true;
+            const model::Rational reported = model::Rational(sense) *
+                (model::Rational(exact.value) - model::Rational(pmin.obj_offset)) +
+                model::Rational(pmin.obj_offset);
+            raw.dual_bound = diag.dual_objective = sense > 0
+                ? model::rounded_down(reported) : model::rounded_up(reported);
+            diag.dual_bound_finite = std::isfinite(raw.dual_bound);
             diag.gap_rel = std::fabs(raw.objective - raw.dual_bound) / (1 + std::fabs(raw.objective));
         }
     }
@@ -2872,14 +2896,15 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
     presolve::PresolveMap pmap;
     bool used_presolve = false;
     presolve::PresolveStatus presolve_status = presolve::PresolveStatus::Reduced;
-    std::string presolve_reason;
     const auto presolve_t0 = Clock::now();
     if (opts.presolve) {
         presolve::PresolveOptions popts;
+        popts.equation_sparsification = opts.presolve_equation_sparsification;
+        if (opts.presolve_equation_sparsification) popts.max_aggregation_row_nnz = 128;
+        popts.domain_probing = opts.presolve_domain_probing;
         popts.implied_slack = opts.presolve_implied_slack;
         auto outcome = presolve::presolve(problem, popts);
         presolve_status = outcome.status;
-        presolve_reason = outcome.reason;
         pmap = std::move(outcome.map);
         if (presolve_status == presolve::PresolveStatus::NumericalFailure) {
             // A rejected transformation is not a model conclusion.  Solve the
@@ -2904,40 +2929,18 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         d.presolve_equality_aggregations = pmap.stats.equality_aggregations;
         d.presolve_aggregation_fill = pmap.stats.aggregation_fill;
     };
-    if (opts.presolve && presolve_status == presolve::PresolveStatus::Unbounded) {
+    if (opts.presolve &&
+        (presolve_status == presolve::PresolveStatus::Unbounded ||
+         presolve_status == presolve::PresolveStatus::Infeasible)) {
+        // A presolve conclusion is a search hint until an original-model
+        // witness exists. Use the remaining allowance to extract that witness.
         SimplexOptions continuation = simplex_options_after_elapsed(opts, presolve_ms / 1000.0);
         continuation.presolve = false;
         auto terminal = solve_simplex(problem, continuation, diag, out_basis, out_session);
         diag.presolve_ms += presolve_ms;
         diag.total_ms += presolve_ms;
-        return terminal;
-    }
-    if (opts.presolve &&
-        (presolve_status == presolve::PresolveStatus::Infeasible ||
-         presolve_status == presolve::PresolveStatus::Unbounded)) {
-        core::RawResult raw;
-        raw.x.assign(sz(problem.n_cols()), 0.0);
-        raw.y.assign(sz(problem.n_rows()), 0.0);
-        raw.proposed_status =
-            presolve_status == presolve::PresolveStatus::Infeasible
-                ? core::Status::Infeasible : core::Status::Unbounded;
-        // The current journal does not yet reconstruct Farkas/primal rays.
-        // Report the terminal status and witness reason, but do not manufacture
-        // a proof level or certificate that presolve did not produce.
-        raw.proposed_level = core::ProofLevel::None;
-        raw.engine = "simplex_presolve";
-        raw.backend = "cpu";
-        raw.termination_reason = "presolve " +
-            std::string(presolve::to_string(presolve_status)) + ": " +
-            presolve_reason;
-        diag = SimplexDiagnostics{};
-        diag.status = raw.proposed_status;
-        diag.presolve_ms = presolve_ms;
-        diag.total_ms = presolve_ms;
         copy_presolve_diag(diag);
-        if (out_basis) *out_basis = SimplexBasis{};
-        if (out_session) out_session->reset();
-        return raw;
+        return terminal;
     }
     // Build the immutable numeric representation once. Auto may run a dual
     // primary engine and a failure fallback; all stages solve the identical
@@ -3284,6 +3287,11 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         raw.objective = recovered.raw.objective;
         raw.certificate_basis = recovered.basis.basic;
         raw.exact_dual = recovered.raw.exact_dual;
+        if (raw.proposed_status == core::Status::Unbounded &&
+            !raw.primal_ray.direction.empty()) {
+            raw.primal_ray = presolve::recover_primal_ray(
+                problem, pmap, raw.primal_ray, opts.primal_feas_tol);
+        }
         if (raw.proposed_status == core::Status::Infeasible &&
             !raw.dual_farkas_ray.multipliers.empty()) {
             raw.dual_farkas_ray = presolve::recover_dual_farkas_ray(
@@ -3338,7 +3346,19 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
             ? opts.time_limit_s -
                   std::chrono::duration<double>(Clock::now() - presolve_t0).count()
             : 0.0;
-        const bool search_or_lift_needs_retry =
+        const auto checked_terminal = [&](const core::RawResult& candidate,
+                                           const SimplexDiagnostics& work_diag) {
+            if (candidate.proposed_status != core::Status::Infeasible &&
+                candidate.proposed_status != core::Status::Unbounded) return false;
+            const auto checked = certify::check_lp_result(problem, candidate,
+                simplex_evidence(work_diag, opts));
+            return certify::finalize_result(candidate, checked).status == candidate.proposed_status;
+        };
+        const bool terminal_needs_retry =
+            (raw.proposed_status == core::Status::Infeasible ||
+             raw.proposed_status == core::Status::Unbounded) &&
+            !checked_terminal(raw, diag);
+        const bool search_or_lift_needs_retry = terminal_needs_retry ||
             diag.primal_residual > opts.primal_feas_tol ||
             diag.dual_residual > opts.dual_feas_tol ||
             (diag.dual_bound_finite && diag.gap_rel > opts.gap_tol);
@@ -3347,7 +3367,7 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
             std::getenv("SOR_PRESOLVE_NO_RETRY") == nullptr &&
             (opts.time_limit_s <= 0.0 || retry_time_left > 0.0) &&
             (raw.proposed_status == core::Status::Optimal ||
-             raw.proposed_status == core::Status::Feasible)) {
+             raw.proposed_status == core::Status::Feasible || terminal_needs_retry)) {
             // Count an attempted safety retry even when the original lifted
             // candidate remains preferable. Previously the counter lived only
             // in retry_diag, so a performed-but-rejected retry was reported as
@@ -3382,7 +3402,7 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
                 retry_diag.primal_residual <= retry_opts.primal_feas_tol &&
                 retry_diag.dual_residual <= retry_opts.dual_feas_tol &&
                 retry_diag.dual_bound_finite && retry_diag.gap_rel <= retry_opts.gap_tol;
-            const bool take_retry = retry_proved ||
+            const bool take_retry = retry_proved || checked_terminal(retry_raw, retry_diag) ||
                 (retry_raw.proposed_status == core::Status::Optimal &&
                  raw.proposed_status != core::Status::Optimal) ||
                 (retry_raw.proposed_status == core::Status::Feasible &&

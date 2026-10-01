@@ -50,7 +50,7 @@ namespace {
 void usage() {
     std::fputs(
         "usage: sor_solve MODEL.{mps,lp,qps,qplib} [options]\n"
-        "  --engine NAME    simplex (default) | auto | primal | dual | pdhg | hpr | milp | qp\n"
+        "  --engine NAME    simplex (default) | auto | primal | dual | pdhg | hpr | barrier | milp | qp\n"
         "  --q-diag LIST    comma-separated diagonal of Q (if not using .qps)\n"
         "  --backend NAME   cpu (default) | vulkan | cuda\n"
         "  --engine hprqp   GPU-capable HPR-QP convex QP engine (honours --backend)\n"
@@ -104,6 +104,7 @@ void usage() {
         "                   BB step to every Nth iteration -- see QpOptions::inner_epoch\n"
         "  --max-iter N     iteration / node limit\n"
         "  --tol T          feasibility tolerance\n"
+        "  --lp-gap-tol G   LP gap tolerance, overriding --tol for LP engines\n"
         "  --no-dual-perturbation  disable Koberstein dual cost perturbation (ablation)\n"
         "  --no-primal-bound-perturbation  disable primal plateau recovery (ablation)\n"
         "  --trace-lp        trace LP progress and degeneracy recovery\n"
@@ -267,6 +268,11 @@ void usage() {
         "  --gcs-model PATH    load GCS promote/reinject policy (SOR_GCS)\n"
         "  --gcs-heuristic     use multi-node heuristic score (ignore GNN)\n"
         "  --gcs-reinject N    GCS reinject top cuts every N nodes (0=off cadence)\n"
+        "  --lp-concurrent N  race N independently checked simplex arms (auto route)\n"
+        "  --lp-parallel-basis  evaluate paired basis solves with private worker factors\n"
+        "  --lp-domain-probing  enable bounded continuous-domain probing in presolve\n"
+        "  --no-lp-sparsification  disable exact equation sparsification\n"
+        "  --[no-]dual-crash  zero-cost triangular dual cold start (default: on)\n"
         "  --threads N      worker threads for the sparse linear algebra\n"
         "  --debug-routes[=N]       JSONL route trace, N=0..3 (bare flag = 1)\n"
         "  --debug-routes-file=PATH append the JSONL (stderr if omitted)\n"
@@ -960,6 +966,7 @@ int main(int argc, char** argv) {
     // each engine's options are built, AFTER that branch's own defaults, so an
     // explicitly given option always wins over a built-in choice.
     std::vector<std::string> qp_opt_args, qcqp_opt_args, miqp_opt_args;
+    int lp_concurrent = 1;
     int n_threads = 0;                 // --threads: 0 = sor::core's default
     sor::engines::PdhgOptions pdhg_opts;
     sor::engines::HprOptions hpr_opts;
@@ -967,6 +974,8 @@ int main(int argc, char** argv) {
     sor::io::MpsReadOptions mps_opts;
     bool mps_format_forced = false;
     bool tol_given = false;
+    double lp_gap_tolerance = 0.0;
+    bool lp_gap_given = false;
     bool max_iter_given = false;
     int local_starts = 1;   // --starts: multi-start count of the local QCQP solver
     int qp_inner_epoch = 1;   // --qp-inner-epoch: PDHCG-II sparse-Q inner loop batching
@@ -1263,6 +1272,11 @@ int main(int argc, char** argv) {
                              std::numeric_limits<double>::max(), true);
             tol_given = true;
         }
+        else if (a == "--lp-gap-tol") {
+            lp_gap_tolerance = parse_real(next("--lp-gap-tol"), "--lp-gap-tol", 0.0,
+                std::numeric_limits<double>::max(), true);
+            lp_gap_given = true;
+        }
         else if (a == "--no-dual-perturbation") sx_opts.dual_perturbation = false;
         else if (a == "--no-primal-bound-perturbation") sx_opts.primal_bound_perturbation = false;
         else if (a == "--trace-lp") sx_opts.trace_degeneracy = true;
@@ -1362,6 +1376,11 @@ int main(int argc, char** argv) {
             primal_crash_given = true;
         }
         else if (a == "--pow2-scaling") sx_opts.ruiz_power_of_two = true;
+        else if (a == "--dual-crash") sx_opts.dual_crash = true;
+        else if (a == "--no-dual-crash") sx_opts.dual_crash = false;
+        else if (a == "--lp-parallel-basis") sx_opts.parallel_basis_solves = true;
+        else if (a == "--lp-domain-probing") sx_opts.presolve_domain_probing = true;
+        else if (a == "--no-lp-sparsification") sx_opts.presolve_equation_sparsification = false;
         else if (a == "--no-scaling") {
             sx_opts.ruiz_iterations = 0;
             pdhg_opts.ruiz_iterations = 0;
@@ -1741,6 +1760,8 @@ int main(int argc, char** argv) {
         else if (a == "--hpr-restart-off") hpr_opts.use_restart = false;
         else if (a == "--hpr-reflection-off") hpr_opts.use_reflection = false;
         else if (a == "--hpr-weight-off") hpr_opts.use_primal_weight = false;
+        else if (a == "--lp-concurrent")
+            lp_concurrent = static_cast<int>(parse_uint(next("--lp-concurrent"), "--lp-concurrent", 1, 16));
         else if (a == "--threads")
             n_threads = static_cast<int>(parse_uint(next("--threads"), "--threads", 1, 256));
         else if (a == "--solution-out") solution_out = next("--solution-out");
@@ -1792,13 +1813,14 @@ int main(int argc, char** argv) {
 #endif
     if (engine_name != "pdhg" && engine_name != "simplex" && engine_name != "auto" &&
         engine_name != "primal" && engine_name != "dual" && engine_name != "hpr" &&
+        engine_name != "barrier" &&
         engine_name != "milp" && engine_name != "qp" &&
         engine_name != "hprqp" && engine_name != "binquad" && engine_name != "qpipm" &&
         engine_name != "qpauto" && engine_name != "miqp" &&
         engine_name != "global" && engine_name != "qcqplocal") {
         std::fprintf(stderr,
                      "error: engine '%s' not implemented "
-                     "(have simplex|auto|primal|dual|pdhg|hpr|milp|qp|qpipm|qpauto|hprqp|binquad|miqp|global|qcqplocal)\n",
+                     "(have simplex|auto|primal|dual|pdhg|hpr|barrier|milp|qp|qpipm|qpauto|hprqp|binquad|miqp|global|qcqplocal)\n",
                      engine_name.c_str());
         return 3;
     }
@@ -1825,12 +1847,16 @@ int main(int argc, char** argv) {
         sx_opts.primal_feas_tol = sx_opts.dual_feas_tol = tol;
         sx_opts.gap_tol = tol;
     }
+    if (lp_gap_given) {
+        sx_opts.gap_tol = pdhg_opts.gap_tol = hpr_opts.gap_tol = lp_gap_tolerance;
+    }
 
     // The pool is process-wide and sized once, before any solve: sizing it
     // mid-solve would change how a reduction is chunked.  Printed with every
     // run because a timing that does not say how many threads produced it is
     // not a measurement.
     sor::core::set_global_threads(n_threads);
+    sx_opts.pricing_threads = sor::core::global_threads();
     std::printf("threads:           %d\n", sor::core::global_threads());
 
     RouteSession route_session;
@@ -4115,6 +4141,7 @@ int main(int argc, char** argv) {
             }
             sor::core::LpOptions lp_opts;
             lp_opts.strategy = sor::core::LpStrategy::Auto;
+            lp_opts.concurrent_solves = lp_concurrent;
             lp_opts.max_iterations = max_iter_given ? sx_opts.max_iterations : 0;
             lp_opts.time_limit_s = sx_opts.time_limit_s;
             lp_opts.primal_feas_tol = sx_opts.primal_feas_tol;
@@ -4310,6 +4337,11 @@ int main(int argc, char** argv) {
                             diag.numerical_trouble_refactors),
                         static_cast<unsigned long long>(
                             diag.refused_cost_shifts));
+            std::printf("  residual refactors %8llu  (%llu refinement corrections)\n",
+                        static_cast<unsigned long long>(diag.residual_refactors),
+                        static_cast<unsigned long long>(diag.refinement_corrections));
+            std::printf("  zero dual steps  %10llu\n",
+                        static_cast<unsigned long long>(diag.numerical_zero_dual_steps));
             std::printf("  rho density      %llu sparse / %llu dense, avg support %llu\n",
                         static_cast<unsigned long long>(diag.rho_sparse_iters),
                         static_cast<unsigned long long>(diag.rho_dense_iters),
@@ -4345,6 +4377,8 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(diag.primal_crash_columns),
                         diag.primal_crash_infeasibility_before,
                         diag.primal_crash_infeasibility_after);
+            std::printf("  dual crash       %10llu\n",
+                        static_cast<unsigned long long>(diag.dual_crash_columns));
             std::printf("  auto stages/builds %8llu / %llu\n",
                         static_cast<unsigned long long>(diag.stages),
                         static_cast<unsigned long long>(diag.preprocessing_builds));
@@ -4356,7 +4390,7 @@ int main(int argc, char** argv) {
             return exit_code_for(r.status);
         }
 
-        if (engine_name == "hpr" || engine_name == "pdhg") {
+        if (engine_name == "hpr" || engine_name == "pdhg" || engine_name == "barrier") {
             // Explicit and ablated FO engines share the same model preparation,
             // original-space recovery, and crossover policy.
             {
@@ -4367,6 +4401,7 @@ int main(int argc, char** argv) {
                 sor::core::LpOptions lp_opts;
                 lp_opts.strategy = engine_name == "hpr"
                     ? sor::core::LpStrategy::Hpr
+                    : engine_name == "barrier" ? sor::core::LpStrategy::Barrier
                     : sor::core::LpStrategy::Pdhg;
                 lp_opts.max_iterations = max_iter_given
                     ? (engine_name == "hpr" ? hpr_opts.max_iterations

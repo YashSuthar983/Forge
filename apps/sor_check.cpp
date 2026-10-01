@@ -432,7 +432,10 @@ int main(int argc, char** argv) {
                     ok = false;
                     break;
                 }
-                const auto cert = sor::certify::check_dual_farkas_ray(lp, ray, tol);
+                const auto cert = sol.exact_dual_farkas.empty()
+                    ? sor::certify::check_dual_farkas_ray(lp, ray, tol)
+                    : sor::certify::check_exact_dual_farkas_ray(lp, sol.exact_dual_farkas, tol);
+                if (!sol.exact_dual_farkas.empty()) validation_scope = "lp_farkas_exact";
                 ok &= cert.certified
                           ? pass("farkas certificate",
                                  cert.max_homogeneous_residual, tol)
@@ -470,8 +473,10 @@ int main(int argc, char** argv) {
                     ok = false;
                     break;
                 }
-                const auto cert = sor::certify::check_primal_ray(
-                    lp, sol.primal_ray, tol);
+                const auto cert = sol.exact_primal_ray.empty()
+                    ? sor::certify::check_primal_ray(lp, sol.primal_ray, tol)
+                    : sor::certify::check_exact_primal_ray(lp, sol.exact_primal_ray, tol);
+                if (!sol.exact_primal_ray.empty()) validation_scope = "lp_primal_ray_exact";
                 ok &= cert.certified
                           ? pass("primal ray", std::max(cert.max_row_residual,
                                                        cert.max_bound_sign_residual), tol)

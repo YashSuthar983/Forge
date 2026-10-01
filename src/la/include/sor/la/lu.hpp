@@ -50,6 +50,8 @@
 #include <type_traits>
 #include <vector>
 
+namespace sor::core { class ThreadPool; }
+
 namespace sor::la {
 
 using core::f64;
@@ -69,6 +71,13 @@ struct LuOptions {
     // Columns examined per Markowitz pivot search. Unbounded search is
     // O(nnz) per pivot, which dominates everything on large bases.
     int max_search_cols = 8;
+
+    bool blocked_nucleus = true;
+    Index dense_nucleus_limit = 512;
+    f64 dense_nucleus_density = 0.35;
+    bool adaptive_threshold = true;
+    f64 condition_limit = 1e9;
+    f64 stable_threshold = 0.5;
 };
 
 // Which basis-slot-replacement representation update_ft() vs. update() uses.
@@ -89,9 +98,14 @@ struct LuStats {
     Offset input_nnz       = 0;
     Offset factor_nnz      = 0;   // nnz(L) + nnz(U), excluding L's unit diagonal
     Index  triangular_pivots = 0; // found by Phase A
-    Index  nucleus_pivots  = 0;   // found by Phase B
+    Index  nucleus_pivots  = 0;
+    Index  blocked_nucleus_pivots = 0;   // found by Phase B
+    Index  blocked_nucleus_blocks = 0;
+    Index  dense_tail_blocks = 0;        // Markowitz front finished densely
     Index  singular_count  = 0;
     f64    largest_multiplier = 0.0;
+    f64    condition_estimate = 1.0;
+    f64    effective_threshold = 0.0;
 };
 
 // The exact Forrest-Tomlin spike, R_k...R_1 L^-1 a_q, in POSITION coordinates.
@@ -189,6 +203,12 @@ public:
 
     // d (indexed by basis slot) <- B^-T d (indexed by row). Size m.
     void btran(std::vector<f64>& d) const;
+
+    // Independent candidate solves, using one private factor/scratch copy per
+    // worker because FTRAN/BTRAN mutate traversal workspace even when const.
+    // Null pool executes serially. Optional FTRAN spikes preserve FT updates.
+    void solve_batch(std::vector<std::vector<f64>>& rhs, core::ThreadPool* pool = nullptr,
+                     bool transpose = false, std::vector<SpikeCapture>* spikes = nullptr) const;
 
     // Same solve, additionally returning the nonzero support of the
     // row-indexed result when the final L' solve stayed hypersparse.

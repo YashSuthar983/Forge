@@ -12,6 +12,7 @@
 #include <functional>
 #include <limits>
 #include <numeric>
+#include <string>
 #include <utility>
 #include "sor/core/route_debug.hpp"
 
@@ -548,7 +549,7 @@ core::RawResult crossover_to_simplex(const model::LpProblem& problem,
         return raw;
     }
     if (!diag.triggered_by_tolerances &&
-        !diag.triggered_by_useful_budget_point) {
+        !diag.triggered_by_useful_budget_point && !opts.interior_point_start) {
         core::RawResult raw;
         raw.proposed_status = core::Status::NotSolved;
         raw.engine = "hpr+crossover";
@@ -652,8 +653,9 @@ core::RawResult crossover_to_simplex(const model::LpProblem& problem,
     }
     if (out_basis) *out_basis = diag.validated_basis ? std::move(cleaned)
                                                     : SimplexBasis{};
-    raw.engine = diag.cold_fallback ? "hpr+crossover+cold-dual"
-                                    : "hpr+crossover+dual";
+    const char* start = opts.interior_point_start ? "barrier" : "hpr";
+    raw.engine = std::string(start) + (diag.cold_fallback ? "+crossover+cold-dual"
+                                                          : "+crossover+dual");
     diag.cleanup_ms = ms_since(cleanup_t0);
     diag.total_ms = ms_since(t0);
     return raw;

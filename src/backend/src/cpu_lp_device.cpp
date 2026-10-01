@@ -3,11 +3,14 @@
 // LAYER L1. Same shape the Vulkan backend implements - one algorithm, two
 // devices. Gather-form SpMV via CSC; no host addressability exposed.
 #include "sor/backend/lp_device.hpp"
+#include "sor/sparse/spmv_plan.hpp"
+#include "sor/core/fp_environment.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -139,11 +142,18 @@ public:
         nc_ = static_cast<std::size_t>(lp.n_cols());
         A_csr_ = lp.A_csr;
         A_csc_ = lp.A_csc;
+        csr_plan_.build(lp.n_rows(), lp.n_cols(), A_csr_.pattern.row_ptr(),
+                        A_csr_.pattern.col_idx(), A_csr_.vals);
+        csc_plan_.build(lp.n_cols(), lp.n_rows(), A_csc_.pattern.col_ptr(),
+                        A_csc_.pattern.row_idx(), A_csc_.vals);
         c_ = lp.c;
         col_lo_ = lp.col_lo;
         col_hi_ = lp.col_hi;
         row_lo_ = lp.row_lo;
         row_hi_ = lp.row_hi;
+        uploaded_c_ = c_;
+        uploaded_row_lo_ = row_lo_;
+        uploaded_row_hi_ = row_hi_;
         row_scale_ = lp.row_scale;
         col_scale_ = lp.col_scale;
         if (row_scale_.size() != nr_) row_scale_.assign(nr_, 1.0);
@@ -187,6 +197,7 @@ public:
         last_operator_ratio_ = 0.0;
         checkpoint_valid_ = false;
         batch_size_ = 1;
+        active_batch_slot_.reset();
         batch_slots_.clear();
         uploaded_ = true;
     }
@@ -200,11 +211,11 @@ public:
             throw std::invalid_argument("CpuLpDevice: batch_size must be positive");
 
         std::uint64_t bound_bytes = 0;
-        // Capture shared row bounds / c from the last upload before overlays
-        // overwrite the active buffers.
-        const std::vector<f64> shared_row_lo = row_lo_;
-        const std::vector<f64> shared_row_hi = row_hi_;
-        const std::vector<f64> shared_c = c_;
+        // Defaults belong to upload(), independent of the active overlay.
+        const auto& shared_row_lo = uploaded_row_lo_;
+        const auto& shared_row_hi = uploaded_row_hi_;
+        const auto& shared_c = uploaded_c_;
+        active_batch_slot_.reset();
 
         if (batch_size == 1) {
             apply_overlay_active(bounds[0], nc_, nr_, shared_row_lo, shared_row_hi,
@@ -216,6 +227,7 @@ public:
                           sizeof(f64);
         } else {
             batch_size_ = batch_size;
+            batch_slots_.clear();
             batch_slots_.resize(batch_size);
             for (std::uint32_t s = 0; s < batch_size; ++s) {
                 apply_overlay(bounds[s], nc_, nr_, shared_row_lo, shared_row_hi,
@@ -228,7 +240,7 @@ public:
                                 batch_slots_[s].c.size()) *
                                sizeof(f64);
             }
-            load_slot_to_active(0);
+            activate_slot(0);
         }
         stats_.h2d_bytes += bound_bytes;
         ++stats_.calls;
@@ -240,9 +252,8 @@ public:
             return;
         }
         for (std::uint32_t s = 0; s < batch_size_; ++s) {
-            load_slot_to_active(s);
+            activate_slot(s);
             init_zero();
-            save_active_to_slot(s);
         }
     }
 
@@ -252,9 +263,8 @@ public:
             return;
         }
         for (std::uint32_t s = 0; s < batch_size_; ++s) {
-            load_slot_to_active(s);
+            activate_slot(s);
             hpr_steps(k, p);
-            save_active_to_slot(s);
         }
     }
 
@@ -263,9 +273,8 @@ public:
         std::vector<Kkt> out;
         out.reserve(batch_size_);
         for (std::uint32_t s = 0; s < batch_size_; ++s) {
-            load_slot_to_active(s);
+            activate_slot(s);
             out.push_back(reduce_kkt());
-            save_active_to_slot(s);
         }
         return out;
     }
@@ -343,6 +352,7 @@ public:
     }
 
     void hpr_steps(std::uint32_t k, const StepParams& p) override {
+        const core::ScopedFlushSubnormals fp_scope;
         require_uploaded();
         last_primal_tol_ = p.primal_feas_tol;
         last_dual_tol_ = p.dual_feas_tol;
@@ -611,115 +621,65 @@ private:
         if (!uploaded_) throw std::logic_error("CpuLpDevice: upload() required");
     }
 
-    void load_slot_to_active(std::uint32_t slot) {
-        const SlotState& s = batch_slots_[slot];
-        col_lo_ = s.col_lo;
-        col_hi_ = s.col_hi;
-        row_lo_ = s.row_lo;
-        row_hi_ = s.row_hi;
-        if (!s.c.empty()) c_ = s.c;
-        x_ = s.x;
-        y_ = s.y;
-        xbar_ = s.xbar;
-        Aty_ = s.Aty;
-        Ax_ = s.Ax;
-        x_avg_ = s.x_avg;
-        y_avg_ = s.y_avg;
-        x_anchor_ = s.x_anchor;
-        y_anchor_ = s.y_anchor;
-        x_fixed_ = s.x_fixed;
-        y_fixed_ = s.y_fixed;
-        Ax_current_ = s.Ax_current;
-        Ax_fixed_ = s.Ax_fixed;
-        Ax_anchor_ = s.Ax_anchor;
-        checkpoint_x_ = s.checkpoint_x;
-        checkpoint_y_ = s.checkpoint_y;
-        checkpoint_Ax_ = s.checkpoint_Ax;
-        checkpoint_x_avg_ = s.checkpoint_x_avg;
-        checkpoint_y_avg_ = s.checkpoint_y_avg;
-        last_x_delta_ = s.last_x_delta;
-        last_y_delta_ = s.last_y_delta;
-        primal_ray_ = s.primal_ray;
-        dual_ray_ = s.dual_ray;
-        avg_count_ = s.avg_count;
-        epoch_step_ = s.epoch_step;
-        checkpoint_avg_count_ = s.checkpoint_avg_count;
-        checkpoint_epoch_step_ = s.checkpoint_epoch_step;
-        checkpoint_valid_ = s.checkpoint_valid;
-        last_dx_ = s.last_dx;
-        last_dy_ = s.last_dy;
-        last_operator_lhs_ = s.last_operator_lhs;
-        last_operator_rhs_ = s.last_operator_rhs;
-        last_operator_ratio_ = s.last_operator_ratio;
+    // Active buffers own one lane; that lane's SlotState holds scratch
+    // storage until we switch away. Exchanges move vector ownership in O(1)
+    // per field, so direct active-lane calls persist without a duplicate copy.
+    void activate_slot(std::uint32_t slot) {
+        if (active_batch_slot_ == slot) return;
+        if (active_batch_slot_) exchange_active(batch_slots_[*active_batch_slot_]);
+        exchange_active(batch_slots_[slot]);
+        active_batch_slot_ = slot;
     }
 
-    void save_active_to_slot(std::uint32_t slot) {
-        SlotState& s = batch_slots_[slot];
-        s.col_lo = col_lo_;
-        s.col_hi = col_hi_;
-        s.row_lo = row_lo_;
-        s.row_hi = row_hi_;
-        s.c = c_;
-        s.x = x_;
-        s.y = y_;
-        s.xbar = xbar_;
-        s.Aty = Aty_;
-        s.Ax = Ax_;
-        s.x_avg = x_avg_;
-        s.y_avg = y_avg_;
-        s.x_anchor = x_anchor_;
-        s.y_anchor = y_anchor_;
-        s.x_fixed = x_fixed_;
-        s.y_fixed = y_fixed_;
-        s.Ax_current = Ax_current_;
-        s.Ax_fixed = Ax_fixed_;
-        s.Ax_anchor = Ax_anchor_;
-        s.checkpoint_x = checkpoint_x_;
-        s.checkpoint_y = checkpoint_y_;
-        s.checkpoint_Ax = checkpoint_Ax_;
-        s.checkpoint_x_avg = checkpoint_x_avg_;
-        s.checkpoint_y_avg = checkpoint_y_avg_;
-        s.last_x_delta = last_x_delta_;
-        s.last_y_delta = last_y_delta_;
-        s.primal_ray = primal_ray_;
-        s.dual_ray = dual_ray_;
-        s.avg_count = avg_count_;
-        s.epoch_step = epoch_step_;
-        s.checkpoint_avg_count = checkpoint_avg_count_;
-        s.checkpoint_epoch_step = checkpoint_epoch_step_;
-        s.checkpoint_valid = checkpoint_valid_;
-        s.last_dx = last_dx_;
-        s.last_dy = last_dy_;
-        s.last_operator_lhs = last_operator_lhs_;
-        s.last_operator_rhs = last_operator_rhs_;
-        s.last_operator_ratio = last_operator_ratio_;
+    void exchange_active(SlotState& s) {
+        using std::swap;
+        swap(col_lo_, s.col_lo);
+        swap(col_hi_, s.col_hi);
+        swap(row_lo_, s.row_lo);
+        swap(row_hi_, s.row_hi);
+        swap(c_, s.c);
+        swap(x_, s.x);
+        swap(y_, s.y);
+        swap(xbar_, s.xbar);
+        swap(Aty_, s.Aty);
+        swap(Ax_, s.Ax);
+        swap(x_avg_, s.x_avg);
+        swap(y_avg_, s.y_avg);
+        swap(x_anchor_, s.x_anchor);
+        swap(y_anchor_, s.y_anchor);
+        swap(x_fixed_, s.x_fixed);
+        swap(y_fixed_, s.y_fixed);
+        swap(Ax_current_, s.Ax_current);
+        swap(Ax_fixed_, s.Ax_fixed);
+        swap(Ax_anchor_, s.Ax_anchor);
+        swap(checkpoint_x_, s.checkpoint_x);
+        swap(checkpoint_y_, s.checkpoint_y);
+        swap(checkpoint_Ax_, s.checkpoint_Ax);
+        swap(checkpoint_x_avg_, s.checkpoint_x_avg);
+        swap(checkpoint_y_avg_, s.checkpoint_y_avg);
+        swap(last_x_delta_, s.last_x_delta);
+        swap(last_y_delta_, s.last_y_delta);
+        swap(primal_ray_, s.primal_ray);
+        swap(dual_ray_, s.dual_ray);
+        swap(avg_count_, s.avg_count);
+        swap(epoch_step_, s.epoch_step);
+        swap(checkpoint_avg_count_, s.checkpoint_avg_count);
+        swap(checkpoint_epoch_step_, s.checkpoint_epoch_step);
+        swap(checkpoint_valid_, s.checkpoint_valid);
+        swap(last_dx_, s.last_dx);
+        swap(last_dy_, s.last_dy);
+        swap(last_operator_lhs_, s.last_operator_lhs);
+        swap(last_operator_rhs_, s.last_operator_rhs);
+        swap(last_operator_ratio_, s.last_operator_ratio);
     }
 
     void spmv_csr(const f64* x, f64* y) const {
-        const auto& rp = A_csr_.pattern.row_ptr();
-        const auto& ci = A_csr_.pattern.col_idx();
-        const auto& v = A_csr_.vals;
-        for (std::size_t r = 0; r < nr_; ++r) {
-            f64 acc = 0.0;
-            for (core::Offset k = rp[r]; k < rp[r + 1]; ++k)
-                acc += v[static_cast<std::size_t>(k)] *
-                       x[static_cast<std::size_t>(ci[static_cast<std::size_t>(k)])];
-            y[r] = acc;
-        }
+        csr_plan_.apply(x, y);
     }
 
     // Gather form: for each column j, y[j] = sum_i A_ij * x[i]
     void spmv_csc(const f64* x, f64* y) const {
-        const auto& cp = A_csc_.pattern.col_ptr();
-        const auto& ri = A_csc_.pattern.row_idx();
-        const auto& v = A_csc_.vals;
-        for (std::size_t j = 0; j < nc_; ++j) {
-            f64 acc = 0.0;
-            for (core::Offset k = cp[j]; k < cp[j + 1]; ++k)
-                acc += v[static_cast<std::size_t>(k)] *
-                       x[static_cast<std::size_t>(ri[static_cast<std::size_t>(k)])];
-            y[j] = acc;
-        }
+        csc_plan_.apply(x, y);
     }
 
     void evaluate_ray_candidates(Kkt& k) {
@@ -868,9 +828,12 @@ private:
     std::uint32_t batch_size_ = 1;
     std::vector<SlotState> batch_slots_;
     std::size_t nr_ = 0, nc_ = 0;
+    sparse::SpmvPlan csr_plan_, csc_plan_;
     sparse::CsrMatrix A_csr_;
     sparse::CscMatrix A_csc_;
     std::vector<f64> c_, col_lo_, col_hi_, row_lo_, row_hi_;
+    std::vector<f64> uploaded_c_, uploaded_row_lo_, uploaded_row_hi_;
+    std::optional<std::uint32_t> active_batch_slot_;
     std::vector<f64> row_scale_, col_scale_;
     std::vector<f64> x_, y_, xbar_, Aty_, Ax_;
     std::vector<f64> x_avg_, y_avg_, x_anchor_, y_anchor_;

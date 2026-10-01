@@ -4,11 +4,21 @@
 #include "sor/engines/dual_simplex.hpp"
 #include "sor/engines/simplex.hpp"
 #include "sor/sparse/csc.hpp"
+#include "sor/sparse/spmv_plan.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 
 namespace sor::engines {
+
+inline void validate_simplex_numerics(const SimplexOptions& opts) {
+    if (opts.pricing_threads < 1 || opts.pricing_threads > 256 ||
+        opts.refinement_steps < 0 || !std::isfinite(opts.refinement_target) || opts.refinement_target <= 0 ||
+        !std::isfinite(opts.residual_refactor_tol) || opts.residual_refactor_tol < 0 ||
+        opts.residual_check_interval < 0)
+        throw std::invalid_argument("simplex: invalid numerical policy");
+}
 
 // Immutable preprocessing shared by every stage of the Auto dispatcher.
 // A stage owns only its basis/iterate state; minimization conversion, Ruiz
@@ -21,6 +31,7 @@ struct SimplexPrepared {
     RuizScaling scaling;
     std::shared_ptr<const FactorScalingIdentity> factor_scaling_identity;
     sparse::CscMatrix csc;
+    sparse::SpmvPlan pricing_plan;
     std::vector<f64> lo;
     std::vector<f64> hi;
     std::vector<f64> cost;
@@ -42,6 +53,7 @@ inline std::vector<f64> prepared_tolerances(const SimplexPrepared& p,
                                            const SimplexOptions& opts,
                                            bool dual) {
     model::validate_lp_policy(opts.primal_feas_tol, opts.dual_feas_tol, opts.gap_tol, opts.time_limit_s);
+    validate_simplex_numerics(opts);
     if (p.factor_scaling_identity->ruiz_iterations != opts.ruiz_iterations ||
         p.factor_scaling_identity->ruiz_power_of_two != opts.ruiz_power_of_two)
         throw std::invalid_argument("prepared simplex: scaling policy changed; create a new session");
@@ -68,11 +80,17 @@ inline SimplexOptions simplex_options_after_elapsed(const SimplexOptions& opts,
     return remaining;
 }
 
+struct PrimalCleanupState {
+    std::vector<f64> basic_values;
+    std::vector<f64> nonbasic_values;
+};
+
 core::RawResult solve_primal_simplex_prepared(
     const SimplexPrepared& prepared, const SimplexOptions& opts,
     SimplexDiagnostics& diag, SimplexBasis* out_basis,
     const SimplexBasis* warm = nullptr,
-    FactorCarrier* out_factor = nullptr);
+    FactorCarrier* out_factor = nullptr,
+    const PrimalCleanupState* cleanup_state = nullptr);
 
 // `factor_carrier` (optional, EXPERIMENTAL -- repeated-LP reuse
 // measurement): see FactorCarrier's own doc comment in dual_simplex.hpp. Read
@@ -93,6 +111,13 @@ void accumulate_simplex_work(SimplexDiagnostics& total,
 
 // Shared fallback allowance, further constrained by the caller's pivot limit.
 inline constexpr std::uint64_t simplex_certificate_pivot_allowance = 4096;
+
+// Primal simplex on an unprepared model from an optional warm basis.
+core::RawResult solve_primal_simplex(const model::LpProblem& problem,
+                                     const SimplexOptions& opts,
+                                     SimplexDiagnostics& diag,
+                                     SimplexBasis* out_basis,
+                                     const SimplexBasis* warm);
 
 bool repair_simplex_dual(const model::LpProblem& problem, core::RawResult& raw,
                          const SimplexOptions& opts, SimplexDiagnostics& diag);

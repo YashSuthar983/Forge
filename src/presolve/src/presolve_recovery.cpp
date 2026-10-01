@@ -1,6 +1,7 @@
 #include "sor/presolve/presolve.hpp"
 
 #include "sor/certify/finalize.hpp"
+#include "sor/model/exact.hpp"
 
 #include <cmath>
 #include <limits>
@@ -111,6 +112,19 @@ void lift_row_duals(const model::LpProblem& original,
             if (valid)
                 add_row_multiplier(step.row,
                                    target - ycanon[sz(step.row)]);
+            continue;
+        }
+
+        if (step.kind == DualRecoveryKind::RowScaling) {
+            add_row_multiplier(step.row, (step.coeff - 1) * ycanon[sz(step.row)]);
+            continue;
+        }
+        if (step.kind == DualRecoveryKind::EquationSparsification) {
+            for (std::size_t q = 0; q < step.other_rows.size(); ++q) {
+                const Index row = step.other_rows[q];
+                if (row >= 0 && row < original.n_rows())
+                    add_row_multiplier(step.row, -step.other_row_coefficients[q] * ycanon[sz(row)]);
+            }
             continue;
         }
 
@@ -372,68 +386,68 @@ PresolveRecoveryResult recover_solution(
     return out;
 }
 
+namespace {
+model::Rational certificate_value(const std::string& token) {
+    if (!core::valid_exact_dual_token(token))
+        throw std::invalid_argument("postsolve: malformed exact certificate");
+    const auto slash = token.find('/');
+    const auto integer = [](std::string_view text) {
+        return model::parse_decimal_integer(text);
+    };
+    return model::Rational(integer(std::string_view(token).substr(0,slash))) /
+        model::Rational(slash == std::string::npos ? boost::multiprecision::cpp_int(1) :
+            integer(std::string_view(token).substr(slash+1)));
+}
+std::vector<std::string> certificate_tokens(const std::vector<model::Rational>& values) {
+    std::vector<std::string> result;
+    for (const auto& value : values) {
+        auto token = value.str();
+        if (!core::valid_exact_dual_token(token)) return {};
+        result.push_back(std::move(token));
+    }
+    return result;
+}
+}
+
 core::PrimalRay recover_primal_ray(const model::LpProblem& original,
                                    const PresolveMap& map,
                                    const core::PrimalRay& reduced,
                                    f64 tolerance) {
-    core::PrimalRay out;
-    const Index n = original.n_cols();
-    out.direction.assign(sz(n), 0.0);
-    for (Index j = 0; j < n; ++j) {
-        const Index nj = map.orig_to_new[sz(j)];
-        if (nj < 0) continue;
-        if (nj < static_cast<Index>(reduced.direction.size()))
-            out.direction[sz(j)] = reduced.direction[sz(nj)];
-    }
-    for (std::size_t t = map.equality_aggregations.size(); t-- > 0;) {
-        const auto& rec = map.equality_aggregations[t];
-        if (rec.col < 0 || rec.col >= n || rec.coeff == 0.0 ||
-            rec.other_cols.size() != rec.other_coeffs.size())
-            continue;
-        long double residual = 0.0L;
-        for (std::size_t k = 0; k < rec.other_cols.size(); ++k) {
-            const Index j = rec.other_cols[k];
-            if (j >= 0 && j < n)
-                residual += static_cast<long double>(rec.other_coeffs[k]) *
-                            out.direction[sz(j)];
+    try {
+        const Index n = original.n_cols();
+        std::vector<model::Rational> direction(sz(n),0);
+        if (reduced.direction.size() != map.new_to_orig.size()) return {};
+        const bool exact = reduced.exact_direction.size() == reduced.direction.size();
+        for (std::size_t j = 0; j < map.new_to_orig.size(); ++j)
+            direction[sz(map.new_to_orig[j])] = exact ? certificate_value(reduced.exact_direction[j]) :
+                model::Rational(reduced.direction[j]);
+        // Replay the actual chronological journal: reductions of different
+        // kinds may depend on each other across presolve passes.
+        for (std::size_t t = map.recovery_steps.size(); t-- > 0;) {
+            const auto& step = map.recovery_steps[t];
+            Index col = -1; f64 pivot = 0;
+            std::vector<Index> columns; std::vector<f64> coefficients;
+            if (step.kind == DualRecoveryKind::DoubletonEquality) {
+                const auto& rec = map.doubleton_equalities.at(sz(step.record));
+                col = rec.elim_col; pivot = rec.elim_coeff;
+                columns = rec.other_cols; coefficients = rec.other_coeffs;
+                columns.push_back(rec.keep_col); coefficients.push_back(rec.keep_coeff);
+            } else if (step.kind == DualRecoveryKind::EqualityAggregation) {
+                const auto& rec = map.equality_aggregations.at(sz(step.record));
+                col = rec.col; pivot = rec.coeff; columns = rec.other_cols; coefficients = rec.other_coeffs;
+            } else if (step.kind == DualRecoveryKind::SingletonColumnElimination) {
+                const auto& rec = map.singleton_columns.at(sz(step.record));
+                if (!rec.row_removed) continue;
+                col = rec.col; pivot = rec.coeff; columns = rec.other_cols; coefficients = rec.other_coeffs;
+            } else continue;
+            if (col < 0 || col >= n || pivot == 0 || columns.size() != coefficients.size()) return {};
+            model::Rational residual = 0;
+            for (std::size_t k = 0; k < columns.size(); ++k)
+                residual -= model::Rational(coefficients[k])*direction.at(sz(columns[k]));
+            direction[sz(col)] = residual/model::Rational(pivot);
         }
-        out.direction[sz(rec.col)] =
-            static_cast<f64>(-residual / static_cast<long double>(rec.coeff));
-    }
-    for (std::size_t t = map.doubleton_equalities.size(); t-- > 0;) {
-        const auto& rec = map.doubleton_equalities[t];
-        if (rec.elim_col < 0 || rec.elim_col >= n || rec.elim_coeff == 0.0)
-            continue;
-        long double residual = 0.0L;
-        if (rec.keep_col >= 0 && rec.keep_col < n)
-            residual += static_cast<long double>(rec.keep_coeff) *
-                        out.direction[sz(rec.keep_col)];
-        for (std::size_t k = 0; k < rec.other_cols.size(); ++k) {
-            const Index j = rec.other_cols[k];
-            if (j >= 0 && j < n)
-                residual += static_cast<long double>(rec.other_coeffs[k]) *
-                            out.direction[sz(j)];
-        }
-        out.direction[sz(rec.elim_col)] =
-            static_cast<f64>(-residual / static_cast<long double>(rec.elim_coeff));
-    }
-    for (std::size_t t = map.singleton_columns.size(); t-- > 0;) {
-        const auto& rec = map.singleton_columns[t];
-        if (!rec.row_removed || rec.col < 0 || rec.col >= n ||
-            rec.coeff == 0.0 ||
-            rec.other_cols.size() != rec.other_coeffs.size())
-            continue;
-        long double residual = 0.0L;
-        for (std::size_t k = 0; k < rec.other_cols.size(); ++k) {
-            const Index j = rec.other_cols[k];
-            if (j >= 0 && j < n)
-                residual += static_cast<long double>(rec.other_coeffs[k]) *
-                            out.direction[sz(j)];
-        }
-        out.direction[sz(rec.col)] =
-            static_cast<f64>(-residual / static_cast<long double>(rec.coeff));
-    }
-    return certify::check_primal_ray(original, out.direction, tolerance);
+        return certify::check_exact_primal_ray(original,certificate_tokens(direction),tolerance);
+    } catch (const std::exception&) { return {}; }
 }
 
 core::DualFarkasRay recover_dual_farkas_ray(
@@ -441,41 +455,41 @@ core::DualFarkasRay recover_dual_farkas_ray(
     const PresolveMap& map,
     const core::DualFarkasRay& reduced,
     f64 tolerance) {
-    std::vector<f64> lifted(sz(original.n_rows()), 0.0);
-    const Index rm = map.problem.n_rows();
-    if (static_cast<Index>(reduced.multipliers.size()) == rm &&
-        static_cast<Index>(map.row_new_to_orig.size()) == rm) {
-        for (Index i = 0; i < rm; ++i)
-            lifted[sz(map.row_new_to_orig[sz(i)])] = reduced.multipliers[sz(i)];
-    }
-    for (std::size_t t = map.recovery_steps.size(); t-- > 0;) {
-        const auto& step = map.recovery_steps[t];
-        if (step.row < 0 || step.row >= original.n_rows()) continue;
-        if (step.kind == DualRecoveryKind::EqualityAggregation) {
-            if (step.record < 0 ||
-                sz(step.record) >= map.equality_aggregations.size())
-                continue;
-            const auto& rec = map.equality_aggregations[sz(step.record)];
-            const f64 yp = lifted[sz(step.row)];
-            lifted[sz(step.row)] = 0.0;
-            for (std::size_t q = 0; q < rec.affected_rows.size(); ++q) {
-                const Index row = rec.affected_rows[q];
-                if (row >= 0 && row < original.n_rows())
-                    lifted[sz(row)] -= rec.row_multipliers[q] * yp;
+    try {
+        std::vector<model::Rational> lifted(sz(original.n_rows()),0);
+        const auto rm = sz(map.problem.n_rows());
+        if (reduced.multipliers.size() != rm || map.row_new_to_orig.size() != rm) return {};
+        const bool exact = reduced.exact_multipliers.size() == rm;
+        for (std::size_t i = 0; i < rm; ++i)
+            lifted.at(sz(map.row_new_to_orig[i])) = exact ? certificate_value(reduced.exact_multipliers[i]) :
+                model::Rational(reduced.multipliers[i]);
+        for (std::size_t t = map.recovery_steps.size(); t-- > 0;) {
+            const auto& step = map.recovery_steps[t];
+            if (step.row < 0 || step.row >= original.n_rows()) continue;
+            if (step.kind == DualRecoveryKind::EqualityAggregation) {
+                const auto& rec = map.equality_aggregations.at(sz(step.record));
+                if (rec.affected_rows.size() != rec.row_multipliers.size()) return {};
+                model::Rational target = 0;
+                for (std::size_t q = 0; q < rec.affected_rows.size(); ++q)
+                    target -= model::Rational(rec.row_multipliers[q])*lifted.at(sz(rec.affected_rows[q]));
+                lifted[sz(step.row)] = target;
+            } else if (step.kind == DualRecoveryKind::DoubletonEquality ||
+                       step.kind == DualRecoveryKind::EqualitySingletonFix) {
+                if (step.coeff == 0 || step.other_rows.size() != step.other_row_coefficients.size()) return {};
+                model::Rational target = 0;
+                for (std::size_t q = 0; q < step.other_rows.size(); ++q)
+                    target -= model::Rational(step.other_row_coefficients[q])*lifted.at(sz(step.other_rows[q]));
+                lifted[sz(step.row)] = target/model::Rational(step.coeff);
+            } else if (step.kind == DualRecoveryKind::RowScaling) {
+                lifted[sz(step.row)] *= model::Rational(step.coeff);
+            } else if (step.kind == DualRecoveryKind::EquationSparsification) {
+                if (step.other_rows.size() != step.other_row_coefficients.size()) return {};
+                for (std::size_t q = 0; q < step.other_rows.size(); ++q)
+                    lifted[sz(step.row)] -= model::Rational(step.other_row_coefficients[q])*lifted.at(sz(step.other_rows[q]));
             }
-            continue;
         }
-        if (step.kind == DualRecoveryKind::ParallelRowMerge) {
-            // Redundant parallel row: keep row carries the reduced multiplier.
-            continue;
-        }
-        if (step.kind == DualRecoveryKind::DominatedColumn ||
-            step.kind == DualRecoveryKind::ParallelColumnMerge) {
-            // Column fix at zero reduced multiplier on eliminated rows.
-            continue;
-        }
-    }
-    return certify::check_dual_farkas_ray(original, lifted, tolerance);
+        return certify::check_exact_dual_farkas_ray(original,certificate_tokens(lifted),tolerance);
+    } catch (const std::exception&) { return {}; }
 }
 
 }  // namespace sor::presolve

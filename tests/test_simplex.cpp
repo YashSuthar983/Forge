@@ -331,6 +331,8 @@ void test_pruned_fixed_pivotal_entries_match_retained_path() {
     lp.col_hi = {sor::core::kPosInf, sor::core::kPosInf};
 
     SimplexOptions opts;
+    // Exercise both pivotal-row sweeps; the crash would discharge both rows.
+    opts.dual_crash = false;
     opts.method = sor::engines::SimplexMethod::Dual;
     opts.presolve = false;
     opts.ruiz_iterations = 0;
@@ -2006,7 +2008,82 @@ void test_simplex_consumes_terminal_presolve_outcome() {
 
 }  // namespace
 
+void test_residual_monitor_tracks_pivoted_dual_vector() {
+    // Independent unit rows have exact pivots and no equation drift. Checking
+    // every pivot must not refactor merely because the basic costs changed.
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(5, 5, {0, 1, 2, 3, 4},
+        {0, 1, 2, 3, 4}, {1.0, 1.0, 1.0, 1.0, 1.0});
+    lp.c = {-1.0, -2.0, -3.0, -4.0, -5.0};
+    lp.col_lo.assign(5, 0.0);
+    lp.col_hi.assign(5, sor::model::kInf);
+    lp.row_lo.assign(5, -sor::model::kInf);
+    lp.row_hi.assign(5, 1.0);
+    SimplexOptions opts;
+    opts.method = sor::engines::SimplexMethod::Primal;
+    opts.presolve = false;
+    opts.primal_crash = false;
+    opts.ruiz_iterations = 0;
+    opts.residual_check_interval = 1;
+    const auto run = solve_problem(lp, opts);
+    CHECK(run.r.status == Status::Optimal);
+    CHECK_NEAR(run.r.objective, -15.0, 1e-12);
+    CHECK(run.diag.phase2_iterations >= 5);
+    CHECK(run.diag.residual_refactors == 0);
+}
+
+void test_dual_bfrt_retains_selected_leaving_bound() {
+    // The first boxed variable flips to 1. The remaining travel to the lower
+    // row bound is below the primal tolerance, but the row's upper bound is
+    // still 2. Parking on that opposite side corrupts the row equation.
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
+    lp.c = {1.0, 2.0};
+    lp.col_lo = {0.0, 0.0}; lp.col_hi = {1.0, sor::model::kInf};
+    lp.row_lo = {1.0 + 5e-7}; lp.row_hi = {2.0};
+    SimplexOptions opts;
+    opts.method = sor::engines::SimplexMethod::Dual;
+    opts.presolve = false; opts.ruiz_iterations = 0;
+    opts.primal_feas_tol = 1e-6; opts.use_expand = false;
+    opts.residual_check_interval = 1;
+    const auto run = solve_problem(lp, opts);
+    CHECK(run.r.status == Status::Optimal);
+    CHECK_NEAR(run.r.objective, 1.0 + 1e-6, 1e-12);
+    CHECK(run.diag.bound_flips >= 1);
+    CHECK(run.diag.residual_refactors == 0);
+    CHECK_NEAR(run.r.x[0], 1.0, 1e-12);
+    CHECK_NEAR(run.r.x[1], 5e-7, 1e-12);
+}
+
+void test_unrepresentable_scaling_preserves_original_model() {
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(1, 1, {0}, {0}, {100.0});
+    lp.c = {1.0}; lp.col_lo = {0.0}; lp.col_hi = {1e308};
+    lp.row_lo = lp.row_hi = {1.0};
+    for (bool maximize : {false, true}) {
+        lp.maximize = maximize; lp.c[0] = maximize ? -1.0 : 1.0; lp.obj_offset = 5.0;
+        for (const auto method : {sor::engines::SimplexMethod::Primal, sor::engines::SimplexMethod::Dual}) {
+            SimplexOptions opts;
+            opts.method = method; opts.presolve = false;
+            opts.time_limit_s = 1.0;
+            SimplexDiagnostics diag;
+            auto raw = sor::engines::solve_simplex(lp, opts, diag);
+            const auto checked = sor::certify::check_lp_result(lp, raw,
+                sor::engines::simplex_evidence(diag, opts));
+            const auto result = sor::certify::finalize_result(std::move(raw), checked);
+            CHECK(result.status == Status::Optimal);
+            CHECK_NEAR(result.x[0], 0.01, 1e-12);
+            CHECK_NEAR(result.objective, maximize ? 4.99 : 5.01, 1e-12);
+            CHECK(lp.col_hi[0] == 1e308);
+            CHECK(lp.A.vals[0] == 100.0);
+        }
+    }
+}
+
 int main() {
+    test_dual_bfrt_retains_selected_leaving_bound();
+    test_residual_monitor_tracks_pivoted_dual_vector();
+    test_unrepresentable_scaling_preserves_original_model();
     SOR_FN();
     test_fixture_lp();
     test_auto_commits_to_one_engine_without_a_discarded_probe();

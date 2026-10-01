@@ -49,6 +49,12 @@ struct SimplexOptions {
     // Targeted continuation may price an exact unsupported dual term even
     // when its numerical reduced cost lies below the search tolerance.
     bool certificate_pricing = false;
+    int pricing_threads = 1;
+    bool parallel_basis_solves = false;
+    la::LuOptions basis_lu;
+    std::uint64_t perturbation_seed = 0;
+    bool presolve_equation_sparsification = true;
+    bool presolve_domain_probing = false;
     std::uint64_t max_iterations = 0;
     double time_limit_s = 900.0;
 
@@ -76,6 +82,17 @@ struct SimplexOptions {
     // nnz trigger cannot see. Beyond this relative gap, refactorize and redo
     // the iteration. 0 disables.
     f64 numerical_trouble_tol = 1e-7;
+    bool iterative_refinement = true;
+    bool allow_cost_shifts = false;
+    f64 refinement_target = 1e-13;
+    int refinement_steps = 3;
+    // Equation residuals measure numerical drift, separately from feasibility.
+    // The scan is O(nnz) in long double; every pivot it cost ~45% of the
+    // 80bau3b loop (2187 vs 1133 ms, identical path, no refactor triggered).
+    // The pivot-consistency check above stays per pivot; drift accumulates
+    // with update count, which the count/work refactor triggers also bound.
+    f64 residual_refactor_tol = 1e-6;
+    int residual_check_interval = 32;
 
     SimplexMethod  method  = SimplexMethod::Auto;
     SimplexPricing pricing = SimplexPricing::Choose;
@@ -249,13 +266,15 @@ struct SimplexOptions {
     // engine's cadence because their conditioning and per-rebuild costs differ.
     int primal_phase1_resync_interval = 64;
 
-    // Opt-in primal cold-start crash. It replaces selected row logicals with
+    // Cold-start triangular crash. It replaces selected row logicals with
     // structural columns only when the resulting triangular-by-construction
     // basis strictly reduces the starting primal infeasibility AND the first
     // factorization accepts the basis without singular repair. Kept off as
     // the library default until its full Netlib A/B gate is complete; the LP
-    // CLI may enable it independently.
+    // CLI enables it independently. Dual crash restricts structural basic
+    // columns to zero working cost, preserving its initial dual feasibility.
     bool primal_crash = false;
+    bool dual_crash = true;
 
 
     // Diagnostic-only early abort when the dual merit function goes flat.
@@ -332,6 +351,9 @@ struct SimplexDiagnostics {
     std::uint64_t phase2_iterations = 0;
     std::uint64_t bound_flips       = 0;
     std::uint64_t refactorizations  = 0;
+    std::uint64_t residual_refactors = 0;
+    std::uint64_t numerical_zero_dual_steps = 0;
+    std::uint64_t refinement_corrections = 0;
     std::uint64_t collective_ft_collapses = 0;  // full refactors avoided via collapse_pending_into_ft()
     std::uint64_t collective_ft_skips = 0;      // rejected by bounded-work production guard
     std::uint64_t degenerate_steps  = 0;
@@ -371,6 +393,7 @@ struct SimplexDiagnostics {
     std::uint64_t primal_price_heap_max_size = 0;
     std::uint64_t primal_ftran_dense_switches = 0;
     std::uint64_t primal_crash_columns = 0;
+    std::uint64_t dual_crash_columns = 0;
     f64 primal_crash_infeasibility_before = 0.0;
     f64 primal_crash_infeasibility_after = 0.0;
     std::uint64_t devex_frameworks  = 0;
