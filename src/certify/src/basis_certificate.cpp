@@ -1,5 +1,7 @@
 #include "sor/certify/finalize.hpp"
 #include "padic_solve.hpp"
+#include "sor/la/lu.hpp"
+#include "sor/sparse/csc.hpp"
 #include "sor/model/exact.hpp"
 
 #include <algorithm>
@@ -455,6 +457,275 @@ bool repair_basis_farkas_certificate(const model::LpProblem& p, core::RawResult&
     return true;
 }
 
+namespace {
+// Floating duals of a basis on this model (min sense, logicals -e_i): one LU,
+// BTRAN and a long-double residual refinement step.
+bool floating_basis_duals(const model::LpProblem& p, const std::vector<core::Index>& basis,
+                          std::vector<f64>& y) {
+    y.clear();
+    const auto m = static_cast<std::size_t>(p.n_rows());
+    const auto n = p.n_cols();
+    if (basis.size() != m || m == 0) return false;
+    const auto csc = sparse::to_csc(p.A);
+    const auto& cp = csc.pattern.col_ptr();
+    const auto& ri = csc.pattern.row_idx();
+    std::vector<core::Offset> bp{0};
+    std::vector<core::Index> br;
+    std::vector<f64> bv, cb(m, 0.0);
+    std::vector<char> seen(static_cast<std::size_t>(n) + m, 0);
+    const double sense = p.maximize ? -1.0 : 1.0;
+    for (std::size_t k = 0; k < m; ++k) {
+        const auto j = basis[k];
+        if (j < 0 || j >= n + static_cast<core::Index>(m) || seen[static_cast<std::size_t>(j)]) return false;
+        seen[static_cast<std::size_t>(j)] = 1;
+        if (j < n) {
+            cb[k] = sense * p.c[static_cast<std::size_t>(j)];
+            for (auto z = cp[static_cast<std::size_t>(j)]; z < cp[static_cast<std::size_t>(j) + 1]; ++z) {
+                br.push_back(ri[static_cast<std::size_t>(z)]);
+                bv.push_back(csc.vals[static_cast<std::size_t>(z)]);
+            }
+        } else {
+            br.push_back(j - n);
+            bv.push_back(-1.0);
+        }
+        bp.push_back(static_cast<core::Offset>(br.size()));
+    }
+    la::BasisFactor factor;
+    if (!factor.factorize(static_cast<core::Index>(m), bp, br, bv, la::LuOptions{})) return false;
+    y = cb;
+    factor.btran(y);
+    std::vector<f64> r(m);
+    for (std::size_t k = 0; k < m; ++k) {
+        long double s = cb[k];
+        for (auto z = bp[k]; z < bp[k + 1]; ++z)
+            s -= static_cast<long double>(bv[static_cast<std::size_t>(z)]) *
+                 y[static_cast<std::size_t>(br[static_cast<std::size_t>(z)])];
+        r[k] = static_cast<f64>(s);
+    }
+    factor.btran(r);
+    for (std::size_t i = 0; i < m; ++i) {
+        y[i] += r[i];
+        if (!std::isfinite(y[i])) { y.clear(); return false; }
+    }
+    return true;
+}
+
+// A bound witness for the basis without solving it exactly. The Lagrangian
+// needs exactness only where a term faces a side with no finite (declared or
+// row-implied) bound: such a reduced cost must be exactly zero or of the
+// chargeable sign, such a row multiplier exactly zero. The floating basis
+// duals get every other term right already, so only those few equations are
+// solved exactly, on a matching set of rows, and the result is checked by the
+// exact Lagrangian. Full exact reconstruction remains the fallback; on Netlib
+// it ran in 36 of 93 solves and took 40% of all solve time.
+bool targeted_basis_certificate(const model::LpProblem& p, const std::vector<core::Index>& basis,
+                                const ExactCertificatePolicy& policy,
+                                const std::function<bool()>& expired,
+                                std::vector<std::string>& tokens, const char*& reason,
+                                const std::vector<f64>* point = nullptr) {
+    const auto m = static_cast<std::size_t>(p.n_rows());
+    const auto n = static_cast<std::size_t>(p.n_cols());
+    // With the basis point x the bound equals c'x exactly when every term is
+    // complementary: d_j (b_j - x_j) = 0 for the bound b_j a reduced cost is
+    // charged to, y_i (side_i - a_i x) = 0 for each row. Terms violating that
+    // by more than eps are driven to zero as well; what remains makes the
+    // witness weaker only where the basis itself is not dual feasible, in
+    // which case the exact basis duals could do no better.
+    const bool use_point = point && point->size() == n;
+    std::vector<long double> activity;
+    double objective_scale = 1.0;
+    if (use_point) {
+        activity.assign(m, 0.0L);
+        const auto& rp = p.A.pattern.row_ptr();
+        const auto& ci = p.A.pattern.col_idx();
+        for (std::size_t i = 0; i < m; ++i)
+            for (auto k = rp[i]; k < rp[i + 1]; ++k)
+                activity[i] += static_cast<long double>(p.A.vals[static_cast<std::size_t>(k)]) *
+                               (*point)[static_cast<std::size_t>(ci[static_cast<std::size_t>(k)])];
+        objective_scale = 1.0 + std::fabs(p.objective(*point));
+    }
+    const double eps = 1e-12 * objective_scale;
+    const auto off_bound = [](double value, double bound) {
+        return std::fabs(value - bound) > 1e-6 * (1.0 + std::fabs(bound));
+    };
+    std::vector<f64> yf;
+    if (!floating_basis_duals(p, basis, yf)) { reason = "basis duals unavailable"; return false; }
+    std::vector<Rational> y;
+    y.reserve(m);
+    for (const f64 v : yf) y.emplace_back(v);
+    std::pair<std::vector<double>, std::vector<double>> implied;
+    const auto chargeable = [&](std::size_t j, int sign) {
+        double side = sign > 0 ? p.col_lo[j] : p.col_hi[j];
+        if (std::isfinite(side)) return true;
+        if (implied.first.empty()) implied = implied_lp_column_bounds(p);
+        side = sign > 0 ? implied.first[j] : implied.second[j];
+        return std::isfinite(side);
+    };
+    const auto row_ok = [&](std::size_t i, const Rational& v) {
+        return v == 0 || (v > 0 ? std::isfinite(p.row_lo[i]) : std::isfinite(p.row_hi[i]));
+    };
+    constexpr std::size_t kMaxCritical = 1024;
+    std::vector<std::vector<std::pair<core::Index, f64>>> col_rows;
+    for (int round = 0; round < 8; ++round) {
+        if (expired()) { reason = "deadline"; return false; }
+        const auto terms = dual_terms(p, fraction_parts(y), true);
+        // Critical: a reduced cost whose sign has no chargeable bound. At
+        // risk: one that is not chargeable on both sides and so small that
+        // the correction could flip it. Both are driven to exactly zero
+        // (always chargeable) in one system, so a round cannot create the
+        // next round's critical column.
+        std::vector<std::size_t> critical;
+        std::size_t at_risk = 0, soft = 0;
+        for (std::size_t j = 0; j < n; ++j) {
+            const int sign = terms.reduced[j].sign();
+            if (sign != 0 && !chargeable(j, sign)) { critical.push_back(j); continue; }
+            if (use_point && sign != 0) {
+                double b = sign > 0 ? p.col_lo[j] : p.col_hi[j];
+                if (!std::isfinite(b)) b = sign > 0 ? implied.first[j] : implied.second[j];
+                const Rational dj = terms.reduced[j].value() / Rational(terms.denominator);
+                const double charge = std::fabs(dj.convert_to<double>()) * std::fabs(b - (*point)[j]);
+                if (off_bound((*point)[j], b) && charge > eps) { critical.push_back(j); ++soft; continue; }
+            }
+            if (chargeable(j, 1) && chargeable(j, -1)) continue;
+            const Rational dj = terms.reduced[j].value() / Rational(terms.denominator);
+            const double magnitude = std::fabs(dj.convert_to<double>());
+            if (magnitude <= 1e-9 * (1.0 + std::fabs(p.c[j]))) { critical.push_back(j); ++at_risk; }
+        }
+        std::vector<std::size_t> zeroed;   // rows whose multiplier must become 0
+        for (std::size_t i = 0; i < m; ++i) {
+            if (!row_ok(i, y[i])) { zeroed.push_back(i); continue; }
+            if (!use_point || y[i] == 0) continue;
+            const double side = y[i] > 0 ? p.row_lo[i] : p.row_hi[i];
+            const double a = static_cast<double>(activity[i]);
+            if (off_bound(a, side) && std::fabs(y[i].convert_to<double>()) * std::fabs(side - a) > eps)
+                zeroed.push_back(i);
+        }
+        const bool hard_clear = critical.size() == at_risk + soft &&
+            std::all_of(zeroed.begin(), zeroed.end(), [&](std::size_t i) { return row_ok(i, y[i]); });
+        // Soft terms that survive every round are genuine dual infeasibility
+        // of the basis: publish the finite witness rather than an exact basis
+        // solve that cannot be tighter.
+        if ((critical.size() == at_risk && zeroed.empty()) || (round == 7 && hard_clear)) {
+            tokens.clear();
+            tokens.reserve(m);
+            for (const auto& v : y) {
+                const auto num = numerator(v);
+                if (boost::multiprecision::msb(denominator(v)) > policy.max_bits ||
+                    (num != 0 && boost::multiprecision::msb(num < 0 ? -num : num) > policy.max_bits)) { reason = "witness exceeds size policy"; return false; }
+                tokens.push_back(v.str());
+                if (!core::valid_exact_dual_token(tokens.back())) { reason = "invalid token"; return false; }
+            }
+            reason = "exact bound not finite";
+            return exact_dual_lower_bound(p, tokens).finite;
+        }
+        if (critical.size() > kMaxCritical) { reason = "too many critical terms"; return false; }
+        if (col_rows.empty()) {
+            col_rows.resize(n);
+            const auto& rp = p.A.pattern.row_ptr();
+            const auto& ci = p.A.pattern.col_idx();
+            for (std::size_t i = 0; i < m; ++i)
+                for (auto k = rp[i]; k < rp[i + 1]; ++k)
+                    col_rows[static_cast<std::size_t>(ci[static_cast<std::size_t>(k)])].push_back(
+                        {static_cast<core::Index>(i), p.A.vals[static_cast<std::size_t>(k)]});
+        }
+        // Zero the offending multipliers first; their columns' reduced costs
+        // move by the removed terms.
+        std::vector<char> fixed_row(m, 0);
+        for (const auto i : zeroed) { y[i] = 0; fixed_row[i] = 1; }
+        if (critical.empty()) continue;
+        const auto terms2 = dual_terms(p, fraction_parts(y), true);
+        // Candidate rows touching the critical columns, chosen by floating
+        // elimination with partial pivoting so A[R, F] is well conditioned.
+        std::vector<core::Index> candidates;
+        std::vector<int> candidate_index(m, -1);
+        // A row may move only if no small shift can turn its multiplier
+        // toward an infinite side: boxed rows, or a multiplier comfortably
+        // on its chargeable side.
+        const auto movable = [&](std::size_t i) {
+            if (std::isfinite(p.row_lo[i]) && std::isfinite(p.row_hi[i])) return true;
+            const double v = y[i].convert_to<double>();
+            return std::fabs(v) > 1e-9 && row_ok(i, y[i]);
+        };
+        for (const auto j : critical)
+            for (const auto& [i, a] : col_rows[j]) {
+                (void)a;
+                if (fixed_row[static_cast<std::size_t>(i)] || candidate_index[static_cast<std::size_t>(i)] >= 0 ||
+                    !movable(static_cast<std::size_t>(i))) continue;
+                candidate_index[static_cast<std::size_t>(i)] = static_cast<int>(candidates.size());
+                candidates.push_back(i);
+            }
+        const std::size_t k = critical.size(), c = candidates.size();
+        if (c == 0 || k * c > 4'000'000) { reason = "critical rows unavailable"; return false; }
+        std::vector<double> dense(k * c, 0.0);
+        for (std::size_t q = 0; q < k; ++q)
+            for (const auto& [i, a] : col_rows[critical[q]])
+                if (candidate_index[static_cast<std::size_t>(i)] >= 0)
+                    dense[q * c + static_cast<std::size_t>(candidate_index[static_cast<std::size_t>(i)])] = a;
+        // A critical column dependent on earlier ones (a degenerate
+        // nonbasic one, typically) gets no row this round; zeroing the
+        // independent ones usually fixes it too, and the next round re-checks.
+        std::vector<std::size_t> chosen, solved_columns;
+        std::vector<char> used(c, 0);
+        for (std::size_t q = 0; q < k; ++q) {
+            std::size_t best = c;
+            double best_abs = 0;
+            for (std::size_t t = 0; t < c; ++t)
+                if (!used[t] && std::fabs(dense[q * c + t]) > best_abs) { best_abs = std::fabs(dense[q * c + t]); best = t; }
+            if (best == c || best_abs < 1e-12) continue;
+            used[best] = 1;
+            chosen.push_back(best);
+            solved_columns.push_back(critical[q]);
+            for (std::size_t r = q + 1; r < k; ++r) {
+                const double f = dense[r * c + best] / dense[q * c + best];
+                if (f == 0) continue;
+                for (std::size_t t = 0; t < c; ++t) dense[r * c + t] -= f * dense[q * c + t];
+            }
+        }
+        if (chosen.empty()) { reason = "no independent critical column"; return false; }
+        critical = std::move(solved_columns);
+        const std::size_t solved = chosen.size();
+        // Exact square system: for each critical column j,
+        //   sum_{i in R} a_ij dy_i = d_j   (so the new reduced cost is 0).
+        std::vector<int> unknown(m, -1);
+        for (std::size_t q = 0; q < solved; ++q) unknown[static_cast<std::size_t>(candidates[chosen[q]])] = static_cast<int>(q);
+        std::vector<std::map<core::Index, detail::PadicInteger>> equations(solved);
+        std::vector<detail::PadicInteger> rhs(solved);
+        for (std::size_t q = 0; q < solved; ++q) {
+            const std::size_t j = critical[q];
+            std::vector<std::pair<int, Rational>> entries;
+            for (const auto& [i, a] : col_rows[j])
+                if (unknown[static_cast<std::size_t>(i)] >= 0)
+                    entries.push_back({unknown[static_cast<std::size_t>(i)], Rational(a)});
+            const Rational dj = terms2.reduced[j].value() / Rational(terms2.denominator);
+            // Least common multiple: after a correction round y (and so d_j)
+            // is no longer dyadic.
+            Integer scale = denominator(dj);
+            for (const auto& [u, a] : entries) {
+                const Integer den = denominator(a);
+                if (scale % den != 0) scale = scale / boost::multiprecision::gcd(scale, den) * den;
+            }
+            for (const auto& [u, a] : entries) {
+                const Rational v = a * Rational(scale);
+                if (denominator(v) != 1) { reason = "non-dyadic coefficient"; return false; }   // dyadic data: cannot happen
+                equations[q][u] = numerator(v);
+            }
+            const Rational r = dj * Rational(scale);
+            if (denominator(r) != 1) { reason = "non-dyadic right-hand side"; return false; }
+            rhs[q] = numerator(r);
+        }
+        std::vector<std::vector<Rational>> solution;
+        std::uint64_t budget = policy.max_operations;
+        if (!detail::padic_solve(equations, {rhs}, solution, budget, policy.max_bits, expired)) { reason = "subsystem solve failed"; return false; }
+        for (std::size_t q = 0; q < solved; ++q) {
+            const auto i = static_cast<std::size_t>(candidates[chosen[q]]);
+            y[i] += solution[0][q];
+            if (!row_ok(i, y[i])) { reason = "corrected multiplier faces an infinite side"; return false; }
+        }
+    }
+    { reason = "rounds exhausted"; return false; }
+}
+}  // namespace
+
 bool repair_basis_certificate(const model::LpProblem& problem, core::RawResult& raw,
                                const ExactCertificatePolicy& policy) {
     validate_certificate_policy(policy);
@@ -697,6 +968,51 @@ SafeLpBound lower_bound_from_terms(const model::LpProblem& p,
     return out;
 }
 }  // namespace
+
+bool repair_dual_certificate(const model::LpProblem& problem, core::RawResult& raw,
+                             const ExactCertificatePolicy& policy) {
+    validate_certificate_policy(policy);
+    const auto started = std::chrono::steady_clock::now();
+    const auto expired = [&] { return policy.time_limit_s > 0 &&
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() >= policy.time_limit_s; };
+    std::vector<std::string> tokens;
+    const char* reason = "";
+    const bool targeted = targeted_basis_certificate(problem, raw.certificate_basis, policy,
+                                                     expired, tokens, reason, &raw.x);
+    if (std::getenv("SOR_CERTIFICATE_DEBUG"))
+        std::fprintf(stderr, "exact certificate: targeted %s (%s) m=%d elapsed=%.6f\n",
+            targeted ? "accepted" : "declined", targeted ? "" : reason, problem.n_rows(),
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+    if (targeted && raw.x.size() == static_cast<std::size_t>(problem.n_cols())) {
+        // A finite bound is not enough: a round-off reduced cost charged to a
+        // huge declared bound (1e308) is finite and useless. The witness must
+        // match the basis point's objective as the exact basis duals would;
+        // otherwise the exact solve below decides.
+        const double sense = problem.maximize ? -1.0 : 1.0;
+        const double objective = sense * problem.objective(raw.x);
+        const auto bound = exact_dual_lower_bound(problem, tokens);
+        if (bound.finite && std::isfinite(objective) &&
+            std::fabs(objective - bound.value) <= 1e-9 * (1.0 + std::fabs(objective))) {
+            raw.exact_dual = std::move(tokens);
+            return true;
+        }
+        // Every term is complementary to the point within eps or genuinely
+        // dual infeasible, so the exact basis duals cannot be tighter: keep
+        // this witness for the caller's gap test and continuation pricing.
+        if (bound.finite) {
+            if (std::getenv("SOR_CERTIFICATE_DEBUG"))
+                std::fprintf(stderr, "exact certificate: targeted witness weaker than the basis point (kept)\n");
+            raw.exact_dual = std::move(tokens);
+            return true;
+        }
+    }
+    if (expired()) return false;
+    auto remaining = policy;
+    if (policy.time_limit_s > 0)
+        remaining.time_limit_s = std::max(std::numeric_limits<double>::min(), policy.time_limit_s -
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+    return repair_basis_certificate(problem, raw, remaining);
+}
 
 ExactDualSupportFailure exact_dual_support_failure(
     const model::LpProblem& p, const std::vector<std::string>& witness,

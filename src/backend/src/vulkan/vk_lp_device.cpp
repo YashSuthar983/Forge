@@ -137,6 +137,22 @@ public:
         b_row_hi_ = create_device_buffer(lp.row_hi.data(), byte_size(lp.row_hi));
         b_col_scale_ = create_device_buffer(col_scale.data(), byte_size(col_scale));
         b_row_scale_ = create_device_buffer(row_scale.data(), byte_size(row_scale));
+        // Degree buckets: vectors of at least kLongVector entries are reduced
+        // by a whole workgroup (fit2d has 10.5k-entry rows, fit2p 3k-entry
+        // columns), the rest one invocation each.
+        const auto bucket = [&](const std::vector<int32_t>& ptr, std::size_t n, Buf& flags, Buf& list) {
+            std::vector<uint32_t> is_long(n, 0), longs;
+            for (std::size_t r = 0; r < n; ++r)
+                if (static_cast<std::size_t>(ptr[r + 1] - ptr[r]) >= kLongVector) {
+                    is_long[r] = 1;
+                    longs.push_back(static_cast<uint32_t>(r));
+                }
+            flags = create_device_buffer(is_long.data(), byte_size(is_long));
+            list = create_device_buffer(longs.data(), byte_size(longs));
+            return static_cast<uint32_t>(longs.size());
+        };
+        n_long_rows_ = bucket(row_ptr, nr_, b_row_long_, b_row_list_);
+        n_long_cols_ = bucket(col_ptr, nc_, b_col_long_, b_col_list_);
 
         const auto cols = nc_ * sizeof(f64), rows = nr_ * sizeof(f64);
         for (Buf* b : {&b_x_, &b_x_fixed_, &b_xbar_, &b_Aty_, &b_x_avg_, &b_x_anchor_, &b_ckpt_x_,
@@ -184,8 +200,8 @@ public:
         last_primal_weight_ = std::max<f64>(p.primal_weight, 1e-16);
         vkResetDescriptorPool(ctx_->device(), ctx_->descriptor_pool(), 0);
 
-        const auto set_aty = spmv_set(dsl_spmv_csc_, b_col_ptr_, b_row_idx_, b_csc_vals_, b_y_, b_Aty_);
-        const auto set_ax = spmv_set(dsl_spmv_csr_, b_row_ptr_, b_col_idx_, b_csr_vals_, b_xbar_, b_Ax_);
+        const auto set_aty = spmv_sets(false, b_y_, b_Aty_);
+        const auto set_ax = spmv_sets(true, b_xbar_, b_Ax_);
         VkDescriptorSet set_primal = alloc_set(dsl_primal_);
         write_ssbo(set_primal, 0, b_x_);
         write_ssbo(set_primal, 1, b_c_);
@@ -226,10 +242,10 @@ public:
         const auto stride = static_cast<uint32_t>(stride_);
         for (std::uint32_t s = 0; s < k; ++s) {
             // T: x_fixed = proj(x - tau (c + A'y)), xbar = 2 x_fixed - x.
-            run(cmd, pipe_spmv_csc_, layout_spmv_csc_, set_aty, PC1{nc, 0}, nc_, "spmv_csc");
+            spmv(cmd, set_aty, true);
             alignas(8) struct { uint32_t n; uint32_t stride; double tau; } pc_p{nc, stride, p.tau};
             run(cmd, pipe_primal_, layout_primal_, set_primal, pc_p, nc_, "primal_step");
-            run(cmd, pipe_spmv_csr_, layout_spmv_csr_, set_ax, PC1{nr, 0}, nr_, "spmv_csr");
+            spmv(cmd, set_ax, true);
             alignas(8) struct { uint32_t n; uint32_t stride; double sigma; } pc_d{nr, stride, p.sigma};
             run(cmd, pipe_dual_, layout_dual_, set_dual, pc_d, nr_, "dual_step");
             alignas(8) struct {
@@ -267,8 +283,8 @@ public:
     Kkt reduce_kkt() override {
         require_up();
         vkResetDescriptorPool(ctx_->device(), ctx_->descriptor_pool(), 0);
-        const auto set_ax = spmv_set(dsl_spmv_csr_, b_row_ptr_, b_col_idx_, b_csr_vals_, b_x_, b_Ax_);
-        const auto set_aty = spmv_set(dsl_spmv_csc_, b_col_ptr_, b_row_idx_, b_csc_vals_, b_y_, b_Aty_);
+        const auto set_ax = spmv_sets(true, b_x_, b_Ax_);
+        const auto set_aty = spmv_sets(false, b_y_, b_Aty_);
         VkDescriptorSet set_cols = alloc_set(dsl_kkt_cols_);
         write_ssbo(set_cols, 0, b_x_);
         write_ssbo(set_cols, 1, b_Aty_);
@@ -295,8 +311,8 @@ public:
         prof_->begin_cmd(cmd);
         const auto nc = static_cast<uint32_t>(nc_), nr = static_cast<uint32_t>(nr_);
         const auto stride = static_cast<uint32_t>(stride_);
-        run(cmd, pipe_spmv_csr_, layout_spmv_csr_, set_ax, PC1{nr, 0}, nr_, "spmv_csr", false);
-        run(cmd, pipe_spmv_csc_, layout_spmv_csc_, set_aty, PC1{nc, 0}, nc_, "spmv_csc");
+        spmv(cmd, set_ax, false);
+        spmv(cmd, set_aty, true);
         alignas(8) struct { uint32_t n; uint32_t stride; double primal_tol; double dual_tol; } pc_k{
             nc, stride, last_primal_tol_, last_dual_tol_};
         run(cmd, pipe_kkt_cols_, layout_kkt_cols_, set_cols, pc_k, nc_, "kkt_cols", false);
@@ -435,6 +451,7 @@ public:
 private:
     static constexpr std::size_t kPartSlots = 14;   // kkt 0..10, step 11..13
     static constexpr std::size_t kKktOut = 10;
+    static constexpr std::size_t kLongVector = 256;   // entries; one workgroup's width
 
     struct PC1 { uint32_t n; uint32_t pad; };
     struct PCAvg { uint32_t n; uint32_t count; };
@@ -450,15 +467,42 @@ private:
         if (fence) barrier(cmd);
     }
 
-    VkDescriptorSet spmv_set(VkDescriptorSetLayout dsl, Buf& ptr, Buf& idx, Buf& vals,
-                             Buf& in, Buf& out) {
-        VkDescriptorSet set = alloc_set(dsl);
-        write_ssbo(set, 0, ptr);
-        write_ssbo(set, 1, idx);
-        write_ssbo(set, 2, vals);
-        write_ssbo(set, 3, in);
-        write_ssbo(set, 4, out);
-        return set;
+    // y = A x (CSR, rows) or y = A' x (CSC, columns): per-invocation
+    // products for ordinary vectors, one workgroup per long vector.
+    struct SpmvSets {
+        VkDescriptorSet shorts = VK_NULL_HANDLE, longs = VK_NULL_HANDLE;
+        uint32_t n = 0, n_long = 0;
+        const char* name = "";
+    };
+    SpmvSets spmv_sets(bool csr, Buf& in, Buf& out) {
+        Buf& ptr = csr ? b_row_ptr_ : b_col_ptr_;
+        Buf& idx = csr ? b_col_idx_ : b_row_idx_;
+        Buf& vals = csr ? b_csr_vals_ : b_csc_vals_;
+        SpmvSets sets;
+        sets.n = static_cast<uint32_t>(csr ? nr_ : nc_);
+        sets.n_long = csr ? n_long_rows_ : n_long_cols_;
+        sets.name = csr ? "spmv_csr" : "spmv_csc";
+        const auto make = [&](VkDescriptorSetLayout dsl, Buf& extra) {
+            VkDescriptorSet set = alloc_set(dsl);
+            write_ssbo(set, 0, ptr);
+            write_ssbo(set, 1, idx);
+            write_ssbo(set, 2, vals);
+            write_ssbo(set, 3, in);
+            write_ssbo(set, 4, out);
+            write_ssbo(set, 5, extra);
+            return set;
+        };
+        sets.shorts = make(dsl_spmv_short_, csr ? b_row_long_ : b_col_long_);
+        if (sets.n_long) sets.longs = make(dsl_spmv_long_, csr ? b_row_list_ : b_col_list_);
+        return sets;
+    }
+    void spmv(VkCommandBuffer cmd, const SpmvSets& sets, bool fence) {
+        run(cmd, pipe_spmv_short_, layout_spmv_short_, sets.shorts, PC1{sets.n, 0}, sets.n,
+            sets.name, false);
+        if (sets.n_long)
+            run(cmd, pipe_spmv_long_, layout_spmv_long_, sets.longs, PC1{sets.n_long, 0},
+                static_cast<std::size_t>(sets.n_long) * 256, "spmv_long", false);
+        if (fence) barrier(cmd);
     }
 
     VkDescriptorSet mix_set(Buf& z, Buf& t, Buf& anchor) {
@@ -481,10 +525,9 @@ private:
     // Ax_current = A x on the device (warm starts and the average restart).
     void recompute_ax_cur() {
         vkResetDescriptorPool(ctx_->device(), ctx_->descriptor_pool(), 0);
-        const auto set = spmv_set(dsl_spmv_csr_, b_row_ptr_, b_col_idx_, b_csr_vals_, b_x_, b_ax_cur_);
+        const auto set = spmv_sets(true, b_x_, b_ax_cur_);
         VkCommandBuffer cmd = begin_once();
-        run(cmd, pipe_spmv_csr_, layout_spmv_csr_, set,
-            PC1{static_cast<uint32_t>(nr_), 0}, nr_, "spmv_csr");
+        spmv(cmd, set, true);
         end_submit_wait(cmd);
     }
 
@@ -513,8 +556,8 @@ private:
             const auto words = read_spv((std::string(name) + ".spv").c_str());
             return ctx_->load_shader_module(words.data(), words.size());
         };
-        mod_spmv_csr_ = load("spmv_csr");
-        mod_spmv_csc_ = load("spmv_csc");
+        mod_spmv_short_ = load("spmv_short");
+        mod_spmv_long_ = load("spmv_long");
         mod_primal_ = load("primal_step");
         mod_dual_ = load("dual_step");
         mod_step_reduce_ = load("step_reduce");
@@ -525,8 +568,8 @@ private:
         mod_kkt_final_ = load("kkt_final");
 
         // Binding counts and push sizes are the shaders' contracts.
-        layout_spmv_csr_ = make_layout(5, 16, &dsl_spmv_csr_);
-        layout_spmv_csc_ = make_layout(5, 16, &dsl_spmv_csc_);
+        layout_spmv_short_ = make_layout(6, 16, &dsl_spmv_short_);
+        layout_spmv_long_ = make_layout(6, 16, &dsl_spmv_long_);
         layout_primal_ = make_layout(8, 16, &dsl_primal_);
         layout_dual_ = make_layout(8, 16, &dsl_dual_);
         layout_step_reduce_ = make_layout(2, 32, &dsl_step_reduce_);
@@ -536,8 +579,8 @@ private:
         layout_kkt_rows_ = make_layout(7, 24, &dsl_kkt_rows_);
         layout_kkt_final_ = make_layout(3, 24, &dsl_kkt_final_);
 
-        pipe_spmv_csr_ = make_pipeline(mod_spmv_csr_, layout_spmv_csr_);
-        pipe_spmv_csc_ = make_pipeline(mod_spmv_csc_, layout_spmv_csc_);
+        pipe_spmv_short_ = make_pipeline(mod_spmv_short_, layout_spmv_short_);
+        pipe_spmv_long_ = make_pipeline(mod_spmv_long_, layout_spmv_long_);
         pipe_primal_ = make_pipeline(mod_primal_, layout_primal_);
         pipe_dual_ = make_pipeline(mod_dual_, layout_dual_);
         pipe_step_reduce_ = make_pipeline(mod_step_reduce_, layout_step_reduce_);
@@ -836,7 +879,8 @@ private:
                        &b_x_, &b_x_fixed_, &b_xbar_, &b_Aty_, &b_x_avg_, &b_x_anchor_,
                        &b_y_, &b_y_fixed_, &b_Ax_, &b_ax_cur_, &b_ax_fixed_, &b_ax_anchor_,
                        &b_y_avg_, &b_y_anchor_, &b_ckpt_x_, &b_ckpt_y_, &b_ckpt_ax_,
-                       &b_ckpt_x_avg_, &b_ckpt_y_avg_, &b_part_, &b_acc_, &b_kkt_})
+                       &b_ckpt_x_avg_, &b_ckpt_y_avg_, &b_part_, &b_acc_, &b_kkt_,
+                       &b_row_long_, &b_row_list_, &b_col_long_, &b_col_list_})
             destroy_buf(*b);
     }
 
@@ -844,19 +888,19 @@ private:
         destroy_problem_bufs();
         if (!ctx_) return;
         auto dev = ctx_->device();
-        for (VkPipeline* p : {&pipe_spmv_csr_, &pipe_spmv_csc_, &pipe_primal_, &pipe_dual_,
+        for (VkPipeline* p : {&pipe_spmv_short_, &pipe_spmv_long_, &pipe_primal_, &pipe_dual_,
                               &pipe_step_reduce_, &pipe_mix_, &pipe_avg_, &pipe_kkt_cols_,
                               &pipe_kkt_rows_, &pipe_kkt_final_})
             if (*p) { vkDestroyPipeline(dev, *p, nullptr); *p = VK_NULL_HANDLE; }
-        for (VkPipelineLayout* p : {&layout_spmv_csr_, &layout_spmv_csc_, &layout_primal_, &layout_dual_,
+        for (VkPipelineLayout* p : {&layout_spmv_short_, &layout_spmv_long_, &layout_primal_, &layout_dual_,
                                     &layout_step_reduce_, &layout_mix_, &layout_avg_, &layout_kkt_cols_,
                                     &layout_kkt_rows_, &layout_kkt_final_})
             if (*p) { vkDestroyPipelineLayout(dev, *p, nullptr); *p = VK_NULL_HANDLE; }
-        for (VkDescriptorSetLayout* p : {&dsl_spmv_csr_, &dsl_spmv_csc_, &dsl_primal_, &dsl_dual_,
+        for (VkDescriptorSetLayout* p : {&dsl_spmv_short_, &dsl_spmv_long_, &dsl_primal_, &dsl_dual_,
                                          &dsl_step_reduce_, &dsl_mix_, &dsl_avg_, &dsl_kkt_cols_,
                                          &dsl_kkt_rows_, &dsl_kkt_final_})
             if (*p) { vkDestroyDescriptorSetLayout(dev, *p, nullptr); *p = VK_NULL_HANDLE; }
-        for (VkShaderModule* p : {&mod_spmv_csr_, &mod_spmv_csc_, &mod_primal_, &mod_dual_,
+        for (VkShaderModule* p : {&mod_spmv_short_, &mod_spmv_long_, &mod_primal_, &mod_dual_,
                                   &mod_step_reduce_, &mod_mix_, &mod_avg_, &mod_kkt_cols_,
                                   &mod_kkt_rows_, &mod_kkt_final_})
             if (*p) { vkDestroyShaderModule(dev, *p, nullptr); *p = VK_NULL_HANDLE; }
@@ -886,23 +930,25 @@ private:
     Buf b_y_, b_y_fixed_, b_Ax_, b_ax_cur_, b_ax_fixed_, b_ax_anchor_, b_y_avg_, b_y_anchor_;
     Buf b_ckpt_x_, b_ckpt_y_, b_ckpt_ax_, b_ckpt_x_avg_, b_ckpt_y_avg_;
     Buf b_part_, b_acc_, b_kkt_;
+    Buf b_row_long_, b_row_list_, b_col_long_, b_col_list_;
+    uint32_t n_long_rows_ = 0, n_long_cols_ = 0;
 
-    VkShaderModule mod_spmv_csr_ = VK_NULL_HANDLE, mod_spmv_csc_ = VK_NULL_HANDLE,
+    VkShaderModule mod_spmv_short_ = VK_NULL_HANDLE, mod_spmv_long_ = VK_NULL_HANDLE,
                    mod_primal_ = VK_NULL_HANDLE, mod_dual_ = VK_NULL_HANDLE,
                    mod_step_reduce_ = VK_NULL_HANDLE, mod_mix_ = VK_NULL_HANDLE,
                    mod_avg_ = VK_NULL_HANDLE, mod_kkt_cols_ = VK_NULL_HANDLE,
                    mod_kkt_rows_ = VK_NULL_HANDLE, mod_kkt_final_ = VK_NULL_HANDLE;
-    VkDescriptorSetLayout dsl_spmv_csr_ = VK_NULL_HANDLE, dsl_spmv_csc_ = VK_NULL_HANDLE,
+    VkDescriptorSetLayout dsl_spmv_short_ = VK_NULL_HANDLE, dsl_spmv_long_ = VK_NULL_HANDLE,
                           dsl_primal_ = VK_NULL_HANDLE, dsl_dual_ = VK_NULL_HANDLE,
                           dsl_step_reduce_ = VK_NULL_HANDLE, dsl_mix_ = VK_NULL_HANDLE,
                           dsl_avg_ = VK_NULL_HANDLE, dsl_kkt_cols_ = VK_NULL_HANDLE,
                           dsl_kkt_rows_ = VK_NULL_HANDLE, dsl_kkt_final_ = VK_NULL_HANDLE;
-    VkPipelineLayout layout_spmv_csr_ = VK_NULL_HANDLE, layout_spmv_csc_ = VK_NULL_HANDLE,
+    VkPipelineLayout layout_spmv_short_ = VK_NULL_HANDLE, layout_spmv_long_ = VK_NULL_HANDLE,
                      layout_primal_ = VK_NULL_HANDLE, layout_dual_ = VK_NULL_HANDLE,
                      layout_step_reduce_ = VK_NULL_HANDLE, layout_mix_ = VK_NULL_HANDLE,
                      layout_avg_ = VK_NULL_HANDLE, layout_kkt_cols_ = VK_NULL_HANDLE,
                      layout_kkt_rows_ = VK_NULL_HANDLE, layout_kkt_final_ = VK_NULL_HANDLE;
-    VkPipeline pipe_spmv_csr_ = VK_NULL_HANDLE, pipe_spmv_csc_ = VK_NULL_HANDLE,
+    VkPipeline pipe_spmv_short_ = VK_NULL_HANDLE, pipe_spmv_long_ = VK_NULL_HANDLE,
                pipe_primal_ = VK_NULL_HANDLE, pipe_dual_ = VK_NULL_HANDLE,
                pipe_step_reduce_ = VK_NULL_HANDLE, pipe_mix_ = VK_NULL_HANDLE,
                pipe_avg_ = VK_NULL_HANDLE, pipe_kkt_cols_ = VK_NULL_HANDLE,

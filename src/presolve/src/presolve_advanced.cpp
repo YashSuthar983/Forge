@@ -1,7 +1,13 @@
 #include "live_matrix.hpp"
 #include "sor/model/exact.hpp"
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic ignored "-Wpedantic"   // unsigned __int128 for GF(2^61-1)
+#endif
 #include <algorithm>
 #include <cmath>
+#include <functional>
+#include <cstdint>
+#include <iterator>
 #include <numeric>
 #include <set>
 #include <map>
@@ -58,49 +64,176 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
     const std::vector<char>& col_live, std::vector<f64>& lo, std::vector<f64>& hi,
     PresolveMap& map, const PresolveOptions& options) {
     if (options.equation_sparsification) {
-        // Exact sparse row echelon detects dependencies involving ANY number
-        // of earlier equations, including non-dyadic elimination multipliers.
-        // Only redundant equations are removed; no rounded row is installed.
-        struct Equation { std::map<Index,Rational> entries; Rational rhs; };
-        std::map<Index,Equation> echelon;
+        // Dependent equalities. A sparse row echelon over GF(p), p = 2^61-1,
+        // nominates candidates in word arithmetic; each nominated row is then
+        // verified EXACTLY, with rational elimination over only the earlier
+        // rows its modular reduction used (and rhs consistency), before it is
+        // removed. The previous exact echelon over every equality spent its
+        // 200k-update cap before reaching any dependency: 350 ms and zero rows
+        // removed on brandy, 25fv47, fit1p (most of their presolve time).
+        // A modular false negative only keeps a redundant row (safe); a false
+        // positive is rejected by the exact check.
+        constexpr std::uint64_t P = (std::uint64_t{1} << 61) - 1;
+        const auto mod_add = [](std::uint64_t x, std::uint64_t y) {
+            const std::uint64_t t = x + y; return t >= P ? t - P : t;
+        };
+        const auto mod_mul = [](std::uint64_t x, std::uint64_t y) {
+            const unsigned __int128 t = static_cast<unsigned __int128>(x) * y;
+            std::uint64_t r = static_cast<std::uint64_t>(t & P) + static_cast<std::uint64_t>(t >> 61);
+            return r >= P ? r - P : r;
+        };
+        const auto mod_pow2 = [&](int e) {   // 2^61 = 1 (mod P)
+            int k = e % 61; if (k < 0) k += 61;
+            return std::uint64_t{1} << k;
+        };
+        const auto mod_inv = [&](std::uint64_t x) {
+            std::uint64_t r = 1, base = x, e = P - 2;
+            while (e) { if (e & 1) r = mod_mul(r, base); base = mod_mul(base, base); e >>= 1; }
+            return r;
+        };
+        // A binary64 value is M 2^e exactly with |M| < 2^53.
+        const auto to_mod = [&](f64 v) -> std::uint64_t {
+            if (v == 0) return 0;
+            int e = 0;
+            const f64 f = std::frexp(std::fabs(v), &e);
+            const auto mantissa = static_cast<std::uint64_t>(std::ldexp(f, 53));
+            const std::uint64_t r = mod_mul(mantissa % P, mod_pow2(e - 53));
+            return v < 0 ? (r == 0 ? 0 : P - r) : r;
+        };
+        struct ModRow {
+            std::vector<std::pair<Index, std::uint64_t>> entries;   // ascending columns
+            std::uint64_t inverse_lead = 0;                           // 1 / entries.front()
+            std::vector<Index> provenance;                           // original rows, sorted
+            bool certifiable = true;
+        };
+        std::vector<std::uint64_t> accumulator(sz(matrix.n), 0);
+        std::vector<char> in_heap(sz(matrix.n), 0);
+        std::vector<Index> touched, heap;
+        std::size_t live_entries = 0;
+        constexpr std::size_t kProvenanceCap = 256;
+        std::map<Index, ModRow> echelon;   // pivot column -> row whose first entry it is
+        // Linear budget in the equality block: a complete echelon of a
+        // filled-in block is O(m^2 n) (fit1p: 120 ms) and found no
+        // dependency on any Netlib model; presolve's share of a small solve
+        // must stay proportional to its input.
+        std::uint64_t equality_nnz = 0;
+        for (Index i = 0; i < matrix.m; ++i)
+            if (row_live[sz(i)] && matrix.row_lo[sz(i)] == matrix.row_hi[sz(i)])
+                equality_nnz += matrix.rows[sz(i)].size();
         std::uint64_t operations = 0;
-        for (Index i = 0; i < matrix.m && operations < 200000; ++i) {
+        const std::uint64_t operation_cap = 32 * equality_nnz + 100'000;
+        // Exact: is row i a rational combination of rows `support`, rhs included?
+        const auto exactly_dependent = [&](Index i, const std::vector<Index>& support) {
+            struct Equation { std::map<Index, Rational> entries; Rational rhs; };
+            std::map<Index, Equation> basis;
+            const auto reduce = [&](Equation& e) {
+                while (!e.entries.empty()) {
+                    const auto source = basis.find(e.entries.begin()->first);
+                    if (source == basis.end()) return;
+                    const Rational multiplier = e.entries.begin()->second / source->second.entries.begin()->second;
+                    e.rhs -= multiplier * source->second.rhs;
+                    for (const auto& [j, a] : source->second.entries) {
+                        auto& value = e.entries[j];
+                        value -= multiplier * a;
+                        if (value == 0) e.entries.erase(j);
+                    }
+                }
+            };
+            const auto load = [&](Index r) {
+                Equation e;
+                e.rhs = Rational(matrix.row_lo[sz(r)]);
+                for (const auto& [j, a] : matrix.rows[sz(r)]) if (a != 0) e.entries[j] = Rational(a);
+                return e;
+            };
+            for (const Index r : support) {
+                if (!row_live[sz(r)]) continue;
+                auto e = load(r);
+                reduce(e);
+                if (!e.entries.empty()) {
+                    const Index pivot = e.entries.begin()->first;
+                    basis.emplace(pivot, std::move(e));
+                }
+            }
+            auto target = load(i);
+            reduce(target);
+            return target.entries.empty() && target.rhs == 0;
+        };
+        for (Index i = 0; i < matrix.m && operations < operation_cap; ++i) {
             if (!row_live[sz(i)] || matrix.row_lo[sz(i)] != matrix.row_hi[sz(i)] ||
                 !std::isfinite(matrix.row_lo[sz(i)]) || matrix.rows[sz(i)].size() >
                     static_cast<std::size_t>(options.max_aggregation_row_nnz)) continue;
-            Equation trial; trial.rhs = Rational(matrix.row_lo[sz(i)]);
-            for (const auto& [j,a] : matrix.rows[sz(i)]) if (a != 0) trial.entries[j] = Rational(a);
-            bool completed = true;
-            while (!trial.entries.empty()) {
-                const Index pivot = trial.entries.begin()->first;
-                const auto source = echelon.find(pivot);
+            // Dense accumulator + min-heap of touched columns: the leading
+            // column is the heap top (stale entries skipped lazily), and an
+            // update is two word operations instead of a tree node.
+            const auto clear_trial = [&] {
+                for (const Index j : touched) { accumulator[sz(j)] = 0; in_heap[sz(j)] = 0; }
+                touched.clear();
+                heap.clear();
+                live_entries = 0;
+            };
+            const auto set_entry = [&](Index j, std::uint64_t v) {
+                if (accumulator[sz(j)] == 0 && v != 0) ++live_entries;
+                else if (accumulator[sz(j)] != 0 && v == 0) --live_entries;
+                accumulator[sz(j)] = v;
+                if (v != 0 && !in_heap[sz(j)]) {
+                    in_heap[sz(j)] = 1;
+                    touched.push_back(j);
+                    heap.push_back(j);
+                    std::push_heap(heap.begin(), heap.end(), std::greater<Index>());
+                }
+            };
+            const auto leading = [&]() -> Index {
+                while (!heap.empty() && accumulator[sz(heap.front())] == 0) {
+                    std::pop_heap(heap.begin(), heap.end(), std::greater<Index>());
+                    in_heap[sz(heap.back())] = 0;
+                    heap.pop_back();
+                }
+                return heap.empty() ? Index{-1} : heap.front();
+            };
+            clear_trial();
+            for (const auto& [j, a] : matrix.rows[sz(i)]) set_entry(j, to_mod(a));
+            std::vector<Index> provenance;
+            bool certifiable = true, filled = false;
+            const std::size_t fill_cap = matrix.rows[sz(i)].size() +
+                static_cast<std::size_t>(std::max<Offset>(0, options.max_substitution_fill));
+            for (Index lead = leading(); lead >= 0; lead = leading()) {
+                const auto source = echelon.find(lead);
                 if (source == echelon.end()) break;
-                const Rational multiplier = trial.entries.begin()->second / source->second.entries.begin()->second;
-                trial.rhs -= multiplier * source->second.rhs;
-                for (const auto& [j,a] : source->second.entries) {
-                    if (++operations > 200000) { completed = false; break; }
-                    auto& value = trial.entries[j]; value -= multiplier*a;
-                    if (value == 0) trial.entries.erase(j);
-                    else {
-                        const auto num = numerator(value);
-                        if (boost::multiprecision::msb(denominator(value)) > 16384 ||
-                            boost::multiprecision::msb(num < 0 ? -num : num) > 16384) { completed = false; break; }
-                    }
+                const auto& row = source->second;
+                const std::uint64_t multiplier = mod_mul(accumulator[sz(lead)], row.inverse_lead);
+                if (operations + row.entries.size() > operation_cap) { filled = true; break; }
+                for (const auto& [j, a] : row.entries) {
+                    ++operations;
+                    set_entry(j, mod_add(accumulator[sz(j)], P - mod_mul(multiplier, a)));
                 }
-                if (!completed || trial.entries.size() > matrix.rows[sz(i)].size() +
-                    static_cast<std::size_t>(std::max<Offset>(0,options.max_substitution_fill))) {
-                    completed = false; break;
+                certifiable = certifiable && row.certifiable;
+                if (certifiable) {
+                    std::vector<Index> merged;
+                    std::set_union(provenance.begin(), provenance.end(), row.provenance.begin(),
+                                   row.provenance.end(), std::back_inserter(merged));
+                    provenance = std::move(merged);
+                    if (provenance.size() > kProvenanceCap) { certifiable = false; provenance.clear(); }
                 }
+                if (live_entries > fill_cap) { filled = true; break; }
             }
-            if (!completed) continue;
-            if (trial.entries.empty()) {
-                if (trial.rhs != 0) continue; // A proof object is required before an infeasible report.
+            if (filled) continue;
+            if (live_entries == 0) {
+                // Candidate: verify exactly over the rows the reduction used.
+                if (!certifiable || !exactly_dependent(i, provenance)) continue;
                 for (const auto& [j,a] : matrix.rows[sz(i)]) { (void)a; matrix.col_rows[sz(j)].erase(i); }
                 matrix.rows[sz(i)].clear(); row_live[sz(i)] = 0;
                 ++map.stats.rows_removed; ++map.stats.linear_dependencies_removed;
             } else {
-                const Index pivot = trial.entries.begin()->first;
-                echelon.emplace(pivot, std::move(trial));
+                ModRow row;
+                for (const Index j : touched) if (accumulator[sz(j)] != 0) row.entries.emplace_back(j, accumulator[sz(j)]);
+                std::sort(row.entries.begin(), row.entries.end());
+                row.inverse_lead = mod_inv(row.entries.front().second);
+                row.certifiable = certifiable;
+                if (certifiable) {
+                    provenance.insert(std::upper_bound(provenance.begin(), provenance.end(), i), i);
+                    row.provenance = std::move(provenance);
+                }
+                echelon.emplace(row.entries.front().first, std::move(row));
             }
         }
     }

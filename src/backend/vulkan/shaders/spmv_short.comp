@@ -1,0 +1,27 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Compressed sparse product y = M x, one invocation per row (CSR) or column
+// (CSC), skipping the long vectors that spmv_long reduces cooperatively: a
+// single invocation over a 10k-entry row serializes the whole dispatch.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n;
+} pc;
+
+layout(std430, binding = 0) readonly buffer Ptr  { int ptr[]; };
+layout(std430, binding = 1) readonly buffer Idx  { int idx[]; };
+layout(std430, binding = 2) readonly buffer Vals { double vals[]; };
+layout(std430, binding = 3) readonly buffer XBuf { double x[]; };
+layout(std430, binding = 4) writeonly buffer YBuf { double y[]; };
+layout(std430, binding = 5) readonly buffer Long { uint is_long[]; };
+
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= pc.n || is_long[r] != 0u) return;
+    double acc = 0.0lf;
+    for (int k = ptr[r]; k < ptr[r + 1]; ++k)
+        acc += vals[k] * x[idx[k]];
+    y[r] = acc;
+}

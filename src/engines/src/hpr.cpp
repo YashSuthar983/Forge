@@ -459,6 +459,8 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
         opts_in.weight_min <= 0 || opts_in.weight_min > opts_in.weight_max ||
         !std::isfinite(opts_in.weight_init) || opts_in.weight_init <= 0 ||
         !std::isfinite(opts_in.weight_theta) || opts_in.weight_theta < 0 || opts_in.weight_theta > 1 ||
+        !std::isfinite(opts_in.pid_kp) || !std::isfinite(opts_in.pid_ki) || !std::isfinite(opts_in.pid_kd) ||
+        opts_in.pid_kp < 0 || opts_in.pid_ki < 0 || opts_in.pid_kd < 0 ||
         !std::isfinite(opts_in.sufficient_decay) || !std::isfinite(opts_in.necessary_decay) ||
         opts_in.sufficient_decay <= 0 || opts_in.sufficient_decay > opts_in.necessary_decay ||
         opts_in.necessary_decay >= 1 || !std::isfinite(opts_in.artificial_restart_fraction) ||
@@ -555,6 +557,8 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
     const f64 eta_initial = norm_est > 0.0 ? opts.step_safety / norm_est : 1.0;
     f64 eta = eta_initial;
     f64 weight = std::clamp(opts.weight_init, opts.weight_min, opts.weight_max);
+    f64 pid_integral = 0.0, pid_error = 0.0;
+    bool pid_have_error = false;
 
     const auto t_loop = Clock::now();
     const auto deadline = opts.time_limit_s > 0.0
@@ -922,9 +926,22 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
                         const f64 target = std::clamp(
                             kkt.epoch_dy_norm / kkt.epoch_dx_norm,
                             opts.weight_min, opts.weight_max);
-                        const f64 theta = std::clamp(opts.weight_theta, 0.0, 1.0);
-                        weight = std::exp(theta * std::log(target) +
-                                          (1.0 - theta) * std::log(weight));
+                        if (opts.weight_policy == HprOptions::WeightPolicy::Pid) {
+                            const f64 error = std::log(weight) - std::log(target);
+                            const f64 span = std::log(opts.weight_max / opts.weight_min);
+                            pid_integral = std::clamp(pid_integral + error, -span, span);
+                            const f64 derivative = pid_have_error ? error - pid_error : 0.0;
+                            pid_error = error;
+                            pid_have_error = true;
+                            const f64 next = std::log(weight) -
+                                (opts.pid_kp * error + opts.pid_ki * pid_integral + opts.pid_kd * derivative);
+                            weight = std::exp(next);
+                            if (weight <= opts.weight_min || weight >= opts.weight_max) pid_integral = 0.0;
+                        } else {
+                            const f64 theta = std::clamp(opts.weight_theta, 0.0, 1.0);
+                            weight = std::exp(theta * std::log(target) +
+                                              (1.0 - theta) * std::log(weight));
+                        }
                         weight = std::clamp(weight, opts.weight_min, opts.weight_max);
                     }
 
