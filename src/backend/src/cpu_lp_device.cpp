@@ -387,8 +387,14 @@ public:
             f64 interaction = 0.0;
             for (std::size_t i = 0; i < nr_; ++i) {
                 const f64 v = y_[i] + p.sigma * Ax_[i];
-                const f64 z = clamp_to(v / p.sigma, row_lo_[i], row_hi_[i]);
-                const f64 yn = v - p.sigma * z;
+                // Moreau: y = sigma (w - proj(w)), w = v / sigma. An unclamped
+                // row's multiplier is exactly zero; v - sigma * proj(w) leaves
+                // the division's rounding residual (exposed by FMA on the GPU),
+                // and a nonzero multiplier on an infinite side makes the dual
+                // bound -infinity.
+                const f64 w = v / p.sigma;
+                const f64 yn = w < row_lo_[i] ? v - p.sigma * row_lo_[i]
+                             : w > row_hi_[i] ? v - p.sigma * row_hi_[i] : 0.0;
                 const f64 d = yn - y_[i];
                 dy2 += d * d;
                 last_y_delta_[i] = d;

@@ -1,8 +1,10 @@
 #include "sor/certify/finalize.hpp"
+#include "padic_solve.hpp"
 #include "sor/model/exact.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <cmath>
 #include <cstdint>
 #include <map>
@@ -91,7 +93,8 @@ bool solve_basis_transpose(const model::LpProblem& p,
                            const std::vector<core::Index>& basis,
                            std::vector<Rational>& y, std::vector<Rational>& direction,
                            const ExactCertificatePolicy& policy,
-                           const std::vector<Rational>* override_rhs = nullptr) {
+                           const std::vector<Rational>* override_rhs = nullptr,
+                           const std::function<bool(const std::vector<Rational>&)>& direction_needed = {}) {
     const auto m = static_cast<std::size_t>(p.n_rows());
     const auto n = p.n_cols();
     if (basis.size() != m) return false;
@@ -152,6 +155,34 @@ bool solve_basis_transpose(const model::LpProblem& p,
             if (it->second == 0) it = rows[r].erase(it);
             else { incidence[static_cast<std::size_t>(it->first)].insert(r); ++it; }
         }
+    {
+        // p-adic lifting first; fraction-free elimination below remains the
+        // fallback with its own operation budget (see padic_solve.hpp).
+        std::vector<std::vector<Rational>> solved;
+        detail::PadicStats stats;
+        const auto t0 = std::chrono::steady_clock::now();
+        // Dense nucleus: each row takes >= 64 structural updates on average
+        // (see padic_solve.hpp for the measured crossover).
+        const bool lifted = detail::padic_solve(rows, {rhs, rhs_direction}, solved,
+            policy.max_operations, policy.max_bits, expired, &stats, 64 * static_cast<std::uint64_t>(m),
+            [&](std::size_t, const std::vector<std::vector<Rational>>& solved_so_far) {
+                return !direction_needed || direction_needed(solved_so_far[0]);
+            });
+        if (std::getenv("SOR_CERTIFICATE_DEBUG"))
+            std::fprintf(stderr, "exact certificate: p-adic m=%zu %s ops=%llu lifts=%llu attempts=%llu den_bits=%zu elapsed=%.6f\n",
+                m, lifted ? "solved" : stats.declined ? "declined" : "fell back", static_cast<unsigned long long>(stats.operations),
+                static_cast<unsigned long long>(stats.lifting_steps),
+                static_cast<unsigned long long>(stats.reconstruction_attempts), stats.denominator_bits,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        if (lifted) {
+            y = std::move(solved[0]);
+            direction = std::move(solved[1]);
+            return true;
+        }
+        // B is nonsingular here, so elimination would find the same
+        // solution and the size policy would reject it the same way.
+        if (expired() || stats.exceeds_policy) return false;
+    }
     std::vector<bool> active(m, true);
     std::vector<std::pair<std::size_t, core::Index>> pivots;
     pivots.reserve(m);
@@ -443,7 +474,25 @@ bool repair_basis_certificate(const model::LpProblem& problem, core::RawResult& 
     const auto expired = [&] { return policy.time_limit_s > 0 &&
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() >= policy.time_limit_s; };
     std::vector<Rational> y, direction;
-    if (!solve_basis_transpose(problem, raw.certificate_basis, y, direction, policy)) return false;
+    // The inward direction only matters when y leaves a declared-unbounded
+    // term with the wrong sign; an exact basis dual usually leaves none
+    // (basic reduced costs are exactly zero). Pricing never perturbs.
+    const auto direction_needed = [&](const std::vector<Rational>& solved) {
+        if (!policy.perturb_inward) return false;
+        for (std::size_t i = 0; i < solved.size(); ++i)
+            if ((solved[i] > 0 && !std::isfinite(problem.row_lo[i])) ||
+                (solved[i] < 0 && !std::isfinite(problem.row_hi[i]))) return true;
+        const auto terms = dual_terms(problem, fraction_parts(solved), true);
+        for (std::size_t j = 0; j < terms.reduced.size(); ++j) {
+            const int sign = terms.reduced[j].sign();
+            if ((sign < 0 && !std::isfinite(problem.col_hi[j])) ||
+                (sign > 0 && !std::isfinite(problem.col_lo[j]))) return true;
+        }
+        return false;
+    };
+    if (!solve_basis_transpose(problem, raw.certificate_basis, y, direction, policy, nullptr,
+                               direction_needed)) return false;
+    if (direction.size() != y.size()) direction.assign(y.size(), Rational(0));
     if (policy.perturb_inward) {
     // A coupled perturbation leaves free basic equations exact and moves
     // one-sided basic reduced costs toward their chargeable signs. Find the
@@ -564,25 +613,31 @@ namespace {
 ExactDualSupportFailure support_failure_from_terms(
     const model::LpProblem& p, const std::vector<FractionParts>& multipliers,
     const DualTerms& terms, const std::vector<int>& allowed_directions,
-    std::pair<std::vector<double>, std::vector<double>>& implied) {
+    std::pair<std::vector<double>, std::vector<double>>& implied,
+    std::vector<ExactDualSupportFailure>* ranked = nullptr) {
     ExactDualSupportFailure failure;
     if (!allowed_directions.empty()) {
         if (allowed_directions.size() != static_cast<std::size_t>(p.n_cols() + p.n_rows())) return failure;
         // Exact Dantzig pricing; stable variable order resolves ties.
         // Selecting the largest violation avoids a long chain of tiny
         // improvements on degenerate bases without erasing any sign.
-        model::ExactSum largest;
+        std::vector<std::pair<model::ExactSum, ExactDualSupportFailure>> found;
         for (std::size_t j = 0; j < allowed_directions.size(); ++j) {
             model::ExactSum logical;
             if (j >= terms.reduced.size())
                 logical.add_scaled_product(1, terms.multipliers[j - terms.reduced.size()]);
             const auto& reduced = j < terms.reduced.size() ? terms.reduced[j] : logical;
             const int direction = -reduced.sign();
-            if (direction != 0 && (allowed_directions[j] == direction || allowed_directions[j] == 2) &&
-                (failure.variable < 0 || reduced.absolute_greater_than(largest))) {
-                failure = {static_cast<core::Index>(j), direction};
-                largest = reduced;
-            }
+            if (direction != 0 && (allowed_directions[j] == direction || allowed_directions[j] == 2))
+                found.push_back({reduced, {static_cast<core::Index>(j), direction}});
+        }
+        std::stable_sort(found.begin(), found.end(), [](const auto& a, const auto& b) {
+            return a.first.absolute_greater_than(b.first);
+        });
+        if (!found.empty()) failure = found.front().second;
+        if (ranked) {
+            ranked->clear();
+            for (const auto& entry : found) ranked->push_back(entry.second);
         }
         return failure;
     }
@@ -675,7 +730,8 @@ ExactDualAssessment assess_exact_dual(const model::LpProblem& p,
         const auto terms = dual_terms(p, multipliers, true);
         std::pair<std::vector<double>, std::vector<double>> implied;
         out.bound = lower_bound_from_terms(p, multipliers, terms, implied);
-        out.failure = support_failure_from_terms(p, multipliers, terms, allowed_directions, implied);
+        out.failure = support_failure_from_terms(p, multipliers, terms, allowed_directions, implied,
+                                                 &out.violations);
     } catch (const std::exception&) { return {}; }
     return out;
 }

@@ -56,10 +56,12 @@ void main() {
         double yi = y[i];
         double axi = ax[i];
         double v = yi + pc.sigma * axi;
-        double z = v / pc.sigma;
-        if (z < lo[i]) z = lo[i];
-        if (z > hi[i]) z = hi[i];
-        double yn = v - pc.sigma * z;
+        // Moreau: y = sigma (w - proj(w)), exactly zero when unclamped; the
+        // form v - sigma * proj(w) leaves FMA's exact division residual.
+        double w = v / pc.sigma;
+        double yn = 0.0lf;
+        if (w < lo[i]) yn = v - pc.sigma * lo[i];
+        else if (w > hi[i]) yn = v - pc.sigma * hi[i];
         d = yn - yi;
         double cur = ax_cur[i];
         inter = 0.5lf * (axi - cur) * d;

@@ -1805,25 +1805,37 @@ core::RawResult solve_primal_simplex_prepared(
 
 
     std::vector<long double> equation_residual(sz(m));
+    // Backward-error drift test; see the dual engine's drift_exceeds_limit.
+    std::vector<long double> equation_scale(sz(m), 0.0L);
     const auto drift_exceeds_limit = [&]() {
         std::fill(equation_residual.begin(), equation_residual.end(), 0.0L);
+        std::fill(equation_scale.begin(), equation_scale.end(), 0.0L);
         for (Index j = 0; j < nt; ++j) {
             const f64 x = st[sz(j)] == NonbasicStatus::Basic
                 ? xB[sz(slot_of[sz(j)])] : value[sz(j)];
             if (x == 0) continue;
             for_col(j, [&](Index i, f64 a) {
-                equation_residual[sz(i)] += static_cast<long double>(a) * x;
+                const long double term = static_cast<long double>(a) * x;
+                equation_residual[sz(i)] += term;
+                equation_scale[sz(i)] += std::fabs(term);
             });
         }
-        for (const long double r : equation_residual)
-            if (!std::isfinite(r) || std::fabs(r) > opts.residual_refactor_tol) return true;
+        for (Index i = 0; i < m; ++i) {
+            const long double r = equation_residual[sz(i)];
+            if (!std::isfinite(r) ||
+                std::fabs(r) > opts.residual_refactor_tol * (1.0L + equation_scale[sz(i)])) return true;
+        }
         if (phase == 2 && d_valid) {
             for (Index slot = 0; slot < m; ++slot) {
                 long double residual = -cost[sz(basis[sz(slot)])];
+                long double scale = std::fabs(residual);
                 for_col(basis[sz(slot)], [&](Index i, f64 a) {
-                    residual += static_cast<long double>(a) * y[sz(i)];
+                    const long double term = static_cast<long double>(a) * y[sz(i)];
+                    residual += term;
+                    scale += std::fabs(term);
                 });
-                if (!std::isfinite(residual) || std::fabs(residual) > opts.residual_refactor_tol)
+                if (!std::isfinite(residual) ||
+                    std::fabs(residual) > opts.residual_refactor_tol * (1.0L + scale))
                     return true;
             }
         }
@@ -1831,6 +1843,13 @@ core::RawResult solve_primal_simplex_prepared(
     };
     int since_refactor = 0;
      int polish_reprices = 0;
+     // Exact violators from the last certificate check, largest first.
+     // Each exact check rebuilds the basis dual exactly; on greenbea the
+     // violator count fell by about one per check (47 -> 0 over 33
+     // checks), so the remaining eligible ones are entered before paying
+     // for another check. Only a passing exact check ends the loop.
+     std::vector<certify::ExactDualSupportFailure> exact_queue;
+     std::size_t exact_next = 0;
      // Cleanup escalation: dtol is divided by this factor when the final basis
      // is feasible and dual-clean but the duality gap still exceeds gap_tol --
      // the signature of marginal columns whose |d| sits just under tolerance.
@@ -2102,7 +2121,24 @@ core::RawResult solve_primal_simplex_prepared(
             // final basis actually puts them, which the complementarity check
             // in the residual computation measures.
             recompute_xB();
-            if (opts.certificate_pricing) {
+            const auto exact_eligible = [&](const certify::ExactDualSupportFailure& f) {
+                const Index candidate = f.variable;
+                return candidate >= 0 && candidate < nt &&
+                    st[sz(candidate)] != NonbasicStatus::Basic &&
+                    (st[sz(candidate)] == NonbasicStatus::AtZeroFree ||
+                     (f.improving_direction > 0 && st[sz(candidate)] == NonbasicStatus::AtLower) ||
+                     (f.improving_direction < 0 && st[sz(candidate)] == NonbasicStatus::AtUpper));
+            };
+            while (opts.certificate_pricing && q < 0 && exact_next < exact_queue.size()) {
+                const auto& queued = exact_queue[exact_next++];
+                if (!exact_eligible(queued)) continue;
+                q = queued.variable;
+                qdir = queued.improving_direction;
+                polish_reprices = 0;
+            }
+            if (opts.certificate_pricing && q < 0) {
+                exact_queue.clear();
+                exact_next = 0;
                 core::RawResult certificate;
                 certificate.certificate_basis = basis;
                 if (certify::repair_basis_certificate(pmin, certificate,
@@ -2137,15 +2173,12 @@ core::RawResult solve_primal_simplex_prepared(
                         reason = "checked original-model gap reached";
                         break;
                     }
-                    const auto& failure = assessment.failure;
-                    const Index candidate = failure.variable;
-                    if (candidate >= 0 && candidate < nt &&
-                        st[sz(candidate)] != NonbasicStatus::Basic &&
-                        (st[sz(candidate)] == NonbasicStatus::AtZeroFree ||
-                         (failure.improving_direction > 0 && st[sz(candidate)] == NonbasicStatus::AtLower) ||
-                         (failure.improving_direction < 0 && st[sz(candidate)] == NonbasicStatus::AtUpper))) {
-                        q = candidate;
-                        qdir = failure.improving_direction;
+                    exact_queue = assessment.violations;
+                    while (q < 0 && exact_next < exact_queue.size()) {
+                        const auto& queued = exact_queue[exact_next++];
+                        if (!exact_eligible(queued)) continue;
+                        q = queued.variable;
+                        qdir = queued.improving_direction;
                         // Preserve the exact sign decision through numerical
                         // pricing. Ratio tests and original-model checks still
                         // decide whether this continuation is useful.
