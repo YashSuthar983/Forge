@@ -1,4 +1,5 @@
 #include "sor/model/lp.hpp"
+#include "sor/model/dyadic.hpp"
 #include "sor/model/exact.hpp"
 
 #include <algorithm>
@@ -13,11 +14,11 @@ std::size_t LpProblem::n_integer() const noexcept {
 }
 
 f64 LpProblem::objective(const std::vector<f64>& x) const {
-    ExactSum acc;
+    DyadicSum acc;
     acc.add(obj_offset);
     for (std::size_t j = 0; j < c.size() && j < x.size(); ++j)
         acc.add_product(c[j], x[j]);
-    return acc.value().convert_to<f64>();
+    return acc.nearest();
 }
 
 f64 LpProblem::max_row_violation(const std::vector<f64>& x) const {
@@ -27,19 +28,26 @@ f64 LpProblem::max_row_violation(const std::vector<f64>& x) const {
     const auto& ci = A.pattern.col_idx();
     f64 worst = 0.0;
     for (Index r = 0; r < A.n_rows(); ++r) {
-        ExactSum sum;
+        DyadicSum act;
         for (core::Offset k = rp[static_cast<std::size_t>(r)];
              k < rp[static_cast<std::size_t>(r) + 1]; ++k) {
-            sum.add_product(A.vals[static_cast<std::size_t>(k)],
+            act.add_product(A.vals[static_cast<std::size_t>(k)],
                             x[static_cast<std::size_t>(ci[static_cast<std::size_t>(k)])]);
         }
-        const Rational act = sum.value();
         const f64 lo = row_lo[static_cast<std::size_t>(r)];
         const f64 hi = row_hi[static_cast<std::size_t>(r)];
-        if (std::isfinite(lo) && act < Rational(lo))
-            worst = std::max(worst, rounded_up(Rational(lo) - act));
-        if (std::isfinite(hi) && act > Rational(hi))
-            worst = std::max(worst, rounded_up(act - Rational(hi)));
+        // Exact distance to the violated side, rounded up.
+        if (std::isfinite(lo) && act.compare(lo) < 0) {
+            DyadicSum gap = act;
+            gap.negate();
+            gap.add(lo);
+            worst = std::max(worst, gap.up());
+        }
+        if (std::isfinite(hi) && act.compare(hi) > 0) {
+            DyadicSum gap = act;
+            gap.add(-hi);
+            worst = std::max(worst, gap.up());
+        }
     }
     return worst;
 }

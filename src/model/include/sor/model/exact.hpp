@@ -1,5 +1,7 @@
 #pragma once
 
+#include "sor/model/dyadic.hpp"
+
 #include <boost/multiprecision/cpp_int.hpp>
 #include <cmath>
 #include <bit>
@@ -155,14 +157,17 @@ public:
     }
     bool finite_minimum() const noexcept { return minimum_infinite_ == 0; }
     bool finite_maximum() const noexcept { return maximum_infinite_ == 0; }
-    double lower() const { return finite_minimum() ? rounded_down(minimum_.value()) :
+    double lower() const { return finite_minimum() ? minimum_.down() :
         -std::numeric_limits<double>::infinity(); }
-    double upper() const { return finite_maximum() ? rounded_up(maximum_.value()) :
+    double upper() const { return finite_maximum() ? maximum_.up() :
         std::numeric_limits<double>::infinity(); }
     Rational exact_minimum() const { return minimum_.value(); }
     Rational exact_maximum() const { return maximum_.value(); }
+    // The finite parts as exact sums (meaningful when finite_*()).
+    const DyadicSum& minimum_sum() const noexcept { return minimum_; }
+    const DyadicSum& maximum_sum() const noexcept { return maximum_; }
 private:
-    ExactSum minimum_, maximum_;
+    DyadicSum minimum_, maximum_;
     std::size_t minimum_infinite_ = 0, maximum_infinite_ = 0;
 };
 
