@@ -193,6 +193,42 @@ int main() {
         CHECK_THROWS(io::read_mps(in, rep));
     }
 
+    // ---- number tokens read exactly as strtod reads them ----
+    // A leading '+', exponent forms and hex are accepted; a doubled sign,
+    // trailing text and values strtod reports as out of range (overflow, and
+    // underflow into the subnormals) are rejected. The from_chars fast path
+    // must not widen this.
+    {
+        const auto coefficient = [](const std::string& token, double& out) {
+            const std::string mps =
+                "NAME T\nROWS\n N  OBJ\n L  R1\nCOLUMNS\n    X  OBJ  1  R1  " + token +
+                "\nRHS\n    RHS  R1  1\nENDATA\n";
+            std::istringstream in(mps);
+            io::MpsReadReport rep;
+            try {
+                const auto p = io::read_mps(in, rep);
+                out = p.A.vals.empty() ? 0.0 : p.A.vals[0];
+                return true;
+            } catch (const std::exception&) {
+                return false;
+            }
+        };
+        double v = 0.0;
+        CHECK(coefficient("+5", v) && v == 5.0);
+        CHECK(coefficient("-2.5e+3", v) && v == -2500.0);
+        CHECK(coefficient(".5", v) && v == 0.5);
+        CHECK(coefficient("0.1", v) && v == 0.1);
+        CHECK(coefficient("0x10", v) && v == 16.0);
+        CHECK(coefficient("1e-300", v) && v == 1e-300);
+        CHECK(!coefficient("+-5", v));
+        CHECK(!coefficient("--5", v));
+        CHECK(!coefficient("5x", v));
+        CHECK(!coefficient("1e400", v));
+        CHECK(!coefficient("1e-320", v));
+        CHECK(!coefficient("inf", v));
+        CHECK(!coefficient("nan", v));
+    }
+
     // ---- integrality relaxation ----
     //
     // A MIPLIB root LP relaxation must be formed from the ORIGINAL file, by
