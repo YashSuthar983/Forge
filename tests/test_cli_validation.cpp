@@ -115,7 +115,7 @@ void accept(const char* option, const std::string& value) {
 // can be wrong, because they all funnel through one parser and a regression in
 // it would otherwise show up on only one flag.
 void test_real_flags_reject_malformed_values() {
-    for (const char* option : {"--tol", "--time-limit"}) {
+    for (const char* option : {"--tol", "--lp-gap-tol", "--time-limit"}) {
         reject(option, "nan");
         reject(option, "-nan");
         reject(option, "inf");
@@ -136,7 +136,7 @@ void test_real_flags_reject_malformed_values() {
 // --tol and --time-limit are strictly positive: zero is not a usable value for
 // either, and it is exactly what strtod produced from a typo.
 void test_strictly_positive_flags_reject_zero_and_negatives() {
-    for (const char* option : {"--tol", "--time-limit"}) {
+    for (const char* option : {"--tol", "--lp-gap-tol", "--time-limit"}) {
         reject(option, "0");
         reject(option, "-0.0");
         reject(option, "-1");
@@ -475,7 +475,7 @@ void test_sor_check_recomputes_qp_objective_without_claiming_proof() {
 // A flag at the very end of the command line has no value to consume. This
 // must be a usage error, not a read past the end of argv.
 void test_missing_values_at_end_of_argv() {
-    for (const char* option : {"--tol", "--time-limit", "--max-iter",
+    for (const char* option : {"--tol", "--lp-gap-tol", "--time-limit", "--max-iter",
                                "--refactor-interval", "--refactor-eta-ratio",
                                "--refactor-work-ratio", "--dual-resync-interval",
                                "--dual-cost-perturbation", "--engine", "--method",

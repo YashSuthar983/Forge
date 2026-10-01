@@ -813,6 +813,12 @@ void test_misc03_dense_binary_mexi_auto_off() {
     opts.policy = MilpPolicy::Latest;
     opts.time_limit_s = 8.0;
     opts.feasibility_jump = false;
+    // Exercise conflict learning in the tree. The default incumbent-focused
+    // portfolio can spend this entire short allowance in primal heuristics.
+    opts.heuristic_budget_frac = 0.0;
+    opts.heuristic_budget_frac_no_incumbent = 0.0;
+    opts.heuristic_budget_frac_stalled = 0.0;
+    opts.heuristic_budget_frac_proof = 0.0;
     BabDiagnostics diag;
     sor::search::solve_milp(lp, opts, diag);
     CHECK(diag.conflict_cut_diag.attempts >= 1);

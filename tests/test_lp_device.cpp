@@ -19,6 +19,44 @@ model::LpProblem load_test_lp() {
     return io::read_mps(in, rep);
 }
 
+// An omitted overlay refers to upload(), and objective overrides affect both
+// the iterates and the reported objective. Check each backend against its own
+// fresh upload to avoid conflating their different averaging policies.
+void check_overlay_rebinding(backend::LpDevice& device) {
+    backend::ScaledLp toy;
+    toy.A_csr = sparse::from_triplets(1, 1, {0}, {0}, {1.0});
+    toy.A_csc = sparse::to_csc(toy.A_csr);
+    toy.c = {0.2}; toy.col_lo = {0}; toy.col_hi = {2};
+    toy.row_lo = {1}; toy.row_hi = {model::kInf};
+    toy.row_scale = toy.col_scale = {1};
+    backend::StepParams params;
+    params.tau = params.sigma = 0.1;
+    params.update_average = false;
+    const auto run = [&] {
+        device.init_zero(); device.hpr_steps(20, params);
+        return device.reduce_kkt();
+    };
+    device.upload(toy);
+    const auto baseline = run();
+    backend::LpBoundOverlay defaults;
+    defaults.col_lo = toy.col_lo; defaults.col_hi = toy.col_hi;
+    auto overridden = defaults;
+    overridden.row_lo = {0.5}; overridden.row_hi = {model::kInf};
+    overridden.c = {-1};
+    device.bind_bounds_batch(1, {overridden});
+    const auto changed = run();
+    device.bind_bounds_batch(1, {defaults});
+    const auto restored = run();
+    CHECK(std::fabs(restored.primal_obj - baseline.primal_obj) < 1e-12);
+    CHECK(std::fabs(restored.primal_res - baseline.primal_res) < 1e-12);
+    toy.c = overridden.c; toy.row_lo = overridden.row_lo;
+    device.upload(toy);
+    const auto fresh_override = run();
+    CHECK(fresh_override.primal_obj < baseline.primal_obj - 0.1);
+    CHECK(std::fabs(changed.primal_obj - fresh_override.primal_obj) < 1e-12);
+    CHECK(std::fabs(changed.primal_res - fresh_override.primal_res) < 1e-12);
+}
+
 }  // namespace
 
 int main() {
@@ -99,7 +137,11 @@ int main() {
         tiny.c[0] = -std::numeric_limits<double>::denorm_min();
     };
     check_support(*cpu);
-    if (vk) check_support(*vk);
+    check_overlay_rebinding(*cpu);
+    if (vk) {
+        check_support(*vk);
+        check_overlay_rebinding(*vk);
+    }
 
     return sor::test::finish("test_lp_device");
 }

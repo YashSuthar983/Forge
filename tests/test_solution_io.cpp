@@ -49,6 +49,7 @@ void test_round_trip_infeasible_with_ray() {
     r.y = {0.0};
     r.ray = {1.0};
     r.dual_farkas_ray.multipliers = {1.0};
+    r.dual_farkas_ray.exact_multipliers = {"1/3"};
 
     std::ostringstream out;
     sor::io::write_solution(out, r);
@@ -60,6 +61,7 @@ void test_round_trip_infeasible_with_ray() {
     CHECK_NEAR(s.ray[0], 1.0, 1e-15);
     CHECK(s.dual_farkas_ray.size() == 1);
     CHECK_NEAR(s.dual_farkas_ray[0], 1.0, 1e-15);
+    CHECK(s.exact_dual_farkas == r.dual_farkas_ray.exact_multipliers);
 }
 
 void test_round_trip_unbounded_with_primal_ray() {
@@ -67,6 +69,7 @@ void test_round_trip_unbounded_with_primal_ray() {
     r.status = Status::Unbounded;
     r.proof = ProofLevel::BoundOnly;
     r.primal_ray.direction = {2.0, -1.0};
+    r.primal_ray.exact_direction = {"2/3", "-1/3"};
 
     std::ostringstream out;
     sor::io::write_solution(out, r);
@@ -75,6 +78,7 @@ void test_round_trip_unbounded_with_primal_ray() {
     CHECK(s.primal_ray.size() == 2);
     CHECK_NEAR(s.primal_ray[0], 2.0, 1e-15);
     CHECK_NEAR(s.primal_ray[1], -1.0, 1e-15);
+    CHECK(s.exact_primal_ray == r.primal_ray.exact_direction);
 }
 
 void test_round_trip_empty_vectors() {
@@ -101,6 +105,12 @@ void test_malformed_file_throws() {
     std::istringstream in2("status NotARealStatus\nproof None\nobjective 0\n"
                            "x 0\ny 0\nray 0\n");
     CHECK_THROWS(sor::io::read_solution(in2));
+    const std::string empty = "status NoSolutionFound\nproof None\nobjective 0\n"
+        "x 0\ny 0\nray 0\nprimal_ray 0\ndual_farkas_ray 0\n";
+    for (const auto* field : {"exact_dual", "exact_dual_farkas", "exact_primal_ray"}) {
+        std::istringstream duplicate(empty + field + " 0\n" + field + " 0\n");
+        CHECK_THROWS(sor::io::read_solution(duplicate));
+    }
 }
 
 void test_subnormal_and_complete_number_parsing() {

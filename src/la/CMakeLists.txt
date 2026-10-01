@@ -1,4 +1,4 @@
-add_library(sor_la_cpu src/lu.cpp src/amd.cpp src/ldlt.cpp)
+add_library(sor_la_cpu src/lu.cpp src/basis_numerics.cpp src/dense_lu.cpp src/amd.cpp src/ldlt.cpp)
 add_library(sor::la ALIAS sor_la_cpu)
 target_include_directories(sor_la_cpu PUBLIC include)
 target_link_libraries(sor_la_cpu PUBLIC sor_core PRIVATE sor_flags)

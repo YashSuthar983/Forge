@@ -1,6 +1,7 @@
 #include "sor/backend/kernel_backend.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 
@@ -106,17 +107,23 @@ public:
 
         const auto& rp = p.row_ptr();
         const auto& ci = p.col_idx();
-        for (std::size_t b = 0; b < X.n_items(); ++b) {
-            const f64* xb = X.item(b);
-            f64* yb = Y.item(b);
+        check_dims(p, vals, X.item_len(), p.n_cols(), "spmv_batched values");
+        // Matrix entries are fetched once per group of eight independent RHS.
+        // Each lane retains CSR order; vectorization is across RHS only.
+        for (std::size_t base = 0; base < X.n_items(); base += 8) {
+            const auto lanes = std::min<std::size_t>(8, X.n_items()-base);
             for (core::Index r = 0; r < p.n_rows(); ++r) {
-                f64 acc = 0.0;
+                alignas(64) std::array<f64,8> accum{};
                 for (core::Offset k = rp[static_cast<std::size_t>(r)];
-                     k < rp[static_cast<std::size_t>(r) + 1]; ++k) {
-                    acc += vals[static_cast<std::size_t>(k)] *
-                           xb[static_cast<std::size_t>(ci[static_cast<std::size_t>(k)])];
+                     k < rp[static_cast<std::size_t>(r)+1]; ++k) {
+                    const f64 a = vals[static_cast<std::size_t>(k)];
+                    const auto column = static_cast<std::size_t>(ci[static_cast<std::size_t>(k)]);
+                    #pragma omp simd
+                    for (std::size_t lane = 0; lane < lanes; ++lane)
+                        accum[lane] += a * X.item(base+lane)[column];
                 }
-                yb[static_cast<std::size_t>(r)] = acc;
+                for (std::size_t lane = 0; lane < lanes; ++lane)
+                    Y.item(base+lane)[static_cast<std::size_t>(r)] = accum[lane];
             }
         }
         stats_.kernel_ms += ms_since(t0);

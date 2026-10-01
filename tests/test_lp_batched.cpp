@@ -112,5 +112,50 @@ int main() {
         CHECK(std::isfinite(results[1].primal_res));
     }
 
+    // Omitted overlay rows/costs refer to upload(), even after another bind.
+    // Direct steps on the active lane must also survive a batched reduction.
+    {
+        backend::ScaledLp toy;
+        toy.A_csr = sparse::from_triplets(1, 1, {0}, {0}, {1.0});
+        toy.A_csc = sparse::to_csc(toy.A_csr);
+        toy.c = {0.2}; toy.col_lo = {0}; toy.col_hi = {2};
+        toy.row_lo = {1}; toy.row_hi = {model::kInf};
+        toy.row_scale = toy.col_scale = {1};
+        backend::LpBoundOverlay defaults;
+        defaults.col_lo = toy.col_lo; defaults.col_hi = toy.col_hi;
+        auto overridden = defaults;
+        overridden.row_lo = {0.5}; overridden.row_hi = {model::kInf};
+        overridden.c = {1};
+        auto reused = backend::make_cpu_lp_device();
+        auto fresh = backend::make_cpu_lp_device();
+        reused->upload(toy); fresh->upload(toy);
+        reused->bind_bounds_batch(1, {overridden});
+        reused->bind_bounds_batch(2, {defaults, defaults});
+        reused->init_zero_batched(); fresh->init_zero();
+        auto params = sp;
+        params.update_average = false;
+        reused->hpr_steps_batched(20, params); fresh->hpr_steps(20, params);
+        const auto expected = fresh->reduce_kkt();
+        const auto actual = reused->reduce_kkt_batched();
+        for (const auto& point : actual) {
+            CHECK(std::fabs(point.primal_res - expected.primal_res) < 1e-12);
+            CHECK(std::fabs(point.primal_obj - expected.primal_obj) < 1e-12);
+        }
+        reused->upload(toy);
+        reused->bind_bounds_batch(2, {defaults, defaults});
+        reused->init_zero_batched(); fresh->init_zero();
+        reused->hpr_steps_batched(5, params); fresh->hpr_steps(5, params);
+        const auto five = fresh->reduce_kkt();
+        // The loop leaves lane 1 active. The API permits an ordinary step
+        // on that lane; switching to lane 0 must not discard its state.
+        reused->hpr_steps(1, params); fresh->hpr_steps(1, params);
+        const auto six = fresh->reduce_kkt();
+        CHECK(std::fabs(six.primal_obj - five.primal_obj) > 1e-8);
+        const auto retained = reused->reduce_kkt_batched();
+        CHECK(std::fabs(retained[0].primal_obj - five.primal_obj) < 1e-12);
+        CHECK(std::fabs(retained[1].primal_obj - six.primal_obj) < 1e-12);
+        CHECK(std::fabs(retained[1].dual_obj - six.dual_obj) < 1e-12);
+    }
+
     return sor::test::finish("test_lp_batched");
 }

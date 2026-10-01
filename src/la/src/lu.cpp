@@ -1,10 +1,15 @@
 #include "sor/la/lu.hpp"
+#include "sor/la/basis_numerics.hpp"
+#include "sor/la/ldlt.hpp"
+#include "dense_lu.hpp"
+#include "sor/core/fp_environment.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <stdexcept>
 
 namespace sor::la {
 namespace {
@@ -98,6 +103,22 @@ bool BasisFactor::factorize(Index m,
                             const LuOptions& opts,
                             std::vector<Index>* singular_slots,
                             std::vector<Index>* vacant_rows) {
+    if (m < 0 || col_ptr.size() != sz(m)+1 || col_ptr.front() != 0 ||
+        col_ptr.back() != static_cast<Offset>(row_idx.size()) || vals.size() != row_idx.size())
+        throw std::invalid_argument("BasisFactor: malformed CSC shape");
+    for (Index j = 0; j < m; ++j)
+        if (col_ptr[sz(j)] < 0 || col_ptr[sz(j)] > col_ptr[sz(j)+1])
+            throw std::invalid_argument("BasisFactor: malformed CSC offsets");
+    for (std::size_t k = 0; k < vals.size(); ++k)
+        if (row_idx[k] < 0 || row_idx[k] >= m || !std::isfinite(vals[k]))
+            throw std::invalid_argument("BasisFactor: malformed CSC entry");
+    if (!std::isfinite(opts.markowitz_threshold) || opts.markowitz_threshold <= 0 || opts.markowitz_threshold > 1 ||
+        !std::isfinite(opts.pivot_tol) || opts.pivot_tol < 0 || opts.max_search_cols < 1 ||
+        !std::isfinite(opts.condition_limit) || opts.condition_limit < 1 ||
+        !std::isfinite(opts.stable_threshold) || opts.stable_threshold <= 0 || opts.stable_threshold > 1 ||
+        !std::isfinite(opts.dense_nucleus_density) || opts.dense_nucleus_density < 0 || opts.dense_nucleus_density > 1 ||
+        opts.dense_nucleus_limit < 0)
+        throw std::invalid_argument("BasisFactor: invalid numerical policy");
     m_ = m;
     valid_ = false;
     stats_ = LuStats{};
@@ -357,7 +378,149 @@ bool BasisFactor::factorize(Index m,
     };
 
     peel();
-    for (;;) {
+    std::vector<Index> dense_col_position;
+    const auto factor_dense_block = [&](std::vector<Index> rows, std::vector<Index> columns) {
+        if (!opts.blocked_nucleus) return false;
+        Offset nnz = 0;
+        for (Index i : rows) nnz += static_cast<Offset>(e.row_cols[sz(i)].size());
+        const auto n = static_cast<Index>(rows.size());
+        if (n < 32 || n > opts.dense_nucleus_limit || rows.size() != columns.size() ||
+            static_cast<f64>(nnz) < opts.dense_nucleus_density * n * n) return false;
+        // AMD on the symmetrized local nucleus supplies a fill-reducing
+        // column order; numerical row pivoting supplies stability.
+        if (dense_col_position.empty()) dense_col_position.assign(sz(m), -1);
+        auto& col_position = dense_col_position;
+        for (Index i = 0; i < n; ++i) {
+            col_position[sz(columns[sz(i)])] = i;
+        }
+        std::vector<std::vector<Index>> graph(sz(n));
+        for (Index i = 0; i < n; ++i)
+            for (Index j : e.row_cols[sz(rows[sz(i)])]) {
+                const Index col = col_position[sz(j)];
+                if (col < 0) continue;
+                graph[sz(std::max(i,col))].push_back(std::min(i,col));
+            }
+        SymCsc pattern; pattern.n = n; pattern.col_ptr = {0};
+        for (auto& column : graph) {
+            std::sort(column.begin(), column.end());
+            column.erase(std::unique(column.begin(), column.end()), column.end());
+            pattern.row_idx.insert(pattern.row_idx.end(), column.begin(), column.end());
+            pattern.col_ptr.push_back(static_cast<Offset>(pattern.row_idx.size()));
+        }
+        const auto order = amd_order(pattern);
+        const auto original_columns = columns;
+        for (Index j = 0; j < n; ++j) {
+            columns[sz(j)] = original_columns[sz(order[sz(j)])];
+            col_position[sz(columns[sz(j)])] = j;
+        }
+        std::vector<f64> dense(sz(n)*sz(n), 0);
+        for (Index i = 0; i < n; ++i)
+            for (std::size_t k = 0; k < e.row_cols[sz(rows[sz(i)])].size(); ++k) {
+                const Index j = e.row_cols[sz(rows[sz(i)])][k];
+                dense[sz(i)*sz(n)+sz(col_position[sz(j)])] = e.row_vals[sz(rows[sz(i)])][k];
+            }
+        const bool factored = detail::blocked_dense_lu(n, dense, rows, opts.pivot_tol);
+        // Positions are scratch for this block only: a later block (or the
+        // dense tail after a failed block) must not see stale entries.
+        for (const Index j : columns) col_position[sz(j)] = -1;
+        if (!factored) return false;
+        for (Index k = 0; k < n; ++k) {
+            piv_row_.push_back(rows[sz(k)]); piv_slot_.push_back(columns[sz(k)]);
+            piv_val_.push_back(dense[sz(k)*sz(n)+sz(k)]);
+            u_off_.push_back(u_alloc_nnz_);
+            Index length = 0;
+            for (Index j = k+1; j < n; ++j) {
+                const f64 a = dense[sz(k)*sz(n)+sz(j)];
+                if (a != 0) { u_idx_.push_back(columns[sz(j)]); u_val_.push_back(a); ++length; }
+            }
+            u_len_.push_back(length); u_alloc_nnz_ += length;
+            for (Index i = k+1; i < n; ++i) {
+                const f64 a = dense[sz(i)*sz(n)+sz(k)];
+                if (a != 0) { l_idx_.push_back(rows[sz(i)]); l_val_.push_back(a);
+                    stats_.largest_multiplier = std::max(stats_.largest_multiplier, std::fabs(a)); }
+            }
+            l_start_.push_back(static_cast<Offset>(l_idx_.size()));
+            e.row_live[sz(rows[sz(k)])] = 0; e.col_live[sz(columns[sz(k)])] = 0;
+        }
+        stats_.nucleus_pivots += n; stats_.blocked_nucleus_pivots += n;
+        ++stats_.blocked_nucleus_blocks;
+        return true;
+    };
+    const auto factor_dense_nucleus = [&]() {
+        if (!opts.blocked_nucleus) return false;
+        std::vector<Index> rows, columns;
+        for (Index i = 0; i < m; ++i) if (e.row_live[sz(i)]) rows.push_back(i);
+        for (Index j = 0; j < m; ++j) if (e.col_live[sz(j)]) columns.push_back(j);
+        if (factor_dense_block(rows, columns)) return true;
+        // Disconnected dense components need not fit the global nucleus
+        // limit. Their bipartite incidence proves that elimination creates
+        // no Schur updates outside the component, so each can use the same
+        // blocked kernel independently. Rectangular/sparse components retain
+        // Markowitz elimination. Lazy column entries must be verified before
+        // they nominate a neighboring row.
+        std::vector<char> row_seen(sz(m), 0), col_seen(sz(m), 0);
+        for (const Index seed : rows) {
+            if (row_seen[sz(seed)]) continue;
+            std::vector<Index> component_rows{seed}, component_columns;
+            row_seen[sz(seed)] = 1;
+            for (std::size_t cursor = 0; cursor < component_rows.size(); ++cursor) {
+                const Index i = component_rows[cursor];
+                for (const Index j : e.row_cols[sz(i)]) {
+                    if (!e.col_live[sz(j)] || col_seen[sz(j)]) continue;
+                    col_seen[sz(j)] = 1;
+                    component_columns.push_back(j);
+                    for (const Index neighbor : e.col_rows[sz(j)]) {
+                        if (!e.row_live[sz(neighbor)] || row_seen[sz(neighbor)] ||
+                            e.find(neighbor, j) == nullptr) continue;
+                        row_seen[sz(neighbor)] = 1;
+                        component_rows.push_back(neighbor);
+                    }
+                }
+            }
+            // A single component already failed the global eligibility gate.
+            if (component_rows.size() == rows.size()) return false;
+            std::sort(component_rows.begin(), component_rows.end());
+            std::sort(component_columns.begin(), component_columns.end());
+            factor_dense_block(std::move(component_rows), std::move(component_columns));
+        }
+        return std::none_of(e.row_live.begin(), e.row_live.end(), [](char live) { return live != 0; });
+    };
+    bool dense_done = factor_dense_nucleus();
+    // Dense tail switch. A connected sparse nucleus is eliminated by
+    // Markowitz until its active Schur complement has filled in: from then on
+    // every sparse pivot touches nearly every live row, so the remaining
+    // front is gathered once and finished by the blocked dense kernel with
+    // partial row pivoting. The Schur values in `e` are exact elimination
+    // state, so L/U are the same factor a sparse continuation would build
+    // (up to pivot choice). One attempt only: a numerically singular tail is
+    // left to Markowitz and the singularity repair below.
+    std::vector<Index> tail_rows;
+    bool tail_tried = !opts.blocked_nucleus;
+    for (; !dense_done;) {
+        const Index live = m - static_cast<Index>(piv_row_.size());
+        if (!tail_tried && live <= opts.dense_nucleus_limit) {
+            if (live < 32) {
+                tail_tried = true;
+            } else {
+                if (tail_rows.empty())
+                    for (Index i = 0; i < m; ++i) if (e.row_live[sz(i)]) tail_rows.push_back(i);
+                tail_rows.erase(std::remove_if(tail_rows.begin(), tail_rows.end(),
+                    [&](Index i) { return !e.row_live[sz(i)]; }), tail_rows.end());
+                Offset nnz = 0;
+                for (const Index i : tail_rows) nnz += static_cast<Offset>(e.row_cols[sz(i)].size());
+                const auto n = static_cast<f64>(tail_rows.size());
+                if (static_cast<f64>(nnz) >= opts.dense_nucleus_density * n * n) {
+                    tail_tried = true;
+                    std::vector<Index> columns;
+                    for (Index j = 0; j < m; ++j) if (e.col_live[sz(j)]) columns.push_back(j);
+                    if (factor_dense_block(tail_rows, std::move(columns))) {
+                        ++stats_.dense_tail_blocks;
+                        dense_done = true;
+                        break;
+                    }
+                }
+            }
+        }
         Index r = -1, c = -1;
         f64 v = 0.0;
         if (!markowitz(r, c, v)) break;
@@ -419,6 +582,17 @@ bool BasisFactor::factorize(Index m,
     stats_.factor_nnz = static_cast<Offset>(u_idx_.size() + l_idx_.size()) +
                         static_cast<Offset>(piv_val_.size());
     valid_ = (n_piv == m);
+    stats_.effective_threshold = opts.markowitz_threshold;
+    if (valid_ && opts.adaptive_threshold) {
+        stats_.condition_estimate = estimate_basis_condition(*this, m, col_ptr, row_idx, vals);
+        if (stats_.condition_estimate > opts.condition_limit &&
+            opts.markowitz_threshold < opts.stable_threshold) {
+            auto stable = opts;
+            stable.markowitz_threshold = opts.stable_threshold;
+            return factorize(m, col_ptr, row_idx, vals, stable, singular_slots, vacant_rows);
+        }
+    }
+    work_since_factor_ = 0; // Estimation is factorization setup, not update-file work.
     return valid_;
 }
 
@@ -915,6 +1089,7 @@ bool BasisFactor::sparse_lower_t(const std::vector<Index>& seed,
 // ---------------------------------------------------------------------------
 
 void BasisFactor::ftran(std::vector<f64>& b, SpikeCapture* spike) const {
+    const core::ScopedFlushSubnormals fp_scope;
     ftran_impl(b, nullptr, nullptr, spike);
 }
 
@@ -953,6 +1128,7 @@ void BasisFactor::capture_spike(SpikeCapture& out, bool have_seed) const {
 void BasisFactor::ftran_pair(std::vector<f64>& a,
                              std::vector<f64>& b,
                              SpikeCapture* spike_a) const {
+    const core::ScopedFlushSubnormals fp_scope;
     if (&a == &b) {
         ftran(a, spike_a);
         return;
@@ -1029,12 +1205,14 @@ void BasisFactor::ftran_pair(std::vector<f64>& a,
 
 bool BasisFactor::ftran_with_support(std::vector<f64>& b,
                                      std::vector<Index>& support) const {
+    const core::ScopedFlushSubnormals fp_scope;
     return ftran_impl(b, &support, nullptr);
 }
 
 bool BasisFactor::ftran_seeded_with_support(
     std::vector<f64>& b, const std::vector<Index>& seed_rows,
     std::vector<Index>& support, SpikeCapture* spike) const {
+    const core::ScopedFlushSubnormals fp_scope;
     return ftran_impl(b, &support, &seed_rows, spike);
 }
 
@@ -1261,17 +1439,20 @@ bool BasisFactor::ftran_impl(std::vector<f64>& b,
 }
 
 void BasisFactor::btran(std::vector<f64>& d) const {
+    const core::ScopedFlushSubnormals fp_scope;
     (void)btran_impl(d, nullptr, nullptr);
 }
 
 bool BasisFactor::btran_with_support(std::vector<f64>& d,
                                      std::vector<Index>& support) const {
+    const core::ScopedFlushSubnormals fp_scope;
     return btran_impl(d, &support, nullptr);
 }
 
 bool BasisFactor::btran_seeded_with_support(
     std::vector<f64>& d, const std::vector<Index>& seed_slots,
     std::vector<Index>& support) const {
+    const core::ScopedFlushSubnormals fp_scope;
     return btran_impl(d, &support, &seed_slots);
 }
 

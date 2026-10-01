@@ -35,6 +35,11 @@ struct PresolveStats {
     Index forcing_columns_fixed = 0;
     Index equality_aggregations = 0;
     Offset aggregation_fill = 0;
+    Index equation_sparsifications = 0;
+    Index linear_dependencies_removed = 0;
+    Offset sparsification_nnz_removed = 0;
+    Index domain_probes = 0;
+    Index coefficient_strengthenings = 0;
     Index dual_fixes = 0;
     Index doubleton_substitutions = 0;
     Index dominated_columns_removed = 0;
@@ -62,6 +67,12 @@ struct PresolveOptions {
     f64 feasibility_tol = 1e-7;
     f64 stability_tol_scale = 1e-9;
     Offset max_substitution_fill = 512;
+    bool equation_sparsification = false;
+    bool domain_probing = false;
+    bool coefficient_strengthening = false;
+    Index max_aggregation_row_nnz = 32;
+    int sparsification_passes = 2;
+    Index max_domain_probes = 64;
 };
 
 enum class PresolveStatus : std::uint8_t {
@@ -95,6 +106,8 @@ enum class DualRecoveryKind : std::uint8_t {
     DominatedColumn,
     ParallelRowMerge,
     ParallelColumnMerge,
+    EquationSparsification,
+    RowScaling,
 };
 
 struct DualRecoveryStep {

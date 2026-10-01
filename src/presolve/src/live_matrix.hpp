@@ -196,4 +196,8 @@ bool run_live_presolve_passes(
     f64& work_obj_offset,
     LiveMatrix& lm);
 
+void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
+    const std::vector<char>& col_live, std::vector<f64>& lo, std::vector<f64>& hi,
+    PresolveMap& map, const PresolveOptions& options);
+
 }  // namespace sor::presolve::detail

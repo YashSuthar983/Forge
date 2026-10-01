@@ -323,7 +323,7 @@ core::PrimalRay check_primal_ray(const model::LpProblem& problem,
     out.max_bound_sign_residual = bound_res;
     const f64 improving = problem.maximize ? out.objective_direction
                                            : -out.objective_direction;
-    out.certified = row_res <= tolerance && bound_res <= tolerance &&
+    out.certified = row_res == 0.0 && bound_res == 0.0 &&
                     improving > tolerance;
     return out;
 }
@@ -502,11 +502,12 @@ ProofEvidence check_lp_result(const model::LpProblem& problem,
     checked.vipr_verified = proposed.vipr_verified;
 
     const auto& primal_direction = raw.primal_ray.direction;
-    if (!primal_direction.empty()) {
-        const core::PrimalRay ray = check_primal_ray(
-            problem, primal_direction, proposed.primal_feas_tol);
-        checked.primal_ray_violation = std::max(
-            ray.max_row_residual, ray.max_bound_sign_residual);
+    if (!primal_direction.empty() || !raw.primal_ray.exact_direction.empty()) {
+        const core::PrimalRay ray = !raw.primal_ray.exact_direction.empty()
+            ? check_exact_primal_ray(problem, raw.primal_ray.exact_direction, proposed.primal_feas_tol)
+            : check_primal_ray(problem, primal_direction, proposed.primal_feas_tol);
+        checked.primal_ray_violation = ray.certified ? std::max(
+            ray.max_row_residual, ray.max_bound_sign_residual) : core::kPosInf;
         // Evidence uses minimization convention so finalize_result can apply
         // one sign-independent rule; PrimalRay retains the original-model
         // objective direction for users.
@@ -519,9 +520,10 @@ ProofEvidence check_lp_result(const model::LpProblem& problem,
         dual_multipliers = &raw.dual_farkas_ray.multipliers;
     else if (!raw.ray.empty())
         dual_multipliers = &raw.ray;
-    if (dual_multipliers != nullptr) {
-        const core::DualFarkasRay ray = check_dual_farkas_ray(
-            problem, *dual_multipliers, proposed.primal_feas_tol);
+    if (dual_multipliers != nullptr || !raw.dual_farkas_ray.exact_multipliers.empty()) {
+        const core::DualFarkasRay ray = !raw.dual_farkas_ray.exact_multipliers.empty()
+            ? check_exact_dual_farkas_ray(problem, raw.dual_farkas_ray.exact_multipliers, proposed.primal_feas_tol)
+            : check_dual_farkas_ray(problem, *dual_multipliers, proposed.primal_feas_tol);
         checked.dual_farkas_contradiction = ray.contradiction;
         // A finite residual plus contradiction > tol is not sufficient: the
         // checker also applies a scale-aware separation threshold.  Publish
@@ -544,6 +546,18 @@ ProofEvidence check_lp_result(const model::LpProblem& problem,
 CheckedLpResult check_lp_candidate(const model::LpProblem& problem,
                                    RawResult raw, const ProofEvidence& proposed) {
     problem.validate(/*allow_empty_domains=*/true);
+    if (!raw.dual_farkas_ray.exact_multipliers.empty()) {
+        const auto ray = check_exact_dual_farkas_ray(problem,
+            raw.dual_farkas_ray.exact_multipliers, proposed.primal_feas_tol);
+        if (ray.certified) {
+            raw.dual_farkas_ray.multipliers = ray.multipliers;
+            raw.ray = ray.multipliers;
+        }
+    }
+    if (!raw.primal_ray.exact_direction.empty()) {
+        const auto ray = check_exact_primal_ray(problem, raw.primal_ray.exact_direction, proposed.primal_feas_tol);
+        if (ray.certified) raw.primal_ray.direction = ray.direction;
+    }
     const auto checked = check_lp_result(problem, raw, proposed);
     return CheckedLpResult(std::move(raw), checked);
 }
@@ -587,7 +601,7 @@ SolveResult finalize_result(RawResult raw, const ProofEvidence& ev) {
         r.ray = r.dual_farkas_ray.multipliers;
 
     const bool checked_dual_ray =
-        (!r.dual_farkas_ray.multipliers.empty() &&
+        ((!r.dual_farkas_ray.multipliers.empty() || !r.dual_farkas_ray.exact_multipliers.empty()) &&
          ((std::isfinite(ev.dual_farkas_violation) &&
            ev.dual_farkas_violation <= ev.primal_feas_tol &&
            ev.dual_farkas_contradiction > ev.primal_feas_tol) ||
