@@ -3780,7 +3780,7 @@ static core::RawResult dual_prepared_pass(
     if (status == core::Status::Infeasible && !farkas_ray.empty()) {
         raw.ray = std::move(farkas_ray);
         raw.certificate_basis = basis;
-        if (farkas_leaving_slot >= 0 &&
+        if (opts.certify_rays && farkas_leaving_slot >= 0 &&
             (opts.time_limit_s <= 0 || ms_since(t_all) < 1000*opts.time_limit_s)) {
             certify::repair_basis_farkas_certificate(pmin, raw, farkas_leaving_slot, farkas_sign,
                 {.time_limit_s = opts.time_limit_s > 0

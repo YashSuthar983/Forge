@@ -71,6 +71,18 @@ public:
         else if (exponent_ < other.exponent_) right <<= other.exponent_ - exponent_;
         return left > right;
     }
+    // Nearest-ish long double of value() without building a Rational (a
+    // screening hint only; never a proof quantity).
+    long double approx() const {
+        if (sum_ == 0) return 0.0L;
+        const bool negative = sum_ < 0;
+        const boost::multiprecision::cpp_int magnitude = negative ? boost::multiprecision::cpp_int(-sum_) : sum_;
+        const auto bits = static_cast<long>(boost::multiprecision::msb(magnitude));
+        const long shift = bits > 62 ? bits - 62 : 0;
+        const auto top = static_cast<std::uint64_t>(magnitude >> static_cast<unsigned>(shift));
+        const long double v = std::ldexp(static_cast<long double>(top), static_cast<int>(shift + exponent_));
+        return negative ? -v : v;
+    }
     // value() == mantissa() * 2^exponent(), without normalization.
     const boost::multiprecision::cpp_int& mantissa() const { return sum_; }
     int exponent() const { return exponent_; }

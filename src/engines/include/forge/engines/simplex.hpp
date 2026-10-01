@@ -95,6 +95,21 @@ struct SimplexOptions {
     // presolve route clears it for the reduced solve: only the lifted
     // original-model proof counts, and it is certified after postsolve.
     bool certify_terminal = true;
+    // Close the result with an exactly evaluated dual bound within gap_tol
+    // (dyadic refinement, targeted/exact basis certificates, support
+    // selection, exact-pricing continuation). Without it a solve stops at
+    // the optimality standard every floating-point LP solver uses: a basis
+    // whose original-model primal and dual residuals are within tolerance,
+    // reported as ProvedKKT; a bound that happens to close without extra
+    // work is still reported as ProvedOptimalFP. Measured on Netlib-93 the
+    // proof stages were 40 s of a 73 s total for the same 93 objectives.
+    // The struct default keeps existing library callers (MILP node LPs, the
+    // first-order routes) unchanged; the LP command line turns it off.
+    bool exact_proof = true;
+    // Exact Farkas/ray witnesses for an Infeasible/Unbounded finish. Internal
+    // candidate-generator solves (certificate repair correction LPs) only read
+    // the floating point and basis, so they clear both flags.
+    bool certify_rays = true;
     f64 refinement_target = 1e-13;
     int refinement_steps = 3;
     // Equation residuals measure numerical drift, separately from feasibility.

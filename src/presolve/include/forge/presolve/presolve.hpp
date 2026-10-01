@@ -129,6 +129,11 @@ struct DualRecoveryStep {
     bool at_max = false;
     std::vector<Index> columns;
     std::vector<f64> coefficients;
+    // ForcingRow: each column's objective coefficient at the time of the
+    // step. Earlier substitutions (singleton-column elimination, equality
+    // aggregation) have already moved cost between columns, so this is the
+    // cost the forcing row's multiplier must be measured against.
+    std::vector<f64> column_costs;
 };
 
 struct SingletonColumnElimination {
