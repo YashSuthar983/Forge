@@ -649,7 +649,10 @@ void test_enigma_stops_when_the_global_gap_closes() {
         std::string(SOR_SOURCE_DIR) + "/benchmarks/miplib-easy/mps/enigma.mps",
         report);
     BabOptions opts;
-    opts.time_limit_s = 20.0;
+    // Root phases take fractions of the limit: at 20 s they ended on wall
+    // clock and the tree varied (4.6k-6k nodes, 16-20 s, failing under ctest
+    // load); at 60 s the path is deterministic (800 nodes, ~14 s alone).
+    opts.time_limit_s = 60.0;
     opts.para_bab.threads = 1;
     BabDiagnostics diag;
     auto raw = sor::search::solve_milp(lp, opts, diag);

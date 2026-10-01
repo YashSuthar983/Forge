@@ -2870,14 +2870,14 @@ core::RawResult solve_primal_simplex_prepared(
             break;
     }
 
-    if (status == core::Status::Optimal && sense == 1.0 &&
+    if (opts.certify_terminal && status == core::Status::Optimal && sense == 1.0 &&
         (!diag.dual_bound_finite || diag.gap_rel > opts.gap_tol) &&
         (opts.time_limit_s == 0 || ms_since(t_all) < 1000 * opts.time_limit_s))
         repair_simplex_dual(pmin, raw, simplex_options_after_elapsed(opts, ms_since(t_all) / 1000), diag);
-    if (status == core::Status::Optimal &&
+    if (opts.certify_terminal && status == core::Status::Optimal &&
         (!diag.dual_bound_finite || (sense < 0 && diag.gap_rel > opts.gap_tol)) &&
         (opts.time_limit_s <= 0 || ms_since(t_all) < 1000 * opts.time_limit_s) &&
-        raw.exact_dual.empty() && certify::repair_basis_certificate(pmin, raw,
+        raw.exact_dual.empty() && certify::repair_dual_certificate(pmin, raw,
             {.time_limit_s = opts.time_limit_s > 0 ? std::max(std::numeric_limits<double>::min(),
                 opts.time_limit_s - ms_since(t_all) / 1000) : 0})) {
         const auto exact = certify::exact_dual_lower_bound(pmin, raw.exact_dual);
@@ -3014,6 +3014,8 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         SOR_FN();
         diag = SimplexDiagnostics{};
         SimplexOptions stage_opts = o;
+        // The reduced model's bound is never the published proof.
+        if (used_presolve) stage_opts.certify_terminal = false;
         if (opts.time_limit_s > 0.0) {
             const auto remaining = simplex_options_after_elapsed(
                 opts, std::chrono::duration<double>(Clock::now() - presolve_t0).count());
@@ -3313,6 +3315,13 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
             ? std::max(-1.0, opts.time_limit_s - ms_since(presolve_t0) / 1000) : 0;
         if (opts.time_limit_s > 0 && ropts.certificate_time_limit_s <= 0)
             ropts.certificate_time_limit_s = -1;
+        // A minimization lift that lacks a finite bound is repaired below by
+        // repair_simplex_dual, cheapest witness first (dyadic refinement,
+        // targeted, exact). Building the exact certificate inside recovery
+        // ran the most expensive stage first: maros-r7 spent 7.7 s on an
+        // exact solve the size policy then rejected, before refinement
+        // certified the same lift in 0.45 s.
+        if (!problem.maximize) ropts.certificate_time_limit_s = -1;
         const auto recovered =
             presolve::recover_solution(problem, pmap, rs, ropts);
         raw.x = recovered.raw.x;
@@ -3332,8 +3341,10 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         }
         presolve_recovery_validated = recovered.validated;
         rematerialize_original(problem, raw, diag, opts);
+        // Infinite or loose: either way the lifted basis's own certificate is
+        // the first thing to try (recovery no longer builds one, see above).
         if (raw.proposed_status == core::Status::Optimal && !problem.maximize &&
-            !diag.dual_bound_finite &&
+            (!diag.dual_bound_finite || diag.gap_rel > opts.gap_tol) &&
             (opts.time_limit_s == 0 || diag.total_ms < 1000 * opts.time_limit_s)) {
             const auto repair_started = Clock::now();
             repair_simplex_dual(problem, raw,
@@ -3343,8 +3354,11 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         // A finite but loose bound benefits from support selection. When the
         // basis has unsupported terms, retain the warm exact-pricing route;
         // a cold support LP can spend its whole allowance without progress.
+        // Also when the bound is still infinite after the dual repair: an
+        // unsupported term (a slightly dual-infeasible lifted basis, d2q06c)
+        // is exactly what support selection prices.
         if (raw.proposed_status == core::Status::Optimal &&
-            diag.dual_bound_finite && diag.gap_rel > opts.gap_tol &&
+            (!diag.dual_bound_finite || diag.gap_rel > opts.gap_tol) &&
             (opts.time_limit_s == 0 || ms_since(presolve_t0) < 1000 * opts.time_limit_s)) {
             const auto repair_started = Clock::now();
             repair_simplex_support(problem, raw,

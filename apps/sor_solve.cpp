@@ -123,6 +123,7 @@ void usage() {
         "  --[no-]fo-crossover  enable/disable Auto FO-to-simplex crossover\n"
         "  --auto-budget-split S  one of 60/25/15, 70/20/10, 80/15/5\n"
         "  --hpr-restart-off | --hpr-reflection-off | --hpr-weight-off\n"
+        "  --hpr-weight-pid | --hpr-weight-smoothed  primal-weight controller (default smoothed)\n"
         "  --implied-slack  presolve: drop zero-cost singleton columns as slacks\n"
         "  --lattice-reform  opt-in AHL lattice reform for pure integer equalities\n"
         "  --no-probing     skip MILP root probing (conflict graph, implied bounds)\n"
@@ -1364,6 +1365,8 @@ int main(int argc, char** argv) {
             sx_opts.dual_resync_interval = static_cast<int>(parse_uint(
                 next("--dual-resync-interval"), "--dual-resync-interval", 0,
                 static_cast<unsigned long long>(std::numeric_limits<int>::max())));
+        else if (a == "--cost-shifts") sx_opts.allow_cost_shifts = true;
+        else if (a == "--no-cost-shifts") sx_opts.allow_cost_shifts = false;
         else if (a == "--dual-cost-perturbation")
             sx_opts.dual_cost_perturbation_multiplier = parse_real(
                 next("--dual-cost-perturbation"), "--dual-cost-perturbation", 0.0);
@@ -1760,6 +1763,10 @@ int main(int argc, char** argv) {
         else if (a == "--hpr-restart-off") hpr_opts.use_restart = false;
         else if (a == "--hpr-reflection-off") hpr_opts.use_reflection = false;
         else if (a == "--hpr-weight-off") hpr_opts.use_primal_weight = false;
+        else if (a == "--hpr-weight-pid")
+            hpr_opts.weight_policy = sor::engines::HprOptions::WeightPolicy::Pid;
+        else if (a == "--hpr-weight-smoothed")
+            hpr_opts.weight_policy = sor::engines::HprOptions::WeightPolicy::Smoothed;
         else if (a == "--lp-concurrent")
             lp_concurrent = static_cast<int>(parse_uint(next("--lp-concurrent"), "--lp-concurrent", 1, 16));
         else if (a == "--threads")
