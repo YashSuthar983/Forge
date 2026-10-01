@@ -816,6 +816,107 @@ int main() {
         CHECK(p.max_row_violation(tampered) > ropts.primal_feas_tol);
     }
 
+    // ---- lifted basis after singleton-row bound tightening ----
+    //
+    //   min  -x0 + x1
+    //   s.t. 2 x0      <= 4        (singleton: becomes x0 <= 2, row removed)
+    //          x0 + x1 >= 3
+    //        x0 >= 0 (no upper bound), x1 in [0, 10]
+    //
+    // The reduced optimum has x0 nonbasic at the tightened bound 2. The
+    // original model has no such bound, so the lifted basis must make x0
+    // basic and the singleton row nonbasic at its upper side. Leaving the
+    // row's logical basic names a basis whose point is x0 = +inf.
+    {
+        using sor::presolve::PostsolveNonbasicStatus;
+        using sor::presolve::PresolveRecoveryOptions;
+        using sor::presolve::PresolveReducedSolve;
+        using sor::presolve::recover_solution;
+
+        LpProblem p;
+        p.A = sor::sparse::from_triplets(
+            2, 2, {0, 1, 1}, {0, 0, 1}, {2.0, 1.0, 1.0});
+        p.c = {-1.0, 1.0};
+        p.row_lo = {-sor::model::kInf, 3.0};
+        p.row_hi = {4.0, sor::model::kInf};
+        p.col_lo = {0.0, 0.0};
+        p.col_hi = {sor::model::kInf, 10.0};
+        const auto map = presolve_lp(p);
+        CHECK(map.stats.bounds_tightened == 1);
+        CHECK(map.problem.n_rows() == 1);
+        CHECK(map.problem.n_cols() == 2);
+        if (map.problem.n_rows() == 1 && map.problem.n_cols() == 2) {
+            CHECK(map.problem.col_hi[0] == 2.0);
+            PresolveReducedSolve rs;
+            rs.x = {2.0, 1.0};
+            rs.y = {1.0};
+            rs.has_basis = true;
+            rs.basis.n_struct = 2;
+            rs.basis.basic = {1};
+            rs.basis.status = {PostsolveNonbasicStatus::AtUpper,
+                               PostsolveNonbasicStatus::Basic,
+                               PostsolveNonbasicStatus::AtLower};
+            PresolveRecoveryOptions ropts;
+            ropts.gap_tol = 1e-9;
+            const auto lifted = recover_solution(p, map, rs, ropts);
+            CHECK(lifted.validated);
+            CHECK_NEAR(lifted.raw.x[0], 2.0, 1e-12);
+            CHECK_NEAR(lifted.raw.x[1], 1.0, 1e-12);
+            CHECK(lifted.basis.basic.size() == 2);
+            CHECK(lifted.basis.basic[0] == 0);
+            CHECK(lifted.basis.basic[1] == 1);
+            CHECK(lifted.basis.status[0] == PostsolveNonbasicStatus::Basic);
+            CHECK(lifted.basis.status[1] == PostsolveNonbasicStatus::Basic);
+            CHECK(lifted.basis.status[2] == PostsolveNonbasicStatus::AtUpper);
+            CHECK(lifted.basis.status[3] == PostsolveNonbasicStatus::AtLower);
+        }
+    }
+
+    // ---- forcing-row multiplier after an earlier cost substitution ----
+    //
+    //   min  s
+    //   s.t. s + 2 j     = 3       (E: s is a free singleton column)
+    //            j + k  <= 0       (F: forcing once k >= 0 is known)
+    //                k  >= 0       (S: singleton row)
+    //        s free, j >= 0, k in [-1, 5]
+    //
+    // Pass 1 eliminates s through E, which moves cost -2 onto j, and tightens
+    // k >= 0 from S. Pass 2 then finds F forcing and fixes j = k = 0. F's
+    // multiplier must make j dual feasible for the cost j carries at that
+    // stage (-2, so y_F <= -2); measured against j's original cost 0 it comes
+    // out as 0 and j is left with reduced cost -2 at its lower bound.
+    {
+        using sor::presolve::PresolveRecoveryOptions;
+        using sor::presolve::PresolveReducedSolve;
+        using sor::presolve::recover_solution;
+
+        LpProblem p;
+        p.A = sor::sparse::from_triplets(
+            3, 3, {0, 0, 1, 1, 2}, {0, 1, 1, 2, 2}, {1.0, 2.0, 1.0, 1.0, 1.0});
+        p.c = {1.0, 0.0, 0.0};
+        p.row_lo = {3.0, -sor::model::kInf, 0.0};
+        p.row_hi = {3.0, 0.0, sor::model::kInf};
+        p.col_lo = {-sor::model::kInf, 0.0, -1.0};
+        p.col_hi = { sor::model::kInf, sor::model::kInf, 5.0};
+        const auto map = presolve_lp(p);
+        CHECK(map.stats.singleton_columns_removed == 1);
+        CHECK(map.stats.forcing_rows_removed == 1);
+        CHECK(map.problem.n_cols() == 0);
+        if (map.problem.n_cols() == 0 && map.problem.n_rows() == 0) {
+            PresolveReducedSolve rs;
+            PresolveRecoveryOptions ropts;
+            ropts.gap_tol = 1e-9;
+            const auto lifted = recover_solution(p, map, rs, ropts);
+            CHECK_NEAR(lifted.raw.x[0], 3.0, 1e-12);
+            CHECK_NEAR(lifted.raw.x[1], 0.0, 1e-12);
+            CHECK_NEAR(lifted.raw.x[2], 0.0, 1e-12);
+            CHECK(lifted.evidence.max_dual_violation <= 1e-9);
+            CHECK(lifted.raw.y.size() == 3);
+            CHECK(lifted.raw.y[1] <= -2.0 + 1e-9);
+            CHECK(lifted.validated);
+        }
+    }
+
     // ---- Presolve v2 (live CSR/CSC queue driver) ----
     {
         using sor::presolve::PresolveOptions;

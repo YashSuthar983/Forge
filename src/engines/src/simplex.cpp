@@ -3015,7 +3015,7 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         diag = SimplexDiagnostics{};
         SimplexOptions stage_opts = o;
         // The reduced model's bound is never the published proof.
-        if (used_presolve) stage_opts.certify_terminal = false;
+        if (used_presolve || !opts.exact_proof) stage_opts.certify_terminal = false;
         if (opts.time_limit_s > 0.0) {
             const auto remaining = simplex_options_after_elapsed(
                 opts, std::chrono::duration<double>(Clock::now() - presolve_t0).count());
@@ -3229,8 +3229,10 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
     copy_presolve_diag(diag);
     raw.iterations = diag.iterations;
     // Both presolved and original-space solves use the same checked recovery.
-    const auto continue_original_certificate = [&](const SimplexBasis& warm_basis) {
-        if (raw.proposed_status != core::Status::Optimal ||
+    const auto continue_original_certificate = [&](const SimplexBasis& warm_basis,
+                                                   std::uint64_t pivot_cap = 0) {
+        if (!opts.exact_proof ||
+            raw.proposed_status != core::Status::Optimal ||
             (diag.dual_bound_finite && diag.gap_rel <= opts.gap_tol) ||
             warm_basis.status.empty() ||
             diag.certificate_iterations >= simplex_certificate_pivot_allowance ||
@@ -3240,9 +3242,18 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         continuation.presolve = false;
         continuation.method = SimplexMethod::Primal;
         continuation.certificate_pricing = true;
+        // The continuation starts on an optimal-within-tolerance basis and
+        // only enters exact violators. Bound perturbation answers a phase-2
+        // plateau by moving the bounds and restoring them with a second warm
+        // solve; here that restoration consumed the whole allowance (greenbea,
+        // greenbeb: interrupted at the cap, then 3400 more certificate pivots)
+        // where the unperturbed continuation proves both in about 200.
+        continuation.primal_bound_perturbation = false;
         const auto certificate_available = simplex_certificate_pivot_allowance - diag.certificate_iterations;
         continuation.max_iterations = opts.max_iterations == 0 ? certificate_available
             : std::min(certificate_available, opts.max_iterations - diag.iterations);
+        if (pivot_cap != 0)
+            continuation.max_iterations = std::min(continuation.max_iterations, pivot_cap);
         SimplexDiagnostics continuation_work;
         SimplexBasis repaired_basis;
         auto candidate = solve_primal_simplex(problem, continuation, continuation_work,
@@ -3275,6 +3286,13 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
             const auto totals = diag;
             diag = continuation_work;
             install_work_totals(diag, totals);
+            // The continuation's diagnostics describe an unpresolved solve;
+            // the reductions and routing summary of the run it finished
+            // belong to the result (perold reported "0 rows / 0 cols" for a
+            // presolve that had removed 144 rows).
+            copy_presolve_diag(diag);
+            diag.route_features = totals.route_features;
+            diag.route_features_valid = totals.route_features_valid;
             diag.primal_residual = checked.max_primal_violation;
             diag.dual_residual = checked.max_dual_violation;
             diag.primal_objective = candidate.objective;
@@ -3313,7 +3331,8 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         ropts.gap_tol = opts.gap_tol;
         ropts.certificate_time_limit_s = opts.time_limit_s > 0
             ? std::max(-1.0, opts.time_limit_s - ms_since(presolve_t0) / 1000) : 0;
-        if (opts.time_limit_s > 0 && ropts.certificate_time_limit_s <= 0)
+        if ((opts.time_limit_s > 0 && ropts.certificate_time_limit_s <= 0) ||
+            !opts.exact_proof)
             ropts.certificate_time_limit_s = -1;
         // A minimization lift that lacks a finite bound is repaired below by
         // repair_simplex_dual, cheapest witness first (dyadic refinement,
@@ -3343,7 +3362,8 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         rematerialize_original(problem, raw, diag, opts);
         // Infinite or loose: either way the lifted basis's own certificate is
         // the first thing to try (recovery no longer builds one, see above).
-        if (raw.proposed_status == core::Status::Optimal && !problem.maximize &&
+        if (opts.exact_proof &&
+            raw.proposed_status == core::Status::Optimal && !problem.maximize &&
             (!diag.dual_bound_finite || diag.gap_rel > opts.gap_tol) &&
             (opts.time_limit_s == 0 || diag.total_ms < 1000 * opts.time_limit_s)) {
             const auto repair_started = Clock::now();
@@ -3351,13 +3371,30 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
                 simplex_options_after_elapsed(opts, diag.total_ms / 1000), diag);
             diag.total_ms += ms_since(repair_started);
         }
+        // What the lifted basis still lacks is a handful of pivots: reduced
+        // costs that were within tolerance against a presolve-tightened bound
+        // and now face the original, wider one. Exact pricing from the lifted
+        // basis enters exactly those columns (perold 33 pivots, pilot.ja 41),
+        // where the cold support LP below rebuilds a model-sized problem
+        // (perold 1082 pivots, pilot.ja 1539) before this same continuation
+        // finishes the proof anyway. Bounded, so a basis it cannot finish
+        // quickly still reaches support selection with its allowance intact.
+        SimplexBasis continuation_basis;
+        continuation_basis.n_struct = recovered.basis.n_struct;
+        continuation_basis.basic = recovered.basis.basic;
+        for (auto status : recovered.basis.status)
+            continuation_basis.status.push_back(static_cast<NonbasicStatus>(status));
+        constexpr std::uint64_t kEarlyContinuationPivots = 256;
+        if (continue_original_certificate(continuation_basis, kEarlyContinuationPivots))
+            presolve_recovery_validated = true;
         // A finite but loose bound benefits from support selection. When the
         // basis has unsupported terms, retain the warm exact-pricing route;
         // a cold support LP can spend its whole allowance without progress.
         // Also when the bound is still infinite after the dual repair: an
         // unsupported term (a slightly dual-infeasible lifted basis, d2q06c)
         // is exactly what support selection prices.
-        if (raw.proposed_status == core::Status::Optimal &&
+        if (opts.exact_proof &&
+            raw.proposed_status == core::Status::Optimal &&
             (!diag.dual_bound_finite || diag.gap_rel > opts.gap_tol) &&
             (opts.time_limit_s == 0 || ms_since(presolve_t0) < 1000 * opts.time_limit_s)) {
             const auto repair_started = Clock::now();
@@ -3365,11 +3402,6 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
                 simplex_options_after_elapsed(opts, ms_since(presolve_t0) / 1000), diag);
             diag.total_ms += ms_since(repair_started);
         }
-        SimplexBasis continuation_basis;
-        continuation_basis.n_struct = recovered.basis.n_struct;
-        continuation_basis.basic = recovered.basis.basic;
-        for (auto status : recovered.basis.status)
-            continuation_basis.status.push_back(static_cast<NonbasicStatus>(status));
         if (continue_original_certificate(continuation_basis)) presolve_recovery_validated = true;
         raw.iterations = diag.iterations;
         if (out_basis && raw.engine != "simplex+certificate-continuation" && !recovered.basis.status.empty()) {
@@ -3383,12 +3415,16 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
             *out_basis = std::move(lifted);
         }
 
+        // Without the exact proof the lifted result is judged by its
+        // original-model residuals alone; an open exact gap is then not a
+        // reason to solve the model again.
         const bool presolved_proved =
-            presolve_recovery_validated &&
+            (presolve_recovery_validated || !opts.exact_proof) &&
             raw.proposed_status == core::Status::Optimal &&
             diag.primal_residual <= opts.primal_feas_tol &&
             diag.dual_residual <= opts.dual_feas_tol &&
-            diag.dual_bound_finite && diag.gap_rel <= opts.gap_tol;
+            (!opts.exact_proof ||
+             (diag.dual_bound_finite && diag.gap_rel <= opts.gap_tol));
         const double retry_time_left = opts.time_limit_s > 0.0
             ? opts.time_limit_s -
                   std::chrono::duration<double>(Clock::now() - presolve_t0).count()
@@ -3408,7 +3444,7 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         const bool search_or_lift_needs_retry = terminal_needs_retry ||
             diag.primal_residual > opts.primal_feas_tol ||
             diag.dual_residual > opts.dual_feas_tol ||
-            (diag.dual_bound_finite && diag.gap_rel > opts.gap_tol);
+            (opts.exact_proof && diag.dual_bound_finite && diag.gap_rel > opts.gap_tol);
         if (used_presolve && !presolved_proved && search_or_lift_needs_retry &&
             (opts.max_iterations == 0 || diag.iterations < opts.max_iterations) &&
             std::getenv("SOR_PRESOLVE_NO_RETRY") == nullptr &&
@@ -3477,7 +3513,8 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         }
     }
     if (!used_presolve) {
-        if (raw.proposed_status == core::Status::Optimal &&
+        if (opts.exact_proof &&
+            raw.proposed_status == core::Status::Optimal &&
             diag.dual_bound_finite && diag.gap_rel > opts.gap_tol &&
             (opts.time_limit_s == 0 || ms_since(presolve_t0) < 1000 * opts.time_limit_s)) {
             const auto repair_started = Clock::now();
@@ -3530,6 +3567,10 @@ core::ProofEvidence simplex_evidence(const SimplexDiagnostics& diag,
     switch (diag.status) {
         case core::Status::Optimal:
             ev.claimed_level = gap_closed ? core::ProofLevel::ProvedOptimalFP
+                : !opts.exact_proof &&
+                  diag.primal_residual <= opts.primal_feas_tol &&
+                  diag.dual_residual <= opts.dual_feas_tol
+                ? core::ProofLevel::ProvedKKT
                 : diag.dual_bound_finite && std::isfinite(diag.gap_rel)
                 ? core::ProofLevel::FeasibleWithGap : core::ProofLevel::FeasibleOnly;
             break;

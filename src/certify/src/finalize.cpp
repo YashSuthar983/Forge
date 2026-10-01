@@ -2,6 +2,10 @@
 #include "sor/model/exact.hpp"
 
 #include <algorithm>
+#include <cstdint>
+#include <bit>
+#include <optional>
+#include <cstring>
 #include <cmath>
 #include <limits>
 #include <cstdio>
@@ -62,7 +66,7 @@ ProofLevel supported_level(const ProofEvidence& ev) {
 // bounds so far, so the limit is valid for every feasible point. Bounds are
 // computed exactly from binary64 inputs, then converted outward. Approximate
 // screening may decline a tightening; it never supplies a published bound.
-void row_implied_bounds(const model::LpProblem& problem,
+void row_implied_bounds_uncached(const model::LpProblem& problem,
                         const std::vector<f64>& lo_in,
                         const std::vector<f64>& hi_in,
                         std::vector<f64>& imp_lo, std::vector<f64>& imp_hi) {
@@ -74,13 +78,19 @@ void row_implied_bounds(const model::LpProblem& problem,
     const auto loosen = [](const model::Rational& v, int dir) {
         return dir < 0 ? model::rounded_down(v) : model::rounded_up(v);
     };
-    for (int round = 0; round < 20; ++round) {
-        bool changed = false;
-        for (core::Index i = 0; i < m; ++i) {
+    // Rows to revisit: all at first, then only rows holding a column whose
+    // implied bound moved in the previous round.
+    std::vector<std::vector<core::Index>> col_rows;
+    std::vector<char> queued(sz(m), 1), next(sz(m), 0);
+    std::vector<core::Index> active(sz(m));
+    for (core::Index i = 0; i < m; ++i) active[sz(i)] = i;
+    std::vector<f64> row_min, row_max;
+    for (int round = 0; round < 20 && !active.empty(); ++round) {
+        std::vector<core::Index> touched_cols;
+        for (const core::Index i : active) {
+            queued[sz(i)] = 0;
             model::ExactSum min_sum, max_sum;
-            std::vector<f64> row_min, row_max;
-            row_min.reserve(sz(rp[sz(i) + 1] - rp[sz(i)]));
-            row_max.reserve(row_min.capacity());
+            row_min.clear(); row_max.clear();
             int nmin = 0, nmax = 0;
             for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
                 const f64 a = problem.A.vals[sz(k)];
@@ -93,9 +103,10 @@ void row_implied_bounds(const model::LpProblem& problem,
                 if (std::isfinite(bmin)) min_sum.add_product(a, bmin); else ++nmin;
                 if (std::isfinite(bmax)) max_sum.add_product(a, bmax); else ++nmax;
             }
-            const model::Rational amin = min_sum.value(), amax = max_sum.value();
-            const long double amin_hint = amin.convert_to<long double>();
-            const long double amax_hint = amax.convert_to<long double>();
+            // Screening reads the exact sums approximately; the exact
+            // rationals are formed only for a row with a promising entry.
+            const long double amin_hint = min_sum.approx(), amax_hint = max_sum.approx();
+            std::optional<model::Rational> amin, amax;
             const f64 lo = problem.row_lo[sz(i)], hi = problem.row_hi[sz(i)];
             for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
                 const f64 a = problem.A.vals[sz(k)];
@@ -118,37 +129,102 @@ void row_implied_bounds(const model::LpProblem& problem,
                     useful |= screen((static_cast<long double>(hi) - amin_hint +
                         (std::isfinite(bmin) ? static_cast<long double>(a) * bmin : 0)) / a, a < 0);
                 if (!useful) continue;
+                if (!amin) { amin = min_sum.value(); amax = max_sum.value(); }
                 model::Rational rmin, rmax;
                 bool fmin, fmax;
-                if (std::isfinite(bmin)) { rmin = amin - model::Rational(a) * model::Rational(bmin); fmin = nmin == 0; }
-                else { rmin = amin; fmin = nmin == 1; }
-                if (std::isfinite(bmax)) { rmax = amax - model::Rational(a) * model::Rational(bmax); fmax = nmax == 0; }
-                else { rmax = amax; fmax = nmax == 1; }
+                if (std::isfinite(bmin)) { rmin = *amin - model::Rational(a) * model::Rational(bmin); fmin = nmin == 0; }
+                else { rmin = *amin; fmin = nmin == 1; }
+                if (std::isfinite(bmax)) { rmax = *amax - model::Rational(a) * model::Rational(bmax); fmax = nmax == 0; }
+                else { rmax = *amax; fmax = nmax == 1; }
+                bool moved = false;
                 // a x_c in [lo - rmax, hi - rmin]
                 if (std::isfinite(lo) && fmax) {
                     const model::Rational v = (model::Rational(lo) - rmax) / model::Rational(a);
                     if (a > 0.0) {
                         const f64 nb = loosen(v, -1);
-                        if (nb > imp_lo[sz(c)] + 1e-9 * (1.0 + std::fabs(nb))) { imp_lo[sz(c)] = nb; changed = true; }
+                        if (nb > imp_lo[sz(c)] + 1e-9 * (1.0 + std::fabs(nb))) { imp_lo[sz(c)] = nb; moved = true; }
                     } else {
                         const f64 nb = loosen(v, +1);
-                        if (nb < imp_hi[sz(c)] - 1e-9 * (1.0 + std::fabs(nb))) { imp_hi[sz(c)] = nb; changed = true; }
+                        if (nb < imp_hi[sz(c)] - 1e-9 * (1.0 + std::fabs(nb))) { imp_hi[sz(c)] = nb; moved = true; }
                     }
                 }
                 if (std::isfinite(hi) && fmin) {
                     const model::Rational v = (model::Rational(hi) - rmin) / model::Rational(a);
                     if (a > 0.0) {
                         const f64 nb = loosen(v, +1);
-                        if (nb < imp_hi[sz(c)] - 1e-9 * (1.0 + std::fabs(nb))) { imp_hi[sz(c)] = nb; changed = true; }
+                        if (nb < imp_hi[sz(c)] - 1e-9 * (1.0 + std::fabs(nb))) { imp_hi[sz(c)] = nb; moved = true; }
                     } else {
                         const f64 nb = loosen(v, -1);
-                        if (nb > imp_lo[sz(c)] + 1e-9 * (1.0 + std::fabs(nb))) { imp_lo[sz(c)] = nb; changed = true; }
+                        if (nb > imp_lo[sz(c)] + 1e-9 * (1.0 + std::fabs(nb))) { imp_lo[sz(c)] = nb; moved = true; }
                     }
                 }
+                if (moved) touched_cols.push_back(c);
             }
         }
-        if (!changed) break;
+        if (touched_cols.empty()) break;
+        if (col_rows.empty()) {
+            col_rows.resize(sz(problem.n_cols()));
+            for (core::Index i = 0; i < m; ++i)
+                for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
+                    col_rows[sz(ci[sz(k)])].push_back(i);
+        }
+        std::vector<core::Index> upcoming;
+        for (const core::Index c : touched_cols)
+            for (const core::Index i : col_rows[sz(c)])
+                if (!next[sz(i)]) { next[sz(i)] = 1; upcoming.push_back(i); }
+        for (const core::Index i : upcoming) next[sz(i)] = 0;
+        std::sort(upcoming.begin(), upcoming.end());
+        active = std::move(upcoming);
     }
+}
+
+// Implied bounds depend only on the matrix, the row sides and the column
+// box, and one solve asks for them many times (pilot: 7 calls of ~0.8 s each
+// across the dual bound, the point check and certificate repair). A small
+// per-thread cache keyed by a content hash returns the identical result.
+void row_implied_bounds(const model::LpProblem& problem,
+                        const std::vector<f64>& lo_in,
+                        const std::vector<f64>& hi_in,
+                        std::vector<f64>& imp_lo, std::vector<f64>& imp_hi) {
+    std::uint64_t h = 1469598103934665603ull;
+    const auto mix = [&h](std::uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+    const auto mix_values = [&](const std::vector<f64>& v) {
+        mix(v.size());
+        for (const f64 x : v) mix(std::bit_cast<std::uint64_t>(x));
+    };
+    mix(static_cast<std::uint64_t>(problem.n_rows()));
+    mix(static_cast<std::uint64_t>(problem.n_cols()));
+    for (const auto o : problem.A.pattern.row_ptr()) mix(static_cast<std::uint64_t>(o));
+    for (const auto c : problem.A.pattern.col_idx()) mix(static_cast<std::uint64_t>(c));
+    mix_values(problem.A.vals);
+    mix_values(problem.row_lo);
+    mix_values(problem.row_hi);
+    mix_values(lo_in);
+    mix_values(hi_in);
+    // The hash only selects a candidate; a hit is confirmed by comparing the
+    // full inputs, so a collision can never return another model's bounds.
+    struct Entry {
+        std::uint64_t key;
+        std::vector<core::Offset> row_ptr;
+        std::vector<core::Index> col_idx;
+        std::vector<f64> vals, row_lo, row_hi, col_lo, col_hi, lo, hi;
+    };
+    thread_local std::vector<Entry> cache;
+    const auto same_bits = [](const std::vector<f64>& a, const std::vector<f64>& b) {
+        return a.size() == b.size() &&
+               (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(f64)) == 0);
+    };
+    for (const auto& e : cache)
+        if (e.key == h && e.row_ptr == problem.A.pattern.row_ptr() &&
+            e.col_idx == problem.A.pattern.col_idx() && same_bits(e.vals, problem.A.vals) &&
+            same_bits(e.row_lo, problem.row_lo) && same_bits(e.row_hi, problem.row_hi) &&
+            same_bits(e.col_lo, lo_in) && same_bits(e.col_hi, hi_in)) {
+            imp_lo = e.lo; imp_hi = e.hi; return;
+        }
+    row_implied_bounds_uncached(problem, lo_in, hi_in, imp_lo, imp_hi);
+    if (cache.size() >= 4) cache.erase(cache.begin());
+    cache.push_back({h, problem.A.pattern.row_ptr(), problem.A.pattern.col_idx(), problem.A.vals,
+                     problem.row_lo, problem.row_hi, lo_in, hi_in, imp_lo, imp_hi});
 }
 
 }  // namespace

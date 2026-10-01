@@ -172,7 +172,15 @@ void lift_row_duals(const model::LpProblem& original,
                     valid = false;
                     break;
                 }
-                const f64 c = sense_ * original.c[sz(j)];
+                // The reduced cost at this stage: rows removed before this
+                // step have no multiplier yet in this reverse pass, and their
+                // effect on column j is exactly the cost they moved onto it.
+                // Measuring against the original cost instead leaves the
+                // column dual infeasible once those rows are recovered
+                // (supportcase7: a residual of 28.9 on a proved optimum,
+                // followed by a cold re-solve without presolve).
+                const f64 c = sense_ * (step.column_costs.size() == step.columns.size()
+                    ? step.column_costs[q] : original.c[sz(j)]);
                 const f64 threshold = (c - aty[sz(j)]) / a;
                 if (!std::isfinite(threshold)) {
                     valid = false;
@@ -326,6 +334,76 @@ PostsolveBasis lift_basis(const model::LpProblem& original,
         outb.status[sz(ns + step.row)] = PostsolveNonbasicStatus::AtLower;
         outb.basic[sz(step.row)] = step.col;
         outb.status[sz(step.col)] = PostsolveNonbasicStatus::Basic;
+    }
+    // A singleton row a*x_j in [lo, hi] was replaced by a tighter bound on
+    // x_j (and normally removed). When the reduced solution leaves x_j nonbasic at
+    // that tightened bound, the original model has no such column bound: there
+    // x_j is basic and the singleton row is the nonbasic one, at the side that
+    // produced the bound. Leaving the row's logical basic instead names a
+    // basis whose point puts x_j at a bound the model does not have, and its
+    // exact duals are not the lifted duals (d2q06c: 2769 certificate pivots to
+    // repair it, none once the basis is lifted consistently).
+    const auto tightened_value = [&](Index j, bool& at_upper, f64& value) {
+        const Index nj = pmap.orig_to_new[sz(j)];
+        if (nj >= 0) {
+            const auto status = outb.status[sz(j)];
+            if (status == PostsolveNonbasicStatus::AtUpper) {
+                at_upper = true;
+                value = pmap.problem.col_hi[sz(nj)];
+                return value != original.col_hi[sz(j)];
+            }
+            if (status == PostsolveNonbasicStatus::AtLower) {
+                at_upper = false;
+                value = pmap.problem.col_lo[sz(nj)];
+                return value != original.col_lo[sz(j)];
+            }
+            return false;
+        }
+        value = pmap.fixed_value[sz(j)];
+        if (value == original.col_lo[sz(j)] || value == original.col_hi[sz(j)])
+            return false;
+        at_upper = false;   // decided per step below
+        return true;
+    };
+    for (auto it = pmap.recovery_steps.rbegin(); it != pmap.recovery_steps.rend(); ++it) {
+        const auto& step = *it;
+        if (step.kind != DualRecoveryKind::BoundTightening) continue;
+        if (step.row < 0 || step.row >= m || step.col < 0 || step.col >= ns ||
+            step.coeff == 0.0 ||
+            outb.status[sz(ns + step.row)] != PostsolveNonbasicStatus::Basic ||
+            outb.status[sz(step.col)] == PostsolveNonbasicStatus::Basic)
+            continue;
+        // A removed row's logical sits in its own slot. A row kept in the
+        // reduced model (outward rounding left the bound a hair looser than
+        // the row, so the row was not provably redundant) may hold it anywhere.
+        Index slot = step.row;
+        if (outb.basic[sz(slot)] != ns + step.row) {
+            slot = -1;
+            for (Index s = 0; s < m; ++s)
+                if (outb.basic[sz(s)] == ns + step.row) { slot = s; break; }
+            if (slot < 0) continue;
+        }
+        bool at_upper = false;
+        f64 value = 0.0;
+        if (!tightened_value(step.col, at_upper, value)) continue;
+        const bool from_hi = step.new_hi < step.old_hi && step.new_hi == value;
+        const bool from_lo = step.new_lo > step.old_lo && step.new_lo == value;
+        if (pmap.orig_to_new[sz(step.col)] >= 0) {
+            if (at_upper ? !from_hi : !from_lo) continue;
+        } else {
+            if (!from_hi && !from_lo) continue;
+            at_upper = from_hi;
+        }
+        // x_j at its upper tightened bound is the row at its upper side for a
+        // positive coefficient and at its lower side for a negative one.
+        const bool row_upper = at_upper == (step.coeff > 0.0);
+        const f64 row_side = row_upper ? original.row_hi[sz(step.row)]
+                                       : original.row_lo[sz(step.row)];
+        if (!std::isfinite(row_side)) continue;
+        outb.basic[sz(slot)] = step.col;
+        outb.status[sz(step.col)] = PostsolveNonbasicStatus::Basic;
+        outb.status[sz(ns + step.row)] = row_upper ? PostsolveNonbasicStatus::AtUpper
+                                                   : PostsolveNonbasicStatus::AtLower;
     }
     for (Index j = 0; j < ns; ++j) {
         if (pmap.orig_to_new[sz(j)] < 0 &&

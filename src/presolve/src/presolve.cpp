@@ -291,10 +291,12 @@ PresolveMap run_presolve(const model::LpProblem& in,
                 if (!std::isfinite(v)) {
                     step.columns.clear();
                     step.coefficients.clear();
+                    step.column_costs.clear();
                     break;
                 }
                 step.columns.push_back(j);
                 step.coefficients.push_back(a);
+                step.column_costs.push_back(work_cost[sz(j)]);
             }
             if (static_cast<Index>(step.columns.size()) != live_count) continue;
 
