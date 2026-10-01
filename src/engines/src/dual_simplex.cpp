@@ -3797,14 +3797,14 @@ static core::RawResult dual_prepared_pass(
     raw.termination_reason = reason;
     diag.ray_violation = farkas_ray_violation;
 
-    if (status == core::Status::Optimal && sense == 1.0 &&
+    if (opts.certify_terminal && status == core::Status::Optimal && sense == 1.0 &&
         (!diag.dual_bound_finite || diag.gap_rel > opts.gap_tol) &&
         (opts.time_limit_s == 0 || ms_since(t_all) < 1000 * opts.time_limit_s))
         repair_simplex_dual(pmin, raw, simplex_options_after_elapsed(opts, ms_since(t_all) / 1000), diag);
-    if (status == core::Status::Optimal &&
+    if (opts.certify_terminal && status == core::Status::Optimal &&
         (!diag.dual_bound_finite || (sense < 0 && diag.gap_rel > opts.gap_tol)) &&
         (opts.time_limit_s <= 0 || ms_since(t_all) < 1000 * opts.time_limit_s) &&
-        raw.exact_dual.empty() && certify::repair_basis_certificate(pmin, raw,
+        raw.exact_dual.empty() && certify::repair_dual_certificate(pmin, raw,
             {.time_limit_s = opts.time_limit_s > 0 ? std::max(std::numeric_limits<double>::min(),
                 opts.time_limit_s - ms_since(t_all) / 1000) : 0})) {
         const auto exact = certify::exact_dual_lower_bound(pmin, raw.exact_dual);

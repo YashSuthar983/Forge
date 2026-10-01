@@ -225,6 +225,73 @@ ENDATA
     }
 }
 
+// Free basic columns with non-dyadic duals: floating duals leave round-off
+// reduced costs on columns with no finite bound, so the bound for them is
+// -inf; repair_dual_certificate must zero those exactly and publish a witness
+// whose exact Lagrangian is finite and matches the optimum.
+void test_targeted_dual_certificate() {
+    std::mt19937 rng(91);
+    for (int trial = 0; trial < 20; ++trial) {
+        model::LpProblem lp;
+        constexpr int n = 12;
+        std::vector<core::Index> rows, cols;
+        std::vector<double> vals;
+        std::vector<model::Rational> y(n);
+        for (int i = 0; i < n; ++i) y[static_cast<std::size_t>(i)] = model::Rational(static_cast<int>(rng() % 21) - 10, 3 + 2 * static_cast<int>(rng() % 5));
+        std::vector<model::Rational> c(n, 0);
+        for (int i = 0; i < n; ++i)
+            for (int j = 0; j < n; ++j) {
+                const double a = i == j ? 7.0 + j : static_cast<int>(rng() % 9) - 4;
+                if (a == 0) continue;
+                rows.push_back(i); cols.push_back(j); vals.push_back(a);
+                c[static_cast<std::size_t>(j)] += model::Rational(a) * y[static_cast<std::size_t>(i)];
+            }
+        lp.A = sparse::from_triplets(n, n, rows, cols, vals);
+        // c is the rounded A'y: the exact duals of this basis are near y but
+        // not dyadic, and every column is free.
+        for (const auto& v : c) lp.c.push_back(v.convert_to<double>());
+        lp.col_lo.assign(n, -model::kInf); lp.col_hi.assign(n, model::kInf);
+        lp.row_lo.assign(n, 1.0); lp.row_hi.assign(n, 1.0);
+        core::RawResult raw;
+        for (int j = 0; j < n; ++j) raw.certificate_basis.push_back(j);
+        // The basis point: A x = 1 by dense elimination with partial pivoting.
+        {
+            std::vector<double> dense(n * n, 0.0), rhs(n, 1.0);
+            for (std::size_t k = 0; k < rows.size(); ++k)
+                dense[static_cast<std::size_t>(rows[k]) * n + static_cast<std::size_t>(cols[k])] = vals[k];
+            std::vector<int> perm(n);
+            for (int i = 0; i < n; ++i) perm[static_cast<std::size_t>(i)] = i;
+            for (int col = 0; col < n; ++col) {
+                int piv = col;
+                for (int r = col + 1; r < n; ++r)
+                    if (std::fabs(dense[static_cast<std::size_t>(r * n + col)]) > std::fabs(dense[static_cast<std::size_t>(piv * n + col)])) piv = r;
+                for (int t = 0; t < n; ++t) std::swap(dense[static_cast<std::size_t>(col * n + t)], dense[static_cast<std::size_t>(piv * n + t)]);
+                std::swap(rhs[static_cast<std::size_t>(col)], rhs[static_cast<std::size_t>(piv)]);
+                for (int r = col + 1; r < n; ++r) {
+                    const double f = dense[static_cast<std::size_t>(r * n + col)] / dense[static_cast<std::size_t>(col * n + col)];
+                    for (int t = col; t < n; ++t) dense[static_cast<std::size_t>(r * n + t)] -= f * dense[static_cast<std::size_t>(col * n + t)];
+                    rhs[static_cast<std::size_t>(r)] -= f * rhs[static_cast<std::size_t>(col)];
+                }
+            }
+            raw.x.assign(n, 0.0);
+            for (int r = n - 1; r >= 0; --r) {
+                double v = rhs[static_cast<std::size_t>(r)];
+                for (int t = r + 1; t < n; ++t) v -= dense[static_cast<std::size_t>(r * n + t)] * raw.x[static_cast<std::size_t>(t)];
+                raw.x[static_cast<std::size_t>(r)] = v / dense[static_cast<std::size_t>(r * n + r)];
+            }
+        }
+        CHECK(certify::repair_dual_certificate(lp, raw));
+        CHECK(raw.exact_dual.size() == static_cast<std::size_t>(n));
+        const auto bound = certify::exact_dual_lower_bound(lp, raw.exact_dual);
+        CHECK(bound.finite);
+        // The optimum is c'x with A x = 1, i.e. sum of the exact duals.
+        const auto exact = certify::exact_dual_lower_bound(lp, raw.exact_dual);
+        model::Rational sum = 0;
+        for (const auto& t : raw.exact_dual) sum += model::Rational(t);
+        CHECK(std::fabs(exact.value - sum.convert_to<double>()) <= 1e-9 * (1 + std::fabs(exact.value)));
+    }
+}
+
 void test_sparse_integer_basis_certificate() {
     std::mt19937 rng(26207);
     for (int trial = 0; trial < 20; ++trial) {
@@ -359,7 +426,8 @@ void test_presolved_terminal_witnesses() {
 int main() {
     test_presolved_terminal_witnesses();
     test_exact_terminal_rays();
-    test_sparse_integer_basis_certificate();    test_exact_dual_rational_reference();
+    test_sparse_integer_basis_certificate();
+    test_targeted_dual_certificate();    test_exact_dual_rational_reference();
     test_safe_lagrangian_bound();
     test_safe_bound_refuses_unbounded_direction();
     test_small_cost_cannot_erase_unbounded_direction();

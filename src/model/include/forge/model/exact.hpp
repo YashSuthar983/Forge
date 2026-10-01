@@ -131,6 +131,16 @@ public:
         if (std::isfinite(upper)) maximum_.add_product(coefficient, upper);
         else ++maximum_infinite_;
     }
+    // Exactly undoes add(coefficient, lo, hi) for the same arguments.
+    void remove(double coefficient, double lo, double hi) {
+        if (coefficient == 0) return;
+        const double lower = coefficient > 0 ? lo : hi;
+        const double upper = coefficient > 0 ? hi : lo;
+        if (std::isfinite(lower)) minimum_.add_product(-coefficient, lower);
+        else --minimum_infinite_;
+        if (std::isfinite(upper)) maximum_.add_product(-coefficient, upper);
+        else --maximum_infinite_;
+    }
     bool finite_minimum() const noexcept { return minimum_infinite_ == 0; }
     bool finite_maximum() const noexcept { return maximum_infinite_ == 0; }
     double lower() const { return finite_minimum() ? rounded_down(minimum_.value()) :

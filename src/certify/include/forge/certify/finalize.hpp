@@ -59,6 +59,14 @@ struct ExactCertificatePolicy {
 };
 bool repair_basis_certificate(const model::LpProblem& problem, core::RawResult& raw,
                                const ExactCertificatePolicy& policy = {});
+// A bound witness for raw.certificate_basis, not necessarily its exact duals:
+// the basis's floating duals with the few terms that face an unbounded side
+// (no finite declared or row-implied bound) zeroed by a small exact solve on
+// a matching set of rows, accepted only if the exact Lagrangian is finite;
+// otherwise repair_basis_certificate. For callers that need a dual bound,
+// not exact pricing.
+bool repair_dual_certificate(const model::LpProblem& problem, core::RawResult& raw,
+                             const ExactCertificatePolicy& policy = {});
 bool repair_basis_primal_ray(const model::LpProblem& problem, core::RawResult& raw,
     core::Index entering_variable, int direction, const ExactCertificatePolicy& policy = {});
 core::PrimalRay check_exact_primal_ray(const model::LpProblem& problem,

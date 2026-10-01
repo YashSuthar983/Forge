@@ -169,7 +169,7 @@ bool repair_simplex_dual(const model::LpProblem& p, core::RawResult& raw,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - refinement_started).count());
         if (refined) return true;
         if (opts.time_limit_s > 0 && remaining() <= 0) return false;
-        certify::repair_basis_certificate(p, raw,
+        certify::repair_dual_certificate(p, raw,
             {.time_limit_s = remaining()});
     }
     if (!raw.exact_dual.empty()) {

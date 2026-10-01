@@ -187,6 +187,33 @@ int main() {
         }
         same_kkt(cpu->reduce_kkt(), vk->reduce_kkt());
         same_iterate(*cpu, *vk);
+        // Long vectors take the cooperative kernel: a 600-entry row and a
+        // 300-entry column must give the same steps and KKT as the CPU.
+        {
+            constexpr int rows = 300, cols = 600;
+            std::vector<core::Index> ri, ci;
+            std::vector<double> vals;
+            for (int j = 0; j < cols; ++j) { ri.push_back(0); ci.push_back(j); vals.push_back(1.0 + 0.001 * j); }
+            for (int i = 1; i < rows; ++i) {
+                ri.push_back(i); ci.push_back(0); vals.push_back(0.5);
+                ri.push_back(i); ci.push_back(i); vals.push_back(1.0 + (i % 7));
+            }
+            backend::ScaledLp wide;
+            wide.A_csr = sparse::from_triplets(rows, cols, ri, ci, vals);
+            wide.A_csc = sparse::to_csc(wide.A_csr);
+            wide.c.resize(cols);
+            for (int j = 0; j < cols; ++j) wide.c[static_cast<std::size_t>(j)] = (j % 5) - 2.0;
+            wide.col_lo.assign(cols, 0.0); wide.col_hi.assign(cols, 1.0);
+            wide.row_lo.assign(rows, 1.0); wide.row_hi.assign(rows, 50.0);
+            wide.row_scale.assign(rows, 1.0); wide.col_scale.assign(cols, 1.0);
+            for (backend::LpDevice* d : {cpu.get(), vk.get()}) {
+                d->upload(wide);
+                d->init_zero();
+                d->hpr_steps(25, hp);
+            }
+            same_kkt(cpu->reduce_kkt(), vk->reduce_kkt());
+            same_iterate(*cpu, *vk);
+        }
         CHECK(vk->capabilities().transactional_step);
         // A KKT check moves only its scalars across the bus.
         vk->reset_stats();

@@ -665,7 +665,11 @@ post_fixed_point:
                                 aggregation_initial_nnz / 10;
     Offset positive_fill = 0;
 
-    const auto pivot_bounds_redundant = [&](Index row, Index col) {
+    // `whole` (optional) is the exact activity interval of the entire row;
+    // the rest of the row is then one exact removal instead of a fresh
+    // O(row) exact sum per candidate column.
+    const auto pivot_bounds_redundant = [&](Index row, Index col,
+                                            const model::ExactIntervalSum* whole = nullptr) {
         const auto& entries = mutable_rows[sz(row)];
         const auto pivot_it = entries.find(col);
         if (pivot_it == entries.end()) return false;
@@ -679,20 +683,35 @@ post_fixed_point:
             // doomed scans dominate six seconds of a presolve that accepted
             // no aggregations.
             model::ExactIntervalSum other;
-            for (const auto& [j, a] : entries)
-                if (j != col) other.add(a, work_lo[sz(j)], work_hi[sz(j)]);
-            const model::Rational rhs(mutable_row_lo[sz(row)]), ap(pivot);
+            if (whole) {
+                other = *whole;
+                other.remove(pivot, lo, hi);
+            } else {
+                for (const auto& [j, a] : entries)
+                    if (j != col) other.add(a, work_lo[sz(j)], work_hi[sz(j)]);
+            }
+            // x = (rhs - other) / pivot; compare without dividing:
+            // (rhs - e) / p < l  <=>  (rhs - e) < p l  for p > 0, reversed for p < 0.
+            const model::Rational rhs(mutable_row_lo[sz(row)]);
             const bool lower_finite = pivot > 0 ? other.finite_maximum() : other.finite_minimum();
             const bool upper_finite = pivot > 0 ? other.finite_minimum() : other.finite_maximum();
+            const auto below = [&](const model::Rational& numerator, f64 bound) {
+                const model::Rational scaled = model::Rational(pivot) * model::Rational(bound);
+                return pivot > 0 ? numerator < scaled : numerator > scaled;
+            };
+            const auto above = [&](const model::Rational& numerator, f64 bound) {
+                const model::Rational scaled = model::Rational(pivot) * model::Rational(bound);
+                return pivot > 0 ? numerator > scaled : numerator < scaled;
+            };
             if (std::isfinite(lo)) {
                 if (!lower_finite) return false;
                 const auto other_end = pivot > 0 ? other.exact_maximum() : other.exact_minimum();
-                if ((rhs - other_end) / ap < model::Rational(lo)) return false;
+                if (below(rhs - other_end, lo)) return false;
             }
             if (std::isfinite(hi)) {
                 if (!upper_finite) return false;
                 const auto other_end = pivot > 0 ? other.exact_minimum() : other.exact_maximum();
-                if ((rhs - other_end) / ap > model::Rational(hi)) return false;
+                if (above(rhs - other_end, hi)) return false;
             }
         }
 
@@ -721,11 +740,13 @@ post_fixed_point:
             return;
         AggregationCandidate best;
         bool found = false;
+        model::ExactIntervalSum whole;
+        for (const auto& [col, a] : entries) whole.add(a, work_lo[sz(col)], work_hi[sz(col)]);
         for (const auto& [col, a] : entries) {
             (void)a;
             if (!col_live[sz(col)] ||
                 (!in.is_integer.empty() && in.is_integer[sz(col)]) ||
-                !pivot_bounds_redundant(row, col))
+                !pivot_bounds_redundant(row, col, &whole))
                 continue;
             const auto row_part = static_cast<std::uint64_t>(entries.size() - 1);
             const auto col_part = static_cast<std::uint64_t>(

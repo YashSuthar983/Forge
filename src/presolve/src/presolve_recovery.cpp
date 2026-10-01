@@ -371,7 +371,7 @@ PresolveRecoveryResult recover_solution(
     out.raw.certificate_basis = out.basis.basic;
     if (out.evidence.checker_passed && !std::isfinite(out.evidence.gap_rel) &&
         !out.basis.basic.empty() && opts.certificate_time_limit_s >= 0 &&
-        certify::repair_basis_certificate(original, out.raw,
+        certify::repair_dual_certificate(original, out.raw,
             certify::ExactCertificatePolicy{2000000, 32768, opts.certificate_time_limit_s}))
         out.evidence = certify::check_lp_point(original, out.raw, opts.primal_feas_tol,
             opts.dual_feas_tol, opts.gap_tol, reduced.has_basis);

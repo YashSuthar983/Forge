@@ -91,6 +91,10 @@ struct SimplexOptions {
     // -13%, total time -30%; dfl001 newly proved, pilot87 lost to an
     // exact-certificate size limit on its different final basis.
     bool allow_cost_shifts = true;
+    // Repair and exact certification of a terminal Optimal bound. The
+    // presolve route clears it for the reduced solve: only the lifted
+    // original-model proof counts, and it is certified after postsolve.
+    bool certify_terminal = true;
     f64 refinement_target = 1e-13;
     int refinement_steps = 3;
     // Equation residuals measure numerical drift, separately from feasibility.

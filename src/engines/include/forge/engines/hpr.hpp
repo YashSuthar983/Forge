@@ -41,13 +41,19 @@ struct HprOptions {
 
     std::uint64_t halpern_warmup = 400;  // vanilla steps before first Halpern anchor
 
-    // Primal weight is updated only at restart from full-epoch travel and is
-    // smoothed in log space.  PID fields remain source-compatible for one
-    // release but are no longer used by r2HPDHG.
+    // Primal weight is updated only at restart from full-epoch travel.
+    // Smoothed (default): log w <- theta log(dy/dx) + (1 - theta) log w,
+    // i.e. a proportional controller with gain theta on the log error.
+    // Pid: the restarted-PDHG controller of cuPDLPx (Lu & Peng 2025):
+    // error e = log w - log(dy/dx) per restart, log w -= kp e + ki I + kd de,
+    // with the integral clamped to the weight box (anti-windup) and reset
+    // whenever the weight saturates.
+    enum class WeightPolicy : std::uint8_t { Smoothed = 0, Pid = 1 };
+    WeightPolicy weight_policy = WeightPolicy::Smoothed;
     f64 weight_init = 1.0;
     f64 weight_theta = 0.5;
-    f64 pid_kp = 0.15;
-    f64 pid_ki = 0.0;
+    f64 pid_kp = 0.99;
+    f64 pid_ki = 0.01;
     f64 pid_kd = 0.0;
     f64 weight_min = 1e-2;
     f64 weight_max = 1e2;
