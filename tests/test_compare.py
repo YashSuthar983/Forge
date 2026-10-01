@@ -242,6 +242,10 @@ class CorrectnessTests(unittest.TestCase):
         incumbent_only = self.result("forge:milp", proof="ProvedGlobalEpsilon")
         incumbent_only.checker_validation_scope = "milp_incumbent"
         self.assertFalse(compare.is_certified_success(incumbent_only))
+        # forge_check verifies a ProvedKKT LP claim by its residuals.
+        kkt = self.result("forge:simplex", proof="ProvedKKT")
+        kkt.checker_validation_scope = "lp_kkt_f64"
+        self.assertTrue(compare.is_certified_success(kkt))
         self.assertTrue(compare.is_certified_success(self.result("highs")))
 
     def test_stage_attribution_is_machine_parseable(self) -> None:
