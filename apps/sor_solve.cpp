@@ -105,6 +105,8 @@ void usage() {
         "  --max-iter N     iteration / node limit\n"
         "  --tol T          feasibility tolerance\n"
         "  --lp-gap-tol G   LP gap tolerance, overriding --tol for LP engines\n"
+        "  --exact-proof    simplex/primal/dual: also close an exactly evaluated dual\n"
+        "                   bound within the gap tolerance (off: stop at KKT tolerances)\n"
         "  --no-dual-perturbation  disable Koberstein dual cost perturbation (ablation)\n"
         "  --no-primal-bound-perturbation  disable primal plateau recovery (ablation)\n"
         "  --trace-lp        trace LP progress and degeneracy recovery\n"
@@ -976,6 +978,7 @@ int main(int argc, char** argv) {
     bool mps_format_forced = false;
     bool tol_given = false;
     double lp_gap_tolerance = 0.0;
+    bool lp_exact_proof = false;
     bool lp_gap_given = false;
     bool max_iter_given = false;
     int local_starts = 1;   // --starts: multi-start count of the local QCQP solver
@@ -1365,6 +1368,7 @@ int main(int argc, char** argv) {
             sx_opts.dual_resync_interval = static_cast<int>(parse_uint(
                 next("--dual-resync-interval"), "--dual-resync-interval", 0,
                 static_cast<unsigned long long>(std::numeric_limits<int>::max())));
+        else if (a == "--exact-proof") lp_exact_proof = true;
         else if (a == "--cost-shifts") sx_opts.allow_cost_shifts = true;
         else if (a == "--no-cost-shifts") sx_opts.allow_cost_shifts = false;
         else if (a == "--dual-cost-perturbation")
@@ -4202,6 +4206,9 @@ int main(int argc, char** argv) {
                 std::printf("NOTE:              solving the LP RELAXATION "
                             "(use --engine milp for branch-and-bound)\n");
             }
+            // The LP engines stop at tolerance-level optimality unless the
+            // exact dual-bound proof is requested.
+            sx_opts.exact_proof = lp_exact_proof;
             sor::engines::SimplexDiagnostics diag;
             auto raw = sor::engines::solve_simplex(problem, sx_opts, diag, nullptr);
             auto ev = sor::engines::simplex_evidence(diag, sx_opts);

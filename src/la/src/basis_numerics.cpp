@@ -1,6 +1,10 @@
 #include "sor/la/basis_numerics.hpp"
 #include "sor/core/parallel.hpp"
+#if !defined(__SIZEOF_FLOAT128__)
 #include <boost/multiprecision/cpp_bin_float.hpp>
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic ignored "-Wpedantic"   // __float128
+#endif
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -8,7 +12,19 @@
 
 namespace sor::la {
 namespace {
+// Residuals a*x of two binary64 factors are exact in binary128, and the
+// compiler's binary128 rounds every sum, quotient and conversion the same way
+// the multiprecision type does, at a fraction of its cost: on pilot87 the
+// class-based arithmetic was about a sixth of the whole dual simplex loop.
+#if defined(__SIZEOF_FLOAT128__)
+using Quad = __float128;
+inline Quad quad_abs(Quad v) { return v < 0 ? -v : v; }
+inline f64 quad_to_f64(Quad v) { return static_cast<f64>(v); }
+#else
 using Quad = boost::multiprecision::cpp_bin_float_quad;
+inline Quad quad_abs(const Quad& v) { return abs(v); }
+inline f64 quad_to_f64(const Quad& v) { return v.convert_to<f64>(); }
+#endif
 std::size_t sz(Index v) { return static_cast<std::size_t>(v); }
 std::size_t sz(Offset v) { return static_cast<std::size_t>(v); }
 void validate(Index n, const std::vector<Offset>& p,
@@ -120,22 +136,22 @@ RefinementStats refine_basis_solution(const BasisFactor& factor, Index n,
         RefinementStats result;
         for (Index i = 0; i < n; ++i) {
             residual[sz(i)] = Quad(rhs[sz(i)]);
-            scale[sz(i)] = abs(Quad(rhs[sz(i)]));
+            scale[sz(i)] = quad_abs(Quad(rhs[sz(i)]));
         }
         for (Index j = 0; j < n; ++j)
             for (Offset k = p[sz(j)]; k < p[sz(j)+1]; ++k) {
                 const auto out = transpose ? sz(j) : sz(r[sz(k)]);
                 const auto in = transpose ? sz(r[sz(k)]) : sz(j);
                 const Quad term = Quad(a[sz(k)]) * Quad(candidate[in]);
-                residual[out] -= term; scale[out] += abs(term);
+                residual[out] -= term; scale[out] += quad_abs(term);
             }
         for (Index i = 0; i < n; ++i) {
-            const Quad magnitude = abs(residual[sz(i)]);
-            correction[sz(i)] = residual[sz(i)].convert_to<f64>();
-            result.residual_inf = std::max(result.residual_inf, magnitude.convert_to<f64>());
+            const Quad magnitude = quad_abs(residual[sz(i)]);
+            correction[sz(i)] = quad_to_f64(residual[sz(i)]);
+            result.residual_inf = std::max(result.residual_inf, quad_to_f64(magnitude));
             const Quad denominator = scale[sz(i)] == 0 ? Quad(1) : scale[sz(i)];
             result.backward_error = std::max(result.backward_error,
-                (magnitude / denominator).convert_to<f64>());
+                quad_to_f64(magnitude / denominator));
             result.finite &= std::isfinite(correction[sz(i)]);
         }
         return result;

@@ -250,6 +250,7 @@ bool repair_simplex_dual(const model::LpProblem& p, core::RawResult& raw,
     policy.primal_feas_tol = policy.dual_feas_tol = 1e-9;
     policy.gap_tol = 1e-7;
     policy.verbose = false;
+    policy.certify_terminal = policy.certify_rays = false;
     SimplexDiagnostics work;
     const auto proposed = solve_dual_simplex(correction, policy, work);
     // Include candidate-generation pivots and wall time in the solve ledger.
@@ -378,6 +379,7 @@ bool repair_simplex_support(const model::LpProblem& p, core::RawResult& raw,
     if (policy.max_iterations == 0) return false;
     policy.primal_feas_tol = policy.dual_feas_tol = 1e-10;
     policy.verbose = false;
+    policy.certify_terminal = policy.certify_rays = false;
     SimplexDiagnostics work;
     const auto proposed = solve_dual_simplex(correction, policy, work);
     work.certificate_stages = std::max<std::uint64_t>(1, work.stages);
