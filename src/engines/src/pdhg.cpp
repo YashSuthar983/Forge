@@ -357,8 +357,11 @@ core::RawResult solve_pdhg(const model::LpProblem& problem,
         be.spmv(p.A.pattern, vals, xbar, Axbar);
         for (std::size_t i = 0; i < nr; ++i) {
             const f64 v = y[i] + sigma * Axbar[i];
-            const f64 z = clamp_to(v / sigma, p.row_lo[i], p.row_hi[i]);
-            y[i] = v - sigma * z;
+            // Moreau form: exactly zero for an unclamped row (see the HPR
+            // device's dual step).
+            const f64 w = v / sigma;
+            y[i] = w < p.row_lo[i] ? v - sigma * p.row_lo[i]
+                 : w > p.row_hi[i] ? v - sigma * p.row_hi[i] : 0.0;
         }
         std::swap(x.host(), x_new.host());
 

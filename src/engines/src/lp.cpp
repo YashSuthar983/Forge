@@ -697,6 +697,47 @@ core::RawResult solve_lp(const model::LpProblem& problem,
                 } else crossed_basis = SimplexBasis{};
             }
         }
+        // Deterministic simplex reserve, as on the HPR route: when the FO or
+        // barrier point and its crossover leave no proof, the remaining budget
+        // goes to the simplex dispatcher on the same (presolved) model.
+        // greenbea through barrier: the interior point stalled 0.12% from the
+        // optimum and both crossover cleanups failed, so the route returned
+        // an unproved point with most of its budget unused.
+        // Explicitly disabling crossover asks for the FO/barrier answer
+        // itself, as on the HPR route, so the reserve follows that switch.
+        if (options.fo_crossover && !proved_basis(raw, checked) && !certified_terminal(raw, checked)) {
+            const double simplex_time = remaining_seconds(options, start, 1.0);
+            const std::uint64_t used = diagnostics.fo_iterations + diagnostics.crossover_iterations;
+            const std::uint64_t simplex_iterations = options.max_iterations == 0 ? 0
+                : options.max_iterations - std::min(options.max_iterations, used);
+            if ((options.time_limit_s <= 0.0 || simplex_time > 0.0) &&
+                (options.max_iterations == 0 || simplex_iterations > 0)) {
+                SimplexOptions reserve = simplex_policy ? *simplex_policy : SimplexOptions{};
+                reserve.method = SimplexMethod::Auto;
+                reserve.max_iterations = simplex_iterations;
+                reserve.time_limit_s = simplex_time;
+                reserve.primal_feas_tol = options.primal_feas_tol;
+                reserve.dual_feas_tol = options.dual_feas_tol;
+                reserve.gap_tol = options.gap_tol;
+                reserve.presolve = presolve_map == nullptr && options.presolve;
+                SimplexDiagnostics reserve_diag;
+                SimplexBasis reserve_basis;
+                const auto reserve_start = Clock::now();
+                auto reserved = solve_simplex(work_problem, reserve, reserve_diag,
+                    presolve_map != nullptr ? &reserve_basis : nullptr);
+                diagnostics.simplex_elapsed_s = elapsed_seconds(reserve_start);
+                diagnostics.simplex_iterations = reserve_diag.iterations;
+                const auto reserve_producer = simplex_evidence(reserve_diag, reserve);
+                const auto reserve_ev = independently_checked(work_problem, reserved, reserve_producer);
+                if (proved_basis(reserved, reserve_ev) || certified_terminal(reserved, reserve_ev) ||
+                    candidate_merit(reserved, reserve_ev) < candidate_merit(raw, checked)) {
+                    raw = std::move(reserved);
+                    producer_ev = reserve_producer;
+                    checked = reserve_ev;
+                    crossed_basis = std::move(reserve_basis);
+                }
+            }
+        }
         if (presolve_map != nullptr) {
             SimplexBasis lifted_basis;
             auto lifted = lift_reduced_candidate(problem, *presolve_map, std::move(raw), options,

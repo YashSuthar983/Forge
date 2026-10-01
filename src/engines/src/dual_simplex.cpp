@@ -2404,19 +2404,29 @@ static core::RawResult dual_prepared_pass(
 
 
     std::vector<long double> equation_residual(sz(m));
+    // Drift is judged as backward error: a residual relative to the size of
+    // the terms that produced it. Floating evaluation alone leaves about
+    // eps * sum |a_ij x_j|, so an absolute threshold is unattainable on
+    // large-magnitude models and every refactor triggered the next (dfl001:
+    // 660 of 737 refactors, one per ~60 pivots, in 60 s).
+    std::vector<long double> equation_scale(sz(m), 0.0L);
     const auto drift_exceeds_limit = [&]() {
         std::fill(equation_residual.begin(), equation_residual.end(), 0.0L);
+        std::fill(equation_scale.begin(), equation_scale.end(), 0.0L);
         for (Index j = 0; j < nt; ++j) {
             const f64 x = st[sz(j)] == NonbasicStatus::Basic
                 ? xB[sz(slot_of[sz(j)])] : value[sz(j)];
             if (x == 0) continue;
             for_col(j, [&](Index i, f64 a) {
-                equation_residual[sz(i)] += static_cast<long double>(a) * x;
+                const long double term = static_cast<long double>(a) * x;
+                equation_residual[sz(i)] += term;
+                equation_scale[sz(i)] += std::fabs(term);
             });
         }
         for (Index i = 0; i < m; ++i) {
             const long double r = equation_residual[sz(i)];
-            if (!std::isfinite(r) || std::fabs(r) > opts.residual_refactor_tol) {
+            if (!std::isfinite(r) ||
+                std::fabs(r) > opts.residual_refactor_tol * (1.0L + equation_scale[sz(i)])) {
                 if (opts.verbose)
                     std::printf("  [dual] primal equation drift iter=%llu phase=%d row=%d residual=%.9Lg\n",
                         static_cast<unsigned long long>(iter), phase, i, r);
@@ -2426,10 +2436,14 @@ static core::RawResult dual_prepared_pass(
         if (phase == 2) {
             for (Index slot = 0; slot < m; ++slot) {
                 long double residual = -work_cost[sz(basis[sz(slot)])];
+                long double scale = std::fabs(residual);
                 for_col(basis[sz(slot)], [&](Index i, f64 a) {
-                    residual += static_cast<long double>(a) * y[sz(i)];
+                    const long double term = static_cast<long double>(a) * y[sz(i)];
+                    residual += term;
+                    scale += std::fabs(term);
                 });
-                if (!std::isfinite(residual) || std::fabs(residual) > opts.residual_refactor_tol) {
+                if (!std::isfinite(residual) ||
+                    std::fabs(residual) > opts.residual_refactor_tol * (1.0L + scale)) {
                     if (opts.verbose)
                         std::printf("  [dual] basis dual equation drift iter=%llu phase=%d slot=%d residual=%.9Lg\n",
                             static_cast<unsigned long long>(iter), phase, slot, residual);

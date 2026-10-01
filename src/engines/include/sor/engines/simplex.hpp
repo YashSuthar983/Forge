@@ -83,7 +83,14 @@ struct SimplexOptions {
     // the iteration. 0 disables.
     f64 numerical_trouble_tol = 1e-7;
     bool iterative_refinement = true;
-    bool allow_cost_shifts = false;
+    // Phase-2 drift that leaves a reduced cost on the wrong side by a
+    // rounding margin is absorbed by a bounded working-cost shift (removed
+    // with the perturbation before any conclusion). Without it the dual
+    // abandoned to primal clean-up mid-run: d2q06c spent 20k of 26k pivots
+    // there. Netlib (93 models, 60 s): proofs 92 = 92, shifted geomean
+    // -13%, total time -30%; dfl001 newly proved, pilot87 lost to an
+    // exact-certificate size limit on its different final basis.
+    bool allow_cost_shifts = true;
     f64 refinement_target = 1e-13;
     int refinement_steps = 3;
     // Equation residuals measure numerical drift, separately from feasibility.
