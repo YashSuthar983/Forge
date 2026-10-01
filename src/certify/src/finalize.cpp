@@ -1,4 +1,5 @@
 #include "sor/certify/finalize.hpp"
+#include "sor/model/dyadic.hpp"
 #include "sor/model/exact.hpp"
 
 #include <algorithm>
@@ -22,6 +23,34 @@ inline std::size_t sz(core::Index i) { SOR_FN(); return static_cast<std::size_t>
 f64 scaled_tol(f64 tol, f64 magnitude) {
     SOR_FN();
     return tol * (1.0 + std::fabs(magnitude));
+}
+
+// Column-major view of the CSR entries: for column j, entries
+// [ptr[j], ptr[j+1]) list (row, CSR entry index). Exact column sums then need
+// one live accumulator instead of one per column.
+struct ColumnEntries {
+    std::vector<core::Offset> ptr;
+    std::vector<core::Index> row;
+    std::vector<core::Offset> entry;
+};
+ColumnEntries column_entries(const model::LpProblem& problem) {
+    const auto& rp = problem.A.pattern.row_ptr();
+    const auto& ci = problem.A.pattern.col_idx();
+    const core::Index m = problem.n_rows(), n = problem.n_cols();
+    ColumnEntries out;
+    out.ptr.assign(sz(n) + 1, 0);
+    for (core::Offset k = 0; k < rp[sz(m)]; ++k) ++out.ptr[sz(ci[sz(k)]) + 1];
+    for (core::Index j = 0; j < n; ++j) out.ptr[sz(j) + 1] += out.ptr[sz(j)];
+    out.row.resize(static_cast<std::size_t>(rp[sz(m)]));
+    out.entry.resize(out.row.size());
+    std::vector<core::Offset> fill(out.ptr.begin(), out.ptr.end() - 1);
+    for (core::Index i = 0; i < m; ++i)
+        for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+            const auto at = static_cast<std::size_t>(fill[sz(ci[sz(k)])]++);
+            out.row[at] = i;
+            out.entry[at] = k;
+        }
+    return out;
 }
 
 bool residuals_within_tolerance(const ProofEvidence& ev) {
@@ -75,9 +104,6 @@ void row_implied_bounds_uncached(const model::LpProblem& problem,
     const core::Index m = problem.n_rows();
     imp_lo = lo_in;
     imp_hi = hi_in;
-    const auto loosen = [](const model::Rational& v, int dir) {
-        return dir < 0 ? model::rounded_down(v) : model::rounded_up(v);
-    };
     // Rows to revisit: all at first, then only rows holding a column whose
     // implied bound moved in the previous round.
     std::vector<std::vector<core::Index>> col_rows;
@@ -89,7 +115,7 @@ void row_implied_bounds_uncached(const model::LpProblem& problem,
         std::vector<core::Index> touched_cols;
         for (const core::Index i : active) {
             queued[sz(i)] = 0;
-            model::ExactSum min_sum, max_sum;
+            model::DyadicSum min_sum, max_sum;
             row_min.clear(); row_max.clear();
             int nmin = 0, nmax = 0;
             for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
@@ -103,10 +129,9 @@ void row_implied_bounds_uncached(const model::LpProblem& problem,
                 if (std::isfinite(bmin)) min_sum.add_product(a, bmin); else ++nmin;
                 if (std::isfinite(bmax)) max_sum.add_product(a, bmax); else ++nmax;
             }
-            // Screening reads the exact sums approximately; the exact
-            // rationals are formed only for a row with a promising entry.
+            // Screening reads the exact sums approximately; exact quotients
+            // are formed only for a promising entry.
             const long double amin_hint = min_sum.approx(), amax_hint = max_sum.approx();
-            std::optional<model::Rational> amin, amax;
             const f64 lo = problem.row_lo[sz(i)], hi = problem.row_hi[sz(i)];
             for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
                 const f64 a = problem.A.vals[sz(k)];
@@ -129,32 +154,35 @@ void row_implied_bounds_uncached(const model::LpProblem& problem,
                     useful |= screen((static_cast<long double>(hi) - amin_hint +
                         (std::isfinite(bmin) ? static_cast<long double>(a) * bmin : 0)) / a, a < 0);
                 if (!useful) continue;
-                if (!amin) { amin = min_sum.value(); amax = max_sum.value(); }
-                model::Rational rmin, rmax;
-                bool fmin, fmax;
-                if (std::isfinite(bmin)) { rmin = *amin - model::Rational(a) * model::Rational(bmin); fmin = nmin == 0; }
-                else { rmin = *amin; fmin = nmin == 1; }
-                if (std::isfinite(bmax)) { rmax = *amax - model::Rational(a) * model::Rational(bmax); fmax = nmax == 0; }
-                else { rmax = *amax; fmax = nmax == 1; }
+                const bool fmin = std::isfinite(bmin) ? nmin == 0 : nmin == 1;
+                const bool fmax = std::isfinite(bmax) ? nmax == 0 : nmax == 1;
                 bool moved = false;
-                // a x_c in [lo - rmax, hi - rmin]
+                // a x_c in [lo - rmax, hi - rmin], rmax = amax - a bmax (the
+                // rest of the row), so x_c's bound is (side - amax + a b) / a,
+                // rounded outward exactly.
+                const auto side_quotient = [&](f64 side, const model::DyadicSum& whole,
+                                               f64 own, bool down) {
+                    model::DyadicSum v = whole;
+                    v.negate();
+                    v.add(side);
+                    if (std::isfinite(own)) v.add_product(a, own);
+                    return down ? v.quotient_down(a) : v.quotient_up(a);
+                };
                 if (std::isfinite(lo) && fmax) {
-                    const model::Rational v = (model::Rational(lo) - rmax) / model::Rational(a);
                     if (a > 0.0) {
-                        const f64 nb = loosen(v, -1);
+                        const f64 nb = side_quotient(lo, max_sum, bmax, true);
                         if (nb > imp_lo[sz(c)] + 1e-9 * (1.0 + std::fabs(nb))) { imp_lo[sz(c)] = nb; moved = true; }
                     } else {
-                        const f64 nb = loosen(v, +1);
+                        const f64 nb = side_quotient(lo, max_sum, bmax, false);
                         if (nb < imp_hi[sz(c)] - 1e-9 * (1.0 + std::fabs(nb))) { imp_hi[sz(c)] = nb; moved = true; }
                     }
                 }
                 if (std::isfinite(hi) && fmin) {
-                    const model::Rational v = (model::Rational(hi) - rmin) / model::Rational(a);
                     if (a > 0.0) {
-                        const f64 nb = loosen(v, +1);
+                        const f64 nb = side_quotient(hi, min_sum, bmin, false);
                         if (nb < imp_hi[sz(c)] - 1e-9 * (1.0 + std::fabs(nb))) { imp_hi[sz(c)] = nb; moved = true; }
                     } else {
-                        const f64 nb = loosen(v, -1);
+                        const f64 nb = side_quotient(hi, min_sum, bmin, true);
                         if (nb > imp_lo[sz(c)] + 1e-9 * (1.0 + std::fabs(nb))) { imp_lo[sz(c)] = nb; moved = true; }
                     }
                 }
@@ -286,22 +314,19 @@ ProofEvidence check_lp_point(const model::LpProblem& problem,
         return ev;
     }
     const f64 sense = problem.maximize ? -1.0 : 1.0;
-    std::vector<model::ExactSum> aty(n);
-    std::vector<model::ExactSum> activity(m);
     const auto& rp = problem.A.pattern.row_ptr();
     const auto& ci = problem.A.pattern.col_idx();
-    for (core::Index i = 0; i < problem.n_rows(); ++i) {
-        const f64 yi_min = sense * raw.y[sz(i)];
-        for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
-            aty[sz(ci[sz(k)])].add_product(yi_min, problem.A.vals[sz(k)]);
-            activity[sz(i)].add_product(problem.A.vals[sz(k)], raw.x[sz(ci[sz(k)])]);
-        }
-    }
+    const auto columns = column_entries(problem);
 
     f64 dres = 0.0;
     for (std::size_t j = 0; j < n; ++j) {
-        const model::Rational reduced = model::Rational(sense * problem.c[j]) - aty[j].value();
-        const f64 r = reduced.convert_to<f64>();
+        // Exact reduced cost c_j - (A'y)_j, read as the nearest double.
+        model::DyadicSum reduced;
+        reduced.add(sense * problem.c[j]);
+        for (core::Offset e = columns.ptr[j]; e < columns.ptr[j + 1]; ++e)
+            reduced.add_product(-(sense * raw.y[sz(columns.row[static_cast<std::size_t>(e)])]),
+                                problem.A.vals[static_cast<std::size_t>(columns.entry[static_cast<std::size_t>(e)])]);
+        const f64 r = reduced.nearest();
         const f64 btol = scaled_tol(primal_feas_tol, raw.x[j]);
         const bool at_lo = std::isfinite(problem.col_lo[j]) &&
                            raw.x[j] <= problem.col_lo[j] + btol;
@@ -312,7 +337,10 @@ ProofEvidence check_lp_point(const model::LpProblem& problem,
         else if (!at_lo && !at_hi) dres = std::max(dres, std::fabs(r));
     }
     for (std::size_t i = 0; i < m; ++i) {
-        const f64 value = activity[i].value().convert_to<f64>();
+        model::DyadicSum activity;
+        for (core::Offset k = rp[i]; k < rp[i + 1]; ++k)
+            activity.add_product(problem.A.vals[sz(k)], raw.x[sz(ci[sz(k)])]);
+        const f64 value = activity.nearest();
         const f64 multiplier = sense * raw.y[i];
         const f64 btol = scaled_tol(primal_feas_tol, value);
         const bool at_lo = std::isfinite(problem.row_lo[i]) &&
@@ -881,23 +909,26 @@ SafeLpBound lagrangian_bound_impl(const model::LpProblem& problem,
     }
     // Only this final exact pass publishes a bound. The rounded arithmetic
     // above proposes multiplier corrections; it cannot establish a proof.
-    std::vector<model::ExactSum> sums(sz(n));
     std::vector<model::Rational> exact_d(d_out ? sz(n) : 0);
-    model::ExactSum exact_L;
+    model::DyadicSum exact_L;
     exact_L.add(sense * problem.obj_offset);
-    for (core::Index j = 0; j < n; ++j)
-        sums[sz(j)].add(sense * problem.c[sz(j)]);
     for (core::Index i = 0; i < m; ++i) {
         if (y[sz(i)] == 0.0) continue;
         const f64 b = y[sz(i)] > 0.0 ? problem.row_lo[sz(i)] : problem.row_hi[sz(i)];
         if (!std::isfinite(b)) return out;
         exact_L.add_product(y[sz(i)], b);
-        for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
-            sums[sz(ci[sz(k)])].add_product(-y[sz(i)], problem.A.vals[sz(k)]);
     }
+    const auto columns = column_entries(problem);
     for (core::Index j = 0; j < n; ++j) {
-        if (d_out) exact_d[sz(j)] = sums[sz(j)].value();
-        const int sign = sums[sz(j)].sign();
+        model::DyadicSum dj;
+        dj.add(sense * problem.c[sz(j)]);
+        for (core::Offset e = columns.ptr[sz(j)]; e < columns.ptr[sz(j) + 1]; ++e) {
+            const f64 yi = y[sz(columns.row[static_cast<std::size_t>(e)])];
+            if (yi != 0.0)
+                dj.add_product(-yi, problem.A.vals[static_cast<std::size_t>(columns.entry[static_cast<std::size_t>(e)])]);
+        }
+        if (d_out) exact_d[sz(j)] = dj.value();
+        const int sign = dj.sign();
         if (sign == 0) continue;
         f64 b = sign > 0 ? col_lo[sz(j)] : col_hi[sz(j)];
         if (!std::isfinite(b)) {
@@ -906,9 +937,9 @@ SafeLpBound lagrangian_bound_impl(const model::LpProblem& problem,
             ++out.implied_bound_uses;
         }
         if (!std::isfinite(b)) return out;
-        exact_L.add_sum_product(sums[sz(j)], b);
+        exact_L.add_sum_product(dj, b);
     }
-    out.value = model::rounded_down(exact_L.value());
+    out.value = exact_L.down();
     out.finite = std::isfinite(out.value);
     if (d_out != nullptr) *d_out = std::move(exact_d);
     return out;

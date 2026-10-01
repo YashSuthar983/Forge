@@ -1,4 +1,5 @@
 #include "sor/presolve/presolve.hpp"
+#include "sor/model/dyadic.hpp"
 #include "sor/model/exact.hpp"
 
 #include "live_matrix.hpp"
@@ -268,10 +269,10 @@ PresolveMap run_presolve(const model::LpProblem& in,
 
             const bool at_max =
                 std::isfinite(in.row_lo[sz(i)]) && activity.finite_maximum() &&
-                activity.exact_maximum() == model::Rational(in.row_lo[sz(i)]);
+                activity.maximum_sum().compare(in.row_lo[sz(i)]) == 0;
             const bool at_min =
                 std::isfinite(in.row_hi[sz(i)]) && activity.finite_minimum() &&
-                activity.exact_minimum() == model::Rational(in.row_hi[sz(i)]);
+                activity.minimum_sum().compare(in.row_hi[sz(i)]) == 0;
             if (!at_max && !at_min) continue;
 
             DualRecoveryStep step;
@@ -694,26 +695,26 @@ post_fixed_point:
             }
             // x = (rhs - other) / pivot; compare without dividing:
             // (rhs - e) / p < l  <=>  (rhs - e) < p l  for p > 0, reversed for p < 0.
-            const model::Rational rhs(mutable_row_lo[sz(row)]);
+            // sign(rhs - e - p bound) decides both, exactly.
+            const f64 rhs = mutable_row_lo[sz(row)];
             const bool lower_finite = pivot > 0 ? other.finite_maximum() : other.finite_minimum();
             const bool upper_finite = pivot > 0 ? other.finite_minimum() : other.finite_maximum();
-            const auto below = [&](const model::Rational& numerator, f64 bound) {
-                const model::Rational scaled = model::Rational(pivot) * model::Rational(bound);
-                return pivot > 0 ? numerator < scaled : numerator > scaled;
-            };
-            const auto above = [&](const model::Rational& numerator, f64 bound) {
-                const model::Rational scaled = model::Rational(pivot) * model::Rational(bound);
-                return pivot > 0 ? numerator > scaled : numerator < scaled;
+            const auto excess = [&](const model::DyadicSum& other_end, f64 bound) {
+                model::DyadicSum t = other_end;
+                t.negate();
+                t.add(rhs);
+                t.add_product(-pivot, bound);
+                return t.sign();
             };
             if (std::isfinite(lo)) {
                 if (!lower_finite) return false;
-                const auto other_end = pivot > 0 ? other.exact_maximum() : other.exact_minimum();
-                if (below(rhs - other_end, lo)) return false;
+                const int s = excess(pivot > 0 ? other.maximum_sum() : other.minimum_sum(), lo);
+                if (pivot > 0 ? s < 0 : s > 0) return false;
             }
             if (std::isfinite(hi)) {
                 if (!upper_finite) return false;
-                const auto other_end = pivot > 0 ? other.exact_minimum() : other.exact_maximum();
-                if (above(rhs - other_end, hi)) return false;
+                const int s = excess(pivot > 0 ? other.minimum_sum() : other.maximum_sum(), hi);
+                if (pivot > 0 ? s > 0 : s < 0) return false;
             }
         }
 

@@ -1,4 +1,5 @@
 #include "live_matrix.hpp"
+#include "sor/model/dyadic.hpp"
 #include "sor/model/exact.hpp"
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic ignored "-Wpedantic"   // unsigned __int128 for GF(2^61-1)
@@ -258,23 +259,67 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
                     const auto& old = matrix.rows[sz(target)];
                     const auto it = old.find(pivot);
                     if (it == old.end()) continue;
-                    f64 multiplier;
-                    const Rational ratio = Rational(it->second)/Rational(equation.at(pivot));
-                    if (!representable(ratio, multiplier)) continue;
-                    FlatMap rewritten = old;
-                    bool safe = true;
-                    for (const auto& [j, a] : equation) {
-                        const auto old_entry = rewritten.find(j);
-                        const Rational prior = old_entry == rewritten.end() ? Rational(0) : Rational(old_entry->second);
-                        f64 value;
-                        if (!representable(prior-ratio*Rational(a), value)) { safe = false; break; }
-                        if (value == 0) rewritten.erase(j); else rewritten[j] = value;
+                    // The multiplier must be a binary64 number exactly. When
+                    // the ratio is representable, IEEE division returns it;
+                    // the exact product check confirms it.
+                    const f64 pivot_coeff = equation.at(pivot);
+                    const f64 multiplier = it->second / pivot_coeff;
+                    if (!std::isfinite(multiplier)) continue;
+                    {
+                        model::DyadicSum check;
+                        check.add_product(multiplier, pivot_coeff);
+                        check.add(-it->second);
+                        if (check.sign() != 0) continue;
                     }
-                    if (!safe || rewritten.size() >= old.size()) continue;
+                    // target - multiplier * source, entry by entry (both rows
+                    // sorted by column). A first pass decides, without
+                    // building anything, whether every new coefficient is a
+                    // binary64 number and the row gets sparser; most targets
+                    // fail and then cost no copy.
+                    const auto combined = [&](f64 prior, f64 a, f64& value) {
+                        model::DyadicSum t;
+                        t.add(prior);
+                        t.add_product(-multiplier, a);
+                        return t.representable(value);
+                    };
+                    bool safe = true;
+                    std::ptrdiff_t net = 0;   // entries added minus entries cancelled
+                    {
+                        auto o = old.begin();
+                        for (const auto& [j, a] : equation) {
+                            while (o != old.end() && o->first < j) ++o;
+                            const bool present = o != old.end() && o->first == j;
+                            f64 value;
+                            if (!combined(present ? o->second : 0.0, a, value)) { safe = false; break; }
+                            if (present && value == 0) --net;
+                            else if (!present && value != 0) ++net;
+                        }
+                    }
+                    if (!safe || net >= 0) continue;
                     f64 lower = matrix.row_lo[sz(target)], upper = matrix.row_hi[sz(target)];
-                    const Rational shift = ratio*Rational(matrix.row_lo[sz(source)]);
-                    if ((std::isfinite(lower) && !representable(Rational(lower)-shift, lower)) ||
-                        (std::isfinite(upper) && !representable(Rational(upper)-shift, upper))) continue;
+                    const f64 source_side = matrix.row_lo[sz(source)];
+                    const auto shifted = [&](f64& side) {
+                        if (!std::isfinite(side)) return true;
+                        model::DyadicSum t;
+                        t.add(side);
+                        t.add_product(-multiplier, source_side);
+                        return t.representable(side);
+                    };
+                    if (!shifted(lower) || !shifted(upper)) continue;
+                    FlatMap rewritten;
+                    rewritten.v.reserve(old.size());
+                    {
+                        auto o = old.begin();
+                        for (const auto& [j, a] : equation) {
+                            for (; o != old.end() && o->first < j; ++o) rewritten.v.push_back(*o);
+                            const bool present = o != old.end() && o->first == j;
+                            f64 value = 0;
+                            combined(present ? o->second : 0.0, a, value);
+                            if (value != 0) rewritten.v.emplace_back(j, value);
+                            if (present) ++o;
+                        }
+                        for (; o != old.end(); ++o) rewritten.v.push_back(*o);
+                    }
                     const auto removed = old.size()-rewritten.size();
                     for (const auto& [j, a] : old) {
                         (void)a;
