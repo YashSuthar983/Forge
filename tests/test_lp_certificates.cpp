@@ -273,7 +273,92 @@ ENDATA
     if (!raw.exact_dual.empty()) CHECK(model::Rational(raw.exact_dual[0]) == model::Rational(1) / 3);
 }
 
+void test_exact_terminal_rays() {
+    model::LpProblem p;
+    p.A = sparse::from_triplets(1,2,{0,0},{0,1},{3,-1});
+    p.c = {0,-1}; p.col_lo = {0,0}; p.col_hi = {model::kInf,model::kInf};
+    p.row_lo = p.row_hi = {0};
+    // A rounded 1/3 leaves a nonzero recession drift on an equality.
+    CHECK(!certify::check_primal_ray(p,{1.0/3,1},1e-7).certified);
+    CHECK(certify::check_exact_primal_ray(p,{"1/3","1"},1e-7).certified);
+    CHECK(!certify::check_exact_primal_ray(p,{"1/3","-1"},1e-7).certified);
+    core::RawResult raw;
+    raw.certificate_basis = {0};
+    CHECK(certify::repair_basis_primal_ray(p,raw,1,1,{}));
+    CHECK(certify::check_exact_primal_ray(p,raw.primal_ray.exact_direction,1e-7).certified);
+    // A caller asking for a tighter terminal gate must get a witness even
+    // when its slope is smaller than the default feasibility tolerance.
+    p.c[1] = -1e-8;
+    raw.primal_ray = {};
+    CHECK(!certify::repair_basis_primal_ray(p, raw, 1, 1, {}));
+    CHECK(certify::repair_basis_primal_ray(p, raw, 1, 1, {.ray_tolerance = 1e-10}));
+    CHECK(certify::check_exact_primal_ray(p, raw.primal_ray.exact_direction, 1e-10).certified);
+    for (int invalid_kind = 0; invalid_kind < 3; ++invalid_kind) {
+        certify::ExactCertificatePolicy policy;
+        if (invalid_kind == 0) policy.time_limit_s = core::kNaN;
+        if (invalid_kind == 1) policy.max_bits = 0;
+        if (invalid_kind == 2) policy.ray_tolerance = 0;
+        bool rejected = false;
+        try { certify::repair_basis_primal_ray(p, raw, 1, 1, policy); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        CHECK(rejected);
+    }
+    // A non-dyadic Farkas multiplier must cancel the free column exactly.
+    p.A = sparse::from_triplets(2,1,{0,1},{0,0},{3,1});
+    p.c = {0}; p.col_lo = {-model::kInf}; p.col_hi = {model::kInf};
+    p.row_lo = {3,-model::kInf}; p.row_hi = {model::kInf,0};
+    CHECK(certify::check_exact_dual_farkas_ray(p,{"-1/3","1"},1e-7).certified);
+    CHECK(!certify::check_exact_dual_farkas_ray(p,{"-1/3","0"},1e-7).certified);
+    raw = {}; raw.certificate_basis = {0,2};
+    CHECK(certify::repair_basis_farkas_certificate(p,raw,1,-1,{}));
+    CHECK(certify::check_exact_dual_farkas_ray(p,raw.dual_farkas_ray.exact_multipliers,1e-7).certified);
+    p.row_lo[0] = 3e-8;
+    raw.dual_farkas_ray = {}; raw.ray.clear();
+    CHECK(!certify::repair_basis_farkas_certificate(p, raw, 1, -1, {}));
+    CHECK(certify::repair_basis_farkas_certificate(p, raw, 1, -1, {.ray_tolerance = 1e-10}));
+    CHECK(certify::check_exact_dual_farkas_ray(p,
+        raw.dual_farkas_ray.exact_multipliers, 1e-10).certified);
+}
+
+void test_presolved_terminal_witnesses() {
+    model::LpProblem unbounded;
+    unbounded.A = sparse::from_triplets(2, 3, {0,0,1,1}, {0,1,1,2}, {3,-1,1,-1});
+    unbounded.c = {0,-1,0};
+    unbounded.col_lo = {0,0,0};
+    unbounded.col_hi.assign(3, model::kInf);
+    unbounded.row_lo = {0,-model::kInf}; unbounded.row_hi = {0,0};
+    model::LpProblem infeasible;
+    infeasible.A = sparse::from_triplets(3, 2, {0,0,1,2}, {0,1,0,1}, {3,-1,3,1});
+    infeasible.c = {1,0};
+    infeasible.col_lo.assign(2, -model::kInf); infeasible.col_hi.assign(2, model::kInf);
+    infeasible.row_lo = {0,3,-model::kInf}; infeasible.row_hi = {0,model::kInf,0};
+    for (bool presolve : {false, true}) {
+        for (const auto method : {engines::SimplexMethod::Primal, engines::SimplexMethod::Dual}) {
+            engines::SimplexOptions opts;
+            opts.presolve = presolve; opts.method = method;
+            opts.time_limit_s = 2; opts.max_iterations = 64;
+            for (const auto* model : {&unbounded, &infeasible}) {
+                engines::SimplexDiagnostics diag;
+                const auto raw = engines::solve_simplex(*model, opts, diag);
+                const auto expected = model == &unbounded ? core::Status::Unbounded : core::Status::Infeasible;
+                const auto checked = certify::check_lp_result(*model, raw, engines::simplex_evidence(diag, opts));
+                CHECK(certify::finalize_result(raw, checked).status == expected);
+                CHECK(diag.iterations <= opts.max_iterations);
+                if (expected == core::Status::Unbounded) {
+                    CHECK(!raw.primal_ray.exact_direction.empty());
+                    CHECK(certify::check_exact_primal_ray(*model, raw.primal_ray.exact_direction, 1e-7).certified);
+                } else {
+                    CHECK(!raw.dual_farkas_ray.exact_multipliers.empty());
+                    CHECK(certify::check_exact_dual_farkas_ray(*model, raw.dual_farkas_ray.exact_multipliers, 1e-7).certified);
+                }
+            }
+        }
+    }
+}
+
 int main() {
+    test_presolved_terminal_witnesses();
+    test_exact_terminal_rays();
     test_sparse_integer_basis_certificate();    test_exact_dual_rational_reference();
     test_safe_lagrangian_bound();
     test_safe_bound_refuses_unbounded_direction();

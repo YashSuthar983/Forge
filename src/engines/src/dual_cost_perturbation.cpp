@@ -25,7 +25,7 @@ bool build_dual_perturbed_costs(
     const core::f64 multiplier,
     const core::f64 infinity,
     std::vector<core::f64>& perturbed,
-    DualCostPerturbationStats* stats) {
+    DualCostPerturbationStats* stats, std::uint64_t seed) {
     DualCostPerturbationStats local;
     if (n_struct < 0 || static_cast<std::size_t>(n_struct) > cost.size() ||
         lower.size() != cost.size() || upper.size() != cost.size() ||
@@ -69,7 +69,7 @@ bool build_dual_perturbed_costs(
         const bool fixed = l == u;
         if (free || fixed) continue;
         const core::f64 magnitude =
-            (1.0 + deterministic_fraction(static_cast<std::uint64_t>(j))) *
+            (1.0 + deterministic_fraction(static_cast<std::uint64_t>(j) + seed)) *
             (std::fabs(cost[k]) + 1.0) * local.structural_base;
         core::f64 sign = 0.0;
         if (u >= infinity) sign = 1.0;            // lower-bounded
@@ -84,7 +84,7 @@ bool build_dual_perturbed_costs(
     for (std::size_t k = static_cast<std::size_t>(n_struct);
          k < cost.size(); ++k) {
         const core::f64 delta =
-            (0.5 - deterministic_fraction(static_cast<std::uint64_t>(k))) *
+            (0.5 - deterministic_fraction(static_cast<std::uint64_t>(k) + seed)) *
             logical_base;
         if (delta == 0.0) continue;
         perturbed[k] += delta;

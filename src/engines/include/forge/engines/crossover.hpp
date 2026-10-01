@@ -30,6 +30,11 @@ struct CrossoverOptions {
     std::uint64_t max_iterations = 0;
     f64 time_limit_s = 0.0;
     bool fo_budget_ended = false;
+    // The start is an interior point (barrier), not a first-order iterate.
+    // Its absolute residuals reflect the model's scale, not the quality of
+    // its active-set information, and dual simplex cleanup is correct from
+    // any basis, so the FO usefulness gate does not apply.
+    bool interior_point_start = false;
     bool allow_cold_fallback = true;
     bool verbose = false;
 };

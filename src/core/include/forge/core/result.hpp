@@ -79,6 +79,7 @@ enum class LpStrategy : std::uint8_t {
     DualSimplex,
     Hpr,
     Pdhg,
+    Barrier,   // primal-dual interior point, then crossover to a basis
 };
 
 // The three serial Auto schedules frozen by the execution protocol.  Keeping
@@ -109,6 +110,7 @@ inline constexpr f64 kPosInf = std::numeric_limits<f64>::infinity();
 // propose it; certify::finalize_result is the sole writer of `certified`.
 struct PrimalRay {
     std::vector<f64> direction;
+    std::vector<std::string> exact_direction;
     f64 max_row_residual = kPosInf;
     f64 max_bound_sign_residual = kPosInf;
     f64 objective_direction = kNaN;
@@ -120,6 +122,7 @@ struct PrimalRay {
 // normalized positive separation L-U for the row/column boxes.
 struct DualFarkasRay {
     std::vector<f64> multipliers;
+    std::vector<std::string> exact_multipliers;
     f64 max_homogeneous_residual = kPosInf;
     f64 max_sign_residual = kPosInf;
     f64 contradiction = 0.0;
@@ -130,6 +133,7 @@ struct DualFarkasRay {
 // top-level dispatcher translates these into the existing explicit-engine
 // option records, keeping the L0 contract independent of L4 engine headers.
 struct LpOptions {
+    int concurrent_solves = 1;
     LpStrategy strategy = LpStrategy::Simplex;
     std::uint64_t max_iterations = 0;  // 0 = engine default
     f64 time_limit_s = 0.0;            // 0 = unlimited

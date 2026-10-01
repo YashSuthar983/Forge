@@ -55,9 +55,20 @@ struct ExactCertificatePolicy {
     unsigned max_bits = 32768;
     double time_limit_s = 0; // Zero means no deadline; work/size caps still apply.
     bool perturb_inward = true; // Pricing needs the pure B-transpose solution.
+    f64 ray_tolerance = 1e-7; // Match the independent terminal acceptance policy.
 };
 bool repair_basis_certificate(const model::LpProblem& problem, core::RawResult& raw,
                                const ExactCertificatePolicy& policy = {});
+bool repair_basis_primal_ray(const model::LpProblem& problem, core::RawResult& raw,
+    core::Index entering_variable, int direction, const ExactCertificatePolicy& policy = {});
+core::PrimalRay check_exact_primal_ray(const model::LpProblem& problem,
+    const std::vector<std::string>& witness, f64 tolerance);
+bool repair_basis_farkas_certificate(const model::LpProblem& problem, core::RawResult& raw,
+    core::Index leaving_slot, int direction, const ExactCertificatePolicy& policy = {});
+bool repair_basis_farkas_certificate(const model::LpProblem& problem, core::RawResult& raw,
+    const std::vector<f64>& basis_rhs, const ExactCertificatePolicy& policy = {});
+core::DualFarkasRay check_exact_dual_farkas_ray(const model::LpProblem& problem,
+    const std::vector<std::string>& witness, f64 tolerance);
 // Exact, outward-converted row implications. Used lazily when a dual term
 // requires a column endpoint absent from its declared box.
 std::pair<std::vector<f64>, std::vector<f64>> implied_lp_column_bounds(
@@ -71,6 +82,15 @@ ExactDualSupportFailure exact_dual_support_failure(
     const std::vector<int>& allowed_directions = {});
 SafeLpBound exact_dual_lower_bound(const model::LpProblem& problem,
                                    const std::vector<std::string>& witness);
+// Both of the above from one parse of the witness and one set of exact
+// reduced costs (certificate pricing needs both for every candidate basis).
+struct ExactDualAssessment {
+    SafeLpBound bound;
+    ExactDualSupportFailure failure;
+};
+ExactDualAssessment assess_exact_dual(const model::LpProblem& problem,
+                                      const std::vector<std::string>& witness,
+                                      const std::vector<int>& allowed_directions);
 SafeLpBound safe_lagrangian_lower_bound(const model::LpProblem& problem,
                                         const std::vector<f64>& y_min,
                                         const std::vector<f64>& col_lo,

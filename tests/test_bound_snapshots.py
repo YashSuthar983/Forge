@@ -25,12 +25,18 @@ class BoundSnapshotTests(unittest.TestCase):
             import resource
             signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
             resource.setrlimit(resource.RLIMIT_FSIZE, (4096, 4096))
+        # p0033 must finish its proof: a 0.1 s wall-clock budget made exit 0
+        # depend on machine load (ctest -j), not on snapshot I/O. Its budget is
+        # far above the ~0.4 s unloaded solve so the status is deterministic.
+        # n5-3 only needs to reach the root snapshot phases; its short budget
+        # keeps the file-size-limited run cheap and either status is valid.
         model = 'n5-3' if limited else 'p0033'
+        budget = '0.1' if limited else '30'
         result = subprocess.run(
             [str(BINARY), str(ROOT / 'benchmarks/miplib-easy/mps' / (model + '.mps')),
-             '--engine', 'milp', '--time-limit', '0.1', '--bab-threads', '1'],
+             '--engine', 'milp', '--time-limit', budget, '--bab-threads', '1'],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            preexec_fn=limit_files if limited else None, timeout=15)
+            preexec_fn=limit_files if limited else None, timeout=60)
         # The large model may exhaust the short solve budget without an
         # incumbent (CLI exit 4); this test concerns diagnostic I/O only.
         self.assertIn(result.returncode, (0, 4) if limited else (0,),

@@ -73,18 +73,22 @@ public:
         const auto& o = bounds[0];
         if (o.col_lo.size() != nc_ || o.col_hi.size() != nc_)
             throw std::invalid_argument("VulkanLpDevice: column bound size mismatch");
+        // Validate the entire overlay before changing host or device state.
+        if ((!o.row_lo.empty() || !o.row_hi.empty()) &&
+            (o.row_lo.size() != nr_ || o.row_hi.size() != nr_))
+            throw std::invalid_argument("VulkanLpDevice: row bound size mismatch");
+        if (!o.c.empty() && o.c.size() != nc_)
+            throw std::invalid_argument("VulkanLpDevice: cost size mismatch");
         col_lo_ = o.col_lo;
         col_hi_ = o.col_hi;
+        row_lo_ = o.row_lo.empty() ? uploaded_row_lo_ : o.row_lo;
+        row_hi_ = o.row_hi.empty() ? uploaded_row_hi_ : o.row_hi;
+        c_ = o.c.empty() ? uploaded_c_ : o.c;
         upload_vec(b_col_lo_, col_lo_);
         upload_vec(b_col_hi_, col_hi_);
-        if (!o.row_lo.empty() || !o.row_hi.empty()) {
-            if (o.row_lo.size() != nr_ || o.row_hi.size() != nr_)
-                throw std::invalid_argument("VulkanLpDevice: row bound size mismatch");
-            row_lo_ = o.row_lo;
-            row_hi_ = o.row_hi;
-            upload_vec(b_row_lo_, row_lo_);
-            upload_vec(b_row_hi_, row_hi_);
-        }
+        upload_vec(b_row_lo_, row_lo_);
+        upload_vec(b_row_hi_, row_hi_);
+        upload_vec(b_c_, c_);
     }
 
     void upload(const ScaledLp& lp) override {
@@ -101,6 +105,9 @@ public:
         col_hi_ = lp.col_hi;
         row_lo_ = lp.row_lo;
         row_hi_ = lp.row_hi;
+        uploaded_c_ = c_;
+        uploaded_row_lo_ = row_lo_;
+        uploaded_row_hi_ = row_hi_;
         // Keep CSR/CSC on host for KKT SpMV (until GPU reduce lands).
         A_csr_ = lp.A_csr;
         A_csc_ = lp.A_csc;
@@ -869,6 +876,7 @@ private:
     sparse::CsrMatrix A_csr_;
     sparse::CscMatrix A_csc_;
     std::vector<f64> c_, col_lo_, col_hi_, row_lo_, row_hi_;
+    std::vector<f64> uploaded_c_, uploaded_row_lo_, uploaded_row_hi_;
     std::vector<f64> col_scale_, row_scale_;
     std::vector<f64> x_host_, y_host_, x_avg_host_, y_avg_host_;
     std::vector<f64> x_anchor_host_, y_anchor_host_;

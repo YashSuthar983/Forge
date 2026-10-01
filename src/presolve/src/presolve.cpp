@@ -34,6 +34,9 @@ PresolveMap run_presolve(const model::LpProblem& in,
                          Index& witness_row, Index& witness_col,
                          std::string& reason) {
     using PresolveClock = std::chrono::steady_clock;
+    if (options.max_aggregation_row_nnz < 2 || options.max_substitution_fill < 0 ||
+        options.sparsification_passes < 0 || options.max_domain_probes < 0)
+        throw std::invalid_argument("presolve: invalid advanced reduction policy");
     const auto presolve_t0 = PresolveClock::now();
     const bool implied_slack = options.implied_slack;
     status = PresolveStatus::Reduced;
@@ -589,6 +592,8 @@ post_fixed_point:
         fixed = std::move(live.fixed);
     }
 
+    detail::advanced_reductions(live, row_live, col_live, work_lo, work_hi, out, options);
+
     // ------------------------------------------------------------------
     // Guarded equality aggregation
     // ------------------------------------------------------------------
@@ -652,8 +657,8 @@ post_fixed_point:
                         std::vector<AggregationCandidate>, WorseCandidate> candidates;
     std::vector<std::uint64_t> row_version(sz(m), 0);
 
-    constexpr std::size_t kMaxAggregationRowNnz = 32;
-    constexpr Offset kMaxStepFill = 512;
+    const auto kMaxAggregationRowNnz = static_cast<std::size_t>(std::max<Index>(2, options.max_aggregation_row_nnz));
+    const Offset kMaxStepFill = std::max<Offset>(0, options.max_substitution_fill);
     const Offset aggregation_initial_nnz = mutable_nnz;
     const Offset max_positive_fill = aggregation_initial_nnz / 2;
     const Offset max_live_nnz = aggregation_initial_nnz +
@@ -673,35 +678,22 @@ post_fixed_point:
             // column-scale scan: on fit2p, shared dense columns made those
             // doomed scans dominate six seconds of a presolve that accepted
             // no aggregations.
-            long double other_lo = 0.0L, other_hi = 0.0L;
-            for (const auto& [j, a] : entries) {
-                if (j == col) continue;
-                if (a > 0.0) {
-                    other_lo += static_cast<long double>(a) * work_lo[sz(j)];
-                    other_hi += static_cast<long double>(a) * work_hi[sz(j)];
-                } else {
-                    other_lo += static_cast<long double>(a) * work_hi[sz(j)];
-                    other_hi += static_cast<long double>(a) * work_lo[sz(j)];
-                }
+            model::ExactIntervalSum other;
+            for (const auto& [j, a] : entries)
+                if (j != col) other.add(a, work_lo[sz(j)], work_hi[sz(j)]);
+            const model::Rational rhs(mutable_row_lo[sz(row)]), ap(pivot);
+            const bool lower_finite = pivot > 0 ? other.finite_maximum() : other.finite_minimum();
+            const bool upper_finite = pivot > 0 ? other.finite_minimum() : other.finite_maximum();
+            if (std::isfinite(lo)) {
+                if (!lower_finite) return false;
+                const auto other_end = pivot > 0 ? other.exact_maximum() : other.exact_minimum();
+                if ((rhs - other_end) / ap < model::Rational(lo)) return false;
             }
-            if (std::isnan(other_lo) || std::isnan(other_hi)) return false;
-            const long double rhs = mutable_row_lo[sz(row)];
-            const long double x0 = (rhs - other_lo) / pivot;
-            const long double x1 = (rhs - other_hi) / pivot;
-            const long double implied_lo = std::min(x0, x1);
-            const long double implied_hi = std::max(x0, x1);
-            if ((std::isfinite(lo) && !std::isfinite(implied_lo)) ||
-                (std::isfinite(hi) && !std::isfinite(implied_hi)))
-                return false;
-            long double scale = 1.0L;
-            if (std::isfinite(implied_lo)) scale = std::max(scale, std::fabs(implied_lo));
-            if (std::isfinite(implied_hi)) scale = std::max(scale, std::fabs(implied_hi));
-            if (std::isfinite(lo)) scale = std::max(scale, std::fabs(static_cast<long double>(lo)));
-            if (std::isfinite(hi)) scale = std::max(scale, std::fabs(static_cast<long double>(hi)));
-            const long double tol = 1e-12L * scale;
-            const bool lower_ok = !std::isfinite(lo) || implied_lo >= lo - tol;
-            const bool upper_ok = !std::isfinite(hi) || implied_hi <= hi + tol;
-            if (!lower_ok || !upper_ok) return false;
+            if (std::isfinite(hi)) {
+                if (!upper_finite) return false;
+                const auto other_end = pivot > 0 ? other.exact_minimum() : other.exact_maximum();
+                if ((rhs - other_end) / ap > model::Rational(hi)) return false;
+            }
         }
 
         f64 row_scale = 1.0;
