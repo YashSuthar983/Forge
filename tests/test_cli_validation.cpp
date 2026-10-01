@@ -655,6 +655,62 @@ void test_sor_check_tolerance_validation() {
                         __FILE__, __LINE__, ok.output);
 }
 
+// An LP optimum is checked against its claim. The default simplex result,
+// ProvedKKT, asserts original-model residuals within tolerance; it is
+// verified by them and its safe dual bound is only reported. Here x1 sits
+// 9e-8 above its bound with reduced cost 10: every residual is within 1e-7,
+// but the multipliers' safe bound is 9e-7 below the objective. The same
+// point claimed as ProvedOptimalFP, or checked with --strict, is rejected.
+void test_sor_check_kkt_claim_scope() {
+    const fs::path lp = fs::temp_directory_path() / "sor_check_kkt.mps";
+    const fs::path claim = fs::temp_directory_path() / "sor_check_kkt.sol";
+    {
+        std::ofstream out(lp);
+        out << "NAME          KKTGAP\n"
+               "ROWS\n"
+               " N  COST\n"
+               " E  R1\n"
+               "COLUMNS\n"
+               "    X1        COST      10.0       R1        1.0\n"
+               "    X2        R1        1.0\n"
+               "RHS\n"
+               "    RHS       R1        5.0\n"
+               "BOUNDS\n"
+               " UP BND       X1        10.0\n"
+               " UP BND       X2        10.0\n"
+               "ENDATA\n";
+    }
+    const auto write_claim = [&](const char* proof) {
+        std::ofstream out(claim);
+        out << "status Optimal\n"
+            << "proof " << proof << "\n"
+            << "objective 9.0000000000000003e-07\n"
+            << "x 2 9.0000000000000003e-08 4.9999999100000002\n"
+            << "y 1 0\n"
+            << "ray 0\n"
+            << "primal_ray 0\n"
+            << "dual_farkas_ray 0\n";
+    };
+    write_claim("ProvedKKT");
+    const Run kkt = run({check_exe, lp.string(), claim.string()});
+    ::sor::test::report(kkt.exit_code == 0 && contains(kkt.output, "lp_kkt_f64"),
+                        "sor_check verifies a KKT claim by its residuals", __FILE__,
+                        __LINE__, kkt.output);
+    CHECK(contains(kkt.output, "info  primal-dual gap"));
+    const Run strict = run({check_exe, lp.string(), claim.string(), "--strict"});
+    ::sor::test::report(strict.exit_code == 1 && contains(strict.output, "lp_optimality_f64"),
+                        "--strict requires the safe dual bound", __FILE__, __LINE__,
+                        strict.output);
+    write_claim("ProvedOptimalFP");
+    const Run fp = run({check_exe, lp.string(), claim.string()});
+    ::sor::test::report(fp.exit_code == 1 && contains(fp.output, "FAIL  primal-dual gap"),
+                        "a ProvedOptimalFP claim still requires the bound", __FILE__,
+                        __LINE__, fp.output);
+    std::error_code ec;
+    fs::remove(lp, ec);
+    fs::remove(claim, ec);
+}
+
 // For an integer model sor_check validates only the incumbent: original-model
 // rows, bounds, integrality and recomputed objective.  In particular, it must
 // neither demand an LP dual vector nor imply that the MILP search bound/tree
@@ -1041,6 +1097,7 @@ int main() {
     test_unavailable_backends_are_not_silently_replaced();
     test_auto_budget_split_is_a_closed_protocol_set();
     test_sor_check_tolerance_validation();
+    test_sor_check_kkt_claim_scope();
     test_sor_check_milp_incumbent_scope();
     test_sor_check_milp_integrality_tolerance_agreement();
     test_sor_check_milp_infeasible_without_lp_ray_is_unverified();

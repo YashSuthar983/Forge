@@ -32,8 +32,12 @@ void usage() {
     std::fputs(
         "usage: sor_check MODEL.{mps,lp,qps} SOLUTION.sol [--tol T] [--gap-tol G] [--strict-mps]\n"
         "                 [--relax-integrality] [--small-matrix-value V]\n"
-        "                 [--fixed-mps|--free-mps]\n"
+        "                 [--fixed-mps|--free-mps] [--strict]\n"
         "  SOLUTION.sol is written by `sor_solve ... --solution-out FILE`.\n"
+        "  An LP optimum is checked against what it claims: ProvedKKT (the default\n"
+        "  simplex result) by its primal and dual residuals; ProvedOptimalFP and\n"
+        "  above (sor_solve --exact-proof) also by a safe dual bound within the gap\n"
+        "  tolerance. --strict demands that bound for every LP optimum.\n"
         "  Exit 0: the claim independently verifies. Exit 1: rejected.\n"
         "  Exit 3: unverified claim (insufficient certificate).\n",
         stderr);
@@ -196,6 +200,7 @@ int main(int argc, char** argv) {
     std::string model_path, solution_path;
     double tol = 1e-7;
     std::optional<double> gap_tol;
+    bool strict = false;
     sor::io::MpsReadOptions mps_opts;
     bool mps_format_forced = false;
     for (int i = 1; i < argc; ++i) {
@@ -219,6 +224,8 @@ int main(int argc, char** argv) {
                 return 2;
             }
             if (a == "--gap-tol") gap_tol = parsed; else tol = parsed;
+        } else if (a == "--strict") {
+            strict = true;
         } else if (a == "--relax-integrality") {
             mps_opts.relax_integrality = true;
         } else if (a == "--strict-mps") {
@@ -359,7 +366,16 @@ int main(int argc, char** argv) {
                           : fail("objective (recomputed)", obj_err, tol);
                 if (sol.status == sor::core::Status::Optimal && !has_integer &&
                     !is_qps) {
-                    validation_scope = "lp_optimality_f64";
+                    // A ProvedKKT claim asserts tolerance-level optimality:
+                    // original-model primal and dual residuals (multiplier
+                    // signs, reduced costs, complementarity) within
+                    // tolerance. It does not assert a safe dual bound, which
+                    // from floating multipliers is often -inf (a round-off
+                    // reduced cost on a column with no finite bound on that
+                    // side), so the gap is then reported, not required.
+                    const bool kkt_claim =
+                        sol.proof == sor::core::ProofLevel::ProvedKKT && !strict;
+                    validation_scope = kkt_claim ? "lp_kkt_f64" : "lp_optimality_f64";
                     sor::core::RawResult raw;
                     raw.proposed_status = sol.status;
                     raw.proposed_level = sol.proof;
@@ -374,9 +390,14 @@ int main(int argc, char** argv) {
                                      ev.max_dual_violation, tol)
                               : fail("dual/reduced costs",
                                      ev.max_dual_violation, tol);
-                    ok &= (ev.gap_rel <= gap_tol.value_or(tol))
-                              ? pass("primal-dual gap", ev.gap_rel, gap_tol.value_or(tol))
-                              : fail("primal-dual gap", ev.gap_rel, gap_tol.value_or(tol));
+                    if (kkt_claim)
+                        std::printf("info  %-28s residual=%.3e  (not claimed; --strict "
+                                    "requires <= %.3e)\n", "primal-dual gap", ev.gap_rel,
+                                    gap_tol.value_or(tol));
+                    else
+                        ok &= (ev.gap_rel <= gap_tol.value_or(tol))
+                                  ? pass("primal-dual gap", ev.gap_rel, gap_tol.value_or(tol))
+                                  : fail("primal-dual gap", ev.gap_rel, gap_tol.value_or(tol));
                 } else if (sol.status == sor::core::Status::Optimal &&
                            !has_integer && qp) {
                     bool convexity_proved = !lp.maximize;

@@ -1263,7 +1263,8 @@ def is_certified_success(r: Result) -> bool:
     # Incumbent and primal-point checks, including QP, do not replay an
     # optimality proof. Admit only scopes that independently check it.
     return (r.proof in _SOR_PROOFS and r.checker_verified is True and
-            r.checker_validation_scope in ("lp_optimality_f64", "qp_kkt_f64"))
+            r.checker_validation_scope in ("lp_optimality_f64", "lp_kkt_f64",
+                                           "qp_kkt_f64"))
 
 
 def parse_solu_file(path: Path) -> dict[str, tuple[str, float | None]]:
