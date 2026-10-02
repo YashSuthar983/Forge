@@ -222,8 +222,15 @@ bool BasisFactor::factorize(Index m,
         u_len_.push_back(static_cast<Index>(e.pr_cols.size()));
         u_alloc_nnz_ += static_cast<Offset>(e.pr_cols.size());
 
-        // Eliminate column c from every other live row that holds it.
-        const std::vector<Index> targets = e.col_rows[sz(c)];
+        // Eliminate column c from every other live row that holds it. The
+        // column's list is taken rather than copied: it is cleared when the
+        // column retires below, and the loop only appends to other columns'
+        // lists (the pivot row has no entry in column c).
+        std::vector<Index> targets;
+        targets.swap(e.col_rows[sz(c)]);
+        const std::size_t np = e.pr_cols.size();
+        const Index* pc = e.pr_cols.data();
+        const f64* pv = e.pr_vals.data();
         for (const Index i : targets) {
             if (i == r || !e.row_live[sz(i)]) continue;
             const f64* aic = e.find(i, c);
@@ -236,30 +243,40 @@ bool BasisFactor::factorize(Index m,
 
             // row_i <- (row_i minus column c) - mult * pivot_row
             // Merge of two ascending lists, so the result stays sorted and the
-            // fills and exact cancellations are both visible as we go.
-            e.tmp_cols.clear(); e.tmp_vals.clear();
-            const auto& ric = e.row_cols[sz(i)];
-            const auto& riv = e.row_vals[sz(i)];
-            std::size_t a = 0, b = 0;
-            while (a < ric.size() || b < e.pr_cols.size()) {
-                if (a < ric.size() && ric[a] == c) { ++a; continue; }
-                const Index ja = (a < ric.size()) ? ric[a] : kBigIndex;
-                const Index jb = (b < e.pr_cols.size()) ? e.pr_cols[b] : kBigIndex;
+            // fills and exact cancellations are both visible as we go. Column
+            // c sits at a known position of row i; the merge runs over the
+            // entries before and after it.
+            auto& ric = e.row_cols[sz(i)];
+            auto& riv = e.row_vals[sz(i)];
+            const std::size_t na = ric.size();
+            const auto skip = static_cast<std::size_t>(aic - riv.data());
+            e.tmp_cols.resize(na - 1 + np);
+            e.tmp_vals.resize(na - 1 + np);
+            Index* oc = e.tmp_cols.data();
+            f64* ov = e.tmp_vals.data();
+            std::size_t w = 0, a = 0, b = 0;
+            const Index* rcp = ric.data();
+            const f64* rvp = riv.data();
+            for (;;) {
+                if (a == skip) ++a;
+                if (a >= na) break;
+                if (b >= np) break;
+                const Index ja = rcp[a], jb = pc[b];
                 if (ja < jb) {
-                    e.tmp_cols.push_back(ja); e.tmp_vals.push_back(riv[a]); ++a;
+                    oc[w] = ja; ov[w] = rvp[a]; ++w; ++a;
                 } else if (jb < ja) {
-                    const f64 v = -mult * e.pr_vals[b];
+                    const f64 v = -mult * pv[b];
                     if (v != 0.0) {                      // fill-in
-                        e.tmp_cols.push_back(jb); e.tmp_vals.push_back(v);
+                        oc[w] = jb; ov[w] = v; ++w;
                         ++e.col_cnt[sz(jb)];
                         e.col_rows[sz(jb)].push_back(i);
                         e.note_col(jb);
                     }
                     ++b;
                 } else {
-                    const f64 v = riv[a] - mult * e.pr_vals[b];
+                    const f64 v = rvp[a] - mult * pv[b];
                     if (v != 0.0) {
-                        e.tmp_cols.push_back(ja); e.tmp_vals.push_back(v);
+                        oc[w] = ja; ov[w] = v; ++w;
                     } else {                             // exact cancellation
                         --e.col_cnt[sz(ja)];
                         e.note_col(ja);
@@ -267,9 +284,24 @@ bool BasisFactor::factorize(Index m,
                     ++a; ++b;
                 }
             }
+            for (; a < na; ++a) {
+                if (a == skip) continue;
+                oc[w] = rcp[a]; ov[w] = rvp[a]; ++w;
+            }
+            for (; b < np; ++b) {
+                const f64 v = -mult * pv[b];
+                if (v != 0.0) {                          // fill-in
+                    oc[w] = pc[b]; ov[w] = v; ++w;
+                    ++e.col_cnt[sz(pc[b])];
+                    e.col_rows[sz(pc[b])].push_back(i);
+                    e.note_col(pc[b]);
+                }
+            }
+            e.tmp_cols.resize(w);
+            e.tmp_vals.resize(w);
             --e.col_cnt[sz(c)];   // row i no longer holds the pivot column
-            e.row_cols[sz(i)].swap(e.tmp_cols);
-            e.row_vals[sz(i)].swap(e.tmp_vals);
+            ric.swap(e.tmp_cols);
+            riv.swap(e.tmp_vals);
             e.note_row(i);
         }
         l_start_.push_back(static_cast<Offset>(l_idx_.size()));
