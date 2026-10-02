@@ -13,11 +13,20 @@ namespace sor::presolve::detail {
 void LiveMatrix::record_column_dual_state(DualRecoveryStep& step, Index row,
                                           Index col) {
     SOR_FN();
+    // Stage cost AND stage coefficients. Live substitutions (doubleton
+    // equalities) rewrite other rows, so after one the original matrix no
+    // longer describes this column: its recovery equation
+    //   y_row = (c_col - sum_r a_r,col y_r) / a_row,col
+    // holds for the rows and coefficients of the current stage (pilot.we:
+    // original coefficients left column 12 with reduced cost 153.6 after
+    // the lift, and the presolved solve was redone without presolve).
     step.stage_cost = cost[sz(col)];
-    for (const auto& [other_row, coefficient] : original_column_entries[sz(col)]) {
+    for (const Index other_row : col_rows[sz(col)]) {
         if (other_row == row || !row_active[sz(other_row)]) continue;
+        const auto it = rows[sz(other_row)].find(col);
+        if (it == rows[sz(other_row)].end() || it->second == 0.0) continue;
         step.other_rows.push_back(other_row);
-        step.other_row_coefficients.push_back(coefficient);
+        step.other_row_coefficients.push_back(it->second);
     }
 }
 
@@ -437,6 +446,14 @@ bool LiveMatrix::try_doubleton_equality(Index i) {
     // non-eliminated term.  Duplicating it in other_cols makes postsolve
     // subtract that term twice and reconstruct the wrong primal value.
 
+    // The column's dual state before the substitution rewrites its rows.
+    DualRecoveryStep step;
+    step.kind = DualRecoveryKind::DoubletonEquality;
+    step.row = i;
+    step.col = elim;
+    step.coeff = a_elim;
+    record_column_dual_state(step, i, elim);
+
     const f64 elim_cost = cost[sz(elim)];
     *obj_offset += elim_cost * rhs / a_elim;
     for (const auto& [h, b] : entries) {
@@ -452,12 +469,20 @@ bool LiveMatrix::try_doubleton_equality(Index i) {
         rows[sz(row)].erase(elim);
         for (const auto& [h, b] : entries) {
             if (h == elim) continue;
-            const f64 value = rows[sz(row)][h] - mult * b;
+            // Look up before writing: operator[] inserts, so testing for a
+            // new entry afterwards never saw the fill, and the column
+            // incidence missed it (pilot.we: a later aggregation of column
+            // 12 rewrote 3 of the 12 rows that held it, leaving the column
+            // in the others after its elimination).
+            const auto present = rows[sz(row)].find(h);
+            const bool was_new = present == rows[sz(row)].end();
+            const f64 value = (was_new ? 0.0 : present->second) - mult * b;
             if (value == 0.0) {
-                if (rows[sz(row)].find(h) != rows[sz(row)].end())
+                if (!was_new) {
                     rows[sz(row)].erase(h);
+                    col_rows[sz(h)].erase(row);
+                }
             } else {
-                const bool was_new = rows[sz(row)].find(h) == rows[sz(row)].end();
                 rows[sz(row)][h] = value;
                 if (was_new) col_rows[sz(h)].insert(row);
             }
@@ -479,13 +504,7 @@ bool LiveMatrix::try_doubleton_equality(Index i) {
 
     const Index record = static_cast<Index>(out->doubleton_equalities.size());
     out->doubleton_equalities.push_back(std::move(rec));
-    DualRecoveryStep step;
-    step.kind = DualRecoveryKind::DoubletonEquality;
-    step.row = i;
-    step.col = elim;
-    step.coeff = a_elim;
     step.record = record;
-    record_column_dual_state(step, i, elim);
     out->recovery_steps.push_back(std::move(step));
     ++out->stats.rows_removed;
     ++out->stats.doubleton_substitutions;
@@ -606,6 +625,10 @@ bool LiveMatrix::try_duplicate_rows() {
                  model::Rational(implied_lo) * model::Rational(scale) != model::Rational(source_lo))) ||
                 (std::isfinite(source_hi) && (!std::isfinite(implied_hi) ||
                  model::Rational(implied_hi) * model::Rational(scale) != model::Rational(source_hi)))) continue;
+            // Recovery needs to know which row supplied each merged side:
+            // keep's bounds before the merge, and the removed row's bounds in
+            // keep's scale.
+            const f64 keep_lo = row_lo[sz(keep)], keep_hi = row_hi[sz(keep)];
             row_lo[sz(keep)] = std::max(row_lo[sz(keep)], implied_lo);
             row_hi[sz(keep)] = std::min(row_hi[sz(keep)], implied_hi);
             for (const auto& [j, a] : rows[sz(rem)]) {
@@ -619,6 +642,8 @@ bool LiveMatrix::try_duplicate_rows() {
             step.row = rem;
             step.record = keep;
             step.coeff = scale;
+            step.old_lo = keep_lo; step.old_hi = keep_hi;
+            step.new_lo = implied_lo; step.new_hi = implied_hi;
             out->recovery_steps.push_back(std::move(step));
             ++out->stats.rows_removed;
             ++out->stats.duplicate_rows_merged;
