@@ -129,8 +129,25 @@ void lift_row_duals(const model::LpProblem& original,
         }
 
         if (step.kind == DualRecoveryKind::ParallelRowMerge) {
-            // Removed row was redundant given the kept parallel row; multiplier
-            // stays at the zero filled in by row_new_to_orig mapping.
+            // The removed row is s times the kept one, so only y_keep +
+            // s y_rem is determined: the kept row's multiplier y'. It belongs
+            // to whichever row supplied the active merged side. When that is
+            // the removed row, y' moves to it as y'/s (the sign is right for
+            // either sign of s: s < 0 swaps its sides) and the kept row,
+            // strictly inside its own bounds there, gets zero.
+            const Index keep = step.record;
+            const f64 scale = step.coeff;
+            if (keep < 0 || keep >= original.n_rows() || scale == 0.0 ||
+                !std::isfinite(scale))
+                continue;
+            const f64 y_keep = ycanon[sz(keep)];
+            const bool from_removed =
+                (y_keep > 0.0 && step.new_lo > step.old_lo) ||
+                (y_keep < 0.0 && step.new_hi < step.old_hi);
+            if (from_removed) {
+                add_row_multiplier(keep, -y_keep);
+                add_row_multiplier(step.row, y_keep / scale);
+            }
             continue;
         }
 
@@ -334,6 +351,30 @@ PostsolveBasis lift_basis(const model::LpProblem& original,
         outb.status[sz(ns + step.row)] = PostsolveNonbasicStatus::AtLower;
         outb.basic[sz(step.row)] = step.col;
         outb.status[sz(step.col)] = PostsolveNonbasicStatus::Basic;
+    }
+    // Parallel rows: a removed row's logical is basic by default, which is
+    // right while the kept row's own bound is the active merged side. When
+    // the removed row supplied it, that row is the tight one: its logical is
+    // nonbasic at the matching side (opposite for a negative scale) and the
+    // kept row's logical, strictly inside its own bounds, takes the slot.
+    // Latest merge first, as in the dual recovery.
+    for (auto it = pmap.recovery_steps.rbegin(); it != pmap.recovery_steps.rend(); ++it) {
+        const auto& step = *it;
+        if (step.kind != DualRecoveryKind::ParallelRowMerge) continue;
+        const Index keep = step.record, rem = step.row;
+        if (keep < 0 || keep >= m || rem < 0 || rem >= m || step.coeff == 0.0 ||
+            pmap.row_orig_to_new[sz(keep)] < 0 || outb.basic[sz(rem)] != ns + rem)
+            continue;
+        const auto keep_status = outb.status[sz(ns + keep)];
+        const bool at_lower = keep_status == PostsolveNonbasicStatus::AtLower;
+        const bool at_upper = keep_status == PostsolveNonbasicStatus::AtUpper;
+        const bool from_removed = (at_lower && step.new_lo > step.old_lo) ||
+                                  (at_upper && step.new_hi < step.old_hi);
+        if (!from_removed) continue;
+        outb.basic[sz(rem)] = ns + keep;
+        outb.status[sz(ns + keep)] = PostsolveNonbasicStatus::Basic;
+        outb.status[sz(ns + rem)] = (at_lower == (step.coeff > 0.0))
+            ? PostsolveNonbasicStatus::AtLower : PostsolveNonbasicStatus::AtUpper;
     }
     // A singleton row a*x_j in [lo, hi] was replaced by a tighter bound on
     // x_j (and normally removed). When the reduced solution leaves x_j nonbasic at
