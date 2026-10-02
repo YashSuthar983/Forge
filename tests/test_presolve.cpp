@@ -1071,6 +1071,79 @@ int main() {
             CHECK_NEAR(rec.raw.x[0] + rec.raw.x[1], 3.0, 1e-9);
         }
 
+        // Parallel rows: the multiplier and the tight logical belong to the
+        // row that supplied the active merged side.
+        //
+        //   min -x0 - x1   s.t.  R0:  x0 + x1 <= 4   (kept)
+        //                        R1: s(x0 + x1) in R1's sides (merged)
+        //   x in [0, 10]
+        //
+        // With R1 = 2x0 + 2x1 <= 6 (or -2x0 - 2x1 >= -6) the merged row is
+        // x0 + x1 <= 3 and its reduced multiplier is -1. R0 is then slack at
+        // the optimum, so the lift must give y_R0 = 0 and y_R1 = -1/s, with
+        // R1's logical nonbasic and R0's basic. Keeping y' on R0 (the old
+        // lift) leaves a multiplier of 1 on a slack row. When R0's own bound
+        // is the tighter one, nothing moves.
+        {
+            using sor::presolve::PostsolveNonbasicStatus;
+            using sor::presolve::PresolveRecoveryOptions;
+            struct Case { f64 a1; f64 lo1; f64 hi1; f64 merged_hi; f64 y0; f64 y1;
+                          PostsolveNonbasicStatus s0, s1; };
+            const f64 inf = sor::model::kInf;
+            const Case cases[] = {
+                {2.0, -inf, 6.0, 3.0, 0.0, -0.5,
+                 PostsolveNonbasicStatus::Basic, PostsolveNonbasicStatus::AtUpper},
+                {-2.0, -6.0, inf, 3.0, 0.0, 0.5,
+                 PostsolveNonbasicStatus::Basic, PostsolveNonbasicStatus::AtLower},
+                {2.0, -inf, 10.0, 4.0, -1.0, 0.0,
+                 PostsolveNonbasicStatus::AtUpper, PostsolveNonbasicStatus::Basic},
+            };
+            for (const auto& cs : cases) {
+                PresolveOptions par = v2;
+                par.parallel_rows = true;
+                LpProblem p;
+                p.A = sor::sparse::from_triplets(
+                    2, 2, {0, 0, 1, 1}, {0, 1, 0, 1}, {1.0, 1.0, cs.a1, cs.a1});
+                p.c = {-1.0, -1.0};
+                p.row_lo = {-inf, cs.lo1};
+                p.row_hi = {4.0, cs.hi1};
+                p.col_lo = {0.0, 0.0};
+                p.col_hi = {10.0, 10.0};
+                const auto out = sor::presolve::presolve(p, par);
+                CHECK(out.stats().duplicate_rows_merged == 1);
+                CHECK(out.map.problem.n_rows() == 1);
+                CHECK(out.map.problem.n_cols() == 2);
+                if (out.map.problem.n_rows() != 1 || out.map.problem.n_cols() != 2) continue;
+                CHECK(out.map.problem.row_hi[0] == cs.merged_hi);
+                PresolveReducedSolve rs;
+                rs.x = {cs.merged_hi, 0.0};
+                rs.y = {-1.0};
+                rs.has_basis = true;
+                rs.basis.n_struct = 2;
+                rs.basis.basic = {0};
+                rs.basis.status = {PostsolveNonbasicStatus::Basic,
+                                   PostsolveNonbasicStatus::AtLower,
+                                   PostsolveNonbasicStatus::AtUpper};
+                PresolveRecoveryOptions ropts;
+                ropts.gap_tol = 1e-9;
+                const auto rec = recover_solution(p, out.map, rs, ropts);
+                CHECK(rec.validated);
+                CHECK(rec.evidence.max_dual_violation <= 1e-12);
+                CHECK(rec.raw.y.size() == 2);
+                if (rec.raw.y.size() == 2) {
+                    CHECK_NEAR(rec.raw.y[0], cs.y0, 1e-12);
+                    CHECK_NEAR(rec.raw.y[1], cs.y1, 1e-12);
+                }
+                CHECK(rec.basis.status.size() == 4);
+                if (rec.basis.status.size() == 4) {
+                    CHECK(rec.basis.status[0] == PostsolveNonbasicStatus::Basic);
+                    CHECK(rec.basis.status[2] == cs.s0);
+                    CHECK(rec.basis.status[3] == cs.s1);
+                    CHECK(rec.basis.basic[0] == 0);
+                }
+            }
+        }
+
         // Parallel columns: proportional costs required; full solve + lift.
         {
             PresolveOptions par = v2;
