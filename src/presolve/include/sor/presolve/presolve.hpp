@@ -238,6 +238,10 @@ struct PresolveRecoveryOptions {
     f64 primal_feas_tol = 1e-7;
     f64 dual_feas_tol = 1e-7;
     f64 gap_tol = 1e-9;
+    // Check the lifted point on the original model (evidence, validated).
+    // A caller that re-evaluates the lifted point itself and never reads
+    // the verdict clears it (the simplex route without the exact proof).
+    bool check_point = true;
 };
 
 struct PresolveRecoveryResult {

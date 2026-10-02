@@ -3341,6 +3341,10 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         // exact solve the size policy then rejected, before refinement
         // certified the same lift in 0.45 s.
         if (!problem.maximize) ropts.certificate_time_limit_s = -1;
+        // Without the exact proof the recovery verdict is never read
+        // (presolved_proved below does not require it) and
+        // rematerialize_original re-evaluates the lifted point anyway.
+        ropts.check_point = opts.exact_proof;
         const auto recovered =
             presolve::recover_solution(problem, pmap, rs, ropts);
         raw.x = recovered.raw.x;
