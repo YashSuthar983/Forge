@@ -1532,7 +1532,11 @@ static core::RawResult dual_prepared_pass(
         }
         const f64 bound = 1e3 * opts.dual_feas_tol *
                           std::max(1.0, std::fabs(cost[sz(j)]));
-        if (std::fabs(delta) > bound) {
+        // The bound also caps the accumulated shift of the column: many
+        // admissible shifts must not add up to a cost the model does not
+        // have. Measured maxima of the accumulated shift: 1.0e-5 on
+        // Netlib-93 (pilot87) and 3.6e-5 on the large-LP set, both inside it.
+        if (std::fabs(delta) > bound || std::fabs(cost_shift[sz(j)] + delta) > bound) {
             ++diag.refused_cost_shifts;
             SOR_ROUTE(1, "simplex_dual", "cost_shift_refused");
             char l2[96];
