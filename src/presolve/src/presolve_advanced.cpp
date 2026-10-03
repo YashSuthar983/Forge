@@ -105,6 +105,8 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
             std::vector<std::pair<Index, std::uint64_t>> entries;   // ascending columns
             std::uint64_t inverse_lead = 0;                           // 1 / entries.front()
             std::vector<Index> provenance;                           // original rows, sorted
+            // The row as a combination of original rows (mod P), when certifiable.
+            std::vector<std::pair<Index, std::uint64_t>> combination;
             bool certifiable = true;
         };
         std::vector<std::uint64_t> accumulator(sz(matrix.n), 0);
@@ -127,6 +129,79 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
         // an unsorted list deduplicated by stamp (sorted when it is read).
         std::vector<std::uint32_t> provenance_stamp(sz(matrix.m), 0);
         std::uint32_t stamp = 0;
+        // Combination of original rows the trial row has become (mod P).
+        std::vector<std::uint64_t> combination(sz(matrix.m), 0);
+        std::vector<std::uint32_t> combination_stamp(sz(matrix.m), 0);
+        std::vector<Index> combination_rows;
+        // Exact and cheap: the modular combination sum_r c_r row_r = 0 names
+        // rational weights c_r = n_r/d_r (rational reconstruction, |n|,|d| <
+        // 2^30). Scaled to integers below 2^53 they are binary64 numbers, so
+        // sum_r w_r a_rj = 0 for every column and the rhs is checked exactly
+        // with DyadicSum, in time linear in the rows. Such a sum is a proof of
+        // dependence; when reconstruction or the check fails, the rational
+        // elimination below decides (huahum: 24700 dependent rows, 6 s of
+        // rational elimination before).
+        const auto reconstruct = [&](std::uint64_t c, std::int64_t& num, std::int64_t& den) {
+            constexpr std::int64_t bound = std::int64_t{1} << 30;
+            std::int64_t r0 = static_cast<std::int64_t>(P), r1 = static_cast<std::int64_t>(c);
+            std::int64_t t0 = 0, t1 = 1;
+            while (r1 >= bound) {
+                const std::int64_t q = r0 / r1;
+                std::int64_t r2 = r0 - q * r1; r0 = r1; r1 = r2;
+                const __int128 t2 = static_cast<__int128>(t0) - static_cast<__int128>(q) * t1;
+                if (t2 > (static_cast<__int128>(1) << 62) || t2 < -(static_cast<__int128>(1) << 62)) return false;
+                t0 = t1; t1 = static_cast<std::int64_t>(t2);
+            }
+            if (t1 == 0 || t1 >= bound || t1 <= -bound) return false;
+            num = t1 < 0 ? -r1 : r1;
+            den = t1 < 0 ? -t1 : t1;
+            // num == c * den (mod P)
+            const std::uint64_t lhs = num < 0 ? P - static_cast<std::uint64_t>(-num) % P
+                                              : static_cast<std::uint64_t>(num) % P;
+            return lhs % P == mod_mul(c, static_cast<std::uint64_t>(den));
+        };
+        const auto combination_proves_dependent = [&]() {
+            std::vector<std::pair<Index, std::int64_t>> weights;   // row, n_r
+            std::vector<std::int64_t> dens;
+            std::int64_t common = 1;
+            for (const Index r : combination_rows) {
+                const std::uint64_t c = combination[sz(r)];
+                if (c == 0) continue;
+                std::int64_t num = 0, den = 1;
+                if (!reconstruct(c, num, den)) return false;
+                const std::int64_t g = std::gcd(common, den);
+                const __int128 l = static_cast<__int128>(common / g) * den;
+                if (l >= (static_cast<__int128>(1) << 52)) return false;
+                common = static_cast<std::int64_t>(l);
+                weights.emplace_back(r, num);
+                dens.push_back(den);
+            }
+            model::DyadicSum rhs;
+            std::vector<std::pair<Index, std::pair<f64, f64>>> products;
+            for (std::size_t q = 0; q < weights.size(); ++q) {
+                const __int128 w = static_cast<__int128>(weights[q].second) * (common / dens[q]);
+                if (w >= (static_cast<__int128>(1) << 53) || w <= -(static_cast<__int128>(1) << 53)) return false;
+                const f64 wd = static_cast<f64>(static_cast<std::int64_t>(w));
+                const Index r = weights[q].first;
+                if (!row_live[sz(r)] || matrix.row_lo[sz(r)] != matrix.row_hi[sz(r)] ||
+                    !std::isfinite(matrix.row_lo[sz(r)])) return false;
+                rhs.add_product(wd, matrix.row_lo[sz(r)]);
+                for (const auto& [j, a] : matrix.rows[sz(r)])
+                    if (a != 0) products.push_back({j, {wd, a}});
+            }
+            if (rhs.sign() != 0) return false;
+            std::sort(products.begin(), products.end(),
+                      [](const auto& x, const auto& y) { return x.first < y.first; });
+            for (std::size_t q = 0; q < products.size();) {
+                model::DyadicSum column;
+                std::size_t e = q;
+                for (; e < products.size() && products[e].first == products[q].first; ++e)
+                    column.add_product(products[e].second.first, products[e].second.second);
+                if (column.sign() != 0) return false;
+                q = e;
+            }
+            return true;
+        };
         // Exact: is row i a rational combination of rows `support`, rhs included?
         const auto exactly_dependent = [&](Index i, const std::vector<Index>& support) {
             struct Equation { std::map<Index, Rational> entries; Rational rhs; };
@@ -199,6 +274,10 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
             for (const auto& [j, a] : matrix.rows[sz(i)]) set_entry(j, to_mod(a));
             std::vector<Index> provenance;
             ++stamp;
+            for (const Index r : combination_rows) combination[sz(r)] = 0;
+            combination_rows.assign(1, i);
+            combination[sz(i)] = 1;
+            combination_stamp[sz(i)] = stamp;
             bool certifiable = true, filled = false;
             const std::size_t fill_cap = matrix.rows[sz(i)].size() +
                 static_cast<std::size_t>(std::max<Offset>(0, options.max_substitution_fill));
@@ -214,6 +293,13 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
                 }
                 certifiable = certifiable && row.certifiable;
                 if (certifiable) {
+                    for (const auto& [r, c] : row.combination) {
+                        if (combination_stamp[sz(r)] != stamp) {
+                            combination_stamp[sz(r)] = stamp;
+                            combination_rows.push_back(r);
+                        }
+                        combination[sz(r)] = mod_add(combination[sz(r)], P - mod_mul(multiplier, c));
+                    }
                     for (const Index r : row.provenance)
                         if (provenance_stamp[sz(r)] != stamp) {
                             provenance_stamp[sz(r)] = stamp;
@@ -227,7 +313,9 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
             std::sort(provenance.begin(), provenance.end());
             if (live_entries == 0) {
                 // Candidate: verify exactly over the rows the reduction used.
-                if (!certifiable || !exactly_dependent(i, provenance)) continue;
+                if (!certifiable ||
+                    (!combination_proves_dependent() && !exactly_dependent(i, provenance)))
+                    continue;
                 for (const auto& [j,a] : matrix.rows[sz(i)]) { (void)a; matrix.col_rows[sz(j)].erase(i); }
                 matrix.rows[sz(i)].clear(); row_live[sz(i)] = 0;
                 ++map.stats.rows_removed; ++map.stats.linear_dependencies_removed;
@@ -240,6 +328,8 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
                 if (certifiable) {
                     provenance.insert(std::upper_bound(provenance.begin(), provenance.end(), i), i);
                     row.provenance = std::move(provenance);
+                    for (const Index r : combination_rows)
+                        if (combination[sz(r)] != 0) row.combination.emplace_back(r, combination[sz(r)]);
                 }
                 echelon.emplace(row.entries.front().first, std::move(row));
             }
@@ -275,7 +365,12 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
                         auto o = old.begin();
                         for (const auto& [j, a] : equation) {
                             (void)a;
-                            while (o != old.end() && o->first < j) ++o;
+                            // Search a much longer target, walk a comparable one.
+                            o = old.size() > 8 * equation.size()
+                                ? std::lower_bound(o, old.end(), j,
+                                      [](const auto& entry, Index k) { return entry.first < k; })
+                                : std::find_if(o, old.end(),
+                                      [j](const auto& entry) { return entry.first >= j; });
                             if (o != old.end() && o->first == j) ++shared;
                         }
                         if (shared <= equation.size() - shared) continue;
