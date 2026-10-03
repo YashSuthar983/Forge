@@ -1509,8 +1509,13 @@ void test_presolve_cross_kind_recovery_and_lifted_basis_statuses() {
     // R0 forces upper-bound x=2,y=3. R1 then becomes empty, R2 fixes the
     // interior z=4 through a singleton equality, and R3 tightens w<=3 before
     // negative cost fixes it at that implied upper bound. Reverse dual recovery
-    // must produce [+1,0,+1,-1]. In the lifted basis, forced x is nonbasic at
-    // upper while interior equality-fixed z is basic in R2.
+    // must produce [+1,0,+1,-1]. The lifted basis is the vertex those duals
+    // price: R0's multiplier is nonzero, so R0 is tight (nonbasic at its
+    // lower side) and x, whose reduced cost fixes it (d_x = 0), is basic at
+    // its forced upper bound; interior equality-fixed z is basic in R2; R3's
+    // multiplier is nonzero, so R3 is tight at its upper side and w, at a
+    // bound only R3 implies, is basic. Basic {x, s1, z, w} gives exactly
+    // y = [+1,0,+1,-1].
     sor::model::LpProblem lp;
     lp.name = "FORCE_CASCADE";
     lp.A = sor::sparse::from_triplets(
@@ -1552,10 +1557,15 @@ void test_presolve_cross_kind_recovery_and_lifted_basis_statuses() {
     CHECK(run.basis.n_struct == 4);
     CHECK(run.basis.basic.size() == 4);
     CHECK(run.basis.status.size() == 8);
-    CHECK(run.basis.status[0] == NonbasicStatus::AtUpper);
+    CHECK(run.basis.basic[0] == 0);
+    CHECK(run.basis.status[0] == NonbasicStatus::Basic);
+    CHECK(run.basis.status[1] == NonbasicStatus::AtUpper);
     CHECK(run.basis.basic[2] == 2);
     CHECK(run.basis.status[2] == NonbasicStatus::Basic);
+    CHECK(run.basis.status[3] == NonbasicStatus::Basic);
+    CHECK(run.basis.status[4] == NonbasicStatus::AtLower);
     CHECK(run.basis.status[6] == NonbasicStatus::AtLower);
+    CHECK(run.basis.status[7] == NonbasicStatus::AtUpper);
 }
 
 void test_presolve_equality_aggregation_chain_lifts_proof_and_basis() {
