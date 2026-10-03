@@ -213,8 +213,22 @@ bool LiveMatrix::fix_column(Index j, f64 value, DualRecoveryKind kind, Index row
     col_lo[sz(j)] = value;
     col_hi[sz(j)] = value;
     ++out->stats.cols_fixed;
-    for (const Index i : col_rows[sz(j)])
-        if (row_active[sz(i)]) queue_row(i);
+    // Move the fixed contribution into the row sides and drop the entry, as
+    // build() does for columns fixed before the live passes. The final
+    // reduced matrix skips inactive columns, so a fixed entry left in a row
+    // lost its contribution a*value (seed 2992 of the lift test: a column
+    // fixed at 5 by a bound transfer left its row asking for 7.5 more).
+    for (const Index i : col_rows[sz(j)]) {
+        if (!row_active[sz(i)]) continue;
+        const auto entry = rows[sz(i)].find(j);
+        if (entry != rows[sz(i)].end()) {
+            const f64 shift = entry->second * value;
+            row_lo[sz(i)] -= shift;
+            row_hi[sz(i)] -= shift;
+            rows[sz(i)].erase(j);
+        }
+        queue_row(i);
+    }
     col_rows[sz(j)].clear();
 
     if (kind == DualRecoveryKind::DualFix ||
@@ -408,18 +422,34 @@ bool LiveMatrix::try_doubleton_equality(Index i) {
     const f64 tol = std::max(1e-12 * scale, options.feasibility_tol * (1.0 + scale));
     if (implied_lo > implied_hi + tol) return false;
 
-    // Doubleton substitution drops elim's bounds. Only safe when:
+    // Doubleton substitution drops elim's bounds. Safe when:
     //   * elim is free (both bounds infinite), or
-    //   * elim is boxed and those bounds are redundant over keep's range.
+    //   * elim is boxed and those bounds are redundant over keep's range, or
+    //   * elim is boxed and its bounds move onto keep: a_e x_e + a_k x_k = b
+    //     with x_e in [l_e, u_e] is x_k in [(b - a_e l_e)/a_k, (b - a_e u_e)/a_k]
+    //     (ordered), rounded outward so no feasible point is lost.
     // Semi-bounded columns (one infinite bound) are the Andersen "implied
     // slack" case and must not be removed here - that path is opt-in via
     // implied_slack on the singleton-column rule.
     const bool elim_free = !std::isfinite(clo) && !std::isfinite(chi);
     const bool elim_boxed = std::isfinite(clo) && std::isfinite(chi);
     if (!elim_free && !elim_boxed) return false;
-    if (elim_boxed &&
-        (implied_lo < clo - tol || implied_hi > chi + tol))
-        return false;
+    const bool transfer = elim_boxed &&
+        (implied_lo < clo - tol || implied_hi > chi + tol);
+    f64 keep_new_lo = col_lo[sz(keep)], keep_new_hi = col_hi[sz(keep)];
+    if (transfer) {
+        const auto keep_at = [&](f64 elim_value, bool down) {
+            model::DyadicSum v;
+            v.add(rhs);
+            v.add_product(-a_elim, elim_value);
+            return down ? v.quotient_down(a_keep) : v.quotient_up(a_keep);
+        };
+        const f64 k_lo = std::min(keep_at(clo, true), keep_at(chi, true));
+        const f64 k_hi = std::max(keep_at(clo, false), keep_at(chi, false));
+        keep_new_lo = std::max(keep_new_lo, k_lo);
+        keep_new_hi = std::min(keep_new_hi, k_hi);
+        if (!(keep_new_lo <= keep_new_hi)) return false;   // left to the solver
+    }
 
     Offset fill = 0;
     std::vector<Index> affected(col_rows[sz(elim)].begin(),
@@ -453,6 +483,23 @@ bool LiveMatrix::try_doubleton_equality(Index i) {
     step.col = elim;
     step.coeff = a_elim;
     record_column_dual_state(step, i, elim);
+    if (transfer) {
+        // keep's own dual state at this stage, for a lift where keep ends at
+        // a transferred bound (then keep is basic and elim at its bound).
+        DualRecoveryStep keep_state;
+        record_column_dual_state(keep_state, i, keep);
+        rec.transferred = true;
+        rec.keep_lo_before = col_lo[sz(keep)];
+        rec.keep_hi_before = col_hi[sz(keep)];
+        rec.keep_lo_after = keep_new_lo;
+        rec.keep_hi_after = keep_new_hi;
+        rec.keep_stage_cost = keep_state.stage_cost;
+        rec.keep_rows = std::move(keep_state.other_rows);
+        rec.keep_row_coeffs = std::move(keep_state.other_row_coefficients);
+        col_lo[sz(keep)] = keep_new_lo;
+        col_hi[sz(keep)] = keep_new_hi;
+        ++out->stats.bounds_tightened;
+    }
 
     const f64 elim_cost = cost[sz(elim)];
     *obj_offset += elim_cost * rhs / a_elim;
@@ -509,6 +556,71 @@ bool LiveMatrix::try_doubleton_equality(Index i) {
     ++out->stats.rows_removed;
     ++out->stats.doubleton_substitutions;
     queue_col(keep);
+    return true;
+}
+
+// A column x_j that appears in one inequality row besides the objective,
+// with a cost that pushes it toward one side S of that row, makes the row
+// tight at every optimum whenever x_j reaches S no later than its own bound
+// in that direction: from any feasible point, moving x_j toward S changes no
+// other row and strictly improves the objective until the row is at S. The
+// row is then the equation a_j x_j + a_k x_k = S, and when it is a doubleton
+// with x_j the column the substitution eliminates, it is substituted at once
+// (bound transfer included). Only then: x_j leaves the model basic, so a tie
+// at x_j's own bound cannot leave the equation with a multiplier of the
+// wrong sign for the inequality. If the substitution declines, the row is
+// restored. (HiGHS removes 53,130 such rows on thor50dday.)
+bool LiveMatrix::try_cost_tight_doubleton(Index j) {
+    SOR_FN();
+    if (!col_active[sz(j)]) return false;
+    if (!in->is_integer.empty() && in->is_integer[sz(j)]) return false;
+    Index i = -1;
+    int count = 0;
+    for (const Index r : col_rows[sz(j)]) {
+        if (!row_active[sz(r)] || rows[sz(r)].find(j) == rows[sz(r)].end()) continue;
+        i = r;
+        ++count;
+    }
+    if (count != 1 || row_lo[sz(i)] == row_hi[sz(i)] || rows[sz(i)].size() != 2) return false;
+    Index k = -1;
+    f64 a = 0.0, a_k = 0.0;
+    for (const auto& [h, v] : rows[sz(i)]) {
+        if (h == j) a = v; else { k = h; a_k = v; }
+    }
+    if (k < 0 || a == 0.0 || a_k == 0.0 || !col_active[sz(k)]) return false;
+    // try_doubleton_equality eliminates the larger |a|, the first column on a tie.
+    if (std::fabs(a) < std::fabs(a_k) || (std::fabs(a) == std::fabs(a_k) && k < j)) return false;
+    const f64 c = in->maximize ? -cost[sz(j)] : cost[sz(j)];
+    if (c == 0.0 || !std::isfinite(c)) return false;
+    const bool decrease = c > 0.0;
+    const bool use_lo = decrease == (a > 0.0);
+    const f64 side = use_lo ? row_lo[sz(i)] : row_hi[sz(i)];
+    if (!std::isfinite(side)) return false;
+    const f64 own = decrease ? col_lo[sz(j)] : col_hi[sz(j)];
+    if (std::isfinite(own)) {
+        // use_lo: side - max(a_k x_k) - a own >= 0; else a own - side + min(a_k x_k) >= 0.
+        const f64 kb = (use_lo == (a_k > 0.0)) ? col_hi[sz(k)] : col_lo[sz(k)];
+        if (!std::isfinite(kb)) return false;
+        model::DyadicSum slack;
+        if (use_lo) { slack.add(side); slack.add_product(-a_k, kb); slack.add_product(-a, own); }
+        else        { slack.add_product(a, own); slack.add(-side); slack.add_product(a_k, kb); }
+        if (slack.sign() < 0) return false;
+    }
+    const f64 old_lo = row_lo[sz(i)], old_hi = row_hi[sz(i)];
+    row_lo[sz(i)] = row_hi[sz(i)] = side;
+    if (!try_doubleton_equality(i)) {
+        row_lo[sz(i)] = old_lo;
+        row_hi[sz(i)] = old_hi;
+        return false;
+    }
+    DualRecoveryStep step;
+    step.kind = DualRecoveryKind::RowSideFixed;
+    step.row = i;
+    step.col = j;
+    step.old_lo = old_lo;
+    step.old_hi = old_hi;
+    step.new_lo = side;
+    out->recovery_steps.push_back(std::move(step));
     return true;
 }
 
@@ -772,6 +884,7 @@ bool LiveMatrix::run_until_stable() {
                 continue;
             }
             apply_dual_fixing_col(j);
+            if (col_active[sz(j)]) try_cost_tight_doubleton(j);
         }
 
         if (*status != PresolveStatus::Reduced) break;

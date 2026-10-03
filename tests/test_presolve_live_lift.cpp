@@ -1,7 +1,9 @@
 // Live presolve rules against direct solves. Random small LPs built to
 // trigger doubleton equalities (including chains, where one substitution
 // fills a column into rows a later reduction rewrites) and parallel rows
-// (both orientations, either row supplying the tighter side). For every
+// (both orientations, either row supplying the tighter side), doubletons
+// whose eliminated column's bounds move to the kept column, and cost-tight
+// singleton columns that make their inequality an equation. For every
 // model with an optimum: presolve with the live rules, solve the reduced
 // model, lift, and require the lift to meet the primal and dual residual
 // tolerances on the ORIGINAL model with the direct optimum, and the lifted
@@ -80,13 +82,31 @@ LpProblem make_lp(std::uint32_t seed) {
         if (r.pick(2)) { lo.push_back(-inf); hi.push_back(side); }
         else           { lo.push_back(side); hi.push_back(inf); }
     }
+    // Cost-tight singletons: a new column x appearing only in one
+    // two-entry inequality with a larger coefficient than its partner
+    // (a capacity-style row, f - cap x <= 0 and its mirror images).
+    const int singles = r.pick(4);
+    for (int t = 0; t < singles; ++t) {
+        const Index x = static_cast<Index>(lp.c.size());
+        lp.c.push_back((r.pick(3) + 1) * (r.pick(2) ? 1.0 : -1.0));
+        lp.col_lo.push_back(0.0);
+        lp.col_hi.push_back(r.pick(2) ? 1.0 : 2.0);
+        const Index f = r.pick(n);
+        const double ax = (r.pick(2) ? 1.0 : -1.0) * (3 + r.pick(3));
+        const double af = vals[r.pick(6)];
+        rows.push_back({{f, af}, {x, ax}});
+        const double side = r.pick(5) - 2;
+        if (r.pick(2)) { lo.push_back(-inf); hi.push_back(side); }
+        else           { lo.push_back(side); hi.push_back(inf); }
+    }
+    const Index ncols = static_cast<Index>(lp.c.size());
     std::vector<Index> ri, ci;
     std::vector<double> v;
     for (Index i = 0; i < static_cast<Index>(rows.size()); ++i)
         for (const auto& [j, a] : rows[static_cast<std::size_t>(i)]) {
             ri.push_back(i); ci.push_back(j); v.push_back(a);
         }
-    lp.A = sor::sparse::from_triplets(static_cast<Index>(rows.size()), n, ri, ci, v);
+    lp.A = sor::sparse::from_triplets(static_cast<Index>(rows.size()), ncols, ri, ci, v);
     lp.row_lo = lo;
     lp.row_hi = hi;
     return lp;
@@ -97,6 +117,7 @@ LpProblem make_lp(std::uint32_t seed) {
 int main() {
     using sor::presolve::DualRecoveryKind;
     int optimal = 0, lifted_with_doubleton = 0, lifted_with_parallel = 0, chains = 0;
+    int lifted_with_transfer = 0, lifted_with_tight_row = 0;
     for (std::uint32_t seed = 1; seed <= 3000; ++seed) {
         const LpProblem lp = make_lp(seed);
         sor::engines::SimplexOptions direct;
@@ -117,11 +138,13 @@ int main() {
                                 __FILE__, __LINE__, "seed " + std::to_string(seed));
             continue;
         }
-        int doubletons = 0, parallels = 0;
+        int doubletons = 0, parallels = 0, tight_rows = 0, transfers = 0;
         for (const auto& step : out.map.recovery_steps) {
             doubletons += step.kind == DualRecoveryKind::DoubletonEquality;
             parallels += step.kind == DualRecoveryKind::ParallelRowMerge;
+            tight_rows += step.kind == DualRecoveryKind::RowSideFixed;
         }
+        for (const auto& rec : out.map.doubleton_equalities) transfers += rec.transferred;
         if (doubletons == 0 && parallels == 0) continue;
 
         sor::presolve::PresolveReducedSolve rs;
@@ -171,11 +194,17 @@ int main() {
                                 __FILE__, __LINE__, where);
         }
         lifted_with_doubleton += doubletons > 0;
+        lifted_with_transfer += transfers > 0;
+        lifted_with_tight_row += tight_rows > 0;
         lifted_with_parallel += parallels > 0;
         chains += doubletons > 1;
     }
     std::cout << "optimal " << optimal << ", lifts with doubletons " << lifted_with_doubleton
-              << " (chains " << chains << "), with parallel rows " << lifted_with_parallel << "\n";
+              << " (chains " << chains << ", bound transfers " << lifted_with_transfer
+              << ", cost-tight rows " << lifted_with_tight_row << "), with parallel rows "
+              << lifted_with_parallel << "\n";
+    CHECK(lifted_with_transfer >= 50);
+    CHECK(lifted_with_tight_row >= 50);
     CHECK(lifted_with_doubleton >= 100);
     CHECK(lifted_with_parallel >= 50);
     CHECK(chains >= 20);
