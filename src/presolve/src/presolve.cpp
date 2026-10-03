@@ -819,16 +819,27 @@ post_fixed_point:
             const auto old_size = mutable_rows[sz(row)].size();
             const f64 multiplier = mutable_rows[sz(row)].at(pivot_col) / pivot;
             if (!std::isfinite(multiplier)) { safe = false; break; }
-            SparseRow rewritten = mutable_rows[sz(row)];
-            rewritten.erase(pivot_col);
+            // row - multiplier * pivot row without pivot_col, as one merge
+            // of the two column-sorted rows (an entry-wise insert into the
+            // copy shifts the row per new entry; huahum's 15572
+            // aggregations spent seconds there).
+            const SparseRow& old = mutable_rows[sz(row)];
+            SparseRow rewritten;
+            rewritten.v.reserve(old.size() + pivot_entries.size());
+            auto o = old.begin();
             for (const auto& [col, a] : pivot_entries) {
                 if (col == pivot_col) continue;
-                const f64 value = rewritten[col] - multiplier * a;
+                for (; o != old.end() && o->first < col; ++o)
+                    if (o->first != pivot_col) rewritten.v.push_back(*o);
+                f64 prior = 0.0;
+                if (o != old.end() && o->first == col) { prior = o->second; ++o; }
+                const f64 value = prior - multiplier * a;
                 if (!std::isfinite(value)) { safe = false; break; }
-                if (value == 0.0) rewritten.erase(col);
-                else              rewritten[col] = value;
+                if (value != 0.0) rewritten.v.emplace_back(col, value);
             }
             if (!safe) break;
+            for (; o != old.end(); ++o)
+                if (o->first != pivot_col) rewritten.v.push_back(*o);
             const f64 new_lo = mutable_row_lo[sz(row)] - multiplier * rhs;
             const f64 new_hi = mutable_row_hi[sz(row)] - multiplier * rhs;
             if (std::isnan(new_lo) || std::isnan(new_hi)) { safe = false; break; }
@@ -867,22 +878,29 @@ post_fixed_point:
             recovery.other_cols.push_back(col);
             recovery.other_coeffs.push_back(a);
         }
-        for (const auto& rewrite : rewrites) {
+        for (auto& rewrite : rewrites) {
             recovery.affected_rows.push_back(rewrite.row);
             recovery.row_multipliers.push_back(rewrite.multiplier);
 
-            const auto old_entries = mutable_rows[sz(rewrite.row)];
-            for (const auto& [col, a] : old_entries) {
-                (void)a;
-                if (rewrite.entries.find(col) == rewrite.entries.end())
-                    column_rows[sz(col)].erase(rewrite.row);
+            // Incidence: columns only in the old row lose it, columns only
+            // in the new row gain it (one merge of the sorted rows).
+            const auto& old_entries = mutable_rows[sz(rewrite.row)].v;
+            const auto& new_entries = rewrite.entries.v;
+            auto o = old_entries.begin();
+            auto e = new_entries.begin();
+            while (o != old_entries.end() || e != new_entries.end()) {
+                if (e == new_entries.end() || (o != old_entries.end() && o->first < e->first)) {
+                    column_rows[sz(o->first)].erase(rewrite.row);
+                    ++o;
+                } else if (o == old_entries.end() || e->first < o->first) {
+                    column_rows[sz(e->first)].insert(rewrite.row);
+                    ++e;
+                } else {
+                    ++o;
+                    ++e;
+                }
             }
-            for (const auto& [col, a] : rewrite.entries) {
-                (void)a;
-                if (old_entries.find(col) == old_entries.end())
-                    column_rows[sz(col)].insert(rewrite.row);
-            }
-            mutable_rows[sz(rewrite.row)] = rewrite.entries;
+            mutable_rows[sz(rewrite.row)] = std::move(rewrite.entries);
             mutable_row_lo[sz(rewrite.row)] = rewrite.lo;
             mutable_row_hi[sz(rewrite.row)] = rewrite.hi;
             ++row_version[sz(rewrite.row)];
