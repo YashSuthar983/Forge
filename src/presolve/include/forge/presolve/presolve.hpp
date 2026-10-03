@@ -108,6 +108,9 @@ enum class DualRecoveryKind : std::uint8_t {
     ParallelColumnMerge,
     EquationSparsification,
     RowScaling,
+    // An inequality row made an equation at the side its singleton column's
+    // cost forces (old_lo/old_hi: the row's sides before; new_lo: the side).
+    RowSideFixed,
 };
 
 struct DualRecoveryStep {
@@ -169,6 +172,18 @@ struct DoubletonEqualitySubstitution {
     f64 dual_value = 0.0;
     std::vector<Index> other_cols;
     std::vector<f64> other_coeffs;
+    // Bound transfer: a boxed eliminated column whose bounds the row does
+    // not imply hands them to the kept column (outward rounded). When the
+    // kept column ends at a transferred bound, the eliminated one sits at
+    // its own bound and the kept one is basic: the row multiplier then
+    // zeroes the kept column's reduced cost, from its dual state before
+    // the substitution.
+    bool transferred = false;
+    f64 keep_lo_before = 0.0, keep_hi_before = 0.0;
+    f64 keep_lo_after = 0.0, keep_hi_after = 0.0;
+    f64 keep_stage_cost = 0.0;
+    std::vector<Index> keep_rows;
+    std::vector<f64> keep_row_coeffs;
 };
 
 struct PresolveMap {

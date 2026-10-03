@@ -11,12 +11,17 @@ namespace {
 
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 
+// transfer_case[r] for doubleton record r: 0 = elim basic (the usual
+// lift), 1 / 2 = keep at a transferred lower / upper bound, so keep basic
+// and elim nonbasic at its matching bound. Shared with lift_basis.
 void lift_row_duals(const model::LpProblem& original,
                     const PresolveMap& map,
                     const std::vector<f64>& y_reduced,
                     std::vector<f64>& y_out,
                     const PresolveRecoveryOptions& opts,
-                    const std::vector<f64>& x_original) {
+                    const std::vector<f64>& x_original,
+                    std::vector<signed char>& transfer_case) {
+    transfer_case.assign(map.doubleton_equalities.size(), 0);
     const Index rm = map.problem.n_rows();
     y_out.assign(sz(original.n_rows()), 0.0);
     if (static_cast<Index>(y_reduced.size()) == rm &&
@@ -155,6 +160,18 @@ void lift_row_duals(const model::LpProblem& original,
             if (step.col < 0 || step.col >= ns_ || step.coeff == 0.0 ||
                 step.other_rows.size() != step.other_row_coefficients.size())
                 continue;
+            // Bound transfer: when keep sits at a bound it only has through
+            // the transfer AND its reduced cost under the usual lift pushes
+            // against that bound, the original vertex has elim at its own
+            // bound and keep basic: the multiplier must zero keep's reduced
+            // cost instead (keep's dual state before substitution). A keep
+            // at a bound that is also its own (fixed by the transfer, or a
+            // tie) with a reduced cost pointing at the own side keeps the
+            // usual lift.
+            const DoubletonEqualitySubstitution* transfer = nullptr;
+            if (step.record >= 0 && sz(step.record) < map.doubleton_equalities.size() &&
+                map.doubleton_equalities[sz(step.record)].transferred)
+                transfer = &map.doubleton_equalities[sz(step.record)];
             f64 target = sense_ * step.stage_cost;
             bool valid = std::isfinite(target);
             for (std::size_t q = 0; q < step.other_rows.size(); ++q) {
@@ -168,6 +185,43 @@ void lift_row_duals(const model::LpProblem& original,
                 target -= coefficient * ycanon[sz(row)];
             }
             target /= step.coeff;
+            if (valid && std::isfinite(target) && transfer != nullptr) {
+                const auto& rec = *transfer;
+                const Index keep = rec.keep_col;
+                const auto at = [](f64 x, f64 bound) {
+                    return std::isfinite(bound) &&
+                           std::fabs(x - bound) <= 1e-9 * (1.0 + std::fabs(bound));
+                };
+                if (keep >= 0 && keep < ns_ && sz(keep) < x_original.size() &&
+                    rec.keep_coeff != 0.0 && rec.keep_rows.size() == rec.keep_row_coeffs.size()) {
+                    // keep's reduced cost under the usual lift (stage form).
+                    f64 d_keep = sense_ * rec.keep_stage_cost - rec.keep_coeff * target;
+                    f64 keep_target = sense_ * rec.keep_stage_cost;
+                    bool keep_valid = std::isfinite(d_keep);
+                    for (std::size_t q = 0; q < rec.keep_rows.size() && keep_valid; ++q) {
+                        const Index row = rec.keep_rows[q];
+                        if (row < 0 || row >= original.n_rows() ||
+                            !std::isfinite(rec.keep_row_coeffs[q])) { keep_valid = false; break; }
+                        d_keep -= rec.keep_row_coeffs[q] * ycanon[sz(row)];
+                        keep_target -= rec.keep_row_coeffs[q] * ycanon[sz(row)];
+                    }
+                    const f64 xk = x_original[sz(keep)];
+                    const bool lower_transferred = rec.keep_lo_after > rec.keep_lo_before &&
+                                                   at(xk, rec.keep_lo_after);
+                    const bool upper_transferred = rec.keep_hi_after < rec.keep_hi_before &&
+                                                   at(xk, rec.keep_hi_after);
+                    signed char which = 0;
+                    if (keep_valid && d_keep > 0.0 && lower_transferred) which = 1;
+                    else if (keep_valid && d_keep < 0.0 && upper_transferred) which = 2;
+                    if (which != 0) {
+                        keep_target /= rec.keep_coeff;
+                        if (std::isfinite(keep_target)) {
+                            target = keep_target;
+                            transfer_case[sz(step.record)] = which;
+                        }
+                    }
+                }
+            }
             if (valid && std::isfinite(target))
                 add_row_multiplier(step.row,
                                    target - ycanon[sz(step.row)]);
@@ -280,7 +334,8 @@ void lift_row_duals(const model::LpProblem& original,
 PostsolveBasis lift_basis(const model::LpProblem& original,
                           const PresolveMap& pmap,
                           const PostsolveBasis& reduced,
-                          const PresolveRecoveryOptions& opts) {
+                          const PresolveRecoveryOptions& opts,
+                          const std::vector<signed char>& transfer_case) {
     PostsolveBasis outb;
     const Index ns = original.n_cols();
     const Index m = original.n_rows();
@@ -331,11 +386,29 @@ PostsolveBasis lift_basis(const model::LpProblem& original,
         outb.basic[sz(rec.row)] = rec.col;
         outb.status[sz(rec.col)] = PostsolveNonbasicStatus::Basic;
     }
-    for (const auto& rec : pmap.doubleton_equalities) {
+    for (std::size_t r = pmap.doubleton_equalities.size(); r-- > 0;) {
+        const auto& rec = pmap.doubleton_equalities[r];
         if (rec.row < 0 || rec.row >= m || rec.elim_col < 0 ||
             rec.elim_col >= ns || pmap.row_orig_to_new[sz(rec.row)] >= 0)
             continue;
         outb.status[sz(ns + rec.row)] = PostsolveNonbasicStatus::AtLower;
+        // Bound transfer with keep at a transferred bound (decided with the
+        // duals in lift_row_duals): keep is basic in the original and elim
+        // sits at the matching own bound (x_e = (b - a_k x_k)/a_e,
+        // decreasing in x_k when a_k/a_e > 0).
+        const Index keep = rec.keep_col;
+        const signed char which = r < transfer_case.size() ? transfer_case[r] : 0;
+        if (which != 0 && keep >= 0 && keep < ns) {
+            const bool at_lo = which == 1;
+            {
+                const bool elim_upper = at_lo == (rec.keep_coeff / rec.elim_coeff > 0.0);
+                outb.basic[sz(rec.row)] = keep;
+                outb.status[sz(keep)] = PostsolveNonbasicStatus::Basic;
+                outb.status[sz(rec.elim_col)] = elim_upper ? PostsolveNonbasicStatus::AtUpper
+                                                           : PostsolveNonbasicStatus::AtLower;
+                continue;
+            }
+        }
         outb.basic[sz(rec.row)] = rec.elim_col;
         outb.status[sz(rec.elim_col)] = PostsolveNonbasicStatus::Basic;
     }
@@ -351,6 +424,16 @@ PostsolveBasis lift_basis(const model::LpProblem& original,
         outb.status[sz(ns + step.row)] = PostsolveNonbasicStatus::AtLower;
         outb.basic[sz(step.row)] = step.col;
         outb.status[sz(step.col)] = PostsolveNonbasicStatus::Basic;
+    }
+    // A row made an equation at its cost-forced side: a nonbasic logical
+    // of the original inequality sits at that side, not at "lower".
+    for (const auto& step : pmap.recovery_steps) {
+        if (step.kind != DualRecoveryKind::RowSideFixed || step.row < 0 || step.row >= m)
+            continue;
+        auto& status = outb.status[sz(ns + step.row)];
+        if (status == PostsolveNonbasicStatus::Basic) continue;
+        status = step.new_lo == step.old_lo ? PostsolveNonbasicStatus::AtLower
+                                            : PostsolveNonbasicStatus::AtUpper;
     }
     // Parallel rows: a removed row's logical is basic by default, which is
     // right while the kept row's own bound is the active merged side. When
@@ -476,13 +559,14 @@ PresolveRecoveryResult recover_solution(
     out.raw = core::RawResult{};
     out.raw.x = postsolve(map, reduced.x);
     out.raw.y.clear();
-    lift_row_duals(original, map, reduced.y, out.raw.y, opts, out.raw.x);
+    std::vector<signed char> transfer_case;
+    lift_row_duals(original, map, reduced.y, out.raw.y, opts, out.raw.x, transfer_case);
     out.raw.objective = original.objective(out.raw.x);
 
     if (reduced.has_basis)
-        out.basis = lift_basis(original, map, reduced.basis, opts);
+        out.basis = lift_basis(original, map, reduced.basis, opts, transfer_case);
     else if (map.problem.n_rows() == 0 && map.problem.n_cols() == 0)
-        out.basis = lift_basis(original, map, PostsolveBasis{}, opts);
+        out.basis = lift_basis(original, map, PostsolveBasis{}, opts, transfer_case);
 
     out.raw.certificate_basis = out.basis.basic;
     if (!opts.check_point) {
