@@ -11,17 +11,36 @@ namespace {
 
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 
+// Choices the dual lift makes that the basis lift must follow.
 // transfer_case[r] for doubleton record r: 0 = elim basic (the usual
 // lift), 1 / 2 = keep at a transferred lower / upper bound, so keep basic
-// and elim nonbasic at its matching bound. Shared with lift_basis.
+// and elim nonbasic at its matching bound. row_side[t] for a parallel row
+// merge at recovery step t: the merged side the kept row's multiplier
+// prices, +1 lower, -1 upper, 0 a zero multiplier (either side); for a
+// bound tightening: the side of the singleton row the lift gave a nonzero
+// multiplier (the row is tight, its column basic), else 0.
+// forcing_col[t] for a forcing row at step t: the forced column whose
+// reduced cost fixes a nonzero multiplier (it is basic in the original
+// vertex and the row nonbasic at its forced side), -1 when the multiplier
+// is zero.
+struct LiftChoices {
+    std::vector<signed char> transfer_case;
+    std::vector<signed char> row_side;
+    std::vector<Index> forcing_col;
+};
+
 void lift_row_duals(const model::LpProblem& original,
                     const PresolveMap& map,
                     const std::vector<f64>& y_reduced,
                     std::vector<f64>& y_out,
                     const PresolveRecoveryOptions& opts,
                     const std::vector<f64>& x_original,
-                    std::vector<signed char>& transfer_case) {
+                    const PostsolveBasis* reduced_basis,
+                    LiftChoices& choices) {
+    auto& transfer_case = choices.transfer_case;
     transfer_case.assign(map.doubleton_equalities.size(), 0);
+    choices.row_side.assign(map.recovery_steps.size(), 0);
+    choices.forcing_col.assign(map.recovery_steps.size(), -1);
     const Index rm = map.problem.n_rows();
     y_out.assign(sz(original.n_rows()), 0.0);
     if (static_cast<Index>(y_reduced.size()) == rm &&
@@ -53,6 +72,31 @@ void lift_row_duals(const model::LpProblem& original,
         for (Offset k = rp[sz(row)]; k < rp[sz(row) + 1]; ++k)
             aty[sz(ci[sz(k)])] += av[sz(k)] * delta;
     };
+
+    // Removed columns the basis lift makes basic in a removed row (as
+    // lift_basis does). A doubleton elim starts basic and turns nonbasic
+    // when its record transfers; records are visited latest first, so a
+    // keep that a later doubleton removed has its lifted status by then.
+    std::vector<char> lifted_basic(sz(ns_), 0);
+    const auto removed_row = [&](Index row) {
+        return row >= 0 && row < original.n_rows() && map.row_orig_to_new[sz(row)] < 0;
+    };
+    for (const auto& rec : map.singleton_columns)
+        if (rec.row_removed && removed_row(rec.row) && rec.col >= 0 && rec.col < ns_)
+            lifted_basic[sz(rec.col)] = 1;
+    for (const auto& rec : map.equality_aggregations)
+        if (rec.row >= 0 && rec.row < original.n_rows() && rec.col >= 0 && rec.col < ns_)
+            lifted_basic[sz(rec.col)] = 1;
+    for (const auto& rec : map.doubleton_equalities)
+        if (removed_row(rec.row) && rec.elim_col >= 0 && rec.elim_col < ns_)
+            lifted_basic[sz(rec.elim_col)] = 1;
+    for (const auto& step : map.recovery_steps)
+        if ((step.kind == DualRecoveryKind::EqualitySingletonFix ||
+             step.kind == DualRecoveryKind::DualFix ||
+             step.kind == DualRecoveryKind::DominatedColumn ||
+             step.kind == DualRecoveryKind::ParallelColumnMerge) &&
+            removed_row(step.row) && step.col >= 0 && step.col < ns_)
+            lifted_basic[sz(step.col)] = 1;
 
     for (std::size_t t = map.recovery_steps.size(); t-- > 0;) {
         const auto& step = map.recovery_steps[t];
@@ -146,6 +190,7 @@ void lift_row_duals(const model::LpProblem& original,
                 !std::isfinite(scale))
                 continue;
             const f64 y_keep = ycanon[sz(keep)];
+            choices.row_side[t] = y_keep > 0.0 ? 1 : y_keep < 0.0 ? -1 : 0;
             const bool from_removed =
                 (y_keep > 0.0 && step.new_lo > step.old_lo) ||
                 (y_keep < 0.0 && step.new_hi < step.old_hi);
@@ -210,14 +255,32 @@ void lift_row_duals(const model::LpProblem& original,
                                                    at(xk, rec.keep_lo_after);
                     const bool upper_transferred = rec.keep_hi_after < rec.keep_hi_before &&
                                                    at(xk, rec.keep_hi_after);
+                    // A keep the reduced basis holds nonbasic at a bound that
+                    // is only transferred (not its own) has no original bound
+                    // there, whatever the sign of a (degenerate) reduced cost:
+                    // the transfer is the only consistent lift.
+                    const Index nk = keep < static_cast<Index>(map.orig_to_new.size())
+                                         ? map.orig_to_new[sz(keep)] : -1;
+                    const bool keep_nonbasic =
+                        nk < 0 ? !lifted_basic[sz(keep)]
+                               : reduced_basis != nullptr &&
+                                     sz(nk) < reduced_basis->status.size() &&
+                                     reduced_basis->status[sz(nk)] !=
+                                         PostsolveNonbasicStatus::Basic;
+                    const bool at_own = at(xk, rec.keep_lo_before) || at(xk, rec.keep_hi_before);
+                    const bool forced = keep_nonbasic && !at_own;
                     signed char which = 0;
-                    if (keep_valid && d_keep > 0.0 && lower_transferred) which = 1;
-                    else if (keep_valid && d_keep < 0.0 && upper_transferred) which = 2;
+                    if (keep_valid && (d_keep > 0.0 || forced) && lower_transferred) which = 1;
+                    else if (keep_valid && (d_keep < 0.0 || forced) && upper_transferred) which = 2;
                     if (which != 0) {
                         keep_target /= rec.keep_coeff;
                         if (std::isfinite(keep_target)) {
                             target = keep_target;
                             transfer_case[sz(step.record)] = which;
+                            if (removed_row(rec.row)) {
+                                lifted_basic[sz(rec.elim_col)] = 0;
+                                lifted_basic[sz(keep)] = 1;
+                            }
                         }
                     }
                 }
@@ -236,6 +299,7 @@ void lift_row_duals(const model::LpProblem& original,
                 ? -std::numeric_limits<f64>::infinity()
                 :  std::numeric_limits<f64>::infinity();
             bool valid = true;
+            Index pricing_col = -1;
             for (std::size_t q = 0; q < step.columns.size(); ++q) {
                 const Index j = step.columns[q];
                 const f64 a = step.coefficients[q];
@@ -257,8 +321,10 @@ void lift_row_duals(const model::LpProblem& original,
                     valid = false;
                     break;
                 }
-                if (step.at_max) target = std::max(target, threshold);
-                else             target = std::min(target, threshold);
+                if (step.at_max ? threshold > target : threshold < target) {
+                    target = threshold;
+                    pricing_col = j;
+                }
             }
             if (!valid || !std::isfinite(target)) continue;
             const bool equality =
@@ -269,6 +335,7 @@ void lift_row_duals(const model::LpProblem& original,
                                      : std::min(0.0, target);
             }
             add_row_multiplier(step.row, target - ycanon[sz(step.row)]);
+            if (target != 0.0) choices.forcing_col[t] = pricing_col;
             continue;
         }
 
@@ -326,6 +393,7 @@ void lift_row_duals(const model::LpProblem& original,
             (!active_lo && candidate_y > opts.dual_feas_tol))
             continue;
         add_row_multiplier(step.row, candidate_y - ycanon[sz(step.row)]);
+        choices.row_side[t] = candidate_y > 0.0 ? 1 : candidate_y < 0.0 ? -1 : 0;
     }
     for (Index i = 0; i < original.n_rows(); ++i)
         y_out[sz(i)] = sense_ * ycanon[sz(i)];
@@ -335,7 +403,9 @@ PostsolveBasis lift_basis(const model::LpProblem& original,
                           const PresolveMap& pmap,
                           const PostsolveBasis& reduced,
                           const PresolveRecoveryOptions& opts,
-                          const std::vector<signed char>& transfer_case) {
+                          const std::vector<f64>& x_original,
+                          const LiftChoices& choices) {
+    const auto& transfer_case = choices.transfer_case;
     PostsolveBasis outb;
     const Index ns = original.n_cols();
     const Index m = original.n_rows();
@@ -351,6 +421,11 @@ PostsolveBasis lift_basis(const model::LpProblem& original,
     outb.n_struct = ns;
     outb.status.assign(sz(ns + m), PostsolveNonbasicStatus::AtLower);
     outb.basic.assign(sz(m), -1);
+    // A removed column's value: the lifted point (fixed_value holds only
+    // the columns presolve fixed, not a transferred doubleton's elim).
+    const auto removed_value = [&](Index j) {
+        return sz(j) < x_original.size() ? x_original[sz(j)] : pmap.fixed_value[sz(j)];
+    };
 
     const auto lift = [&](Index rj) -> Index {
         if (rj < rns) return pmap.new_to_orig[sz(rj)];
@@ -425,6 +500,24 @@ PostsolveBasis lift_basis(const model::LpProblem& original,
         outb.basic[sz(step.row)] = step.col;
         outb.status[sz(step.col)] = PostsolveNonbasicStatus::Basic;
     }
+    // A forcing row with a nonzero multiplier is tight in the original
+    // vertex: its logical is nonbasic at the forced side (maximum activity
+    // at the lower side) and the column that prices it is basic, at the
+    // bound it was fixed to.
+    for (std::size_t t = 0; t < pmap.recovery_steps.size(); ++t) {
+        const auto& step = pmap.recovery_steps[t];
+        if (step.kind != DualRecoveryKind::ForcingRow) continue;
+        const Index j = t < choices.forcing_col.size() ? choices.forcing_col[t] : -1;
+        if (j < 0 || j >= ns || step.row < 0 || step.row >= m ||
+            pmap.row_orig_to_new[sz(step.row)] >= 0 ||
+            outb.basic[sz(step.row)] != ns + step.row ||
+            outb.status[sz(j)] == PostsolveNonbasicStatus::Basic)
+            continue;
+        outb.basic[sz(step.row)] = j;
+        outb.status[sz(j)] = PostsolveNonbasicStatus::Basic;
+        outb.status[sz(ns + step.row)] = step.at_max ? PostsolveNonbasicStatus::AtLower
+                                                     : PostsolveNonbasicStatus::AtUpper;
+    }
     // A row made an equation at its cost-forced side: a nonbasic logical
     // of the original inequality sits at that side, not at "lower".
     for (const auto& step : pmap.recovery_steps) {
@@ -440,20 +533,36 @@ PostsolveBasis lift_basis(const model::LpProblem& original,
     // the removed row supplied it, that row is the tight one: its logical is
     // nonbasic at the matching side (opposite for a negative scale) and the
     // kept row's logical, strictly inside its own bounds, takes the slot.
+    // The kept row may itself be removed later (an equation aggregated
+    // away): its logical is then nonbasic at the merged side all the same.
     // Latest merge first, as in the dual recovery.
-    for (auto it = pmap.recovery_steps.rbegin(); it != pmap.recovery_steps.rend(); ++it) {
-        const auto& step = *it;
+    // For a merged equation the side is the one the kept row's multiplier
+    // prices (the status names no side); otherwise, or with a zero
+    // multiplier, the status's side.
+    for (std::size_t t = pmap.recovery_steps.size(); t-- > 0;) {
+        const auto& step = pmap.recovery_steps[t];
         if (step.kind != DualRecoveryKind::ParallelRowMerge) continue;
         const Index keep = step.record, rem = step.row;
         if (keep < 0 || keep >= m || rem < 0 || rem >= m || step.coeff == 0.0 ||
-            pmap.row_orig_to_new[sz(keep)] < 0 || outb.basic[sz(rem)] != ns + rem)
+            outb.basic[sz(rem)] != ns + rem)
             continue;
-        const auto keep_status = outb.status[sz(ns + keep)];
-        const bool at_lower = keep_status == PostsolveNonbasicStatus::AtLower;
-        const bool at_upper = keep_status == PostsolveNonbasicStatus::AtUpper;
+        auto& keep_status = outb.status[sz(ns + keep)];
+        if (keep_status != PostsolveNonbasicStatus::AtLower &&
+            keep_status != PostsolveNonbasicStatus::AtUpper)
+            continue;
+        const bool equation = std::max(step.old_lo, step.new_lo) ==
+                              std::min(step.old_hi, step.new_hi);
+        const signed char side =
+            equation && t < choices.row_side.size() ? choices.row_side[t] : 0;
+        const bool at_lower = side > 0 || (side == 0 && keep_status == PostsolveNonbasicStatus::AtLower);
+        const bool at_upper = !at_lower;
         const bool from_removed = (at_lower && step.new_lo > step.old_lo) ||
                                   (at_upper && step.new_hi < step.old_hi);
-        if (!from_removed) continue;
+        if (!from_removed) {
+            keep_status = at_lower ? PostsolveNonbasicStatus::AtLower
+                                   : PostsolveNonbasicStatus::AtUpper;
+            continue;
+        }
         outb.basic[sz(rem)] = ns + keep;
         outb.status[sz(ns + keep)] = PostsolveNonbasicStatus::Basic;
         outb.status[sz(ns + rem)] = (at_lower == (step.coeff > 0.0))
@@ -467,6 +576,12 @@ PostsolveBasis lift_basis(const model::LpProblem& original,
     // basis whose point puts x_j at a bound the model does not have, and its
     // exact duals are not the lifted duals (d2q06c: 2769 certificate pivots to
     // repair it, none once the basis is lifted consistently).
+    // A removed column's lifted value is computed (a doubleton elim from
+    // its keep), so it meets a bound only to rounding.
+    const auto near = [](f64 value, f64 bound) {
+        return std::isfinite(bound) &&
+               std::fabs(value - bound) <= 1e-9 * (1.0 + std::fabs(bound));
+    };
     const auto tightened_value = [&](Index j, bool& at_upper, f64& value) {
         const Index nj = pmap.orig_to_new[sz(j)];
         if (nj >= 0) {
@@ -483,14 +598,14 @@ PostsolveBasis lift_basis(const model::LpProblem& original,
             }
             return false;
         }
-        value = pmap.fixed_value[sz(j)];
-        if (value == original.col_lo[sz(j)] || value == original.col_hi[sz(j)])
+        value = removed_value(j);
+        if (near(value, original.col_lo[sz(j)]) || near(value, original.col_hi[sz(j)]))
             return false;
         at_upper = false;   // decided per step below
         return true;
     };
-    for (auto it = pmap.recovery_steps.rbegin(); it != pmap.recovery_steps.rend(); ++it) {
-        const auto& step = *it;
+    for (std::size_t t = pmap.recovery_steps.size(); t-- > 0;) {
+        const auto& step = pmap.recovery_steps[t];
         if (step.kind != DualRecoveryKind::BoundTightening) continue;
         if (step.row < 0 || step.row >= m || step.col < 0 || step.col >= ns ||
             step.coeff == 0.0 ||
@@ -507,20 +622,26 @@ PostsolveBasis lift_basis(const model::LpProblem& original,
                 if (outb.basic[sz(s)] == ns + step.row) { slot = s; break; }
             if (slot < 0) continue;
         }
-        bool at_upper = false;
-        f64 value = 0.0;
-        if (!tightened_value(step.col, at_upper, value)) continue;
-        const bool from_hi = step.new_hi < step.old_hi && step.new_hi == value;
-        const bool from_lo = step.new_lo > step.old_lo && step.new_lo == value;
-        if (pmap.orig_to_new[sz(step.col)] >= 0) {
-            if (at_upper ? !from_hi : !from_lo) continue;
-        } else {
-            if (!from_hi && !from_lo) continue;
-            at_upper = from_hi;
+        // A row the dual lift priced is tight at the priced side, also when
+        // x_j sits where its own bound and the tightened one meet.
+        const signed char priced = t < choices.row_side.size() ? choices.row_side[t] : 0;
+        bool row_upper = priced < 0;
+        if (priced == 0) {
+            bool at_upper = false;
+            f64 value = 0.0;
+            if (!tightened_value(step.col, at_upper, value)) continue;
+            const bool from_hi = step.new_hi < step.old_hi && near(value, step.new_hi);
+            const bool from_lo = step.new_lo > step.old_lo && near(value, step.new_lo);
+            if (pmap.orig_to_new[sz(step.col)] >= 0) {
+                if (at_upper ? !from_hi : !from_lo) continue;
+            } else {
+                if (!from_hi && !from_lo) continue;
+                at_upper = from_hi;
+            }
+            // x_j at its upper tightened bound is the row at its upper side
+            // for a positive coefficient and at its lower side for a negative.
+            row_upper = at_upper == (step.coeff > 0.0);
         }
-        // x_j at its upper tightened bound is the row at its upper side for a
-        // positive coefficient and at its lower side for a negative one.
-        const bool row_upper = at_upper == (step.coeff > 0.0);
         const f64 row_side = row_upper ? original.row_hi[sz(step.row)]
                                        : original.row_lo[sz(step.row)];
         if (!std::isfinite(row_side)) continue;
@@ -532,7 +653,7 @@ PostsolveBasis lift_basis(const model::LpProblem& original,
     for (Index j = 0; j < ns; ++j) {
         if (pmap.orig_to_new[sz(j)] < 0 &&
             outb.status[sz(j)] != PostsolveNonbasicStatus::Basic) {
-            const f64 value = pmap.fixed_value[sz(j)];
+            const f64 value = removed_value(j);
             const f64 tol = std::max(opts.primal_feas_tol, 1e-9) *
                             (1.0 + std::fabs(value));
             if (original.col_lo[sz(j)] > -model::kInf &&
@@ -559,14 +680,15 @@ PresolveRecoveryResult recover_solution(
     out.raw = core::RawResult{};
     out.raw.x = postsolve(map, reduced.x);
     out.raw.y.clear();
-    std::vector<signed char> transfer_case;
-    lift_row_duals(original, map, reduced.y, out.raw.y, opts, out.raw.x, transfer_case);
+    LiftChoices choices;
+    lift_row_duals(original, map, reduced.y, out.raw.y, opts, out.raw.x,
+                   reduced.has_basis ? &reduced.basis : nullptr, choices);
     out.raw.objective = original.objective(out.raw.x);
 
     if (reduced.has_basis)
-        out.basis = lift_basis(original, map, reduced.basis, opts, transfer_case);
+        out.basis = lift_basis(original, map, reduced.basis, opts, out.raw.x, choices);
     else if (map.problem.n_rows() == 0 && map.problem.n_cols() == 0)
-        out.basis = lift_basis(original, map, PostsolveBasis{}, opts, transfer_case);
+        out.basis = lift_basis(original, map, PostsolveBasis{}, opts, out.raw.x, choices);
 
     out.raw.certificate_basis = out.basis.basic;
     if (!opts.check_point) {
