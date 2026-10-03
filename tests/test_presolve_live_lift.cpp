@@ -7,7 +7,10 @@
 // model with an optimum: presolve with the live rules, solve the reduced
 // model, lift, and require the lift to meet the primal and dual residual
 // tolerances on the ORIGINAL model with the direct optimum, and the lifted
-// basis to name one basic variable per row.
+// basis to name the lifted vertex: one basic variable per row, every
+// nonbasic variable at the finite bound its status names, every basic
+// variable priced at zero by the lifted duals. The default rule set alone
+// (forcing rows, singleton rows made bounds) is held to the same.
 #include "sor/engines/simplex.hpp"
 #include "sor/presolve/presolve.hpp"
 #include "sor/sparse/csr.hpp"
@@ -118,6 +121,10 @@ int main() {
     using sor::presolve::DualRecoveryKind;
     int optimal = 0, lifted_with_doubleton = 0, lifted_with_parallel = 0, chains = 0;
     int lifted_with_transfer = 0, lifted_with_tight_row = 0;
+    int default_lifts = 0, default_forcing = 0, default_tightened = 0;
+    // The live rules, then the default rule set alone (forcing rows and
+    // singleton rows turned into bounds) on the same models.
+    for (const bool live : {true, false})
     for (std::uint32_t seed = 1; seed <= 3000; ++seed) {
         const LpProblem lp = make_lp(seed);
         sor::engines::SimplexOptions direct;
@@ -126,11 +133,11 @@ int main() {
         sor::engines::SimplexDiagnostics dd;
         const auto ref = sor::engines::solve_simplex(lp, direct, dd, nullptr);
         if (ref.proposed_status != sor::core::Status::Optimal) continue;
-        ++optimal;
+        optimal += live;
 
         sor::presolve::PresolveOptions po;
-        po.live_reductions = true;
-        po.parallel_rows = true;
+        po.live_reductions = live;
+        po.parallel_rows = live;
         const auto out = sor::presolve::presolve(lp, po);
         if (out.status != sor::presolve::PresolveStatus::Reduced &&
             out.status != sor::presolve::PresolveStatus::Solved) {
@@ -139,13 +146,16 @@ int main() {
             continue;
         }
         int doubletons = 0, parallels = 0, tight_rows = 0, transfers = 0;
+        int forcing = 0, tightened = 0;
         for (const auto& step : out.map.recovery_steps) {
             doubletons += step.kind == DualRecoveryKind::DoubletonEquality;
             parallels += step.kind == DualRecoveryKind::ParallelRowMerge;
             tight_rows += step.kind == DualRecoveryKind::RowSideFixed;
+            forcing += step.kind == DualRecoveryKind::ForcingRow;
+            tightened += step.kind == DualRecoveryKind::BoundTightening;
         }
         for (const auto& rec : out.map.doubleton_equalities) transfers += rec.transferred;
-        if (doubletons == 0 && parallels == 0) continue;
+        if (live ? doubletons == 0 && parallels == 0 : out.map.recovery_steps.empty()) continue;
 
         sor::presolve::PresolveReducedSolve rs;
         if (out.map.problem.n_rows() > 0 || out.map.problem.n_cols() > 0) {
@@ -192,6 +202,51 @@ int main() {
                                     basic.size() == rec.basis.basic.size() && !basic.count(-1),
                                 "lifted basis has one distinct basic variable per row",
                                 __FILE__, __LINE__, where);
+            // Every nonbasic variable sits at the finite original bound its
+            // status names, at the lifted point: otherwise the basis names a
+            // different vertex than the lifted solution (or none at all).
+            using PS = sor::presolve::PostsolveNonbasicStatus;
+            const Index n = lp.n_cols();
+            std::vector<double> ax(static_cast<std::size_t>(lp.n_rows()), 0.0);
+            const auto& rp = lp.A.pattern.row_ptr();
+            const auto& ci = lp.A.pattern.col_idx();
+            for (Index i = 0; i < lp.n_rows(); ++i)
+                for (auto k = rp[i]; k < rp[i + 1]; ++k)
+                    ax[static_cast<std::size_t>(i)] += lp.A.vals[k] * rec.raw.x[ci[k]];
+            bool consistent = rec.basis.status.size() == static_cast<std::size_t>(n + lp.n_rows());
+            for (Index j = 0; consistent && j < n + lp.n_rows(); ++j) {
+                const auto st = rec.basis.status[static_cast<std::size_t>(j)];
+                if (st == PS::Basic) continue;
+                const double lo = j < n ? lp.col_lo[j] : lp.row_lo[j - n];
+                const double hi = j < n ? lp.col_hi[j] : lp.row_hi[j - n];
+                const double v = j < n ? rec.raw.x[j] : ax[static_cast<std::size_t>(j - n)];
+                const double b = st == PS::AtLower ? lo : st == PS::AtUpper ? hi : 0.0;
+                consistent = std::isfinite(b) && std::fabs(v - b) <= 1e-7 * (1.0 + std::fabs(b));
+            }
+            ::sor::test::report(consistent,
+                                "lifted nonbasic variables sit at their named finite bounds",
+                                __FILE__, __LINE__, where);
+            // And the lifted duals price every basic variable at zero, so the
+            // basis and the multipliers describe the same optimal vertex.
+            std::vector<double> d(lp.c.begin(), lp.c.end());
+            for (Index i = 0; i < lp.n_rows(); ++i)
+                for (auto k = rp[i]; k < rp[i + 1]; ++k)
+                    d[static_cast<std::size_t>(ci[k])] -= lp.A.vals[k] * rec.raw.y[i];
+            bool complementary = true;
+            for (Index j = 0; j < n + lp.n_rows(); ++j) {
+                if (rec.basis.status[static_cast<std::size_t>(j)] != PS::Basic) continue;
+                const double dj = j < n ? d[static_cast<std::size_t>(j)] : rec.raw.y[j - n];
+                if (std::fabs(dj) > 1e-7) complementary = false;
+            }
+            ::sor::test::report(complementary,
+                                "lifted duals price the lifted basic variables at zero",
+                                __FILE__, __LINE__, where);
+        }
+        if (!live) {
+            ++default_lifts;
+            default_forcing += forcing > 0;
+            default_tightened += tightened > 0;
+            continue;
         }
         lifted_with_doubleton += doubletons > 0;
         lifted_with_transfer += transfers > 0;
@@ -203,6 +258,10 @@ int main() {
               << " (chains " << chains << ", bound transfers " << lifted_with_transfer
               << ", cost-tight rows " << lifted_with_tight_row << "), with parallel rows "
               << lifted_with_parallel << "\n";
+    std::cout << "default rules: lifts " << default_lifts << " (forcing rows "
+              << default_forcing << ", tightened singleton rows " << default_tightened << ")\n";
+    CHECK(default_forcing >= 50);
+    CHECK(default_tightened >= 20);
     CHECK(lifted_with_transfer >= 50);
     CHECK(lifted_with_tight_row >= 50);
     CHECK(lifted_with_doubleton >= 100);
