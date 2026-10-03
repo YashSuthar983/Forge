@@ -168,6 +168,7 @@ struct LiveMatrix {
     bool apply_implied_bounds_row(Index i);
     bool apply_dual_fixing_col(Index j);
     bool try_doubleton_equality(Index i);
+    bool try_cost_tight_doubleton(Index j);
     bool try_dominated_columns();
     bool try_duplicate_rows();
     bool try_duplicate_columns();

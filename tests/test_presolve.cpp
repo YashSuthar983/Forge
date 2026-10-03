@@ -941,20 +941,17 @@ int main() {
             CHECK_NEAR(x[0], 2.0, 1e-15);
         }
 
-        // Dual fixing must not eliminate a zero-cost structural slack.
+        // A zero-cost semi-bounded slack next to a boxed column:
+        //   min x0  s.t.  x0 + x1 = 5,  x0 in [0, 10],  x1 in [0, inf).
+        // The doubleton eliminates x0 and transfers its box onto the slack
+        // (x1 in [0, 5], cost -1 after substitution). The lift of the reduced
+        // optimum x1 = 5 must be the original optimum x0 = 0 with exact duals
+        // and the basis {x1}: x1 sits at a transferred bound, so x0 is the
+        // nonbasic column. (These models used to assert that no reduction
+        // happens at all; the transfer is now recovered.)
         {
-            LpProblem p;
-            p.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
-            p.c = {1.0, 0.0};
-            p.row_lo = p.row_hi = {5.0};
-            p.col_lo = {0.0, 0.0};
-            p.col_hi = {10.0, sor::model::kInf};
-            const auto out = sor::presolve::presolve(p, v2);
-            CHECK(out.map.problem.n_cols() == 2);
-        }
-
-        // Live presolve must run (extra pass) without changing a tight slack model.
-        {
+            using sor::presolve::PostsolveNonbasicStatus;
+            using sor::presolve::PresolveRecoveryOptions;
             LpProblem p;
             p.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
             p.c = {1.0, 0.0};
@@ -962,9 +959,33 @@ int main() {
             p.col_lo = {0.0, 0.0};
             p.col_hi = {10.0, sor::model::kInf};
             const auto plain = sor::presolve::presolve(p);
-            const auto live = sor::presolve::presolve(p, v2);
-            CHECK(plain.map.problem.n_cols() == live.map.problem.n_cols());
-            CHECK(live.stats().passes >= plain.stats().passes);
+            const auto out = sor::presolve::presolve(p, v2);
+            CHECK(out.stats().passes >= plain.stats().passes);
+            CHECK(out.stats().doubleton_substitutions == 1);
+            CHECK(out.map.problem.n_rows() == 0);
+            // x1 may also be dual-fixed at 5 once its row is gone.
+            CHECK(out.map.problem.n_cols() <= 1);
+            if (out.map.problem.n_rows() == 0 && out.map.problem.n_cols() <= 1) {
+                PresolveReducedSolve rs;
+                rs.has_basis = true;
+                if (out.map.problem.n_cols() == 1) {
+                    CHECK(out.map.problem.col_lo[0] == 0.0);
+                    CHECK(out.map.problem.col_hi[0] == 5.0);
+                    rs.x = {5.0};
+                    rs.basis.n_struct = 1;
+                    rs.basis.status = {PostsolveNonbasicStatus::AtUpper};
+                }
+                PresolveRecoveryOptions ropts;
+                ropts.gap_tol = 1e-9;
+                const auto rec = recover_solution(p, out.map, rs, ropts);
+                CHECK(rec.validated);
+                CHECK_NEAR(rec.raw.x[0], 0.0, 1e-15);
+                CHECK_NEAR(rec.raw.x[1], 5.0, 1e-15);
+                CHECK(rec.evidence.max_dual_violation <= 1e-15);
+                CHECK(rec.basis.basic.size() == 1 && rec.basis.basic[0] == 1);
+                CHECK(rec.basis.status[0] == PostsolveNonbasicStatus::AtLower);
+                CHECK(rec.basis.status[1] == PostsolveNonbasicStatus::Basic);
+            }
         }
 
         // Seeded small LP: lift a reduced candidate and validate primal+dual.
@@ -1239,14 +1260,16 @@ int main() {
             CHECK_NEAR(recovered.raw.x[0] + recovered.raw.x[1], 1.0, 1e-9);
         }
 
-        // Negative: semi-bounded slack must not be removed by doubleton.
+        // Negative: a semi-bounded column is never the one a doubleton
+        // eliminates (the implied-slack case); here x0 is the elimination
+        // candidate (equal |a|, first column) and must stay.
         {
             LpProblem p;
             p.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
-            p.c = {1.0, 0.0};
+            p.c = {0.0, 1.0};
             p.row_lo = p.row_hi = {5.0};
             p.col_lo = {0.0, 0.0};
-            p.col_hi = {10.0, sor::model::kInf};
+            p.col_hi = {sor::model::kInf, 10.0};
             const auto out = sor::presolve::presolve(p, v2);
             CHECK(out.stats().doubleton_substitutions == 0);
             CHECK(out.map.problem.n_cols() == 2);
