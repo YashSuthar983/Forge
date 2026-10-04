@@ -1007,12 +1007,16 @@ int main() {
         }
 
         // Implied bounds tighten finite columns when explicitly enabled.
+        // Zero costs keep the other live rules out: with c > 0 nothing locks
+        // the columns downward and dual fixing removes both; with c < 0 the
+        // row is cost-tight (x0 alone would pass 3), becomes an equation and
+        // the doubleton substitution removes x0.
         {
             PresolveOptions ib = v2;
             ib.implied_bounds = true;
             LpProblem p;
             p.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
-            p.c = {1.0, 1.0};
+            p.c = {0.0, 0.0};
             p.row_lo = {-sor::model::kInf};
             p.row_hi = {3.0};
             p.col_lo = {0.0, 0.0};
@@ -1025,15 +1029,17 @@ int main() {
             CHECK(out.map.problem.col_hi[1] <= 3.0 + 1e-12);
         }
 
-        // Dominated column: looser parallel column removed (opt-in).
+        // Dominated column: looser parallel column removed (opt-in). A >=
+        // row locks both columns downward, so dual fixing (c > 0) leaves
+        // them, and the row is not cost-tight (4 - 10 - 0 < 0).
         {
             PresolveOptions dom = v2;
             dom.dominated_columns = true;
             LpProblem p;
             p.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
             p.c = {1.0, 1.0};
-            p.row_lo = {-sor::model::kInf};
-            p.row_hi = {4.0};
+            p.row_lo = {4.0};
+            p.row_hi = {sor::model::kInf};
             p.col_lo = {0.0, 0.0};
             p.col_hi = {sor::model::kInf, 10.0};
             const auto out = sor::presolve::presolve(p, dom);
@@ -1044,7 +1050,7 @@ int main() {
                     saw_dom = true;
             CHECK(saw_dom);
             PresolveReducedSolve rs;
-            rs.x.assign(static_cast<std::size_t>(out.map.problem.n_cols()), 2.0);
+            rs.x.assign(static_cast<std::size_t>(out.map.problem.n_cols()), 4.0);
             rs.y.assign(static_cast<std::size_t>(out.map.problem.n_rows()), 1.0);
             const auto rec = recover_solution(p, out.map, rs);
             CHECK(rec.evidence.max_primal_violation <= 1e-9);
@@ -1055,8 +1061,8 @@ int main() {
             LpProblem p;
             p.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
             p.c = {1.0, 1.0};
-            p.row_lo = {-sor::model::kInf};
-            p.row_hi = {4.0};
+            p.row_lo = {4.0};
+            p.row_hi = {sor::model::kInf};
             p.col_lo = {0.0, 0.0};
             p.col_hi = {4.0, 10.0};
             const auto out = sor::presolve::presolve(p, dom);
@@ -1065,13 +1071,15 @@ int main() {
         }
 
         // Parallel rows: tighter duplicate survives; journal + primal lift.
+        // Negative costs: the <= rows lock the columns upward (with c > 0
+        // nothing locks them downward and dual fixing empties both rows).
         {
             PresolveOptions par = v2;
             par.parallel_rows = true;
             LpProblem p;
             p.A = sor::sparse::from_triplets(
                 2, 2, {0, 0, 1, 1}, {0, 1, 0, 1}, {1.0, 1.0, 1.0, 1.0});
-            p.c = {1.0, 1.0};
+            p.c = {-1.0, -1.0};
             p.row_lo = {-sor::model::kInf, -sor::model::kInf};
             p.row_hi = {5.0, 3.0};
             p.col_lo = {0.0, 0.0};
@@ -1166,15 +1174,18 @@ int main() {
         }
 
         // Parallel columns: proportional costs required; full solve + lift.
+        // Two rows, so neither column is a singleton (a lone inequality is
+        // cost-tight here and the doubleton would take it), and negative
+        // costs against R0's upward lock keep dual fixing out.
         {
             PresolveOptions par = v2;
             par.parallel_columns = true;
             LpProblem p;
             p.A = sor::sparse::from_triplets(
-                1, 2, {0, 0}, {0, 1}, {1.0, 2.0});
-            p.c = {1.0, 2.0};
-            p.row_lo = {-sor::model::kInf};
-            p.row_hi = {10.0};
+                2, 2, {0, 0, 1, 1}, {0, 1, 0, 1}, {1.0, 2.0, 1.0, 2.0});
+            p.c = {-1.0, -2.0};
+            p.row_lo = {-sor::model::kInf, 1.0};
+            p.row_hi = {10.0, sor::model::kInf};
             p.col_lo = {0.0, 0.0};
             p.col_hi = {5.0, 10.0};
             const auto out = sor::presolve::presolve(p, par);
@@ -1184,8 +1195,9 @@ int main() {
                 if (step.kind == sor::presolve::DualRecoveryKind::ParallelColumnMerge)
                     saw_col = true;
             CHECK(saw_col);
+            // The merged column z = x0 + 2 x1 in [0, 25]; z = 5 meets both rows.
             PresolveReducedSolve rs;
-            rs.x = {};
+            rs.x.assign(static_cast<std::size_t>(out.map.problem.n_cols()), 5.0);
             rs.y = {};
             const auto rec = recover_solution(p, out.map, rs);
             CHECK(rec.evidence.max_primal_violation <= 1e-9);
@@ -1213,7 +1225,9 @@ int main() {
             PresolveOptions dom = v2; dom.dominated_columns = true;
             LpProblem p;
             p.A = sor::sparse::from_triplets(1,2,{0,0},{0,1},{1.0,1.0});
-            p.c = {1.0,2.0}; p.col_lo = {0.0,0.0}; p.col_hi = {1.0,2.0};
+            // x1 <= 3, not 2: with x1 <= 2 the row is cost-tight (x0 = 2 - x1
+            // >= 0 always) and the doubleton removes x0 before this rule.
+            p.c = {1.0,2.0}; p.col_lo = {0.0,0.0}; p.col_hi = {1.0,3.0};
             p.row_lo = {2.0}; p.row_hi = {sor::model::kInf};
             const auto out = sor::presolve::presolve(p, dom);
             CHECK(out.stats().dominated_columns_removed == 0);
