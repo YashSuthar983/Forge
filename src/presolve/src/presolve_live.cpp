@@ -110,9 +110,8 @@ void LiveMatrix::build(const model::LpProblem& problem,
         }
         recompute_row_activity(i);
     }
-    // Locks are not computed here: dual fixing, their only reader, acts on
-    // empty columns and recomputes them itself. Computing every lock
-    // rescans each column's rows, sum(row length^2) work (nw04: 35 s).
+    // Locks are not computed here: dual fixing, their only reader,
+    // recomputes a column's locks (O(degree)) when it looks at it.
 }
 
 void LiveMatrix::seed_all_queues() {
@@ -158,44 +157,20 @@ void LiveMatrix::recompute_row_activity(Index i) {
 void LiveMatrix::recompute_col_locks(Index j) {
     SOR_FN();
     if (!col_active[sz(j)]) return;
+    // A row locks x_j downward when decreasing x_j can violate it (a > 0
+    // with a finite lower side, a < 0 with a finite upper side), upward
+    // symmetrically. O(degree): no activity, no rescan of the row.
     down_lock[sz(j)] = 0;
     up_lock[sz(j)] = 0;
-    const f64 cl = col_lo[sz(j)], ch = col_hi[sz(j)];
-    if (!std::isfinite(cl) && !std::isfinite(ch)) return;
     for (const Index i : col_rows[sz(j)]) {
         if (!row_active[sz(i)]) continue;
         const auto it = rows[sz(i)].find(j);
         if (it == rows[sz(i)].end() || it->second == 0.0) continue;
-        const f64 a = it->second;
-        f64 other_lo = 0.0, other_hi = 0.0;
-        for (const auto& [h, b] : rows[sz(i)]) {
-            if (h == j || !col_active[sz(h)]) {
-                if (h != j && !col_active[sz(h)])
-                    other_lo += b * fixed[sz(h)];
-                if (h != j && !col_active[sz(h)])
-                    other_hi += b * fixed[sz(h)];
-                continue;
-            }
-            add_interval(other_lo, other_hi, b, col_lo[sz(h)], col_hi[sz(h)]);
-        }
-        if (row_lo[sz(i)] > -model::kInf && std::isfinite(a)) {
-            f64 implied = (row_lo[sz(i)] - other_hi) / a;
-            if (a > 0.0 && std::isfinite(implied) && std::isfinite(cl) &&
-                implied <= cl + stability_tol(cl))
-                down_lock[sz(j)] = 1;
-            if (a < 0.0 && std::isfinite(implied) && std::isfinite(ch) &&
-                implied >= ch - stability_tol(ch))
-                up_lock[sz(j)] = 1;
-        }
-        if (row_hi[sz(i)] < model::kInf && std::isfinite(a)) {
-            f64 implied = (row_hi[sz(i)] - other_lo) / a;
-            if (a > 0.0 && std::isfinite(implied) && std::isfinite(ch) &&
-                implied >= ch - stability_tol(ch))
-                up_lock[sz(j)] = 1;
-            if (a < 0.0 && std::isfinite(implied) && std::isfinite(cl) &&
-                implied <= cl + stability_tol(cl))
-                down_lock[sz(j)] = 1;
-        }
+        const bool has_lo = row_lo[sz(i)] > -model::kInf;
+        const bool has_hi = row_hi[sz(i)] < model::kInf;
+        if (it->second > 0.0 ? has_lo : has_hi) down_lock[sz(j)] = 1;
+        if (it->second > 0.0 ? has_hi : has_lo) up_lock[sz(j)] = 1;
+        if (down_lock[sz(j)] && up_lock[sz(j)]) return;
     }
 }
 
@@ -248,9 +223,11 @@ bool LiveMatrix::remove_redundant_row(Index i) {
     recompute_row_activity(i);
     if (act_min_inf[sz(i)] > 0 || act_max_inf[sz(i)] > 0) return false;
     if (act_min[sz(i)] >= row_lo[sz(i)] && act_max[sz(i)] <= row_hi[sz(i)]) {
+        // The row's locks go with it: its columns may now be dual-fixable.
         for (const auto& [j, a] : rows[sz(i)]) {
             (void)a;
             col_rows[sz(j)].erase(i);
+            queue_col(j);
         }
         rows[sz(i)].clear();
         row_active[sz(i)] = 0;
@@ -338,7 +315,6 @@ bool LiveMatrix::apply_implied_bounds_row(Index i) {
 bool LiveMatrix::apply_dual_fixing_col(Index j) {
     SOR_FN();
     if (!col_active[sz(j)]) return false;
-    if (!col_rows[sz(j)].empty()) return false;
     recompute_col_locks(j);
     const f64 c = in->maximize ? -cost[sz(j)] : cost[sz(j)];
     const f64 lo = col_lo[sz(j)], hi = col_hi[sz(j)];

@@ -3,7 +3,8 @@
 // fills a column into rows a later reduction rewrites) and parallel rows
 // (both orientations, either row supplying the tighter side), doubletons
 // whose eliminated column's bounds move to the kept column, and cost-tight
-// singleton columns that make their inequality an equation. For every
+// singleton columns that make their inequality an equation, and columns
+// no row locks in the direction their cost favours (dual fixing). For every
 // model with an optimum: presolve with the live rules, solve the reduced
 // model, lift, and require the lift to meet the primal and dual residual
 // tolerances on the ORIGINAL model with the direct optimum, and the lifted
@@ -120,7 +121,7 @@ LpProblem make_lp(std::uint32_t seed) {
 int main() {
     using sor::presolve::DualRecoveryKind;
     int optimal = 0, lifted_with_doubleton = 0, lifted_with_parallel = 0, chains = 0;
-    int lifted_with_transfer = 0, lifted_with_tight_row = 0;
+    int lifted_with_transfer = 0, lifted_with_tight_row = 0, lifted_with_dual_fix = 0;
     int default_lifts = 0, default_forcing = 0, default_tightened = 0;
     // The live rules, then the default rule set alone (forcing rows and
     // singleton rows turned into bounds) on the same models.
@@ -146,13 +147,14 @@ int main() {
             continue;
         }
         int doubletons = 0, parallels = 0, tight_rows = 0, transfers = 0;
-        int forcing = 0, tightened = 0;
+        int forcing = 0, tightened = 0, dual_fixes = 0;
         for (const auto& step : out.map.recovery_steps) {
             doubletons += step.kind == DualRecoveryKind::DoubletonEquality;
             parallels += step.kind == DualRecoveryKind::ParallelRowMerge;
             tight_rows += step.kind == DualRecoveryKind::RowSideFixed;
             forcing += step.kind == DualRecoveryKind::ForcingRow;
             tightened += step.kind == DualRecoveryKind::BoundTightening;
+            dual_fixes += step.kind == DualRecoveryKind::DualFix;
         }
         for (const auto& rec : out.map.doubleton_equalities) transfers += rec.transferred;
         if (live ? doubletons == 0 && parallels == 0 : out.map.recovery_steps.empty()) continue;
@@ -252,12 +254,13 @@ int main() {
         lifted_with_transfer += transfers > 0;
         lifted_with_tight_row += tight_rows > 0;
         lifted_with_parallel += parallels > 0;
+        lifted_with_dual_fix += dual_fixes > 0;
         chains += doubletons > 1;
     }
     std::cout << "optimal " << optimal << ", lifts with doubletons " << lifted_with_doubleton
               << " (chains " << chains << ", bound transfers " << lifted_with_transfer
               << ", cost-tight rows " << lifted_with_tight_row << "), with parallel rows "
-              << lifted_with_parallel << "\n";
+              << lifted_with_parallel << ", with dual fixing " << lifted_with_dual_fix << "\n";
     std::cout << "default rules: lifts " << default_lifts << " (forcing rows "
               << default_forcing << ", tightened singleton rows " << default_tightened << ")\n";
     CHECK(default_forcing >= 50);
@@ -267,5 +270,6 @@ int main() {
     CHECK(lifted_with_doubleton >= 100);
     CHECK(lifted_with_parallel >= 50);
     CHECK(chains >= 20);
+    CHECK(lifted_with_dual_fix >= 50);
     return sor::test::finish("test_presolve_live_lift");
 }
