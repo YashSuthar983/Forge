@@ -1594,6 +1594,9 @@ void test_presolve_equality_aggregation_chain_lifts_proof_and_basis() {
     SimplexOptions opts;
     opts.method = sor::engines::SimplexMethod::Dual;
     opts.presolve = true;
+    // The kernel aggregation path; the live rules would take these
+    // doubleton equalities first (test_presolve_live_lift covers those).
+    opts.presolve_live_reductions = false;
     const auto run = solve_problem(lp, opts);
 
     CHECK(run.r.status == Status::Optimal);
@@ -1699,6 +1702,9 @@ void test_singletons_before_aggregation_replay_stored_duals() {
     SimplexOptions opts;
     opts.method = sor::engines::SimplexMethod::Dual;
     opts.presolve = true;
+    // The kernel aggregation path; the live rules would take these
+    // doubleton equalities first (test_presolve_live_lift covers those).
+    opts.presolve_live_reductions = false;
     const auto run = solve_problem(lp, opts);
     CHECK(run.r.status == Status::Optimal);
     CHECK(run.r.proof == ProofLevel::ProvedOptimalFP);

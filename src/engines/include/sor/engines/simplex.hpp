@@ -55,6 +55,10 @@ struct SimplexOptions {
     std::uint64_t perturbation_seed = 0;
     bool presolve_equation_sparsification = true;
     bool presolve_domain_probing = false;
+    // Live presolve rules (doubleton equalities with bound transfer,
+    // cost-forced inequalities, dual fixing) and parallel rows, each with
+    // its primal, dual and basis recovery.
+    bool presolve_live_reductions = true;
     std::uint64_t max_iterations = 0;
     double time_limit_s = 900.0;
 

@@ -2936,6 +2936,8 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         if (opts.presolve_equation_sparsification) popts.max_aggregation_row_nnz = 128;
         popts.domain_probing = opts.presolve_domain_probing;
         popts.implied_slack = opts.presolve_implied_slack;
+        popts.live_reductions = opts.presolve_live_reductions;
+        popts.parallel_rows = opts.presolve_live_reductions;
         auto outcome = presolve::presolve(problem, popts);
         presolve_status = outcome.status;
         pmap = std::move(outcome.map);
