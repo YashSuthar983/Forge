@@ -110,13 +110,9 @@ void LiveMatrix::build(const model::LpProblem& problem,
         }
         recompute_row_activity(i);
     }
-    // The aggregation-only path needs matrix incidence, but never reads locks.
-    // Computing each lock rescans its incident rows and can cost sum(degree^2)
-    // on wide matrices even when presolve makes no reductions.
-    if (options.live_reductions) {
-        for (Index j = 0; j < n; ++j)
-            if (col_active[sz(j)]) recompute_col_locks(j);
-    }
+    // Locks are not computed here: dual fixing, their only reader, acts on
+    // empty columns and recomputes them itself. Computing every lock
+    // rescans each column's rows, sum(row length^2) work (nw04: 35 s).
 }
 
 void LiveMatrix::seed_all_queues() {
@@ -329,7 +325,6 @@ bool LiveMatrix::apply_implied_bounds_row(Index i) {
             record_column_dual_state(step, i, j);
             out->recovery_steps.push_back(std::move(step));
             ++out->stats.bounds_tightened;
-            recompute_col_locks(j);
             queue_col(j);
             // A bound affects every incident row, including ones already
             // consumed from the queue in this pass.
