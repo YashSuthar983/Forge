@@ -186,8 +186,13 @@ ComponentPresolveDiagnostics apply_component_presolve(
             }
         } row_guard{sub, comp_rows[cid]};
 
+        // Rows outside this component are relaxed in `sub`. Their columns
+        // therefore appear lock-free, but fixing them here is unsound: their
+        // own component rows still constrain them. Only fix columns whose
+        // rows are currently active. This previously produced false root
+        // Infeasible claims on seymour1 and supportcase12.
         auto dfix = apply_dual_fixing(sub, col_lo, col_hi, opts.tol,
-                                         opts.dual_fix_rounds, true);
+                                      opts.dual_fix_rounds, true, 0.0, &cols);
         diag.dual_fixings += dfix.fixings;
         if (dfix.infeasible) {
             diag.infeasible = true;

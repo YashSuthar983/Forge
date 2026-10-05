@@ -465,23 +465,21 @@ backend::BqData binquad_device_data(const io::QplibInstance& q, f64& scale) {
     return d;
 }
 
-BinQuadResult solve_binquad_parallel(const io::QplibInstance& q,
-                                     const BinQuadParallelOptions& opts,
-                                     backend::BinQuadDevice& dev,
-                                     BinQuadDiagnostics& diag) {
+// The device-interaction core of solve_binquad_parallel: upload, run epochs,
+// track the elite pool, restart stalled searches. Model-representation
+// agnostic -- everything here reads only `data` (already in BqData's L/M/A
+// form), never the original instance -- so it is reused as-is by
+// solve_binquad_parallel (QPLIB) and by try_binquad_milp_heuristic (a pure-
+// binary MILP, G1 in the GPU-track plan: same model, M always empty).
+// Returns the best point found; the caller re-scores it from ITS OWN
+// original representation (never trusting the device's running sums -- see
+// the QPLIB re-scoring right below this function, and the LP-side
+// equivalent in binquad_milp_heuristic.cpp) and fills in diag's
+// found_feasible/best_objective/best_violation/total_ms itself.
+std::vector<std::uint8_t> solve_binquad_parallel_core(
+    const backend::BqData& data, f64 scale, const BinQuadParallelOptions& opts,
+    backend::BinQuadDevice& dev, BinQuadDiagnostics& diag) {
     const auto t0 = Clock::now();
-    diag = BinQuadDiagnostics{};
-    for (auto t : q.var_type)
-        if (t != io::QplibVarType::Binary)
-            throw std::invalid_argument("solve_binquad_parallel: every variable must be binary");
-    if (q.has_quadratic_constraints())   // same reason as solve_binquad
-        throw std::invalid_argument(
-            "solve_binquad_parallel: quadratic constraints are not supported");
-    if (opts.elite_size == 0 || opts.elite_size > 16 || opts.searches == 0)
-        throw std::invalid_argument("solve_binquad_parallel: need 1..16 elites, >= 1 search");
-
-    f64 scale = 1.0;
-    const backend::BqData data = binquad_device_data(q, scale);
     backend::BqParams bp;
     bp.searches = opts.searches;
     bp.tenure_min = opts.tenure_min;
@@ -559,11 +557,34 @@ BinQuadResult solve_binquad_parallel(const io::QplibInstance& q,
         }
     }
 
-    // Re-score from the raw instance; the device's running sums are not trusted.
+    diag.total_ms = ms_since(t0);
+    return !elite.empty() ? elite.front().x
+                         : (!least_viol_x.empty()
+                                ? least_viol_x
+                                : std::vector<std::uint8_t>(sz(data.n), 0));
+}
+
+BinQuadResult solve_binquad_parallel(const io::QplibInstance& q,
+                                     const BinQuadParallelOptions& opts,
+                                     backend::BinQuadDevice& dev,
+                                     BinQuadDiagnostics& diag) {
+    diag = BinQuadDiagnostics{};
+    for (auto t : q.var_type)
+        if (t != io::QplibVarType::Binary)
+            throw std::invalid_argument("solve_binquad_parallel: every variable must be binary");
+    if (q.has_quadratic_constraints())   // same reason as solve_binquad
+        throw std::invalid_argument(
+            "solve_binquad_parallel: quadratic constraints are not supported");
+    if (opts.elite_size == 0 || opts.elite_size > 16 || opts.searches == 0)
+        throw std::invalid_argument("solve_binquad_parallel: need 1..16 elites, >= 1 search");
+
+    const auto t0 = Clock::now();
+    f64 scale = 1.0;
+    const backend::BqData data = binquad_device_data(q, scale);
     const std::vector<std::uint8_t> best_x =
-        !elite.empty() ? elite.front().x
-                       : (!least_viol_x.empty() ? least_viol_x
-                                                : std::vector<std::uint8_t>(sz(q.n), 0));
+        solve_binquad_parallel_core(data, scale, opts, dev, diag);
+
+    // Re-score from the raw instance; the device's running sums are not trusted.
     f64 o = q.f_const;
     for (std::size_t t = 0; t < q.h_val.size(); ++t)
         o += 0.5 * q.h_val[t] * best_x[sz(q.h_row[t] - 1)] * best_x[sz(q.h_col[t] - 1)];

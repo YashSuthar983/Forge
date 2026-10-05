@@ -1,6 +1,5 @@
 #include "sor/search/mip_presolve.hpp"
 
-#include "sor/engines/lp_batched.hpp"
 #include "sor/search/component_presolve.hpp"
 #include "sor/search/gf2_presolve.hpp"
 #include "sor/search/implied_int.hpp"
@@ -31,42 +30,6 @@ inline bool nearly_fixed(f64 lo, f64 hi, f64 tol) {
     return std::isfinite(lo) && std::isfinite(hi) && hi - lo <= tol;
 }
 
-// Activity range of row i under the current box.
-void row_activity_bounds(const model::LpProblem& lp, Index i,
-                         const std::vector<f64>& col_lo,
-                         const std::vector<f64>& col_hi, f64& amin, f64& amax) {
-    const auto& rp = lp.A.pattern.row_ptr();
-    const auto& ci = lp.A.pattern.col_idx();
-    const auto& av = lp.A.vals;
-    amin = 0.0;
-    amax = 0.0;
-    for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
-        const Index j = ci[sz(k)];
-        const f64 a = av[sz(k)];
-        const f64 lo = col_lo[sz(j)];
-        const f64 hi = col_hi[sz(j)];
-        if (a >= 0.0) {
-            amin += a * lo;
-            amax += a * hi;
-        } else {
-            amin += a * hi;
-            amax += a * lo;
-        }
-    }
-}
-
-bool row_redundant(const model::LpProblem& lp, Index i,
-                   const std::vector<f64>& col_lo,
-                   const std::vector<f64>& col_hi, f64 tol) {
-    f64 amin = 0.0, amax = 0.0;
-    row_activity_bounds(lp, i, col_lo, col_hi, amin, amax);
-    const f64 rlo = lp.row_lo[sz(i)];
-    const f64 rhi = lp.row_hi[sz(i)];
-    const bool lo_ok = !std::isfinite(rlo) || amin >= rlo - tol;
-    const bool hi_ok = !std::isfinite(rhi) || amax <= rhi + tol;
-    return lo_ok && hi_ok;
-}
-
 // Effective objective coeff in minimize sense.
 inline f64 min_sense_c(const model::LpProblem& lp, Index j) {
     const f64 c = lp.c[sz(j)];
@@ -81,7 +44,8 @@ DualFixDiagnostics apply_dual_fixing(const model::LpProblem& lp,
                                       f64 tol,
                                       int max_rounds,
                                       bool zero_cost_ok,
-                                      double time_limit_s) {
+                                      double time_limit_s,
+                                      const std::vector<Index>* candidate_cols) {
     DualFixDiagnostics diag;
     // Dual fixing is the non-optional core of root MIP presolve and, on large
     // models, its dominant cost: 5.6 s on atlanta-ip (48738 cols) with every
@@ -109,7 +73,12 @@ DualFixDiagnostics apply_dual_fixing(const model::LpProblem& lp,
         std::vector<int> down_locks(sz(n), 0), up_locks(sz(n), 0);
 
         for (Index i = 0; i < m; ++i) {
-            if (row_redundant(lp, i, col_lo, col_hi, tol)) continue;
+            // Every nonzero row coefficient can lock a direction, even when
+            // its magnitude is below the feasibility tolerance: its activity
+            // over a wide domain can still be large. Likewise, a row that is
+            // only nearly redundant must retain its locks. Counting extra
+            // locks is conservative; dropping a real lock can remove the
+            // optimum.
             const f64 rlo = lp.row_lo[sz(i)];
             const f64 rhi = lp.row_hi[sz(i)];
             const bool has_lo = std::isfinite(rlo);
@@ -117,7 +86,7 @@ DualFixDiagnostics apply_dual_fixing(const model::LpProblem& lp,
             for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
                 const Index j = ci[sz(k)];
                 const f64 a = av[sz(k)];
-                if (std::fabs(a) <= tol) continue;
+                if (a == 0.0) continue;
                 if (a > 0.0) {
                     if (has_hi) ++up_locks[sz(j)];
                     if (has_lo) ++down_locks[sz(j)];
@@ -128,22 +97,25 @@ DualFixDiagnostics apply_dual_fixing(const model::LpProblem& lp,
             }
         }
 
-        for (Index j = 0; j < n; ++j) {
+        const Index n_candidates = candidate_cols
+            ? static_cast<Index>(candidate_cols->size()) : n;
+        for (Index t = 0; t < n_candidates; ++t) {
+            const Index j = candidate_cols ? (*candidate_cols)[sz(t)] : t;
             if (nearly_fixed(col_lo[sz(j)], col_hi[sz(j)], tol)) continue;
             if (!std::isfinite(col_lo[sz(j)]) && !std::isfinite(col_hi[sz(j)]))
                 continue;
             const f64 c = min_sense_c(lp, j);
-            if (!zero_cost_ok && std::fabs(c) <= tol) continue;
+            if (!zero_cost_ok && c == 0.0) continue;
 
             // Never dual-fix a free (two-sided infinite) direction to ±inf.
-            if (down_locks[sz(j)] == 0 && c >= -tol &&
+            if (down_locks[sz(j)] == 0 && c >= 0.0 &&
                 std::isfinite(col_lo[sz(j)])) {
                 if (col_hi[sz(j)] > col_lo[sz(j)] + tol) {
                     col_hi[sz(j)] = col_lo[sz(j)];
                     ++diag.fixings;
                     any = true;
                 }
-            } else if (up_locks[sz(j)] == 0 && c <= tol &&
+            } else if (up_locks[sz(j)] == 0 && c <= 0.0 &&
                        std::isfinite(col_hi[sz(j)])) {
                 if (col_lo[sz(j)] < col_hi[sz(j)] - tol) {
                     col_lo[sz(j)] = col_hi[sz(j)];
@@ -193,8 +165,46 @@ CliqueProbeDiagnostics apply_clique_probing(const model::LpProblem& lp,
     std::uint64_t cp_seen = 0;
 
     const Index n = lp.n_cols();
+    const Index m = lp.n_rows();
     const f64 tol = opts.tol;
     std::size_t probed = 0;
+
+    // Incremental probing. Each case fixes the clique's literals on the ONE
+    // global box, propagates only the rows its fixings reach (event queue,
+    // same row rule and integer rounding as the full sweep), records every
+    // bound change on a trail and undoes it afterwards. A case therefore costs
+    // its own cascade instead of an O(n) box copy plus `rounds` sweeps of the
+    // whole matrix (ex9: 18.1 s for 1,038 cliques before this).
+    //
+    // Hull over the feasible cases: a column no case changed keeps its bound
+    // in every case, so only a column changed by EVERY feasible case can be
+    // tightened. `seen_count[j] == f` after f feasible cases marks exactly
+    // those, and h_lo/h_hi hold their running hull.
+    const ColumnRowIndex index = build_column_row_index(lp);
+    PropagationScratch scratch;
+    PropTrail trail;
+    const std::uint64_t visit_cap =
+        static_cast<std::uint64_t>(std::max(1, opts.clique_propagation_rounds)) *
+        static_cast<std::uint64_t>(std::max<Index>(1, m));
+    std::vector<std::uint32_t> seen_stamp(sz(n), 0);
+    std::vector<std::uint32_t> seen_count(sz(n), 0);
+    std::vector<std::uint32_t> case_stamp(sz(n), 0);
+    std::vector<f64> h_lo(sz(n), 0.0), h_hi(sz(n), 0.0);
+    std::vector<Index> candidates, seeds;
+    std::uint32_t clique_stamp = 0, case_id = 0;
+    // Propagation fixpoint of the global box first, so a case differs from
+    // it only by what the case's fixings cause (the hull logic relies on it).
+    {
+        std::vector<Index> all(sz(n));
+        for (Index k = 0; k < n; ++k) all[sz(k)] = k;
+        const auto fr = propagate_bounds_events(lp, index, col_lo, col_hi, all,
+                                                scratch, nullptr, 0, tol, visit_cap);
+        if (!fr.feasible) {
+            diag.infeasible = true;
+            return diag;
+        }
+        diag.tightenings += fr.tightened;
+    }
 
     for (const Clique& c : cg.cliques()) {
         // Per-clique cost scales with clique size, so poll often.
@@ -220,58 +230,70 @@ CliqueProbeDiagnostics apply_clique_probing(const model::LpProblem& lp,
         if (bins.size() < 2 || bins.size() > opts.max_clique_size) continue;
         ++probed;
         ++diag.cliques_probed;
+        ++clique_stamp;
+        candidates.clear();
+        std::uint32_t feasible_cases = 0;
 
-        std::vector<f64> hull_lo = col_lo, hull_hi = col_hi;
-        bool hull_init = false;
-        std::size_t feasible_cases = 0;
-
-        auto absorb = [&](const std::vector<f64>& lo, const std::vector<f64>& hi) {
-            if (!hull_init) {
-                hull_lo = lo;
-                hull_hi = hi;
-                hull_init = true;
-            } else {
-                for (Index j = 0; j < n; ++j) {
-                    hull_lo[sz(j)] = std::min(hull_lo[sz(j)], lo[sz(j)]);
-                    hull_hi[sz(j)] = std::max(hull_hi[sz(j)], hi[sz(j)]);
+        // Runs one assignment (x_on = 1, the rest 0; on < 0: all 0) on the
+        // global box and restores it. Returns whether it stayed feasible.
+        const auto run_case = [&](Index on) -> bool {
+            const std::size_t mark = trail.size();
+            seeds.clear();
+            for (const Index j : bins) {
+                const f64 v = j == on ? 1.0 : 0.0;
+                if (col_lo[sz(j)] != v) {
+                    trail.push(j, BoundDir::Lower, v, col_lo[sz(j)],
+                               ReasonKind::Branch, -1, 1);
+                    col_lo[sz(j)] = v;
                 }
+                if (col_hi[sz(j)] != v) {
+                    trail.push(j, BoundDir::Upper, v, col_hi[sz(j)],
+                               ReasonKind::Branch, -1, 1);
+                    col_hi[sz(j)] = v;
+                }
+                seeds.push_back(j);
             }
-            ++feasible_cases;
+            const auto pr = propagate_bounds_events(lp, index, col_lo, col_hi,
+                                                    seeds, scratch, &trail, 1,
+                                                    tol, visit_cap);
+            if (pr.feasible) {
+                ++case_id;
+                const auto& es = trail.entries();
+                for (std::size_t k = mark; k < es.size(); ++k) {
+                    const Index v = es[k].var;
+                    if (case_stamp[sz(v)] == case_id) continue;  // once per case
+                    case_stamp[sz(v)] = case_id;
+                    if (feasible_cases == 0) {
+                        seen_stamp[sz(v)] = clique_stamp;
+                        seen_count[sz(v)] = 1;
+                        h_lo[sz(v)] = col_lo[sz(v)];
+                        h_hi[sz(v)] = col_hi[sz(v)];
+                        candidates.push_back(v);
+                    } else if (seen_stamp[sz(v)] == clique_stamp &&
+                               seen_count[sz(v)] == feasible_cases) {
+                        seen_count[sz(v)] = feasible_cases + 1;
+                        h_lo[sz(v)] = std::min(h_lo[sz(v)], col_lo[sz(v)]);
+                        h_hi[sz(v)] = std::max(h_hi[sz(v)], col_hi[sz(v)]);
+                    }
+                }
+                ++feasible_cases;
+            }
+            const auto& es = trail.entries();
+            for (std::size_t k = es.size(); k-- > mark;) {
+                const auto& e = es[k];
+                (e.dir == BoundDir::Lower ? col_lo : col_hi)[sz(e.var)] = e.old_bound;
+            }
+            trail.truncate(mark);
+            return pr.feasible;
         };
 
-        // All-zero assignment.
-        {
-            std::vector<f64> lo = col_lo, hi = col_hi;
-            for (Index j : bins) {
-                lo[sz(j)] = 0.0;
-                hi[sz(j)] = 0.0;
-            }
-            const auto pr =
-                propagate_bounds(lp, lo, hi, tol, opts.clique_propagation_rounds);
-            if (!pr.feasible) {
-                ++diag.exactly_one_upgrades;
-                // At least one must be 1: cannot tighten globally without more
-                // structure; skip hull contribution.
-            } else {
-                absorb(lo, hi);
-            }
-        }
+        // All-zero assignment. Infeasible means at least one must be 1:
+        // no global tightening from that alone, and no hull contribution.
+        if (!run_case(-1)) ++diag.exactly_one_upgrades;
 
         for (Index on : bins) {
-            std::vector<f64> lo = col_lo, hi = col_hi;
-            for (Index j : bins) {
-                if (j == on) {
-                    lo[sz(j)] = 1.0;
-                    hi[sz(j)] = 1.0;
-                } else {
-                    lo[sz(j)] = 0.0;
-                    hi[sz(j)] = 0.0;
-                }
-            }
-            const auto pr =
-                propagate_bounds(lp, lo, hi, tol, opts.clique_propagation_rounds);
-            if (!pr.feasible) {
-                // x_on = 1 is impossible → fix to 0.
+            if (!run_case(on)) {
+                // x_on = 1 is impossible -> fix to 0.
                 if (col_hi[sz(on)] > 0.5) {
                     col_hi[sz(on)] = 0.0;
                     if (col_lo[sz(on)] > col_hi[sz(on)] + tol) {
@@ -280,30 +302,29 @@ CliqueProbeDiagnostics apply_clique_probing(const model::LpProblem& lp,
                     }
                     ++diag.fixings;
                 }
-                continue;
             }
-            absorb(lo, hi);
         }
 
-        if (!hull_init) {
-            // Every case infeasible → global infeasibility.
+        if (feasible_cases == 0) {
+            // Every case infeasible -> global infeasibility.
             diag.infeasible = true;
             return diag;
         }
 
-        for (Index j = 0; j < n; ++j) {
+        for (const Index j : candidates) {
+            if (seen_count[sz(j)] != feasible_cases) continue;
             const f64 width = col_hi[sz(j)] - col_lo[sz(j)];
             const bool integral = is_int_col(lp, j);
             const f64 need =
                 (integral || !std::isfinite(width))
                     ? tol
                     : std::max(tol, 0.05 * width);
-            if (hull_lo[sz(j)] > col_lo[sz(j)] + need) {
-                col_lo[sz(j)] = hull_lo[sz(j)];
+            if (h_lo[sz(j)] > col_lo[sz(j)] + need) {
+                col_lo[sz(j)] = h_lo[sz(j)];
                 ++diag.tightenings;
             }
-            if (hull_hi[sz(j)] < col_hi[sz(j)] - need) {
-                col_hi[sz(j)] = hull_hi[sz(j)];
+            if (h_hi[sz(j)] < col_hi[sz(j)] - need) {
+                col_hi[sz(j)] = h_hi[sz(j)];
                 ++diag.tightenings;
             }
             if (col_lo[sz(j)] > col_hi[sz(j)] + tol) {
@@ -311,7 +332,6 @@ CliqueProbeDiagnostics apply_clique_probing(const model::LpProblem& lp,
                 return diag;
             }
         }
-        (void)feasible_cases;
     }
     return diag;
 }
@@ -353,77 +373,16 @@ ObbtDiagnostics apply_obbt_lite(const model::LpProblem& lp,
 
     bool any_lp = false;
 
-    // BatchLP FO min/max x_j probes (shared A). Apply only confident
-    // tightenings; remaining vars fall through to simplex / FBBT.
-    std::vector<char> batch_done(cands.size(), 0);
-    if (opts.batch_lp_obbt && !cands.empty()) {
-        std::vector<engines::BatchBoundProbe> probes;
-        struct Meta { std::size_t ci; Index j; int sense; };
-        std::vector<Meta> meta;
-        probes.reserve(cands.size() * 2);
-        meta.reserve(cands.size() * 2);
-        for (std::size_t ci = 0; ci < cands.size(); ++ci) {
-            const Index j = cands[ci].j;
-            for (int sense = 0; sense < 2; ++sense) {
-                engines::BatchBoundProbe pr;
-                pr.col_lo = col_lo;
-                pr.col_hi = col_hi;
-                pr.c.assign(sz(n), 0.0);
-                // Minimize sense: sense 0 → min x_j, sense 1 → min -x_j.
-                pr.c[sz(j)] = (sense == 0) ? 1.0 : -1.0;
-                probes.push_back(std::move(pr));
-                meta.push_back({ci, j, sense});
-            }
-        }
-        try {
-            engines::BatchProbeOptions bopt;
-            bopt.hpr_steps = opts.batch_lp_obbt_steps;
-            model::LpProblem base = lp;
-            base.col_lo = col_lo;
-            base.col_hi = col_hi;
-            base.maximize = false;
-            base.obj_offset = 0.0;
-            const auto results =
-                engines::batch_bound_probes_hpr(base, probes, bopt);
-            diag.batch_lp_probes += results.size();
-            for (std::size_t pi = 0; pi < results.size(); ++pi) {
-                const auto& r = results[pi];
-                const auto& m = meta[pi];
-                if (!r.looks_feasible || !std::isfinite(r.primal_obj))
-                    continue;
-                // Objective was ±x_j (+ offset 0); undo the sign for max.
-                const f64 val =
-                    (m.sense == 0) ? r.primal_obj : -r.primal_obj;
-                if (m.sense == 0) {
-                    f64 nl = is_int_col(lp, m.j) ? std::ceil(val - tol) : val;
-                    if (nl > col_lo[sz(m.j)] + tol) {
-                        col_lo[sz(m.j)] = std::min(nl, col_hi[sz(m.j)]);
-                        ++diag.batch_lp_tightenings;
-                        ++diag.lp_tightenings;
-                        batch_done[m.ci] = 1;
-                        any_lp = true;
-                    }
-                } else {
-                    f64 nh = is_int_col(lp, m.j) ? std::floor(val + tol) : val;
-                    if (nh < col_hi[sz(m.j)] - tol) {
-                        col_hi[sz(m.j)] = std::max(nh, col_lo[sz(m.j)]);
-                        ++diag.batch_lp_tightenings;
-                        ++diag.lp_tightenings;
-                        batch_done[m.ci] = 1;
-                        any_lp = true;
-                    }
-                }
-            }
-        } catch (...) {
-            // Fall through to simplex / FBBT.
-        }
-    }
+    // Only certified LP optima may tighten a domain. The former BatchLP
+    // path used an approximate primal objective, which is the wrong bound
+    // direction for OBBT and can remove feasible or optimal assignments.
+    // Keep the BatchLP option disabled until it returns a checked dual bound.
+    (void)opts.batch_lp_obbt;
 
     for (std::size_t ci = 0; ci < cands.size(); ++ci) {
         const Cand& c = cands[ci];
         ++diag.vars_tried;
         const Index j = c.j;
-        if (batch_done[ci]) continue;
         if (lp_opts != nullptr) {
             bool tightened = false;
             for (int sense = 0; sense < 2; ++sense) {
@@ -433,6 +392,11 @@ ObbtDiagnostics apply_obbt_lite(const model::LpProblem& lp,
                 sub.maximize = (sense == 1);
                 sub.c.assign(sz(n), 0.0);
                 sub.c[sz(j)] = 1.0;
+                // This probe optimizes x_j, not the model's original
+                // objective. Retaining obj_offset would shift the reported
+                // extremum before integer rounding and could exclude an
+                // optimal assignment (including a false Optimal proof).
+                sub.obj_offset = 0.0;
                 engines::SimplexOptions so = *lp_opts;
                 so.presolve = false;
                 so.time_limit_s = opts.obbt_lp_time_s;
@@ -441,26 +405,40 @@ ObbtDiagnostics apply_obbt_lite(const model::LpProblem& lp,
                 const core::RawResult raw =
                     engines::solve_simplex(sub, so, sd, nullptr);
                 ++diag.lp_solves;
-                if (raw.proposed_status != core::Status::Optimal) continue;
+                if (raw.proposed_status != core::Status::Optimal ||
+                    !sd.dual_bound_finite ||
+                    !std::isfinite(sd.dual_objective) ||
+                    sd.primal_residual > so.primal_feas_tol ||
+                    sd.dual_residual > so.dual_feas_tol ||
+                    sd.gap_rel > so.gap_tol)
+                    continue;
                 any_lp = true;
-                const f64 val = raw.objective;
+                // OBBT needs a relaxation bound: a lower bound on min x_j
+                // or an upper bound on max x_j. The primal objective has the
+                // opposite guarantee. Use the checked simplex dual value.
+                const f64 val = sd.dual_objective;
+                const f64 margin = std::max(tol,
+                    std::max(so.primal_feas_tol, so.dual_feas_tol) *
+                    (1.0 + std::fabs(val)));
                 if (sense == 0) {
                     // minimize x_j
-                    f64 nl = std::ceil(val - tol);
+                    f64 nl = std::ceil(val - margin);
                     if (is_int_col(lp, j)) {
                         // already ceil
                     } else {
                         nl = val;
                     }
-                    if (nl > col_lo[sz(j)] + tol) {
+                    if (nl > col_lo[sz(j)] + tol &&
+                        nl <= col_hi[sz(j)] + margin) {
                         col_lo[sz(j)] = std::min(nl, col_hi[sz(j)]);
                         ++diag.lp_tightenings;
                         tightened = true;
                     }
                 } else {
-                    f64 nh = std::floor(val + tol);
+                    f64 nh = std::floor(val + margin);
                     if (!is_int_col(lp, j)) nh = val;
-                    if (nh < col_hi[sz(j)] - tol) {
+                    if (nh < col_hi[sz(j)] - tol &&
+                        nh >= col_lo[sz(j)] - margin) {
                         col_hi[sz(j)] = std::max(nh, col_lo[sz(j)]);
                         ++diag.lp_tightenings;
                         tightened = true;
@@ -495,7 +473,8 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
                                         const MipPresolveOptions& opts,
                                         bool run_probing,
                                         const ProbingOptions& probe_opts,
-                                        const engines::SimplexOptions* lp_opts) {
+                                        const engines::SimplexOptions* lp_opts,
+                                        ProbingState* probing_state) {
     MipPresolveDiagnostics diag;
     const auto t0 = Clock::now();
     // Root presolve must live inside the solver's budget. Checked at the
@@ -591,10 +570,17 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
         ProbingOptions po = probe_opts;
         po.dual_fix_in_probing = opts.dual_fix_in_probing;
         if (out_of_time()) { ++diag.aborted_on_time; return true; }
+        // The probing allowance is for the whole presolve, not per cycle: two
+        // cycles each allowed the full limit doubled the cost (piperout-27
+        // spent 7.4 s in probing against a 3 s limit).
+        if (do_probe && po.probe_time_limit_s > 0.0) {
+            po.probe_time_limit_s -= diag.ms_conflict_graph / 1000.0;
+            if (po.probe_time_limit_s < 0.05) do_probe = false;
+        }
         if (do_probe) {
             PhaseTimer _t(diag.ms_conflict_graph);
             const auto cd =
-                build_conflict_graph(lp, col_lo, col_hi, cg, po);
+                build_conflict_graph(lp, col_lo, col_hi, cg, po, probing_state);
             merge_conflict(cd);
             if (cd.infeasible) return false;
         }

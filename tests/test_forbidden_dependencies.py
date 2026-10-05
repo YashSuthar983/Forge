@@ -10,6 +10,7 @@ listing from hiding a statically linked forbidden dependency.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -48,7 +49,10 @@ def run_checked(*argv: str) -> str:
 
 def reject_forbidden(label: str, payload: str) -> None:
     lowered = payload.lower()
-    matches = [token for token in FORBIDDEN if token in lowered]
+    # Solver symbols/library stems may have suffixes, but never start in
+    # the middle of an identifier (e.g. Boost's "expression").
+    matches = [token for token in FORBIDDEN
+               if re.search(r"(?<![a-z])(?:lib)?" + re.escape(token), lowered)]
     if matches:
         raise AssertionError(
             f"{label} contains forbidden solver dependency names "

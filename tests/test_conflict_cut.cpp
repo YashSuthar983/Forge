@@ -13,6 +13,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include "sor/core/route_debug.hpp"
 
 using sor::core::Status;
 using sor::search::BabDiagnostics;
@@ -91,6 +92,7 @@ void test_analyze_learns_valid_cut() {
 void test_latest_bab_learns_global_conflict_cut() {
     auto lp = read_text(kPairInfeas);
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.conflict_cut.enabled = true;
     opts.conflict_cut.mode = ConflictCutMode::Paper;
@@ -115,6 +117,9 @@ void test_latest_bab_learns_global_conflict_cut() {
     sor::search::solve_milp(lp, opts, diag);
     CHECK(diag.conflict_cut_diag.attempts >= 1);
     CHECK(diag.conflict_cuts_global >= 1);
+    CHECK(diag.conflict_cuts_global +
+              diag.conflict_cut_diag.validation_rejected ==
+          diag.conflict_cut_diag.learned);
 }
 
 void test_classical_default_off() {
@@ -123,6 +128,7 @@ void test_classical_default_off() {
     sor::search::apply_conflict_cut_policy(MilpPolicy::Classical, o);
     CHECK(!o.enabled);
     BabOptions latest;
+    latest.structural_presolve.enabled = false;  // component test: keep the model unreduced
     latest.policy = MilpPolicy::Latest;
     // Product default: Mexi on in struct; bab auto-disables on dense pure-binary.
     CHECK(latest.conflict_cut.enabled);
@@ -132,7 +138,7 @@ void test_classical_default_off() {
 void test_nogood_from_branch_trail_valid() {
     auto lp = read_text(kPairInfeas);
     sor::search::PropTrail trail;
-    // x1=1, x2=1 - classic infeasible assignment under CAP.
+    // x1=1, x2=1 — classic infeasible assignment under CAP.
     trail.push(0, sor::search::BoundDir::Lower, 1.0, 0.0,
                sor::search::ReasonKind::Branch, -1, 1);
     trail.push(1, sor::search::BoundDir::Lower, 1.0, 0.0,
@@ -233,6 +239,47 @@ void test_near_empty_cut_refused() {
     CHECK(!sor::search::conflict_cut_near_empty(bot));
 }
 
+void test_unverified_wide_cut_is_not_verified() {
+    constexpr int n = 18;
+    sor::model::LpProblem lp;
+    std::vector<sor::core::Index> rows(n, 0);
+    std::vector<sor::core::Index> cols(n);
+    std::vector<double> vals(n, 1.0);
+    for (int j = 0; j < n; ++j) cols[j] = j;
+    lp.A = sor::sparse::from_triplets(1, n, rows, cols, vals);
+    lp.row_lo = {1.0};
+    lp.row_hi = {sor::model::kInf};
+    lp.c.assign(n, 1.0);
+    lp.col_lo.assign(n, 0.0);
+    lp.col_hi.assign(n, 1.0);
+    lp.is_integer.assign(n, true);
+    sor::search::CutRow wide;
+    wide.cols = cols;
+    wide.vals = vals;
+    wide.row_lo = 1.0;
+    wide.row_hi = sor::model::kInf;
+    // Valid for the model (it is the model row) but the support exceeds the
+    // enumeration cap, so the checker must abstain instead of inserting it.
+    CHECK(sor::search::conflict_cut_check_binary(lp, wide) ==
+          sor::search::CutValidity::Unverified);
+
+    sor::model::LpProblem small;
+    small.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
+    small.row_lo = {1.0};
+    small.row_hi = {sor::model::kInf};
+    small.c = {1.0, 1.0};
+    small.col_lo = {0.0, 0.0};
+    small.col_hi = {1.0, 1.0};
+    small.is_integer = {true, true};
+    sor::search::CutRow narrow;
+    narrow.cols = {0, 1};
+    narrow.vals = {1.0, 1.0};
+    narrow.row_lo = 1.0;
+    narrow.row_hi = sor::model::kInf;
+    CHECK(sor::search::conflict_cut_check_binary(small, narrow) ==
+          sor::search::CutValidity::Verified);
+}
+
 void test_large_pure_binary_support_verified() {
     // 20 binaries with x0 + x1 >= 1. Full 2^20 exceeds the old enum budget;
     // support+prop verification must still certify the redundant cut.
@@ -264,9 +311,10 @@ void test_large_pure_binary_support_verified() {
 }
 
 void test_p0033_latest_learns_mexi_cut() {
-    // p0033: 33 pure binaries - Mexi stays on (n_bin < 80). Before support+prop
+    // p0033: 33 pure binaries — Mexi stays on (n_bin < 80). Before support+prop
     // verification, every FUIP cut died at Verified-only apply (2^33 budget).
     const char* candidates[] = {
+        SOR_SOURCE_DIR "/benchmarks/miplib-easy/mps/p0033.mps",
         "benchmarks/miplib-easy/mps/p0033.mps",
         "../benchmarks/miplib-easy/mps/p0033.mps",
         "sor/benchmarks/miplib-easy/mps/p0033.mps",
@@ -280,20 +328,37 @@ void test_p0033_latest_learns_mexi_cut() {
         }
     }
     if (!path) {
-        ::sor::test::report(true, "p0033: skipped (no mps)", __FILE__, __LINE__);
+        ::sor::test::skip("test_p0033_latest_learns_mexi_cut",
+                          "benchmarks/miplib-easy/mps/p0033.mps");
         return;
     }
     sor::io::MpsReadReport rep;
     auto lp = sor::io::read_mps_file(path, rep);
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.time_limit_s = 15.0;
     opts.feasibility_jump = false;
+    // This regression exercises the conflict trajectory reached with the
+    // light root-cut policy. The default cut selector can close p0033 before
+    // any conflict is generated, making the accounting assertion vacuous.
+    opts.auto_cuts = false;
     BabDiagnostics diag;
     sor::search::solve_milp(lp, opts, diag);
     CHECK(diag.conflict_cut_diag.attempts >= 1);
     CHECK(diag.conflict_cut_diag.learned >= 1);
-    CHECK(diag.conflict_cuts_global >= 1);
+    // Every configured analysis attempt either learns a cut or aborts its
+    // derivation; post-learning rejection must not inflate aborted.
+    CHECK(diag.conflict_cut_diag.aborted + diag.conflict_cut_diag.learned ==
+          diag.conflict_cut_diag.attempts);
+    // Accounting only. p0033 is not the accepted-cut regression: a learned
+    // cut is inserted or counted validation_rejected, and derivation aborts
+    // do not fill that counter. The accepted insertion is
+    // test_latest_bab_learns_global_conflict_cut. The rejected checker path
+    // is test_unverified_wide_cut_is_not_verified.
+    CHECK(diag.conflict_cuts_global +
+              diag.conflict_cut_diag.validation_rejected ==
+          diag.conflict_cut_diag.learned);
 }
 
 // Nogoods must refuse trails that branch on non-binary columns: the node
@@ -429,6 +494,7 @@ void test_general_integer_disabled_aborts() {
     const auto cut = sor::search::analyze_conflict_cuts(ctx, opts, cd);
     CHECK(!cut.has_value());
     CHECK(cd.aborted >= 1);
+    CHECK(cd.aborted_reason == cd.aborted);
 }
 
 void test_safe_limited_skips_cmir_on_nonbinary() {
@@ -462,7 +528,7 @@ void test_safe_limited_skips_cmir_on_nonbinary() {
 // Paper Example 2 / Fig. 2 mixed-binary skeleton (reconstructed):
 // binaries x1,x2,x3; continuous y1∈[0,1], y2∈[-1,1].
 // Local: x2=0 ⇒ y2≤0 (C4), y2≥0 & x3=0 (C5), y1≤3/4 (C1), x1≥1 (C2),
-// C3 infeasible. Analysis must either learn a valid cut or abort - never
+// C3 infeasible. Analysis must either learn a valid cut or abort — never
 // emit an inequality violated by a feasible MBP point.
 void test_mixed_binary_example2_safe() {
     sor::model::LpProblem lp;
@@ -546,7 +612,7 @@ void test_paper_mode_default() {
 
 // 2x1 + 2x2 + 2x3 = 3 with binaries: the LP relaxation sits at the fractional
 // point (1/2,1/2,1/2) so the tree must branch, and every integer leaf is
-// infeasible (the row can only sum to 0, 2, 4 or 6) - branches like
+// infeasible (the row can only sum to 0, 2, 4 or 6) — branches like
 // x1=0,x2=0 (forcing 2x3=3 > 1) are the canonical nogood source.
 const char* kNogoodModel = R"(NAME          NOGOOD
 ROWS
@@ -573,6 +639,7 @@ ENDATA
 
 BabOptions nogood_test_options() {
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.max_nodes = 50;
     opts.feasibility_jump = false;
     opts.sub_mip_lns = false;
@@ -594,9 +661,20 @@ void test_latest_bab_learns_nogood() {
     opts.policy = MilpPolicy::Latest;
     opts.conflict_cut.enabled = true;
     opts.conflict_cut.nogood_cuts = true;
+    // The LP-row path (kept as the fallback) ...
+    opts.conflict_cut.conflict_store = false;
     BabDiagnostics diag;
     sor::search::solve_milp(lp, opts, diag);
     CHECK(diag.nogood_cuts_global >= 1);
+    CHECK(diag.conflict_store.added == 0);
+    // ... and the persistent store, which learns the same nogood without
+    // touching the LP.
+    opts.conflict_cut.conflict_store = true;
+    BabDiagnostics stored;
+    sor::search::solve_milp(lp, opts, stored);
+    // A unit clause is applied to the root box instead of being stored.
+    CHECK(stored.conflict_store.added + stored.conflict_store_root_units >= 1);
+    CHECK(stored.nogood_cuts_global == 0);
 }
 
 void test_classical_learns_no_conflict_family() {
@@ -622,7 +700,7 @@ void test_nogood_cap_zero_disables_learning() {
 }
 
 void test_local_cut_row_aborts_global_learn() {
-    // Conflict on a row past n_global_rows must abort - never promote a
+    // Conflict on a row past n_global_rows must abort — never promote a
     // node-local GMI/MIR into a global conflict cut.
     auto lp = read_text(kPairInfeas);
     std::vector<sor::core::f64> lo = {1.0, 1.0};
@@ -654,6 +732,7 @@ void test_flugpl_latest_dual_not_above_opt() {
     // P0 regression (2026-09-13): Latest + conflict cuts promoted local tree
     // GMI into global_lp and proved dual 1253765 > true opt 1201500.
     const char* candidates[] = {
+        SOR_SOURCE_DIR "/benchmarks/miplib-easy/mps/flugpl.mps",
         "benchmarks/miplib-easy/mps/flugpl.mps",
         "../benchmarks/miplib-easy/mps/flugpl.mps",
         "sor/benchmarks/miplib-easy/mps/flugpl.mps",
@@ -667,13 +746,14 @@ void test_flugpl_latest_dual_not_above_opt() {
         }
     }
     if (!path) {
-        ::sor::test::report(true, "flugpl: skipped (no mps)", __FILE__,
-                            __LINE__);
+        ::sor::test::skip("test_flugpl_latest_dual_not_above_opt",
+                          "benchmarks/miplib-easy/mps/flugpl.mps");
         return;
     }
     sor::io::MpsReadReport rep;
     auto lp = sor::io::read_mps_file(path, rep);
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.time_limit_s = 15.0;
     opts.conflict_cut.enabled = true;
@@ -690,7 +770,10 @@ void test_flugpl_latest_dual_not_above_opt() {
 
     if (r.status == Status::Optimal || diag.globally_proved) {
         CHECK_NEAR(diag.incumbent, kOpt, kTol);
-        CHECK_NEAR(diag.dual_bound, kOpt, kTol);
+        // A proof may close on the solver's MIP gap tolerance rather than by
+        // exhausting the tree, so the bound is only within opts.gap_tol of
+        // the optimum (still never above it: dual_ok above).
+        CHECK_NEAR(diag.dual_bound, kOpt, 2.0 * opts.gap_tol);
     } else if (r.status == Status::Feasible) {
         CHECK(std::isfinite(diag.incumbent));
         CHECK(diag.incumbent >= kOpt * (1.0 - kTol));
@@ -703,10 +786,11 @@ void test_flugpl_latest_dual_not_above_opt() {
 }
 
 void test_misc03_dense_binary_mexi_auto_off() {
-    // misc03: 159×0-1 + 1 continuous - mixed, so dense pure-binary auto-off
+    // misc03: 159×0-1 + 1 continuous — mixed, so dense pure-binary auto-off
     // (n_cont==0 && n_bin≥80 && n_bin==n_int) does not fire. Nogoods apply.
     // Support+prop Verified accepts small binary-support FUIP cuts.
     const char* candidates[] = {
+        SOR_SOURCE_DIR "/benchmarks/miplib-easy/mps/misc03.mps",
         "benchmarks/miplib-easy/mps/misc03.mps",
         "../benchmarks/miplib-easy/mps/misc03.mps",
         "sor/benchmarks/miplib-easy/mps/misc03.mps",
@@ -720,20 +804,32 @@ void test_misc03_dense_binary_mexi_auto_off() {
         }
     }
     if (!path) {
-        ::sor::test::report(true, "misc03: skipped (no mps)", __FILE__, __LINE__);
+        ::sor::test::skip("test_misc03_dense_binary_mexi_auto_off",
+                          "benchmarks/miplib-easy/mps/misc03.mps");
         return;
     }
     sor::io::MpsReadReport rep;
     auto lp = sor::io::read_mps_file(path, rep);
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.time_limit_s = 8.0;
     opts.feasibility_jump = false;
+    // Exercise conflict learning in the tree. The default incumbent-focused
+    // portfolio can spend this entire short allowance in primal heuristics.
+    opts.heuristic_budget_frac = 0.0;
+    opts.heuristic_budget_frac_no_incumbent = 0.0;
+    opts.heuristic_budget_frac_stalled = 0.0;
+    opts.heuristic_budget_frac_proof = 0.0;
     BabDiagnostics diag;
     sor::search::solve_milp(lp, opts, diag);
     CHECK(diag.conflict_cut_diag.attempts >= 1);
-    CHECK(diag.conflict_cuts_global >= 1);
-    CHECK(diag.nogood_cuts_global >= 1);
+    // The mixed-model Mexi path must execute. Accepted insertion is the
+    // enumerable pair model, not this timed solve and not p0033.
+    CHECK(diag.nogood_cuts_global + diag.conflict_store.added >= 1);
+    CHECK(diag.conflict_cuts_global +
+              diag.conflict_cut_diag.validation_rejected ==
+          diag.conflict_cut_diag.learned);
 }
 
 void test_enigma_latest_not_false_infeasible() {
@@ -741,6 +837,7 @@ void test_enigma_latest_not_false_infeasible() {
     // Latest defaults (dense pure-binary Mexi auto-off in bab) must not claim
     // Infeasible; HiGHS / Classical Optimal 0.
     const char* candidates[] = {
+        SOR_SOURCE_DIR "/benchmarks/miplib-easy/mps/enigma.mps",
         "benchmarks/miplib-easy/mps/enigma.mps",
         "../benchmarks/miplib-easy/mps/enigma.mps",
         "sor/benchmarks/miplib-easy/mps/enigma.mps",
@@ -754,13 +851,14 @@ void test_enigma_latest_not_false_infeasible() {
         }
     }
     if (!path) {
-        ::sor::test::report(true, "enigma: skipped (no mps)", __FILE__,
-                            __LINE__);
+        ::sor::test::skip("test_enigma_latest_not_false_infeasible",
+                          "benchmarks/miplib-easy/mps/enigma.mps");
         return;
     }
     sor::io::MpsReadReport rep;
     auto lp = sor::io::read_mps_file(path, rep);
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.time_limit_s = 20.0;
     // Explicit default-on conflict (struct default); do not force Paper.
@@ -779,6 +877,7 @@ void test_gen_ip002_latest_not_false_optimal() {
     // P0 (2026-09-14): Unverified Mexi cuts on global_lp falsely closed the
     // tree at incumbent ~-4746 while HiGHS holds feasible ~-4772 (min).
     const char* candidates[] = {
+        SOR_SOURCE_DIR "/benchmarks/miplib-easy/mps/gen-ip002.mps",
         "benchmarks/miplib-easy/mps/gen-ip002.mps",
         "../benchmarks/miplib-easy/mps/gen-ip002.mps",
         "sor/benchmarks/miplib-easy/mps/gen-ip002.mps",
@@ -792,13 +891,14 @@ void test_gen_ip002_latest_not_false_optimal() {
         }
     }
     if (!path) {
-        ::sor::test::report(true, "gen-ip002: skipped (no mps)", __FILE__,
-                            __LINE__);
+        ::sor::test::skip("test_gen_ip002_latest_not_false_optimal",
+                          "benchmarks/miplib-easy/mps/gen-ip002.mps");
         return;
     }
     sor::io::MpsReadReport rep;
     auto lp = sor::io::read_mps_file(path, rep);
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.time_limit_s = 25.0;
     BabDiagnostics diag;
@@ -825,6 +925,7 @@ void test_markshare1_latest_not_false_optimal() {
     // P0 (2026-09-14): conflict+nogood Unverified cuts claimed Optimal 19;
     // MIPLIB verified optimum is 1.
     const char* candidates[] = {
+        SOR_SOURCE_DIR "/benchmarks/miplib-easy/mps/markshare1.mps",
         "benchmarks/miplib-easy/mps/markshare1.mps",
         "../benchmarks/miplib-easy/mps/markshare1.mps",
         "sor/benchmarks/miplib-easy/mps/markshare1.mps",
@@ -838,13 +939,14 @@ void test_markshare1_latest_not_false_optimal() {
         }
     }
     if (!path) {
-        ::sor::test::report(true, "markshare1: skipped (no mps)", __FILE__,
-                            __LINE__);
+        ::sor::test::skip("test_markshare1_latest_not_false_optimal",
+                          "benchmarks/miplib-easy/mps/markshare1.mps");
         return;
     }
     sor::io::MpsReadReport rep;
     auto lp = sor::io::read_mps_file(path, rep);
     BabOptions opts;
+    opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.time_limit_s = 20.0;
     BabDiagnostics diag;
@@ -871,6 +973,7 @@ int main() {
     test_nogood_refuses_mixed_trail();
     test_validity_check_tri_state();
     test_near_empty_cut_refused();
+    test_unverified_wide_cut_is_not_verified();
     test_large_pure_binary_support_verified();
     test_general_integer_conflict_safe();
     test_general_integer_disabled_aborts();

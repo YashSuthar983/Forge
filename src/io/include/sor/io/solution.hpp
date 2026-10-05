@@ -22,8 +22,11 @@ struct SolutionFile {
     f64 objective = core::kNaN;
     std::vector<f64> x;
     std::vector<f64> y;
+    std::vector<std::string> exact_dual;
+    std::vector<std::string> exact_dual_farkas;
     std::vector<f64> ray;  // Farkas certificate; empty unless status == Infeasible
     std::vector<f64> primal_ray;
+    std::vector<std::string> exact_primal_ray;
     std::vector<f64> dual_farkas_ray;
 };
 
@@ -36,6 +39,10 @@ struct SolutionFile {
 //   ray <k> <v0> ... <v_{k-1}>     (k == 0 line still present when empty)
 //   primal_ray <k> ...              (unboundedness certificate)
 //   dual_farkas_ray <k> ...         (infeasibility certificate)
+// Optional exact witnesses, with the corresponding floating vector's size:
+//   exact_dual <m> <rational> ...
+//   exact_dual_farkas <m> <rational> ...
+//   exact_primal_ray <n> <rational> ...
 void write_solution(std::ostream& out, const core::SolveResult& r);
 
 // Throws std::runtime_error on a malformed file (missing field, size

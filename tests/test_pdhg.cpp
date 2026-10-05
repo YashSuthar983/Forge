@@ -215,5 +215,15 @@ int main() {
         CHECK(diag.gap_rel <= opts.gap_tol);
     }
 
+    // Residual evaluation can be disabled without disabling the deadline.
+    {
+        engines::PdhgOptions options;
+        options.check_every = 0;
+        options.time_limit_s = 1e-12;
+        options.max_iterations = 100000000;
+        engines::PdhgDiagnostics diagnostics;
+        engines::solve_pdhg(load_test_lp(), options, *be, diagnostics);
+        CHECK(diagnostics.iterations <= 1);
+    }
     return sor::test::finish("test_pdhg");
 }

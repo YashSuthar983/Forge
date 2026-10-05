@@ -1,0 +1,96 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Folds every workgroup partial into the ten doubles that are the ONLY
+// thing the KKT check moves across the bus.  Everything the HPR engine reads
+// off LpDevice::Kkt is either one of these ten or derivable from them on
+// the host, so a convergence check costs 80 bytes regardless of problem size.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint wg_cols;
+    uint wg_rows;
+    uint stride;
+    uint pad;
+    double primal_weight;
+} pc;
+
+layout(std430, binding = 0) readonly buffer PartBuf { double part[]; };
+layout(std430, binding = 1) readonly buffer AccBuf  { double acc[]; };
+layout(std430, binding = 2) writeonly buffer OutBuf { double kkt[]; };
+
+const uint SLOT_PRES_C   = 0u;
+const uint SLOT_DRES_C   = 1u;
+const uint SLOT_NONFIN_C = 2u;
+const uint SLOT_POBJ     = 3u;
+const uint SLOT_DOBJ_C   = 4u;
+const uint SLOT_EDX2     = 5u;
+const uint SLOT_PRES_R   = 6u;
+const uint SLOT_DRES_R   = 7u;
+const uint SLOT_NONFIN_R = 8u;
+const uint SLOT_DOBJ_R   = 9u;
+const uint SLOT_EDY2     = 10u;
+
+const uint ACC_DX2   = 0u;
+const uint ACC_DY2   = 1u;
+const uint ACC_RATIO = 2u;
+
+shared double s_red[256];
+
+double wg_reduce(double v, bool take_max) {
+    uint t = gl_LocalInvocationID.x;
+    barrier();
+    s_red[t] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) s_red[t] = take_max ? max(s_red[t], s_red[t + s])
+                                       : s_red[t] + s_red[t + s];
+        barrier();
+    }
+    double r = s_red[0];
+    barrier();
+    return r;
+}
+
+double gather(uint slot, uint count, bool take_max) {
+    double v = 0.0lf;
+    for (uint k = gl_LocalInvocationID.x; k < count; k += 256u) {
+        double p = part[slot * pc.stride + k];
+        v = take_max ? max(v, p) : v + p;
+    }
+    return wg_reduce(v, take_max);
+}
+
+void main() {
+    double pres_c = gather(SLOT_PRES_C, pc.wg_cols, true);
+    double dres_c = gather(SLOT_DRES_C, pc.wg_cols, true);
+    double nonfin_c = gather(SLOT_NONFIN_C, pc.wg_cols, true);
+    double pobj = gather(SLOT_POBJ, pc.wg_cols, false);
+    double dobj_c = gather(SLOT_DOBJ_C, pc.wg_cols, false);
+    double edx2 = gather(SLOT_EDX2, pc.wg_cols, false);
+    double pres_r = gather(SLOT_PRES_R, pc.wg_rows, true);
+    double dres_r = gather(SLOT_DRES_R, pc.wg_rows, true);
+    double nonfin_r = gather(SLOT_NONFIN_R, pc.wg_rows, true);
+    double dobj_r = gather(SLOT_DOBJ_R, pc.wg_rows, false);
+    double edy2 = gather(SLOT_EDY2, pc.wg_rows, false);
+
+    if (gl_LocalInvocationID.x != 0u) return;
+
+    double w = pc.primal_weight;
+    bool finite = (nonfin_c + nonfin_r) == 0.0lf;
+    double dobj = dobj_c + dobj_r;
+    if (!finite || isinf(dobj) || isnan(dobj))
+        dobj = packDouble2x32(uvec2(0u, 0x7FF80000u));  // quiet NaN
+
+    kkt[0] = max(pres_c, pres_r);
+    kkt[1] = max(dres_c, dres_r);
+    kkt[2] = pobj;
+    kkt[3] = dobj;
+    kkt[4] = sqrt(edx2);
+    kkt[5] = sqrt(edy2);
+    kkt[6] = sqrt(w * acc[ACC_DX2] + acc[ACC_DY2] / w);
+    kkt[7] = acc[ACC_RATIO];
+    kkt[8] = sqrt(acc[ACC_DX2]);   // last step's fixed-point movement
+    kkt[9] = sqrt(acc[ACC_DY2]);
+}

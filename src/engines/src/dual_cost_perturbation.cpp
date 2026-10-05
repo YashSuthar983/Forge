@@ -25,7 +25,7 @@ bool build_dual_perturbed_costs(
     const core::f64 multiplier,
     const core::f64 infinity,
     std::vector<core::f64>& perturbed,
-    DualCostPerturbationStats* stats) {
+    DualCostPerturbationStats* stats, std::uint64_t seed) {
     DualCostPerturbationStats local;
     if (n_struct < 0 || static_cast<std::size_t>(n_struct) > cost.size() ||
         lower.size() != cost.size() || upper.size() != cost.size() ||
@@ -69,7 +69,7 @@ bool build_dual_perturbed_costs(
         const bool fixed = l == u;
         if (free || fixed) continue;
         const core::f64 magnitude =
-            (1.0 + deterministic_fraction(static_cast<std::uint64_t>(j))) *
+            (1.0 + deterministic_fraction(static_cast<std::uint64_t>(j) + seed)) *
             (std::fabs(cost[k]) + 1.0) * local.structural_base;
         core::f64 sign = 0.0;
         if (u >= infinity) sign = 1.0;            // lower-bounded
@@ -84,7 +84,7 @@ bool build_dual_perturbed_costs(
     for (std::size_t k = static_cast<std::size_t>(n_struct);
          k < cost.size(); ++k) {
         const core::f64 delta =
-            (0.5 - deterministic_fraction(static_cast<std::uint64_t>(k))) *
+            (0.5 - deterministic_fraction(static_cast<std::uint64_t>(k) + seed)) *
             logical_base;
         if (delta == 0.0) continue;
         perturbed[k] += delta;
@@ -93,6 +93,40 @@ bool build_dual_perturbed_costs(
     }
     if (stats) *stats = local;
     return true;
+}
+
+core::f64 koberstein_perturbation(const core::f64 cost, const bool downward,
+                                  const core::f64 mu,
+                                  const core::Index column_nonzeros,
+                                  const core::f64 dual_tol,
+                                  const core::f64 mean_abs_cost) {
+    constexpr core::f64 psi = 1e-5;
+    static constexpr core::f64 w[10] = {1e-2, 1e-1, 1.0, 2.0, 5.0,
+                                        10.0, 20.0, 30.0, 40.0, 100.0};
+    // Step 1.
+    core::f64 xi = 100.0 * dual_tol + psi * std::fabs(cost);
+    // Step 2.
+    xi = 0.5 * xi * (1.0 + mu);
+    // Step 3: nu_j = 1..10 maps to w_1..w_10; more than 10 uses w_10.
+    const core::Index nu = std::max<core::Index>(1, column_nonzeros);
+    xi *= w[std::min<core::Index>(nu, 10) - 1];
+    // Step 4.
+    const core::f64 xi_min = std::min(1e-2 * dual_tol, psi);
+    const core::f64 xi_max = std::max(1e3 * dual_tol, psi * 10.0 * mean_abs_cost);
+    while (xi > xi_max) xi *= 0.1;
+    while (xi < xi_min) xi *= 10.0;
+    return downward ? -xi : xi;
+}
+
+bool koberstein_perturb_at_start(const std::vector<core::f64>& cost,
+                                 const core::Index n_struct) {
+    if (n_struct <= 0 || static_cast<std::size_t>(n_struct) > cost.size())
+        return false;
+    std::vector<core::f64> c(cost.begin(), cost.begin() + n_struct);
+    std::sort(c.begin(), c.end());
+    const auto distinct = static_cast<core::Index>(
+        std::unique(c.begin(), c.end()) - c.begin());
+    return 4 * distinct < n_struct;
 }
 
 }  // namespace sor::engines

@@ -1,0 +1,101 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Row half of the device-side KKT reduction.  See kkt_cols.comp; the row
+// multiplier is -y*row_scale because the internal HPR y carries the opposite
+// sign of the public multiplier.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n_rows;
+    uint stride;
+    double primal_tol;
+    double dual_tol;
+} pc;
+
+layout(std430, binding = 0) readonly buffer YBuf      { double y[]; };
+layout(std430, binding = 1) readonly buffer AxBuf     { double ax[]; };
+layout(std430, binding = 2) readonly buffer LoBuf     { double lo[]; };
+layout(std430, binding = 3) readonly buffer HiBuf     { double hi[]; };
+layout(std430, binding = 4) readonly buffer ScaleBuf  { double row_scale[]; };
+layout(std430, binding = 5) readonly buffer AnchorBuf { double y_anchor[]; };
+layout(std430, binding = 6) buffer PartBuf            { double part[]; };
+
+const uint SLOT_PRES_R   = 6u;
+const uint SLOT_DRES_R   = 7u;
+const uint SLOT_NONFIN_R = 8u;
+const uint SLOT_DOBJ_R   = 9u;
+const uint SLOT_EDY2     = 10u;
+
+shared double s_red[256];
+
+double wg_reduce(double v, bool take_max) {
+    uint t = gl_LocalInvocationID.x;
+    barrier();
+    s_red[t] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) s_red[t] = take_max ? max(s_red[t], s_red[t + s])
+                                       : s_red[t] + s_red[t + s];
+        barrier();
+    }
+    double r = s_red[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    bool live = i < pc.n_rows;
+
+    double pres = 0.0lf;
+    double dres = 0.0lf;
+    double nonfin = 0.0lf;
+    double dobj = 0.0lf;
+    double edy2 = 0.0lf;
+
+    if (live) {
+        double rs = row_scale[i];
+        double a = ax[i];
+        double rlo = lo[i];
+        double rhi = hi[i];
+        if (a < rlo) pres = max(pres, (rlo - a) / rs);
+        if (a > rhi) pres = max(pres, (a - rhi) / rs);
+
+        double yi = y[i];
+        double activity_orig = a / rs;
+        double multiplier = -yi * rs;
+        double at_tol = pc.primal_tol * (1.0lf + abs(activity_orig));
+        bool at_lo = !isinf(rlo) && activity_orig <= rlo / rs + at_tol;
+        bool at_hi = !isinf(rhi) && activity_orig >= rhi / rs - at_tol;
+        if (at_lo && !at_hi)       dres = max(0.0lf, -multiplier);
+        else if (at_hi && !at_lo)  dres = max(0.0lf, multiplier);
+        else if (!at_lo && !at_hi) dres = abs(multiplier);
+
+        double bound = yi >= 0.0lf ? rhi : rlo;
+        if (isinf(bound)) {
+            if (yi != 0.0lf) nonfin = 1.0lf;
+        } else {
+            dobj = -yi * bound;
+        }
+
+        double d = yi - y_anchor[i];
+        edy2 = d * d;
+    }
+
+    double r_pres = wg_reduce(pres, true);
+    double r_dres = wg_reduce(dres, true);
+    double r_nonfin = wg_reduce(nonfin, true);
+    double r_dobj = wg_reduce(dobj, false);
+    double r_edy2 = wg_reduce(edy2, false);
+
+    if (gl_LocalInvocationID.x == 0u) {
+        uint w = gl_WorkGroupID.x;
+        part[SLOT_PRES_R * pc.stride + w] = r_pres;
+        part[SLOT_DRES_R * pc.stride + w] = r_dres;
+        part[SLOT_NONFIN_R * pc.stride + w] = r_nonfin;
+        part[SLOT_DOBJ_R * pc.stride + w] = r_dobj;
+        part[SLOT_EDY2 * pc.stride + w] = r_edy2;
+    }
+}

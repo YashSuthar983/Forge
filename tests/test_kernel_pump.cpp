@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <vector>
+#include "sor/core/route_debug.hpp"
 
 using sor::core::f64;
 using sor::core::Index;
@@ -80,12 +81,25 @@ void test_kernel_pump_finds_feasible() {
     std::vector<f64> xout;
     KernelPumpDiagnostics d;
     const bool ok = kernel_pump(lp, xlp, nullptr, o, xout, d);
-    // May or may not succeed under tight caps; if it claims success it must
-    // be feasible for the original model.
-    if (ok) {
-        CHECK(satisfies(lp, xout, 1e-6));
-        CHECK(d.found);
-    }
+    // This fixture is deliberately easy and deterministic: exercise actual
+    // heuristic success as well as validating the point it returns.
+    CHECK(ok);
+    CHECK(satisfies(lp, xout, 1e-6));
+    CHECK(d.found);
+    CHECK(d.pumps > 0);
+}
+
+void test_exhausted_budget_starts_no_pump() {
+    const auto lp = tiny_set_cover();
+    KernelPumpOptions o;
+    o.time_limit_s = 1e-12;
+    o.kappa = 3;
+    o.max_pumps_total = 40;
+    o.refine_kernel = false;
+    std::vector<f64> xout;
+    KernelPumpDiagnostics d;
+    CHECK(!kernel_pump(lp, {0.7, 0.7, 0.6}, nullptr, o, xout, d));
+    CHECK(d.pumps == 0);
 }
 
 void test_disabled_returns_false() {
@@ -103,6 +117,7 @@ int main() {
     test_buckets_partition_binaries();
     test_restriction_fixes_excluded_to_zero();
     test_kernel_pump_finds_feasible();
+    test_exhausted_budget_starts_no_pump();
     test_disabled_returns_false();
     return sor::test::finish("test_kernel_pump");
 }

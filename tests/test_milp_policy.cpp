@@ -8,6 +8,9 @@
 
 #include <sstream>
 #include <string>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 using sor::search::BabDiagnostics;
 using sor::search::BabOptions;
@@ -53,6 +56,32 @@ void test_policy_parse_and_default() {
     CHECK(!sor::search::parse_milp_policy("bogus", p));
     CHECK(std::string(sor::search::milp_policy_name(MilpPolicy::Latest)) ==
           "latest");
+}
+
+void test_auto_parallelism_respects_affinity() {
+    sor::search::ParaBabOptions opts;
+    opts.threads = 0;
+#if defined(__linux__)
+    cpu_set_t original;
+    CPU_ZERO(&original);
+    if (sched_getaffinity(0, sizeof(original), &original) == 0) {
+        int first = -1;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+            if (CPU_ISSET(cpu, &original)) { first = cpu; break; }
+        if (first >= 0) {
+            cpu_set_t single;
+            CPU_ZERO(&single);
+            CPU_SET(first, &single);
+            if (sched_setaffinity(0, sizeof(single), &single) == 0) {
+                CHECK(sor::search::resolve_para_bab_threads(opts, true) == 1);
+                opts.threads = 3;
+                CHECK(sor::search::resolve_para_bab_threads(opts, true) == 3);
+                CHECK(sor::search::resolve_para_bab_threads(opts, false) == 1);
+                CHECK(sched_setaffinity(0, sizeof(original), &original) == 0);
+            }
+        }
+    }
+#endif
 }
 
 void test_feature_dims_stable() {
@@ -134,6 +163,7 @@ void test_classical_vs_latest_selectable() {
 
 int main() {
     test_policy_parse_and_default();
+    test_auto_parallelism_respects_affinity();
     test_feature_dims_stable();
     test_features_on_tiny_milp();
     test_classical_vs_latest_selectable();

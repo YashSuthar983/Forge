@@ -34,6 +34,7 @@
 #include "sor/core/result.hpp"
 #include "sor/model/lp.hpp"
 #include "sor/search/cuts.hpp"
+#include "sor/search/row_support_probe.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -97,10 +98,12 @@ struct ProbingOptions {
     // so it is budgeted three ways: by model size, by candidate count, and by
     // wall clock. Any of them tripping degrades probing to "did less", never to
     // an unsound result -- the facts already recorded stay valid.
-    Index max_binaries_probed = 2000;
+    Index max_binaries_probed = 200000;   // was 2000: on drayage-25-23 the first 4000 probes fixed nothing and probes 4001..17744 fixed 1162 columns (LP bound 11.7k -> 99.7k); time is bounded by probe_time_limit_s
     core::Offset max_nnz = 2000000;
     int probe_propagation_rounds = 6;
     double probe_time_limit_s = 3.0;
+    // Stop early on a slow, unproductive probing pass (see build_conflict_graph).
+    bool give_up_unproductive = true;
     // Row clique extraction. Long rows are skipped: the sorted sweep is
     // O(len log len), but the cliques a very long row yields are mostly
     // redundant with the row itself.
@@ -192,6 +195,32 @@ public:
 
     void sort_adjacency();
 
+    // Flags columns that are binary under the given box and were not flagged
+    // before (a column whose bounds later narrowed to {0,1}). Existing facts
+    // are untouched; used when a graph is carried into a narrower model.
+    void add_new_binaries(const model::LpProblem& lp,
+                          const std::vector<f64>& col_lo,
+                          const std::vector<f64>& col_hi);
+
+    // The same facts over a model whose columns were renumbered: `new_of_old[c]`
+    // is column c's index there, or -1 if c is gone (eliminated) or no longer
+    // means the same thing (merged into a sum). Every fact naming a gone column
+    // is dropped -- a clique minus some literals is still a clique -- and the
+    // rest is valid on the new model whenever the new model's feasible points
+    // project into the old model's.
+    ConflictGraph remapped(const std::vector<Index>& new_of_old, Index new_n) const;
+
+    // Forget every fact about the flagged columns: their literals' edges,
+    // their implied bounds (as either side), and their literals in cliques
+    // (a clique minus some literals is still a clique). Used when a later
+    // reformulation changes what those columns MEAN -- symmetry folding
+    // turns a representative into a sum and fixes the other members to 0,
+    // so a fact probed on the original columns is no longer about them.
+    // Facts among the remaining columns stay valid: every solution of the
+    // reformulated model lifts to one of the original with the same values
+    // on those columns.
+    void forget_columns(const std::vector<char>& drop);
+
 private:
     Index n_cols_ = 0;
     std::vector<bool> binary_;
@@ -204,6 +233,47 @@ private:
     bool sorted_ = false;
 };
 
+// Every pairwise conflict (a,b) encodes the clauses a => !b and
+// b => !a. Mutually reachable binary literals therefore describe an
+// equality or complement relation valid throughout the current global box.
+// Returns only relations between distinct variables; a contradictory graph
+// yields no substitutions and leaves infeasibility to the ordinary solver.
+std::vector<BinaryRelation> binary_equivalences_from_conflicts(
+    const ConflictGraph& graph);
+
+// How far probing got over one model's binaries, so a later pass resumes where
+// this one stopped instead of re-probing the same literals: `probed[j]` is set
+// once column j's two sides have been probed. `out` (the graph) carries the
+// facts those probes found; the state carries which columns they cover.
+struct ProbingState {
+    Index n_cols = 0;
+    std::vector<char> probed;
+    bool complete = false;   // every binary probed
+    bool gave_up = false;    // stopped as slow-and-unproductive: do not resume
+    std::size_t probed_count() const {
+        std::size_t c = 0;
+        for (const char p : probed) c += p != 0;
+        return c;
+    }
+    // Same state over renumbered columns (see ConflictGraph::remapped); columns
+    // with no old counterpart start unprobed.
+    ProbingState remapped(const std::vector<Index>& new_of_old, Index new_n) const;
+};
+
+// Probing facts handed from one stage to the next (presolve -> search) together
+// with what they are valid for: the matrix (fingerprint) and a box that the
+// consumer's own box must lie inside.
+struct ProbingCarry {
+    std::uint64_t fingerprint = 0;
+    std::vector<f64> lo, hi;
+    ConflictGraph graph;
+    ProbingState state;
+    bool usable_for(const model::LpProblem& lp) const;
+};
+
+// Hash of the constraint matrix and integrality (not bounds, costs or row sides).
+std::uint64_t matrix_fingerprint(const model::LpProblem& lp);
+
 // Builds `out` from `lp` and tightens `col_lo`/`col_hi` IN PLACE with the
 // globally valid consequences probing found (fixings and hull bounds). Both
 // vectors must be sized lp.n_cols() and hold the bounds probing should start
@@ -213,7 +283,8 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
                                          std::vector<f64>& col_lo,
                                          std::vector<f64>& col_hi,
                                          ConflictGraph& out,
-                                         const ProbingOptions& opts);
+                                         const ProbingOptions& opts,
+                                         ProbingState* state = nullptr);
 
 // Violated clique cuts at `x`. Every clique in the table is checked, and a
 // greedy weight-first extension over the conflict graph looks for violated

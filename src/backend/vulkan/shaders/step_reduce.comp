@@ -1,0 +1,76 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Single-workgroup fold of one iteration's partials into the persistent
+// accumulator.  This is the only reason a chunk of k fused iterations can
+// still report the adaptive-step evidence the controller needs: the whole
+// chunk's worst operator ratio and the final step's movement norms are
+// accumulated on the device, so the chunk still costs exactly one D2H.
+//
+// The controller only ever uses operator_lhs and operator_rhs through their
+// ratio, so the accumulator keeps the ratio alone and the host reconstitutes
+// the pair as (ratio, 1).  That keeps the whole KKT download at 64 bytes.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint wg_cols;
+    uint wg_rows;
+    uint stride;
+    uint pad;
+    double tau;
+    double sigma;
+} pc;
+
+layout(std430, binding = 0) readonly buffer PartBuf { double part[]; };
+layout(std430, binding = 1) buffer AccBuf           { double acc[]; };
+
+const uint SLOT_DX2   = 11u;
+const uint SLOT_DY2   = 12u;
+const uint SLOT_INTER = 13u;
+
+const uint ACC_DX2   = 0u;
+const uint ACC_DY2   = 1u;
+const uint ACC_RATIO = 2u;
+
+shared double s_red[256];
+
+double wg_sum(double v) {
+    uint t = gl_LocalInvocationID.x;
+    barrier();
+    s_red[t] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) s_red[t] += s_red[t + s];
+        barrier();
+    }
+    double r = s_red[0];
+    barrier();
+    return r;
+}
+
+double gather_sum(uint slot, uint count) {
+    double v = 0.0lf;
+    for (uint k = gl_LocalInvocationID.x; k < count; k += 256u)
+        v += part[slot * pc.stride + k];
+    return wg_sum(v);
+}
+
+void main() {
+    double dx2 = gather_sum(SLOT_DX2, pc.wg_cols);
+    double dy2 = gather_sum(SLOT_DY2, pc.wg_rows);
+    double inter = gather_sum(SLOT_INTER, pc.wg_rows);
+    if (gl_LocalInvocationID.x != 0u) return;
+
+    double lhs = 2.0lf * abs(inter);
+    double rhs = 0.0lf;
+    if (pc.tau > 0.0lf) rhs += dx2 / pc.tau;
+    if (pc.sigma > 0.0lf) rhs += dy2 / pc.sigma;
+    double ratio = rhs > 0.0lf ? lhs / rhs : 0.0lf;
+
+    acc[ACC_DX2] = dx2;
+    acc[ACC_DY2] = dy2;
+    // Worst ratio over the chunk wins: one violating step invalidates the
+    // whole transactional chunk, so the maximum is the acceptance test.
+    if (ratio > acc[ACC_RATIO]) acc[ACC_RATIO] = ratio;
+}

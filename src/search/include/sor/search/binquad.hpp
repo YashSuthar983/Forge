@@ -111,4 +111,14 @@ BinQuadResult solve_binquad_parallel(const io::QplibInstance& inst,
 // convention has one home.  `scale` is max |coefficient|, the penalty unit.
 backend::BqData binquad_device_data(const io::QplibInstance& inst, f64& scale);
 
+// The device-interaction core shared by every BqData-shaped caller
+// (solve_binquad_parallel's QPLIB path, and a pure-binary MILP -- see
+// binquad_milp_heuristic.hpp). Uploads `data`, runs to opts.time_limit_s /
+// opts.max_epochs, and returns the best point found; does NOT re-score it
+// (the caller's own representation is the only thing that should be
+// trusted for that -- see the callers for why).
+std::vector<std::uint8_t> solve_binquad_parallel_core(
+    const backend::BqData& data, f64 scale, const BinQuadParallelOptions& opts,
+    backend::BinQuadDevice& device, BinQuadDiagnostics& diag);
+
 }  // namespace sor::search

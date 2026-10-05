@@ -91,11 +91,47 @@ void test_gf2_keeps_pair_feasible() {
     CHECK(hi[1] >= 1.0 - 1e-9);
 }
 
+void test_gf2_does_not_ignore_small_nonzero_term() {
+    // x + 5e-10*y = 1 has the feasible integer point (0,2e9). Ignoring the
+    // small coefficient would derive the false parity equation x = 1.
+    LpProblem lp;
+    lp.name = "gf2_small_term";
+    lp.c = {1.0, 0.0};
+    lp.col_lo = {0.0, 0.0};
+    lp.col_hi = {1.0, 2e9};
+    lp.is_integer = {true, true};
+    lp.row_lo = {1.0};
+    lp.row_hi = {1.0};
+    lp.A = from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 5e-10});
+    auto lo = lp.col_lo, hi = lp.col_hi;
+    const auto d = sor::search::apply_gf2_presolve(
+        lp, lo, hi, sor::search::Gf2PresolveOptions{});
+    CHECK(!d.infeasible);
+    CHECK(lo[0] <= 0.0);
+    CHECK(hi[0] >= 1.0);
+}
+
+void test_gf2_declines_unrepresentable_parity() {
+    // 2^54+1 rounds to 2^54 in binary64; its parity cannot be recovered from
+    // the stored coefficient. A GF(2) derivation must abstain.
+    LpProblem lp = xor_pair_model();
+    lp.A = from_triplets(1, 2, {0, 0}, {0, 1}, {18014398509481984.0, 1.0});
+    auto lo = lp.col_lo, hi = lp.col_hi;
+    const auto d = sor::search::apply_gf2_presolve(
+        lp, lo, hi, sor::search::Gf2PresolveOptions{});
+    CHECK(!d.infeasible);
+    CHECK(d.equations == 0);
+    CHECK_NEAR(lo[0], 0.0, 0.0);
+    CHECK_NEAR(hi[0], 1.0, 0.0);
+}
+
 }  // namespace
 
 int main() {
     test_gf2_singleton_fix();
     test_gf2_detects_infeas();
     test_gf2_keeps_pair_feasible();
+    test_gf2_does_not_ignore_small_nonzero_term();
+    test_gf2_declines_unrepresentable_parity();
     return sor::test::finish("test_gf2_presolve");
 }

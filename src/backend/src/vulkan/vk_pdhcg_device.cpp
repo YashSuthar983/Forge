@@ -49,6 +49,8 @@
 // spmv kernel for both forms beats a branch in every kernel.  q*x computed
 // by that CSR is the same single product the CPU forms, so nothing moves.
 #include "sor/backend/pdhcg_device.hpp"
+#include "../pdhcg_lp_diagnostics.hpp"
+#include "sor/sparse/csr.hpp"
 #include "vk_compute.hpp"
 
 #include <cmath>
@@ -80,6 +82,7 @@ public:
         k_prox_ = vk_.make_kernel("pdhcg_diag_prox", 7, 16);
         k_grad_ = vk_.make_kernel("pdhcg_grad", 9, 16);
         k_trial_ = vk_.make_kernel("pdhcg_trial", 5, 16);
+        k_init_ = vk_.make_kernel("pdhcg_init", 5, 16);
         k_bb_ = vk_.make_kernel("pdhcg_bb", 9, 16);
         k_adv_x_ = vk_.make_kernel("pdhcg_advance_x", 6, 24);
         k_adv_y_ = vk_.make_kernel("pdhcg_advance_y", 6, 32);
@@ -89,7 +92,7 @@ public:
     ~VulkanPdhcgDevice() override {
         vk_.flush();
         destroy_problem_bufs();
-        for (Kernel* k : {&k_csr_, &k_csc_, &k_prox_, &k_grad_, &k_trial_, &k_bb_,
+        for (Kernel* k : {&k_csr_, &k_csc_, &k_prox_, &k_grad_, &k_trial_, &k_bb_, &k_init_,
                           &k_adv_x_, &k_adv_y_, &k_ev_c_, &k_ev_r_})
             vk_.kill_kernel(*k);
     }
@@ -139,6 +142,17 @@ public:
         clo_host_ = d.col_lo;
         chi_host_ = d.col_hi;
 
+        // Retain only the LP data needed by explicit diagnostic evaluation;
+        // the CSC copy, sparse Q and diagonal Q stay on the device.
+        d_host_.A_csr = d.A_csr;
+        d_host_.c = d.c;
+        d_host_.col_lo = d.col_lo;
+        d_host_.col_hi = d.col_hi;
+        d_host_.row_lo = d.row_lo;
+        d_host_.row_hi = d.row_hi;
+        d_host_.col_scale = d.col_scale;
+        d_host_.row_scale = d.row_scale;
+
         for (Buf* b : {&x_, &x0_, &xprev_, &xc_, &xin_, &trial_, &grad_, &aty_, &qx_,
                        &xbar_, &s1_, &s2_, &s3_, &s4_, &s5_, &s6_, &x_avg_, &x_mark_})
             *b = vk_.dev_zero(n_);
@@ -151,12 +165,8 @@ public:
 
     void init() override {
         require_up();
-        std::vector<f64> x(n_);
-        for (std::size_t j = 0; j < n_; ++j)
-            x[j] = std::max(clo_host_[j], std::min(0.0, chi_host_[j]));
-        vk_.upload(x_, x);
-        vk_.copy(x_, x0_);
-        vk_.copy(x_, xprev_);
+        struct { uint32_t n, pad[3]; } pn{u32(n_), {0, 0, 0}};
+        vk_.rec(k_init_, {&clo_, &chi_, &x_, &x0_, &xprev_}, &pn, sizeof(pn), n_);
         for (Buf* b : {&y_, &y0_, &yprev_}) vk_.fill_zero(*b);
         average_reset();
         vk_.flush();
@@ -277,6 +287,15 @@ public:
     }
 
     Eval evaluate(bool at_average) override {
+        return evaluate_impl(at_average, true);
+    }
+
+    Eval evaluate_qp(bool at_average) override {
+        return evaluate_impl(at_average, false);
+    }
+
+private:
+    Eval evaluate_impl(bool at_average, bool with_lp_diagnostics) {
         Buf& xe = at_average ? x_avg_ : x_;
         Buf& ye = at_average ? y_avg_ : y_;
         rec_a(xe, r1_);          // r1 = A x
@@ -312,9 +331,41 @@ public:
         e.py = s[8];
         e.support_finite = s[7] == 0.0 && s[9] == 0.0 && std::isfinite(s[6]) &&
                            std::isfinite(s[8]);
+
+        if (!with_lp_diagnostics) return e;
+
+        // Optional LP diagnostics share their formulas with the CPU device.
+        std::vector<f64> xv(n_), yv(m_);
+        vk_.download(xe, xv);
+        vk_.download(ye, yv);
+        std::vector<f64> x0h(n_), y0h(m_);
+        vk_.download(x0_, x0h);
+        vk_.download(y0_, y0h);
+
+        // A*x and A'*y on the host
+        std::vector<f64> ax(m_, 0.0), atyv(n_, 0.0);
+        {
+            const auto& rp = d_host_.A_csr.pattern.row_ptr();
+            const auto& ci = d_host_.A_csr.pattern.col_idx();
+            const auto& av = d_host_.A_csr.vals;
+            for (std::size_t i = 0; i < m_; ++i) {
+                f64 sum = 0.0;
+                for (auto k = rp[i]; k < rp[i + 1]; ++k)
+                    sum += av[static_cast<std::size_t>(k)] * xv[static_cast<std::size_t>(ci[k])];
+                ax[i] = sum;
+            }
+            for (std::size_t i = 0; i < m_; ++i)
+                for (auto k = rp[i]; k < rp[i + 1]; ++k)
+                    atyv[static_cast<std::size_t>(ci[k])] +=
+                        av[static_cast<std::size_t>(k)] * yv[i];
+        }
+
+        detail::fill_lp_kkt(e, d_host_, xv, yv, x0h, y0h, ax, atyv);
+
         return e;
     }
 
+public:
     void download(std::vector<f64>& x, std::vector<f64>& y) override {
         x.assign(n_, 0.0);
         y.assign(m_, 0.0);
@@ -350,8 +401,8 @@ private:
     void destroy_problem_bufs() {
         for (Buf* b : {&a_rp_, &a_ci_, &a_v_, &at_cp_, &at_ri_, &at_v_, &q_rp_, &q_ci_,
                        &q_v_, &qd_, &c_, &clo_, &chi_, &rlo_, &rhi_,
-                       &x_, &x0_, &xprev_, &xc_, &xin_, &trial_, &grad_, &aty_, &qx_,
-                       &xbar_, &s1_, &s2_, &s3_, &s4_, &s5_, &s6_, &x_avg_, &x_mark_,
+                       &x_, &x0_, &xprev_, &xc_, &xin_, &trial_, &grad_, &aty_,
+                       &qx_, &xbar_, &x_avg_, &x_mark_, &s1_, &s2_, &s3_, &s4_, &s5_, &s6_,
                        &y_, &y0_, &yprev_, &axbar_, &r1_, &r2_, &r3_, &r4_, &y_avg_, &y_mark_})
             vk_.destroy_buf(*b);
         uploaded_ = false;
@@ -361,8 +412,10 @@ private:
     bool uploaded_ = false, diagonal_ = false;
     std::size_t n_ = 0, m_ = 0, avg_n_ = 1;
     std::vector<f64> clo_host_, chi_host_;
+    PdhcgData d_host_;  // Host copy of problem data for CPU-side KKT
 
     Kernel k_csr_, k_csc_, k_prox_, k_grad_, k_trial_, k_bb_, k_adv_x_, k_adv_y_,
+           k_init_,
         k_ev_c_, k_ev_r_;
 
     Buf a_rp_, a_ci_, a_v_, at_cp_, at_ri_, at_v_, q_rp_, q_ci_, q_v_, qd_;
@@ -370,6 +423,7 @@ private:
     Buf x_, x0_, xprev_, xc_, xin_, trial_, grad_, aty_, qx_, xbar_, x_avg_, x_mark_;
     Buf s1_, s2_, s3_, s4_, s5_, s6_;
     Buf y_, y0_, yprev_, axbar_, r1_, r2_, r3_, r4_, y_avg_, y_mark_;
+
 };
 
 }  // namespace

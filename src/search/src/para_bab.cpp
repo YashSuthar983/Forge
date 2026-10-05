@@ -2,15 +2,31 @@
 
 #include <algorithm>
 #include <thread>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 namespace sor::search {
 
 int resolve_para_bab_threads(const ParaBabOptions& opts, bool latest_policy) {
     if (!latest_policy) return 1;
     if (opts.threads > 0) return opts.threads;
+#if defined(__linux__)
+    // hardware_concurrency() reports the host topology on some Linux
+    // runtimes even when this process is pinned to a single CPU. Starting
+    // eight B&B workers in that case creates contention, not parallelism.
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
+        int available = 0;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+            available += CPU_ISSET(cpu, &allowed) ? 1 : 0;
+        if (available > 0) return std::min(8, available);
+    }
+#endif
     const unsigned hc = std::thread::hardware_concurrency();
-    if (hc == 0) return 4;
-    return static_cast<int>(std::min(8u, std::max(2u, hc)));
+    if (hc == 0) return 1;
+    return static_cast<int>(std::min(8u, std::max(1u, hc)));
 }
 
 bool para_bab_should_activate(const ParaBabCostModel& model,
