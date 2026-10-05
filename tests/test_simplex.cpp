@@ -1590,66 +1590,70 @@ void test_presolve_equality_aggregation_chain_lifts_proof_and_basis() {
     lp.col_lo = {-sor::model::kInf, -sor::model::kInf, 0.0, 0.0};
     lp.col_hi = {sor::model::kInf, sor::model::kInf, 2.0, 10.0};
 
-    ScopedEnvironment no_retry("SOR_PRESOLVE_NO_RETRY", "1");
-    SimplexOptions opts;
-    opts.method = sor::engines::SimplexMethod::Dual;
-    opts.presolve = true;
-    // The kernel aggregation path; the live rules would take these
-    // doubleton equalities first (test_presolve_live_lift covers those).
-    opts.presolve_live_reductions = false;
-    const auto run = solve_problem(lp, opts);
+    // Every equation here has an orientation whose bounds are exactly
+    // implied, so live presolve leaves it to the kernel aggregation: with
+    // live presolve off or on, the journal, the answer and the basis are
+    // the same.
+    for (const bool live : {false, true}) {
+        ScopedEnvironment no_retry("SOR_PRESOLVE_NO_RETRY", "1");
+        SimplexOptions opts;
+        opts.method = sor::engines::SimplexMethod::Dual;
+        opts.presolve = true;
+        opts.presolve_live_reductions = live;
+        const auto run = solve_problem(lp, opts);
 
-    CHECK(run.r.status == Status::Optimal);
-    CHECK(run.r.proof == ProofLevel::ProvedOptimalFP);
-    CHECK(run.r.x.size() == 4);
-    CHECK_NEAR(run.r.x[0], 1.0, 1e-9);
-    CHECK_NEAR(run.r.x[1], 3.0, 1e-9);
-    CHECK_NEAR(run.r.x[2], 2.0, 1e-9);
-    CHECK_NEAR(run.r.x[3], 0.0, 1e-9);
-    CHECK_NEAR(run.r.objective, 8.0, 1e-9);
-    CHECK(run.r.y.size() == 3);
-    CHECK_NEAR(run.r.y[0], 0.0, 1e-9);
-    CHECK_NEAR(run.r.y[1], 1.0, 1e-9);
-    CHECK_NEAR(run.r.y[2], 1.0, 1e-9);
-    CHECK(run.r.max_primal_violation <= 1e-9);
-    CHECK(run.r.max_dual_violation <= 1e-9);
-    CHECK(run.diag.dual_bound_finite);
-    CHECK_NEAR(run.diag.dual_objective, 8.0, 1e-9);
-    CHECK(run.diag.gap_rel <= 1e-9);
-    CHECK(run.diag.presolve_equality_aggregations == 2);
-    CHECK(run.diag.presolve_retries == 0);
-    CHECK(run.diag.stages == 1);
+        CHECK(run.r.status == Status::Optimal);
+        CHECK(run.r.proof == ProofLevel::ProvedOptimalFP);
+        CHECK(run.r.x.size() == 4);
+        CHECK_NEAR(run.r.x[0], 1.0, 1e-9);
+        CHECK_NEAR(run.r.x[1], 3.0, 1e-9);
+        CHECK_NEAR(run.r.x[2], 2.0, 1e-9);
+        CHECK_NEAR(run.r.x[3], 0.0, 1e-9);
+        CHECK_NEAR(run.r.objective, 8.0, 1e-9);
+        CHECK(run.r.y.size() == 3);
+        CHECK_NEAR(run.r.y[0], 0.0, 1e-9);
+        CHECK_NEAR(run.r.y[1], 1.0, 1e-9);
+        CHECK_NEAR(run.r.y[2], 1.0, 1e-9);
+        CHECK(run.r.max_primal_violation <= 1e-9);
+        CHECK(run.r.max_dual_violation <= 1e-9);
+        CHECK(run.diag.dual_bound_finite);
+        CHECK_NEAR(run.diag.dual_objective, 8.0, 1e-9);
+        CHECK(run.diag.gap_rel <= 1e-9);
+        CHECK(run.diag.presolve_equality_aggregations == 2);
+        CHECK(run.diag.presolve_retries == 0);
+        CHECK(run.diag.stages == 1);
 
-    CHECK(run.basis.n_struct == 4);
-    CHECK(run.basis.basic.size() == 3);
-    CHECK(run.basis.status.size() == 7);
-    CHECK(run.basis.basic[0] == 0);
-    CHECK(run.basis.basic[1] == 1);
-    CHECK(run.basis.status[0] == NonbasicStatus::Basic);
-    CHECK(run.basis.status[1] == NonbasicStatus::Basic);
-    CHECK(run.basis.basic[0] != run.basis.basic[1]);
-    CHECK(run.basis.basic[0] != run.basis.basic[2]);
-    CHECK(run.basis.basic[1] != run.basis.basic[2]);
+        CHECK(run.basis.n_struct == 4);
+        CHECK(run.basis.basic.size() == 3);
+        CHECK(run.basis.status.size() == 7);
+        CHECK(run.basis.basic[0] == 0);
+        CHECK(run.basis.basic[1] == 1);
+        CHECK(run.basis.status[0] == NonbasicStatus::Basic);
+        CHECK(run.basis.status[1] == NonbasicStatus::Basic);
+        CHECK(run.basis.basic[0] != run.basis.basic[1]);
+        CHECK(run.basis.basic[0] != run.basis.basic[2]);
+        CHECK(run.basis.basic[1] != run.basis.basic[2]);
 
-    // The original dual engine accepts only dimensionally and structurally
-    // sane warm starts, and immediately factorizes their basis.  Re-solving
-    // from the lifted basis validates that the two substituted columns really
-    // form valid pivots for their restored equality rows.
-    SimplexOptions warm_opts = opts;
-    warm_opts.presolve = false;
-    SimplexDiagnostics warm_diag;
-    SimplexBasis warm_basis;
-    auto warm_raw = sor::engines::solve_dual_simplex(
-        lp, warm_opts, warm_diag, &warm_basis, &run.basis);
-    const auto warm_ev = sor::engines::simplex_evidence(warm_diag, warm_opts);
-    const auto warm_result =
-        sor::certify::finalize_result(std::move(warm_raw), warm_ev);
-    CHECK(warm_diag.warm_starts == 1);
-    CHECK(warm_result.status == Status::Optimal);
-    CHECK(warm_result.proof == ProofLevel::ProvedOptimalFP);
-    CHECK_NEAR(warm_result.objective, 8.0, 1e-9);
-    CHECK(warm_result.max_primal_violation <= 1e-9);
-    CHECK(warm_result.max_dual_violation <= 1e-9);
+        // The original dual engine accepts only dimensionally and structurally
+        // sane warm starts, and immediately factorizes their basis.  Re-solving
+        // from the lifted basis validates that the two substituted columns really
+        // form valid pivots for their restored equality rows.
+        SimplexOptions warm_opts = opts;
+        warm_opts.presolve = false;
+        SimplexDiagnostics warm_diag;
+        SimplexBasis warm_basis;
+        auto warm_raw = sor::engines::solve_dual_simplex(
+            lp, warm_opts, warm_diag, &warm_basis, &run.basis);
+        const auto warm_ev = sor::engines::simplex_evidence(warm_diag, warm_opts);
+        const auto warm_result =
+            sor::certify::finalize_result(std::move(warm_raw), warm_ev);
+        CHECK(warm_diag.warm_starts == 1);
+        CHECK(warm_result.status == Status::Optimal);
+        CHECK(warm_result.proof == ProofLevel::ProvedOptimalFP);
+        CHECK_NEAR(warm_result.objective, 8.0, 1e-9);
+        CHECK(warm_result.max_primal_violation <= 1e-9);
+        CHECK(warm_result.max_dual_violation <= 1e-9);
+    }
 }
 
 void test_singletons_before_aggregation_replay_stored_duals() {
@@ -1698,36 +1702,40 @@ void test_singletons_before_aggregation_replay_stored_duals() {
     CHECK(pmap.equality_aggregations[0].col == 2);
     CHECK_NEAR(pmap.equality_aggregations[0].dual_value, -1.0, 1e-15);
 
-    ScopedEnvironment no_retry("SOR_PRESOLVE_NO_RETRY", "1");
-    SimplexOptions opts;
-    opts.method = sor::engines::SimplexMethod::Dual;
-    opts.presolve = true;
-    // The kernel aggregation path; the live rules would take these
-    // doubleton equalities first (test_presolve_live_lift covers those).
-    opts.presolve_live_reductions = false;
-    const auto run = solve_problem(lp, opts);
-    CHECK(run.r.status == Status::Optimal);
-    CHECK(run.r.proof == ProofLevel::ProvedOptimalFP);
-    CHECK(run.r.x.size() == 5);
-    CHECK_NEAR(run.r.x[0], 1.0, 1e-9);
-    CHECK_NEAR(run.r.x[1], 1.0, 1e-9);
-    CHECK_NEAR(run.r.x[2], 3.0, 1e-9);
-    CHECK_NEAR(run.r.x[3], 2.0, 1e-9);
-    CHECK_NEAR(run.r.x[4], 1.0, 1e-9);
-    CHECK_NEAR(run.r.objective, 33.0, 1e-9);
-    CHECK(run.r.y.size() == 4);
-    CHECK_NEAR(run.r.y[0], 2.0, 1e-9);
-    CHECK_NEAR(run.r.y[1], 3.0, 1e-9);
-    CHECK_NEAR(run.r.y[2], -4.0, 1e-9);
-    CHECK_NEAR(run.r.y[3], 3.0, 1e-9);
-    CHECK(run.r.max_primal_violation <= 1e-9);
-    CHECK(run.r.max_dual_violation <= 1e-9);
-    CHECK(run.diag.dual_bound_finite);
-    CHECK_NEAR(run.diag.dual_objective, 33.0, 1e-9);
-    CHECK(run.diag.gap_rel <= 1e-9);
-    CHECK(run.diag.presolve_singleton_columns_removed == 2);
-    CHECK(run.diag.presolve_equality_aggregations == 1);
-    CHECK(run.diag.presolve_retries == 0);
+    // Every equation here has an orientation whose bounds are exactly
+    // implied, so live presolve leaves it to the kernel aggregation: with
+    // live presolve off or on, the journal, the answer and the basis are
+    // the same.
+    for (const bool live : {false, true}) {
+        ScopedEnvironment no_retry("SOR_PRESOLVE_NO_RETRY", "1");
+        SimplexOptions opts;
+        opts.method = sor::engines::SimplexMethod::Dual;
+        opts.presolve = true;
+        opts.presolve_live_reductions = live;
+        const auto run = solve_problem(lp, opts);
+        CHECK(run.r.status == Status::Optimal);
+        CHECK(run.r.proof == ProofLevel::ProvedOptimalFP);
+        CHECK(run.r.x.size() == 5);
+        CHECK_NEAR(run.r.x[0], 1.0, 1e-9);
+        CHECK_NEAR(run.r.x[1], 1.0, 1e-9);
+        CHECK_NEAR(run.r.x[2], 3.0, 1e-9);
+        CHECK_NEAR(run.r.x[3], 2.0, 1e-9);
+        CHECK_NEAR(run.r.x[4], 1.0, 1e-9);
+        CHECK_NEAR(run.r.objective, 33.0, 1e-9);
+        CHECK(run.r.y.size() == 4);
+        CHECK_NEAR(run.r.y[0], 2.0, 1e-9);
+        CHECK_NEAR(run.r.y[1], 3.0, 1e-9);
+        CHECK_NEAR(run.r.y[2], -4.0, 1e-9);
+        CHECK_NEAR(run.r.y[3], 3.0, 1e-9);
+        CHECK(run.r.max_primal_violation <= 1e-9);
+        CHECK(run.r.max_dual_violation <= 1e-9);
+        CHECK(run.diag.dual_bound_finite);
+        CHECK_NEAR(run.diag.dual_objective, 33.0, 1e-9);
+        CHECK(run.diag.gap_rel <= 1e-9);
+        CHECK(run.diag.presolve_singleton_columns_removed == 2);
+        CHECK(run.diag.presolve_equality_aggregations == 1);
+        CHECK(run.diag.presolve_retries == 0);
+    }
 }
 
 void test_singleton_then_equality_fix_replays_stage_state() {

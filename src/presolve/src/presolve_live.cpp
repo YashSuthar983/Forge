@@ -356,7 +356,7 @@ bool LiveMatrix::apply_dual_fixing_col(Index j) {
     return fix_column(j, fix_val, DualRecoveryKind::DualFix);
 }
 
-bool LiveMatrix::try_doubleton_equality(Index i) {
+bool LiveMatrix::try_doubleton_equality(Index i, bool from_cost_tight) {
     SOR_FN();
     if (!row_active[sz(i)] || row_lo[sz(i)] != row_hi[sz(i)]) return false;
     const auto& entries = rows[sz(i)];
@@ -375,11 +375,57 @@ bool LiveMatrix::try_doubleton_equality(Index i) {
     if (q != 2) return false;
 
     const f64 rhs = row_lo[sz(i)];
+    // Are column c's bounds implied by the row and the other column's
+    // bounds? Exactly, as the kernel aggregation decides it
+    // (pivot_bounds_redundant): only then may substitution drop them.
+    const auto exactly_implied = [&](int c) {
+        const int p = 1 - c;
+        const f64 ac = coeffs[c], ap = coeffs[p];
+        const f64 lo = col_lo[sz(cols[c])], hi = col_hi[sz(cols[c])];
+        if (!std::isfinite(lo) && !std::isfinite(hi)) return true;
+        model::ExactIntervalSum other;
+        other.add(ap, col_lo[sz(cols[p])], col_hi[sz(cols[p])]);
+        const bool lower_finite = ac > 0 ? other.finite_maximum() : other.finite_minimum();
+        const bool upper_finite = ac > 0 ? other.finite_minimum() : other.finite_maximum();
+        // sign(rhs - other_end - ac * bound) decides x_c = (rhs - other) / ac
+        // against the bound without dividing.
+        const auto excess = [&](const model::DyadicSum& other_end, f64 bound) {
+            model::DyadicSum t = other_end;
+            t.negate();
+            t.add(rhs);
+            t.add_product(-ac, bound);
+            return t.sign();
+        };
+        if (std::isfinite(lo)) {
+            if (!lower_finite) return false;
+            const int sg = excess(ac > 0 ? other.maximum_sum() : other.minimum_sum(), lo);
+            if (ac > 0 ? sg < 0 : sg > 0) return false;
+        }
+        if (std::isfinite(hi)) {
+            if (!upper_finite) return false;
+            const int sg = excess(ac > 0 ? other.minimum_sum() : other.maximum_sum(), hi);
+            if (ac > 0 ? sg > 0 : sg < 0) return false;
+        }
+        return true;
+    };
+    const bool implied[2] = {exactly_implied(0), exactly_implied(1)};
+    // An equation with an orientation that needs no bound transfer is the
+    // kernel aggregation's, which runs next and chooses the elimination in
+    // Markowitz order. Taking it here in row order with its own tie-break
+    // only re-labels the reduced model (radiationm40: 18350 equal-|a|
+    // doubletons eliminated the other way, 1240 -> 2116 pivots) or removes
+    // fewer rows (cryptanalysiskb128n5obj16: 2364 fewer, +40% pivots over
+    // six seeds). The live rule keeps what the kernel cannot do: transfer
+    // the eliminated column's bounds. A row the cost-tight rule just made an
+    // equation is not the kernel's (it was an inequality there).
+    if (!from_cost_tight && (implied[0] || implied[1])) return false;
     Index elim = cols[0], keep = cols[1];
     f64 a_elim = coeffs[0], a_keep = coeffs[1];
+    bool elim_implied = implied[0];
     if (std::fabs(a_elim) < std::fabs(a_keep)) {
         std::swap(elim, keep);
         std::swap(a_elim, a_keep);
+        elim_implied = implied[1];
     }
     f64 row_scale = std::max(std::fabs(a_elim), std::fabs(a_keep));
     if (std::fabs(a_elim) < options.stability_tol_scale * row_scale) return false;
@@ -414,8 +460,9 @@ bool LiveMatrix::try_doubleton_equality(Index i) {
     const bool elim_free = !std::isfinite(clo) && !std::isfinite(chi);
     const bool elim_boxed = std::isfinite(clo) && std::isfinite(chi);
     if (!elim_free && !elim_boxed) return false;
-    const bool transfer = elim_boxed &&
-        (implied_lo < clo - tol || implied_hi > chi + tol);
+    // Bounds not exactly implied are moved onto keep (rounded outward),
+    // never dropped.
+    const bool transfer = elim_boxed && !elim_implied;
     f64 keep_new_lo = col_lo[sz(keep)], keep_new_hi = col_hi[sz(keep)];
     if (transfer) {
         const auto keep_at = [&](f64 elim_value, bool down) {
@@ -588,7 +635,7 @@ bool LiveMatrix::try_cost_tight_doubleton(Index j) {
     }
     const f64 old_lo = row_lo[sz(i)], old_hi = row_hi[sz(i)];
     row_lo[sz(i)] = row_hi[sz(i)] = side;
-    if (!try_doubleton_equality(i)) {
+    if (!try_doubleton_equality(i, true)) {
         row_lo[sz(i)] = old_lo;
         row_hi[sz(i)] = old_hi;
         return false;
