@@ -284,6 +284,9 @@ std::vector<core::RawResult> solve_batch_core(const QpProblem& p,
     if (!certify_psd(p, opts, convexity_reason, psd_slack))
         return finish_error(core::Status::Unsupported, convexity_reason);
 
+    if (Clock::now() >= deadline)
+        return finish_error(core::Status::Interrupted, "PDHCG-II time limit");
+
     const f64 anorm = matrix_two_norm_upper(lp.A);
     const f64 qnorm = has_sparse_q(p) ? matrix_row_sum_norm(p.q_matrix)
                                       : (p.q_diag.empty() ? 0.0
@@ -372,7 +375,9 @@ std::vector<core::RawResult> solve_batch_core(const QpProblem& p,
     std::vector<std::uint64_t> since_restart(K, 0);
 
     backend::LaneMask active(K, 1);
+    bool timed_out = false;
     for (std::uint64_t k = 0; k < opts.max_iterations; ++k) {
+        if (Clock::now() >= deadline) { timed_out = true; break; }
         for (std::size_t l = 0; l < K; ++l)
             if (active[l]) diags[l].iterations = k + 1;
         dev.outer_begin(active);
@@ -400,6 +405,7 @@ std::vector<core::RawResult> solve_batch_core(const QpProblem& p,
             // `blind` always 0, so this is byte-for-byte the pre-epoch loop.
             const int epoch = std::max(1, opts.inner_epoch);
             for (int it = 0; it < opts.inner_max_iterations;) {
+                if (Clock::now() >= deadline) { timed_out = true; break; }
                 const int remaining = opts.inner_max_iterations - it;
                 const int blind = std::min(epoch - 1, remaining - 1);
                 if (blind > 0) {
@@ -427,6 +433,7 @@ std::vector<core::RawResult> solve_batch_core(const QpProblem& p,
             dev.inner_end(active);
         }
 
+        if (timed_out) break;
         const f64 a = static_cast<f64>(k + 1) / static_cast<f64>(k + 2);
         // Only the sparse path's inner tolerance consumes the movement, so the
         // diagonal path skips it and a device never has to read it back.
@@ -521,7 +528,7 @@ std::vector<core::RawResult> solve_batch_core(const QpProblem& p,
                                      l, static_cast<unsigned long long>(k + 1),
                                      diags[l].primal_residual, diags[l].stationarity,
                                      diags[l].gap_rel);
-            if (Clock::now() >= deadline) break;
+            if (Clock::now() >= deadline) { timed_out = true; break; }
         }
     }
     // Lanes still running get one last check, as the single solve always had.
@@ -545,12 +552,13 @@ std::vector<core::RawResult> solve_batch_core(const QpProblem& p,
         diag.device_stats = stats;
         raw.objective = diag.objective;
         raw.iterations = diag.iterations;
-        raw.proposed_status = converged[l] ? core::Status::Optimal : core::Status::Interrupted;
-        raw.proposed_level = converged[l] ? core::ProofLevel::ProvedKKT
+        const bool proved = converged[l] && !timed_out;
+        raw.proposed_status = proved ? core::Status::Optimal : core::Status::Interrupted;
+        raw.proposed_level = proved ? core::ProofLevel::ProvedKKT
                                           : core::ProofLevel::None;
-        raw.dual_bound = converged[l] ? certified_dual_bound[l] : core::kNaN;
-        raw.termination_reason = converged[l] ? "PDHCG-II KKT and Wolfe gap satisfied"
-                                              : "PDHCG-II iteration limit";
+        raw.dual_bound = proved ? certified_dual_bound[l] : core::kNaN;
+        raw.termination_reason = proved ? "PDHCG-II KKT and Wolfe gap satisfied"
+                                              : (timed_out ? "PDHCG-II time limit" : "PDHCG-II iteration limit");
         diag.termination_reason = raw.termination_reason;
         diag.total_ms = ms_since(t0);
     }
@@ -597,13 +605,14 @@ std::vector<core::RawResult> solve_batch_impl(const QpProblem& p,
         if (opts.time_limit_s > 0.0) {
             o.time_limit_s = opts.time_limit_s - ms_since(t0) / 1000.0;
             if (o.time_limit_s <= 0.0 && attempt > 0) break;
-            o.time_limit_s = std::max(o.time_limit_s, 1e-3);
+            o.time_limit_s = std::max(o.time_limit_s, std::numeric_limits<f64>::min());
         }
         raws = solve_batch_core(ps, ls, o, dev, diags);
         bool retry = false;
         for (std::size_t l = 0; l < lanes.size(); ++l) {
             auto& r = raws[l];
-            if (r.proposed_status == core::Status::Unsupported) continue;
+            if (r.proposed_status == core::Status::Unsupported ||
+                r.x.size() != sz(p.linear.n_cols())) continue;
             for (std::size_t j = 0; j < r.x.size(); ++j) r.x[j] *= sc.dc[j];
             for (std::size_t i = 0; i < r.y.size(); ++i) r.y[i] *= sc.dr[i];
             kk[l] = qpc::kkt_original(p, lanes[l], r.x, r.y);
@@ -620,11 +629,13 @@ std::vector<core::RawResult> solve_batch_impl(const QpProblem& p,
     for (std::size_t l = 0; l < lanes.size(); ++l) {
         auto& r = raws[l];
         auto& d = diags[l];
-        if (r.proposed_status == core::Status::Unsupported) continue;
+        if (r.proposed_status == core::Status::Unsupported ||
+            r.x.size() != sz(p.linear.n_cols())) continue;
         auto& k = kk[l];
         bool ok = qpc::kkt_ok(k, opts);
         bool polished = false;
-        if (!ok && opts.polish && !r.x.empty())
+        if (!ok && opts.polish && !r.x.empty() &&
+            (opts.time_limit_s <= 0.0 || ms_since(t0) < opts.time_limit_s * 1000.0))
             polished = ok = qpc::polish_scaled(p, lanes[l], sc, ps, ls[l], opts, r.x, r.y, k);
         d.primal_residual = k.primal;
         d.stationarity = k.dual_res;

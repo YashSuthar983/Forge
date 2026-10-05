@@ -148,6 +148,35 @@ int main() {
         CHECK(rep.had_objsense_max);
     }
 
+    // Integer markers default to binary only when no BOUNDS record is present.
+    {
+        const std::string mps =
+            "NAME MARKERBOUNDS\n"
+            "ROWS\n"
+            " N OBJ\n"
+            " L R1\n"
+            "COLUMNS\n"
+            " MARK1 'MARKER' 'INTORG'\n"
+            " BINARY OBJ 1 R1 1\n"
+            " GENERAL OBJ 1 R1 1\n"
+            " MARK2 'MARKER' 'INTEND'\n"
+            "RHS\n"
+            " RHS1 R1 2\n"
+            "BOUNDS\n"
+            " LO BND GENERAL 0\n"
+            "ENDATA\n";
+        std::istringstream in(mps);
+        io::MpsReadReport rep;
+        const auto p = io::read_mps(in, rep);
+        const int binary = index_of(p.col_names, "BINARY");
+        const int general = index_of(p.col_names, "GENERAL");
+        CHECK(binary >= 0 && general >= 0);
+        CHECK_NEAR(p.col_hi[static_cast<std::size_t>(binary)], 1.0, 1e-15);
+        CHECK(std::isinf(p.col_hi[static_cast<std::size_t>(general)]));
+        CHECK(p.is_integer[static_cast<std::size_t>(binary)]);
+        CHECK(p.is_integer[static_cast<std::size_t>(general)]);
+    }
+
     // ---- malformed input must throw with a line number, not be guessed at ----
     {
         const std::string bad =
@@ -162,6 +191,42 @@ int main() {
         std::istringstream in(bad);
         io::MpsReadReport rep;
         CHECK_THROWS(io::read_mps(in, rep));
+    }
+
+    // ---- number tokens read exactly as strtod reads them ----
+    // A leading '+', exponent forms and hex are accepted; a doubled sign,
+    // trailing text and values strtod reports as out of range (overflow, and
+    // underflow into the subnormals) are rejected. The from_chars fast path
+    // must not widen this.
+    {
+        const auto coefficient = [](const std::string& token, double& out) {
+            const std::string mps =
+                "NAME T\nROWS\n N  OBJ\n L  R1\nCOLUMNS\n    X  OBJ  1  R1  " + token +
+                "\nRHS\n    RHS  R1  1\nENDATA\n";
+            std::istringstream in(mps);
+            io::MpsReadReport rep;
+            try {
+                const auto p = io::read_mps(in, rep);
+                out = p.A.vals.empty() ? 0.0 : p.A.vals[0];
+                return true;
+            } catch (const std::exception&) {
+                return false;
+            }
+        };
+        double v = 0.0;
+        CHECK(coefficient("+5", v) && v == 5.0);
+        CHECK(coefficient("-2.5e+3", v) && v == -2500.0);
+        CHECK(coefficient(".5", v) && v == 0.5);
+        CHECK(coefficient("0.1", v) && v == 0.1);
+        CHECK(coefficient("0x10", v) && v == 16.0);
+        CHECK(coefficient("1e-300", v) && v == 1e-300);
+        CHECK(!coefficient("+-5", v));
+        CHECK(!coefficient("--5", v));
+        CHECK(!coefficient("5x", v));
+        CHECK(!coefficient("1e400", v));
+        CHECK(!coefficient("1e-320", v));
+        CHECK(!coefficient("inf", v));
+        CHECK(!coefficient("nan", v));
     }
 
     // ---- integrality relaxation ----

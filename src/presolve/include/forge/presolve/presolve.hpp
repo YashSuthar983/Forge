@@ -35,6 +35,11 @@ struct PresolveStats {
     Index forcing_columns_fixed = 0;
     Index equality_aggregations = 0;
     Offset aggregation_fill = 0;
+    Index equation_sparsifications = 0;
+    Index linear_dependencies_removed = 0;
+    Offset sparsification_nnz_removed = 0;
+    Index domain_probes = 0;
+    Index coefficient_strengthenings = 0;
     Index dual_fixes = 0;
     Index doubleton_substitutions = 0;
     Index dominated_columns_removed = 0;
@@ -62,6 +67,12 @@ struct PresolveOptions {
     f64 feasibility_tol = 1e-7;
     f64 stability_tol_scale = 1e-9;
     Offset max_substitution_fill = 512;
+    bool equation_sparsification = false;
+    bool domain_probing = false;
+    bool coefficient_strengthening = false;
+    Index max_aggregation_row_nnz = 32;
+    int sparsification_passes = 2;
+    Index max_domain_probes = 64;
 };
 
 enum class PresolveStatus : std::uint8_t {
@@ -95,6 +106,11 @@ enum class DualRecoveryKind : std::uint8_t {
     DominatedColumn,
     ParallelRowMerge,
     ParallelColumnMerge,
+    EquationSparsification,
+    RowScaling,
+    // An inequality row made an equation at the side its singleton column's
+    // cost forces (old_lo/old_hi: the row's sides before; new_lo: the side).
+    RowSideFixed,
 };
 
 struct DualRecoveryStep {
@@ -116,6 +132,11 @@ struct DualRecoveryStep {
     bool at_max = false;
     std::vector<Index> columns;
     std::vector<f64> coefficients;
+    // ForcingRow: each column's objective coefficient at the time of the
+    // step. Earlier substitutions (singleton-column elimination, equality
+    // aggregation) have already moved cost between columns, so this is the
+    // cost the forcing row's multiplier must be measured against.
+    std::vector<f64> column_costs;
 };
 
 struct SingletonColumnElimination {
@@ -151,6 +172,18 @@ struct DoubletonEqualitySubstitution {
     f64 dual_value = 0.0;
     std::vector<Index> other_cols;
     std::vector<f64> other_coeffs;
+    // Bound transfer: a boxed eliminated column whose bounds the row does
+    // not imply hands them to the kept column (outward rounded). When the
+    // kept column ends at a transferred bound, the eliminated one sits at
+    // its own bound and the kept one is basic: the row multiplier then
+    // zeroes the kept column's reduced cost, from its dual state before
+    // the substitution.
+    bool transferred = false;
+    f64 keep_lo_before = 0.0, keep_hi_before = 0.0;
+    f64 keep_lo_after = 0.0, keep_hi_after = 0.0;
+    f64 keep_stage_cost = 0.0;
+    std::vector<Index> keep_rows;
+    std::vector<f64> keep_row_coeffs;
 };
 
 struct PresolveMap {
@@ -215,9 +248,15 @@ struct PresolveReducedSolve {
 };
 
 struct PresolveRecoveryOptions {
+    // Negative disables certificate generation; zero permits work without a deadline.
+    f64 certificate_time_limit_s = 0;
     f64 primal_feas_tol = 1e-7;
     f64 dual_feas_tol = 1e-7;
     f64 gap_tol = 1e-9;
+    // Check the lifted point on the original model (evidence, validated).
+    // A caller that re-evaluates the lifted point itself and never reads
+    // the verdict clears it (the simplex route without the exact proof).
+    bool check_point = true;
 };
 
 struct PresolveRecoveryResult {

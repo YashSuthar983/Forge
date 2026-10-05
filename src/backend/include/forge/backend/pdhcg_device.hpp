@@ -47,6 +47,7 @@ struct PdhcgData {
     sparse::CsrMatrix Q_csr;
     std::vector<f64> q_diag;
     std::vector<f64> c, col_lo, col_hi, row_lo, row_hi;
+    std::vector<f64> col_scale, row_scale;
 };
 
 class PdhcgDevice {
@@ -143,8 +144,23 @@ public:
         f64 px = 0.0;         // support of the box at -r   (finite only if ok)
         f64 py = 0.0;         // support of the row box at y
         bool support_finite = false;
+
+        // LP KKT fields (unscaled)
+        f64 kkt_primal_res = 0.0;
+        f64 kkt_dual_res = 0.0;
+        f64 kkt_primal_obj = 0.0;
+        f64 kkt_dual_obj = 0.0;
+        f64 kkt_operator_lhs = 0.0;
+        f64 kkt_operator_rhs = 0.0;
+        f64 kkt_epoch_dx_norm = 0.0;
+        f64 kkt_epoch_dy_norm = 0.0;
     };
+    // Includes the legacy LP diagnostic fields above; these ignore Q.
     virtual Eval evaluate(bool at_average) = 0;
+    // Production QP convergence needs only the QP residuals and supports.
+    // Devices may skip LP diagnostics and their full-vector readbacks here.
+    // The fallback preserves compatibility with existing device subclasses.
+    virtual Eval evaluate_qp(bool at_average) { return evaluate(at_average); }
 
     virtual void download(std::vector<f64>& x, std::vector<f64>& y) = 0;
     virtual TransferStats transfer_stats() const = 0;

@@ -28,6 +28,7 @@ inline bool is_continuous(const model::LpProblem& lp, Index j) {
 struct FlowArc {
     Index y = -1;     // continuous flow column
     Index x = -1;     // binary indicator (VUB)
+    f64 scale = 1.0;  // positive coefficient of y in the capacity row
     f64 u = 0.0;      // capacity on y when x = 1
     f64 y_val = 0.0;
     f64 x_val = 0.0;
@@ -82,14 +83,9 @@ bool vub_from_pair(f64 ay, f64 ax, f64 rhs, f64 tol, f64& u_out) {
         // here; caller tries the ≥ form separately.
         return false;
     }
-    if (c < -tol && std::fabs(r) <= tol) {
-        u_out = -c;
-        return u_out > tol;
-    }
-    // Soft: y − u x ≤ ε with tiny positive rhs still encodes a VUB up to
-    // shifting capacity: y ≤ u x + ε ⇒ effective u' = u + ε when x=1, but we
-    // keep u = −c and require ε small.
-    if (c < -tol && r >= -tol && r <= tol * 10.0) {
+    // A positive residual, however small, is y <= u*x + epsilon and cannot
+    // be discarded in a validity proof for a cut.
+    if (c < -tol && r <= 0.0 && r >= -tol) {
         u_out = -c;
         return u_out > tol;
     }
@@ -139,7 +135,7 @@ void collect_vubs(const model::LpProblem& lp, const std::vector<f64>& lo,
 
         // ---- Projected VUBs from multi-column rows ------------------------
         // For each (continuous y, binary x) pair on the row, move every other
-        // term to the RHS at its maximum contribution under ≤ sense. A
+        // term to the RHS at its minimum contribution under ≤ sense. A
         // surviving relation y − u x ≤ ε with ε≈0 yields a valid (possibly
         // weaker) VUB.
         const f64 rh = lp.row_hi[sz(i)];
@@ -165,20 +161,21 @@ void collect_vubs(const model::LpProblem& lp, const std::vector<f64>& lo,
                     if (!is_binary(lp, lo, hi, terms[q].j)) continue;
                     if (!(terms[q].a < -opts.tol)) continue;
 
-                    // Move other terms to RHS at max contribution for ≤.
+                    // For a <= row, the largest possible y occurs when the
+                    // omitted terms have their MINIMUM activity. Using their
+                    // maximum would invent a stronger, invalid VUB.
                     f64 rhs = bound;
                     bool ok = true;
                     for (std::size_t t = 0; t < terms.size(); ++t) {
                         if (t == p || t == q) continue;
                         const f64 a = terms[t].a;
                         const Index j = terms[t].j;
-                        // max a·x over box: a>0 → hi, a<0 → lo
-                        const f64 at_max = a > 0.0 ? hi[sz(j)] : lo[sz(j)];
-                        if (!std::isfinite(at_max)) {
+                        const f64 at_min = a > 0.0 ? lo[sz(j)] : hi[sz(j)];
+                        if (!std::isfinite(at_min)) {
                             ok = false;
                             break;
                         }
-                        rhs -= a * at_max;
+                        rhs -= a * at_min;
                     }
                     if (!ok) continue;
                     f64 u = 0.0;
@@ -229,47 +226,34 @@ bool build_flow_from_row(
 
         if (is_continuous(lp, j) && a > opts.tol) {
             auto it = vub.find(j);
-            if (it == vub.end()) continue;
-            // The flow cover inequality rests on 0 <= y <= u*x. A flow
-            // variable with a NEGATIVE lower bound breaks that outright: y can
-            // go below zero, the cover/lambda arithmetic no longer measures
-            // what it claims, and the resulting cut is not valid.
-            //
-            // This was unchecked. Measured on blend2 with --verify-cuts
-            // against the true optimum (7.5989850): 57 invalid FC_ cuts, e.g.
-            // FC_1 activity 12040 against an rhs of 312, and the solve
-            // reported a FALSE Optimal of 16.554765.
-            //
-            // The capacity line below already nods at negative lower bounds
-            // via hi - min(0, lo), but adjusting the CAPACITY is not the same
-            // as shifting the VARIABLE. The proper treatment is to substitute
-            // y' = y - lo >= 0 and carry the shift through cap.
-            //
-            // NOT A VERIFIED FIX EITHER: blend2 still produced 57 invalid cuts
-            // with this guard in place, so its flow arcs were not the problem.
-            // Three theories have now failed on this separator (tolerance
-            // flooring, unsafe lifting, negative flow bounds). The next person
-            // should dump one offending cut and check it term by term against
-            // the source row rather than reason about the derivation -- that
-            // is what finally worked for the cover and node-promotion bugs.
-            if (!std::isfinite(lo[sz(j)]) || lo[sz(j)] < -opts.tol) {
-                ++diag.rejected_negative_flow;
-                continue;
+            if (it != vub.end()) {
+                // The inequality needs 0 <= y <= u*x. A negative lower
+                // bound cannot be used as a flow arc without shifting y.
+                // The historical blend2 run still had invalid cuts after
+                // this guard; rejection alone was not a complete repair.
+                if (!std::isfinite(lo[sz(j)]) || lo[sz(j)] < -opts.tol) {
+                    ++diag.rejected_negative_flow;
+                } else {
+                    FlowArc arc;
+                    arc.y = j;
+                    arc.x = it->second.first;
+                    arc.scale = a;
+                    arc.u = a * it->second.second;
+                    if (std::isfinite(hi[sz(j)]))
+                        arc.u = std::min(arc.u, a * hi[sz(j)]);
+                    if (arc.u > opts.tol) {
+                        arc.y_val = a * x[sz(j)];
+                        arc.x_val = x[sz(arc.x)];
+                        arcs.push_back(arc);
+                        continue;
+                    }
+                }
             }
-            FlowArc arc;
-            arc.y = j;
-            arc.x = it->second.first;
-            arc.u = a * it->second.second;
-            if (std::isfinite(hi[sz(j)]))
-                arc.u = std::min(arc.u,
-                                 a * (hi[sz(j)] - std::min(0.0, lo[sz(j)])));
-            if (arc.u <= opts.tol) continue;
-            arc.y_val = a * x[sz(j)];
-            arc.x_val = x[sz(arc.x)];
-            arcs.push_back(arc);
-            continue;
         }
 
+        // A term not used as a flow arc still affects capacity. In particular,
+        // a negative lower bound on a positive continuous term increases the
+        // available capacity. Dropping it produced invalid cuts.
         const f64 at_min = a > 0.0 ? lo[sz(j)] : hi[sz(j)];
         if (!std::isfinite(at_min)) return false;
         cap -= a * at_min;
@@ -387,7 +371,7 @@ std::vector<CutRow> separate_flow_covers(const model::LpProblem& lp,
 
             for (const std::size_t idx : cover) {
                 const auto& a = arcs[idx];
-                push_coef(a.y, 1.0, a.y_val);
+                push_coef(a.y, a.scale, x[sz(a.y)]);
                 const f64 excess = a.u - lambda;
                 if (excess > opts.tol) {
                     // +(u−λ)(1−x) → −(u−λ) x and RHS −= (u−λ)
@@ -454,7 +438,7 @@ std::vector<CutRow> separate_flow_covers(const model::LpProblem& lp,
                         ++diag.rejected_unsafe_lift;
                         continue;
                     }
-                    push_coef(a.y, 1.0, a.y_val);
+                    push_coef(a.y, a.scale, x[sz(a.y)]);
                     push_coef(a.x, beta, a.x_val);
                     ++lifted;
                     ++diag.si_lifted_arcs;

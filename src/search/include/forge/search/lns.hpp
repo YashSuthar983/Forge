@@ -210,7 +210,8 @@ bool build_neighborhood(Neighborhood kind,
                         f64 fixing_rate,
                         f64 int_tol,
                         std::uint32_t& rng_state,
-                        NeighborhoodProblem& out);
+                        NeighborhoodProblem& out,
+                        const std::vector<f64>* redcost = nullptr);
 
 // Materialises `np` as a solvable model: applies the box, and appends the
 // local-branching distance row and/or the proximity objective and cutoff row

@@ -45,6 +45,10 @@ option(FORGE_NATIVE_ARCH "Build for the host CPU (-march=native); not portable" 
 # choices. Reproducibility is worth more than 0.4%.
 option(FORGE_DETERMINISTIC_FP
        "Forbid FP contraction (-ffp-contract=off) so results are reproducible" ON)
+# Route probes (FORGE_ROUTE, RouteSpan, FORGE_FN) sit on the solve path. A normal
+# build leaves FORGE_ROUTE_DEBUG undefined, so those expand to nothing.
+option(FORGE_ROUTE_FN
+       "Compile route debug (off: FORGE_ROUTE, RouteSpan, and FORGE_FN are empty)" OFF)
 
 # Keep every binary at the TOP of the build tree. With add_subdirectory(),
 # CMake would otherwise put forge_solve in build/cli/ and libforge_core.a in
@@ -57,7 +61,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_library(forge_flags INTERFACE)
 target_compile_options(forge_flags INTERFACE
-  $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic -Wshadow>
+  $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic -Wshadow -fopenmp-simd>
   $<$<AND:$<CXX_COMPILER_ID:GNU,Clang>,$<BOOL:${FORGE_NATIVE_ARCH}>>:-march=native>
   $<$<AND:$<CXX_COMPILER_ID:GNU,Clang>,$<BOOL:${FORGE_DETERMINISTIC_FP}>>:-ffp-contract=off>
   $<$<AND:$<CXX_COMPILER_ID:GNU,Clang>,$<BOOL:${FORGE_WARNINGS_AS_ERRORS}>>:-Werror>

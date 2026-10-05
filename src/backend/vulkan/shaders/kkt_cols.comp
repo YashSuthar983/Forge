@@ -1,0 +1,113 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+// Column half of the device-side KKT reduction.  Mirrors the CPU LpDevice
+// term for term, including the un-scaling: residuals are reported in the
+// ORIGINAL coordinates (bound violations times col_scale, reduced costs
+// divided by it), because scaling must never make termination easier.
+//
+// The dual bound's "is it finite" test cannot be folded into a sum, so it
+// rides along as a max over a 0/1 flag; kkt_final turns a set flag into a
+// NaN dual objective, which is exactly what the CPU device reports.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n_cols;
+    uint stride;
+    double primal_tol;
+    double dual_tol;
+} pc;
+
+layout(std430, binding = 0) readonly buffer XBuf       { double x[]; };
+layout(std430, binding = 1) readonly buffer AtyBuf     { double aty[]; };
+layout(std430, binding = 2) readonly buffer CBuf       { double c[]; };
+layout(std430, binding = 3) readonly buffer LoBuf      { double lo[]; };
+layout(std430, binding = 4) readonly buffer HiBuf      { double hi[]; };
+layout(std430, binding = 5) readonly buffer ScaleBuf   { double col_scale[]; };
+layout(std430, binding = 6) readonly buffer AnchorBuf  { double x_anchor[]; };
+layout(std430, binding = 7) buffer PartBuf             { double part[]; };
+
+const uint SLOT_PRES_C   = 0u;
+const uint SLOT_DRES_C   = 1u;
+const uint SLOT_NONFIN_C = 2u;
+const uint SLOT_POBJ     = 3u;
+const uint SLOT_DOBJ_C   = 4u;
+const uint SLOT_EDX2     = 5u;
+
+shared double s_red[256];
+
+double wg_reduce(double v, bool take_max) {
+    uint t = gl_LocalInvocationID.x;
+    barrier();
+    s_red[t] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) s_red[t] = take_max ? max(s_red[t], s_red[t + s])
+                                       : s_red[t] + s_red[t + s];
+        barrier();
+    }
+    double r = s_red[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    bool live = j < pc.n_cols;
+
+    double pres = 0.0lf;
+    double dres = 0.0lf;
+    double nonfin = 0.0lf;
+    double pobj = 0.0lf;
+    double dobj = 0.0lf;
+    double edx2 = 0.0lf;
+
+    if (live) {
+        double xj = x[j];
+        double cs = col_scale[j];
+        double clo = lo[j];
+        double chi = hi[j];
+        if (xj < clo) pres = max(pres, (clo - xj) * cs);
+        if (xj > chi) pres = max(pres, (xj - chi) * cs);
+
+        double r_scaled = c[j] + aty[j];
+        double r = r_scaled / cs;
+        double x_orig = xj * cs;
+        double at_tol = pc.primal_tol * (1.0lf + abs(x_orig)) / cs;
+        bool at_lo = !isinf(clo) && xj <= clo + at_tol;
+        bool at_hi = !isinf(chi) && xj >= chi - at_tol;
+        if (at_lo && !at_hi)       dres = max(0.0lf, -r);
+        else if (at_hi && !at_lo)  dres = max(0.0lf, r);
+        else if (!at_lo && !at_hi) dres = abs(r);
+
+        pobj = c[j] * xj;
+
+        double bound = r_scaled >= 0.0lf ? clo : chi;
+        if (isinf(bound)) {
+            if (r_scaled != 0.0lf) nonfin = 1.0lf;
+        } else {
+            dobj = r_scaled * bound;
+        }
+
+        double d = xj - x_anchor[j];
+        edx2 = d * d;
+    }
+
+    double r_pres = wg_reduce(pres, true);
+    double r_dres = wg_reduce(dres, true);
+    double r_nonfin = wg_reduce(nonfin, true);
+    double r_pobj = wg_reduce(pobj, false);
+    double r_dobj = wg_reduce(dobj, false);
+    double r_edx2 = wg_reduce(edx2, false);
+
+    if (gl_LocalInvocationID.x == 0u) {
+        uint w = gl_WorkGroupID.x;
+        part[SLOT_PRES_C * pc.stride + w] = r_pres;
+        part[SLOT_DRES_C * pc.stride + w] = r_dres;
+        part[SLOT_NONFIN_C * pc.stride + w] = r_nonfin;
+        part[SLOT_POBJ * pc.stride + w] = r_pobj;
+        part[SLOT_DOBJ_C * pc.stride + w] = r_dobj;
+        part[SLOT_EDX2 * pc.stride + w] = r_edx2;
+    }
+}

@@ -16,6 +16,7 @@ enum class CrossoverVariableClass : std::uint8_t {
 };
 
 struct CrossoverOptions {
+    const SimplexOptions* simplex_policy = nullptr;
     f64 primal_tol = 1e-7;
     f64 dual_tol = 1e-7;
     f64 trigger_primal_dual_tol = 1e-4;
@@ -29,6 +30,11 @@ struct CrossoverOptions {
     std::uint64_t max_iterations = 0;
     f64 time_limit_s = 0.0;
     bool fo_budget_ended = false;
+    // The start is an interior point (barrier), not a first-order iterate.
+    // Its absolute residuals reflect the model's scale, not the quality of
+    // its active-set information, and dual simplex cleanup is correct from
+    // any basis, so the FO usefulness gate does not apply.
+    bool interior_point_start = false;
     bool allow_cold_fallback = true;
     bool verbose = false;
 };
@@ -53,6 +59,7 @@ struct CrossoverDiagnostics {
     bool triggered_by_useful_budget_point = false;
     bool basis_candidate_built = false;
     bool basis_candidate_factorized = false;
+    bool time_limit_reached = false;
     bool warm_cleanup_attempted = false;
     bool cold_fallback = false;
     bool validated_basis = false;

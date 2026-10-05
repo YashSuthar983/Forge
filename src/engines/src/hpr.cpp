@@ -83,7 +83,7 @@ OriginalKkt evaluate_original(const model::LpProblem& problem,
                               const std::vector<f64>& xs,
                               const std::vector<f64>& ys,
                               f64 primal_tol,
-                              f64 dual_tol) {
+                              f64 /*dual_tol*/) {
     OriginalKkt out;
     const auto n = static_cast<std::size_t>(problem.n_cols());
     const auto m = static_cast<std::size_t>(problem.n_rows());
@@ -142,7 +142,7 @@ OriginalKkt evaluate_original(const model::LpProblem& problem,
         const f64 r = reduced[j];
         const f64 bound = r >= 0.0 ? problem.col_lo[j] : problem.col_hi[j];
         if (!std::isfinite(bound)) {
-            if (std::fabs(r) > dual_tol) finite = false;
+            if (r != 0.0) finite = false;
             continue;
         }
         dmin += static_cast<long double>(r) * bound;
@@ -151,7 +151,7 @@ OriginalKkt evaluate_original(const model::LpProblem& problem,
         const f64 y = y_min[i];
         const f64 bound = y >= 0.0 ? problem.row_hi[i] : problem.row_lo[i];
         if (!std::isfinite(bound)) {
-            if (std::fabs(y) > dual_tol) finite = false;
+            if (y != 0.0) finite = false;
             continue;
         }
         dmin -= static_cast<long double>(y) * bound;
@@ -449,6 +449,26 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
                           HprDiagnostics& diag) {
     core::RouteSpan eng(1, "hpr", "loop", "loop", "",
                         core::RouteLedgerBucket::Engine);
+    problem.validate();
+    model::validate_lp_policy(opts_in.primal_tol, opts_in.dual_tol, opts_in.gap_tol, opts_in.time_limit_s);
+    if (!std::isfinite(opts_in.step_safety) || opts_in.step_safety <= 0 || opts_in.step_safety >= 1 ||
+        opts_in.power_iterations < 0 || !std::isfinite(opts_in.pock_chambolle_alpha) ||
+        opts_in.pock_chambolle_alpha < 0 || opts_in.pock_chambolle_alpha > 2 ||
+        !std::isfinite(opts_in.reflection_gamma) || opts_in.reflection_gamma <= 0 || opts_in.reflection_gamma > 2 ||
+        !std::isfinite(opts_in.weight_min) || !std::isfinite(opts_in.weight_max) ||
+        opts_in.weight_min <= 0 || opts_in.weight_min > opts_in.weight_max ||
+        !std::isfinite(opts_in.weight_init) || opts_in.weight_init <= 0 ||
+        !std::isfinite(opts_in.weight_theta) || opts_in.weight_theta < 0 || opts_in.weight_theta > 1 ||
+        !std::isfinite(opts_in.pid_kp) || !std::isfinite(opts_in.pid_ki) || !std::isfinite(opts_in.pid_kd) ||
+        opts_in.pid_kp < 0 || opts_in.pid_ki < 0 || opts_in.pid_kd < 0 ||
+        !std::isfinite(opts_in.sufficient_decay) || !std::isfinite(opts_in.necessary_decay) ||
+        opts_in.sufficient_decay <= 0 || opts_in.sufficient_decay > opts_in.necessary_decay ||
+        opts_in.necessary_decay >= 1 || !std::isfinite(opts_in.artificial_restart_fraction) ||
+        opts_in.artificial_restart_fraction <= 0 ||
+        !std::isfinite(opts_in.polish_budget_fraction) || opts_in.polish_budget_fraction < 0 ||
+        opts_in.polish_budget_fraction > 1 || !std::isfinite(opts_in.polish_gap_trigger) ||
+        opts_in.polish_gap_trigger < 0)
+        throw std::invalid_argument("HPR: invalid step, weight, restart, or polishing policy");
     const auto t_all = Clock::now();
     diag = HprDiagnostics{};
     device.reset_stats();
@@ -537,6 +557,8 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
     const f64 eta_initial = norm_est > 0.0 ? opts.step_safety / norm_est : 1.0;
     f64 eta = eta_initial;
     f64 weight = std::clamp(opts.weight_init, opts.weight_min, opts.weight_max);
+    f64 pid_integral = 0.0, pid_error = 0.0;
+    bool pid_have_error = false;
 
     const auto t_loop = Clock::now();
     const auto deadline = opts.time_limit_s > 0.0
@@ -904,9 +926,22 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
                         const f64 target = std::clamp(
                             kkt.epoch_dy_norm / kkt.epoch_dx_norm,
                             opts.weight_min, opts.weight_max);
-                        const f64 theta = std::clamp(opts.weight_theta, 0.0, 1.0);
-                        weight = std::exp(theta * std::log(target) +
-                                          (1.0 - theta) * std::log(weight));
+                        if (opts.weight_policy == HprOptions::WeightPolicy::Pid) {
+                            const f64 error = std::log(weight) - std::log(target);
+                            const f64 span = std::log(opts.weight_max / opts.weight_min);
+                            pid_integral = std::clamp(pid_integral + error, -span, span);
+                            const f64 derivative = pid_have_error ? error - pid_error : 0.0;
+                            pid_error = error;
+                            pid_have_error = true;
+                            const f64 next = std::log(weight) -
+                                (opts.pid_kp * error + opts.pid_ki * pid_integral + opts.pid_kd * derivative);
+                            weight = std::exp(next);
+                            if (weight <= opts.weight_min || weight >= opts.weight_max) pid_integral = 0.0;
+                        } else {
+                            const f64 theta = std::clamp(opts.weight_theta, 0.0, 1.0);
+                            weight = std::exp(theta * std::log(target) +
+                                              (1.0 - theta) * std::log(weight));
+                        }
                         weight = std::clamp(weight, opts.weight_min, opts.weight_max);
                     }
 

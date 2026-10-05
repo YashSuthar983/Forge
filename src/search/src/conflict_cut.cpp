@@ -731,6 +731,7 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
     };
     if (row_is_local(ctx.conflict_row)) {
         ++diag.aborted;
+        ++diag.aborted_local_scope;
         return std::nullopt;
     }
     for (const auto& e : ctx.trail->entries()) {
@@ -738,6 +739,7 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
              e.kind == ReasonKind::Conflict) &&
             row_is_local(e.reason_id)) {
             ++diag.aborted;
+            ++diag.aborted_local_scope;
             return std::nullopt;
         }
     }
@@ -746,10 +748,12 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
     GeqConstraint learn;
     if (!build_conflict_constraint(ctx, learn)) {
         ++diag.aborted;
+        ++diag.aborted_seed;
         return std::nullopt;
     }
     if (!geq_infeasible(learn, *ctx.col_lo, *ctx.col_hi, opts.tol)) {
         ++diag.aborted;
+        ++diag.aborted_seed;
         return std::nullopt;
     }
 
@@ -772,6 +776,22 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
             earliest_infeasible_index(learn, *ctx.lp, trail, opts.tol);
         if (idx == static_cast<std::size_t>(-1) || idx >= ents.size()) {
             ++diag.aborted;
+            ++diag.aborted_trail;
+            std::vector<f64> replay_lo = ctx.lp->col_lo;
+            std::vector<f64> replay_hi = ctx.lp->col_hi;
+            for (const auto& entry : ents) {
+                if (entry.dir == BoundDir::Lower)
+                    replay_lo[sz(entry.var)] = entry.new_bound;
+                else
+                    replay_hi[sz(entry.var)] = entry.new_bound;
+            }
+            for (Index j : learn.cols) {
+                if ((*ctx.col_lo)[sz(j)] > replay_lo[sz(j)] + opts.tol ||
+                    (*ctx.col_hi)[sz(j)] < replay_hi[sz(j)] - opts.tol) {
+                    ++diag.aborted_trail_missing_bound;
+                    break;
+                }
+            }
             return std::nullopt;
         }
         const PropTrailEntry& e = ents[idx];
@@ -786,6 +806,7 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
         GeqConstraint reason;
         if (!entry_as_reason(*ctx.lp, e, reason)) {
             ++diag.aborted;
+            ++diag.aborted_reason;
             return std::nullopt;
         }
 
@@ -804,10 +825,12 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
             // SafeLimited: abort on continuous; skip cMIR on non-binary.
             if (has_continuous) {
                 ++diag.aborted;
+                ++diag.aborted_reason;
                 return std::nullopt;
             }
             if (has_nonbinary && !opts.allow_general_integer) {
                 ++diag.aborted;
+                ++diag.aborted_reason;
                 return std::nullopt;
             }
             const bool use_cmir =
@@ -830,6 +853,7 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
             // Paper path: Alg 3 continuous resolve + cMIR / coef reduce.
             if (has_nonbinary && !opts.allow_general_integer) {
                 ++diag.aborted;
+                ++diag.aborted_reason;
                 return std::nullopt;
             }
             auto red = reduce_mixed_binary(std::move(reason), learn, e.var, idx,
@@ -840,6 +864,7 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
                 apply_coef_tightening(learn, *ctx.lp, opts.tol);
                 if (!geq_infeasible(learn, *ctx.col_lo, *ctx.col_hi, opts.tol)) {
                     ++diag.aborted;
+                    ++diag.aborted_resolution;
                     return std::nullopt;
                 }
                 continue;
@@ -849,6 +874,7 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
 
         if (!resolve_geq(learn, reason, e.var, opts.tol)) {
             ++diag.aborted;
+            ++diag.aborted_resolution;
             return std::nullopt;
         }
         apply_coef_tightening(learn, *ctx.lp, opts.tol);  // Alg 1 strengthen
@@ -857,12 +883,14 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
         // Invariant: resolvent must stay locally infeasible (§7 abort-safe).
         if (!geq_infeasible(learn, *ctx.col_lo, *ctx.col_hi, opts.tol)) {
             ++diag.aborted;
+            ++diag.aborted_resolution;
             return std::nullopt;
         }
     }
 
     if (!geq_infeasible(learn, *ctx.col_lo, *ctx.col_hi, opts.tol)) {
         ++diag.aborted;
+        ++diag.aborted_final;
         return std::nullopt;
     }
 
@@ -879,6 +907,7 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
             return geq_to_cut(clean);
         }
         ++diag.aborted;
+        ++diag.aborted_final;
         return std::nullopt;
     }
 

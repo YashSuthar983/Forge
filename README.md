@@ -47,10 +47,18 @@ ctest --test-dir build --output-on-failure
 ./build/forge_solve examples/scheduling/schedule_s42.mps --engine milp
 ./build/forge_solve examples/dispatch/dispatch_s42.qps   --engine qp
 ./build/forge_solve MODEL.qplib --engine auto --time-limit 60
+./build/forge_solve MODEL.lp    --engine milp --solution-out out.sol
+./build/forge_check MODEL.lp out.sol
 
 # First-order solve on the GPU
 ./build/forge_solve MODEL.qps --engine hprqp --backend vulkan
 ```
+
+Linear CPLEX-style `.lp` and `.lp.gz` files are supported by the solver and
+checker, including integer/binary declarations, objective constants, free
+bounds and ranged rows. Explicit binary bounds are preserved. Quadratic,
+indicator, SOS and semi-continuous LP constructs are rejected; use the QPS or
+QPLIB paths for quadratic models.
 
 **Requirements:** a C++20 compiler (GCC or Clang), CMake ≥ 3.20 and zlib. For
 the GPU backend you also need the Vulkan SDK (`libvulkan-dev`,

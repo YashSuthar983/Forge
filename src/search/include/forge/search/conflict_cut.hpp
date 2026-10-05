@@ -57,6 +57,17 @@ struct ConflictCutOptions {
     // leaves them on (no trail analysis, no LP stall).
     bool nogood_cuts = true;
     int max_nogood_cuts = 24;
+    // Learn branch-decision nogoods into the persistent ConflictStore (bound
+    // disjunctions propagated at every node, general integers included)
+    // instead of appending binary-only rows to the global LP, which bumped
+    // global_lp_generation and discarded the LP sessions and checkpoints.
+    // Off: the row path above is used.
+    bool conflict_store = true;
+    std::size_t store_bytes = 64ull << 20;
+    // Farkas explanations can be longer than short decision nogoods. Retain
+    // them under the byte budget instead of discarding most at 16 literals;
+    // propagation already backs off when the store supplies few deductions.
+    std::size_t store_max_len = 64;
     // Prefer cMIR reduction (Prop. 2 / general Marchand-Wolsey) before / with
     // the coefficient-tightening loop.
     bool use_cmirror = true;
@@ -71,7 +82,24 @@ struct ConflictCutOptions {
 struct ConflictCutDiagnostics {
     std::uint64_t attempts = 0;
     std::uint64_t learned = 0;
+    // Derivation stopped before a cut existed (analysis returned nothing).
     std::uint64_t aborted = 0;
+    // Disjoint reasons for aborted derivations. Keep their sum equal to
+    // `aborted`; a total alone hides whether scope, trail data, or the
+    // reduction invariant prevents learning on a large MIP.
+    std::uint64_t aborted_local_scope = 0;
+    std::uint64_t aborted_seed = 0;
+    std::uint64_t aborted_trail = 0;
+    // The final node box is tighter than replaying the recorded trail from
+    // the global box on a variable used by the conflict constraint.
+    std::uint64_t aborted_trail_missing_bound = 0;
+    std::uint64_t aborted_reason = 0;
+    std::uint64_t aborted_resolution = 0;
+    std::uint64_t aborted_final = 0;
+    // A cut was learned, then the global-apply gate refused it. Not an
+    // `aborted` derivation failure: every learned Mexi cut is either inserted
+    // (`conflict_cuts_global`) or counted here.
+    std::uint64_t validation_rejected = 0;
     std::uint64_t general_int_reasons = 0;
     std::uint64_t cmir_applied = 0;
     std::uint64_t cmir_skipped_nonbinary = 0;  // SafeLimited only

@@ -41,13 +41,14 @@ std::string_view to_string(LpStrategy s) noexcept {
         case LpStrategy::DualSimplex:   return "dual";
         case LpStrategy::Hpr:           return "hpr";
         case LpStrategy::Pdhg:          return "pdhg";
+        case LpStrategy::Barrier:       return "barrier";
     }
     return "unknown";
 }
 
 std::string_view human_line(Status s, ProofLevel p) noexcept {
     if (s == Status::Feasible && p == ProofLevel::FeasibleOnly)
-        return "feasible (no dual bound - first-order method)";
+        return "feasible (no finite checked dual bound)";
     if (s == Status::Feasible && p == ProofLevel::FeasibleWithGap)
         return "feasible with a dual bound (no basis - not proved optimal)";
     if (s == Status::Feasible)

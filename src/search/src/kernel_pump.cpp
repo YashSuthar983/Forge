@@ -413,7 +413,7 @@ bool kernel_pump(const model::LpProblem& mip,
     };
 
     const double spent0 = ms_since(t0) / 1000.0;
-    if (run_stage(std::max(0.05, per - spent0 * 0.5), kb.buckets.empty())) {
+    if (run_stage(std::max(0.0, per - spent0 * 0.5), kb.buckets.empty())) {
         diag.found = true;
         diag.ms = ms_since(t0);
         return true;
@@ -425,8 +425,8 @@ bool kernel_pump(const model::LpProblem& mip,
         active.insert(active.end(), kb.buckets[b].begin(), kb.buckets[b].end());
         const bool last = (b + 1 == kb.buckets.size());
         const double budget =
-            last ? std::max(0.05, opts.time_limit_s - spent)
-                 : std::max(0.05, std::min(per, opts.time_limit_s - spent));
+            last ? std::max(0.0, opts.time_limit_s - spent)
+                 : std::max(0.0, std::min(per, opts.time_limit_s - spent));
         if (run_stage(budget, last)) {
             diag.found = true;
             diag.ms = ms_since(t0);
