@@ -1247,8 +1247,11 @@ int main() {
         }
 
         // Doubleton equality: free x appears in two rows so the singleton
-        // column rule cannot take it; the live doubleton must. The remaining
-        // column may then dual-fix once its row becomes redundant.
+        // column rule cannot take it. x0 is free, so its bounds are exactly
+        // implied: live presolve leaves the equation to the kernel
+        // aggregation (the live doubleton only transfers bounds), which must
+        // eliminate x0 and lift it. The remaining column may then dual-fix
+        // once its row becomes redundant.
         {
             LpProblem p;
             p.A = sor::sparse::from_triplets(
@@ -1259,11 +1262,20 @@ int main() {
             p.col_lo = {-sor::model::kInf, 0.0};
             p.col_hi = {sor::model::kInf, 1.0};
             const auto out = sor::presolve::presolve(p, v2);
-            CHECK(out.stats().doubleton_substitutions >= 1);
+            CHECK(out.stats().doubleton_substitutions == 0);
+            CHECK(out.stats().equality_aggregations >= 1);
             CHECK(out.map.problem.n_cols() <= 1);
-            std::vector<f64> x_red(static_cast<std::size_t>(out.map.problem.n_cols()),
-                                   0.25);
-            if (!x_red.empty()) x_red[0] = 0.25;
+            // Any reduced point lifts onto the equation x0 + x1 = 1.
+            if (out.map.problem.n_cols() == 1) {
+                const auto x = postsolve(out.map, {0.25});
+                CHECK_NEAR(x[0] + x[1], 1.0, 1e-12);
+            }
+            // The reduced optimum: what is left is x1 in [0, 1] with cost
+            // 1 - 0 * 1 = 1 and the slack row x1 <= 2 (the aggregation runs
+            // after the live pass that would have removed it), so x1 = 0, its
+            // lower bound. `validated` needs an optimal input.
+            std::vector<f64> x_red(out.map.problem.col_lo.begin(),
+                                   out.map.problem.col_lo.end());
             const auto x = postsolve(out.map, x_red);
             CHECK_NEAR(x[0] + x[1], 1.0, 1e-12);
             PresolveReducedSolve rs;
