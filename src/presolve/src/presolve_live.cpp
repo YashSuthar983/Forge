@@ -1,7 +1,10 @@
 #include "live_matrix.hpp"
 #include "sor/model/exact.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <map>
 #include <set>
 #include <tuple>
@@ -68,12 +71,6 @@ void LiveMatrix::build(const model::LpProblem& problem,
     row_lo = problem.row_lo;
     row_hi = problem.row_hi;
 
-    act_min.assign(sz(m), 0.0);
-    act_max.assign(sz(m), 0.0);
-    act_min_inf.assign(sz(m), 0);
-    act_max_inf.assign(sz(m), 0);
-    down_lock.assign(sz(n), 0);
-    up_lock.assign(sz(n), 0);
     row_queued.assign(sz(m), 0);
     col_queued.assign(sz(n), 0);
 
@@ -108,10 +105,8 @@ void LiveMatrix::build(const model::LpProblem& problem,
             if (a == 0.0) continue;
             col_rows[sz(j)].insert(i);
         }
-        recompute_row_activity(i);
     }
-    // Locks are not computed here: dual fixing, their only reader,
-    // recomputes a column's locks (O(degree)) when it looks at it.
+    // Locks are not stored: dual fixing asks for the one it needs.
 }
 
 void LiveMatrix::seed_all_queues() {
@@ -140,38 +135,58 @@ void LiveMatrix::queue_col(Index j) {
     changed_cols.push_back(j);
 }
 
-void LiveMatrix::recompute_row_activity(Index i) {
+bool LiveMatrix::row_activity_within_sides(Index i) const {
     SOR_FN();
-    if (!row_active[sz(i)]) return;
+    // Redundant when the activity interval lies inside [row_lo, row_hi]
+    // exactly. A plain double sum is within (2n + 2) u sum|terms| of the
+    // exact one, which settles almost every row; only rows that bound
+    // cannot decide get the exact sums.
+    const f64 lo = row_lo[sz(i)], hi = row_hi[sz(i)];
+    f64 fmin = 0.0, fmax = 0.0, magnitude = 0.0;
+    std::size_t terms = 0;
+    bool overflow = false;
+    for (const auto& [j, a] : rows[sz(i)]) {
+        if (a == 0.0) continue;
+        const f64 l = col_active[sz(j)] ? col_lo[sz(j)] : fixed[sz(j)];
+        const f64 u = col_active[sz(j)] ? col_hi[sz(j)] : fixed[sz(j)];
+        const f64 lower = a > 0.0 ? l : u, upper = a > 0.0 ? u : l;
+        if (!std::isfinite(lower) || !std::isfinite(upper)) return false;
+        const f64 pl = a * lower, pu = a * upper;
+        if (!std::isfinite(pl) || !std::isfinite(pu)) { overflow = true; break; }
+        fmin += pl;
+        fmax += pu;
+        magnitude += std::fabs(pl) + std::fabs(pu);
+        ++terms;
+    }
+    if (!overflow && std::isfinite(magnitude)) {
+        const f64 err = (2.0 * static_cast<f64>(terms) + 2.0) * 0x1p-53 * magnitude * (1.0 + 0x1p-50);
+        if (fmin + err < lo || fmax - err > hi) return false;
+    }
     model::ExactIntervalSum activity;
     for (const auto& [j, a] : rows[sz(i)]) {
         if (!col_active[sz(j)]) activity.add(a, fixed[sz(j)], fixed[sz(j)]);
         else activity.add(a, col_lo[sz(j)], col_hi[sz(j)]);
     }
-    act_min[sz(i)] = activity.lower();
-    act_max[sz(i)] = activity.upper();
-    act_min_inf[sz(i)] = !activity.finite_minimum();
-    act_max_inf[sz(i)] = !activity.finite_maximum();
+    if (!activity.finite_minimum() || !activity.finite_maximum()) return false;
+    return activity.lower() >= lo && activity.upper() <= hi;
 }
 
-void LiveMatrix::recompute_col_locks(Index j) {
+bool LiveMatrix::col_locked(Index j, bool down, bool up) const {
     SOR_FN();
-    if (!col_active[sz(j)]) return;
     // A row locks x_j downward when decreasing x_j can violate it (a > 0
     // with a finite lower side, a < 0 with a finite upper side), upward
-    // symmetrically. O(degree): no activity, no rescan of the row.
-    down_lock[sz(j)] = 0;
-    up_lock[sz(j)] = 0;
+    // symmetrically. Stops at the first lock in an asked direction: dual
+    // fixing needs only to know whether one exists.
     for (const Index i : col_rows[sz(j)]) {
         if (!row_active[sz(i)]) continue;
         const auto it = rows[sz(i)].find(j);
         if (it == rows[sz(i)].end() || it->second == 0.0) continue;
         const bool has_lo = row_lo[sz(i)] > -model::kInf;
         const bool has_hi = row_hi[sz(i)] < model::kInf;
-        if (it->second > 0.0 ? has_lo : has_hi) down_lock[sz(j)] = 1;
-        if (it->second > 0.0 ? has_hi : has_lo) up_lock[sz(j)] = 1;
-        if (down_lock[sz(j)] && up_lock[sz(j)]) return;
+        if (down && (it->second > 0.0 ? has_lo : has_hi)) return true;
+        if (up && (it->second > 0.0 ? has_hi : has_lo)) return true;
     }
+    return false;
 }
 
 bool LiveMatrix::fix_column(Index j, f64 value, DualRecoveryKind kind, Index row,
@@ -220,9 +235,7 @@ bool LiveMatrix::fix_column(Index j, f64 value, DualRecoveryKind kind, Index row
 bool LiveMatrix::remove_redundant_row(Index i) {
     SOR_FN();
     if (!row_active[sz(i)]) return false;
-    recompute_row_activity(i);
-    if (act_min_inf[sz(i)] > 0 || act_max_inf[sz(i)] > 0) return false;
-    if (act_min[sz(i)] >= row_lo[sz(i)] && act_max[sz(i)] <= row_hi[sz(i)]) {
+    if (row_activity_within_sides(i)) {
         // The row's locks go with it: its columns may now be dual-fixable.
         for (const auto& [j, a] : rows[sz(i)]) {
             (void)a;
@@ -315,35 +328,31 @@ bool LiveMatrix::apply_implied_bounds_row(Index i) {
 bool LiveMatrix::apply_dual_fixing_col(Index j) {
     SOR_FN();
     if (!col_active[sz(j)]) return false;
-    recompute_col_locks(j);
     const f64 c = in->maximize ? -cost[sz(j)] : cost[sz(j)];
     const f64 lo = col_lo[sz(j)], hi = col_hi[sz(j)];
     if (lo == hi) return false;
 
+    // Only the lock the cost direction needs is looked for.
     f64 fix_val = 0.0;
-    bool do_fix = false;
-    if (c > 0.0 && !down_lock[sz(j)] && std::isfinite(lo)) {
+    if (c > 0.0) {
+        if (!std::isfinite(lo) || col_locked(j, true, false)) return false;
         fix_val = lo;
-        do_fix = true;
-    } else if (c < 0.0 && !up_lock[sz(j)] && std::isfinite(hi)) {
+    } else if (c < 0.0) {
+        if (!std::isfinite(hi) || col_locked(j, false, true)) return false;
         fix_val = hi;
-        do_fix = true;
-    } else if (c == 0.0 && !down_lock[sz(j)] && !up_lock[sz(j)]) {
-        if (std::isfinite(lo) && std::isfinite(hi)) {
+    } else if (c == 0.0) {
+        if (col_locked(j, true, true)) return false;
+        if (std::isfinite(lo) && std::isfinite(hi))
             fix_val = (std::fabs(lo) <= std::fabs(hi)) ? lo : hi;
-            do_fix = true;
-        } else if (std::isfinite(lo)) {
+        else if (std::isfinite(lo))
             fix_val = lo;
-            do_fix = true;
-        } else if (std::isfinite(hi)) {
+        else if (std::isfinite(hi))
             fix_val = hi;
-            do_fix = true;
-        } else {
+        else
             fix_val = 0.0;
-            do_fix = true;
-        }
+    } else {
+        return false;
     }
-    if (!do_fix) return false;
     return fix_column(j, fix_val, DualRecoveryKind::DualFix);
 }
 
@@ -550,7 +559,7 @@ bool LiveMatrix::try_cost_tight_doubleton(Index j) {
     for (const Index r : col_rows[sz(j)]) {
         if (!row_active[sz(r)] || rows[sz(r)].find(j) == rows[sz(r)].end()) continue;
         i = r;
-        ++count;
+        if (++count > 1) return false;   // not a singleton column
     }
     if (count != 1 || row_lo[sz(i)] == row_hi[sz(i)] || rows[sz(i)].size() != 2) return false;
     Index k = -1;
@@ -653,8 +662,51 @@ bool LiveMatrix::try_dominated_columns() {
 
 bool LiveMatrix::try_duplicate_rows() {
     SOR_FN();
+    // The normalized row (columns, a / lead) is the bucket key. Most rows
+    // share it with no other row, and building it costs an allocation and
+    // vector comparisons per row: hash it first (equal keys, equal hashes;
+    // zeros hashed as +0 since the key compares -0 == +0) and give only rows
+    // whose hash repeats to the ordered map. Buckets, their order and the
+    // row order within them are unchanged.
+    const auto row_lead = [&](Index i) {
+        f64 lead = 1.0;
+        for (const auto& [j, a] : rows[sz(i)]) {
+            if (!col_active[sz(j)]) continue;
+            if (lead == 1.0 && a != 0.0) lead = a;
+        }
+        return lead;
+    };
+    std::vector<std::pair<std::uint64_t, Index>> hashed;
+    for (Index i = 0; i < m; ++i) {
+        if (!row_active[sz(i)] || rows[sz(i)].size() > 32) continue;
+        const f64 lead = row_lead(i);
+        if (lead == 0.0) continue;
+        std::uint64_t h = 1469598103934665603ull;
+        bool any_entry = false;
+        for (const auto& [j, a] : rows[sz(i)]) {
+            if (!col_active[sz(j)]) continue;
+            f64 v = a / lead;
+            if (v == 0.0) v = 0.0;
+            std::uint64_t bits = 0;
+            std::memcpy(&bits, &v, sizeof bits);
+            h = (h ^ static_cast<std::uint64_t>(j)) * 1099511628211ull;
+            h = (h ^ bits) * 1099511628211ull;
+            any_entry = true;
+        }
+        if (any_entry) hashed.emplace_back(h, i);
+    }
+    std::sort(hashed.begin(), hashed.end());
+    std::vector<char> repeated(sz(m), 0);
+    for (std::size_t q = 0; q < hashed.size();) {
+        std::size_t e = q + 1;
+        while (e < hashed.size() && hashed[e].first == hashed[q].first) ++e;
+        if (e - q > 1)
+            for (std::size_t t = q; t < e; ++t) repeated[sz(hashed[t].second)] = 1;
+        q = e;
+    }
     std::map<std::vector<std::pair<Index, f64>>, std::vector<Index>> buckets;
     for (Index i = 0; i < m; ++i) {
+        if (!repeated[sz(i)]) continue;
         if (!row_active[sz(i)]) continue;
         if (rows[sz(i)].size() > 32) continue;
         std::vector<std::pair<Index, f64>> norm;
