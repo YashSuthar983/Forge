@@ -1,4 +1,5 @@
 #include "sor/search/implied_int.hpp"
+#include "sor/sparse/csc.hpp"
 
 #include <chrono>
 
@@ -98,149 +99,87 @@ std::uint64_t infer_equality_pm1(model::LpProblem& p, f64 tol,
     return added;
 }
 
-// Column is network-like: nonzeros ⊆ {+1}, {-1}, or one +1 and one -1.
-bool network_column(const model::LpProblem& lp, Index j, f64 tol,
-                    int& n_plus, int& n_minus, bool& bad) {
-    n_plus = n_minus = 0;
-    bad = false;
-    const auto& rp = lp.A.pattern.row_ptr();
-    const auto& ci = lp.A.pattern.col_idx();
-    const auto& av = lp.A.vals;
-    // Scan all rows for column j (CSR: walk each row).
-    for (Index i = 0; i < lp.n_rows(); ++i) {
-        for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
-            if (ci[sz(k)] != j) continue;
-            const f64 a = av[sz(k)];
-            if (std::fabs(a) <= tol) continue;
-            if (std::fabs(a - 1.0) <= tol) {
-                ++n_plus;
-            } else if (std::fabs(a + 1.0) <= tol) {
-                ++n_minus;
-            } else {
-                bad = true;
-                return false;
-            }
-        }
-    }
-    return n_plus <= 1 && n_minus <= 1 && (n_plus + n_minus) >= 1;
-}
-
+// Validate a whole equality-connected continuous subsystem before changing
+// any integrality flag. Integer and fixed columns are external RHS terms.
 std::uint64_t infer_network(model::LpProblem& p, f64 tol,
-                    const IiDeadline& dl) {
+                            const IiDeadline& dl) {
     const Index m = p.n_rows(), n = p.n_cols();
-    if (p.is_integer.size() != sz(n))
-        p.is_integer.assign(sz(n), false);
-
-    // Equality rows with integer RHS only.
-    std::vector<char> eq(sz(m), 0);
-    for (Index i = 0; i < m; ++i) eq[sz(i)] = is_eq_row(p, i, tol) ? 1 : 0;
-
-    // A continuous column is network-implied integer if:
-    //  - every row it appears in is an integer equality,
-    //  - every column in those rows is network-structured (±1 incidence),
-    //  - every other column in those rows is already integer or fixed int,
-    //  - finite bounds on j are integer-valued.
+    if (p.is_integer.size() != sz(n)) p.is_integer.assign(sz(n), false);
+    const auto csc = sparse::to_csc(p.A);
+    const auto& cp = csc.pattern.col_ptr();
+    const auto& ri = csc.pattern.row_idx();
     const auto& rp = p.A.pattern.row_ptr();
     const auto& ci = p.A.pattern.col_idx();
     const auto& av = p.A.vals;
-
-    std::vector<char> col_network(sz(n), 0);
+    std::vector<char> eq(sz(m), 0), network(sz(n), 0), seen(sz(n), 0);
+    std::vector<Index> component_id(sz(n), -1), row_id(sz(m), -1);
+    for (Index i = 0; i < m; ++i) eq[sz(i)] = is_eq_row(p, i, tol);
     for (Index j = 0; j < n; ++j) {
         if ((static_cast<std::uint64_t>(j) & kIiPollMask) == 0 && dl.over())
-            break;
-        int np = 0, nm = 0;
-        bool bad = false;
-        if (network_column(p, j, tol, np, nm, bad) && !bad)
-            col_network[sz(j)] = 1;
+            return 0;
+        int plus = 0, minus = 0;
+        bool valid = true;
+        for (core::Offset k = cp[sz(j)]; k < cp[sz(j) + 1]; ++k) {
+            const f64 v = csc.vals[sz(k)];
+            if (std::fabs(v) <= tol) continue;
+            if (std::fabs(v - 1.0) <= tol) ++plus;
+            else if (std::fabs(v + 1.0) <= tol) ++minus;
+            else valid = false;
+        }
+        network[sz(j)] = valid && plus <= 1 && minus <= 1 && plus + minus > 0;
     }
-
     std::uint64_t added = 0;
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (Index j = 0; j < n; ++j) {
-            if ((static_cast<std::uint64_t>(j) & kIiPollMask) == 0 && dl.over())
-                break;
-            if (p.is_integer[sz(j)]) continue;
-            if (!col_network[sz(j)]) continue;
-            if (std::isfinite(p.col_lo[sz(j)]) &&
-                !nearly_int(p.col_lo[sz(j)], tol))
-                continue;
-            if (std::isfinite(p.col_hi[sz(j)]) &&
-                !nearly_int(p.col_hi[sz(j)], tol))
-                continue;
-
-            bool appears = false, ok = true;
-            for (Index i = 0; i < m && ok; ++i) {
-                f64 aj = 0.0;
-                for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
-                    if (ci[sz(k)] == j) aj += av[sz(k)];
-                if (std::fabs(aj) <= tol) continue;
-                appears = true;
-                if (!eq[sz(i)]) {
-                    ok = false;
-                    break;
-                }
-                for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
-                    const Index q = ci[sz(k)];
-                    if (std::fabs(av[sz(k)]) <= tol) continue;
-                    if (!col_network[sz(q)]) {
-                        ok = false;
-                        break;
-                    }
-                    if (q == j) continue;
-                    if (!p.is_integer[sz(q)] && !fixed_int(p, q, tol)) {
-                        // Other continuous network cols: allow if they also
-                        // qualify in the same pass (mark jointly below).
-                        // Require at least integer RHS already checked.
-                        if (std::isfinite(p.col_lo[sz(q)]) &&
-                            !nearly_int(p.col_lo[sz(q)], tol)) {
-                            ok = false;
-                            break;
-                        }
-                        if (std::isfinite(p.col_hi[sz(q)]) &&
-                            !nearly_int(p.col_hi[sz(q)], tol)) {
-                            ok = false;
-                            break;
-                        }
-                    }
+    for (Index seed = 0; seed < n; ++seed) {
+        if (dl.over()) break;
+        if (seen[sz(seed)] || p.is_integer[sz(seed)] || fixed_int(p, seed, tol))
+            continue;
+        std::vector<Index> columns{seed}, rows;
+        seen[sz(seed)] = 1;
+        component_id[sz(seed)] = seed;
+        // Collect even invalid continuous neighbours: skipping one would
+        // leave a partially marked component, which is the A2 defect.
+        for (std::size_t head = 0; head < columns.size(); ++head) {
+            if (dl.over()) return added;
+            const Index j = columns[head];
+            for (core::Offset k = cp[sz(j)]; k < cp[sz(j) + 1]; ++k) {
+                if (std::fabs(csc.vals[sz(k)]) <= tol) continue;
+                const Index i = ri[sz(k)];
+                if (row_id[sz(i)] == seed) continue;
+                row_id[sz(i)] = seed;
+                rows.push_back(i);
+                if (!eq[sz(i)]) continue;
+                for (core::Offset q = rp[sz(i)]; q < rp[sz(i) + 1]; ++q) {
+                    const Index col = ci[sz(q)];
+                    if (std::fabs(av[sz(q)]) <= tol || seen[sz(col)] ||
+                        p.is_integer[sz(col)] || fixed_int(p, col, tol)) continue;
+                    seen[sz(col)] = 1;
+                    component_id[sz(col)] = seed;
+                    columns.push_back(col);
                 }
             }
-            if (appears && ok) {
-                // Mark all continuous network columns that share these equality
-                // rows (closed subsystem).
-                std::vector<Index> stack = {j};
-                std::vector<char> seen(sz(n), 0);
-                seen[sz(j)] = 1;
-                while (!stack.empty()) {
-                    const Index u = stack.back();
-                    stack.pop_back();
-                    if (!p.is_integer[sz(u)]) {
-                        p.is_integer[sz(u)] = true;
-                        ++added;
-                        changed = true;
-                    }
-                    for (Index i = 0; i < m; ++i) {
-                        bool hit = false;
-                        for (core::Offset k = rp[sz(i)];
-                             k < rp[sz(i) + 1]; ++k)
-                            if (ci[sz(k)] == u &&
-                                std::fabs(av[sz(k)]) > tol) {
-                                hit = true;
-                                break;
-                            }
-                        if (!hit || !eq[sz(i)]) continue;
-                        for (core::Offset k = rp[sz(i)];
-                             k < rp[sz(i) + 1]; ++k) {
-                            const Index q = ci[sz(k)];
-                            if (std::fabs(av[sz(k)]) <= tol) continue;
-                            if (!col_network[sz(q)] || seen[sz(q)]) continue;
-                            seen[sz(q)] = 1;
-                            stack.push_back(q);
-                        }
-                    }
-                }
+        }
+        bool valid = true;
+        for (Index j : columns) {
+            if (!network[sz(j)] ||
+                (std::isfinite(p.col_lo[sz(j)]) && !nearly_int(p.col_lo[sz(j)], tol)) ||
+                (std::isfinite(p.col_hi[sz(j)]) && !nearly_int(p.col_hi[sz(j)], tol)))
+                valid = false;
+        }
+        for (Index i : rows) {
+            if (dl.over()) return added;
+            if (!eq[sz(i)]) { valid = false; continue; }
+            for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+                if (std::fabs(av[sz(k)]) <= tol) continue;
+                const Index j = ci[sz(k)];
+                if (component_id[sz(j)] == seed) continue;
+                if ((!p.is_integer[sz(j)] && !fixed_int(p, j, tol)) ||
+                    !nearly_int(av[sz(k)], tol)) valid = false;
             }
+        }
+        if (!valid) continue;
+        for (Index j : columns) {
+            p.is_integer[sz(j)] = true;
+            ++added;
         }
     }
     return added;
@@ -816,29 +755,35 @@ ImpliedIntDiagnostics infer_implied_integers_ex(
                    opts.time_limit_s;
     };
     if (ii_over()) { diag.aborted_on_time = 1; return diag; }
+    // These rules change the discrete feasible set. A near-zero coefficient,
+    // near-unit matrix entry, near-integer RHS, or near-equality is not an
+    // exact TU/equality pattern: over a wide domain the discarded difference
+    // can force a fractional value. Use exact representable data for the
+    // structural proof; opts.tol remains only for conservative bound snaps.
+    constexpr f64 proof_tol = 0.0;
     if (opts.equality_pm1)
-        diag.equality_pm1 = infer_equality_pm1(lp, opts.tol, dl);
+        diag.equality_pm1 = infer_equality_pm1(lp, proof_tol, dl);
     if (ii_over()) { diag.aborted_on_time = 1; return diag; }
-    if (opts.network) diag.network = infer_network(lp, opts.tol, dl);
+    if (opts.network) diag.network = infer_network(lp, proof_tol, dl);
     if (ii_over()) { diag.aborted_on_time = 1; return diag; }
     if (opts.consecutive_ones)
-        diag.consecutive_ones = infer_consecutive_ones(lp, opts.tol, dl);
+        diag.consecutive_ones = infer_consecutive_ones(lp, proof_tol, dl);
     if (ii_over()) { diag.aborted_on_time = 1; return diag; }
     if (opts.dual_rational)
-        diag.dual_rational = infer_dual_rational(lp, opts.tol, dl);
+        diag.dual_rational = infer_dual_rational(lp, proof_tol, dl);
     if (ii_over()) { diag.aborted_on_time = 1; return diag; }
     if (opts.tu_network_block) {
-        diag.tu_network_block = infer_tu_network_block(lp, opts.tol, dl);
-        diag.tu_network_transpose = infer_tu_network_transpose(lp, opts.tol, dl);
+        diag.tu_network_block = infer_tu_network_block(lp, proof_tol, dl);
+        diag.tu_network_transpose = infer_tu_network_transpose(lp, proof_tol, dl);
     }
     // Cascade: TU marks may unlock more ±1 / dual inferences.
     const std::uint64_t tu_extra = diag.network + diag.consecutive_ones +
                                    diag.tu_network_block +
                                    diag.tu_network_transpose;
     if (opts.equality_pm1 && tu_extra > 0)
-        diag.equality_pm1 += infer_equality_pm1(lp, opts.tol, dl);
+        diag.equality_pm1 += infer_equality_pm1(lp, proof_tol, dl);
     if (opts.dual_rational && tu_extra > 0)
-        diag.dual_rational += infer_dual_rational(lp, opts.tol, dl);
+        diag.dual_rational += infer_dual_rational(lp, proof_tol, dl);
     diag.total = diag.equality_pm1 + diag.network + diag.consecutive_ones +
                  diag.dual_rational + diag.tu_network_block +
                  diag.tu_network_transpose;

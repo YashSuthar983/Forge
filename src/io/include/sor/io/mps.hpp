@@ -62,7 +62,8 @@ model::LpProblem read_mps(std::istream&, MpsReadReport&,
 model::LpProblem read_mps_file(const std::string& path, MpsReadReport&,
                                const MpsReadOptions& = {});
 
-// Tries free format, and on ANY parse failure retries in fixed format. This is
+// Routes .lp/.lp.gz to the LP reader. For MPS, tries free format, and on ANY
+// parse failure retries in fixed format. This is
 // the behaviour a benchmark harness wants: real-world MPS corpora mix both.
 // Reports which one succeeded via MpsReadReport::used_fixed_format.
 model::LpProblem read_mps_file_auto(const std::string& path, MpsReadReport&,

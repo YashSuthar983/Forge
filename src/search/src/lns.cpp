@@ -1,5 +1,6 @@
 #include "sor/search/lns.hpp"
 
+#include "sor/search/propagate.hpp"
 #include "sor/sparse/csr.hpp"
 
 #include <algorithm>
@@ -180,7 +181,8 @@ bool build_neighborhood(Neighborhood kind,
                         f64 fixing_rate,
                         f64 int_tol,
                         std::uint32_t& rng_state,
-                        NeighborhoodProblem& out) {
+                        NeighborhoodProblem& out,
+                        const std::vector<f64>* redcost) {
     const Index n = mip.n_cols();
     if (static_cast<Index>(node_lo.size()) != n ||
         static_cast<Index>(node_hi.size()) != n)
@@ -208,19 +210,119 @@ bool build_neighborhood(Neighborhood kind,
 
     switch (kind) {
         case Neighborhood::Rens: {
+            // Propagation-guarded RENS. Fixing EVERY integral LP value at once
+            // routinely empties the neighbourhood on partitioning structure
+            // (air05: the sub-MIP proved it infeasible in 0.05 s), because the
+            // LP sits at 0 on columns some integer solution needs. Instead:
+            //  1. restrict fractional integers to [floor, ceil] and propagate
+            //     (dropped as a whole if that alone is infeasible);
+            //  2. fix integral LP values one at a time, most LP-confident
+            //     first (largest |reduced cost|), propagating each; a fix
+            //     propagation refutes is undone and the column stays free;
+            //  3. stop at the adaptive target fixing rate.
+            // Every bound in the result is a fixing or a consequence of the
+            // fixings and the model rows, so the box is exactly the RENS
+            // neighbourhood of the accepted fixings, never an invalid cut.
             if (!have_relax) return false;
+            const Index m = mip.n_rows();
+            const ColumnRowIndex index = build_column_row_index(mip);
+            PropagationScratch scratch;
+            PropTrail trail;
+            const std::uint64_t step_cap =
+                static_cast<std::uint64_t>(std::max<Index>(1, m));
+            std::uint64_t total_left =
+                20ull * static_cast<std::uint64_t>(std::max<Index>(1, m));
+            const auto propagate_from = [&](const std::vector<Index>& seeds) {
+                const auto pr = propagate_bounds_events(
+                    mip, index, out.col_lo, out.col_hi, seeds, scratch, &trail,
+                    1, int_tol, std::min(step_cap, total_left));
+                const auto used = static_cast<std::uint64_t>(std::max(0, pr.rounds));
+                total_left = used >= total_left ? 0 : total_left - used;
+                return pr.feasible;
+            };
+            const auto undo_to = [&](std::size_t mark) {
+                const auto& es = trail.entries();
+                for (std::size_t t = es.size(); t-- > mark;)
+                    (es[t].dir == BoundDir::Lower ? out.col_lo : out.col_hi)
+                        [sz(es[t].var)] = es[t].old_bound;
+                trail.truncate(mark);
+            };
+            const auto set_bound = [&](Index j, bool lower, f64 v) {
+                auto& b = lower ? out.col_lo[sz(j)] : out.col_hi[sz(j)];
+                if (b == v) return;
+                trail.push(j, lower ? BoundDir::Lower : BoundDir::Upper, v, b,
+                           ReasonKind::Branch, -1, 1);
+                b = v;
+            };
+
+            Index n_int = 0;
+            std::vector<Index> seeds, candidates;
             for (Index j = 0; j < n; ++j) {
                 if (!integral_col(mip, j)) continue;
+                ++n_int;
                 const f64 v = x_relax[sz(j)];
                 if (!std::isfinite(v)) continue;
                 if (is_int_value(v, int_tol)) {
-                    if (!fix_at(j, v)) return false;
+                    candidates.push_back(j);
                 } else {
-                    out.col_lo[sz(j)] = std::max(out.col_lo[sz(j)], std::floor(v));
-                    out.col_hi[sz(j)] = std::min(out.col_hi[sz(j)], std::ceil(v));
+                    set_bound(j, true, std::max(out.col_lo[sz(j)], std::floor(v)));
+                    set_bound(j, false, std::min(out.col_hi[sz(j)], std::ceil(v)));
+                    seeds.push_back(j);
                     ++out.free_integer;
                 }
             }
+            if (n_int == 0) return false;
+            if (!seeds.empty() && !propagate_from(seeds)) {
+                undo_to(0);
+                out.free_integer = 0;
+            }
+            const bool have_rc = redcost != nullptr &&
+                                 static_cast<Index>(redcost->size()) == n;
+            std::stable_sort(candidates.begin(), candidates.end(),
+                             [&](Index a, Index b) {
+                                 if (!have_rc) return false;
+                                 return std::fabs((*redcost)[sz(a)]) >
+                                        std::fabs((*redcost)[sz(b)]);
+                             });
+            const auto is_fixed = [&](Index j) {
+                return out.col_hi[sz(j)] - out.col_lo[sz(j)] <= int_tol;
+            };
+            std::vector<char> fixed_flag(sz(n), 0);
+            Index fixed = 0;
+            for (Index j = 0; j < n; ++j)
+                if (integral_col(mip, j) && is_fixed(j)) {
+                    fixed_flag[sz(j)] = 1;
+                    ++fixed;
+                }
+            const Index target = static_cast<Index>(
+                std::ceil(std::clamp(fixing_rate, 0.0, 1.0) * static_cast<f64>(n_int)));
+            std::vector<Index> one(1);
+            for (const Index j : candidates) {
+                if (fixed >= target || total_left == 0) break;
+                if (is_fixed(j)) continue;
+                const f64 r = std::round(x_relax[sz(j)]);
+                if (r < out.col_lo[sz(j)] - int_tol || r > out.col_hi[sz(j)] + int_tol)
+                    continue;  // propagation already excluded the LP value
+                const std::size_t mark = trail.size();
+                set_bound(j, true, r);
+                set_bound(j, false, r);
+                one[0] = j;
+                if (!propagate_from(one)) {
+                    undo_to(mark);
+                    continue;
+                }
+                // Count every integer column this fixing closed, once.
+                const auto& es = trail.entries();
+                for (std::size_t t = mark; t < es.size(); ++t) {
+                    const Index k = es[t].var;
+                    if (!fixed_flag[sz(k)] && integral_col(mip, k) && is_fixed(k)) {
+                        fixed_flag[sz(k)] = 1;
+                        ++fixed;
+                    }
+                }
+            }
+            out.fixed = static_cast<decltype(out.fixed)>(fixed);
+            out.free_integer = static_cast<decltype(out.free_integer)>(n_int - fixed);
             break;
         }
         case Neighborhood::Rins: {

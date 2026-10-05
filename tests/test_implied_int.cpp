@@ -1,5 +1,6 @@
 // WP-F: TU / network / consecutive-ones implied integrality.
 #include "sor/search/bab.hpp"
+#include "sor/certify/finalize.hpp"
 #include "sor/search/implied_int.hpp"
 #include "sor/sparse/csr.hpp"
 
@@ -104,6 +105,28 @@ void test_equality_pm1() {
     CHECK(lp.is_integer[1]);
 }
 
+void test_small_nonzero_coefficient_blocks_implied_integrality() {
+    // x + 5e-10*y = 0, y integer in [0,1e9]. The feasible point
+    // (x,y)=(-0.5,1e9) proves that x is NOT implied integer. Rounding the
+    // small coefficient to zero would falsely mark it as integer.
+    LpProblem lp;
+    lp.name = "implied_int_small_coef";
+    lp.c = {1.0, 0.0};
+    lp.col_lo = {-1.0, 0.0};
+    lp.col_hi = {0.0, 1e9};
+    lp.is_integer = {false, true};
+    lp.row_lo = {0.0};
+    lp.row_hi = {0.0};
+    lp.A = from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 5e-10});
+    search::ImpliedIntOptions o;
+    o.network = false;
+    o.consecutive_ones = false;
+    o.dual_rational = false;
+    const auto d = search::infer_implied_integers_ex(lp, o);
+    CHECK(d.total == 0);
+    CHECK(!lp.is_integer[0]);
+}
+
 void test_network_marks_flow() {
     auto lp = network_flow_model();
     sor::search::ImpliedIntOptions o;
@@ -157,8 +180,55 @@ void test_tu_network_block_pair() {
 
 }  // namespace
 
+void test_network_component_is_atomic() {
+    for (bool reverse_second : {false, true}) {
+        for (bool inequality : {false, true}) {
+            LpProblem lp;
+            lp.c = inequality ? std::vector<double>{0.0, 1.0} : std::vector<double>{1.0, 0.0, 0.0};
+            lp.col_lo = inequality ? std::vector<double>{0.0, 0.0} : std::vector<double>{0.0, 0.0, 0.3};
+            lp.col_hi = inequality ? std::vector<double>{1.0, 1.0} : std::vector<double>{1.0, 1.0, 0.7};
+            lp.is_integer.assign(lp.c.size(), false);
+            const double sign = reverse_second ? -1.0 : 1.0;
+            if (inequality) {
+                lp.A = from_triplets(2, 2, {0, 0, 1}, {0, 1, 1}, {1.0, 1.0, sign});
+                lp.row_lo = {1.0, reverse_second ? -kInf : 0.3};
+                lp.row_hi = {1.0, reverse_second ? -0.3 : kInf};
+            } else {
+                lp.A = from_triplets(2, 3, {0, 0, 1, 1}, {0, 1, 1, 2}, {1.0, 1.0, sign, sign});
+                lp.row_lo = {1.0, sign}; lp.row_hi = lp.row_lo;
+            }
+            search::ImpliedIntOptions o;
+            o.equality_pm1 = false; o.network = true; o.consecutive_ones = false;
+            o.dual_rational = false; o.tu_network_block = false;
+            auto diag = search::infer_implied_integers_ex(lp, o);
+            CHECK(diag.total == 0);
+            for (bool integer : lp.is_integer) CHECK(!integer);
+            search::BabOptions opts; opts.para_bab.threads = 1;
+            search::BabDiagnostics bd;
+            auto raw = search::solve_milp(lp, opts, bd);
+            auto result = sor::certify::finalize_result(std::move(raw), search::milp_evidence(bd, opts));
+            CHECK(result.status == core::Status::Optimal);
+            CHECK(std::fabs(result.objective - 0.3) <= 1e-6);
+        }
+    }
+    LpProblem transport;
+    transport.c = {1.0, 2.0, 2.0, 1.0};
+    transport.col_lo.assign(4, 0.0); transport.col_hi.assign(4, 1.0);
+    transport.is_integer.assign(4, false);
+    transport.row_lo = {1.0, 1.0, -1.0, -1.0}; transport.row_hi = transport.row_lo;
+    transport.A = from_triplets(4, 4, {0,0,1,1,2,2,3,3}, {0,1,2,3,0,2,1,3}, {1,1,1,1,-1,-1,-1,-1});
+    search::ImpliedIntOptions o;
+    o.equality_pm1 = false; o.network = true; o.consecutive_ones = false;
+    o.dual_rational = false; o.tu_network_block = false;
+    auto d = search::infer_implied_integers_ex(transport, o);
+    CHECK(d.network == 4);
+}
+
+
 int main() {
+    test_network_component_is_atomic();
     test_equality_pm1();
+    test_small_nonzero_coefficient_blocks_implied_integrality();
     test_network_marks_flow();
     test_c1_marks();
     test_dual_rational_marks_z();

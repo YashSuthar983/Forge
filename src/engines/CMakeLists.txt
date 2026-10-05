@@ -1,6 +1,8 @@
 add_library(sor_engines
   src/pdhg.cpp
   src/simplex.cpp
+  src/triangular_crash.cpp
+  src/dual_certificate_repair.cpp
   src/dual_simplex.cpp
   src/dual_edge_weights.cpp
   src/dual_cost_perturbation.cpp
@@ -11,6 +13,7 @@ add_library(sor_engines
   src/qp_option_bindings.cpp
   src/lp_batched.cpp
   src/crossover.cpp
+  src/lp_concurrent.cpp
   src/lp.cpp
   src/qp.cpp src/qcqp.cpp src/qcqp_local.cpp
   src/qp_pdhcg.cpp src/qp_ipm.cpp src/qp_polish.cpp src/qp_krylov.cpp src/qp_route.cpp

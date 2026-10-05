@@ -19,6 +19,11 @@ Usage: `sor_solve MODEL [options]`
 | `--eval-solution` | `FILE` or `zero` | Evaluate a QPLIB solution without solving. |
 | `--solution-out` | `PATH` | Write the solution/certificate file consumed by `sor_check`. |
 | `--fixed-mps` / `--free-mps` | switch | Force fixed/free MPS parsing instead of auto-detection. |
+| `.lp` / `.lp.gz` input | path | Automatically use the linear LP reader; use `--engine milp` for integer declarations. |
+| `--trace-lp` | switch | Trace phase-2 progress and cleanup/restoration inside MILP relaxations. |
+| `--no-primal-bound-perturbation` | switch | Disable recovery from primal phase-2 plateaus for comparison. |
+| `--conflict-store-max-len` | integer; `64` | Maximum normalized learned clause length (1–4096), still subject to the store's byte budget. |
+| `--rb-time-share` / `--rb-sb-share` | real; `0.25` | Reliability-probe allowance as a share of node-LP work, within the solve's remaining time. |
 | `--relax-integrality` | switch; off | Read integer columns as continuous. |
 | `--small-matrix-value` | nonnegative real | Drop matrix coefficients whose absolute value is at most this threshold. |
 | `--threads` | integer `1..256` | Sparse-linear-algebra worker count. |
@@ -91,6 +96,7 @@ Usage: `sor_solve MODEL [options]`
 | `--lattice-reform` | switch; off | Enable AHL lattice reformulation for pure-integer equalities. |
 | `--no-probing` | switch | Disable root probing. |
 | `--no-mip-presolve` | switch | Disable MIP root presolve. |
+| `--no-monotone-binary-pairs` | switch | Disable optimality-preserving saturation and substitution of binary activation pairs. |
 | `--no-symmetry` | switch | Disable orbit/orbital-fixing symmetry handling. |
 | `--reflection` / `--no-reflection` | switches; off | Enable/disable experimental reflection-complete symmetry. |
 | `--no-folding` | switch | Disable folding-complete symmetry. |

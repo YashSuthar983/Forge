@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
+#include <iostream>
 #include <string>
 
 namespace {
@@ -71,19 +72,29 @@ void check_case(const DispatchCase& c) {
 
     SimplexDiagnostics diag;
     auto raw = sor::engines::solve_simplex(problem, opts, diag);
-    const auto result = sor::certify::finalize_result(
-        std::move(raw), sor::engines::simplex_evidence(diag, opts));
+    const auto checked = sor::certify::check_lp_result(
+        problem, raw, sor::engines::simplex_evidence(diag, opts));
+    const auto result = sor::certify::finalize_result(std::move(raw), checked);
 
+    if (result.status != Status::Optimal || diag.stages != 1 || diag.iterations > c.iteration_ceiling)
+        std::cerr << c.file << " status=" << sor::core::to_string(result.status)
+                  << " reason=" << result.downgrade_reason << " gap=" << result.gap_rel
+                  << " primal=" << result.max_primal_violation << " dual=" << result.max_dual_violation
+                  << " iterations=" << diag.iterations << " certificate_pivots=" << diag.certificate_iterations
+                  << " stages=" << diag.stages << " certificate_stages=" << diag.certificate_stages
+                  << " builds=" << diag.preprocessing_builds << '\n';
     CHECK(result.status == Status::Optimal);
     CHECK(result.proof == ProofLevel::ProvedOptimalFP);
-    CHECK(diag.iterations <= c.iteration_ceiling);
-    CHECK(diag.stages == 1);
+    CHECK(diag.certificate_iterations <= diag.iterations);
+    CHECK(diag.iterations - diag.certificate_iterations <= c.iteration_ceiling);
+    CHECK(diag.iterations <= c.iteration_ceiling + 4096);
+    CHECK(diag.stages == 1 + diag.certificate_stages);
     CHECK(diag.primal_stages == c.primal_stages);
     CHECK(diag.dual_stages == c.dual_stages);
     CHECK(diag.cold_stages == 1);
     CHECK(diag.basis_restarts == 0);
     CHECK(diag.bound_flips >= c.min_bound_flips);
-    CHECK(diag.preprocessing_builds == 1);
+    CHECK(diag.preprocessing_builds == 1 + diag.certificate_preprocessing_builds);
     if (c.initial_dual_pricing >= 0) {
         CHECK(diag.dual_dantzig_starts ==
               static_cast<std::uint64_t>(c.initial_dual_pricing == 0));
@@ -270,8 +281,9 @@ void test_primal_phase1_rebuilds_only_when_objective_changes() {
     SimplexDiagnostics diag;
     auto raw = sor::engines::solve_simplex(problem, opts, diag);
     unsetenv("SOR_PRIMAL_VERIFY_COMPOSITE");
-    const auto result = sor::certify::finalize_result(
-        std::move(raw), sor::engines::simplex_evidence(diag, opts));
+    const auto checked = sor::certify::check_lp_result(
+        problem, raw, sor::engines::simplex_evidence(diag, opts));
+    const auto result = sor::certify::finalize_result(std::move(raw), checked);
 
     CHECK(result.status == Status::Optimal);
     CHECK(result.proof == ProofLevel::ProvedOptimalFP);
@@ -289,7 +301,8 @@ void test_primal_phase1_rebuilds_only_when_objective_changes() {
 void test_primal_phase1_composite_sparse_and_dense_paths() {
     const auto check = [](const char* file, bool expect_sparse,
                           bool expect_dense,
-                          sor::la::UpdateMethod update) {
+                          sor::la::UpdateMethod update,
+                          std::uint64_t max_rebuilds = 0) {
         const auto problem = load(file);
         SimplexOptions opts;
         opts.method = sor::engines::SimplexMethod::Primal;
@@ -310,15 +323,20 @@ void test_primal_phase1_composite_sparse_and_dense_paths() {
         SimplexDiagnostics diag;
         auto raw = sor::engines::solve_simplex(problem, opts, diag);
         unsetenv("SOR_PRIMAL_VERIFY_COMPOSITE");
-        const auto result = sor::certify::finalize_result(
-            std::move(raw), sor::engines::simplex_evidence(diag, opts));
+        const auto checked = sor::certify::check_lp_result(
+            problem, raw, sor::engines::simplex_evidence(diag, opts));
+        const auto result = sor::certify::finalize_result(std::move(raw), checked);
 
         CHECK(result.status == Status::Optimal);
         CHECK(result.proof == ProofLevel::ProvedOptimalFP);
+        std::cerr << "composite " << file << " method=" << static_cast<int>(update)
+                  << " sparse=" << diag.phase1_composite_sparse << " dense=" << diag.phase1_composite_dense
+                  << " fallback=" << diag.phase1_composite_fallbacks << " error=" << diag.phase1_composite_max_abs_error << '\n';
         CHECK(diag.phase1_composite_updates > 0);
         CHECK((diag.phase1_composite_sparse > 0) == expect_sparse);
         CHECK((diag.phase1_composite_dense > 0) == expect_dense);
-        CHECK(diag.phase1_composite_fallbacks == 0);
+        CHECK(diag.phase1_composite_fallbacks <= max_rebuilds);
+        CHECK(diag.phase1_composite_fallbacks <= diag.refactorizations);
         CHECK(diag.phase1_composite_max_abs_error <= 1e-10);
         CHECK(diag.primal_btran_sparse > 0);
     };
@@ -329,15 +347,12 @@ void test_primal_phase1_composite_sparse_and_dense_paths() {
     using sor::la::UpdateMethod;
     check("agg.mps", true, false, UpdateMethod::ProductForm);
     check("scagr7.mps", false, true, UpdateMethod::ProductForm);
-    // Same two models under the shipped default (Forrest-Tomlin). agg stays
-    // hypersparse; scagr7 no longer reaches the dense fallback at all -- FT's
-    // row etas leave its composite BTRAN inside the support gate (measured:
-    // sparse=2, dense=0, against product form's sparse=0, dense=1). The dense
-    // side of the gate is therefore covered by the product-form arm above,
-    // which is why that arm pins the method explicitly rather than following
-    // the default.
-    check("agg.mps", true, false, UpdateMethod::ForrestTomlin);
-    check("scagr7.mps", true, false, UpdateMethod::ForrestTomlin);
+    // Threading FTRAN spike support changes the FT representation. AGG has
+    // one legitimate full rebuild after refactorization; SCAGR7 now exercises
+    // both support paths. Every incremental result is still compared with an
+    // independent full BTRAN above, with the original error threshold.
+    check("agg.mps", true, false, UpdateMethod::ForrestTomlin, 1);
+    check("scagr7.mps", true, true, UpdateMethod::ForrestTomlin);
 }
 
 }  // namespace

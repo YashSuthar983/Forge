@@ -1,5 +1,7 @@
 #include "sor/certify/finalize.hpp"
 #include "sor/engines/lp.hpp"
+#include "sor/engines/hpr.hpp"
+#include "sor/engines/pdhg.hpp"
 #include "sor/io/mps.hpp"
 #include "sor/model/lp.hpp"
 #include "fixtures.hpp"
@@ -230,11 +232,11 @@ int main() {
     // FO routes must honor presolve terminal outcomes without running HPR.
     {
         model::LpProblem bad;
-        bad.A = sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
+        bad.A = sparse::from_triplets(1, 2, {}, {}, {});
         bad.c = {1.0, 1.0};
-        bad.row_lo = {-model::kInf};
-        bad.row_hi = {10.0};
-        bad.col_lo = {5.0, 0.0};
+        bad.row_lo = {5.0};
+        bad.row_hi = {model::kInf};
+        bad.col_lo = {0.0, 0.0};
         bad.col_hi = {1.0, 1.0};
         core::LpOptions hpr_options;
         hpr_options.strategy = core::LpStrategy::Hpr;
@@ -251,5 +253,22 @@ int main() {
         CHECK(finalized.status == core::Status::NoSolutionFound);
     }
 
+    // Rich FO policies must reach the engine through the same dispatcher as
+    // default policies. Invalid engine-specific settings cannot disappear.
+    {
+        core::LpOptions opts;
+        opts.presolve = false;
+        opts.fo_crossover = false;
+        opts.max_iterations = 2;
+        core::LpDiagnostics diag;
+        engines::HprOptions hpr;
+        hpr.weight_min = 0;
+        opts.strategy = core::LpStrategy::Hpr;
+        CHECK_THROWS(engines::solve_lp(problem, opts, diag, nullptr, nullptr, &hpr));
+        engines::PdhgOptions pdhg;
+        pdhg.step_safety = 2;
+        opts.strategy = core::LpStrategy::Pdhg;
+        CHECK_THROWS(engines::solve_lp(problem, opts, diag, nullptr, nullptr, nullptr, &pdhg));
+    }
     return test::finish("test_lp_auto");
 }

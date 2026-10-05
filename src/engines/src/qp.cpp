@@ -61,6 +61,13 @@ core::RawResult solve_qp_diag(const QpProblem& problem,
                               const QpOptions& opts,
                               QpDiagnostics& diag) {
     const auto t0 = Clock::now();
+    const auto deadline = (opts.time_limit_s > 0.0)
+        ? t0 + std::chrono::duration_cast<Clock::duration>(
+              std::chrono::duration<double>(opts.time_limit_s))
+        : Clock::time_point::max();
+    const auto time_limit_reached = [&]() {
+        return opts.time_limit_s > 0.0 && Clock::now() >= deadline;
+    };
     diag = QpDiagnostics{};
     core::RawResult raw;
     raw.engine = "qp_diag_as";
@@ -146,6 +153,20 @@ core::RawResult solve_qp_diag(const QpProblem& problem,
     const auto& ci = lp.A.pattern.col_idx();
     const auto& av = lp.A.vals;
 
+    auto finish_timeout = [&]() {
+        raw.proposed_status = core::Status::Interrupted;
+        raw.proposed_level = core::ProofLevel::None;
+        raw.dual_bound = core::kNaN;
+        raw.termination_reason = "QP time limit";
+        diag.primal_residual = core::kPosInf;
+        diag.stationarity = core::kPosInf;
+        diag.gap_rel = core::kPosInf;
+        diag.termination_reason = raw.termination_reason;
+        diag.total_ms = ms_since(t0);
+        return raw;
+    };
+    if (time_limit_reached()) return finish_timeout();
+
     // A_eq as list of (row_in_eq, col, val)
     struct Triple { Index r, j; f64 v; };
     std::vector<Triple> aeq;
@@ -193,10 +214,12 @@ core::RawResult solve_qp_diag(const QpProblem& problem,
             f64 ylo = -1.0, yhi = 1.0;
             f64 flo = eval(ylo, nullptr), fhi = eval(yhi, nullptr);
             for (int k = 0; k < 200 && flo < 0.0; ++k) {
+                if (time_limit_reached()) return finish_timeout();
                 ylo *= 2.0;
                 flo = eval(ylo, nullptr);
             }
             for (int k = 0; k < 200 && fhi > 0.0; ++k) {
+                if (time_limit_reached()) return finish_timeout();
                 yhi *= 2.0;
                 fhi = eval(yhi, nullptr);
             }
@@ -208,6 +231,7 @@ core::RawResult solve_qp_diag(const QpProblem& problem,
                 return raw;
             }
             for (int k = 0; k < 160; ++k) {
+                if (time_limit_reached()) return finish_timeout();
                 yval = 0.5 * (ylo + yhi);
                 const f64 fm = eval(yval, nullptr);
                 if (fm > 0.0) ylo = yval;
@@ -215,6 +239,7 @@ core::RawResult solve_qp_diag(const QpProblem& problem,
             }
             yval = 0.5 * (ylo + yhi);
         }
+        if (time_limit_reached()) return finish_timeout();
         eval(yval, &x_fast);
 
         f64 eq_viol = 0.0;
@@ -284,6 +309,7 @@ core::RawResult solve_qp_diag(const QpProblem& problem,
     std::vector<f64> y(sz(m), 0.0);
 
     for (std::uint64_t it = 0; it < opts.max_iterations; ++it) {
+        if (time_limit_reached()) return finish_timeout();
         diag.iterations = it + 1;
 
         // Build rhs for free KKT: (A_F Q_F^{-1} A_F') y = -b' - A_F Q_F^{-1} c_F
@@ -302,6 +328,8 @@ core::RawResult solve_qp_diag(const QpProblem& problem,
         // For each free col j: contrib = a_{*j} / Q_j
         std::vector<f64> acol(sz(m), 0.0);
         for (Index j = 0; j < n; ++j) {
+            if ((j & 0x3f) == 0 && time_limit_reached())
+                return finish_timeout();
             if (side[sz(j)] != Side::Free) continue;
             std::fill(acol.begin(), acol.end(), 0.0);
             for (const auto& t : aeq)
@@ -313,7 +341,6 @@ core::RawResult solve_qp_diag(const QpProblem& problem,
                     S[sz(r) * sz(m) + sz(s)] += acol[sz(r)] * invq * acol[sz(s)];
             }
         }
-
         // Regularize empty / rank-deficient Schur (no free vars with A).
         for (Index r = 0; r < m; ++r)
             S[sz(r) * sz(m) + sz(r)] += 1e-14;

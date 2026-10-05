@@ -35,11 +35,14 @@ import platform
 import random
 import re
 import shutil
+import signal
 import socket
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
+from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, replace, field
 from pathlib import Path
 
@@ -58,6 +61,20 @@ _PAT = {
     "viol":    re.compile(r"^max (?:primal viol|row violation):\s+(\S+)", re.M),
     "iters":   re.compile(r"^iterations:\s+(\d+)", re.M),
     "solve_ms": re.compile(r"^  total\s+(\S+)", re.M),
+    "stage_iters": re.compile(
+        r"^(?:iterations:\s+\d+\s+\(|stage iterations:\s+)"
+        r"FO\s+(\d+),\s+crossover\s+(\d+),\s+simplex\s+(\d+)\)?", re.M),
+    "stage_ms": re.compile(
+        r"^stage time \(ms\):\s+FO\s+(\S+),\s+crossover\s+(\S+),\s+simplex\s+(\S+)",
+        re.M),
+    "crossover": re.compile(
+        r"^crossover:\s+attempted\s+(yes|no),\s+basis valid\s+(yes|no),\s+"
+        r"cold fallback\s+(yes|no)", re.M),
+    "checker_validation": re.compile(r"^validation:\s+(\S+)\s*$", re.M),
+    "checker_verified": re.compile(r"^VERIFIED\s*$", re.M),
+    "checker_unverified": re.compile(r"^UNVERIFIED\s*$", re.M),
+    "bab_threads": re.compile(r"^bab threads:\s+(\d+)\s*$", re.M),
+    "mip_gap_tol": re.compile(r"^mip gap tolerance:\s+(\S+)\s*$", re.M),
 }
 
 
@@ -74,6 +91,15 @@ class Result:
     seconds: float | None = None      # solver-internal where available
     wall_s: float | None = None       # full process wall
     iterations: int | None = None
+    fo_iterations: int | None = None
+    crossover_iterations: int | None = None
+    simplex_iterations: int | None = None
+    fo_seconds: float | None = None
+    crossover_seconds: float | None = None
+    simplex_seconds: float | None = None
+    crossover_attempted: bool | None = None
+    crossover_basis_valid: bool | None = None
+    crossover_cold_fallback: bool | None = None
     proof: str | None = None
     violation: float | None = None
     rows: int | None = None
@@ -101,6 +127,26 @@ class Result:
     configuration: dict | None = None
     solution_file: str | None = None
     solution_sha256: str | None = None
+    model_sha256: str | None = None
+    checker_command: list[str] | None = None
+    checker_verified: bool | None = None
+    checker_error: str | None = None
+    checker_validation_scope: str | None = None
+    checker_executable_sha256: str | None = None
+    checker_returncode: int | None = None
+    checker_stdout: str | None = None
+    checker_stderr: str | None = None
+    checker_timed_out: bool | None = None
+    solver_returncode: int | None = None
+    solver_stdout: str | None = None
+    solver_stderr: str | None = None
+    started_utc: str | None = None
+    executable_sha256: str | None = None
+    launch_affinity: list[int] | None = None
+    effective_bab_threads: int | None = None
+    mip_gap_tolerance: float | None = None
+    reference_model_path: str | None = None
+    reference_model_sha256: str | None = None
     # External-oracle identity is carried on every row.  In particular, the
     # source lane is valid only when this describes the native API runner and
     # the source tree/build it was linked against.
@@ -122,6 +168,36 @@ def sha256_file(path: Path) -> str | None:
         return h.hexdigest()
     except OSError:
         return None
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def verify_executable(path: Path, expected: str) -> None:
+    """Abort a campaign if a solver binary changes during measurement."""
+    actual = sha256_file(path)
+    if actual != expected:
+        raise RuntimeError(f"executable changed: {path}: {expected} -> {actual}")
+
+
+def freeze_sor_binaries(exe: Path, destination: Path) -> tuple[Path, str]:
+    """Keep the measured solver and checker beside the result artifact."""
+    source_hash = sha256_file(exe)
+    checker = exe.with_name("sor_check")
+    checker_hash = sha256_file(checker)
+    if source_hash is None or checker_hash is None:
+        raise RuntimeError("SOR solver and checker must both exist before a campaign")
+    destination.mkdir(parents=True, exist_ok=True)
+    for source, expected in ((exe, source_hash), (checker, checker_hash)):
+        target = destination / source.name
+        if target.exists():
+            verify_executable(target, expected)
+        else:
+            shutil.copy2(source, target)
+            verify_executable(target, expected)
+        verify_executable(source, expected)
+    return destination / exe.name, source_hash
 
 
 def _num(text: str, key: str) -> float | None:
@@ -192,6 +268,40 @@ def build_sor_command(model: Path, engine: str, backend: str,
     return cmd
 
 
+def run_solver_process(cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    """Capture a solver and kill its whole process group at the hard limit.
+
+    ``subprocess.run`` kills only its immediate child on timeout. If a solver
+    has descendants holding the captured pipes open, its cleanup may wait
+    well past the requested limit. A new session gives this run a dedicated
+    process group and bounds the cleanup wait too.
+    """
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, start_new_session=True)
+    try:
+        stdout, stderr = p.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(cmd, p.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            p.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            # A child stuck in uninterruptible kernel I/O must not hold the
+            # harness forever. The group has received SIGKILL; report timeout.
+            if p.stdout is not None:
+                p.stdout.close()
+            if p.stderr is not None:
+                p.stderr.close()
+            try:
+                p.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        raise
+
+
 def run_sor(model: Path, engine: str, backend: str, time_limit: float,
             tol: float, exe: Path, label: str, method: str | None = None,
             basis_update: str = "default", max_iter: int | None = None,
@@ -200,10 +310,22 @@ def run_sor(model: Path, engine: str, backend: str, time_limit: float,
             sor_extra: list[str] | None = None,
             solution_out: Path | None = None) -> Result:
     r = Result(solver=label, instance=model.name)
+    r.started_utc = datetime.now(timezone.utc).isoformat()
+    r.executable_sha256 = sha256_file(exe)
+    r.launch_affinity = ([cpu] if cpu is not None else
+                         sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None)
     try:
+        extra = list(sor_extra or [])
+        if engine == "milp" and cpu is not None and not any(
+                arg == "--bab-threads" or arg.startswith("--bab-threads=")
+                for arg in extra):
+            # Affinity limits *where* workers run, not how many SOR starts.
+            # SOR's auto setting can select eight Para-B&B workers inside a
+            # one-CPU taskset, while the reference runs with one thread.
+            extra += ["--bab-threads", "1"]
         base_cmd = build_sor_command(
             model, engine, backend, time_limit, tol, exe, method,
-            basis_update, max_iter, pricing, dual_cost_perturbation, sor_extra)
+            basis_update, max_iter, pricing, dual_cost_perturbation, extra)
         if solution_out is not None:
             solution_out.parent.mkdir(parents=True, exist_ok=True)
             if solution_out.exists():
@@ -218,19 +340,39 @@ def run_sor(model: Path, engine: str, backend: str, time_limit: float,
         return r
     t0 = time.perf_counter()
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=time_limit + 30)
+        p = run_solver_process(cmd, time_limit + 30)
+        r.solver_returncode = p.returncode
+        r.solver_stdout = p.stdout
+        r.solver_stderr = p.stderr
+        if r.executable_sha256 is not None:
+            verify_executable(exe, r.executable_sha256)
         r.wall_s = time.perf_counter() - t0
         out = p.stdout
         m = _PAT["status"].search(out)
         r.status = m.group(1) if m else "unparsed"
         m = _PAT["proof"].search(out)
         r.proof = m.group(1) if m else None
+        m = _PAT["bab_threads"].search(out)
+        r.effective_bab_threads = int(m.group(1)) if m else None
+        r.mip_gap_tolerance = _num(out, "mip_gap_tol")
         r.objective = _num(out, "obj")
         r.dual_bound = _num(out, "dual")
         r.violation = _num(out, "viol")
         it = _num(out, "iters")
         r.iterations = int(it) if it is not None else None
+        stage_iters = _PAT["stage_iters"].search(out)
+        if stage_iters:
+            (r.fo_iterations, r.crossover_iterations,
+             r.simplex_iterations) = map(int, stage_iters.groups())
+        stage_ms = _PAT["stage_ms"].search(out)
+        if stage_ms:
+            (r.fo_seconds, r.crossover_seconds,
+             r.simplex_seconds) = (float(x) / 1000.0 for x in stage_ms.groups())
+        crossover = _PAT["crossover"].search(out)
+        if crossover:
+            (r.crossover_attempted, r.crossover_basis_valid,
+             r.crossover_cold_fallback) = (
+                value == "yes" for value in crossover.groups())
         ms = _num(out, "solve_ms")
         # Compare solver-internal time to solver-internal time; keep the full
         # process wall separately so startup and file I/O stay visible.
@@ -244,9 +386,63 @@ def run_sor(model: Path, engine: str, backend: str, time_limit: float,
             if solution_out.is_file():
                 r.solution_file = str(solution_out.resolve())
                 r.solution_sha256 = sha256_file(solution_out)
-            elif is_certified_success(r):
-                r.error = (r.error + "; " if r.error else "") + \
-                    "measured solve did not write its requested solution"
+                checker = exe.with_name("sor_check")
+                check_cmd = [str(checker), str(model), str(solution_out),
+                             "--tol", str(tol)]
+                if "--relax-integrality" in base_cmd:
+                    check_cmd.append("--relax-integrality")
+                if "--small-matrix-value" in base_cmd:
+                    pos = base_cmd.index("--small-matrix-value")
+                    check_cmd += ["--small-matrix-value", base_cmd[pos + 1]]
+                r.checker_command = affined_command(check_cmd, cpu)
+                r.checker_executable_sha256 = sha256_file(checker)
+                if not checker.is_file():
+                    r.checker_verified = False
+                    r.checker_timed_out = False
+                    r.checker_error = f"independent checker not found: {checker}"
+                else:
+                    try:
+                        checked = subprocess.run(
+                            r.checker_command, capture_output=True, text=True,
+                            timeout=time_limit + 30)
+                        r.checker_returncode = checked.returncode
+                        r.checker_stdout = checked.stdout
+                        r.checker_stderr = checked.stderr
+                        r.checker_timed_out = False
+                        scope = _PAT["checker_validation"].search(checked.stdout)
+                        r.checker_validation_scope = (
+                            scope.group(1) if scope else None)
+                        is_unverified = bool(
+                            checked.returncode == 3 and scope is not None and
+                            _PAT["checker_unverified"].search(checked.stdout))
+                        if is_unverified:
+                            r.checker_verified = None
+                            r.checker_error = (
+                                "checker outcome unverified: insufficient "
+                                "certificate for the claim")
+                        else:
+                            r.checker_verified = bool(
+                                checked.returncode == 0 and scope is not None and
+                                _PAT["checker_verified"].search(checked.stdout))
+                        if not is_unverified and not r.checker_verified:
+                            r.checker_error = "checker rejected or output was unparseable"
+                    except subprocess.TimeoutExpired as e:
+                        r.checker_timed_out = True
+                        r.checker_verified = False
+                        r.checker_stdout = (e.stdout or "") if isinstance(
+                            e.stdout, str) else (e.stdout or b"").decode(errors="replace")
+                        r.checker_stderr = (e.stderr or "") if isinstance(
+                            e.stderr, str) else (e.stderr or b"").decode(errors="replace")
+                        r.checker_error = "independent checker timed out"
+                    except Exception as e:  # noqa: BLE001
+                        r.checker_timed_out = False
+                        r.checker_verified = False
+                        r.checker_error = f"checker execution failed: {type(e).__name__}: {e}"
+            else:
+                r.checker_verified = False
+                r.checker_timed_out = False
+                r.checker_error = "measured solve did not write its requested solution"
+                r.error = (r.error + "; " if r.error else "") + r.checker_error
     except subprocess.TimeoutExpired:
         r.wall_s = r.seconds = time.perf_counter() - t0
         r.status = "timeout"
@@ -292,6 +488,9 @@ def highs_worker(model: Path, time_limit: float, tol: float = 1e-7,
     """
     _HIGHS_OPTION_NOTES.clear()
     r = Result(solver="highs", instance=model.name)
+    r.started_utc = datetime.now(timezone.utc).isoformat()
+    r.launch_affinity = (sorted(os.sched_getaffinity(0))
+                         if hasattr(os, "sched_getaffinity") else None)
     try:
         import highspy
     except ImportError:
@@ -329,7 +528,23 @@ def highs_worker(model: Path, time_limit: float, tol: float = 1e-7,
         _set_option(h, "run_crossover", "on")
         if relax_integrality:
             _set_option(h, "solve_relaxation", True)
-        read_status = h.readModel(str(model))
+        # HiGHS dispatches its MPS reader by filename suffix. QPS uses the
+        # MPS grammar with a quadratic section, but .qps is not accepted by
+        # this reader. A byte-identical .mps alias preserves the model.
+        alias_context = tempfile.TemporaryDirectory(prefix="sor-highs-qps-")
+        try:
+            read_path = model
+            if model.suffix.lower() == ".qps":
+                read_path = Path(alias_context.name) / (model.stem + ".mps")
+                shutil.copyfile(model, read_path)
+                source_hash = sha256_file(model)
+                if source_hash != sha256_file(read_path):
+                    raise RuntimeError("QPS reference alias differs from source bytes")
+                r.reference_model_path = str(read_path)
+                r.reference_model_sha256 = source_hash
+            read_status = h.readModel(str(read_path))
+        finally:
+            alias_context.cleanup()
         if "kOk" not in str(read_status) and str(read_status) != "0":
             raise RuntimeError(f"readModel rejected model: {read_status}")
         run_time_before = float(h.getRunTime())
@@ -364,6 +579,9 @@ def run_highs(model: Path, time_limit: float, label: str,
               small_matrix_value: float | None = None, seed: int = 0) -> Result:
     """Run HiGHS in a fresh process, matching SOR's process isolation."""
     r = Result(solver=label, instance=model.name)
+    r.started_utc = datetime.now(timezone.utc).isoformat()
+    r.launch_affinity = ([cpu] if cpu is not None else
+                         sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None)
     cmd = [sys.executable, str(Path(__file__).resolve()), "--_highs-worker",
            str(model), str(time_limit), str(tol),
            "1" if relax_integrality else "0",
@@ -377,6 +595,9 @@ def run_highs(model: Path, time_limit: float, label: str,
         p = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=time_limit + 30)
         outer_wall = time.perf_counter() - t0
+        worker_returncode = p.returncode
+        worker_stdout = p.stdout
+        worker_stderr = p.stderr
         payload = None
         # With console logging enabled to match the source CLI lane, HiGHS
         # writes its normal report before (or, depending on C stdio flushing,
@@ -395,6 +616,9 @@ def run_highs(model: Path, time_limit: float, label: str,
         r.solver = label
         r.wall_s = outer_wall
         r.command = list(cmd)
+        r.solver_returncode = worker_returncode
+        r.solver_stdout = worker_stdout
+        r.solver_stderr = worker_stderr
         if p.returncode != 0 and r.status not in ("crash", "unavailable"):
             r.status = "crash"
             r.error = (p.stderr or f"worker exited {p.returncode}")[:200]
@@ -1026,10 +1250,51 @@ def is_optimal(r: Result) -> bool:
 
 
 def is_certified_success(r: Result) -> bool:
-    """Optimal is success for SOR only when its independent proof gate passed."""
+    """Fail closed for claims that the checker can validate end to end.
+
+    ``milp_incumbent`` deliberately does not qualify: sor_check verifies the
+    original-model incumbent, integrality and objective, but it does not replay
+    the search tree or independently validate the final global bound.
+    """
     if not is_optimal(r):
         return False
-    return not r.solver.lower().startswith("sor") or r.proof in _SOR_PROOFS
+    if not r.solver.lower().startswith("sor"):
+        return True
+    # Incumbent and primal-point checks, including QP, do not replay an
+    # optimality proof. Admit only scopes that independently check it.
+    return (r.proof in _SOR_PROOFS and r.checker_verified is True and
+            r.checker_validation_scope in ("lp_optimality_f64", "lp_kkt_f64",
+                                           "qp_kkt_f64"))
+
+
+def parse_solu_file(path: Path) -> dict[str, tuple[str, float | None]]:
+    """Parse a MIPLIB .solu file: '=opt=|=best=|=unkn=  name  [value]' per
+    line. Maps instance name -> (tag, value); value is None for =unkn= (and
+    for any line missing a trailing number, rather than raising)."""
+    out: dict[str, tuple[str, float | None]] = {}
+    with path.open() as fh:
+        for line in fh:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            tag, name = parts[0], parts[1]
+            if tag not in ("=opt=", "=best=", "=unkn="):
+                continue
+            value = None
+            if len(parts) >= 3:
+                try:
+                    value = float(parts[2])
+                except ValueError:
+                    value = None
+            out[name] = (tag, value)
+    return out
+
+
+def solu_lookup(solu: dict[str, tuple[str, float | None]],
+                instance: str) -> tuple[str, float | None] | None:
+    """MPS files carry a path and extension the .solu file does not."""
+    stem = Path(instance).stem
+    return solu.get(stem)
 
 
 def objectives_agree(a: float | None, b: float | None,
@@ -1115,7 +1380,9 @@ def aggregate_repetitions(runs: list[Result]) -> Result:
 
 def report(rows: list[Result], solvers: list[str], shift: float,
            abs_tol: float, rel_tol: float, time_limit: float,
-           reference: str | None) -> dict[str, int]:
+           reference: str | None,
+           solu: dict[str, tuple[str, float | None]] | None = None
+           ) -> dict[str, int]:
     by_inst: dict[str, dict[str, Result]] = {}
     for r in rows:
         by_inst.setdefault(r.instance, {})[r.solver] = r
@@ -1166,6 +1433,38 @@ def report(rows: list[Result], solvers: list[str], shift: float,
                 tag = " UNCHECKED"
             line += f"{fmt_obj(r.objective) + tag:<{colw}}  "
         print(line)
+
+    # Primal/dual gap against the published MIPLIB reference (--solu), when
+    # given: independent of any solver-vs-solver agreement above, and the
+    # only one of these two tables that says anything when only one solver
+    # ran. =unkn= instances are printed as "no ref" rather than skipped, so a
+    # thin table doesn't read as "everything agreed".
+    if solu:
+        print()
+        print(f"{'instance':<{wid}}  gap vs .solu")
+        print("-" * (wid + 44))
+        for inst in sorted(by_inst):
+            entry = solu_lookup(solu, inst)
+            line = f"{inst:<{wid}}  "
+            for s in solvers:
+                r = by_inst[inst].get(s)
+                if r is None or r.objective is None:
+                    line += f"{'-':<{colw}}  "
+                    continue
+                if entry is None or entry[1] is None:
+                    line += f"{'no ref':<{colw}}  "
+                    continue
+                tag, ref_val = entry
+                gap = abs(r.objective - ref_val) / (1.0 + abs(ref_val))
+                cell = f"{gap:.2e}"
+                # A gap on an =opt= reference that isn't itself a certified
+                # proof is a primal gap only -- the dual side is whatever the
+                # solver's own dual_bound says, printed separately, never
+                # implied by matching the known optimum.
+                if tag == "=opt=" and is_certified_success(r) and gap > rel_tol:
+                    cell += " MISMATCH"
+                line += f"{cell:<{colw}}  "
+            print(line)
 
     print()
     print(f"{'solver':<{colw}} {'proved':>8} {'correct':>9} "
@@ -1255,6 +1554,21 @@ def collect_models(paths: list[str], limit: int | None) -> list[Path]:
     return out[:limit] if limit else out
 
 
+def duplicate_model_names(models: list[Path]) -> dict[str, list[Path]]:
+    """Find distinct paths that would share one benchmark instance identity.
+
+    MIPLIB's local archive can contain the same 240 compressed models in a
+    parent directory and a nested directory. A recursive run over the parent
+    otherwise counts 480 instances and can overwrite solution filenames.
+    """
+    by_name: dict[str, list[Path]] = {}
+    for model in models:
+        name = model.name[:-3] if model.name.endswith(".gz") else model.name
+        identity = Path(name).stem
+        by_name.setdefault(identity, []).append(model)
+    return {name: paths for name, paths in by_name.items() if len(paths) > 1}
+
+
 def read_clocksource() -> str | None:
     """The kernel clocksource, which decides what a timing run even measures.
 
@@ -1280,23 +1594,54 @@ def environment_record(args: argparse.Namespace, solvers: list[str],
         commit = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True,
             text=True, check=True).stdout.strip()
-        dirty = bool(subprocess.run(
+        status_text = subprocess.run(
             ["git", "status", "--porcelain"], cwd=ROOT, capture_output=True,
-            text=True, check=True).stdout.strip())
+            text=True, check=True).stdout
+        dirty = bool(status_text.strip())
+        tracked_patch = subprocess.run(
+            ["git", "diff", "--binary", "HEAD"], cwd=ROOT,
+            capture_output=True, check=True).stdout
+        untracked = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"], cwd=ROOT,
+            capture_output=True, text=True, check=True).stdout.splitlines()
     except Exception:  # noqa: BLE001
-        commit, dirty = None, None
+        commit, dirty, tracked_patch, untracked = None, None, b"", []
+    untracked_hashes = {
+        name: sha256_file(ROOT / name) for name in sorted(untracked)
+        if (ROOT / name).is_file()
+    }
+    workspace_identity = tracked_patch + json.dumps(
+        untracked_hashes, sort_keys=True).encode()
+    cache = exe.parent / "CMakeCache.txt"
+    cmake_configuration: dict[str, str] = {}
+    if cache.is_file():
+        wanted = {"CMAKE_BUILD_TYPE", "CMAKE_CXX_COMPILER",
+                  "CMAKE_CXX_COMPILER_VERSION", "CMAKE_CXX_FLAGS",
+                  "CMAKE_CXX_FLAGS_RELEASE"}
+        for line in cache.read_text(errors="replace").splitlines():
+            if "=" not in line or line.startswith(("#", "//")):
+                continue
+            key_type, value = line.split("=", 1)
+            key = key_type.split(":", 1)[0]
+            if key in wanted:
+                cmake_configuration[key] = value
     return {
         "record": "environment",
         "commit": commit,
         "dirty": dirty,
+        "workspace_sha256": sha256_bytes(workspace_identity),
+        "untracked_sha256": untracked_hashes,
         "host": socket.gethostname(),
         "platform": platform.platform(),
         "python": sys.version.split()[0],
         "cpu_count": os.cpu_count(),
         "cpu_affinity": args.cpu,
         "executable": str(exe.resolve()),
+        "executable_sha256": sha256_file(exe),
+        "cmake_configuration": cmake_configuration,
         "solvers": solvers,
         "models": len(models),
+        "model_sha256": {str(m.resolve()): sha256_file(m) for m in models},
         "time_limit_s": args.time_limit,
         "max_iter": args.max_iter,
         "tol": args.tol,
@@ -1378,6 +1723,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--reference", default=None,
                     help="reference solver label (default: highs when selected, "
                          "otherwise first certified solver)")
+    ap.add_argument("--solu", type=Path, default=None,
+                    help="MIPLIB .solu file (=opt=/=best=/=unkn= per instance); "
+                         "when given, an extra table reports the primal gap "
+                         "against the published value, independent of any "
+                         "solver-vs-solver reference comparison")
     ap.add_argument("--allow-unavailable", action="store_true",
                     help="do not fail solely because a requested solver is unavailable")
     ap.add_argument("--allow-unchecked", action="store_true",
@@ -1454,6 +1804,23 @@ def main() -> int:
         if not args.highs_source.is_file() or not os.access(args.highs_source, os.X_OK):
             ap.error("--highs-source must be a regular executable file")
 
+    if args.jsonl is not None and args.jsonl.exists():
+        print(f"error: result file {args.jsonl} already exists; refusing to "
+              "mix campaigns", file=sys.stderr)
+        return 2
+
+    models = collect_models(args.models, args.limit)
+    if not models:
+        print("error: no models found", file=sys.stderr)
+        return 2
+    duplicates = duplicate_model_names(models)
+    if duplicates:
+        first = next(iter(duplicates.items()))
+        print(f"error: {len(duplicates)} duplicate model identities; "
+              f"{first[0]} appears at {first[1][0]} and {first[1][1]}. "
+              "Choose one copy of each model.", file=sys.stderr)
+        return 2
+
     if args.solutions_dir is not None:
         if args.solutions_dir.exists():
             print(f"error: solution directory {args.solutions_dir} already exists; "
@@ -1461,10 +1828,24 @@ def main() -> int:
             return 2
         args.solutions_dir.mkdir(parents=True)
 
-    models = collect_models(args.models, args.limit)
-    if not models:
-        print("error: no models found", file=sys.stderr)
-        return 2
+    source_exe = exe
+    source_hash = None
+    binary_temp = None
+    if any(s.lower().startswith("sor") for s in solvers):
+        if args.jsonl is None:
+            binary_temp = tempfile.TemporaryDirectory(prefix="sor-compare-binaries-")
+            binary_dir = Path(binary_temp.name)
+        else:
+            binary_dir = args.jsonl.parent / (args.jsonl.stem + "-binaries")
+        exe, source_hash = freeze_sor_binaries(source_exe, binary_dir)
+        frozen_hash = sha256_file(exe)
+        source_checker = source_exe.with_name("sor_check")
+        source_checker_hash = sha256_file(source_checker)
+        frozen_checker = exe.with_name("sor_check")
+        frozen_checker_hash = sha256_file(frozen_checker)
+    else:
+        frozen_hash = None
+        source_checker_hash = frozen_checker_hash = None
 
     print(f"{len(models)} model(s) x {len(solvers)} solver(s), "
           f"time limit {args.time_limit:g}s")
@@ -1479,9 +1860,17 @@ def main() -> int:
               file=sys.stderr)
 
     rows: list[Result] = []
-    fh = args.jsonl.open("a") if args.jsonl else None
+    # The build metadata lives beside the original executable, while every
+    # command below runs the frozen copy. Record both identities explicitly.
+    environment = environment_record(args, solvers, models, source_exe)
+    environment["executable"] = str(exe.resolve())
+    environment["executable_sha256"] = frozen_hash if frozen_hash else sha256_file(exe)
+    environment["source_executable"] = str(source_exe.resolve())
+    environment["source_executable_sha256"] = source_hash
+    environment["checker_executable_sha256"] = frozen_checker_hash
+    fh = args.jsonl.open("x") if args.jsonl else None
     if fh:
-        fh.write(json.dumps(environment_record(args, solvers, models, exe)) + "\n")
+        fh.write(json.dumps(environment) + "\n")
         fh.flush()
     rng = random.Random(args.seed)
     try:
@@ -1491,6 +1880,11 @@ def main() -> int:
             rng.shuffle(order)
             for s in order:
                 for _ in range(args.warmups):
+                    if source_hash is not None:
+                        verify_executable(source_exe, source_hash)
+                        verify_executable(exe, frozen_hash)
+                        verify_executable(source_checker, source_checker_hash)
+                        verify_executable(frozen_checker, frozen_checker_hash)
                     warm = dispatch(s, m, args.time_limit, args.tol, exe,
                                     args.method, args.basis_update,
                                     args.max_iter, args.cpu, args.pricing,
@@ -1498,10 +1892,20 @@ def main() -> int:
                                     args.sor_arg, args.relax_integrality,
                                     args.small_matrix_value, args.seed,
                                     args.highs_source)
+                    if source_hash is not None:
+                        verify_executable(source_exe, source_hash)
+                        verify_executable(exe, frozen_hash)
+                        verify_executable(source_checker, source_checker_hash)
+                        verify_executable(frozen_checker, frozen_checker_hash)
                     if warm.status.lower() == "unavailable":
                         break
                 measured: list[Result] = []
                 for rep in range(args.repetitions):
+                    if source_hash is not None:
+                        verify_executable(source_exe, source_hash)
+                        verify_executable(exe, frozen_hash)
+                        verify_executable(source_checker, source_checker_hash)
+                        verify_executable(frozen_checker, frozen_checker_hash)
                     solution_out = None
                     if (args.solutions_dir is not None and
                             s.lower().startswith("sor")):
@@ -1517,7 +1921,13 @@ def main() -> int:
                                  args.relax_integrality,
                                  args.small_matrix_value, args.seed,
                                  args.highs_source, solution_out)
+                    if source_hash is not None:
+                        verify_executable(source_exe, source_hash)
+                        verify_executable(exe, frozen_hash)
+                        verify_executable(source_checker, source_checker_hash)
+                        verify_executable(frozen_checker, frozen_checker_hash)
                     r.repetition = rep
+                    r.model_sha256 = sha256_file(m)
                     measured.append(r)
                     if fh:
                         record = asdict(r)
@@ -1543,9 +1953,12 @@ def main() -> int:
     finally:
         if fh:
             fh.close()
+        if binary_temp is not None:
+            binary_temp.cleanup()
 
+    solu = parse_solu_file(args.solu) if args.solu is not None else None
     summary = report(rows, solvers, args.sgm_shift, args.obj_abs_tol,
-                     args.obj_rel_tol, args.time_limit, args.reference)
+                     args.obj_rel_tol, args.time_limit, args.reference, solu)
     if args.jsonl:
         print(f"\nJSONL: {args.jsonl}")
     failed = summary["mismatches"] > 0

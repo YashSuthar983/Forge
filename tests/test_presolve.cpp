@@ -816,6 +816,107 @@ int main() {
         CHECK(p.max_row_violation(tampered) > ropts.primal_feas_tol);
     }
 
+    // ---- lifted basis after singleton-row bound tightening ----
+    //
+    //   min  -x0 + x1
+    //   s.t. 2 x0      <= 4        (singleton: becomes x0 <= 2, row removed)
+    //          x0 + x1 >= 3
+    //        x0 >= 0 (no upper bound), x1 in [0, 10]
+    //
+    // The reduced optimum has x0 nonbasic at the tightened bound 2. The
+    // original model has no such bound, so the lifted basis must make x0
+    // basic and the singleton row nonbasic at its upper side. Leaving the
+    // row's logical basic names a basis whose point is x0 = +inf.
+    {
+        using sor::presolve::PostsolveNonbasicStatus;
+        using sor::presolve::PresolveRecoveryOptions;
+        using sor::presolve::PresolveReducedSolve;
+        using sor::presolve::recover_solution;
+
+        LpProblem p;
+        p.A = sor::sparse::from_triplets(
+            2, 2, {0, 1, 1}, {0, 0, 1}, {2.0, 1.0, 1.0});
+        p.c = {-1.0, 1.0};
+        p.row_lo = {-sor::model::kInf, 3.0};
+        p.row_hi = {4.0, sor::model::kInf};
+        p.col_lo = {0.0, 0.0};
+        p.col_hi = {sor::model::kInf, 10.0};
+        const auto map = presolve_lp(p);
+        CHECK(map.stats.bounds_tightened == 1);
+        CHECK(map.problem.n_rows() == 1);
+        CHECK(map.problem.n_cols() == 2);
+        if (map.problem.n_rows() == 1 && map.problem.n_cols() == 2) {
+            CHECK(map.problem.col_hi[0] == 2.0);
+            PresolveReducedSolve rs;
+            rs.x = {2.0, 1.0};
+            rs.y = {1.0};
+            rs.has_basis = true;
+            rs.basis.n_struct = 2;
+            rs.basis.basic = {1};
+            rs.basis.status = {PostsolveNonbasicStatus::AtUpper,
+                               PostsolveNonbasicStatus::Basic,
+                               PostsolveNonbasicStatus::AtLower};
+            PresolveRecoveryOptions ropts;
+            ropts.gap_tol = 1e-9;
+            const auto lifted = recover_solution(p, map, rs, ropts);
+            CHECK(lifted.validated);
+            CHECK_NEAR(lifted.raw.x[0], 2.0, 1e-12);
+            CHECK_NEAR(lifted.raw.x[1], 1.0, 1e-12);
+            CHECK(lifted.basis.basic.size() == 2);
+            CHECK(lifted.basis.basic[0] == 0);
+            CHECK(lifted.basis.basic[1] == 1);
+            CHECK(lifted.basis.status[0] == PostsolveNonbasicStatus::Basic);
+            CHECK(lifted.basis.status[1] == PostsolveNonbasicStatus::Basic);
+            CHECK(lifted.basis.status[2] == PostsolveNonbasicStatus::AtUpper);
+            CHECK(lifted.basis.status[3] == PostsolveNonbasicStatus::AtLower);
+        }
+    }
+
+    // ---- forcing-row multiplier after an earlier cost substitution ----
+    //
+    //   min  s
+    //   s.t. s + 2 j     = 3       (E: s is a free singleton column)
+    //            j + k  <= 0       (F: forcing once k >= 0 is known)
+    //                k  >= 0       (S: singleton row)
+    //        s free, j >= 0, k in [-1, 5]
+    //
+    // Pass 1 eliminates s through E, which moves cost -2 onto j, and tightens
+    // k >= 0 from S. Pass 2 then finds F forcing and fixes j = k = 0. F's
+    // multiplier must make j dual feasible for the cost j carries at that
+    // stage (-2, so y_F <= -2); measured against j's original cost 0 it comes
+    // out as 0 and j is left with reduced cost -2 at its lower bound.
+    {
+        using sor::presolve::PresolveRecoveryOptions;
+        using sor::presolve::PresolveReducedSolve;
+        using sor::presolve::recover_solution;
+
+        LpProblem p;
+        p.A = sor::sparse::from_triplets(
+            3, 3, {0, 0, 1, 1, 2}, {0, 1, 1, 2, 2}, {1.0, 2.0, 1.0, 1.0, 1.0});
+        p.c = {1.0, 0.0, 0.0};
+        p.row_lo = {3.0, -sor::model::kInf, 0.0};
+        p.row_hi = {3.0, 0.0, sor::model::kInf};
+        p.col_lo = {-sor::model::kInf, 0.0, -1.0};
+        p.col_hi = { sor::model::kInf, sor::model::kInf, 5.0};
+        const auto map = presolve_lp(p);
+        CHECK(map.stats.singleton_columns_removed == 1);
+        CHECK(map.stats.forcing_rows_removed == 1);
+        CHECK(map.problem.n_cols() == 0);
+        if (map.problem.n_cols() == 0 && map.problem.n_rows() == 0) {
+            PresolveReducedSolve rs;
+            PresolveRecoveryOptions ropts;
+            ropts.gap_tol = 1e-9;
+            const auto lifted = recover_solution(p, map, rs, ropts);
+            CHECK_NEAR(lifted.raw.x[0], 3.0, 1e-12);
+            CHECK_NEAR(lifted.raw.x[1], 0.0, 1e-12);
+            CHECK_NEAR(lifted.raw.x[2], 0.0, 1e-12);
+            CHECK(lifted.evidence.max_dual_violation <= 1e-9);
+            CHECK(lifted.raw.y.size() == 3);
+            CHECK(lifted.raw.y[1] <= -2.0 + 1e-9);
+            CHECK(lifted.validated);
+        }
+    }
+
     // ---- Presolve v2 (live CSR/CSC queue driver) ----
     {
         using sor::presolve::PresolveOptions;
@@ -840,20 +941,17 @@ int main() {
             CHECK_NEAR(x[0], 2.0, 1e-15);
         }
 
-        // Dual fixing must not eliminate a zero-cost structural slack.
+        // A zero-cost semi-bounded slack next to a boxed column:
+        //   min x0  s.t.  x0 + x1 = 5,  x0 in [0, 10],  x1 in [0, inf).
+        // The doubleton eliminates x0 and transfers its box onto the slack
+        // (x1 in [0, 5], cost -1 after substitution). The lift of the reduced
+        // optimum x1 = 5 must be the original optimum x0 = 0 with exact duals
+        // and the basis {x1}: x1 sits at a transferred bound, so x0 is the
+        // nonbasic column. (These models used to assert that no reduction
+        // happens at all; the transfer is now recovered.)
         {
-            LpProblem p;
-            p.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
-            p.c = {1.0, 0.0};
-            p.row_lo = p.row_hi = {5.0};
-            p.col_lo = {0.0, 0.0};
-            p.col_hi = {10.0, sor::model::kInf};
-            const auto out = sor::presolve::presolve(p, v2);
-            CHECK(out.map.problem.n_cols() == 2);
-        }
-
-        // Live presolve must run (extra pass) without changing a tight slack model.
-        {
+            using sor::presolve::PostsolveNonbasicStatus;
+            using sor::presolve::PresolveRecoveryOptions;
             LpProblem p;
             p.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
             p.c = {1.0, 0.0};
@@ -861,9 +959,33 @@ int main() {
             p.col_lo = {0.0, 0.0};
             p.col_hi = {10.0, sor::model::kInf};
             const auto plain = sor::presolve::presolve(p);
-            const auto live = sor::presolve::presolve(p, v2);
-            CHECK(plain.map.problem.n_cols() == live.map.problem.n_cols());
-            CHECK(live.stats().passes >= plain.stats().passes);
+            const auto out = sor::presolve::presolve(p, v2);
+            CHECK(out.stats().passes >= plain.stats().passes);
+            CHECK(out.stats().doubleton_substitutions == 1);
+            CHECK(out.map.problem.n_rows() == 0);
+            // x1 may also be dual-fixed at 5 once its row is gone.
+            CHECK(out.map.problem.n_cols() <= 1);
+            if (out.map.problem.n_rows() == 0 && out.map.problem.n_cols() <= 1) {
+                PresolveReducedSolve rs;
+                rs.has_basis = true;
+                if (out.map.problem.n_cols() == 1) {
+                    CHECK(out.map.problem.col_lo[0] == 0.0);
+                    CHECK(out.map.problem.col_hi[0] == 5.0);
+                    rs.x = {5.0};
+                    rs.basis.n_struct = 1;
+                    rs.basis.status = {PostsolveNonbasicStatus::AtUpper};
+                }
+                PresolveRecoveryOptions ropts;
+                ropts.gap_tol = 1e-9;
+                const auto rec = recover_solution(p, out.map, rs, ropts);
+                CHECK(rec.validated);
+                CHECK_NEAR(rec.raw.x[0], 0.0, 1e-15);
+                CHECK_NEAR(rec.raw.x[1], 5.0, 1e-15);
+                CHECK(rec.evidence.max_dual_violation <= 1e-15);
+                CHECK(rec.basis.basic.size() == 1 && rec.basis.basic[0] == 1);
+                CHECK(rec.basis.status[0] == PostsolveNonbasicStatus::AtLower);
+                CHECK(rec.basis.status[1] == PostsolveNonbasicStatus::Basic);
+            }
         }
 
         // Seeded small LP: lift a reduced candidate and validate primal+dual.
@@ -885,12 +1007,16 @@ int main() {
         }
 
         // Implied bounds tighten finite columns when explicitly enabled.
+        // Zero costs keep the other live rules out: with c > 0 nothing locks
+        // the columns downward and dual fixing removes both; with c < 0 the
+        // row is cost-tight (x0 alone would pass 3), becomes an equation and
+        // the doubleton substitution removes x0.
         {
             PresolveOptions ib = v2;
             ib.implied_bounds = true;
             LpProblem p;
             p.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
-            p.c = {1.0, 1.0};
+            p.c = {0.0, 0.0};
             p.row_lo = {-sor::model::kInf};
             p.row_hi = {3.0};
             p.col_lo = {0.0, 0.0};
@@ -903,17 +1029,19 @@ int main() {
             CHECK(out.map.problem.col_hi[1] <= 3.0 + 1e-12);
         }
 
-        // Dominated column: looser parallel column removed (opt-in).
+        // Dominated column: looser parallel column removed (opt-in). A >=
+        // row locks both columns downward, so dual fixing (c > 0) leaves
+        // them, and the row is not cost-tight (4 - 10 - 0 < 0).
         {
             PresolveOptions dom = v2;
             dom.dominated_columns = true;
             LpProblem p;
             p.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
             p.c = {1.0, 1.0};
-            p.row_lo = {-sor::model::kInf};
-            p.row_hi = {4.0};
+            p.row_lo = {4.0};
+            p.row_hi = {sor::model::kInf};
             p.col_lo = {0.0, 0.0};
-            p.col_hi = {4.0, 10.0};
+            p.col_hi = {sor::model::kInf, 10.0};
             const auto out = sor::presolve::presolve(p, dom);
             CHECK(out.stats().dominated_columns_removed >= 1);
             bool saw_dom = false;
@@ -922,34 +1050,39 @@ int main() {
                     saw_dom = true;
             CHECK(saw_dom);
             PresolveReducedSolve rs;
-            rs.x.assign(static_cast<std::size_t>(out.map.problem.n_cols()), 2.0);
+            rs.x.assign(static_cast<std::size_t>(out.map.problem.n_cols()), 4.0);
             rs.y.assign(static_cast<std::size_t>(out.map.problem.n_rows()), 1.0);
             const auto rec = recover_solution(p, out.map, rs);
             CHECK(rec.evidence.max_primal_violation <= 1e-9);
         }
+        // The same model as above with the rule off: nothing is removed.
+        // (x0 must be the unbounded receiver, or the rule could not fire even
+        // when enabled and this would test nothing.)
         {
             PresolveOptions dom = v2;
             dom.dominated_columns = false;
             LpProblem p;
             p.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
             p.c = {1.0, 1.0};
-            p.row_lo = {-sor::model::kInf};
-            p.row_hi = {4.0};
+            p.row_lo = {4.0};
+            p.row_hi = {sor::model::kInf};
             p.col_lo = {0.0, 0.0};
-            p.col_hi = {4.0, 10.0};
+            p.col_hi = {sor::model::kInf, 10.0};
             const auto out = sor::presolve::presolve(p, dom);
             CHECK(out.stats().dominated_columns_removed == 0);
             CHECK(out.map.problem.n_cols() == 2);
         }
 
         // Parallel rows: tighter duplicate survives; journal + primal lift.
+        // Negative costs: the <= rows lock the columns upward (with c > 0
+        // nothing locks them downward and dual fixing empties both rows).
         {
             PresolveOptions par = v2;
             par.parallel_rows = true;
             LpProblem p;
             p.A = sor::sparse::from_triplets(
                 2, 2, {0, 0, 1, 1}, {0, 1, 0, 1}, {1.0, 1.0, 1.0, 1.0});
-            p.c = {1.0, 1.0};
+            p.c = {-1.0, -1.0};
             p.row_lo = {-sor::model::kInf, -sor::model::kInf};
             p.row_hi = {5.0, 3.0};
             p.col_lo = {0.0, 0.0};
@@ -970,16 +1103,92 @@ int main() {
             CHECK_NEAR(rec.raw.x[0] + rec.raw.x[1], 3.0, 1e-9);
         }
 
+        // Parallel rows: the multiplier and the tight logical belong to the
+        // row that supplied the active merged side.
+        //
+        //   min -x0 - x1   s.t.  R0:  x0 + x1 <= 4   (kept)
+        //                        R1: s(x0 + x1) in R1's sides (merged)
+        //   x in [0, 10]
+        //
+        // With R1 = 2x0 + 2x1 <= 6 (or -2x0 - 2x1 >= -6) the merged row is
+        // x0 + x1 <= 3 and its reduced multiplier is -1. R0 is then slack at
+        // the optimum, so the lift must give y_R0 = 0 and y_R1 = -1/s, with
+        // R1's logical nonbasic and R0's basic. Keeping y' on R0 (the old
+        // lift) leaves a multiplier of 1 on a slack row. When R0's own bound
+        // is the tighter one, nothing moves.
+        {
+            using sor::presolve::PostsolveNonbasicStatus;
+            using sor::presolve::PresolveRecoveryOptions;
+            struct Case { f64 a1; f64 lo1; f64 hi1; f64 merged_hi; f64 y0; f64 y1;
+                          PostsolveNonbasicStatus s0, s1; };
+            const f64 inf = sor::model::kInf;
+            const Case cases[] = {
+                {2.0, -inf, 6.0, 3.0, 0.0, -0.5,
+                 PostsolveNonbasicStatus::Basic, PostsolveNonbasicStatus::AtUpper},
+                {-2.0, -6.0, inf, 3.0, 0.0, 0.5,
+                 PostsolveNonbasicStatus::Basic, PostsolveNonbasicStatus::AtLower},
+                {2.0, -inf, 10.0, 4.0, -1.0, 0.0,
+                 PostsolveNonbasicStatus::AtUpper, PostsolveNonbasicStatus::Basic},
+            };
+            for (const auto& cs : cases) {
+                PresolveOptions par = v2;
+                par.parallel_rows = true;
+                LpProblem p;
+                p.A = sor::sparse::from_triplets(
+                    2, 2, {0, 0, 1, 1}, {0, 1, 0, 1}, {1.0, 1.0, cs.a1, cs.a1});
+                p.c = {-1.0, -1.0};
+                p.row_lo = {-inf, cs.lo1};
+                p.row_hi = {4.0, cs.hi1};
+                p.col_lo = {0.0, 0.0};
+                p.col_hi = {10.0, 10.0};
+                const auto out = sor::presolve::presolve(p, par);
+                CHECK(out.stats().duplicate_rows_merged == 1);
+                CHECK(out.map.problem.n_rows() == 1);
+                CHECK(out.map.problem.n_cols() == 2);
+                if (out.map.problem.n_rows() != 1 || out.map.problem.n_cols() != 2) continue;
+                CHECK(out.map.problem.row_hi[0] == cs.merged_hi);
+                PresolveReducedSolve rs;
+                rs.x = {cs.merged_hi, 0.0};
+                rs.y = {-1.0};
+                rs.has_basis = true;
+                rs.basis.n_struct = 2;
+                rs.basis.basic = {0};
+                rs.basis.status = {PostsolveNonbasicStatus::Basic,
+                                   PostsolveNonbasicStatus::AtLower,
+                                   PostsolveNonbasicStatus::AtUpper};
+                PresolveRecoveryOptions ropts;
+                ropts.gap_tol = 1e-9;
+                const auto rec = recover_solution(p, out.map, rs, ropts);
+                CHECK(rec.validated);
+                CHECK(rec.evidence.max_dual_violation <= 1e-12);
+                CHECK(rec.raw.y.size() == 2);
+                if (rec.raw.y.size() == 2) {
+                    CHECK_NEAR(rec.raw.y[0], cs.y0, 1e-12);
+                    CHECK_NEAR(rec.raw.y[1], cs.y1, 1e-12);
+                }
+                CHECK(rec.basis.status.size() == 4);
+                if (rec.basis.status.size() == 4) {
+                    CHECK(rec.basis.status[0] == PostsolveNonbasicStatus::Basic);
+                    CHECK(rec.basis.status[2] == cs.s0);
+                    CHECK(rec.basis.status[3] == cs.s1);
+                    CHECK(rec.basis.basic[0] == 0);
+                }
+            }
+        }
+
         // Parallel columns: proportional costs required; full solve + lift.
+        // Two rows, so neither column is a singleton (a lone inequality is
+        // cost-tight here and the doubleton would take it), and negative
+        // costs against R0's upward lock keep dual fixing out.
         {
             PresolveOptions par = v2;
             par.parallel_columns = true;
             LpProblem p;
             p.A = sor::sparse::from_triplets(
-                1, 2, {0, 0}, {0, 1}, {1.0, 2.0});
-            p.c = {1.0, 2.0};
-            p.row_lo = {-sor::model::kInf};
-            p.row_hi = {10.0};
+                2, 2, {0, 0, 1, 1}, {0, 1, 0, 1}, {1.0, 2.0, 1.0, 2.0});
+            p.c = {-1.0, -2.0};
+            p.row_lo = {-sor::model::kInf, 1.0};
+            p.row_hi = {10.0, sor::model::kInf};
             p.col_lo = {0.0, 0.0};
             p.col_hi = {5.0, 10.0};
             const auto out = sor::presolve::presolve(p, par);
@@ -989,16 +1198,65 @@ int main() {
                 if (step.kind == sor::presolve::DualRecoveryKind::ParallelColumnMerge)
                     saw_col = true;
             CHECK(saw_col);
+            // The merged column z = x0 + 2 x1 in [0, 25]; z = 5 meets both rows.
             PresolveReducedSolve rs;
-            rs.x = {};
+            rs.x.assign(static_cast<std::size_t>(out.map.problem.n_cols()), 5.0);
             rs.y = {};
             const auto rec = recover_solution(p, out.map, rs);
             CHECK(rec.evidence.max_primal_violation <= 1e-9);
         }
 
+        // F4: aggregate costs and nonzero lower bounds must preserve the
+        // original optimum (the audit counterexample has optimum 1).
+        {
+            PresolveOptions par = v2;
+            par.parallel_columns = true;
+            LpProblem p;
+            p.A = sor::sparse::from_triplets(1, 2, {0,0}, {0,1}, {1.0,1.0});
+            p.c = {1.0,1.0}; p.col_lo = {0.0,1.0}; p.col_hi = {2.0,2.0};
+            p.row_lo = {1.0}; p.row_hi = {sor::model::kInf};
+            const auto out = sor::presolve::presolve(p, par);
+            std::vector<double> reduced = out.map.problem.col_lo;
+            const auto lifted = postsolve(out.map, reduced);
+            CHECK(p.max_bound_violation(lifted) <= 1e-12);
+            CHECK(p.max_row_violation(lifted) <= 1e-12);
+            CHECK_NEAR(p.objective(lifted), 1.0, 1e-12);
+            CHECK_NEAR(out.map.problem.objective(reduced), 1.0, 1e-12);
+        }
+        // A receiver with finite capacity cannot absorb a dominated column.
+        {
+            PresolveOptions dom = v2; dom.dominated_columns = true;
+            LpProblem p;
+            p.A = sor::sparse::from_triplets(1,2,{0,0},{0,1},{1.0,1.0});
+            // x1 <= 3, not 2: with x1 <= 2 the row is cost-tight (x0 = 2 - x1
+            // >= 0 always) and the doubleton removes x0 before this rule.
+            // The pair has the same support, ratio 1 and c0 * 1 <= c1, so
+            // the only thing refusing it is x0's finite capacity.
+            p.c = {1.0,2.0}; p.col_lo = {0.0,0.0}; p.col_hi = {1.0,3.0};
+            p.row_lo = {2.0}; p.row_hi = {sor::model::kInf};
+            const auto out = sor::presolve::presolve(p, dom);
+            CHECK(out.stats().dominated_columns_removed == 0);
+        }
+        // Negative proportional rows reverse lower/upper endpoints.
+        {
+            PresolveOptions par = v2; par.parallel_rows = true;
+            LpProblem p;
+            p.A = sor::sparse::from_triplets(2,2,{0,0,1,1},{0,1,0,1},{1.0,1.0,-1.0,-1.0});
+            p.c = {1.0,1.0}; p.col_lo = {0.0,0.0}; p.col_hi = {10.0,10.0};
+            p.row_lo = {1.0,-3.0}; p.row_hi = {5.0,-2.0};
+            const auto out = sor::presolve::presolve(p, par);
+            CHECK(out.map.problem.n_rows() == 1);
+            for (const auto& x : {std::vector<double>{2.0,0.0}, std::vector<double>{3.0,0.0}})
+                CHECK(out.map.problem.max_row_violation(x) <= 1e-12);
+            CHECK(out.map.problem.max_row_violation({1.0,0.0}) >= 1.0);
+        }
+
         // Doubleton equality: free x appears in two rows so the singleton
-        // column rule cannot take it; the live doubleton must. The remaining
-        // column may then dual-fix once its row becomes redundant.
+        // column rule cannot take it. x0 is free, so its bounds are exactly
+        // implied: live presolve leaves the equation to the kernel
+        // aggregation (the live doubleton only transfers bounds), which must
+        // eliminate x0 and lift it. The remaining column may then dual-fix
+        // once its row becomes redundant.
         {
             LpProblem p;
             p.A = sor::sparse::from_triplets(
@@ -1009,11 +1267,20 @@ int main() {
             p.col_lo = {-sor::model::kInf, 0.0};
             p.col_hi = {sor::model::kInf, 1.0};
             const auto out = sor::presolve::presolve(p, v2);
-            CHECK(out.stats().doubleton_substitutions >= 1);
+            CHECK(out.stats().doubleton_substitutions == 0);
+            CHECK(out.stats().equality_aggregations >= 1);
             CHECK(out.map.problem.n_cols() <= 1);
-            std::vector<f64> x_red(static_cast<std::size_t>(out.map.problem.n_cols()),
-                                   0.25);
-            if (!x_red.empty()) x_red[0] = 0.25;
+            // Any reduced point lifts onto the equation x0 + x1 = 1.
+            if (out.map.problem.n_cols() == 1) {
+                const auto x = postsolve(out.map, {0.25});
+                CHECK_NEAR(x[0] + x[1], 1.0, 1e-12);
+            }
+            // The reduced optimum: what is left is x1 in [0, 1] with cost
+            // 1 - 0 * 1 = 1 and the slack row x1 <= 2 (the aggregation runs
+            // after the live pass that would have removed it), so x1 = 0, its
+            // lower bound. `validated` needs an optimal input.
+            std::vector<f64> x_red(out.map.problem.col_lo.begin(),
+                                   out.map.problem.col_lo.end());
             const auto x = postsolve(out.map, x_red);
             CHECK_NEAR(x[0] + x[1], 1.0, 1e-12);
             PresolveReducedSolve rs;
@@ -1024,19 +1291,38 @@ int main() {
             CHECK_NEAR(recovered.raw.x[0] + recovered.raw.x[1], 1.0, 1e-9);
         }
 
-        // Negative: semi-bounded slack must not be removed by doubleton.
+        // Negative: a semi-bounded column is never the one a doubleton
+        // eliminates (the implied-slack case); here x0 is the elimination
+        // candidate (equal |a|, first column) and must stay.
         {
             LpProblem p;
             p.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
-            p.c = {1.0, 0.0};
+            p.c = {0.0, 1.0};
             p.row_lo = p.row_hi = {5.0};
             p.col_lo = {0.0, 0.0};
-            p.col_hi = {10.0, sor::model::kInf};
+            p.col_hi = {sor::model::kInf, 10.0};
             const auto out = sor::presolve::presolve(p, v2);
             CHECK(out.stats().doubleton_substitutions == 0);
             CHECK(out.map.problem.n_cols() == 2);
         }
     }
 
+    // Cancelling fixed terms leave an exact unit contribution. Neither the
+    // singleton substitution nor redundant-row check may lose it.
+    {
+        LpProblem p;
+        p.A = sor::sparse::from_triplets(1, 4, {0,0,0,0}, {0,1,2,3}, {1e10,1,-1e10,1});
+        p.c = {0,0,0,1};
+        p.col_lo = {1e10,1,1e10,-sor::model::kInf};
+        p.col_hi = {1e10,1,1e10,sor::model::kInf};
+        p.row_lo = p.row_hi = {0};
+        const auto reduced = presolve_lp(p);
+        CHECK(reduced.problem.n_cols() == 0);
+        const auto x = postsolve(reduced, {});
+        CHECK(x.size() == 4);
+        CHECK(x[3] == -1);
+        CHECK(p.max_row_violation(x) == 0);
+        CHECK(p.objective(x) == -1);
+    }
     return sor::test::finish("test_presolve");
 }

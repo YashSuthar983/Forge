@@ -76,7 +76,7 @@ public:
     }
     std::vector<Eval> evaluate(bool at_average, const LaneMask& m) override {
         std::vector<Eval> out(lanes_.size());
-        each(m, [&](PdhcgDevice& d, std::size_t l) { out[l] = d.evaluate(at_average); });
+        each(m, [&](PdhcgDevice& d, std::size_t l) { out[l] = d.evaluate_qp(at_average); });
         return out;
     }
     void average_reset(const LaneMask& m) override {

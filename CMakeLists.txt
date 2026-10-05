@@ -45,6 +45,10 @@ option(SOR_NATIVE_ARCH "Build for the host CPU (-march=native); not portable" OF
 # choices. Reproducibility is worth more than 0.4%.
 option(SOR_DETERMINISTIC_FP
        "Forbid FP contraction (-ffp-contract=off) so results are reproducible" ON)
+# Route probes (SOR_ROUTE, RouteSpan, SOR_FN) sit on the solve path. A normal
+# build leaves SOR_ROUTE_DEBUG undefined, so those expand to nothing.
+option(SOR_ROUTE_FN
+       "Compile route debug (off: SOR_ROUTE, RouteSpan, and SOR_FN are empty)" OFF)
 
 # Keep every binary at the TOP of the build tree. With add_subdirectory(),
 # CMake would otherwise put sor_solve in build/cli/ and libsor_core.a in
@@ -57,7 +61,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_library(sor_flags INTERFACE)
 target_compile_options(sor_flags INTERFACE
-  $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic -Wshadow>
+  $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic -Wshadow -fopenmp-simd>
   $<$<AND:$<CXX_COMPILER_ID:GNU,Clang>,$<BOOL:${SOR_NATIVE_ARCH}>>:-march=native>
   $<$<AND:$<CXX_COMPILER_ID:GNU,Clang>,$<BOOL:${SOR_DETERMINISTIC_FP}>>:-ffp-contract=off>
   $<$<AND:$<CXX_COMPILER_ID:GNU,Clang>,$<BOOL:${SOR_WARNINGS_AS_ERRORS}>>:-Werror>

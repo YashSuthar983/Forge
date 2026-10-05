@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <unordered_map>
 #include <vector>
 
 namespace sor::search {
@@ -37,24 +38,6 @@ bool normalized_le(const CutRow& cut, std::vector<f64>& unit_vals,
         unit_vals[k] = sign * cut.vals[k] / norm;
     rhs_unit = sign * (has_hi ? cut.row_hi : cut.row_lo) / norm;
     return std::isfinite(rhs_unit);
-}
-
-f64 sparse_dot(const CutRow& a, const std::vector<f64>& av, const CutRow& b,
-               const std::vector<f64>& bv) {
-    std::size_t p = 0, q = 0;
-    f64 dot = 0.0;
-    while (p < a.cols.size() && q < b.cols.size()) {
-        if (a.cols[p] == b.cols[q]) {
-            dot += av[p] * bv[q];
-            ++p;
-            ++q;
-        } else if (a.cols[p] < b.cols[q]) {
-            ++p;
-        } else {
-            ++q;
-        }
-    }
-    return dot;
 }
 
 struct ScoreCtx {
@@ -159,16 +142,24 @@ void apply_auto_cuts_policy(BabOptions& o) {
     o.mir_cuts = true;
     o.lifted_cover_cuts = true;
     o.zerohalf_cuts = true;
-    o.flow_cover_cuts = true;
+    // Flow-cover derivation has a known, gross counterexample on blend2.
+    // Auto policy must never make an unverified separator available.
+    o.flow_cover_cuts = false;
     // Clique cuts: valid but regressed misc03 node LP cost; keep opt-in only.
 }
 
 std::vector<CutRow> filter_cut_candidates_for_round(
     std::vector<CutRow> candidates, const model::LpProblem& lp,
-    const std::vector<f64>& x, const CutOptions& opts) {
+    const std::vector<f64>& x, const CutOptions& opts,
+    CutFilterStats* stats) {
+    CutFilterStats local;
+    CutFilterStats& st = stats != nullptr ? *stats : local;
     if (candidates.empty()) return candidates;
     const int cap = opts.max_candidates_per_round;
-    if (cap <= 0) return {};
+    if (cap <= 0) {
+        st.rejected_budget += candidates.size();
+        return {};
+    }
 
     const ScoreCtx ctx = build_score_ctx(lp);
     std::vector<CandUnit> pool;
@@ -186,8 +177,14 @@ std::vector<CutRow> filter_cut_candidates_for_round(
     for (auto& cut : candidates) {
         CandUnit c;
         c.cut = std::move(cut);
-        if (!normalized_le(c.cut, c.unit_vals, c.rhs_unit)) continue;
-        if (c.cut.cols.size() > dense_nnz) continue;
+        if (!normalized_le(c.cut, c.unit_vals, c.rhs_unit)) {
+            ++st.rejected_malformed;
+            continue;
+        }
+        if (c.cut.cols.size() > dense_nnz) {
+            ++st.rejected_dense;
+            continue;
+        }
         f64 activity = 0.0;
         bool ok = true;
         for (std::size_t k = 0; k < c.cut.cols.size(); ++k) {
@@ -198,9 +195,15 @@ std::vector<CutRow> filter_cut_candidates_for_round(
             }
             activity += c.unit_vals[k] * x[sz(j)];
         }
-        if (!ok) continue;
+        if (!ok) {
+            ++st.rejected_malformed;
+            continue;
+        }
         c.efficacy = activity - c.rhs_unit;
-        if (c.efficacy < opts.pool_efficacy_min) continue;
+        if (c.efficacy < opts.pool_efficacy_min) {
+            ++st.rejected_efficacy;
+            continue;
+        }
         max_eff = std::max(max_eff, c.efficacy);
         pool.push_back(std::move(c));
     }
@@ -208,49 +211,78 @@ std::vector<CutRow> filter_cut_candidates_for_round(
 
     for (auto& c : pool) c.score = composite_score(c, ctx, max_eff, opts);
 
-    const f64 nnz_budget =
-        opts.pool_nnz_budget_factor > 0.0 && ctx.n_cols > 0
-            ? std::max(static_cast<f64>(opts.pool_min_nnz_budget),
-                       opts.pool_nnz_budget_factor * static_cast<f64>(ctx.n_cols))
-            : static_cast<f64>(cap) * static_cast<f64>(ctx.n_cols);
-
-    std::vector<char> alive(pool.size(), 1);
-    std::vector<CutRow> out;
-    f64 nnz_used = 0.0;
-    constexpr f64 kStopScore = 0.04;
-
-    while (static_cast<int>(out.size()) < cap) {
-        std::size_t best = pool.size();
-        f64 best_score = -std::numeric_limits<f64>::infinity();
-        for (std::size_t i = 0; i < pool.size(); ++i) {
-            if (!alive[i]) continue;
-            if (nnz_used + static_cast<f64>(pool[i].cut.cols.size()) > nnz_budget)
-                continue;
-            if (pool[i].score > best_score) {
-                best_score = pool[i].score;
-                best = i;
-            }
+    // The prefilter screens for validity and numerics and caps the candidate
+    // list generously; it does NOT take the selection decisions. Diversity
+    // (parallelism penalties) and the nonzero budget are applied once, by the
+    // selecting CutPool, which sees every survivor. Only exact / near
+    // duplicates (cosine above pool_parallelism_max) are dropped here, since
+    // the pool can gain nothing from two copies of one cut.
+    //
+    // (This function used to run its own greedy selection and computed each
+    // pick's parallelism AFTER moving the pick into the output: the moved-from
+    // cut had no support, every cosine was 0, and no parallel candidate was
+    // ever rejected.)
+    std::vector<std::size_t> order(pool.size());
+    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        return pool[a].score > pool[b].score;
+    });
+    const std::size_t keep_cap =
+        static_cast<std::size_t>(cap) * static_cast<std::size_t>(std::max(1, opts.prefilter_cap_factor));
+    std::vector<std::size_t> accepted;
+    accepted.reserve(std::min(order.size(), keep_cap));
+    // Duplicate detection is EXACT (canonical form), not a cosine threshold:
+    // both rows are put in one sense (<=, unit norm by positive scaling), and
+    // two rows are the same inequality only when they have the same support and
+    // the same normalised coefficients. Then the one with the smaller
+    // normalised right-hand side is the stronger and is kept; the other is
+    // dominated. Opposite-facing rows (x <= 0 and x >= 1) have opposite
+    // normalised coefficients and are never duplicates, and neither are
+    // near-parallel independent rows: how much a pick should discourage
+    // similar candidates is the pool's soft score, not a rejection here.
+    const auto same_lhs = [&](const CandUnit& a, const CandUnit& b) {
+        if (a.cut.cols.size() != b.cut.cols.size()) return false;
+        for (std::size_t k = 0; k < a.cut.cols.size(); ++k) {
+            if (a.cut.cols[k] != b.cut.cols[k]) return false;
+            if (std::fabs(a.unit_vals[k] - b.unit_vals[k]) > 1e-9) return false;
         }
-        if (best == pool.size() || best_score < kStopScore) break;
-
-        alive[best] = 0;
-        nnz_used += static_cast<f64>(pool[best].cut.cols.size());
-        out.push_back(std::move(pool[best].cut));
-
-        for (std::size_t i = 0; i < pool.size(); ++i) {
-            if (!alive[i]) continue;
-            const f64 cosine = std::fabs(
-                sparse_dot(pool[i].cut, pool[i].unit_vals, pool[best].cut,
-                           pool[best].unit_vals));
-            if (opts.pool_parallel_hard_filter) {
-                if (cosine > opts.pool_parallelism_max) alive[i] = 0;
-                continue;
+        return true;
+    };
+    std::unordered_map<std::uint64_t, std::vector<std::size_t>> by_support;   // hash -> slots in `accepted`
+    const auto support_hash = [&](const CandUnit& c) {
+        std::uint64_t h = 1469598103934665603ull;
+        for (const Index j : c.cut.cols) { h ^= static_cast<std::uint64_t>(j) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); h *= 1099511628211ull; }
+        return h;
+    };
+    std::uint64_t duplicates = 0, dominated = 0;
+    for (const std::size_t i : order) {
+        if (accepted.size() >= keep_cap) break;
+        auto& slots = by_support[support_hash(pool[i])];
+        bool handled = false;
+        for (const std::size_t slot : slots) {
+            const std::size_t a = accepted[slot];
+            if (!same_lhs(pool[i], pool[a])) continue;
+            handled = true;
+            if (pool[i].rhs_unit < pool[a].rhs_unit - 1e-12) {
+                accepted[slot] = i;   // strictly stronger: replaces the kept one
+                ++dominated;
+            } else if (pool[i].rhs_unit > pool[a].rhs_unit + 1e-12) {
+                ++dominated;
+            } else {
+                ++duplicates;
             }
-            if (cosine < opts.pool_parallelism_penalty_min) continue;
-            pool[i].score -= opts.pool_parallelism_penalty * cosine;
-            if (pool[i].score <= 0.0) alive[i] = 0;
+            break;
         }
+        if (handled) continue;
+        slots.push_back(accepted.size());
+        accepted.push_back(i);
     }
+    std::vector<CutRow> out;
+    out.reserve(accepted.size());
+    for (const std::size_t i : accepted) out.push_back(std::move(pool[i].cut));
+    st.rejected_duplicate += duplicates;
+    st.rejected_dominated += dominated;
+    st.rejected_budget += pool.size() - accepted.size() - duplicates - dominated;
     return out;
 }
 

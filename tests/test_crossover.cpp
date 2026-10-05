@@ -8,18 +8,21 @@
 #include "test_helpers.hpp"
 
 #include <sstream>
+#include "sor/core/route_debug.hpp"
 
 using namespace sor;
 
 namespace {
 
 model::LpProblem fixture() {
+    SOR_FN();
     std::istringstream input(test::kTestLpMps);
     io::MpsReadReport report;
     return io::read_mps(input, report);
 }
 
 model::LpProblem degenerate_problem() {
+    SOR_FN();
     model::LpProblem problem;
     problem.name = "degenerate-holdout";
     problem.A = sparse::from_triplets(
@@ -33,6 +36,7 @@ model::LpProblem degenerate_problem() {
 }
 
 model::LpProblem terminal_problem(bool infeasible) {
+    SOR_FN();
     model::LpProblem problem;
     problem.name = infeasible ? "infeasible-holdout" : "unbounded-holdout";
     problem.A = sparse::from_triplets(1, 1, {}, {}, {});
@@ -45,6 +49,7 @@ model::LpProblem terminal_problem(bool infeasible) {
 }
 
 core::RawResult hpr_point(const model::LpProblem& problem) {
+    SOR_FN();
     engines::HprOptions options;
     options.max_iterations = 50000;
     options.check_every = 25;
@@ -60,6 +65,7 @@ core::RawResult hpr_point(const model::LpProblem& problem) {
 }  // namespace
 
 int main() {
+    SOR_FN();
     const auto problem = fixture();
     core::RawResult point = hpr_point(problem);
     CHECK(point.engine == "hpr");
@@ -107,6 +113,20 @@ int main() {
     CHECK(result.iterations <= options.max_iterations);
     CHECK(diag.warm_cleanup_iterations + diag.cold_fallback_iterations ==
           result.iterations);
+
+    // Construction and cleanup share one wall budget. A tiny positive cap
+    // must stop inside basis construction and must not become unlimited.
+    {
+        engines::CrossoverOptions deadline_options = options;
+        deadline_options.time_limit_s = 1e-12;
+        engines::CrossoverDiagnostics deadline_diag;
+        const auto deadline_raw = engines::crossover_to_simplex(
+            problem, point, deadline_options, deadline_diag);
+        CHECK(deadline_raw.proposed_status == core::Status::Interrupted);
+        CHECK(deadline_diag.time_limit_reached);
+        CHECK(!deadline_diag.warm_cleanup_attempted);
+        CHECK(!deadline_diag.cold_fallback);
+    }
 
     // A budget-ended point gets a separate, explicitly looser usefulness
     // gate.  The gate recomputes KKT and gap from the original model rather

@@ -12,16 +12,19 @@
 namespace sor::search {
 
 // When true, BabOptions::auto_cuts enables the Turner pool weights, pre-pool
-// candidate filtering, and the measured-safe optional separator subset (MIR,
-// lifted cover, zero-half, flow cover). Clique cuts stay off unless explicitly
+// candidate filtering, and the optional separator subset (MIR, lifted cover,
+// zero-half). Flow cover has a known validity counterexample and stays off.
+// Clique cuts stay off unless explicitly
 // requested (--clique-cuts).
 void apply_auto_cuts_policy(BabOptions& o);
 
 // Pre-pool greedy rank/limit: normalised efficacy + sparsity / locks / objective
 // alignment, parallelism penalties, nnz budget - mirrors CutPool selection but
 // on a single round's candidate batch so separators can stay generous.
+// When `stats` is non-null every dropped candidate is counted there by reason.
 std::vector<CutRow> filter_cut_candidates_for_round(
     std::vector<CutRow> candidates, const model::LpProblem& lp,
-    const std::vector<f64>& x, const CutOptions& opts);
+    const std::vector<f64>& x, const CutOptions& opts,
+    CutFilterStats* stats = nullptr);
 
 }  // namespace sor::search

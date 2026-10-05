@@ -21,6 +21,26 @@ using f32 = float;
 using Index = std::int32_t;   // row/column indices
 using Offset = std::int64_t;  // CSR row pointers; nnz can exceed 2^31
 
+// Bounded, canonical rational tokens used by independently checked witnesses.
+// Both numerator and denominator may contain up to 32768 bits.
+inline constexpr std::size_t max_exact_dual_token_size = 20000;
+inline bool valid_exact_dual_token(std::string_view token) noexcept {
+    if (token.empty() || token.size() > max_exact_dual_token_size) return false;
+    std::size_t k = token.front() == '-' ? 1 : 0;
+    const auto first = k;
+    while (k < token.size() && token[k] >= '0' && token[k] <= '9') ++k;
+    if (k == first) return false;
+    if (k == token.size()) return true;
+    if (token[k++] != '/') return false;
+    const auto denominator_start = k;
+    bool nonzero = false;
+    for (; k < token.size(); ++k) {
+        if (token[k] < '0' || token[k] > '9') return false;
+        nonzero |= token[k] != '0';
+    }
+    return k > denominator_start && nonzero;
+}
+
 // Termination status. Set by engines EXCEPT for Optimal, which only
 // sor::certify::finalize_result() may produce.
 enum class Status {
@@ -59,6 +79,7 @@ enum class LpStrategy : std::uint8_t {
     DualSimplex,
     Hpr,
     Pdhg,
+    Barrier,   // primal-dual interior point, then crossover to a basis
 };
 
 // The three serial Auto schedules frozen by the execution protocol.  Keeping
@@ -89,6 +110,7 @@ inline constexpr f64 kPosInf = std::numeric_limits<f64>::infinity();
 // propose it; certify::finalize_result is the sole writer of `certified`.
 struct PrimalRay {
     std::vector<f64> direction;
+    std::vector<std::string> exact_direction;
     f64 max_row_residual = kPosInf;
     f64 max_bound_sign_residual = kPosInf;
     f64 objective_direction = kNaN;
@@ -100,6 +122,7 @@ struct PrimalRay {
 // normalized positive separation L-U for the row/column boxes.
 struct DualFarkasRay {
     std::vector<f64> multipliers;
+    std::vector<std::string> exact_multipliers;
     f64 max_homogeneous_residual = kPosInf;
     f64 max_sign_residual = kPosInf;
     f64 contradiction = 0.0;
@@ -110,6 +133,7 @@ struct DualFarkasRay {
 // top-level dispatcher translates these into the existing explicit-engine
 // option records, keeping the L0 contract independent of L4 engine headers.
 struct LpOptions {
+    int concurrent_solves = 1;
     LpStrategy strategy = LpStrategy::Simplex;
     std::uint64_t max_iterations = 0;  // 0 = engine default
     f64 time_limit_s = 0.0;            // 0 = unlimited
@@ -206,6 +230,12 @@ struct ProofEvidence {
     f64 dual_feas_tol   = 1e-7;
     f64 gap_tol         = 1e-9;
 
+    // Original-model values recomputed by the independent LP checker.
+    bool lp_values_checked = false;
+    bool reported_values_consistent = true;
+    f64 checked_objective = kNaN;
+    f64 checked_dual_bound = kNaN;
+
     // Farkas certificate (see RawResult::ray): max(0, U - L) recomputed
     // independently against the unscaled model. kPosInf means either no ray
     // was proposed or the proposed one is structurally unable to certify
@@ -239,6 +269,11 @@ struct RawResult {
     PrimalRay primal_ray;
     DualFarkasRay dual_farkas_ray;
 
+    // Original-model basis equations and optional exact minimization dual.
+    // These are candidate witnesses, independently recomputed at acceptance.
+    std::vector<Index> certificate_basis;
+    std::vector<std::string> exact_dual;
+
     std::uint64_t iterations = 0;
     std::string engine;
     std::string backend;
@@ -256,6 +291,7 @@ struct SolveResult {
 
     std::vector<f64> x;
     std::vector<f64> y;
+    std::vector<std::string> exact_dual;
     // Farkas infeasibility certificate, present only when status == Infeasible
     // AND ray_certified is true -- finalize_result() is the sole writer of
     // ray_certified, the same rule it enforces for Status::Optimal. An empty

@@ -125,12 +125,6 @@ struct LiveMatrix {
     std::vector<f64> fixed;
     f64* obj_offset = nullptr;
 
-    std::vector<f64> act_min;
-    std::vector<f64> act_max;
-    std::vector<Index> act_min_inf;
-    std::vector<Index> act_max_inf;
-    std::vector<char> down_lock;
-    std::vector<char> up_lock;
 
     std::deque<Index> changed_rows;
     std::deque<Index> changed_cols;
@@ -159,15 +153,16 @@ struct LiveMatrix {
     void seed_all_queues();
     void queue_row(Index i);
     void queue_col(Index j);
-    void recompute_row_activity(Index i);
-    void recompute_col_locks(Index j);
+    bool row_activity_within_sides(Index i) const;
+    bool col_locked(Index j, bool down, bool up) const;
 
     bool fix_column(Index j, f64 value, DualRecoveryKind kind, Index row = -1,
                     f64 coeff = 0.0, Index record = -1);
     bool remove_redundant_row(Index i);
     bool apply_implied_bounds_row(Index i);
     bool apply_dual_fixing_col(Index j);
-    bool try_doubleton_equality(Index i);
+    bool try_doubleton_equality(Index i, bool from_cost_tight = false);
+    bool try_cost_tight_doubleton(Index j);
     bool try_dominated_columns();
     bool try_duplicate_rows();
     bool try_duplicate_columns();
@@ -195,5 +190,9 @@ bool run_live_presolve_passes(
     std::vector<f64>& fixed,
     f64& work_obj_offset,
     LiveMatrix& lm);
+
+void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
+    const std::vector<char>& col_live, std::vector<f64>& lo, std::vector<f64>& hi,
+    PresolveMap& map, const PresolveOptions& options);
 
 }  // namespace sor::presolve::detail

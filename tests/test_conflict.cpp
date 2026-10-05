@@ -229,7 +229,9 @@ void test_probing_fixes_column() {
     ConflictGraph cg;
     const auto d = sor::search::build_conflict_graph(lp, lo, hi, cg, {});
     CHECK(!d.infeasible);
-    CHECK(d.probe_fixings >= 1);
+    // The pre-probing propagation fixpoint already forces both columns; a
+    // dead probe side would fix them otherwise. Either way they are fixed.
+    CHECK(d.probe_fixings + d.probe_tightenings >= 1);
     CHECK_NEAR(lo[0], 1.0, 1e-12);
     CHECK_NEAR(lo[1], 1.0, 1e-12);
 }
@@ -289,6 +291,154 @@ void test_probing_records_implied_bound() {
     const std::vector<f64> x = {2.0, 0.5};
     const auto cuts = sor::search::separate_implied_bound_cuts(cg, x, {});
     CHECK(!cuts.empty());
+}
+
+void test_dual_fix_probe_does_not_create_global_implied_bound() {
+    // With x=0, every y in [0,2] is feasible, although minimizing y lets
+    // dual fixing choose y=0. The objective-based choice cannot become the
+    // globally valid implication y <= 0 when x=0.
+    LpProblem lp;
+    lp.name = "dual_probe_scope";
+    lp.A = from_triplets(1, 2, {0, 0}, {0, 1}, {-1.0, 1.0});
+    lp.c = {0.0, 1.0};
+    lp.row_lo = {0.0};
+    lp.row_hi = {kInf};
+    lp.col_lo = {0.0, 0.0};
+    lp.col_hi = {1.0, 2.0};
+    lp.is_integer = {true, false};
+
+    std::vector<f64> lo = lp.col_lo, hi = lp.col_hi;
+    ProbingOptions opts;
+    opts.dual_fix_in_probing = true;
+    ConflictGraph cg;
+    const auto d = sor::search::build_conflict_graph(lp, lo, hi, cg, opts);
+    CHECK(!d.infeasible);
+    const std::vector<f64> feasible_witness = {0.0, 2.0};
+    for (const auto& ib : cg.implied_bounds()) {
+        const f64 rhs = ib.b0 + (ib.b1 - ib.b0) * feasible_witness[ib.bin];
+        if (ib.upper)
+            CHECK(feasible_witness[ib.col] <= rhs + 1e-9);
+        else
+            CHECK(feasible_witness[ib.col] >= rhs - 1e-9);
+    }
+}
+
+void test_dual_fix_probe_does_not_create_conflict_edge() {
+    // y >= x and min y: x=0, y=1 is feasible but dual fixing picks y=0
+    // on the x=0 probe. That objective choice cannot imply x=0 -> y=0.
+    LpProblem lp;
+    lp.name = "dual_probe_binary_scope";
+    lp.A = from_triplets(1, 2, {0, 0}, {0, 1}, {-1.0, 1.0});
+    lp.c = {0.0, 1.0};
+    lp.row_lo = {0.0};
+    lp.row_hi = {kInf};
+    lp.col_lo = {0.0, 0.0};
+    lp.col_hi = {1.0, 1.0};
+    lp.is_integer = {true, true};
+
+    std::vector<f64> lo = lp.col_lo, hi = lp.col_hi;
+    ProbingOptions opts;
+    opts.dual_fix_in_probing = true;
+    ConflictGraph cg;
+    const auto d = sor::search::build_conflict_graph(lp, lo, hi, cg, opts);
+    CHECK(!d.infeasible);
+    CHECK(!cg.conflicts(lit_of(0, 0), lit_of(1, 1)));
+    std::vector<f64> node_lo = {0.0, 0.0}, node_hi = {0.0, 1.0};
+    std::uint64_t tightened = 0;
+    CHECK(sor::search::propagate_conflicts(
+        cg, node_lo, node_hi, tightened));
+    CHECK_NEAR(node_hi[1], 1.0, 1e-12);
+}
+
+void test_dual_fix_probe_random_scope_and_optimum() {
+    std::mt19937 rng(20260924u);
+    std::uniform_int_distribution<int> cost(-3, 3);
+    int nonempty = 0;
+    for (int trial = 0; trial < 300; ++trial) {
+        const Index n = 4 + static_cast<Index>(trial % 3);
+        const Index m = 2 + static_cast<Index>(trial % 3);
+        LpProblem lp = random_binary_lp(rng, n, m, trial % 2);
+        for (f64& cj : lp.c) cj = static_cast<f64>(cost(rng));
+        lp.maximize = trial % 2 == 0;
+        const auto feasible = all_feasible(lp);
+        if (feasible.empty()) continue;
+        ++nonempty;
+
+        std::vector<f64> lo = lp.col_lo, hi = lp.col_hi;
+        ProbingOptions opts;
+        opts.dual_fix_in_probing = true;
+        ConflictGraph cg;
+        const auto d = sor::search::build_conflict_graph(lp, lo, hi, cg, opts);
+        CHECK(!d.infeasible);
+        if (d.infeasible) continue;
+
+        f64 best = lp.maximize ? -kInf : kInf;
+        for (const auto& point : feasible) {
+            const f64 obj = lp.objective(point);
+            best = lp.maximize ? std::max(best, obj) : std::min(best, obj);
+        }
+        bool retained_optimum = false;
+        for (const auto& point : feasible) {
+            bool in_box = true;
+            for (Index j = 0; j < n; ++j)
+                if (point[j] < lo[j] - 1e-9 || point[j] > hi[j] + 1e-9)
+                    in_box = false;
+            if (!in_box) continue;
+            if (std::fabs(lp.objective(point) - best) <= 1e-9)
+                retained_optimum = true;
+
+            for (const auto& ib : cg.implied_bounds()) {
+                const f64 rhs = ib.b0 + (ib.b1 - ib.b0) * point[ib.bin];
+                if (ib.upper) CHECK(point[ib.col] <= rhs + 1e-9);
+                else CHECK(point[ib.col] >= rhs - 1e-9);
+            }
+            for (const auto& clique : cg.cliques()) {
+                int active = 0;
+                for (Index lit : clique.lits)
+                    active += point[sor::search::lit_var(lit)] ==
+                              sor::search::lit_val(lit);
+                CHECK(active <= 1);
+            }
+            for (Index j = 0; j < n; ++j)
+                for (Index k = j + 1; k < n; ++k)
+                    if (cg.is_binary(j) && cg.is_binary(k))
+                        CHECK(!cg.conflicts(
+                            lit_of(j, static_cast<int>(point[j])),
+                            lit_of(k, static_cast<int>(point[k]))));
+        }
+        CHECK(retained_optimum);
+    }
+    CHECK(nonempty >= 100);
+}
+
+void test_probe_preserves_wide_integer_side() {
+    // x=0, y=2e9 is feasible and minimizes x. A small row coefficient is
+    // still decisive over y's wide domain; probing must retain this side.
+    LpProblem lp;
+    lp.name = "probe_wide_integer";
+    lp.A = from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 5e-10});
+    lp.c = {1.0, 0.0};
+    lp.row_lo = {1.0};
+    lp.row_hi = {1.0};
+    lp.col_lo = {0.0, 0.0};
+    lp.col_hi = {1.0, 2e9};
+    lp.is_integer = {true, true};
+    std::vector<f64> probe_lo = {0.0, 0.0}, probe_hi = {0.0, 2e9};
+    const auto pr = sor::search::propagate_bounds(
+        lp, probe_lo, probe_hi, 1e-7, 5);
+    CHECK(pr.feasible);
+    CHECK(probe_lo[1] <= 2e9);
+    CHECK(probe_hi[1] >= 2e9);
+    std::vector<f64> lo = lp.col_lo, hi = lp.col_hi;
+    ProbingOptions opts;
+    opts.dual_fix_in_probing = false;
+    ConflictGraph cg;
+    const auto d = sor::search::build_conflict_graph(lp, lo, hi, cg, opts);
+    CHECK(!d.infeasible);
+    CHECK(lo[0] <= 0.0);
+    CHECK(hi[0] >= 1.0);
+    CHECK(lo[1] <= 2e9);
+    CHECK(hi[1] >= 2e9);
 }
 
 // ----------------------------------------------------------- randomized ----
@@ -455,15 +605,67 @@ void test_random_conflict_propagation_keeps_feasible_points() {
     CHECK(pruned > 0);  // non-vacuous: propagation does prune some boxes
 }
 
+// Probing must not stop at the first few thousand binaries: on drayage-25-23
+// the first 4000 probes fixed nothing and the rest fixed 1162 columns. Here a
+// column that only probing can fix (z = 0 forces p = q = 1, which a third row
+// forbids) sits after 3000 filler binaries.
+void test_probing_budget_reaches_late_binaries() {
+    const int fillers = 3000;
+    const Index n = fillers + 3;   // ..., p, q, z
+    const Index p = fillers, q = fillers + 1, z = fillers + 2;
+    std::vector<Index> rows, cols;
+    std::vector<double> vals;
+    Index m = 0;
+    for (int i = 0; i + 2 < fillers; i += 3) {   // packing rows over the fillers
+        for (int k = 0; k < 3; ++k) { rows.push_back(m); cols.push_back(i + k); vals.push_back(1.0); }
+        ++m;
+    }
+    const Index r_first = m;
+    for (const auto& e : std::vector<std::pair<Index, Index>>{{z, p}, {z, q}}) {
+        rows.push_back(m); cols.push_back(e.first); vals.push_back(1.0);
+        rows.push_back(m); cols.push_back(e.second); vals.push_back(1.0);
+        ++m;
+    }
+    rows.push_back(m); cols.push_back(p); vals.push_back(1.0);
+    rows.push_back(m); cols.push_back(q); vals.push_back(1.0);
+    ++m;
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(m, n, rows, cols, vals);
+    lp.row_lo.assign(static_cast<std::size_t>(m), -sor::model::kInf);
+    lp.row_hi.assign(static_cast<std::size_t>(m), 1.0);
+    for (Index i = r_first; i < r_first + 2; ++i) {   // z + p >= 1, z + q >= 1
+        lp.row_lo[static_cast<std::size_t>(i)] = 1.0;
+        lp.row_hi[static_cast<std::size_t>(i)] = sor::model::kInf;
+    }
+    lp.c.assign(static_cast<std::size_t>(n), 0.0);
+    lp.col_lo.assign(static_cast<std::size_t>(n), 0.0);
+    lp.col_hi.assign(static_cast<std::size_t>(n), 1.0);
+    lp.is_integer.assign(static_cast<std::size_t>(n), true);
+    auto lo = lp.col_lo, hi = lp.col_hi;
+    ConflictGraph g;
+    ProbingOptions po;   // defaults
+    const auto d = build_conflict_graph(lp, lo, hi, g, po);
+    CHECK(!d.infeasible);
+    CHECK(!d.probing_truncated);
+    CHECK(d.probes >= 2 * static_cast<std::uint64_t>(fillers));   // past the old 4000-probe cap
+    CHECK(d.probe_fixings + d.probe_tightenings >= 1);
+    CHECK(lo[static_cast<std::size_t>(z)] == 1.0);
+}
+
 }  // namespace
 
 int main() {
+    test_probing_budget_reaches_late_binaries();
     test_set_packing_row_gives_clique();
     test_precedence_row_gives_implication();
     test_probing_detects_infeasibility();
     test_probing_fixes_column();
     test_probing_hull_tightens_continuous();
     test_probing_records_implied_bound();
+    test_dual_fix_probe_does_not_create_global_implied_bound();
+    test_dual_fix_probe_does_not_create_conflict_edge();
+    test_dual_fix_probe_random_scope_and_optimum();
+    test_probe_preserves_wide_integer_side();
     test_random_models_preserve_all_feasible_points();
     test_random_separated_cuts_are_valid();
     test_random_conflict_propagation_keeps_feasible_points();

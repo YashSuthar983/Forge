@@ -5,6 +5,7 @@
 // -- so CPU results did not move by a single bit.  Keep it that way: this
 // file is what vk_pdhcg_device.cpp is checked against.
 #include "sor/backend/pdhcg_device.hpp"
+#include "pdhcg_lp_diagnostics.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -195,6 +196,15 @@ public:
     }
 
     Eval evaluate(bool at_average) override {
+        return evaluate_impl(at_average, true);
+    }
+
+    Eval evaluate_qp(bool at_average) override {
+        return evaluate_impl(at_average, false);
+    }
+
+private:
+    Eval evaluate_impl(bool at_average, bool with_lp_diagnostics) {
         // Evaluated at the current iterate or at the running average; the
         // restart rule compares the two.
         const std::vector<f64>& xv = at_average ? x_avg_ : x_;
@@ -239,9 +249,14 @@ public:
         for (f64& v : minus_r) v = -v;
         e.support_finite = support_box(minus_r, d_.col_lo, d_.col_hi, e.px) &&
                            support_box(yv, d_.row_lo, d_.row_hi, e.py);
+
+        if (with_lp_diagnostics)
+            detail::fill_lp_kkt(e, d_, xv, yv, x0_, y0_, ax, atyv);
+
         return e;
     }
 
+public:
     void download(std::vector<f64>& x, std::vector<f64>& y) override {
         x = x_;
         y = y_;

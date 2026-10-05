@@ -3,9 +3,12 @@
 #include <chrono>
 
 #include "sor/io/gzip.hpp"
+#include "sor/io/lp_format.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
+#include <limits>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -26,12 +29,34 @@ std::string upper(std::string s) {
     return s;
 }
 
+// Whitespace-separated tokens, as `istream >> std::string` in the classic
+// locale would produce them, without constructing a stream per line.
 std::vector<std::string> split_ws(const std::string& line) {
     std::vector<std::string> out;
-    std::istringstream is(line);
-    std::string tok;
-    while (is >> tok) out.push_back(tok);
+    const auto space = [](char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
+    };
+    std::size_t k = 0;
+    const std::size_t n = line.size();
+    while (k < n) {
+        while (k < n && space(line[k])) ++k;
+        const std::size_t start = k;
+        while (k < n && !space(line[k])) ++k;
+        if (k > start) out.emplace_back(line, start, k - start);
+    }
     return out;
+}
+
+// Case-insensitive substring test for an upper-case ASCII needle.
+bool contains_upper(const std::string& text, const char* needle) {
+    const std::size_t m = std::char_traits<char>::length(needle);
+    if (text.size() < m) return false;
+    for (std::size_t at = 0; at + m <= text.size(); ++at) {
+        std::size_t q = 0;
+        while (q < m && std::toupper(static_cast<unsigned char>(text[at + q])) == needle[q]) ++q;
+        if (q == m) return true;
+    }
+    return false;
 }
 
 // Fixed-format MPS field columns (1-based in the spec):
@@ -59,10 +84,27 @@ std::vector<std::string> split_fixed(const std::string& line) {
 }
 
 f64 parse_num(const std::string& s, std::size_t line_no) {
+    // Fast path: a plain decimal that std::from_chars consumes entirely and
+    // reads as a normal, nonzero, finite double. Both it and strtod round
+    // correctly, so the value is the same; anything else (a '+' sign
+    // followed by a second sign, hex, zero, subnormal or out-of-range
+    // values, trailing text) takes the strtod path and its exact behavior.
+    {
+        const char* first = s.data();
+        const char* last = s.data() + s.size();
+        if (first != last && *first == '+' && last - first > 1 &&
+            first[1] != '+' && first[1] != '-')
+            ++first;
+        f64 v = 0.0;
+        const auto [ptr, ec] = std::from_chars(first, last, v);
+        if (ec == std::errc() && ptr == last && std::isfinite(v) &&
+            std::fabs(v) >= std::numeric_limits<f64>::min())
+            return v;
+    }
     try {
         std::size_t used = 0;
         const f64 v = std::stod(s, &used);
-        if (used != s.size()) throw std::invalid_argument("trailing");
+        if (used != s.size() || !std::isfinite(v)) throw std::invalid_argument("nonfinite or trailing");
         return v;
     } catch (...) {
         throw std::runtime_error("MPS line " + std::to_string(line_no) +
@@ -220,7 +262,7 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
                 // MARKER lines toggle the integer block.
                 bool is_marker = false;
                 for (const auto& t : f)
-                    if (upper(t).find("MARKER") != std::string::npos) is_marker = true;
+                    if (contains_upper(t, "MARKER")) is_marker = true;
                 if (is_marker) {
                     for (const auto& t : f) {
                         const std::string u = upper(t);
@@ -371,6 +413,13 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
     const Index n_cols = static_cast<Index>(b.col_names.size());
     const Index n_rows = static_cast<Index>(b.rhs.size());
 
+    // An INTORG/INTEND column with no BOUNDS record defaults to binary in
+    // MPS. An explicit bound record instead gives it general integer bounds.
+    for (std::size_t j = 0; j < b.integer_flag.size(); ++j) {
+        if (b.integer_flag[j] && !b.lo_set[j] && !b.hi_set[j])
+            b.col_hi[j] = 1.0;
+    }
+
     model::LpProblem p;
     p.name = name;
     p.maximize = maximize;
@@ -462,6 +511,9 @@ model::LpProblem read_mps_file(const std::string& path, MpsReadReport& rep,
 
 model::LpProblem read_mps_file_auto(const std::string& path, MpsReadReport& rep,
                                     const MpsReadOptions& opt) {
+    // A .lp / .lp.gz file is CPLEX LP format, not MPS: route it to its own
+    // reader so every loader that calls this function accepts both.
+    if (has_lp_extension(path)) return read_lp_file(path, rep, opt);
     MpsReadOptions free_opt = opt;
     free_opt.fixed_format = false;
     try {

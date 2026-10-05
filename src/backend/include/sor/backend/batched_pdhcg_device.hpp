@@ -77,6 +77,7 @@ public:
     virtual std::vector<f64> dual_and_advance(const std::vector<f64>& sigma, bool halpern,
                                               f64 a, f64 theta,
                                               bool want_movement, const LaneMask&) = 0;
+    // QP convergence metrics only; LP diagnostic fields are not populated.
     virtual std::vector<Eval> evaluate(bool at_average, const LaneMask&) = 0;
     // Restart support, per lane; see PdhcgDevice for what these mean.
     virtual void average_reset(const LaneMask&) = 0;

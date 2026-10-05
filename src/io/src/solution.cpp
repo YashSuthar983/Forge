@@ -1,6 +1,7 @@
 #include "sor/io/solution.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <istream>
 #include <ostream>
 #include <sstream>
@@ -29,11 +30,14 @@ f64 read_f64_token(const std::string& tok) {
     if (tok == "nan" || tok == "-nan") return core::kNaN;
     if (tok == "inf" || tok == "+inf") return core::kPosInf;
     if (tok == "-inf") return -core::kPosInf;
-    try {
-        return std::stod(tok);
-    } catch (const std::exception&) {
+    // std::stod throws out_of_range for ERANGE, including a representable
+    // subnormal. Such values are emitted by the solver and must reach the
+    // checker unchanged; reject malformed and overflowing tokens instead.
+    char* end = nullptr;
+    const f64 value = std::strtod(tok.c_str(), &end);
+    if (end == tok.c_str() || *end != '\0' || !std::isfinite(value))
         throw std::runtime_error("solution file: not a number '" + tok + "'");
-    }
+    return value;
 }
 
 Status status_from_string(const std::string& s) {
@@ -100,6 +104,21 @@ void write_solution(std::ostream& out, const core::SolveResult& r) {
     write_vec(out, "ray", r.ray);
     write_vec(out, "primal_ray", r.primal_ray.direction);
     write_vec(out, "dual_farkas_ray", r.dual_farkas_ray.multipliers);
+    if (!r.exact_dual.empty()) {
+        out << "exact_dual " << r.exact_dual.size();
+        for (const auto& value : r.exact_dual) out << ' ' << value;
+        out << '\n';
+    }
+    if (!r.dual_farkas_ray.exact_multipliers.empty()) {
+        out << "exact_dual_farkas " << r.dual_farkas_ray.exact_multipliers.size();
+        for (const auto& value : r.dual_farkas_ray.exact_multipliers) out << ' ' << value;
+        out << '\n';
+    }
+    if (!r.primal_ray.exact_direction.empty()) {
+        out << "exact_primal_ray " << r.primal_ray.exact_direction.size();
+        for (const auto& value : r.primal_ray.exact_direction) out << ' ' << value;
+        out << '\n';
+    }
 }
 
 SolutionFile read_solution(std::istream& in) {
@@ -127,6 +146,28 @@ SolutionFile read_solution(std::istream& in) {
     if (in.peek() != std::char_traits<char>::eof()) {
         s.primal_ray = read_vec(in, "primal_ray");
         s.dual_farkas_ray = read_vec(in, "dual_farkas_ray");
+        in >> std::ws;
+        bool saw_dual = false, saw_farkas = false, saw_primal = false;
+        while (in.peek() != std::char_traits<char>::eof()) {
+            std::size_t count = 0;
+            if (!(in >> tag >> count)) throw std::runtime_error("solution file: invalid exact field");
+            std::vector<std::string>* destination = nullptr;
+            if (tag == "exact_dual" && !saw_dual && count == s.y.size()) {
+                destination = &s.exact_dual; saw_dual = true;
+            }
+            if (tag == "exact_dual_farkas" && !saw_farkas && count == s.dual_farkas_ray.size()) {
+                destination = &s.exact_dual_farkas; saw_farkas = true;
+            }
+            if (tag == "exact_primal_ray" && !saw_primal && count == s.primal_ray.size()) {
+                destination = &s.exact_primal_ray; saw_primal = true;
+            }
+            if (!destination) throw std::runtime_error("solution file: invalid exact field count or tag");
+            destination->resize(count);
+            for (auto& rational : *destination)
+                if (!(in >> rational) || !core::valid_exact_dual_token(rational))
+                    throw std::runtime_error("solution file: invalid exact rational");
+            in >> std::ws;
+        }
     }
     return s;
 }
