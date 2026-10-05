@@ -32,8 +32,11 @@ class BoundSnapshotTests(unittest.TestCase):
         # keeps the file-size-limited run cheap and either status is valid.
         model = 'n5-3' if limited else 'p0033'
         budget = '0.1' if limited else '30'
+        model_path = ROOT / 'benchmarks/miplib-easy/mps' / (model + '.mps')
+        if not model_path.is_file():
+            self.skipTest(f'instance data not present: {model_path}')
         result = subprocess.run(
-            [str(BINARY), str(ROOT / 'benchmarks/miplib-easy/mps' / (model + '.mps')),
+            [str(BINARY), str(model_path),
              '--engine', 'milp', '--time-limit', budget, '--bab-threads', '1'],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             preexec_fn=limit_files if limited else None, timeout=60)
