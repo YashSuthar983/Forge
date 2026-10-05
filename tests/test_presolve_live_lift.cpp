@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <string>
 #include <set>
 #include <vector>
 
@@ -114,6 +115,129 @@ LpProblem make_lp(std::uint32_t seed) {
     lp.row_lo = lo;
     lp.row_hi = hi;
     return lp;
+}
+
+
+// The lifted basis names the lifted vertex: nonbasic variables at the finite
+// bound their status names, basic variables priced at zero by the lifted duals.
+struct BasisCheck { bool distinct = false, consistent = false, complementary = false; };
+BasisCheck check_lifted_basis(const LpProblem& lp, const sor::presolve::PresolveRecoveryResult& rec) {
+    using PS = sor::presolve::PostsolveNonbasicStatus;
+    BasisCheck out;
+    const Index n = lp.n_cols(), m = lp.n_rows();
+    std::set<Index> basic(rec.basis.basic.begin(), rec.basis.basic.end());
+    out.distinct = rec.basis.basic.size() == static_cast<std::size_t>(m) &&
+                   basic.size() == rec.basis.basic.size() && !basic.count(-1);
+    if (rec.basis.status.size() != static_cast<std::size_t>(n + m)) return out;
+    std::vector<double> ax(static_cast<std::size_t>(m), 0.0), d(lp.c.begin(), lp.c.end());
+    const auto& rp = lp.A.pattern.row_ptr();
+    const auto& ci = lp.A.pattern.col_idx();
+    for (Index i = 0; i < m; ++i)
+        for (auto k = rp[i]; k < rp[i + 1]; ++k) {
+            ax[static_cast<std::size_t>(i)] += lp.A.vals[k] * rec.raw.x[ci[k]];
+            d[static_cast<std::size_t>(ci[k])] -= lp.A.vals[k] * rec.raw.y[i];
+        }
+    out.consistent = out.complementary = true;
+    for (Index j = 0; j < n + m; ++j) {
+        const auto st = rec.basis.status[static_cast<std::size_t>(j)];
+        if (st == PS::Basic) {
+            const double dj = j < n ? d[static_cast<std::size_t>(j)] : rec.raw.y[j - n];
+            if (std::fabs(dj) > 1e-7) out.complementary = false;
+            continue;
+        }
+        const double lo = j < n ? lp.col_lo[j] : lp.row_lo[j - n];
+        const double hi = j < n ? lp.col_hi[j] : lp.row_hi[j - n];
+        const double v = j < n ? rec.raw.x[j] : ax[static_cast<std::size_t>(j - n)];
+        const double b = st == PS::AtLower ? lo : st == PS::AtUpper ? hi : 0.0;
+        if (!(std::isfinite(b) && std::fabs(v - b) <= 1e-7 * (1.0 + std::fabs(b)))) out.consistent = false;
+    }
+    return out;
+}
+
+// Presolve with `po`, solve the reduced model, lift; return the lift.
+sor::presolve::PresolveRecoveryResult solve_through_presolve(const LpProblem& lp,
+                                                             const sor::presolve::PresolveOptions& po) {
+    sor::engines::SimplexOptions direct;
+    direct.presolve = false;
+    direct.exact_proof = false;
+    const auto out = sor::presolve::presolve(lp, po);
+    sor::presolve::PresolveReducedSolve rs;
+    if (out.map.problem.n_rows() > 0 || out.map.problem.n_cols() > 0) {
+        sor::engines::SimplexDiagnostics rd;
+        sor::engines::SimplexBasis basis;
+        const auto red = sor::engines::solve_simplex(out.map.problem, direct, rd, &basis);
+        rs.x = red.x;
+        rs.y = red.y;
+        rs.has_basis = !basis.status.empty();
+        rs.basis.n_struct = basis.n_struct;
+        rs.basis.basic = basis.basic;
+        for (const auto st : basis.status)
+            rs.basis.status.push_back(static_cast<sor::presolve::PostsolveNonbasicStatus>(st));
+    }
+    sor::presolve::PresolveRecoveryOptions ro;
+    ro.certificate_time_limit_s = -1;
+    ro.gap_tol = 1e-7;
+    return sor::presolve::recover_solution(lp, out.map, rs, ro);
+}
+
+// The models test_presolve's live-rule cases used before they were changed
+// so a later rule fires first (dual fixing or a cost-tight doubleton now
+// reduces them earlier). Each stays covered end to end: optimum, duals and
+// a lifted basis that names the lifted vertex, through the rule set it was
+// written for.
+void original_rule_models() {
+    const double inf = sor::model::kInf;
+    struct Model {
+        const char* name;
+        std::vector<Index> ri, ci;
+        std::vector<double> v, c, row_lo, row_hi, col_lo, col_hi;
+        bool implied_bounds, dominated, parallel_rows, parallel_columns;
+        std::vector<double> x, y;
+        double objective;
+    };
+    const std::vector<Model> models = {
+        {"implied bounds", {0, 0}, {0, 1}, {1, 1}, {1, 1}, {-inf}, {3}, {0, 0}, {10, 10},
+         true, false, false, false, {0, 0}, {0}, 0.0},
+        {"dominated column", {0, 0}, {0, 1}, {1, 1}, {1, 1}, {-inf}, {4}, {0, 0}, {inf, 10},
+         false, true, false, false, {0, 0}, {0}, 0.0},
+        {"dominated column off", {0, 0}, {0, 1}, {1, 1}, {1, 1}, {-inf}, {4}, {0, 0}, {4, 10},
+         false, false, false, false, {0, 0}, {0}, 0.0},
+        {"parallel rows", {0, 0, 1, 1}, {0, 1, 0, 1}, {1, 1, 1, 1}, {1, 1}, {-inf, -inf}, {5, 3},
+         {0, 0}, {10, 10}, false, false, true, false, {0, 0}, {0, 0}, 0.0},
+        {"parallel columns", {0, 0}, {0, 1}, {1, 2}, {1, 2}, {-inf}, {10}, {0, 0}, {5, 10},
+         false, false, false, true, {0, 0}, {0}, 0.0},
+        // x1 basic prices the row: y = c1 = 2; x0 at its upper bound, d0 = -1.
+        {"finite receiver", {0, 0}, {0, 1}, {1, 1}, {1, 2}, {2}, {inf}, {0, 0}, {1, 2},
+         false, true, false, false, {1, 1}, {2}, 3.0},
+    };
+    for (const auto& md : models) {
+        LpProblem lp;
+        lp.A = sor::sparse::from_triplets(static_cast<Index>(md.row_lo.size()),
+                                          static_cast<Index>(md.c.size()), md.ri, md.ci, md.v);
+        lp.c = md.c;
+        lp.row_lo = md.row_lo;
+        lp.row_hi = md.row_hi;
+        lp.col_lo = md.col_lo;
+        lp.col_hi = md.col_hi;
+        sor::presolve::PresolveOptions po;
+        po.live_reductions = true;
+        po.implied_bounds = md.implied_bounds;
+        po.dominated_columns = md.dominated;
+        po.parallel_rows = md.parallel_rows;
+        po.parallel_columns = md.parallel_columns;
+        const auto rec = solve_through_presolve(lp, po);
+        const std::string where = md.name;
+        ::sor::test::report(std::fabs(rec.raw.objective - md.objective) <= 1e-9,
+                            "original model: optimum", __FILE__, __LINE__, where);
+        bool x_ok = rec.raw.x.size() == md.x.size(), y_ok = rec.raw.y.size() == md.y.size();
+        for (std::size_t j = 0; x_ok && j < md.x.size(); ++j) x_ok = std::fabs(rec.raw.x[j] - md.x[j]) <= 1e-9;
+        for (std::size_t i = 0; y_ok && i < md.y.size(); ++i) y_ok = std::fabs(rec.raw.y[i] - md.y[i]) <= 1e-9;
+        ::sor::test::report(x_ok, "original model: primal solution", __FILE__, __LINE__, where);
+        ::sor::test::report(y_ok, "original model: duals", __FILE__, __LINE__, where);
+        const auto bc = check_lifted_basis(lp, rec);
+        ::sor::test::report(bc.distinct && bc.consistent && bc.complementary,
+                            "original model: lifted basis names the optimal vertex", __FILE__, __LINE__, where);
+    }
 }
 
 }  // namespace
@@ -271,5 +395,6 @@ int main() {
     CHECK(lifted_with_parallel >= 50);
     CHECK(chains >= 20);
     CHECK(lifted_with_dual_fix >= 50);
+    original_rule_models();
     return sor::test::finish("test_presolve_live_lift");
 }

@@ -1055,6 +1055,9 @@ int main() {
             const auto rec = recover_solution(p, out.map, rs);
             CHECK(rec.evidence.max_primal_violation <= 1e-9);
         }
+        // The same model as above with the rule off: nothing is removed.
+        // (x0 must be the unbounded receiver, or the rule could not fire even
+        // when enabled and this would test nothing.)
         {
             PresolveOptions dom = v2;
             dom.dominated_columns = false;
@@ -1064,7 +1067,7 @@ int main() {
             p.row_lo = {4.0};
             p.row_hi = {sor::model::kInf};
             p.col_lo = {0.0, 0.0};
-            p.col_hi = {4.0, 10.0};
+            p.col_hi = {sor::model::kInf, 10.0};
             const auto out = sor::presolve::presolve(p, dom);
             CHECK(out.stats().dominated_columns_removed == 0);
             CHECK(out.map.problem.n_cols() == 2);
@@ -1227,6 +1230,8 @@ int main() {
             p.A = sor::sparse::from_triplets(1,2,{0,0},{0,1},{1.0,1.0});
             // x1 <= 3, not 2: with x1 <= 2 the row is cost-tight (x0 = 2 - x1
             // >= 0 always) and the doubleton removes x0 before this rule.
+            // The pair has the same support, ratio 1 and c0 * 1 <= c1, so
+            // the only thing refusing it is x0's finite capacity.
             p.c = {1.0,2.0}; p.col_lo = {0.0,0.0}; p.col_hi = {1.0,3.0};
             p.row_lo = {2.0}; p.row_hi = {sor::model::kInf};
             const auto out = sor::presolve::presolve(p, dom);
