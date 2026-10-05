@@ -15,8 +15,12 @@ using namespace sor;
 
 namespace {
 
+std::string netlib_path(const std::string& name) {
+    return std::string(SOR_SOURCE_DIR) + "/benchmarks/netlib/mps/" + name + ".mps";
+}
+
 model::LpProblem read_netlib(const std::string& name) {
-    std::ifstream input(std::string(SOR_SOURCE_DIR) + "/benchmarks/netlib/mps/" + name + ".mps");
+    std::ifstream input(netlib_path(name));
     io::MpsReadReport report;
     return io::read_mps(input, report);
 }
@@ -39,6 +43,8 @@ core::SolveResult solve(const model::LpProblem& problem, bool crossover, bool pr
 }  // namespace
 
 int main() {
+    if (!test::data_available(netlib_path("afiro")))
+        return test::skip("test_lp_barrier", netlib_path("afiro"));
     // afiro: optimum -464.7531428571 (Netlib). Barrier plus crossover must
     // reach a checked basis proof, with and without presolve.
     for (const bool presolve : {false, true}) {

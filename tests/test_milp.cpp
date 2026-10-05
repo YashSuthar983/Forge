@@ -628,9 +628,14 @@ void test_gap_pruning_reports_honest_dual_bound(int threads) {
 }
 
 void test_integral_lp_points_reach_incumbent_validation_before_gap_pruning() {
+    const std::string path = std::string(SOR_SOURCE_DIR) + "/benchmarks/miplib-easy/mps/rgn.mps";
+    if (!sor::test::data_available(path)) {
+        sor::test::skip("test_integral_lp_points_reach_incumbent_validation_before_gap_pruning",
+                        path);
+        return;
+    }
     sor::io::MpsReadReport report;
-    const auto lp = sor::io::read_mps_file(
-        std::string(SOR_SOURCE_DIR) + "/benchmarks/miplib-easy/mps/rgn.mps", report);
+    const auto lp = sor::io::read_mps_file(path, report);
     BabOptions opts;
     opts.time_limit_s = 20.0;
     opts.para_bab.threads = 1;
@@ -644,10 +649,13 @@ void test_integral_lp_points_reach_incumbent_validation_before_gap_pruning() {
 }
 
 void test_enigma_stops_when_the_global_gap_closes() {
+    const std::string path = std::string(SOR_SOURCE_DIR) + "/benchmarks/miplib-easy/mps/enigma.mps";
+    if (!sor::test::data_available(path)) {
+        sor::test::skip("test_enigma_stops_when_the_global_gap_closes", path);
+        return;
+    }
     sor::io::MpsReadReport report;
-    const auto lp = sor::io::read_mps_file(
-        std::string(SOR_SOURCE_DIR) + "/benchmarks/miplib-easy/mps/enigma.mps",
-        report);
+    const auto lp = sor::io::read_mps_file(path, report);
     BabOptions opts;
     // Root phases take fractions of the limit: at 20 s they ended on wall
     // clock and the tree varied (4.6k-6k nodes, 16-20 s, failing under ctest
@@ -673,10 +681,13 @@ void test_root_neighborhood_obeys_milp_deadline() {
     // n5-3 reaches the root rounding heuristic. Its first local-neighborhood
     // call formerly consumed the full three-second default after a one-second
     // solve limit, yielding more than four seconds total on this fixture.
+    const std::string path = std::string(SOR_SOURCE_DIR) + "/benchmarks/miplib-easy/mps/n5-3.mps";
+    if (!sor::test::data_available(path)) {
+        sor::test::skip("test_root_neighborhood_obeys_milp_deadline", path);
+        return;
+    }
     sor::io::MpsReadReport report;
-    const auto lp = sor::io::read_mps_file(
-        std::string(SOR_SOURCE_DIR) + "/benchmarks/miplib-easy/mps/n5-3.mps",
-        report);
+    const auto lp = sor::io::read_mps_file(path, report);
     BabOptions opts;
     opts.time_limit_s = 1.0;
     opts.para_bab.threads = 1;
@@ -689,10 +700,13 @@ void test_root_neighborhood_obeys_milp_deadline() {
 // heuristic_spent_ms(). It must be the sum of the disjoint heuristic timers;
 // a stub returning 0 hid 40 s of in-tree rounding on drayage-25-23.
 void test_heuristic_spent_ms_sums_heuristic_timers() {
+    const std::string path = std::string(SOR_SOURCE_DIR) + "/benchmarks/miplib-easy/mps/n5-3.mps";
+    if (!sor::test::data_available(path)) {
+        sor::test::skip("test_heuristic_spent_ms_sums_heuristic_timers", path);
+        return;
+    }
     sor::io::MpsReadReport report;
-    const auto lp = sor::io::read_mps_file(
-        std::string(SOR_SOURCE_DIR) + "/benchmarks/miplib-easy/mps/n5-3.mps",
-        report);
+    const auto lp = sor::io::read_mps_file(path, report);
     BabOptions opts;
     // Node-bounded, not time-bounded: under a loaded CTest a 1 s limit
     // can end before the first heuristic round.
@@ -713,10 +727,13 @@ void test_heuristic_spent_ms_sums_heuristic_timers() {
 // first three with identical arguments could never succeed and doubled the
 // cost of every failed round (40 s of 60 s on drayage-25-23).
 void test_node_rounding_does_not_repeat_identical_attempts() {
+    const std::string path = std::string(SOR_SOURCE_DIR) + "/benchmarks/miplib-easy/mps/n5-3.mps";
+    if (!sor::test::data_available(path)) {
+        sor::test::skip("test_node_rounding_does_not_repeat_identical_attempts", path);
+        return;
+    }
     sor::io::MpsReadReport report;
-    const auto lp = sor::io::read_mps_file(
-        std::string(SOR_SOURCE_DIR) + "/benchmarks/miplib-easy/mps/n5-3.mps",
-        report);
+    const auto lp = sor::io::read_mps_file(path, report);
     BabOptions opts;
     // Node-bounded, not time-bounded: under a loaded CTest a 1 s limit
     // can end before the first heuristic round.
@@ -734,10 +751,13 @@ void test_node_rounding_does_not_repeat_identical_attempts() {
 // not pay for four repair searches at every node (it ran at 400 of 400 n5-3
 // nodes before the backoff).
 void test_node_rounding_backs_off_after_misses() {
+    const std::string path = std::string(SOR_SOURCE_DIR) + "/benchmarks/miplib-easy/mps/n5-3.mps";
+    if (!sor::test::data_available(path)) {
+        sor::test::skip("test_node_rounding_backs_off_after_misses", path);
+        return;
+    }
     sor::io::MpsReadReport report;
-    const auto lp = sor::io::read_mps_file(
-        std::string(SOR_SOURCE_DIR) + "/benchmarks/miplib-easy/mps/n5-3.mps",
-        report);
+    const auto lp = sor::io::read_mps_file(path, report);
     BabOptions opts;
     opts.time_limit_s = 60.0;
     opts.max_nodes = 200;

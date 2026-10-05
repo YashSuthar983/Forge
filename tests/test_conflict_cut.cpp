@@ -328,7 +328,8 @@ void test_p0033_latest_learns_mexi_cut() {
         }
     }
     if (!path) {
-        ::sor::test::report(false, "p0033: required mps missing", __FILE__, __LINE__);
+        ::sor::test::skip("test_p0033_latest_learns_mexi_cut",
+                          "benchmarks/miplib-easy/mps/p0033.mps");
         return;
     }
     sor::io::MpsReadReport rep;
@@ -745,8 +746,8 @@ void test_flugpl_latest_dual_not_above_opt() {
         }
     }
     if (!path) {
-        ::sor::test::report(false, "flugpl: required mps missing", __FILE__,
-                            __LINE__);
+        ::sor::test::skip("test_flugpl_latest_dual_not_above_opt",
+                          "benchmarks/miplib-easy/mps/flugpl.mps");
         return;
     }
     sor::io::MpsReadReport rep;
@@ -803,7 +804,8 @@ void test_misc03_dense_binary_mexi_auto_off() {
         }
     }
     if (!path) {
-        ::sor::test::report(false, "misc03: required mps missing", __FILE__, __LINE__);
+        ::sor::test::skip("test_misc03_dense_binary_mexi_auto_off",
+                          "benchmarks/miplib-easy/mps/misc03.mps");
         return;
     }
     sor::io::MpsReadReport rep;
@@ -849,8 +851,8 @@ void test_enigma_latest_not_false_infeasible() {
         }
     }
     if (!path) {
-        ::sor::test::report(false, "enigma: required mps missing", __FILE__,
-                            __LINE__);
+        ::sor::test::skip("test_enigma_latest_not_false_infeasible",
+                          "benchmarks/miplib-easy/mps/enigma.mps");
         return;
     }
     sor::io::MpsReadReport rep;
@@ -889,8 +891,8 @@ void test_gen_ip002_latest_not_false_optimal() {
         }
     }
     if (!path) {
-        ::sor::test::report(false, "gen-ip002: required mps missing", __FILE__,
-                            __LINE__);
+        ::sor::test::skip("test_gen_ip002_latest_not_false_optimal",
+                          "benchmarks/miplib-easy/mps/gen-ip002.mps");
         return;
     }
     sor::io::MpsReadReport rep;
@@ -937,8 +939,8 @@ void test_markshare1_latest_not_false_optimal() {
         }
     }
     if (!path) {
-        ::sor::test::report(false, "markshare1: required mps missing", __FILE__,
-                            __LINE__);
+        ::sor::test::skip("test_markshare1_latest_not_false_optimal",
+                          "benchmarks/miplib-easy/mps/markshare1.mps");
         return;
     }
     sor::io::MpsReadReport rep;
