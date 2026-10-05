@@ -1,5 +1,8 @@
 #include "sor/la/basis_numerics.hpp"
 #include "sor/core/parallel.hpp"
+#if defined(__SIZEOF_FLOAT128__)
+#include "quad_accumulator.hpp"
+#endif
 #if !defined(__SIZEOF_FLOAT128__)
 #include <boost/multiprecision/cpp_bin_float.hpp>
 #elif defined(__GNUC__) || defined(__clang__)
@@ -17,6 +20,7 @@ namespace {
 // the multiprecision type does, at a fraction of its cost: on pilot87 the
 // class-based arithmetic was about a sixth of the whole dual simplex loop.
 #if defined(__SIZEOF_FLOAT128__)
+#define SOR_QUAD_ACCUMULATOR 1
 using Quad = __float128;
 inline Quad quad_abs(Quad v) { return v < 0 ? -v : v; }
 inline f64 quad_to_f64(Quad v) { return static_cast<f64>(v); }
@@ -132,8 +136,33 @@ RefinementStats refine_basis_solution(const BasisFactor& factor, Index n,
     }
     if (quick.backward_error <= target) return quick;
     std::vector<Quad> residual(sz(n)), scale(sz(n));
+#if defined(SOR_QUAD_ACCUMULATOR)
+    // The same binary128 sums (each a*x exact, each += correctly rounded),
+    // computed unpacked instead of through libgcc's soft-float calls: on
+    // pilot87 those calls were 8.6% of the solve. IEEE rounding makes the
+    // results identical bit for bit (tests/test_quad_accumulator.cpp).
+    std::vector<quadacc::Q> qresidual(sz(n)), qscale(sz(n));
+#endif
     auto measure = [&](const std::vector<f64>& candidate, std::vector<f64>& correction) {
         RefinementStats result;
+#if defined(SOR_QUAD_ACCUMULATOR)
+        for (Index i = 0; i < n; ++i) {
+            qresidual[sz(i)] = quadacc::from_double(rhs[sz(i)]);
+            qscale[sz(i)] = quadacc::absval(qresidual[sz(i)]);
+        }
+        for (Index j = 0; j < n; ++j)
+            for (Offset k = p[sz(j)]; k < p[sz(j)+1]; ++k) {
+                const auto out = transpose ? sz(j) : sz(r[sz(k)]);
+                const auto in = transpose ? sz(r[sz(k)]) : sz(j);
+                const quadacc::Q term = quadacc::mul_exact(a[sz(k)], candidate[in]);
+                qresidual[out] = quadacc::add(qresidual[out], quadacc::negate(term));
+                qscale[out] = quadacc::add(qscale[out], quadacc::absval(term));
+            }
+        for (Index i = 0; i < n; ++i) {
+            residual[sz(i)] = quadacc::to_float128(qresidual[sz(i)]);
+            scale[sz(i)] = quadacc::to_float128(qscale[sz(i)]);
+        }
+#else
         for (Index i = 0; i < n; ++i) {
             residual[sz(i)] = Quad(rhs[sz(i)]);
             scale[sz(i)] = quad_abs(Quad(rhs[sz(i)]));
@@ -145,6 +174,7 @@ RefinementStats refine_basis_solution(const BasisFactor& factor, Index n,
                 const Quad term = Quad(a[sz(k)]) * Quad(candidate[in]);
                 residual[out] -= term; scale[out] += quad_abs(term);
             }
+#endif
         for (Index i = 0; i < n; ++i) {
             const Quad magnitude = quad_abs(residual[sz(i)]);
             correction[sz(i)] = quad_to_f64(residual[sz(i)]);
