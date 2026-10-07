@@ -71,12 +71,21 @@ core::ProofEvidence independently_checked(
     return certify::check_lp_result(problem, raw, proposed);
 }
 
+// A basis candidate that meets the standard its producer claims, the rule
+// detail::simplex_optimum_accepted applies inside the simplex: residuals
+// within tolerance always, and the safe dual bound closing the gap only for
+// a claim of ProvedOptimalFP or above. A simplex run without the exact proof
+// claims tolerance-level KKT optimality; requiring the bound here rejected
+// it, so a crossover's cold simplex fallback lost to the interior point it
+// was meant to finish (scsd6 --engine barrier: Feasible instead of Optimal).
 bool proved_basis(const core::RawResult& raw, const core::ProofEvidence& ev) {
-    return raw.proposed_status == core::Status::Optimal && ev.has_basis &&
-           ev.claimed_level >= core::ProofLevel::ProvedOptimalFP &&
-           ev.checker_passed && ev.max_primal_violation <= ev.primal_feas_tol &&
-           ev.max_dual_violation <= ev.dual_feas_tol &&
-           std::isfinite(ev.gap_rel) && ev.gap_rel <= ev.gap_tol;
+    if (raw.proposed_status != core::Status::Optimal || !ev.has_basis ||
+        !ev.checker_passed || !(ev.max_primal_violation <= ev.primal_feas_tol) ||
+        !(ev.max_dual_violation <= ev.dual_feas_tol))
+        return false;
+    if (ev.claimed_level >= core::ProofLevel::ProvedOptimalFP)
+        return std::isfinite(ev.gap_rel) && ev.gap_rel <= ev.gap_tol;
+    return ev.claimed_level == core::ProofLevel::ProvedKKT;
 }
 
 bool certified_terminal(const core::RawResult& raw,

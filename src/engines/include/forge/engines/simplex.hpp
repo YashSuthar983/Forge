@@ -703,6 +703,23 @@ bool prefer_simplex_candidate(const core::RawResult& candidate,
                               const SimplexOptions& opts,
                               bool maximize);
 
+// Whether an Optimal simplex result meets the requested standard: original-
+// model residuals within tolerance and, only when the exact proof was
+// requested, a finite dual bound closing the gap. Shared by every place that
+// decides between a presolved candidate and its unpresolved retry, so the two
+// sides of that comparison are always judged by the same rule.
+bool simplex_optimum_accepted(const core::RawResult& result,
+                              const SimplexDiagnostics& diag,
+                              const SimplexOptions& opts);
+
+// Whether a finished dual stage leaves the answer to the primal fallback: a
+// numerical failure, an Infeasible finish without a checked Farkas ray, or a
+// "cycling detected" stop (the dual gave up, its perturbed recovery did not
+// finish, and the primal is a complete solver for the allowance left).
+bool dual_stage_needs_fallback(const core::RawResult& result,
+                               const SimplexDiagnostics& diag,
+                               bool infeasibility_certified);
+
 }  // namespace detail
 
 class DualProbeSession;

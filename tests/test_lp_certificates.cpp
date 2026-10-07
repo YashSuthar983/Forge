@@ -423,7 +423,44 @@ void test_presolved_terminal_witnesses() {
     }
 }
 
+// Without the exact proof a terminal ray is checked in floating point, and the
+// rational repair runs only if that check fails. Both rays here are exact in
+// binary64, so each run must finalize with no exact certificate attached;
+// with the exact proof requested the exact certificate is still produced.
+void test_float_rays_skip_exact_repair_without_exact_proof() {
+    model::LpProblem infeasible;   // x + y >= 3 and x + y <= 1
+    infeasible.A = sparse::from_triplets(2, 2, {0,0,1,1}, {0,1,0,1}, {1,1,1,1});
+    infeasible.c = {1, 1};
+    infeasible.col_lo.assign(2, -model::kInf); infeasible.col_hi.assign(2, model::kInf);
+    infeasible.row_lo = {3, -model::kInf}; infeasible.row_hi = {model::kInf, 1};
+    model::LpProblem unbounded;    // min -x with x - y = 0, x, y >= 0
+    unbounded.A = sparse::from_triplets(1, 2, {0,0}, {0,1}, {1,-1});
+    unbounded.c = {-1, 0};
+    unbounded.col_lo = {0, 0}; unbounded.col_hi.assign(2, model::kInf);
+    unbounded.row_lo = unbounded.row_hi = {0};
+    for (const bool exact : {false, true}) {
+        for (const auto method : {engines::SimplexMethod::Primal, engines::SimplexMethod::Dual}) {
+            for (const auto* model : {&infeasible, &unbounded}) {
+                engines::SimplexOptions opts;
+                opts.presolve = false;
+                opts.method = method;
+                opts.exact_proof = exact;
+                engines::SimplexDiagnostics diag;
+                const auto raw = engines::solve_simplex(*model, opts, diag);
+                const auto checked = certify::check_lp_result(*model, raw, engines::simplex_evidence(diag, opts));
+                const auto expected = model == &unbounded ? core::Status::Unbounded : core::Status::Infeasible;
+                CHECK(certify::finalize_result(raw, checked).status == expected);
+                const bool has_exact = model == &unbounded
+                    ? !raw.primal_ray.exact_direction.empty()
+                    : !raw.dual_farkas_ray.exact_multipliers.empty();
+                CHECK(has_exact == exact);
+            }
+        }
+    }
+}
+
 int main() {
+    test_float_rays_skip_exact_repair_without_exact_proof();
     test_presolved_terminal_witnesses();
     test_exact_terminal_rays();
     test_sparse_integer_basis_certificate();

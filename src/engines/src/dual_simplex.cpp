@@ -3791,7 +3791,12 @@ static core::RawResult dual_prepared_pass(
     if (status == core::Status::Infeasible && !farkas_ray.empty()) {
         raw.ray = std::move(farkas_ray);
         raw.certificate_basis = basis;
+        // The rational repair is the exact proof's work. Without it, the
+        // floating-point ray is enough whenever it passes the same check the
+        // result gate applies; repair only rescues a ray that fails it.
         if (opts.certify_rays && farkas_leaving_slot >= 0 &&
+            (opts.exact_proof ||
+             !certify::check_dual_farkas_ray(pmin, raw.ray, opts.primal_feas_tol).certified) &&
             (opts.time_limit_s <= 0 || ms_since(t_all) < 1000*opts.time_limit_s)) {
             certify::repair_basis_farkas_certificate(pmin, raw, farkas_leaving_slot, farkas_sign,
                 {.time_limit_s = opts.time_limit_s > 0
