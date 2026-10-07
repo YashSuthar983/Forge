@@ -32,6 +32,41 @@ int main() {
     p.c = {0,0,0}; p.row_lo = p.row_hi = {2,2,4};
     const auto dependent = sor::presolve::presolve(p, options);
     CHECK(dependent.map.stats.linear_dependencies_removed == 1);
+    // Assignment system: row sums and column sums of a 5x5 matrix, rows and
+    // columns interleaved. Exactly one of the ten equations is dependent
+    // (all row sums minus all column sums is zero). With one right-hand side
+    // changed the same combination is inconsistent, and nothing may go.
+    {
+        constexpr int n = 5;
+        std::vector<sor::core::Index> ri, ci;
+        std::vector<double> vals;
+        for (int i = 0; i < n; ++i)
+            for (int j = 0; j < n; ++j) {
+                ri.push_back(2 * i); ci.push_back(i * n + j); vals.push_back(1);
+                ri.push_back(2 * j + 1); ci.push_back(i * n + j); vals.push_back(1);
+            }
+        sor::model::LpProblem a;
+        a.A = sor::sparse::from_triplets(2 * n, n * n, ri, ci, vals);
+        for (int k = 0; k < n * n; ++k) a.c.push_back(1 + (k * 7) % 11);
+        a.col_lo.assign(n * n, 0.0);
+        a.col_hi.assign(n * n, 1.0);
+        a.row_lo.assign(2 * n, 1.0);
+        a.row_hi = a.row_lo;
+        sor::presolve::PresolveOptions o;
+        o.equation_sparsification = true;
+        const auto assignment = sor::presolve::presolve(a, o);
+        CHECK(assignment.map.stats.linear_dependencies_removed == 1);
+        std::vector<double> identity(n * n, 0.0);
+        for (int i = 0; i < n; ++i) identity[static_cast<std::size_t>(i * n + i)] = 1.0;
+        std::vector<double> reduced;
+        for (auto original : assignment.map.new_to_orig)
+            reduced.push_back(identity[static_cast<std::size_t>(original)]);
+        const auto lifted = sor::presolve::postsolve(assignment.map, reduced);
+        CHECK(a.max_row_violation(lifted) < 1e-12);
+        a.row_lo[3] = a.row_hi[3] = 2.0;
+        const auto inconsistent = sor::presolve::presolve(a, o);
+        CHECK(inconsistent.map.stats.linear_dependencies_removed == 0);
+    }
     // Probe budget is bounded and continuous domains are never integer-rounded.
     options.domain_probing = true; options.max_domain_probes = 1;
     p.A = sor::sparse::from_triplets(2,2,{0,0,1,1},{0,1,0,1},{1,1,1,-1});
