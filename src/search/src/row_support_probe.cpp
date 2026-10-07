@@ -1,4 +1,5 @@
 #include "forge/search/row_support_probe.hpp"
+#include "forge/core/work_clock.hpp"
 
 #include "forge/search/conflict.hpp"
 #include "forge/search/prop_trail.hpp"
@@ -13,7 +14,7 @@
 namespace forge::search {
 namespace {
 
-using Clock = std::chrono::steady_clock;
+using Clock = forge::core::SolverClock;
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 constexpr f64 kInf = std::numeric_limits<f64>::infinity();
 

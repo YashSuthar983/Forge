@@ -120,12 +120,19 @@ struct MirOptions {
     // cuts behind the later large gain; exp/sp150 root bounds were unchanged.
     // Per-base efficacy is not a sufficient selection signal here. Opt-in.
     bool lifted_cover = false;
+    // Integer terms tried at their other bound (c-MIR complementation) per
+    // base, at the best scaling; 0 disables the step. OFF by default: it keeps
+    // the most efficacious of the valid cuts it tries, and per-cut efficacy
+    // is not a sufficient selection signal here -- exp-1-500-5-5 needs 22
+    // nodes with it against 8 without, for no measured gain elsewhere.
+    int complementation_max = 0;
     int max_aggregations = 24;     // rows combined into one base (was 4)
     int max_start_rows = 800;      // starting rows tried per separation call (was 200)
     f64 bad_variable_min_distance = 1e-4;
 };
 
 struct MirDiagnostics {
+    std::uint64_t complemented = 0;   // cuts improved by complementing integer terms
     std::uint64_t rows_scanned = 0;
     std::uint64_t bases_built = 0;
     std::uint64_t cuts_emitted = 0;

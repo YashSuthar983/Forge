@@ -1,4 +1,5 @@
 #include "forge/engines/lp.hpp"
+#include "forge/core/work_clock.hpp"
 
 #include "forge/backend/kernel_backend.hpp"
 #include "forge/backend/lp_device.hpp"
@@ -32,7 +33,7 @@ struct CandidateSpace {
 };
 
 
-using Clock = std::chrono::steady_clock;
+using Clock = forge::core::SolverClock;
 
 double elapsed_seconds(Clock::time_point start) {
     return std::chrono::duration<double>(Clock::now() - start).count();

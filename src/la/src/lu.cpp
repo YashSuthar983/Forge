@@ -1,5 +1,6 @@
 #include "forge/la/lu.hpp"
 #include "forge/core/env_switches.hpp"
+#include "forge/core/work_clock.hpp"
 #include "forge/la/basis_numerics.hpp"
 #include "forge/la/ldlt.hpp"
 #include "dense_lu.hpp"
@@ -160,6 +161,7 @@ bool BasisFactor::factorize(Index m,
                             const LuOptions& opts,
                             std::vector<Index>* singular_slots,
                             std::vector<Index>* vacant_rows) {
+    core::WorkScope work_scope_(core::WorkCat::Factor);
     if (m < 0 || col_ptr.size() != sz(m)+1 || col_ptr.front() != 0 ||
         col_ptr.back() != static_cast<Offset>(row_idx.size()) || vals.size() != row_idx.size())
         throw std::invalid_argument("BasisFactor: malformed CSC shape");
@@ -840,6 +842,9 @@ bool BasisFactor::factorize(Index m,
 
     stats_.factor_nnz = static_cast<Offset>(u_idx_.size() + l_idx_.size()) +
                         static_cast<Offset>(piv_val_.size());
+    // Deterministic work: loading, elimination and the produced factor.
+    core::work_add(static_cast<std::uint64_t>(16 * m + 6 * static_cast<Offset>(row_idx.size()) +
+                                              4 * stats_.factor_nnz), ::forge::core::WorkTag::LuFactor);
     valid_ = (n_piv == m);
     stats_.effective_threshold = opts.markowitz_threshold;
     if (valid_ && opts.adaptive_threshold) {
@@ -1577,9 +1582,9 @@ void BasisFactor::ftran_pair(std::vector<f64>& a,
     // Refactorization work accounting remains expressed in logical RHS work,
     // not wall-clock traversals: batching changes memory traffic, not the
     // amount of numerical update history each solution crosses.
-    scratch_.work_since_factor_ += 4 * static_cast<Offset>(n);
-    scratch_.work_since_factor_ += 2 * static_cast<Offset>(r_start_.back());
-    scratch_.work_since_factor_ += 2 * static_cast<Offset>(eta_nnz());
+    { const auto w_ = (4 * static_cast<Offset>(n)); scratch_.work_since_factor_ += w_; core::work_add(static_cast<std::uint64_t>(w_), ::forge::core::WorkTag::LuSolve); }
+    { const auto w_ = (2 * static_cast<Offset>(r_start_.back())); scratch_.work_since_factor_ += w_; core::work_add(static_cast<std::uint64_t>(w_), ::forge::core::WorkTag::LuSolve); }
+    { const auto w_ = (2 * static_cast<Offset>(eta_nnz())); scratch_.work_since_factor_ += w_; core::work_add(static_cast<std::uint64_t>(w_), ::forge::core::WorkTag::LuSolve); }
 }
 
 bool BasisFactor::ftran_with_support(std::vector<f64>& b,
@@ -1717,7 +1722,7 @@ bool BasisFactor::ftran_impl(SolveScratch& sc, std::vector<f64>& b,
         solve_lower(sc.work_);
         sc.work_all_dirty_ = true;      // dense pass touched every position
     }
-    sc.work_since_factor_ += sp ? static_cast<Offset>(sc.reach_.size()) : static_cast<Offset>(n);
+    { const auto w_ = (sp ? static_cast<Offset>(sc.reach_.size()) : static_cast<Offset>(n)); sc.work_since_factor_ += w_; core::work_add(static_cast<std::uint64_t>(w_), ::forge::core::WorkTag::LuSolve); }
 
     // Row etas, between L and U: B^-1 = U^-1 M_k ... M_1 L^-1. A position the
     // pass turns nonzero has to join sc.work_dirty_, or the next seeded call will
@@ -1731,7 +1736,7 @@ bool BasisFactor::ftran_impl(SolveScratch& sc, std::vector<f64>& b,
         if (lower_sparse)
             sc.seed_.insert(sc.seed_.end(), sc.row_eta_touched_.begin(),
                          sc.row_eta_touched_.end());
-        sc.work_since_factor_ += static_cast<Offset>(r_start_.back());
+        { const auto w_ = (static_cast<Offset>(r_start_.back())); sc.work_since_factor_ += w_; core::work_add(static_cast<std::uint64_t>(w_), ::forge::core::WorkTag::LuSolve); }
     }
 
     // The spike is exactly this state: L and the row etas applied, U not yet.
@@ -1820,8 +1825,8 @@ bool BasisFactor::ftran_impl(SolveScratch& sc, std::vector<f64>& b,
     if (sp && learn)
         learn_density(sc.ftran_density_, in_bucket,
                       static_cast<f64>(sc.reach_.size()) / static_cast<f64>(n));
-    sc.work_since_factor_ += sp ? static_cast<Offset>(sc.reach_.size()) : static_cast<Offset>(n);
-    sc.work_since_factor_ += static_cast<Offset>(eta_nnz());
+    { const auto w_ = (sp ? static_cast<Offset>(sc.reach_.size()) : static_cast<Offset>(n)); sc.work_since_factor_ += w_; core::work_add(static_cast<std::uint64_t>(w_), ::forge::core::WorkTag::LuSolve); }
+    { const auto w_ = (static_cast<Offset>(eta_nnz())); sc.work_since_factor_ += w_; core::work_add(static_cast<std::uint64_t>(w_), ::forge::core::WorkTag::LuSolve); }
 
     const std::size_t support_before_etas = support ? support->size() : 0;
     // B_k^-1 = E_k^-1 ... E_1^-1 B_0^-1, so the etas apply oldest first.
@@ -1981,7 +1986,7 @@ bool BasisFactor::btran_impl(SolveScratch& sc, std::vector<f64>& d,
                 }
             }
             (void)n_eta;
-            sc.work_since_factor_ += fired_entries;
+            { const auto w_ = (fired_entries); sc.work_since_factor_ += w_; core::work_add(static_cast<std::uint64_t>(w_), ::forge::core::WorkTag::LuSolve); }
         }
     }
     if (!used_firing) {
@@ -2002,7 +2007,7 @@ bool BasisFactor::btran_impl(SolveScratch& sc, std::vector<f64>& d,
             if (seed_slots != nullptr)
                 sc.fire_touched_.push_back(static_cast<Index>(p));
         }
-        sc.work_since_factor_ += static_cast<Offset>(eta_nnz());
+        { const auto w_ = (static_cast<Offset>(eta_nnz())); sc.work_since_factor_ += w_; core::work_add(static_cast<std::uint64_t>(w_), ::forge::core::WorkTag::LuSolve); }
     }
 
     const auto n = piv_val_.size();
@@ -2107,7 +2112,7 @@ bool BasisFactor::btran_impl(SolveScratch& sc, std::vector<f64>& d,
         solve_upper_t(sc.work_);
         sc.work_all_dirty_ = true;      // dense pass touched every position
     }
-    sc.work_since_factor_ += sp ? static_cast<Offset>(sc.reach_.size()) : static_cast<Offset>(n);
+    { const auto w_ = (sp ? static_cast<Offset>(sc.reach_.size()) : static_cast<Offset>(n)); sc.work_since_factor_ += w_; core::work_add(static_cast<std::uint64_t>(w_), ::forge::core::WorkTag::LuSolve); }
 
     // Row etas transposed, between U' and L': B^-T = L^-T M_1^T ... M_k^T U^-T.
     // Newest first, mirroring ftran's oldest-first order.
@@ -2119,7 +2124,7 @@ bool BasisFactor::btran_impl(SolveScratch& sc, std::vector<f64>& d,
         if (upper_t_sparse)
             sc.seed_.insert(sc.seed_.end(), sc.row_eta_touched_.begin(),
                          sc.row_eta_touched_.end());
-        sc.work_since_factor_ += static_cast<Offset>(r_start_.back());
+        { const auto w_ = (static_cast<Offset>(r_start_.back())); sc.work_since_factor_ += w_; core::work_add(static_cast<std::uint64_t>(w_), ::forge::core::WorkTag::LuSolve); }
     }
 
     // L'-solve (sparse or dense) + scatter.
@@ -2201,7 +2206,7 @@ bool BasisFactor::btran_impl(SolveScratch& sc, std::vector<f64>& d,
     if (sp && learn)
         learn_density(sc.btran_density_, in_bucket,
                       static_cast<f64>(sc.reach_.size()) / static_cast<f64>(n));
-    sc.work_since_factor_ += sp ? static_cast<Offset>(sc.reach_.size()) : static_cast<Offset>(n);
+    { const auto w_ = (sp ? static_cast<Offset>(sc.reach_.size()) : static_cast<Offset>(n)); sc.work_since_factor_ += w_; core::work_add(static_cast<std::uint64_t>(w_), ::forge::core::WorkTag::LuSolve); }
     // Eta work was already accounted inside the firing-set / plain loops
     // above (actual entries touched in the firing path). As in ftran_impl, a
     // requested support is exact on both paths.

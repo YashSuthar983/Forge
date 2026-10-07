@@ -2,6 +2,8 @@
 // what it is implementing (Salvagnin, MPC 2024).
 
 #include "forge/search/fixprop.hpp"
+#include "heuristic_lp.hpp"
+#include "forge/core/work_clock.hpp"
 
 #include "forge/core/route_debug.hpp"
 #include "forge/engines/simplex.hpp"
@@ -17,7 +19,7 @@
 namespace forge::search {
 namespace {
 
-using Clock = std::chrono::steady_clock;
+using Clock = forge::core::SolverClock;
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 inline std::size_t sz(core::Offset i) { return static_cast<std::size_t>(i); }
 constexpr f64 kInf = model::kInf;
@@ -258,6 +260,7 @@ void Dive::bump_activities(Index j, f64 old_lo, f64 old_hi) {
     }
     diag_.work += static_cast<std::uint64_t>(col_ptr_[sz(j) + 1] -
                                              col_ptr_[sz(j)]);
+    core::work_add(3 * static_cast<std::uint64_t>(col_ptr_[sz(j) + 1] - col_ptr_[sz(j)]), ::forge::core::WorkTag::Fixprop);
 }
 
 // Derive bounds for every column of row i from the residual activity of the
@@ -273,6 +276,12 @@ bool Dive::tighten_row(Index i) {
     const auto& ci = lp_.A.pattern.col_idx();
     const auto& av = lp_.A.vals;
     diag_.work += static_cast<std::uint64_t>(rp[sz(i) + 1] - rp[sz(i)]);
+    // The dive's own propagation, charged like the shared one's process_row
+    // (propagate.cpp). Uncharged, a dive ran 12 s of wall time on
+    // drayage-100-23 while the work clock saw 0.24 s: a deterministic
+    // sub-MIP child then spent its whole life here and stopped on the wall
+    // floor without searching a node.
+    core::work_add(8 + 3 * static_cast<std::uint64_t>(rp[sz(i) + 1] - rp[sz(i)]), ::forge::core::WorkTag::Fixprop);
 
     for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
         if ((k - rp[sz(i)]) % 1024 == 0 && abort_if_over_budget())
@@ -372,6 +381,7 @@ void Dive::compute_activities() {
         maxact_[sz(i)] = hi_sum;
     }
     diag_.work += static_cast<std::uint64_t>(lp_.nnz());
+    core::work_add(3 * static_cast<std::uint64_t>(lp_.nnz()), ::forge::core::WorkTag::Fixprop);
     queued_.assign(sz(m_), 0);
     queue_.clear();
 }
@@ -407,6 +417,7 @@ void Dive::shift_fixed(Index j, f64 new_value) {
     }
     diag_.work += static_cast<std::uint64_t>(col_ptr_[sz(j) + 1] -
                                              col_ptr_[sz(j)]);
+    core::work_add(3 * static_cast<std::uint64_t>(col_ptr_[sz(j) + 1] - col_ptr_[sz(j)]), ::forge::core::WorkTag::Fixprop);
 }
 
 // WalkSAT scores a flip by the DAMAGE it does only -- the rows it newly breaks
@@ -615,6 +626,7 @@ bool Dive::finish_bottom(std::vector<f64>& x_out) {
         fixed.col_hi[sz(j)] = v;
     }
     engines::SimplexOptions so;
+    heuristic_lp_options(so);
     so.method = engines::SimplexMethod::Auto;
     so.presolve = true;
     so.max_iterations = opts_.bottom_lp_iterations;
@@ -757,6 +769,7 @@ bool fix_and_propagate(const model::LpProblem& lp,
                        const FixPropOptions& opts,
                        std::vector<f64>& x_out,
                        FixPropDiagnostics& diag) {
+    core::WorkScope work_scope_(core::WorkCat::Heuristic);
     FORGE_FN();
     FORGE_ROUTE_PATH(1, "fixprop", "heuristic", "start");
     diag = FixPropDiagnostics{};

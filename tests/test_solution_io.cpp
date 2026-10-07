@@ -97,6 +97,18 @@ void test_round_trip_empty_vectors() {
     CHECK(s.ray.empty());
 }
 
+void test_round_trip_global_fp_claim() {
+    SolveResult r;
+    r.status = Status::Optimal;
+    r.proof = ProofLevel::ProvedGlobalFP;
+    r.objective = 3.0;
+    r.x = {1.0, 0.0};
+    std::ostringstream out;
+    forge::io::write_solution(out, r);
+    std::istringstream in(out.str());
+    CHECK(forge::io::read_solution(in).proof == ProofLevel::ProvedGlobalFP);
+}
+
 void test_malformed_file_throws() {
     std::istringstream in("status Optimal\nproof ProvedOptimalFP\nobjective 1.0\n"
                           "x 3 1.0 2.0\n");  // declares 3, gives 2
@@ -156,6 +168,7 @@ void test_integrality_relaxed_mark() {
 
 int main() {
     test_integrality_relaxed_mark();
+    test_round_trip_global_fp_claim();
     test_round_trip_optimal();
     test_round_trip_infeasible_with_ray();
     test_round_trip_unbounded_with_primal_ray();

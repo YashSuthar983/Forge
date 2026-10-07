@@ -14,9 +14,11 @@
 
 #include "test_helpers.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <random>
+#include <set>
 #include <vector>
 
 using forge::core::f64;
@@ -654,7 +656,66 @@ void test_probing_budget_reaches_late_binaries() {
 
 }  // namespace
 
+// add_edge keeps each literal's list as a sorted base, sorted runs merged
+// like a binary counter, and a short tail, so a duplicate check is a few
+// binary searches instead of a scan of the whole list. It must answer
+// exactly as a set would: return value, conflicts(), edge count,
+// forget_columns and the final sorted lists. The last trials have a few
+// literals of degree in the thousands (runs up to 2048 entries) and
+// sort_adjacency mid-stream (a non-empty base under new runs).
+void test_edge_set_matches_reference() {
+    std::mt19937 rng(12345);
+    for (int trial = 0; trial < 46; ++trial) {
+        const bool hubs = trial >= 40;
+        const Index n = hubs ? 1500 + static_cast<Index>(rng() % 1000)
+                             : 8 + static_cast<Index>(rng() % 70);
+        forge::search::ConflictGraph g;
+        g.reset(n);
+        std::set<std::pair<Index, Index>> ref;
+        const auto key = [](Index a, Index b) { return std::make_pair(std::min(a, b), std::max(a, b)); };
+        const int ops = hubs ? 8000 + static_cast<int>(rng() % 2000)
+                             : 2000 + static_cast<int>(rng() % 4000);
+        for (int op = 0; op < ops; ++op) {
+            const Index l1 = hubs ? static_cast<Index>(rng() % 4)
+                                  : static_cast<Index>(rng() % (2 * n));
+            const Index l2 = static_cast<Index>(rng() % (2 * n));
+            const bool valid = l1 != l2 && l1 / 2 != l2 / 2;
+            const bool fresh = valid && ref.find(key(l1, l2)) == ref.end();
+            CHECK(g.add_edge(l1, l2) == fresh);
+            if (fresh) ref.insert(key(l1, l2));
+            const Index q1 = static_cast<Index>(rng() % (hubs ? 4 : 2 * n));
+            const Index q2 = static_cast<Index>(rng() % (2 * n));
+            const bool qvalid = q1 != q2 && q1 / 2 != q2 / 2;
+            CHECK(g.conflicts(q1, q2) == (qvalid && ref.count(key(q1, q2)) > 0));
+            // In the hub trials both re-sort the hubs' lists, so they come
+            // once, early, and the runs after them grow past 1024.
+            if (hubs ? op == 400 : op % 1499 == 700) g.sort_adjacency();
+            if (hubs ? op == 800 : op % 997 == 0) {
+                std::vector<char> drop(static_cast<std::size_t>(n), 0);
+                const Index j = static_cast<Index>(hubs ? 2 + rng() % (n - 2) : rng() % n);
+                drop[static_cast<std::size_t>(j)] = 1;
+                g.forget_columns(drop);
+                for (auto it = ref.begin(); it != ref.end();)
+                    it = (it->first / 2 == j || it->second / 2 == j) ? ref.erase(it) : std::next(it);
+            }
+        }
+        CHECK(g.n_edges() == ref.size());
+        g.sort_adjacency();
+        CHECK(g.n_edges() == ref.size());
+        for (Index l = 0; l < 2 * n; ++l) {
+            std::vector<Index> want;
+            for (const auto& [a, b] : ref) {
+                if (a == l) want.push_back(b);
+                if (b == l) want.push_back(a);
+            }
+            std::sort(want.begin(), want.end());
+            CHECK(g.neighbors(l) == want);
+        }
+    }
+}
+
 int main() {
+    test_edge_set_matches_reference();
     test_probing_budget_reaches_late_binaries();
     test_set_packing_row_gives_clique();
     test_precedence_row_gives_implication();

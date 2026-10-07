@@ -1241,7 +1241,7 @@ def fmt_obj(v: float | None) -> str:
 
 _FORGE_PROOFS = {
     "ProvedOptimalFP", "ProvedOptimalExact", "ProvedOptimalCertified",
-    "ProvedKKT", "ProvedGlobalEpsilon",
+    "ProvedKKT", "ProvedGlobalFP", "ProvedGlobalEpsilon",
 }
 
 

@@ -1,5 +1,6 @@
 #include "forge/engines/dual_simplex.hpp"
 #include "forge/core/env_switches.hpp"
+#include "forge/core/work_clock.hpp"
 #include "forge/la/basis_numerics.hpp"
 #include "forge/core/parallel.hpp"
 
@@ -38,7 +39,7 @@ using core::Offset;
 using la::BasisFactor;
 using model::kInf;
 
-using Clock = std::chrono::steady_clock;
+using Clock = forge::core::SolverClock;
 inline double ms_since(Clock::time_point t0) {
     FORGE_FN();
     return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
@@ -583,7 +584,10 @@ static core::RawResult dual_prepared_pass(
     BasisFactor factor;
     std::uint64_t drift_solve_base = 0;   // solve work of earlier factors
     std::unique_ptr<core::ThreadPool> pricing_pool;
-    if (opts.pricing_threads > 1)
+    // Every use below is gated on m >= 2048. A pool for a smaller basis only
+    // started and joined its threads once per solve: about 5% of awhea's
+    // tree search, one pool per node LP.
+    if (opts.pricing_threads > 1 && m >= 2048)
         pricing_pool = std::make_unique<core::ThreadPool>(opts.pricing_threads);
     // The entering column's exact Forrest-Tomlin spike, captured by whichever
     // FTRAN produced alpha and handed to update_ft(). Only filled when the FT
@@ -3729,6 +3733,12 @@ static core::RawResult dual_prepared_pass(
         }
 
         ++iter;
+        // Deterministic work outside the factor solves (counted in la):
+        // pricing, the pivotal row over rho's support, the ratio test and the
+        // primal/dual updates over alpha's support.
+        core::work_add(64 + static_cast<std::uint64_t>(m / 8) +
+                       4 * static_cast<std::uint64_t>(rho_support.size() + alpha_support.size()) +
+                       3 * static_cast<std::uint64_t>(prow_full_size), ::forge::core::WorkTag::SimplexIter);
         dse_rejections_same_basis = 0;
         if (koberstein_perturbation_on && phase == 2 &&
             !stall_perturbation_done && no_improvement >= maxcycle)
@@ -4175,6 +4185,10 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
                                    DualEdgeWeightCarrier* weights,
                                    FactorCarrier* factor,
                                    std::unique_ptr<DualProbeSession>* out_session) {
+    core::WorkScope work_scope_(core::WorkCat::Simplex);
+    // Per-solve setup (copies, preparation, start state, post-solve checks)
+    // that no iteration charge sees.
+    core::work_add(1000 + static_cast<std::uint64_t>(problem.n_rows() + problem.n_cols()), ::forge::core::WorkTag::LpSolve);
     FORGE_FN();
     const auto t0 = Clock::now();
     // Dimension check against the problem in hand. The caller owns the matrix
@@ -4333,10 +4347,13 @@ core::RawResult DualProbeSession::solve(const SimplexOptions& opts,
                                         const SimplexBasis* warm,
                                         const std::vector<f64>* warm_weights,
                                         const FactorCarrier* warm_factor) {
+    core::WorkScope work_scope_(core::WorkCat::Simplex);
     FORGE_FN();
     const auto t0 = Clock::now();
     auto& im = *impl_;
     const auto& p = im.prepared.scaled;
+    // Per-solve setup a warm node LP pays before and after its pivots.
+    core::work_add(1000 + static_cast<std::uint64_t>(p.n_rows() + p.n_cols()), ::forge::core::WorkTag::LpSolve);
     // The caller may hand back this session's own final_factor() /
     // final_weights() -- the child of the node just solved starts from exactly
     // the basis they describe. Clearing first would destroy what it asked to

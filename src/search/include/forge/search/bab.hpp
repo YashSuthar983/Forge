@@ -49,6 +49,7 @@
 #include <limits>
 #include <string>
 #include <string_view>
+#include <functional>
 #include <vector>
 #include "forge/core/route_debug.hpp"
 
@@ -113,12 +114,19 @@ inline bool parse_branch_strategy(std::string_view s, BranchStrategy& out) {
     return false;
 }
 
-// Defaults for a B&B node LP. Split out so the one field that deliberately
-// differs from the standalone-LP defaults has a name and a single definition
+// Defaults for a B&B node LP. Split out so the fields that deliberately
+// differ from the standalone-LP defaults have a name and a single definition
 // (forge_solve consults it when deciding whether the CLI may override it).
 inline engines::SimplexOptions default_node_lp_options() {
     engines::SimplexOptions o;
     o.update_method = la::UpdateMethod::ProductForm;
+    // Refine basis solves to a 1e-10 backward error, not the LP default 1e-13.
+    // Node bounds rest on the original-model residual checks (1e-7 class) and
+    // the exactly evaluated Lagrangian bound, neither of which needs more; a
+    // long-double residual meets 1e-10 almost always, while 1e-13 sent most
+    // refactorizations into binary128 software refinement (14% of nu25-pr12's
+    // tree search in __multf3/__addtf3).
+    o.refinement_target = 1e-10;
     return o;
 }
 
@@ -195,6 +203,28 @@ struct BabOptions {
     const std::vector<f64>* cut_reference_point = nullptr;
     // Print why the reference point was judged outside a node's subtree.
     bool cut_reference_debug = false;
+    // Incumbent integrity across model transformations. Feasibility within a
+    // tolerance is not preserved by presolve: coefficient tightening shrinks
+    // big-M terms, so an integer column accepted within int_tol in the
+    // reduced model can miss an original row by its distance times the
+    // ORIGINAL coefficient (drayage-100-23: a binary at 1 + 2.8e-9 against
+    // -60000, 1.5e-4 short). A solve on a model derived from its caller's
+    // (structural presolve, a restart stage) is handed the caller's
+    // validator: it maps a candidate point of THIS model back, makes it
+    // canonical there (canonicalize_milp_point) and checks it against the
+    // caller's model, chaining upward. It returns the outermost model's
+    // objective of the canonical point, or NaN to reject. A point becomes the
+    // incumbent -- and its objective the pruning cutoff -- only if it passes.
+    // Null at the outermost solve. A child that solves a different column
+    // space (heuristic sub-MIP, component) must not inherit it: its points
+    // come back through the parent's own acceptance.
+    const std::function<f64(const std::vector<f64>&)>* point_validator = nullptr;
+    // The model handed to this solve already contains rows derived in floating
+    // point (a restart folds the previous stage's cuts into the model before
+    // presolving it again; a heuristic sub-MIP carries its parent's cut rows).
+    // Separators that round a row (covers) then treat none of the rows as
+    // exact data. See CoverOptions::exact_rows.
+    bool model_rows_derived = false;
 
     const core::CancelToken* cancel = nullptr;
     // Shared incumbent/bound channel. Null = no exchange. When set, this
@@ -282,6 +312,13 @@ struct BabOptions {
     // model, its pseudocosts, and -- for improvement searches -- its
     // incumbent value as a cutoff. Off: children start from the bare model.
     bool sub_mip_context = true;
+    // Heuristic children whose box fixes at least this share of the columns
+    // are physically shrunk by the cheap structural presolve reductions
+    // (fixed columns, singleton/redundant rows, bounded FBBT, coefficient
+    // strengthening; no probing) before their search. A smaller share keeps
+    // the child unpresolved, where the parent's mapped root basis still fits.
+    // Negative: never presolve children.
+    double sub_mip_presolve_min_fixed = 0.30;
     // Set by the parent on a child; never by a caller. Pseudocost start.
     const PseudocostSeed* pseudocost_seed = nullptr;
     // Clauses carried over from the stage before a root restart (already mapped
@@ -406,6 +443,12 @@ struct BabOptions {
     // having if they close the gap; when the bound has stalled they buy
     // nothing, and the budget is better spent on the incumbent.
     double heuristic_budget_frac_stalled = 0.85;
+    // With an incumbent, charge the share against the time elapsed so far
+    // (at least heuristic_budget_min_window_s) instead of the whole limit.
+    // A share of the LIMIT is spent up front: sp150x300d held its optimal
+    // incumbent from 0.02 s and still spent 5.3 s of an 8.9 s solve in tree
+    // heuristics. 0 keeps the limit-based rule.
+    double heuristic_budget_min_window_s = 0.0;
     // Nodes without a meaningful dual-bound improvement before the search is
     // called stalled.
     std::uint64_t dual_stall_window = 4000;
@@ -425,6 +468,26 @@ struct BabOptions {
     // heuristic only: child LPs are never used as global bounds or proof.
     bool integer_dive = true;
     std::uint64_t integer_dive_max_nodes = 1024;
+    // Tree dives on the node LP session (incumbent heuristic only). Every
+    // session_dive_freq nodes, after the node's children are queued, round one
+    // fractional integer at a time by a rotating rule (fractional, locks,
+    // pseudocost, incumbent-guided), propagate, and re-solve warm on the
+    // prepared session; one backtrack per step. Budgeted in what dives cost,
+    // which is wall time per LP solve, not pivots (a dive LP is a couple of
+    // pivots on top of a per-solve setup): total dive time stays within
+    // session_dive_quota * (LP time of the search) + session_dive_offset_ms,
+    // and one dive solves at most session_dive_max_lps LPs.
+    // Reduced-cost fixing at every node with a proved LP and a cutoff (the
+    // root already does it, certified); local to the node's subtree.
+    bool node_rc_fixing = true;
+    // Propagate the incumbent's cutoff as a virtual objective row at every
+    // node (propagate_objective_cutoff).
+    bool objective_propagation = true;
+    bool session_dive = true;
+    std::uint64_t session_dive_freq = 10;
+    double session_dive_quota = 0.10;
+    double session_dive_offset_ms = 200.0;
+    std::uint64_t session_dive_max_lps = 64;
     double integer_dive_time_s = 1.5;
     double integer_dive_lp_time_s = 0.02;
     // Bounded RINS/local-neighborhood search around the first feasible
@@ -481,6 +544,18 @@ struct BabOptions {
     // Latest uses the bounded multi-family selector by default. Classical
     // ignores it; callers can opt out for controlled ablations.
     bool auto_cuts = true;
+    // Runs on the search's copy of these options right after the auto cut
+    // policy, which otherwise replaces the cut-pool fields unconditionally:
+    // a caller's explicit cut settings go here to take effect.
+    std::function<void(BabOptions&)> after_cut_policy;
+    // Solve the cold root relaxation with Forrest-Tomlin updates regardless
+    // of lp.update_method (which node LPs keep at product form).
+    bool root_cold_forrest_tomlin = true;
+    // With deterministic timing, the wall-clock hard stop is this multiple of
+    // time_limit_s (the work clock is the limit proper). Above 1 for
+    // reproducible A/B runs on models whose work the counters undercount;
+    // 1 for benchmarks, where the wall limit is the rule.
+    double wall_limit_factor = 1.0;
     CutOptions cut;
     // NOTE: a gap gate on the root cutting loop was tried here and REMOVED.
     // The idea was to stop cutting when the gap showed the instance would not
@@ -615,6 +690,9 @@ struct BabOptions {
     double root_cut_max_s = 0.0;
     double root_total_share = 0.35;
     int plunge_max_depth = 30;
+    // Plunge (depth-first continuation with best-bound fallback) on models
+    // with at most this many columns under the Latest policy. Was 500.
+    Index plunge_max_cols = std::numeric_limits<Index>::max();
     f64 plunge_bound_slack_rel = 0.02;
     bool verbose = false;
 
@@ -747,6 +825,10 @@ struct BabDiagnostics {
     MilpPresolveStats structural_presolve;
     bool structural_presolve_applied = false;
     std::uint64_t structural_postsolve_failures = 0;
+    // Postsolved points that failed the original model's check and passed
+    // after the integers were rounded exactly (or the continuous columns
+    // re-solved with them fixed).
+    std::uint64_t structural_postsolve_polished = 0;
     // Strong-branch probe LPs (dual simplex from the node basis). Every
     // field is summed from the probes' own SimplexDiagnostics, so
     // strong_branch_iterations is exactly the pivots the probes made.
@@ -765,6 +847,13 @@ struct BabDiagnostics {
     std::uint64_t strong_branch_proved = 0;
     std::uint64_t strong_branch_infeasible = 0;
     std::uint64_t strong_branch_unproved = 0;
+    // Unproved probes whose multipliers still certified a lower bound (safe
+    // Lagrangian), the subset recorded as pseudocost samples because that
+    // bound exceeded the current estimate, and children whose bound a probe
+    // of their branching variable raised above the parent's.
+    std::uint64_t strong_branch_partial_bounds = 0;
+    std::uint64_t strong_branch_partial_samples = 0;
+    std::uint64_t sb_child_bound_raises = 0;
     // Nodes whose branching variable came from the pseudocost / strong-
     // branching selector (no learner chose), and the subset where probes ran.
     std::uint64_t rb_nodes = 0;
@@ -938,6 +1027,15 @@ struct BabDiagnostics {
     // Candidate incumbents refused because integer snapping (the check every
     // reported solution must pass) failed on them.
     std::uint64_t incumbents_rejected_unsnappable = 0;
+    // Candidates whose integer columns were rounded and whose continuous
+    // columns had to be re-solved before they passed (canonicalize_milp_point),
+    // and candidates the caller's model rejected (point_validator).
+    std::uint64_t incumbents_canonical_repaired = 0;
+    // Integral-looking node LP points whose canonical objective did not meet
+    // the node's proved bound: split on the moved integer (reopened), or the
+    // region kept by its bound when no split excludes the point (folded).
+    std::uint64_t integral_closures_reopened = 0, integral_closures_folded = 0;
+    std::uint64_t incumbents_rejected_original = 0;
     std::uint64_t lp_repair_attempts = 0;
     std::uint64_t lp_repair_hits = 0;
     std::uint64_t feasibility_pump_attempts = 0;
@@ -1015,6 +1113,15 @@ struct BabDiagnostics {
     // restricted model in the parent, the child's own pre-search setup
     // (its ms_before_search), and the child's search after that.
     std::uint64_t sub_mip_calls = 0;
+    std::uint64_t sub_mip_presolved = 0;   // children shrunk by structural presolve
+
+    // Session dives: dives started, warm LPs they solved, their pivots, and
+    // the dives whose integral point became the incumbent.
+    std::uint64_t node_rc_tightenings = 0, node_rc_nodes = 0;
+    std::uint64_t objprop_tightenings = 0, objprop_prunes = 0;
+    std::uint64_t session_dives = 0, session_dive_lps = 0;
+    std::uint64_t session_dive_iterations = 0, session_dive_incumbents = 0;
+    double session_dive_ms = 0.0;
     std::uint64_t face_attempts = 0, face_hits = 0, face_exhausted = 0;
     double face_ms = 0.0;
     std::uint64_t lns_root_attempts = 0;  // root opportunity taken
@@ -1022,6 +1129,11 @@ struct BabDiagnostics {
     double sub_mip_build_ms = 0.0;
     double sub_mip_child_setup_ms = 0.0;
     double sub_mip_child_search_ms = 0.0;
+    // Where the children's setup went, summed over children: their root setup
+    // phases, root LP solves, separation (separate + select + apply) and
+    // heuristics.
+    double sub_mip_child_root_setup_ms = 0.0, sub_mip_child_root_lp_ms = 0.0;
+    double sub_mip_child_cut_ms = 0.0, sub_mip_child_heur_ms = 0.0;
     // Wall time in every heuristic, and how often the ceiling above refused a
     // heuristic that would otherwise have run.
     double heuristic_ms = 0.0;
@@ -1281,6 +1393,13 @@ struct BabDiagnostics {
     bool lp_only = false;
     core::ProofEvidence lp_only_evidence;
     bool globally_proved = false;
+    // Relaxations that closed or bounded part of the tree at f64 tolerances
+    // only: a tolerance-optimal node LP whose safe Lagrangian bound was not
+    // finite (or not within the gap allowance), taken at its primal
+    // objective. Possible only without lp.exact_proof, where the tree's LPs
+    // skip exact terminal repair. A complete search with any claims
+    // ProvedGlobalFP rather than ProvedGlobalEpsilon (milp_global_proof).
+    std::uint64_t float_relaxation_bounds = 0;
     double total_ms = 0.0;
     std::string termination_reason;
 };
@@ -1319,6 +1438,14 @@ core::RawResult solve_milp(const model::LpProblem& problem,
 
 core::ProofEvidence milp_evidence(const BabDiagnostics& diag,
                                   const BabOptions& opts);
+
+// The level a complete search proves: ProvedGlobalEpsilon when every
+// relaxation bound it used was proved, ProvedGlobalFP when some were taken
+// at f64 tolerances.
+inline core::ProofLevel milp_global_proof(const BabDiagnostics& diag) {
+    return diag.float_relaxation_bounds > 0 ? core::ProofLevel::ProvedGlobalFP
+                                            : core::ProofLevel::ProvedGlobalEpsilon;
+}
 
 // Classify statuses eligible for infeasibility proof checking. This predicate
 // alone NEVER closes a node: a Farkas witness must be checked against the
@@ -1370,7 +1497,7 @@ struct BoundCertificate {
 // Lagrangian bound, and neither says anything about the other.
 struct RelaxationOutcome {
     bool point_valid = false;        // sized, finite, within primal tolerance
-    bool lp_optimal = false;         // passed every relaxation_proved() check
+    bool lp_optimal = false;         // relaxation_proof(): Proved or Floating
     bool infeasible_proved = false;  // Farkas ray verified against this LP
     bool basis_usable = false;       // a basis of this LP's dimensions came back
     // Minimisation-sense bounds this solve certified; -inf when it did not.
@@ -1451,7 +1578,19 @@ inline f64 cut_round_progress(f64 bound_before, f64 bound_now, f64 incumbent_min
            std::max(1.0, std::fabs(bound_before - objective_offset_min));
 }
 
-// Minimisation-sense cutoff with objective lattice and LP roundoff margins.
+// Minimisation-sense cutoff: a region whose bound is >= the returned value
+// is pruned. Two rules each justify a prune on their own, so the cutoff is
+// the LOWER (more aggressive) of the two:
+//   gap rule      bound >= inc - max(abs_gap, gap_tol*|inc|): any better point
+//                 lies within the requested gap, which the final claim allows;
+//   lattice rule  every attainable objective is offset + k*g, so a region
+//                 whose bound exceeds the largest lattice value below the
+//                 incumbent (plus an LP round-off margin) holds no better
+//                 point at all -- an exact prune.
+// Taking the higher of the two kept only the weaker rule: at gap 1e-4 the
+// lattice rule never applied when g > ~1e-4*|inc| (inc 100, g 1: bound 99.5
+// was kept although every point in it costs >= 100), and once the margin
+// exceeded g the cutoff rose above the incumbent itself.
 inline f64 node_cutoff(f64 inc_min, f64 g, f64 offset_min,
                        f64 gap_tol, f64 abs_gap_tol) {
     f64 c = inc_min - std::max(abs_gap_tol, gap_tol * std::fabs(inc_min));
@@ -1459,7 +1598,7 @@ inline f64 node_cutoff(f64 inc_min, f64 g, f64 offset_min,
         const f64 t = (inc_min - offset_min) / g;
         const f64 kr = std::round(t);
         const f64 k = (std::fabs(t - kr) <= 1e-6) ? kr - 1.0 : std::floor(t);
-        c = std::max(c, offset_min + k * g +
+        c = std::min(c, offset_min + k * g +
                            1e-6 * std::max(1.0, std::fabs(inc_min)));
     }
     return c;
@@ -1506,5 +1645,19 @@ CertifiedRcStats certified_reduced_cost_bounds(
 // points return +infinity; otherwise return their row/bound violation.
 f64 milp_point_max_violation(const model::LpProblem& problem,
                              const std::vector<f64>& x, f64 int_tol);
+
+// The one acceptance rule for a point of `problem`. Integer columns within
+// int_tol of an integer are rounded to it exactly (clamped to their bounds),
+// so the point means the same thing in every model it passes through; the
+// point must then pass milp_point_max_violation <= feas_tol. If rounding
+// broke a row (a continuous column was absorbing the fractional part), the
+// continuous columns are re-solved with the integers fixed, for at most
+// repair_time_s (0: no re-solve). On success x is replaced by the canonical
+// point and `repaired` says whether the re-solve was needed; on failure x is
+// unchanged.
+bool canonicalize_milp_point(const model::LpProblem& problem, std::vector<f64>& x,
+                             f64 int_tol, f64 feas_tol, double repair_time_s,
+                             bool* repaired = nullptr);
+
 
 }  // namespace forge::search

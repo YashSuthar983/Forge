@@ -6,6 +6,9 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -153,7 +156,18 @@ void ThreadPool::parallel_for(Offset n_tasks, const std::function<void(Offset, i
 
 int default_thread_count() {
     const unsigned hw = std::thread::hardware_concurrency();
-    const int phys = hw >= 2 ? static_cast<int>(hw / 2) : 1;
+    int phys = hw >= 2 ? static_cast<int>(hw / 2) : 1;
+#if defined(__linux__)
+    // A process restricted to fewer CPUs (taskset, cgroup cpusets) gains
+    // nothing from more workers than it may run on: under `taskset -c 4` the
+    // six default workers time-sliced one core.
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof set, &set) == 0) {
+        const int allowed = CPU_COUNT(&set);
+        if (allowed > 0) phys = std::min(phys, allowed);
+    }
+#endif
     return std::clamp(phys, 1, 8);
 }
 

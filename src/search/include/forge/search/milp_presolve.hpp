@@ -34,6 +34,9 @@ struct MilpPresolveOptions {
     // Bounded, like every other root-setup phase (see bab.cpp's root_budget):
     // a presolve pass that never terminates is worse than no presolve.
     int max_rounds = 50;
+    // Seconds (solver clock) after which no new round starts; 0 = no limit.
+    // A round that has started finishes, so the overrun is one round.
+    double time_limit_s = 0.0;
     // Propagate the global domain before eliminating columns, and again
     // after support/singleton reductions. Charge full sweeps of the original
     // matrix; exhausting this budget only loses deductions.
@@ -59,6 +62,9 @@ struct MilpPresolveOptions {
     // integer points, tighter LP relaxation. Also drops rows the column
     // bounds imply.
     bool coefficient_strengthening = true;
+    // On rows whose columns and coefficients are all integers, round each
+    // side to the lattice of the coefficients' gcd (exact for integer points).
+    bool side_rounding = true;
     // Turn an at-most-one binary pair into an exactly-one pair when increasing
     // at least one member can only relax all other rows and cannot worsen the
     // objective. A feasible (0,0) pair can then be filled, so feasibility and
@@ -94,7 +100,9 @@ struct MilpPresolveStats {
     int cols_after = 0;
     double ms = 0.0;
     int rounds = 0;
-    // Reductions this pass implements. (Side rounding, aggregation and
+    // Rounds the time limit stopped before the fixed point.
+    int rounds_stopped_on_time = 0;
+    // Reductions this pass implements. (Aggregation and
     // dominated/parallel reductions are not implemented yet; see
     // milp_capability_inventory() in bab.hpp.)
     int fixed_cols = 0;
@@ -102,6 +110,7 @@ struct MilpPresolveStats {
     int redundant_rows = 0;
     int bounds_tightened = 0;
     int coefs_tightened = 0;      // big-M coefficient strengthenings
+    int sides_rounded = 0;        // all-integer rows whose sides went to the gcd lattice
     int monotone_pairs_saturated = 0;  // optimality-preserving exactly-one pairs
     int merged_cols = 0;          // columns removed by duplicate-column merging
     int probing_fixings = 0;      // columns fixed / bounds moved by presolve probing

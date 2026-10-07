@@ -64,7 +64,9 @@ enum class ProofLevel {
     FeasibleOnly,            // primal point passes the checker, no bound
     FeasibleWithGap,         // both, gap > tolerance
     ProvedKKT,               // convex QP/NLP: KKT residuals within tolerance
-    ProvedGlobalEpsilon,     // nonconvex: relaxation bound within eps
+    ProvedGlobalFP,          // complete search; some relaxation bounds were
+                             // tolerance-optimal LP values (f64 tolerances)
+    ProvedGlobalEpsilon,     // complete search; every relaxation bound proved
     ProvedOptimalFP,         // basis optimal at f64 tolerances
     ProvedOptimalExact,      // re-verified in rational arithmetic
     ProvedOptimalCertified   // VIPR proof log accepted by forge_verify

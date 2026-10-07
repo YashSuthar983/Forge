@@ -50,6 +50,9 @@ struct EnvSwitches {
     bool certificate_debug = false;               // FORGE_CERTIFICATE_DEBUG
     bool farkas_debug = false;                    // FORGE_FARKAS_DEBUG
 
+    // MILP search.
+    bool ref_trace = false;                       // FORGE_REF_TRACE (with --verify-cuts)
+
     // Quadratic engines.
     bool fgmres_profile = false;                  // FORGE_FGMRES_PROFILE
     std::string dump_kkt;                         // FORGE_DUMP_KKT=<file>

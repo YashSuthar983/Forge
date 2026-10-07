@@ -1,9 +1,11 @@
 #include "forge/certify/finalize.hpp"
 #include "forge/io/mps.hpp"
 #include "forge/engines/dual_simplex.hpp"
+#include "forge/engines/farkas.hpp"
 #include "test_helpers.hpp"
 #include "forge/model/exact.hpp"
 #include <random>
+#include <cmath>
 
 #include <sstream>
 #include <limits>
@@ -459,13 +461,208 @@ void test_float_rays_skip_exact_repair_without_exact_proof() {
     }
 }
 
+// The interval fast path of safe_lagrangian_lower_bound must never exceed the
+// exactly evaluated Lagrangian of the same multipliers (the exact value comes
+// from the d_out route of safe_reduced_cost_tightenings), and must stay within
+// rounding of it. Random dense-ish LPs with mixed signs, magnitudes over many
+// orders, finite boxes and both row senses; multipliers perturbed so reduced
+// costs straddle zero.
+void test_interval_lagrangian_matches_exact() {
+    std::mt19937 rng(20261006u);
+    std::uniform_real_distribution<double> U(-1.0, 1.0);
+    int compared = 0;
+    for (int trial = 0; trial < 400; ++trial) {
+        const core::Index m = 2 + static_cast<core::Index>(rng() % 6);
+        const core::Index n = 2 + static_cast<core::Index>(rng() % 8);
+        model::LpProblem lp;
+        lp.maximize = (rng() & 1u) != 0;
+        lp.obj_offset = U(rng) * 10.0;
+        std::vector<core::Index> rows, cols;
+        std::vector<double> vals;
+        const double scale = std::pow(10.0, static_cast<double>(rng() % 7) - 3.0);
+        for (core::Index i = 0; i < m; ++i)
+            for (core::Index j = 0; j < n; ++j)
+                if (rng() % 3 != 0) {
+                    rows.push_back(i); cols.push_back(j);
+                    vals.push_back(U(rng) * scale * std::pow(10.0, static_cast<double>(rng() % 5) - 2.0));
+                }
+        lp.A = sparse::from_triplets(m, n, rows, cols, vals);
+        lp.c.resize(n); lp.col_lo.resize(n); lp.col_hi.resize(n);
+        for (core::Index j = 0; j < n; ++j) {
+            lp.c[j] = U(rng) * 5.0;
+            lp.col_lo[j] = -1.0 - 3.0 * std::fabs(U(rng));
+            lp.col_hi[j] = lp.col_lo[j] + 0.5 + 4.0 * std::fabs(U(rng));
+        }
+        lp.row_lo.resize(m); lp.row_hi.resize(m);
+        for (core::Index i = 0; i < m; ++i) {
+            lp.row_lo[i] = -2.0 + U(rng);
+            lp.row_hi[i] = (rng() % 4 == 0) ? model::kInf : lp.row_lo[i] + 3.0;
+        }
+        std::vector<double> y(m);
+        for (auto& v : y) v = U(rng) * std::pow(10.0, static_cast<double>(rng() % 5) - 2.0);
+        const auto fast = certify::safe_lagrangian_lower_bound(lp, y, lp.col_lo, lp.col_hi);
+        certify::SafeLpBound exact;
+        (void)certify::safe_reduced_cost_tightenings(lp, y, lp.col_lo, lp.col_hi,
+                                                     std::numeric_limits<double>::infinity(),
+                                                     &exact, nullptr);
+        CHECK(fast.finite == exact.finite);
+        if (!fast.finite || !exact.finite) continue;
+        ++compared;
+        CHECK(fast.value <= exact.value);
+        CHECK(exact.value - fast.value <= 1e-9 * (1.0 + std::fabs(exact.value)));
+    }
+    CHECK(compared > 300);
+}
+
+// check_dual_farkas_ray certifies by interval arithmetic when that decides
+// and exactly otherwise. Either way the verdict must be the exact rule's:
+// lower - upper > tol * (1 + max(|lower|, |upper|)) (rounded down against
+// rounded up), with lower = sum_j d_j b_j (d = A'y exactly, b the bound d_j's
+// sign needs) and upper = sum_i y_i side_i, evaluated here in rationals on
+// the multipliers the check returns. The rays are planted around the
+// threshold: separation a log-uniform multiple (0.1x .. 10x) of the
+// tolerance, coefficients across 1e-4 .. 1e4, so both verdicts and the
+// undecided-interval fallback are exercised.
+void test_farkas_check_matches_exact_rule() {
+    std::mt19937 rng(20261006u + 7u);
+    std::uniform_real_distribution<double> U(-1.0, 1.0);
+    const double tol = 1e-7;
+    int certified = 0, refused = 0;
+    for (int trial = 0; trial < 800; ++trial) {
+        const core::Index m = 1 + static_cast<core::Index>(rng() % 6);
+        const core::Index n = 1 + static_cast<core::Index>(rng() % 8);
+        std::vector<core::Index> rows, cols;
+        std::vector<double> vals;
+        for (core::Index i = 0; i < m; ++i)
+            for (core::Index j = 0; j < n; ++j)
+                if (rng() % 3 != 0) {
+                    rows.push_back(i); cols.push_back(j);
+                    vals.push_back(U(rng) * std::pow(10.0, static_cast<double>(rng() % 9) - 4.0));
+                }
+        model::LpProblem lp;
+        lp.A = sparse::from_triplets(m, n, rows, cols, vals);
+        lp.c.assign(static_cast<std::size_t>(n), 0.0);
+        lp.col_lo.resize(static_cast<std::size_t>(n));
+        lp.col_hi.resize(static_cast<std::size_t>(n));
+        for (core::Index j = 0; j < n; ++j) {
+            lp.col_lo[j] = -1.0 - 3.0 * std::fabs(U(rng));
+            lp.col_hi[j] = lp.col_lo[j] + 0.5 + 4.0 * std::fabs(U(rng));
+        }
+        std::vector<double> y(static_cast<std::size_t>(m));
+        for (auto& v : y) v = rng() % 5 == 0 ? 0.0 : U(rng);
+        core::Index pivot = -1;
+        for (core::Index i = 0; i < m; ++i) if (y[i] != 0.0) pivot = i;
+        if (pivot < 0) continue;
+        // lower for these multipliers, exactly.
+        const auto& rp = lp.A.pattern.row_ptr();
+        const auto& ci = lp.A.pattern.col_idx();
+        const auto exact_lower = [&](const std::vector<double>& yy) {
+            std::vector<model::Rational> d(static_cast<std::size_t>(n), 0);
+            for (core::Index i = 0; i < m; ++i)
+                for (auto k = rp[i]; k < rp[i + 1]; ++k)
+                    d[ci[k]] += model::Rational(yy[i]) * model::Rational(lp.A.vals[k]);
+            model::Rational lower = 0;
+            for (core::Index j = 0; j < n; ++j) {
+                if (d[j] > 0) lower += d[j] * model::Rational(lp.col_lo[j]);
+                else if (d[j] < 0) lower += d[j] * model::Rational(lp.col_hi[j]);
+            }
+            return lower;
+        };
+        const double lower = exact_lower(y).convert_to<double>();
+        // Sides: the one each multiplier's sign uses, the other open or not.
+        lp.row_lo.resize(static_cast<std::size_t>(m));
+        lp.row_hi.resize(static_cast<std::size_t>(m));
+        double upper_rest = 0.0;
+        for (core::Index i = 0; i < m; ++i) {
+            const double side = 3.0 * U(rng);
+            const double other = rng() % 2 ? model::kInf : 2.0 + std::fabs(U(rng));
+            if (y[i] >= 0.0) { lp.row_hi[i] = side; lp.row_lo[i] = side - other; }
+            else { lp.row_lo[i] = side; lp.row_hi[i] = side + other; }
+            if (i != pivot) upper_rest += y[i] * side;
+        }
+        const double factor = std::pow(10.0, 2.0 * std::fabs(U(rng)) - 1.0);
+        const double sign = rng() % 4 == 0 ? -1.0 : 1.0;   // some feasible-side rays
+        const double target_upper =
+            lower - sign * factor * tol * (1.0 + std::fabs(lower));
+        const double side = (target_upper - upper_rest) / y[pivot];
+        if (y[pivot] > 0.0) { lp.row_hi[pivot] = side; lp.row_lo[pivot] = -model::kInf; }
+        else { lp.row_lo[pivot] = side; lp.row_hi[pivot] = model::kInf; }
+
+        const auto got = certify::check_dual_farkas_ray(lp, y, tol);
+        // The exact rule on the multipliers the check settled on.
+        bool want = false;
+        if (got.multipliers.size() == y.size()) {
+            const auto& w = got.multipliers;
+            const model::Rational lo_exact = exact_lower(w);
+            model::Rational up_exact = 0;
+            for (core::Index i = 0; i < m; ++i) {
+                if (w[i] > 0.0) up_exact += model::Rational(w[i]) * model::Rational(lp.row_hi[i]);
+                else if (w[i] < 0.0) up_exact += model::Rational(w[i]) * model::Rational(lp.row_lo[i]);
+            }
+            const double contradiction = model::rounded_down(lo_exact - up_exact);
+            const model::Rational mag = boost::multiprecision::max(
+                boost::multiprecision::abs(lo_exact), boost::multiprecision::abs(up_exact));
+            const double sep = model::rounded_up(model::Rational(tol) * (1 + mag));
+            want = std::isfinite(contradiction) && contradiction > sep;
+        }
+        CHECK(got.certified == want);
+        // The engine's strict rule (no tolerance, declared bounds only) on
+        // the multipliers as given.
+        {
+            const model::Rational lo_exact = exact_lower(y);
+            model::Rational up_exact = 0;
+            for (core::Index i = 0; i < m; ++i) {
+                if (y[i] > 0.0) up_exact += model::Rational(y[i]) * model::Rational(lp.row_hi[i]);
+                else if (y[i] < 0.0) up_exact += model::Rational(y[i]) * model::Rational(lp.row_lo[i]);
+            }
+            CHECK((engines::farkas_violation(lp, y) == 0.0) == (lo_exact > up_exact));
+        }
+        if (got.certified) {
+            ++certified;
+            CHECK(got.max_sign_residual == 0.0);
+        } else {
+            ++refused;
+        }
+    }
+    CHECK(certified > 150);
+    CHECK(refused > 150);
+
+    // Cancellation below long double precision. Column x0's terms are
+    // 1, 3*2^-66, -1, -2^-65: exactly d0 = +2^-66, but summed in long double
+    // (1 + 3*2^-66 rounds to 1) it comes out -2^-65. With x0 in
+    // [-2e20, -1e20] the sign decides the bound: the exact rule charges d0 to
+    // the lower bound (-2.71) and refuses the ray against upper = -1.71;
+    // trusting the computed sign would charge it to the upper bound (+2.71)
+    // and certify. Against upper = -10 both verdicts certify.
+    {
+        const double t66 = std::ldexp(1.0, -66), t65 = std::ldexp(1.0, -65);
+        model::LpProblem lp;
+        lp.A = sparse::from_triplets(
+            4, 2, {0, 0, 1, 2, 3}, {0, 1, 0, 0, 0},
+            {1.0, 1.0, 3.0 * t66, -1.0, -t65});
+        lp.c.assign(2, 0.0);
+        lp.col_lo = {-2e20, 0.0};
+        lp.col_hi = {-1e20, 1.0};
+        lp.row_lo.assign(4, -model::kInf);
+        lp.row_hi = {-1.71, 0.0, 0.0, 0.0};
+        const std::vector<double> y(4, 1.0);
+        CHECK(!certify::check_dual_farkas_ray(lp, y, tol).certified);
+        CHECK(engines::farkas_violation(lp, y) == core::kPosInf);
+        lp.row_hi[0] = -10.0;
+        CHECK(certify::check_dual_farkas_ray(lp, y, tol).certified);
+        CHECK(engines::farkas_violation(lp, y) == 0.0);
+    }
+}
+
 int main() {
     test_float_rays_skip_exact_repair_without_exact_proof();
+    test_farkas_check_matches_exact_rule();
     test_presolved_terminal_witnesses();
     test_exact_terminal_rays();
     test_sparse_integer_basis_certificate();
     test_targeted_dual_certificate();    test_exact_dual_rational_reference();
     test_safe_lagrangian_bound();
+    test_interval_lagrangian_matches_exact();
     test_safe_bound_refuses_unbounded_direction();
     test_small_cost_cannot_erase_unbounded_direction();
     test_checked_repair_preserves_sense_and_offset();

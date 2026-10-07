@@ -158,5 +158,47 @@ int main() {
         CHECK(finalize_result(std::move(raw), ev).ray.empty());
     }
 
+    // 11. A complete search whose relaxation bounds were partly taken at f64
+    // tolerances claims ProvedGlobalFP: accepted as Optimal at that level
+    // (never lifted to ProvedGlobalEpsilon), and held to the same checks.
+    // Evidence shaped as milp_evidence() builds it: no basis, no gap.
+    {
+        CHECK(ProofLevel::ProvedKKT < ProofLevel::ProvedGlobalFP);
+        CHECK(ProofLevel::ProvedGlobalFP < ProofLevel::ProvedGlobalEpsilon);
+        CHECK(forge::core::to_string(ProofLevel::ProvedGlobalFP) == "ProvedGlobalFP");
+        RawResult raw;
+        raw.proposed_status = Status::Optimal;
+        raw.proposed_level  = ProofLevel::ProvedGlobalFP;
+        raw.objective       = 7.0;
+        raw.dual_bound      = 7.0;
+        raw.engine          = "milp_bab";
+        ProofEvidence ev;
+        ev.claimed_level        = ProofLevel::ProvedGlobalFP;
+        ev.has_basis            = false;
+        ev.checker_passed       = true;
+        ev.max_primal_violation = 1e-12;
+        ev.max_dual_violation   = 0.0;
+        ev.gap_rel              = 0.0;
+        auto r = finalize_result(RawResult(raw), ev);
+        CHECK(r.status == Status::Optimal);
+        CHECK(r.proof == ProofLevel::ProvedGlobalFP);
+        ev.max_primal_violation = 1e-3;
+        CHECK(finalize_result(RawResult(raw), ev).status != Status::Optimal);
+
+        // The same complete search with no incumbent proves infeasibility,
+        // at the same level.
+        RawResult inf;
+        inf.proposed_status = Status::Infeasible;
+        inf.proposed_level  = ProofLevel::BoundOnly;
+        inf.engine          = "milp_bab";
+        ProofEvidence iev;
+        iev.claimed_level        = ProofLevel::ProvedGlobalFP;
+        iev.max_primal_violation = 0.0;
+        iev.max_dual_violation   = 0.0;
+        r = finalize_result(std::move(inf), iev);
+        CHECK(r.status == Status::Infeasible);
+        CHECK(r.proof == ProofLevel::ProvedGlobalFP);
+    }
+
     return forge::test::finish("test_no_unproved_optimal");
 }

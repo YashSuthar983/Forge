@@ -1,4 +1,6 @@
 #include "forge/search/kernel_pump.hpp"
+#include "heuristic_lp.hpp"
+#include "forge/core/work_clock.hpp"
 
 #include "forge/sparse/csr.hpp"
 
@@ -10,7 +12,7 @@
 namespace forge::search {
 namespace {
 
-using Clock = std::chrono::steady_clock;
+using Clock = forge::core::SolverClock;
 
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 
@@ -279,6 +281,7 @@ bool feasibility_pump_restricted(const model::LpProblem& mip,
         pump.validate();
 
         engines::SimplexOptions so;
+        heuristic_lp_options(so);
         so.method = engines::SimplexMethod::Primal;
         so.presolve = true;
         so.max_iterations = opts.max_lp_iterations;
@@ -315,6 +318,7 @@ bool kernel_pump(const model::LpProblem& mip,
                  const KernelPumpOptions& opts,
                  std::vector<f64>& x_out,
                  KernelPumpDiagnostics& diag) {
+    core::WorkScope work_scope_(core::WorkCat::Heuristic);
     diag = KernelPumpDiagnostics{};
     const auto t0 = Clock::now();
     if (!opts.enabled || opts.time_limit_s <= 0.0) {
@@ -354,6 +358,7 @@ bool kernel_pump(const model::LpProblem& mip,
                 refine.is_integer[sz(j)] = false;  // pure LP
         }
         engines::SimplexOptions so;
+        heuristic_lp_options(so);
         so.method = engines::SimplexMethod::Dual;
         so.presolve = true;
         so.max_iterations = opts.max_lp_iterations;

@@ -8,6 +8,7 @@
 #include "forge/backend/qp_device.hpp"
 #include "forge/certify/finalize.hpp"
 #include "forge/core/parallel.hpp"
+#include "forge/core/work_clock.hpp"
 #include "forge/engines/hpr.hpp"
 #include "forge/engines/lp.hpp"
 #include "forge/engines/pdhg.hpp"
@@ -174,16 +175,27 @@ void usage() {
         "  --no-component-solve solve a model whose rows split into independent parts as one\n"
         "  --no-root-primal-early  primal work only after the root node LP (old order)\n"
         "  --no-sub-mip-context  heuristic children start from the bare model\n"
+        "  --no-session-dive     no tree dives on the node LP session\n"
+        "  --no-node-rc          no reduced-cost fixing below the root\n"
+        "  --no-obj-prop         no objective-cutoff propagation at nodes\n"
         "  --trace-cuts         print every selected root cut, batch by batch\n"
         "  --no-spp-repair      disable set-partitioning repair while no incumbent exists\n"
         "  --no-conflict-store  learn nogoods as LP rows instead of the propagated store\n"
         "  --no-node-cut-resolve  do not re-solve a node LP with its tree cuts\n"
         "  --tableau-cmir       also round each tableau row as a c-MIR base (opt-in: net negative on easy60)\n"
         "  --relax-small-terms  repair wide cuts by relaxing small terms instead of rejecting (opt-in)\n"
+        "  --refinement-target X  backward-error target of basis-solve refinement (MILP default 1e-10)\n"
+        "  --heuristic-window S with an incumbent, heuristic share of max(elapsed, S) instead of the limit\n"
+        "  --deterministic      internal budgets in work units (reproducible); the time limit stays wall-clock\n"
+        "  --wall-limit-factor F with --deterministic, the wall-clock hard stop is F x the time limit\n"
+        "  --plunge-max-cols N  plunge only on models with at most N columns (default: all)\n"
+        "  --cut-round-max N    at most N cuts appended per root separation round (policy default 120)\n"
+        "  --cut-dynamism X     reject (or repair) cuts whose max|coef|/min|coef| exceeds X (default 1e2)\n"
         "  --integer-slack-gmi  use exact-integer row activities in GMI (default)\n"
         "  --no-integer-slack-gmi  disable integer row-activity GMI for ablation\n"
         "  --integer-slack-gmi-basic  also separate from basic row activities\n"
         "  --no-aggregation skip MIR row aggregation (single-row bases only)\n"
+        "  --mir-complementation N  integer terms tried at their other bound per MIR base (default 0 = off)\n"
         "  --no-mir-variable-bounds  MIR substitutes simple bounds only (ablation)\n"
         "  --mir-probe-bounds  use global probed variable bounds in MIR (experimental)\n"
         "  --mir-lifted-cover  also derive lifted mixed-binary covers on MIR bases\n"
@@ -230,7 +242,8 @@ void usage() {
         "  --cut-min-progress F  stop the cut loop below this relative gain\n"
         "  --cut-rollback       retract root cut rounds that bought no bound\n"
         "  --cut-patience N     consecutive stalled rounds tolerated (default 3)\n"
-        "  --cut-purge          drop root cuts with no dual price at the root LP\n"
+        "  --cut-purge          drop root cuts with no dual price at the root LP (default)\n"
+        "  --no-cut-purge       keep every root cut row\n"
         "  --no-cut-warm-rounds re-solve each root cut round cold (default: warm\n"
         "                       start from the previous round's basis)\n"
         "  --cut-marginal-gate  probe each separator's marginal bound contribution\n"
@@ -1029,6 +1042,10 @@ int main(int argc, char** argv) {
     bool tol_given = false;
     double lp_gap_tolerance = 0.0;
     bool lp_exact_proof = false;
+    bool deterministic = false;
+    long long plunge_max_cols = -1;
+    double wall_limit_factor = 1.0;
+    bool refinement_target_explicit = false;
     bool lp_gap_given = false;
     bool max_iter_given = false;
     int local_starts = 1;   // --starts: multi-start count of the local QCQP solver
@@ -1073,6 +1090,7 @@ int main(int argc, char** argv) {
     bool lifted_cover_cuts = false;   // opt-in: see BabOptions
     bool mir_cuts = false;
     bool mir_aggregate = true;
+    int mir_complementation = -1;   // -1: library default
     bool mir_variable_bounds = true;
     bool mir_probe_bounds = false;
     bool mir_lifted_cover = false;
@@ -1102,6 +1120,7 @@ int main(int argc, char** argv) {
     double root_cut_share = -1.0;
     double root_cut_max = -1.0;
     double cut_nnz_budget = -1.0;    // <0 keeps the library default
+    int cut_round_max = -1;          // --cut-round-max: <0 keeps the policy's cap
     double cut_max_density = -1.0;
     double cut_par_penalty = -1.0;
     double cut_extra_scores = -1.0;
@@ -1159,7 +1178,7 @@ int main(int argc, char** argv) {
     double mip_gap_tol = 1e-4;
     double cut_min_progress = -1.0;  // <0 keeps the library default
     bool cut_rollback = false;
-    bool cut_purge = false;
+    bool cut_purge = true;
     bool cut_warm_rounds = true;
     bool cut_marginal_gate = false;
     double cut_marginal_min = -1.0;
@@ -1168,6 +1187,8 @@ int main(int argc, char** argv) {
     bool auto_cuts = true;
     bool gmi_cmir_recovery = false;
     bool relax_small_terms = false;
+    double heur_window = -1.0;          // --heuristic-window: <0 keeps the library default
+    double cut_dynamism = -1.0;         // --cut-dynamism: <0 keeps the library default
     bool tableau_cmir = false;
     bool node_cut_resolve = true;
     int local_cut_rows = 0;
@@ -1176,6 +1197,9 @@ int main(int argc, char** argv) {
     bool spp_repair_on = true;
     bool trace_cuts = false;
     bool sub_mip_context = true;
+    bool session_dive = true;
+    bool node_rc = true;
+    bool obj_prop = true;
     bool root_primal_early = true;
     bool root_primal_final = true;
     bool carry_probing = true;
@@ -1419,6 +1443,16 @@ int main(int argc, char** argv) {
                 next("--dual-resync-interval"), "--dual-resync-interval", 0,
                 static_cast<unsigned long long>(std::numeric_limits<int>::max())));
         else if (a == "--exact-proof") lp_exact_proof = true;
+        else if (a == "--deterministic") deterministic = true;
+        else if (a == "--plunge-max-cols")
+            plunge_max_cols = static_cast<long long>(parse_uint(next("--plunge-max-cols"), "--plunge-max-cols", 0, 2000000000));
+        else if (a == "--wall-limit-factor")
+            wall_limit_factor = parse_real(next("--wall-limit-factor"), "--wall-limit-factor", 1.0, 100.0);
+        else if (a == "--no-deterministic") deterministic = false;
+        else if (a == "--refinement-target") {
+            sx_opts.refinement_target = parse_real(next("--refinement-target"), "--refinement-target", 1e-30, 1.0);
+            refinement_target_explicit = true;
+        }
         else if (a == "--cost-shifts") sx_opts.allow_cost_shifts = true;
         else if (a == "--no-cost-shifts") sx_opts.allow_cost_shifts = false;
         else if (a == "--dual-cost-perturbation")
@@ -1547,6 +1581,10 @@ int main(int argc, char** argv) {
         else if (a == "--gmi-cmir-recovery") gmi_cmir_recovery = true;
         else if (a == "--no-gmi-cmir-recovery") gmi_cmir_recovery = false;
         else if (a == "--relax-small-terms") relax_small_terms = true;
+        else if (a == "--heuristic-window")
+            heur_window = parse_real(next("--heuristic-window"), "--heuristic-window", 0.0, 1e9);
+        else if (a == "--cut-dynamism")
+            cut_dynamism = parse_real(next("--cut-dynamism"), "--cut-dynamism", 1.0, 1e12);
         else if (a == "--no-relax-small-terms") relax_small_terms = false;
         else if (a == "--tableau-cmir") tableau_cmir = true;
         else if (a == "--no-tableau-cmir") tableau_cmir = false;
@@ -1557,6 +1595,9 @@ int main(int argc, char** argv) {
         else if (a == "--no-spp-repair") spp_repair_on = false;
         else if (a == "--trace-cuts") trace_cuts = true;
         else if (a == "--no-sub-mip-context") sub_mip_context = false;
+        else if (a == "--no-session-dive") session_dive = false;
+        else if (a == "--no-node-rc") node_rc = false;
+        else if (a == "--no-obj-prop") obj_prop = false;
         else if (a == "--no-root-primal-early") root_primal_early = false;
         else if (a == "--no-root-primal-final") root_primal_final = false;
         else if (a == "--no-carry-probing") carry_probing = false;
@@ -1580,6 +1621,9 @@ int main(int argc, char** argv) {
             integer_slack_gmi_basic = true;
         }
         else if (a == "--no-aggregation") mir_aggregate = false;
+        else if (a == "--mir-complementation")
+            mir_complementation = static_cast<int>(parse_uint(
+                next("--mir-complementation"), "--mir-complementation", 0, 1000));
         else if (a == "--no-mir-variable-bounds") mir_variable_bounds = false;
         else if (a == "--mir-probe-bounds") mir_probe_bounds = true;
         else if (a == "--mir-lifted-cover") mir_lifted_cover = true;
@@ -1627,6 +1671,8 @@ int main(int argc, char** argv) {
         }
         else if (a == "--cut-nnz-budget")
             cut_nnz_budget = parse_real(next("--cut-nnz-budget"), "--cut-nnz-budget", 0.0);
+        else if (a == "--cut-round-max")
+            cut_round_max = static_cast<int>(parse_uint(next("--cut-round-max"), "--cut-round-max", 0, 1000000));
         else if (a == "--cut-max-density")
             cut_max_density = parse_real(next("--cut-max-density"), "--cut-max-density", 0.0);
         else if (a == "--cut-extra-scores")
@@ -1707,6 +1753,7 @@ int main(int argc, char** argv) {
         else if (a == "--verify-cuts") verify_cuts_path = next("--verify-cuts");
         else if (a == "--cut-rollback") cut_rollback = true;
         else if (a == "--cut-purge") cut_purge = true;
+        else if (a == "--no-cut-purge") cut_purge = false;
         else if (a == "--cut-warm-rounds") cut_warm_rounds = true;
         else if (a == "--no-cut-warm-rounds") cut_warm_rounds = false;
         else if (a == "--cut-marginal-gate") cut_marginal_gate = true;
@@ -1927,6 +1974,7 @@ int main(int argc, char** argv) {
     // run because a timing that does not say how many threads produced it is
     // not a measurement.
     forge::core::set_global_threads(n_threads);
+    forge::core::set_deterministic_time(deterministic);
     sx_opts.pricing_threads = forge::core::global_threads();
     std::printf("threads:           %d\n", forge::core::global_threads());
 
@@ -3110,6 +3158,15 @@ int main(int argc, char** argv) {
             if (!basis_update_explicit)
                 bab.lp.update_method =
                     forge::search::default_node_lp_options().update_method;
+            else
+                bab.root_cold_forrest_tomlin = false;   // the user chose one
+            // The search's bounds come from its own safe Lagrangian bound and
+            // residual checks, not from an exact LP proof, so the expensive
+            // exact dual-bound closure is opt-in here exactly as for LP.
+            bab.lp.exact_proof = lp_exact_proof;
+            if (!refinement_target_explicit)
+                bab.lp.refinement_target =
+                    forge::search::default_node_lp_options().refinement_target;
             bab.verbose = sx_opts.verbose;
             if (!forge::search::parse_milp_policy(milp_policy, bab.policy)) {
                 std::fprintf(stderr,
@@ -3209,6 +3266,10 @@ int main(int argc, char** argv) {
             bab.auto_cuts = auto_cuts;
             bab.cut.gmi_cmir_recovery = gmi_cmir_recovery;
             bab.cut.relax_small_terms = relax_small_terms;
+            if (cut_dynamism > 0.0) bab.cut.dynamism_max = cut_dynamism;
+            if (heur_window >= 0.0) bab.heuristic_budget_min_window_s = heur_window;
+            bab.wall_limit_factor = wall_limit_factor;
+            if (plunge_max_cols >= 0) bab.plunge_max_cols = static_cast<forge::core::Index>(plunge_max_cols);
             bab.cut.tableau_cmir = tableau_cmir;
             bab.tree_cut.resolve_with_local = node_cut_resolve;
             bab.tree_cut.max_local_rows = local_cut_rows;
@@ -3217,6 +3278,9 @@ int main(int argc, char** argv) {
             bab.spp_repair = spp_repair_on;
             bab.trace_cut_batches = trace_cuts;
             bab.sub_mip_context = sub_mip_context;
+            bab.session_dive = session_dive;
+            bab.node_rc_fixing = node_rc;
+            bab.objective_propagation = obj_prop;
             bab.root_primal_early = root_primal_early;
             bab.root_primal_final = root_primal_final;
             bab.carry_probing = carry_probing;
@@ -3235,6 +3299,7 @@ int main(int argc, char** argv) {
             bab.cut.integer_slack_gmi = integer_slack_gmi;
             bab.cut.integer_activity_basic_gmi = integer_slack_gmi_basic;
             bab.mir.aggregate = mir_aggregate;
+            if (mir_complementation >= 0) bab.mir.complementation_max = mir_complementation;
             bab.mir.variable_bounds = mir_variable_bounds;
             bab.mir.probe_bounds = mir_probe_bounds;
             bab.mir.lifted_cover = mir_lifted_cover;
@@ -3292,6 +3357,18 @@ int main(int argc, char** argv) {
             if (cut_nnz_budget >= 0.0) bab.cut.pool_nnz_budget_factor = cut_nnz_budget;
             if (cut_max_density >= 0.0) bab.cut.pool_max_density = cut_max_density;
             if (cut_par_penalty >= 0.0) bab.cut.pool_parallelism_penalty = cut_par_penalty;
+            // The auto cut policy overwrites these pool fields inside the
+            // search; re-apply whichever ones were given explicitly.
+            bab.after_cut_policy = [=](forge::search::BabOptions& o) {
+                if (cut_nnz_budget >= 0.0) o.cut.pool_nnz_budget_factor = cut_nnz_budget;
+                if (cut_max_density >= 0.0) o.cut.pool_max_density = cut_max_density;
+                if (cut_par_penalty >= 0.0) o.cut.pool_parallelism_penalty = cut_par_penalty;
+                if (cut_round_max >= 0) o.cut.max_cuts_per_round = cut_round_max;
+                if (cut_extra_scores >= 0.0) {
+                    o.cut.pool_weight_sparsity = cut_extra_scores;
+                    o.cut.pool_weight_low_locks = cut_extra_scores;
+                }
+            };
             if (cut_extra_scores >= 0.0) {
                 bab.cut.pool_weight_sparsity = cut_extra_scores;
                 bab.cut.pool_weight_low_locks = cut_extra_scores;
@@ -3423,6 +3500,9 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(diag.lp_solves));
             std::printf("lp fallbacks:      %llu\n",
                         static_cast<unsigned long long>(diag.lp_fallbacks));
+            std::printf("f64 tol bounds:    %llu (tree LPs taken at f64 tolerances; "
+                        "--exact-proof certifies them)\n",
+                        static_cast<unsigned long long>(diag.float_relaxation_bounds));
             std::printf("root LP reused:    %llu\n",
                         static_cast<unsigned long long>(diag.root_lp_reuses));
             std::printf("  root LP prepared handoffs: %llu\n",
@@ -3572,9 +3652,28 @@ int main(int argc, char** argv) {
             std::printf("LNS scheduling:    %llu root attempts, %llu cutoff rows\n",
                         (unsigned long long)diag.lns_root_attempts,
                         (unsigned long long)diag.lns_cutoff_rows);
-            std::printf("sub-MIP calls:     %llu; build %.1f ms, child setup %.1f ms, "
-                        "child search %.1f ms\n",
-                        (unsigned long long)diag.sub_mip_calls, diag.sub_mip_build_ms,
+            std::printf("sub-MIP children:  root setup %.1f ms, root LPs %.1f ms, cuts %.1f ms, "
+                        "heuristics %.1f ms\n",
+                        diag.sub_mip_child_root_setup_ms, diag.sub_mip_child_root_lp_ms,
+                        diag.sub_mip_child_cut_ms, diag.sub_mip_child_heur_ms);
+            std::printf("objective prop:    %llu bounds tightened, %llu nodes pruned\n",
+                        (unsigned long long)diag.objprop_tightenings,
+                        (unsigned long long)diag.objprop_prunes);
+            std::printf("node RC fixing:    %llu bounds at %llu nodes\n",
+                        (unsigned long long)diag.node_rc_tightenings,
+                        (unsigned long long)diag.node_rc_nodes);
+            std::printf("session dives:     %llu dives, %llu LPs, %llu pivots, %llu incumbents (%.1f ms)\n",
+                        (unsigned long long)diag.session_dives,
+                        (unsigned long long)diag.session_dive_lps,
+                        (unsigned long long)diag.session_dive_iterations,
+                        (unsigned long long)diag.session_dive_incumbents,
+                        diag.session_dive_ms);
+            std::printf("sub-MIP calls:     %llu (%llu presolved, %llu searched); build %.1f ms, "
+                        "child setup %.1f ms, child search %.1f ms\n",
+                        (unsigned long long)diag.sub_mip_calls,
+                        (unsigned long long)diag.sub_mip_presolved,
+                        (unsigned long long)diag.sub_mip_children_searched,
+                        diag.sub_mip_build_ms,
                         diag.sub_mip_child_setup_ms, diag.sub_mip_child_search_ms);
             for (const auto& a : diag.lns.arms) {
                 if (a.calls == 0) continue;
@@ -3834,10 +3933,11 @@ int main(int argc, char** argv) {
                             tr.lp_ms, tr.separate_ms, tr.added_nnz, tr.mir_depth);
             }
             std::printf("MIR cuts:          %llu of %llu candidates added; "
-                        "%llu bases, rejected %llu frac / %llu dyn / %llu unviolated\n",
+                        "%llu bases, %llu complemented, rejected %llu frac / %llu dyn / %llu unviolated\n",
                         static_cast<unsigned long long>(diag.mir_cuts_added),
                         static_cast<unsigned long long>(diag.mir_candidates),
                         static_cast<unsigned long long>(diag.mir.bases_built),
+                        static_cast<unsigned long long>(diag.mir.complemented),
                         static_cast<unsigned long long>(diag.mir.rejected_fractionality),
                         static_cast<unsigned long long>(diag.mir.rejected_dynamism),
                         static_cast<unsigned long long>(diag.mir.rejected_not_violated));
@@ -3937,14 +4037,16 @@ int main(int argc, char** argv) {
                             ps.cols_after, ps.ms, ps.rounds);
                 std::printf("  reductions:      fixed %llu singleton-rows %llu "
                             "redundant-rows %llu (by activity %llu) bounds %llu "
-                            "coefs %llu postsolve-fail %llu\n",
+                            "coefs %llu sides %llu postsolve-fail %llu (polished %llu)\n",
                             (unsigned long long)ps.fixed_cols,
                             (unsigned long long)ps.singleton_rows,
                             (unsigned long long)ps.redundant_rows,
                             (unsigned long long)ps.redundant_by_activity,
                             (unsigned long long)ps.bounds_tightened,
                             (unsigned long long)ps.coefs_tightened,
-                            (unsigned long long)diag.structural_postsolve_failures);
+                            (unsigned long long)ps.sides_rounded,
+                            (unsigned long long)diag.structural_postsolve_failures,
+                            (unsigned long long)diag.structural_postsolve_polished);
                 std::printf("structural FBBT: %llu tightenings, %d sweeps, %llu terms\n",
                             (unsigned long long)ps.structural_fbbt_tightenings,
                             ps.structural_fbbt_rounds,
@@ -4140,8 +4242,16 @@ int main(int argc, char** argv) {
             std::printf("integer feas:      %llu  (heuristic hits %llu)\n",
                         static_cast<unsigned long long>(diag.integer_feasible),
                         static_cast<unsigned long long>(diag.heuristic_hits));
-            std::printf("  unsnappable:     %llu candidate incumbents refused\n",
-                        static_cast<unsigned long long>(diag.incumbents_rejected_unsnappable));
+            std::printf("  unsnappable:     %llu candidate incumbents refused; %llu re-solved to canonical; "
+                        "%llu refused by the original model\n",
+                        static_cast<unsigned long long>(diag.incumbents_rejected_unsnappable),
+                        static_cast<unsigned long long>(diag.incumbents_canonical_repaired),
+                        static_cast<unsigned long long>(diag.incumbents_rejected_original));
+            if (diag.integral_closures_reopened + diag.integral_closures_folded > 0)
+                std::printf("  closure:         %llu integral LP points short of their node bound "
+                            "split again, %llu folded\n",
+                            static_cast<unsigned long long>(diag.integral_closures_reopened),
+                            static_cast<unsigned long long>(diag.integral_closures_folded));
             std::printf("LP repair:         %llu attempts, %llu hits\n",
                         static_cast<unsigned long long>(diag.lp_repair_attempts),
                         static_cast<unsigned long long>(diag.lp_repair_hits));
@@ -4165,6 +4275,37 @@ int main(int argc, char** argv) {
                 std::printf("dual bound:        none (no finite global bound)\n");
             std::printf("\ntiming (ms)\n");
             std::printf("  total            %10.3f\n", diag.total_ms);
+            std::printf("  work units       %llu (%.3f s at %.2f ns/unit; %s timing)\n",
+                        static_cast<unsigned long long>(forge::core::work_units()),
+                        static_cast<double>(forge::core::work_units()) *
+                            forge::core::ns_per_work_unit() * 1e-9,
+                        forge::core::ns_per_work_unit(),
+                        forge::core::deterministic_time() ? "deterministic" : "wall");
+            {
+                // Per kind of work: wall time against what its work charges
+                // model at ns_per_work_unit. A ratio far from 1 is a category
+                // the deterministic clock mis-measures.
+                const auto led = forge::core::work_ledger();
+                std::printf("  work ledger      category       wall ms    work ms   work/wall\n");
+                for (int c = 0; c < forge::core::kWorkCats; ++c) {
+                    const double wall_ms = static_cast<double>(led.wall_ns[c]) * 1e-6;
+                    const double work_ms = static_cast<double>(led.units[c]) *
+                                           forge::core::ns_per_work_unit() * 1e-6;
+                    if (wall_ms < 0.5 && work_ms < 0.5) continue;
+                    std::printf("                   %-12s %10.1f %10.1f %10.2f\n",
+                                forge::core::work_cat_name(static_cast<forge::core::WorkCat>(c)),
+                                wall_ms, work_ms, wall_ms > 0.0 ? work_ms / wall_ms : 0.0);
+                }
+                std::printf("  work tags       ");
+                for (int t = 0; t < forge::core::kWorkTags; ++t)
+                    if (forge::core::t_work_tag_units[t] > 0)
+                        std::printf(" %s=%llu", forge::core::work_tag_name(static_cast<forge::core::WorkTag>(t)),
+                                    static_cast<unsigned long long>(forge::core::t_work_tag_units[t]));
+                std::printf("\n");
+                std::printf("  work floor       %llu bindings, max lead %.1f ms\n",
+                            static_cast<unsigned long long>(forge::core::work_floor_binds()),
+                            static_cast<double>(forge::core::work_floor_max_lead_ns()) * 1e-6);
+            }
             // Where the wall clock went. Phases overlap (e.g. the cut loop
             // contains root LP re-solves; heuristics run inside the node
             // loop), so these do not sum to total.

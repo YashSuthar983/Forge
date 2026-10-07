@@ -145,6 +145,39 @@ std::vector<FarkasBoundUse> farkas_conflict_bounds(
     const std::vector<f64>& root_lo, const std::vector<f64>& root_hi,
     f64 tolerance = 1e-7);
 
+// Rigorous long double enclosure of a multiplier vector's Farkas sums, the
+// cheap first pass of every ray check (the exact evaluation runs only when
+// this cannot decide). With d = A'y and upper = sum_i y_i side_i (row_hi for
+// y_i > 0, row_lo for y_i < 0), each exact value lies within its radius:
+// d_j in [d[j] - d_rad[j], d[j] + d_rad[j]] (d_terms[j] == 0: d_j is exactly
+// 0), upper in [upper - upper_rad, upper + upper_rad]. Radii are
+// gamma(2k + 2) * sum |terms| over k accumulated terms, gamma(k) =
+// k u / (1 - k u), u = 2^-64: one rounding per product and per addition,
+// with room for the rounding of the magnitude sums. upper_finite is false
+// when a multiplier faces an infinite row side.
+struct DualRayEnclosure {
+    std::vector<long double> d, d_rad;
+    std::vector<std::uint32_t> d_terms;
+    long double upper = 0.0L, upper_rad = 0.0L;
+    bool upper_finite = true;
+};
+DualRayEnclosure enclose_dual_ray(const model::LpProblem& problem,
+                                  const std::vector<f64>& multipliers);
+
+// Enclosure of lower = sum_j d_j b_j, where b_j is lo[j] for d_j > 0 and
+// hi[j] for d_j < 0, over the d intervals of `ray`. `decided` is false when
+// some d_j could take a sign whose bound is infinite (only an exact
+// evaluation can tell); `needs_infinite` is true when some d_j is certainly
+// nonzero on the side of an infinite bound (no finite lower exists).
+struct RayLowerEnclosure {
+    long double lo = 0.0L, hi = 0.0L;   // lo <= lower <= hi
+    bool decided = false;
+    bool needs_infinite = false;
+};
+RayLowerEnclosure enclose_ray_lower(const DualRayEnclosure& ray,
+                                    const std::vector<f64>& lo,
+                                    const std::vector<f64>& hi);
+
 core::DualFarkasRay check_dual_farkas_ray(
     const model::LpProblem& problem,
     const std::vector<f64>& multipliers,

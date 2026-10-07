@@ -1,4 +1,5 @@
 #include "forge/search/flowcover.hpp"
+#include "forge/core/work_clock.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -314,6 +315,7 @@ std::vector<CutRow> separate_flow_covers(const model::LpProblem& lp,
                                          const std::vector<f64>& col_hi,
                                          const FlowCoverOptions& opts,
                                          FlowCoverDiagnostics& diag) {
+    core::WorkScope work_scope_(core::WorkCat::Separation);
     std::vector<CutRow> cuts;
     const Index n = lp.n_cols();
     if (!opts.enabled || static_cast<Index>(x.size()) != n ||

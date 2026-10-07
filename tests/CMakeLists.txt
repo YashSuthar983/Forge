@@ -88,6 +88,7 @@ forge_add_test(test_node_cut_resolve    forge_search forge_engines forge_certify
 forge_add_test(test_conflict_store       forge_search forge_engines forge_certify forge_io)
 forge_add_test(test_farkas_conflict     forge_search forge_engines forge_certify forge_io)
 forge_add_test(test_component_solve      forge_search forge_engines forge_certify forge_io)
+forge_add_test(test_canonical_point      forge_search forge_engines forge_certify)
 forge_add_test(test_column_merge         forge_search forge_engines forge_certify forge_io)
 forge_add_test(test_cut_policy          forge_search forge_engines forge_certify forge_io)
 forge_add_test(test_propagate           forge_search)

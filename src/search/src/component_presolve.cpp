@@ -1,4 +1,5 @@
 #include "forge/search/component_presolve.hpp"
+#include "forge/core/work_clock.hpp"
 
 #include <chrono>
 
@@ -73,12 +74,12 @@ bool assignment_feasible(const model::LpProblem& lp,
 ComponentPresolveDiagnostics apply_component_presolve(
     const model::LpProblem& lp, std::vector<f64>& col_lo,
     std::vector<f64>& col_hi, const ComponentPresolveOptions& opts) {
-    const auto t0 = std::chrono::steady_clock::now();
+    const auto t0 = forge::core::SolverClock::now();
     // Unbounded before 2026-09-20; see the comment on the component loop.
     const auto out_of_time = [&]() {
         return opts.time_limit_s > 0.0 &&
                std::chrono::duration<double>(
-                   std::chrono::steady_clock::now() - t0).count() >
+                   forge::core::SolverClock::now() - t0).count() >
                    opts.time_limit_s;
     };
 

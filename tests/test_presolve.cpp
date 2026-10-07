@@ -1361,7 +1361,7 @@ int main() {
         CHECK(normal.map.problem.n_cols() < 3);
         CHECK(!normal.map.stats.stopped_at_deadline);
 
-        opts.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+        opts.deadline = forge::core::SolverClock::now() - std::chrono::seconds(1);
         const auto late = forge::presolve::presolve(p, opts);
         CHECK(late.status == forge::presolve::PresolveStatus::Reduced);
         CHECK(late.map.stats.stopped_at_deadline);

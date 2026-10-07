@@ -43,6 +43,7 @@ class ExactSum {
 public:
     void add(double value) { add_product(value, 1.0); }
     void add_product(double a, double b) {
+        ::forge::core::work_add(8, ::forge::core::WorkTag::ExactMp);   // multiprecision multiply and add
         if (a == 0.0 || b == 0.0) {
             if (!std::isfinite(a) || !std::isfinite(b))
                 throw std::invalid_argument("ExactSum: nonfinite operand");
@@ -89,6 +90,7 @@ public:
     const boost::multiprecision::cpp_int& mantissa() const { return sum_; }
     int exponent() const { return exponent_; }
     Rational value() const {
+        ::forge::core::work_add(32, ::forge::core::WorkTag::ExactMp);  // rational construction and normalization
         if (exponent_ >= 0) return Rational(sum_ << exponent_);
         return Rational(sum_) / Rational(boost::multiprecision::cpp_int(1) << -exponent_);
     }

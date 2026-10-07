@@ -20,9 +20,15 @@ using core::Index;
 struct ImpliedIntOptions {
     bool enabled = true;
     bool equality_pm1 = true;     // classic ±1 equality cascade
-    bool network = true;          // directed incidence (±1, ≤1 of each sign)
-    bool consecutive_ones = true; // 0/1 C1 columns in current row order
-    // Corollary 3.3 / dual detection (paper §3.1, Gurobi-style scaling).
+    // Network (each column at most one +1 and one -1) and interval (each
+    // column all +1 on consecutive equality rows) structure, judged for a
+    // whole equality-connected continuous subsystem: every touched row an
+    // integral equality, every outside term an integral multiple of an
+    // integer column, every subsystem bound integral.
+    bool network = true;
+    bool consecutive_ones = true;
+    // Corollary 3.3 / dual detection (paper §3.1, Gurobi-style scaling); also
+    // needs the column's own finite bounds integral unless an equality pins it.
     bool dual_rational = true;
     // Theorem 3.2 + Algorithm 1 (paper §7.1): grow network / transposed-network
     // blocks on continuous connected components (subset of full TU recognition).
@@ -73,8 +79,10 @@ struct ImpliedIntDiagnostics {
     std::uint64_t bounds_snapped = 0;
 };
 
-// Marks implied integers on `lp.is_integer` (resized if needed). Optionally
-// snaps finite continuous bounds of newly marked columns to integers.
+// Marks implied integers on `lp.is_integer` (resized if needed) and snaps the
+// bounds of every integer column. When col_lo/col_hi are given they are the
+// working box the problem lives in (mip_presolve's): the rules reason about
+// THAT box, and it is the one snapped. Every rule is O(nnz).
 ImpliedIntDiagnostics infer_implied_integers_ex(
     model::LpProblem& lp, const ImpliedIntOptions& opts,
     std::vector<f64>* col_lo = nullptr, std::vector<f64>* col_hi = nullptr);

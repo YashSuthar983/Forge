@@ -1,4 +1,5 @@
 #include "forge/search/zerohalf.hpp"
+#include "forge/core/work_clock.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -33,6 +34,8 @@ bool build_integer_base(const model::LpProblem& lp, Index row, f64 sign,
                         const std::vector<f64>& lo,
                         const std::vector<f64>& x,
                         BaseRow& out, ZeroHalfDiagnostics& diag) {
+    core::work_add(4 + static_cast<std::uint64_t>(lp.A.pattern.row_ptr()[sz(row) + 1] -
+                                                  lp.A.pattern.row_ptr()[sz(row)]), ::forge::core::WorkTag::ZeroHalf);
     const f64 bound = sign > 0.0 ? lp.row_hi[sz(row)] : -lp.row_lo[sz(row)];
     if (!std::isfinite(bound)) return false;
 
@@ -67,21 +70,43 @@ bool build_integer_base(const model::LpProblem& lp, Index row, f64 sign,
     return true;
 }
 
-bool merge_bases(const BaseRow& a, const BaseRow& b, BaseRow& out) {
+// Where each column of the row being merged into sits, valid while its stamp
+// is current. Sized to the model's columns once per separation.
+struct MergeScratch {
+    std::vector<std::size_t> pos;
+    std::vector<std::uint32_t> stamp;
+    std::uint32_t cur = 0;
+    explicit MergeScratch(Index n) : pos(sz(n), 0), stamp(sz(n), 0) {}
+};
+
+// a + b: a's columns in order, then b's columns that a lacks, in b's order,
+// coefficients summed. Matching each of b's columns by scanning the row was
+// O(|a| * |b|) per merge; on neos-860300 (rows of ~450 entries) the pair and
+// mod-2 aggregations spent 1.3-2.1 s of one separation round there, 16% of
+// a whole run. The position map gives the same row in O(|a| + |b|).
+bool merge_bases(const BaseRow& a, const BaseRow& b, BaseRow& out,
+                 MergeScratch& ms) {
+    core::work_add(4 + 2 * (a.cols.size() + b.cols.size()), ::forge::core::WorkTag::ZeroHalf);
     out.cols = a.cols;
     out.coef = a.coef;
     out.rhs = a.rhs + b.rhs;
+    if (++ms.cur == 0) {
+        std::fill(ms.stamp.begin(), ms.stamp.end(), 0u);
+        ms.cur = 1;
+    }
+    for (std::size_t s = 0; s < out.cols.size(); ++s) {
+        const auto j = sz(out.cols[s]);
+        if (ms.stamp[j] == ms.cur) continue;   // first occurrence, as a scan finds
+        ms.stamp[j] = ms.cur;
+        ms.pos[j] = s;
+    }
     for (std::size_t t = 0; t < b.cols.size(); ++t) {
         const Index j = b.cols[t];
-        bool found = false;
-        for (std::size_t s = 0; s < out.cols.size(); ++s) {
-            if (out.cols[s] == j) {
-                out.coef[s] += b.coef[t];
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
+        if (ms.stamp[sz(j)] == ms.cur) {
+            out.coef[ms.pos[sz(j)]] += b.coef[t];
+        } else {
+            ms.stamp[sz(j)] = ms.cur;
+            ms.pos[sz(j)] = out.cols.size();
             out.cols.push_back(j);
             out.coef.push_back(b.coef[t]);
         }
@@ -91,12 +116,13 @@ bool merge_bases(const BaseRow& a, const BaseRow& b, BaseRow& out) {
 
 // Aggregate bases selected by a bit-mask over an index list.
 bool aggregate_selected(const std::vector<BaseRow>& bases,
-                        const std::vector<int>& idxs, BaseRow& out) {
+                        const std::vector<int>& idxs, BaseRow& out,
+                        MergeScratch& ms) {
     if (idxs.empty()) return false;
     out = bases[static_cast<std::size_t>(idxs[0])];
     for (std::size_t t = 1; t < idxs.size(); ++t) {
         BaseRow merged;
-        if (!merge_bases(out, bases[static_cast<std::size_t>(idxs[t])], merged))
+        if (!merge_bases(out, bases[static_cast<std::size_t>(idxs[t])], merged, ms))
             return false;
         out = std::move(merged);
     }
@@ -106,6 +132,7 @@ bool aggregate_selected(const std::vector<BaseRow>& bases,
 // CG cut with λ = 1/2 on an integer base ∑ a x ≤ b.
 bool emit_half_cg(const BaseRow& base, const std::vector<f64>& x,
                   const ZeroHalfOptions& opts, CutRow& cut, f64& viol) {
+    core::work_add(4 + 2 * base.cols.size(), ::forge::core::WorkTag::ZeroHalf);
     if (!exact_integer(base.rhs)) return false;
     for (const f64 aj : base.coef)
         if (!exact_integer(aj)) return false;
@@ -220,6 +247,7 @@ std::vector<CutRow> separate_zerohalf(const model::LpProblem& lp,
                                       const std::vector<f64>& col_hi,
                                       const ZeroHalfOptions& opts,
                                       ZeroHalfDiagnostics& diag) {
+    core::WorkScope work_scope_(core::WorkCat::Separation);
     std::vector<CutRow> cuts;
     const Index n = lp.n_cols();
     if (!opts.enabled || static_cast<Index>(x.size()) != n ||
@@ -242,6 +270,8 @@ std::vector<CutRow> separate_zerohalf(const model::LpProblem& lp,
             bases.push_back(std::move(b));
         }
     }
+
+    MergeScratch merge_scratch(n);
 
     auto try_emit = [&](const BaseRow& base) {
         if (static_cast<int>(cuts.size()) >= opts.max_cuts) return;
@@ -269,7 +299,7 @@ std::vector<CutRow> separate_zerohalf(const model::LpProblem& lp,
                 ++tries;
                 BaseRow merged;
                 if (!merge_bases(bases[static_cast<std::size_t>(i)],
-                                 bases[static_cast<std::size_t>(k)], merged))
+                                 bases[static_cast<std::size_t>(k)], merged, merge_scratch))
                     continue;
                 ++diag.aggregations;
                 try_emit(merged);
@@ -357,7 +387,7 @@ std::vector<CutRow> separate_zerohalf(const model::LpProblem& lp,
         for (int si = 0; si < nbase_sel; ++si) {
             if (bit_get(combo, si)) idxs.push_back(selected[si]);
         }
-        return aggregate_selected(bases, idxs, out);
+        return aggregate_selected(bases, idxs, out, merge_scratch);
     };
 
     // Degree-1: each nonzero reduced row.

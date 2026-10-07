@@ -755,6 +755,8 @@ void test_wrapper_projects_cut_reference_point() {
     // Strengthening 2x1+3x2>=2.5 to 2x1+2.5x2>=2.5 makes the root LP
     // integral, leaving no cut to project the reference through.
     opts.structural_presolve.coefficient_strengthening = false;
+    // Likewise rounding its side to 3 (gcd 1 over integer data).
+    opts.structural_presolve.side_rounding = false;
     opts.para_bab.threads = 1;
     opts.lp.presolve = false;
     opts.mip_presolve = opts.probing = opts.symmetry = false;
@@ -889,6 +891,86 @@ void test_probing_fixes_and_shrinks() {
 
 }  // namespace
 
+// Side rounding (structural presolve step 2d): integer columns with integer
+// coefficients make every activity a multiple of the coefficients' gcd.
+forge::model::LpProblem side_rounding_lp(double a1, double a2, double lo, double hi,
+                                       bool second_integer) {
+    forge::model::LpProblem lp;
+    lp.A = forge::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {a1, a2});
+    lp.row_lo = {lo};
+    lp.row_hi = {hi};
+    lp.c = {-1.0, -1.0};
+    lp.col_lo = {0.0, 0.0};
+    lp.col_hi = {10.0, 10.0};
+    lp.is_integer = {true, second_integer};
+    return lp;
+}
+
+void test_side_rounding_moves_sides_to_the_gcd_lattice() {
+    const auto hi0 = [](const forge::search::MilpPresolveResult& pre) {
+        return pre.reduced.n_rows() > 0 ? pre.reduced.row_hi[0] : -1.0;
+    };
+    const auto lo0 = [](const forge::search::MilpPresolveResult& pre) {
+        return pre.reduced.n_rows() > 0 ? pre.reduced.row_lo[0] : -1.0;
+    };
+    MilpPresolveOptions opts;
+    opts.probing_presolve = false;
+    opts.structural_fbbt = false;
+    opts.binary_row_support = false;
+    opts.coefficient_strengthening = false;
+    // Identical columns would be merged and the row turned into a bound.
+    opts.merge_duplicate_columns = false;
+    {   // 2x + 4y <= 7 holds for the same integer points as 2x + 4y <= 6.
+        MilpPresolveStats stats;
+        auto pre = run_structural_presolve(
+            side_rounding_lp(2.0, 4.0, -forge::model::kInf, 7.0, true), opts, stats);
+        CHECK(!pre.infeasible);
+        CHECK(stats.sides_rounded == 1);
+        CHECK(pre.reduced.n_rows() == 1);
+        CHECK_NEAR(hi0(pre), 6.0, 0.0);
+    }
+    {   // 3x + 6y >= 1 becomes >= 3; both sides of a ranged row move.
+        MilpPresolveStats stats;
+        auto pre = run_structural_presolve(
+            side_rounding_lp(3.0, 6.0, 1.0, 10.0, true), opts, stats);
+        CHECK(!pre.infeasible);
+        CHECK_NEAR(lo0(pre), 3.0, 0.0);
+        CHECK_NEAR(hi0(pre), 9.0, 0.0);
+    }
+    {   // 2x + 4y = 3 has no integer point (3 is not a multiple of 2).
+        MilpPresolveStats stats;
+        auto pre = run_structural_presolve(
+            side_rounding_lp(2.0, 4.0, 3.0, 3.0, true), opts, stats);
+        CHECK(pre.infeasible);
+    }
+    {   // A continuous column leaves the row alone.
+        MilpPresolveStats stats;
+        auto pre = run_structural_presolve(
+            side_rounding_lp(2.0, 4.0, -forge::model::kInf, 7.0, false), opts, stats);
+        CHECK(stats.sides_rounded == 0);
+        CHECK_NEAR(hi0(pre), 7.0, 0.0);
+    }
+    {   // A side within round-off of a multiple is not pushed below it:
+        // 2x + 4y <= 5.9999999999 keeps the points with activity 6 out only
+        // through the feasibility tolerance, never by rounding to 4.
+        MilpPresolveStats stats;
+        auto pre = run_structural_presolve(
+            side_rounding_lp(2.0, 4.0, -forge::model::kInf, 5.9999999999, true), opts, stats);
+        CHECK(!pre.infeasible);
+        CHECK(stats.sides_rounded == 0);
+        CHECK(hi0(pre) >= 5.9999999999);
+    }
+    {   // Switched off: untouched.
+        MilpPresolveOptions off = opts;
+        off.side_rounding = false;
+        MilpPresolveStats stats;
+        auto pre = run_structural_presolve(
+            side_rounding_lp(2.0, 4.0, -forge::model::kInf, 7.0, true), off, stats);
+        CHECK(stats.sides_rounded == 0);
+        CHECK_NEAR(hi0(pre), 7.0, 0.0);
+    }
+}
+
 int main() {
     test_monotone_pairs_preserve_optimum_and_postsolve();
     test_probing_fixes_and_shrinks();
@@ -912,5 +994,6 @@ int main() {
     test_conflicting_singleton_rows_detected_infeasible();
     test_chained_elimination_reaches_fixed_point();
     test_presolved_solve_matches_direct_solve();
+    test_side_rounding_moves_sides_to_the_gcd_lattice();
     return forge::test::finish("test_milp_presolve");
 }

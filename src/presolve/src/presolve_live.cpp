@@ -1,4 +1,5 @@
 #include "live_matrix.hpp"
+#include "forge/core/work_clock.hpp"
 #include "forge/model/exact.hpp"
 
 #include <algorithm>
@@ -47,6 +48,8 @@ void LiveMatrix::build(const model::LpProblem& problem,
                        std::vector<f64>& work_cost,
                        std::vector<f64>& fixed_vals,
                        f64& work_obj_offset) {
+    core::work_add(static_cast<std::uint64_t>(problem.nnz()) +
+                   static_cast<std::uint64_t>(problem.n_rows() + problem.n_cols()), ::forge::core::WorkTag::LpPresolve);
     FORGE_FN();
     in = &problem;
     options = opts;

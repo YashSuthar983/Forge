@@ -1,4 +1,5 @@
 #include "forge/engines/crossover.hpp"
+#include "forge/core/work_clock.hpp"
 
 #include "forge/certify/finalize.hpp"
 #include "forge/engines/dual_simplex.hpp"
@@ -19,7 +20,7 @@
 namespace forge::engines {
 namespace {
 
-using Clock = std::chrono::steady_clock;
+using Clock = forge::core::SolverClock;
 inline double ms_since(Clock::time_point t0) {
     FORGE_FN();
     return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();

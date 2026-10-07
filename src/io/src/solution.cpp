@@ -60,6 +60,7 @@ ProofLevel proof_from_string(const std::string& s) {
     if (s == "FeasibleOnly") return ProofLevel::FeasibleOnly;
     if (s == "FeasibleWithGap") return ProofLevel::FeasibleWithGap;
     if (s == "ProvedKKT") return ProofLevel::ProvedKKT;
+    if (s == "ProvedGlobalFP") return ProofLevel::ProvedGlobalFP;
     if (s == "ProvedGlobalEpsilon") return ProofLevel::ProvedGlobalEpsilon;
     if (s == "ProvedOptimalFP") return ProofLevel::ProvedOptimalFP;
     if (s == "ProvedOptimalExact") return ProofLevel::ProvedOptimalExact;

@@ -4,6 +4,7 @@
 #include "forge/search/implied_int.hpp"
 #include "forge/sparse/csr.hpp"
 
+#include "milp_oracle.hpp"
 #include "test_helpers.hpp"
 
 #include <limits>
@@ -178,6 +179,237 @@ void test_tu_network_block_pair() {
     CHECK(lp.is_integer[1]);
 }
 
+
+// --- Oracle: a mark may restrict the feasible set, never the optimum --------
+//
+// Every rule promises that some optimum of the model stays feasible once the
+// marked columns are integer and their bounds snapped. Checked by exhaustive
+// enumeration (milp_oracle.hpp): the optimum of the model with the marks must
+// equal the optimum without them. The generator leans towards the patterns the
+// rules look for (+-1 continuous terms in equality rows, integer companions)
+// and mixes in what must block them: fractional coefficients on integer
+// columns, fractional continuous bounds, fractional sides, and a working box
+// tighter than the model's own bounds (mip_presolve passes one).
+
+struct IiCase {
+    LpProblem lp;                       // rows + the box the problem lives in
+    std::vector<double> lo, hi;         // working box (== lp bounds unless split)
+    bool split_box = false;             // lp.col_lo/hi wider than the working box
+};
+
+IiCase make_ii_case(std::uint32_t seed) {
+    using forge::test::oracle::next;
+    std::uint32_t st = seed * 2654435761u + 977u;
+    IiCase c;
+    LpProblem& lp = c.lp;
+    lp.name = "ii_" + std::to_string(seed);
+    lp.maximize = (next(st) & 1u) != 0;
+    const core::Index n = 3 + static_cast<core::Index>(next(st) % 3);
+    const core::Index m = 1 + static_cast<core::Index>(next(st) % 3);
+    lp.c.assign(n, 0.0);
+    lp.col_lo.assign(n, 0.0);
+    lp.col_hi.assign(n, 0.0);
+    lp.is_integer.assign(n, false);
+    for (core::Index j = 0; j < n; ++j) {
+        lp.c[j] = static_cast<double>(static_cast<int>(next(st) % 7) - 3);
+        if (next(st) % 2 == 0) {
+            lp.is_integer[j] = true;
+            lp.col_lo[j] = (next(st) % 3 == 0) ? -1.0 : 0.0;
+            lp.col_hi[j] = lp.col_lo[j] + 1.0 + static_cast<double>(next(st) % 2);
+        } else {
+            static const double los[] = {0.0, 0.0, 0.5, -1.0};
+            static const double spans[] = {1.0, 2.0, 1.5, 3.0, 2.5};
+            lp.col_lo[j] = los[next(st) % 4];
+            lp.col_hi[j] = lp.col_lo[j] + spans[next(st) % 5];
+        }
+    }
+    static const double coefs[] = {1.0, 1.0, 1.0, -1.0, -1.0, 2.0, -2.0, 0.5, 3.0, 1.5};
+    std::vector<core::Index> rows, cols;
+    std::vector<double> vals;
+    lp.row_lo.assign(m, 0.0);
+    lp.row_hi.assign(m, 0.0);
+    for (core::Index i = 0; i < m; ++i) {
+        const core::Index len = 2 + static_cast<core::Index>(next(st) % 3);
+        std::vector<char> used(n, 0);
+        for (core::Index t = 0; t < len; ++t) {
+            const core::Index j = static_cast<core::Index>(next(st) % static_cast<std::uint32_t>(n));
+            if (used[j]) continue;
+            used[j] = 1;
+            rows.push_back(i);
+            cols.push_back(j);
+            vals.push_back(coefs[next(st) % 10]);
+        }
+        double rhs = static_cast<double>(static_cast<int>(next(st) % 7) - 2);
+        if (next(st) % 7 == 0) rhs += 0.5;
+        const std::uint32_t sense = next(st) % 4;
+        if (sense <= 1) { lp.row_lo[i] = rhs; lp.row_hi[i] = rhs; }
+        else if (sense == 2) { lp.row_lo[i] = -kInf; lp.row_hi[i] = rhs; }
+        else { lp.row_lo[i] = rhs; lp.row_hi[i] = kInf; }
+    }
+    lp.A = from_triplets(m, n, rows, cols, vals);
+    c.lo = lp.col_lo;
+    c.hi = lp.col_hi;
+    // Sometimes the problem being solved lives in a tighter, possibly
+    // fractional, working box than the model's own integral bounds.
+    if (next(st) % 3 == 0) {
+        for (core::Index j = 0; j < n; ++j) {
+            if (lp.is_integer[j] || next(st) % 2 != 0) continue;
+            if (c.hi[j] - c.lo[j] > 1.0) {
+                if (next(st) % 2 == 0) c.lo[j] += 0.5;
+                else c.hi[j] -= 0.5;
+                c.split_box = true;
+            }
+        }
+    }
+    return c;
+}
+
+double ii_scale(double v) { return 1.0 + std::fabs(v); }
+
+// One rule set on one case: 1 if anything was marked (and checked).
+int check_ii_case(const IiCase& c, const search::ImpliedIntOptions& o,
+                  const char* label) {
+    // The problem actually being solved: rows + working box.
+    LpProblem truth = c.lp;
+    truth.col_lo = c.lo;
+    truth.col_hi = c.hi;
+    LpProblem marked = c.lp;
+    std::vector<double> lo = c.lo, hi = c.hi;
+    const auto d = c.split_box
+        ? search::infer_implied_integers_ex(marked, o, &lo, &hi)
+        : search::infer_implied_integers_ex(marked, o);
+    if (d.total == 0) return 0;
+    LpProblem restricted = truth;
+    restricted.is_integer = marked.is_integer;
+    restricted.col_lo = c.split_box ? lo : marked.col_lo;
+    restricted.col_hi = c.split_box ? hi : marked.col_hi;
+    const auto want = forge::test::oracle::solve_oracle(truth);
+    bool crossed = false;
+    for (core::Index j = 0; j < restricted.n_cols(); ++j)
+        if (restricted.col_lo[j] > restricted.col_hi[j]) crossed = true;
+    if (crossed) {
+        // An emptied box claims infeasibility: only right if it is.
+        if (want.feasible)
+            std::fprintf(stderr, "%s %s: snap emptied a box of a feasible model\n",
+                         label, c.lp.name.c_str());
+        CHECK(!want.feasible);
+        return 1;
+    }
+    const auto got = forge::test::oracle::solve_oracle(restricted);
+    const bool ok = want.feasible == got.feasible &&
+        (!want.feasible ||
+         std::fabs(want.objective - got.objective) <= 1e-7 * ii_scale(want.objective));
+    if (!ok)
+        std::fprintf(stderr, "%s %s: optimum %s%.9g -> %s%.9g after %llu marks\n",
+                     label, c.lp.name.c_str(), want.feasible ? "" : "infeasible ",
+                     want.objective, got.feasible ? "" : "infeasible ",
+                     got.objective, static_cast<unsigned long long>(d.total));
+    CHECK(ok);
+    return 1;
+}
+
+void test_implied_int_oracle() {
+    struct Config { const char* name; bool pm1, net, c1, dual; };
+    const Config configs[] = {
+        {"all", true, true, true, true},
+        {"pm1", true, false, false, false},
+        {"network", false, true, false, false},
+        {"c1", false, false, true, false},
+        {"dual", false, false, false, true},
+    };
+    int fired[5] = {0, 0, 0, 0, 0};
+    for (std::uint32_t seed = 1; seed <= 1500; ++seed) {
+        const IiCase c = make_ii_case(seed);
+        for (int k = 0; k < 5; ++k) {
+            search::ImpliedIntOptions o;
+            o.equality_pm1 = configs[k].pm1;
+            o.network = configs[k].net;
+            o.consecutive_ones = configs[k].c1;
+            o.dual_rational = configs[k].dual;
+            o.tu_network_block = false;
+            fired[k] += check_ii_case(c, o, configs[k].name);
+        }
+    }
+    std::printf("implied-int oracle: models with marks all=%d pm1=%d network=%d c1=%d dual=%d\n",
+                fired[0], fired[1], fired[2], fired[3], fired[4]);
+    // The generator must actually exercise every rule.
+    for (int k = 0; k < 5; ++k) CHECK(fired[k] >= 20);
+}
+
+// The three shapes that used to be marked (each would lose the optimum).
+void test_implied_int_pinned_counterexamples() {
+    search::ImpliedIntOptions o;
+    o.tu_network_block = false;
+    {
+        // x + 0.5 y + z = 3, x cont [0,10], y bin, z int [0,5]; min x + z.
+        // Optimum 2.5 needs y = 1 and x fractional.
+        LpProblem lp;
+        lp.c = {1.0, 0.0, 1.0};
+        lp.col_lo = {0.0, 0.0, 0.0};
+        lp.col_hi = {10.0, 1.0, 5.0};
+        lp.is_integer = {false, true, true};
+        lp.row_lo = {3.0}; lp.row_hi = {3.0};
+        lp.A = from_triplets(1, 3, {0, 0, 0}, {0, 1, 2}, {1.0, 0.5, 1.0});
+        search::infer_implied_integers_ex(lp, o);
+        CHECK(!lp.is_integer[0]);
+    }
+    {
+        // x + w + z = 3, x cont [0,10], w cont [0,0.5], z int [0,5]; max w.
+        LpProblem lp;
+        lp.maximize = true;
+        lp.c = {0.0, 1.0, 0.0};
+        lp.col_lo = {0.0, 0.0, 0.0};
+        lp.col_hi = {10.0, 0.5, 5.0};
+        lp.is_integer = {false, false, true};
+        lp.row_lo = {3.0}; lp.row_hi = {3.0};
+        lp.A = from_triplets(1, 3, {0, 0, 0}, {0, 1, 2}, {1.0, 1.0, 1.0});
+        search::infer_implied_integers_ex(lp, o);
+        CHECK(!lp.is_integer[0]);
+        CHECK(!lp.is_integer[1]);
+    }
+    {
+        // x - y >= 0, x cont [0.5,10], y int [0,5]; min x + 10 y. Optimum 0.5.
+        LpProblem lp;
+        lp.c = {1.0, 10.0};
+        lp.col_lo = {0.5, 0.0};
+        lp.col_hi = {10.0, 5.0};
+        lp.is_integer = {false, true};
+        lp.row_lo = {0.0}; lp.row_hi = {kInf};
+        lp.A = from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, -1.0});
+        search::infer_implied_integers_ex(lp, o);
+        CHECK(!lp.is_integer[0]);
+        CHECK(lp.col_lo[0] == 0.5);
+    }
+    {
+        // Same row with integral own bounds: marking is right (x = y or the
+        // bound at the optimum).
+        LpProblem lp;
+        lp.c = {1.0, 10.0};
+        lp.col_lo = {1.0, 0.0};
+        lp.col_hi = {10.0, 5.0};
+        lp.is_integer = {false, true};
+        lp.row_lo = {0.0}; lp.row_hi = {kInf};
+        lp.A = from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, -1.0});
+        const auto d = search::infer_implied_integers_ex(lp, o);
+        CHECK(d.dual_rational == 1);
+        CHECK(lp.is_integer[0]);
+    }
+    {
+        // Working box tighter than the model's: [0.5, 10] in force while the
+        // model says [0, 10]. The working box decides.
+        LpProblem lp;
+        lp.c = {1.0, 10.0};
+        lp.col_lo = {0.0, 0.0};
+        lp.col_hi = {10.0, 5.0};
+        lp.is_integer = {false, true};
+        lp.row_lo = {0.0}; lp.row_hi = {kInf};
+        lp.A = from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, -1.0});
+        std::vector<double> lo = {0.5, 0.0}, hi = {10.0, 5.0};
+        search::infer_implied_integers_ex(lp, o, &lo, &hi);
+        CHECK(!lp.is_integer[0]);
+        CHECK(lo[0] == 0.5);
+    }
+}
 }  // namespace
 
 void test_network_component_is_atomic() {
@@ -233,6 +465,8 @@ int main() {
     test_c1_marks();
     test_dual_rational_marks_z();
     test_tu_network_block_pair();
+    test_implied_int_pinned_counterexamples();
+    test_implied_int_oracle();
     
     // --- Regression: implied integrality must never fire on a pure LP ------
     //

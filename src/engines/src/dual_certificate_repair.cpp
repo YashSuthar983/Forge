@@ -1,5 +1,6 @@
 #include "simplex_prepared.hpp"
 #include "forge/core/env_switches.hpp"
+#include "forge/core/work_clock.hpp"
 #include "forge/certify/finalize.hpp"
 #include "forge/model/exact.hpp"
 
@@ -18,13 +19,14 @@ using model::Rational;
 // decide whether any proposed witness is useful.
 bool refined_basis_dual(const model::LpProblem& p, core::RawResult& raw,
                         const SimplexOptions& opts, SimplexDiagnostics& diag) {
+    core::WorkScope work_scope_(core::WorkCat::Exact);
     const auto m = static_cast<std::size_t>(p.n_rows());
     const auto n = static_cast<std::size_t>(p.n_cols());
     if (raw.certificate_basis.size() != m || raw.y.size() != m || p.maximize) return false;
-    const auto started = std::chrono::steady_clock::now();
+    const auto started = forge::core::SolverClock::now();
     const auto expired = [&] {
         return opts.time_limit_s > 0 &&
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() >= opts.time_limit_s;
+            std::chrono::duration<double>(forge::core::SolverClock::now() - started).count() >= opts.time_limit_s;
     };
     const auto csc = sparse::to_csc(p.A);
     const auto& cp = csc.pattern.col_ptr();
@@ -153,21 +155,22 @@ bool refined_basis_dual(const model::LpProblem& p, core::RawResult& raw,
 // generator: only the independent exact Lagrangian computation can accept it.
 bool repair_simplex_dual(const model::LpProblem& p, core::RawResult& raw,
                          const SimplexOptions& opts, SimplexDiagnostics& diag) {
+    core::WorkScope work_scope_(core::WorkCat::Exact);
     const auto m = static_cast<std::size_t>(p.n_rows());
     const auto n = static_cast<std::size_t>(p.n_cols());
     if (raw.y.size() != m || p.maximize) return false;
-    const auto started = std::chrono::steady_clock::now();
+    const auto started = forge::core::SolverClock::now();
     const auto remaining = [&] {
         return opts.time_limit_s > 0 ? opts.time_limit_s -
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() : 0;
+            std::chrono::duration<double>(forge::core::SolverClock::now() - started).count() : 0;
     };
     if (raw.exact_dual.empty()) {
-        const auto refinement_started = std::chrono::steady_clock::now();
+        const auto refinement_started = forge::core::SolverClock::now();
         const bool refined = refined_basis_dual(p, raw, opts, diag);
         if (core::env_switches().certificate_debug)
             std::fprintf(stderr, "certificate dyadic refinement: m=%zu n=%zu accepted=%d elapsed=%.6f\n",
                 m, n, refined ? 1 : 0,
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - refinement_started).count());
+                std::chrono::duration<double>(forge::core::SolverClock::now() - refinement_started).count());
         if (refined) return true;
         if (opts.time_limit_s > 0 && remaining() <= 0) return false;
         certify::repair_dual_certificate(p, raw,
@@ -289,10 +292,10 @@ bool repair_simplex_support(const model::LpProblem& p, core::RawResult& raw,
     if (p.maximize || raw.y.size() != m || raw.x.size() != n || m == 0 ||
         diag.certificate_iterations >= simplex_certificate_pivot_allowance ||
         (opts.max_iterations > 0 && diag.iterations >= opts.max_iterations)) return false;
-    const auto started = std::chrono::steady_clock::now();
+    const auto started = forge::core::SolverClock::now();
     const auto remaining = [&] {
         return opts.time_limit_s > 0 ? opts.time_limit_s -
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() : 0;
+            std::chrono::duration<double>(forge::core::SolverClock::now() - started).count() : 0;
     };
     const auto expired = [&] { return opts.time_limit_s > 0 && remaining() <= 0; };
     constexpr double radius = 1e-10;

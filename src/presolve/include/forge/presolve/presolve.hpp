@@ -5,6 +5,7 @@
 #pragma once
 
 #include "forge/core/result.hpp"
+#include "forge/core/work_clock.hpp"
 #include "forge/model/lp.hpp"
 
 #include <chrono>
@@ -78,14 +79,16 @@ struct PresolveOptions {
     Index max_aggregation_row_nnz = 32;
     int sparsification_passes = 2;
     Index max_domain_probes = 64;
-    // Wall-clock point after which no new reduction starts. Every reduction
-    // is complete and journaled when it is made, so stopping between two of
-    // them leaves a valid, smaller presolve. max() = no deadline.
-    std::chrono::steady_clock::time_point deadline =
-        std::chrono::steady_clock::time_point::max();
+    // Point on the solver clock after which no new reduction starts. Every
+    // reduction is complete and journaled when it is made, so stopping
+    // between two of them leaves a valid, smaller presolve. max() = no
+    // deadline. The solver clock is wall time, or work time under
+    // --deterministic, where a wall-clock stop would make the presolved
+    // model (and everything after it) depend on machine load.
+    core::SolverClock::time_point deadline = core::SolverClock::time_point::max();
     bool past_deadline() const {
-        return deadline != std::chrono::steady_clock::time_point::max() &&
-               std::chrono::steady_clock::now() >= deadline;
+        return deadline != core::SolverClock::time_point::max() &&
+               core::SolverClock::now() >= deadline;
     }
 };
 

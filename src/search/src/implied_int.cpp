@@ -1,4 +1,5 @@
 #include "forge/search/implied_int.hpp"
+#include "forge/core/work_clock.hpp"
 #include "forge/sparse/csc.hpp"
 
 #include <chrono>
@@ -6,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace forge::search {
@@ -17,12 +19,12 @@ namespace {
 // netdiversion (119589 x 129180) against a 10 s solver limit -- 49204 ms ->
 // 52.6 ms with --no-implied-int. Checks have to be where the loop is.
 struct IiDeadline {
-    std::chrono::steady_clock::time_point t0{};
+    forge::core::SolverClock::time_point t0{};
     double limit = 0.0;
     bool over() const {
         return limit > 0.0 &&
                std::chrono::duration<double>(
-                   std::chrono::steady_clock::now() - t0).count() > limit;
+                   forge::core::SolverClock::now() - t0).count() > limit;
     }
 };
 // Poll every 256 columns: frequent enough to bound a quadratic rule, rare
@@ -51,254 +53,253 @@ inline bool fixed_int(const model::LpProblem& lp, Index j, f64 tol) {
     return nearly_int(lp.col_lo[sz(j)], tol);
 }
 
-std::uint64_t infer_equality_pm1(model::LpProblem& p, f64 tol,
-                    const IiDeadline& dl) {
-    const Index m = p.n_rows(), n = p.n_cols();
-    if (p.is_integer.size() != sz(n))
-        p.is_integer.assign(sz(n), false);
-    const auto& rp = p.A.pattern.row_ptr();
-    const auto& ci = p.A.pattern.col_idx();
-    const auto& av = p.A.vals;
-    std::uint64_t added = 0;
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (Index j = 0; j < n; ++j) {
-            if ((static_cast<std::uint64_t>(j) & kIiPollMask) == 0 && dl.over())
-                break;
-            if (p.is_integer[sz(j)]) continue;
-            bool appears = false, implied = true;
-            for (Index i = 0; i < m && implied; ++i) {
-                f64 aj = 0.0;
-                for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
-                    if (ci[sz(k)] == j) aj += av[sz(k)];
-                if (std::fabs(aj) <= tol) continue;
-                appears = true;
-                if (!is_eq_row(p, i, tol) || std::fabs(std::fabs(aj) - 1.0) > tol) {
-                    implied = false;
-                    break;
-                }
-                for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
-                    const Index q = ci[sz(k)];
-                    if (q == j) continue;
-                    const bool ok_int =
-                        p.is_integer[sz(q)] || fixed_int(p, q, tol);
-                    if (!ok_int || !nearly_int(av[sz(k)], tol)) {
-                        implied = false;
-                        break;
-                    }
-                }
-            }
-            if (appears && implied) {
-                p.is_integer[sz(j)] = true;
-                ++added;
-                changed = true;
-            }
-        }
-    }
-    return added;
-}
+inline std::size_t szo(core::Offset k) { return static_cast<std::size_t>(k); }
 
-// Validate a whole equality-connected continuous subsystem before changing
-// any integrality flag. Integer and fixed columns are external RHS terms.
-std::uint64_t infer_network(model::LpProblem& p, f64 tol,
-                            const IiDeadline& dl) {
-    const Index m = p.n_rows(), n = p.n_cols();
-    if (p.is_integer.size() != sz(n)) p.is_integer.assign(sz(n), false);
-    const auto csc = sparse::to_csc(p.A);
-    const auto& cp = csc.pattern.col_ptr();
-    const auto& ri = csc.pattern.row_idx();
-    const auto& rp = p.A.pattern.row_ptr();
-    const auto& ci = p.A.pattern.col_idx();
-    const auto& av = p.A.vals;
-    std::vector<char> eq(sz(m), 0), network(sz(n), 0), seen(sz(n), 0);
-    std::vector<Index> component_id(sz(n), -1), row_id(sz(m), -1);
-    for (Index i = 0; i < m; ++i) eq[sz(i)] = is_eq_row(p, i, tol);
-    for (Index j = 0; j < n; ++j) {
-        if ((static_cast<std::uint64_t>(j) & kIiPollMask) == 0 && dl.over())
-            return 0;
-        int plus = 0, minus = 0;
-        bool valid = true;
-        for (core::Offset k = cp[sz(j)]; k < cp[sz(j) + 1]; ++k) {
-            const f64 v = csc.vals[sz(k)];
-            if (std::fabs(v) <= tol) continue;
-            if (std::fabs(v - 1.0) <= tol) ++plus;
-            else if (std::fabs(v + 1.0) <= tol) ++minus;
-            else valid = false;
-        }
-        network[sz(j)] = valid && plus <= 1 && minus <= 1 && plus + minus > 0;
-    }
-    std::uint64_t added = 0;
-    for (Index seed = 0; seed < n; ++seed) {
-        if (dl.over()) break;
-        if (seen[sz(seed)] || p.is_integer[sz(seed)] || fixed_int(p, seed, tol))
-            continue;
-        std::vector<Index> columns{seed}, rows;
-        seen[sz(seed)] = 1;
-        component_id[sz(seed)] = seed;
-        // Collect even invalid continuous neighbours: skipping one would
-        // leave a partially marked component, which is the A2 defect.
-        for (std::size_t head = 0; head < columns.size(); ++head) {
-            if (dl.over()) return added;
-            const Index j = columns[head];
-            for (core::Offset k = cp[sz(j)]; k < cp[sz(j) + 1]; ++k) {
-                if (std::fabs(csc.vals[sz(k)]) <= tol) continue;
-                const Index i = ri[sz(k)];
-                if (row_id[sz(i)] == seed) continue;
-                row_id[sz(i)] = seed;
-                rows.push_back(i);
-                if (!eq[sz(i)]) continue;
-                for (core::Offset q = rp[sz(i)]; q < rp[sz(i) + 1]; ++q) {
-                    const Index col = ci[sz(q)];
-                    if (std::fabs(av[sz(q)]) <= tol || seen[sz(col)] ||
-                        p.is_integer[sz(col)] || fixed_int(p, col, tol)) continue;
-                    seen[sz(col)] = 1;
-                    component_id[sz(col)] = seed;
-                    columns.push_back(col);
-                }
-            }
-        }
-        bool valid = true;
-        for (Index j : columns) {
-            if (!network[sz(j)] ||
-                (std::isfinite(p.col_lo[sz(j)]) && !nearly_int(p.col_lo[sz(j)], tol)) ||
-                (std::isfinite(p.col_hi[sz(j)]) && !nearly_int(p.col_hi[sz(j)], tol)))
-                valid = false;
-        }
-        for (Index i : rows) {
-            if (dl.over()) return added;
-            if (!eq[sz(i)]) { valid = false; continue; }
-            for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
-                if (std::fabs(av[sz(k)]) <= tol) continue;
-                const Index j = ci[sz(k)];
-                if (component_id[sz(j)] == seed) continue;
-                if ((!p.is_integer[sz(j)] && !fixed_int(p, j, tol)) ||
-                    !nearly_int(av[sz(k)], tol)) valid = false;
-            }
-        }
-        if (!valid) continue;
-        for (Index j : columns) {
-            p.is_integer[sz(j)] = true;
-            ++added;
-        }
-    }
-    return added;
-}
+// The matrix with duplicate (row, column) entries summed and exact zeros
+// dropped, in both orientations. Every rule below reads coefficients from
+// here, so a column split over two entries of one row is judged by its sum,
+// and no rule rescans the matrix per column: each one is O(nnz). The rules
+// used to find column j's coefficients by walking every row of the matrix,
+// O(n * nnz), and spent their whole time budget on large models finding
+// nothing.
+struct MergedMatrix {
+    std::vector<core::Offset> rptr, cptr;
+    std::vector<Index> rcol, crow;
+    std::vector<f64> rval, cval;
+};
 
-// Consecutive-ones: 0/1 coefficients, ones in each column form an interval
-// of row indices (current order). Equality rows only.
-std::uint64_t infer_consecutive_ones(model::LpProblem& p, f64 tol,
-                    const IiDeadline& dl) {
-    const Index m = p.n_rows(), n = p.n_cols();
-    if (p.is_integer.size() != sz(n))
-        p.is_integer.assign(sz(n), false);
-
-    const auto& rp = p.A.pattern.row_ptr();
-    const auto& ci = p.A.pattern.col_idx();
-    const auto& av = p.A.vals;
-
-    std::vector<char> eq(sz(m), 0);
-    Index n_eq = 0;
+MergedMatrix build_merged(const model::LpProblem& lp) {
+    const Index m = lp.n_rows(), n = lp.n_cols();
+    const auto& rp = lp.A.pattern.row_ptr();
+    const auto& ci = lp.A.pattern.col_idx();
+    const auto& av = lp.A.vals;
+    MergedMatrix M;
+    M.rptr.assign(sz(m) + 1, 0);
+    M.rcol.reserve(av.size());
+    M.rval.reserve(av.size());
+    std::vector<Index> stamp(sz(n), -1);
+    std::vector<std::size_t> pos(sz(n), 0);
     for (Index i = 0; i < m; ++i) {
-        if (is_eq_row(p, i, tol)) {
-            eq[sz(i)] = 1;
-            ++n_eq;
-        }
-    }
-    if (n_eq == 0) return 0;
-
-    // Per column: list of equality rows with nonzero; must be 0/1 and interval.
-    std::vector<char> c1_col(sz(n), 0);
-    for (Index j = 0; j < n; ++j) {
-        if ((static_cast<std::uint64_t>(j) & kIiPollMask) == 0 && dl.over())
-            break;
-        Index first = -1, last = -1;
-        int nnz = 0;
-        bool bad = false;
-        for (Index i = 0; i < m; ++i) {
-            if (!eq[sz(i)]) {
-                // Non-equality row must not contain j.
-                for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
-                    if (ci[sz(k)] == j && std::fabs(av[sz(k)]) > tol) {
-                        bad = true;
-                        break;
-                    }
-                }
-                if (bad) break;
-                continue;
-            }
-            f64 aj = 0.0;
-            for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
-                if (ci[sz(k)] == j) aj += av[sz(k)];
-            if (std::fabs(aj) <= tol) continue;
-            if (std::fabs(aj - 1.0) > tol) {
-                bad = true;
-                break;
-            }
-            if (first < 0) first = i;
-            last = i;
-            ++nnz;
-        }
-        if (bad || nnz == 0 || first < 0) continue;
-        // Interval: every equality row between first and last must have the 1.
-        int expect = 0;
-        for (Index i = first; i <= last; ++i) {
-            if (!eq[sz(i)]) continue;
-            f64 aj = 0.0;
-            for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
-                if (ci[sz(k)] == j) aj += av[sz(k)];
-            if (std::fabs(aj - 1.0) <= tol)
-                ++expect;
-            else if (std::fabs(aj) > tol) {
-                bad = true;
-                break;
+        const std::size_t start = M.rcol.size();
+        for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+            const Index j = ci[szo(k)];
+            if (stamp[sz(j)] == i) {
+                M.rval[pos[sz(j)]] += av[szo(k)];
             } else {
-                bad = true;  // gap in equality block
-                break;
+                stamp[sz(j)] = i;
+                pos[sz(j)] = M.rcol.size();
+                M.rcol.push_back(j);
+                M.rval.push_back(av[szo(k)]);
             }
         }
-        if (!bad && expect == nnz) c1_col[sz(j)] = 1;
+        std::size_t w = start;
+        for (std::size_t t = start; t < M.rcol.size(); ++t) {
+            if (M.rval[t] == 0.0) continue;
+            M.rcol[w] = M.rcol[t];
+            M.rval[w] = M.rval[t];
+            ++w;
+        }
+        M.rcol.resize(w);
+        M.rval.resize(w);
+        M.rptr[sz(i) + 1] = static_cast<core::Offset>(w);
     }
+    M.cptr.assign(sz(n) + 1, 0);
+    for (const Index j : M.rcol) ++M.cptr[sz(j) + 1];
+    for (Index j = 0; j < n; ++j) M.cptr[sz(j) + 1] += M.cptr[sz(j)];
+    M.crow.resize(M.rcol.size());
+    M.cval.resize(M.rcol.size());
+    std::vector<core::Offset> fill(M.cptr.begin(), M.cptr.end() - 1);
+    for (Index i = 0; i < m; ++i)
+        for (core::Offset k = M.rptr[sz(i)]; k < M.rptr[sz(i) + 1]; ++k) {
+            const Index j = M.rcol[szo(k)];
+            const std::size_t at = szo(fill[sz(j)]++);
+            M.crow[at] = i;      // ascending row order within each column
+            M.cval[at] = M.rval[szo(k)];
+        }
+    return M;
+}
 
-    // Subsystem of C1 columns: all continuous with integer finite bounds
-    // and only C1/integer companions → mark.
-    std::uint64_t added = 0;
+// The box the rules reason about: the caller's working bounds when it passes
+// them (mip_presolve's box, already tighter than lp.col_lo/col_hi), else the
+// model's own. Integrality is implied for the problem actually being solved,
+// so its bounds are the ones that have to be integral.
+struct Box {
+    const std::vector<f64>& lo;
+    const std::vector<f64>& hi;
+    f64 tol;
+    bool fixed_int(Index j) const {
+        const f64 l = lo[sz(j)], h = hi[sz(j)];
+        return std::isfinite(l) && std::isfinite(h) && std::fabs(l - h) <= tol &&
+               nearly_int(l, tol);
+    }
+    // Every finite bound integral (an infinite one constrains nothing).
+    bool int_bounds(Index j) const {
+        const f64 l = lo[sz(j)], h = hi[sz(j)];
+        return (!std::isfinite(l) || nearly_int(l, tol)) &&
+               (!std::isfinite(h) || nearly_int(h, tol));
+    }
+};
+
+// Equality rows with an integral right-hand side, x_j with coefficient +-1
+// and every other term an integral multiple of an integer (or integer-fixed)
+// column: x_j = rhs - (integer) is integral at EVERY feasible point.
+//
+// Incremental: bad[i] counts row i's terms that are not an integral
+// coefficient on an integer-like column. A row serves column j when it is
+// such an equality, j's coefficient is +-1 and j is its only bad term; j is
+// marked once every row it appears in serves it. Marking j removes one bad
+// term from each of its rows, and a row whose count drops to one starts
+// serving its last bad column. Each row reaches a count of one at most once,
+// so the whole cascade is O(nnz).
+std::uint64_t infer_equality_pm1(model::LpProblem& p, const MergedMatrix& M,
+                                 const Box& b, const std::vector<char>& eq,
+                                 f64 tol, const IiDeadline& dl) {
+    const Index m = p.n_rows(), n = p.n_cols();
+    const auto int_like = [&](Index j) { return p.is_integer[sz(j)] || b.fixed_int(j); };
+    const auto candidate = [&](Index j) { return !p.is_integer[sz(j)] && !b.fixed_int(j); };
+    const auto deg = [&](Index j) { return M.cptr[sz(j) + 1] - M.cptr[sz(j)]; };
+    std::vector<Index> bad(sz(m), 0);
+    for (Index i = 0; i < m; ++i)
+        for (core::Offset t = M.rptr[sz(i)]; t < M.rptr[sz(i) + 1]; ++t)
+            if (!int_like(M.rcol[szo(t)]) || !nearly_int(M.rval[szo(t)], tol)) ++bad[sz(i)];
+    const auto serves = [&](Index i, f64 a) {
+        return eq[sz(i)] && std::fabs(std::fabs(a) - 1.0) <= tol && bad[sz(i)] == 1;
+    };
+    std::vector<core::Offset> served(sz(n), 0);
+    std::vector<Index> queue;
     for (Index j = 0; j < n; ++j) {
-        if ((static_cast<std::uint64_t>(j) & kIiPollMask) == 0 && dl.over())
-            break;
-        if (p.is_integer[sz(j)] || !c1_col[sz(j)]) continue;
-        if (std::isfinite(p.col_lo[sz(j)]) && !nearly_int(p.col_lo[sz(j)], tol))
-            continue;
-        if (std::isfinite(p.col_hi[sz(j)]) && !nearly_int(p.col_hi[sz(j)], tol))
-            continue;
-
-        bool ok = true, appears = false;
-        for (Index i = 0; i < m && ok; ++i) {
-            f64 aj = 0.0;
-            for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
-                if (ci[sz(k)] == j) aj += av[sz(k)];
-            if (std::fabs(aj) <= tol) continue;
-            appears = true;
-            if (!eq[sz(i)]) {
-                ok = false;
+        if (!candidate(j) || deg(j) == 0) continue;
+        for (core::Offset k = M.cptr[sz(j)]; k < M.cptr[sz(j) + 1]; ++k)
+            if (serves(M.crow[szo(k)], M.cval[szo(k)])) ++served[sz(j)];
+        if (served[sz(j)] == deg(j)) queue.push_back(j);
+    }
+    std::uint64_t added = 0;
+    for (std::size_t head = 0; head < queue.size(); ++head) {
+        if ((head & kIiPollMask) == 0 && dl.over()) break;
+        const Index j = queue[head];
+        if (p.is_integer[sz(j)]) continue;
+        p.is_integer[sz(j)] = true;
+        ++added;
+        // j's terms are +-1 on a now-integer column: no longer bad.
+        for (core::Offset k = M.cptr[sz(j)]; k < M.cptr[sz(j) + 1]; ++k) {
+            const Index i = M.crow[szo(k)];
+            if (--bad[sz(i)] != 1) continue;
+            for (core::Offset t = M.rptr[sz(i)]; t < M.rptr[sz(i) + 1]; ++t) {
+                const Index q = M.rcol[szo(t)];
+                if (int_like(q) && nearly_int(M.rval[szo(t)], tol)) continue;
+                // The row's one remaining bad term.
+                if (candidate(q) && serves(i, M.rval[szo(t)]) &&
+                    ++served[sz(q)] == deg(q))
+                    queue.push_back(q);
                 break;
             }
-            for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
-                const Index q = ci[sz(k)];
-                if (std::fabs(av[sz(k)]) <= tol) continue;
-                if (!c1_col[sz(q)] && !p.is_integer[sz(q)] &&
-                    !fixed_int(p, q, tol)) {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if (appears && ok) {
-            p.is_integer[sz(j)] = true;
-            ++added;
         }
     }
     return added;
+}
+
+struct ComponentMarks {
+    std::uint64_t network = 0;
+    std::uint64_t consecutive_ones = 0;
+};
+
+// Network and interval (consecutive-ones) matrices are totally unimodular.
+// Both rules are about a WHOLE equality-connected continuous subsystem:
+// collect the continuous columns reachable from a seed through equality rows,
+// and the rows they touch. With the integer (and integer-fixed) columns at
+// any integral values, those continuous columns solve
+//     N x = b - (integer terms),   lo <= x <= hi,
+// and if N is TU and the right-hand side and every bound are integral, an
+// optimal vertex is integral: marking the whole subsystem integer keeps an
+// optimum. That needs, for the subsystem as a unit,
+//   - every touched row an equality with an integral side,
+//   - every term outside the subsystem an integral coefficient on an integer
+//     or integer-fixed column,
+//   - every finite bound of every subsystem column integral (working box),
+//   - N network (each column at most one +1 and one -1) or interval (each
+//     column all +1 on a run of consecutive equality rows).
+// A column checked only against its own rows is not enough: a companion with
+// a fractional bound, a fractional coefficient on an integer column, or a
+// further row with a non-TU continuous column all force fractional values.
+// The consecutive-ones rule used to check row by row and marked such columns
+// (x + 0.5 y + z = 3 with y binary: x = 2.5 at the optimum).
+ComponentMarks infer_tu_components(model::LpProblem& p, const MergedMatrix& M,
+                                   const Box& b, const std::vector<char>& eq,
+                                   bool want_network, bool want_c1, f64 tol,
+                                   const IiDeadline& dl) {
+    ComponentMarks out;
+    if (!want_network && !want_c1) return out;
+    const Index m = p.n_rows(), n = p.n_cols();
+    const auto int_like = [&](Index j) { return p.is_integer[sz(j)] || b.fixed_int(j); };
+    const auto candidate = [&](Index j) { return !p.is_integer[sz(j)] && !b.fixed_int(j); };
+    std::vector<Index> eq_rank(sz(m), -1);
+    {
+        Index r = 0;
+        for (Index i = 0; i < m; ++i)
+            if (eq[sz(i)]) eq_rank[sz(i)] = r++;
+    }
+    std::vector<Index> comp_of(sz(n), -1), row_seen(sz(m), -1);
+    std::vector<Index> columns, rows;
+    for (Index seed = 0; seed < n; ++seed) {
+        if ((static_cast<std::uint64_t>(seed) & kIiPollMask) == 0 && dl.over()) break;
+        if (comp_of[sz(seed)] >= 0 || !candidate(seed)) continue;
+        columns.assign(1, seed);
+        rows.clear();
+        comp_of[sz(seed)] = seed;
+        for (std::size_t head = 0; head < columns.size(); ++head) {
+            const Index j = columns[head];
+            for (core::Offset k = M.cptr[sz(j)]; k < M.cptr[sz(j) + 1]; ++k) {
+                const Index i = M.crow[szo(k)];
+                if (row_seen[sz(i)] == seed) continue;
+                row_seen[sz(i)] = seed;
+                rows.push_back(i);
+                if (!eq[sz(i)]) continue;   // touched, and invalidates below
+                for (core::Offset t = M.rptr[sz(i)]; t < M.rptr[sz(i) + 1]; ++t) {
+                    const Index q = M.rcol[szo(t)];
+                    if (comp_of[sz(q)] >= 0 || !candidate(q)) continue;
+                    comp_of[sz(q)] = seed;
+                    columns.push_back(q);
+                }
+            }
+        }
+        bool valid = !rows.empty();
+        for (const Index i : rows) {
+            if (!eq[sz(i)]) { valid = false; break; }
+            for (core::Offset t = M.rptr[sz(i)]; t < M.rptr[sz(i) + 1] && valid; ++t) {
+                const Index q = M.rcol[szo(t)];
+                if (comp_of[sz(q)] == seed) continue;
+                if (!int_like(q) || !nearly_int(M.rval[szo(t)], tol)) valid = false;
+            }
+            if (!valid) break;
+        }
+        for (const Index j : columns)
+            if (valid && !b.int_bounds(j)) valid = false;
+        if (!valid) continue;
+        bool network = want_network, interval = want_c1;
+        for (const Index j : columns) {
+            int plus = 0, minus = 0;
+            bool other = false;
+            Index rmin = std::numeric_limits<Index>::max(), rmax = -1, count = 0;
+            for (core::Offset k = M.cptr[sz(j)]; k < M.cptr[sz(j) + 1]; ++k) {
+                const f64 a = M.cval[szo(k)];
+                if (std::fabs(a - 1.0) <= tol) ++plus;
+                else if (std::fabs(a + 1.0) <= tol) ++minus;
+                else other = true;
+                const Index r = eq_rank[sz(M.crow[szo(k)])];
+                rmin = std::min(rmin, r);
+                rmax = std::max(rmax, r);
+                ++count;
+            }
+            if (other || plus > 1 || minus > 1 || plus + minus == 0) network = false;
+            if (other || minus > 0 || count == 0 || rmax - rmin + 1 != count) interval = false;
+            if (!network && !interval) break;
+        }
+        if (!network && !interval) continue;
+        for (const Index j : columns) p.is_integer[sz(j)] = true;
+        if (network) out.network += columns.size();
+        else out.consecutive_ones += columns.size();
+    }
+    return out;
 }
 
 // --- Paper arXiv:2504.07209 §3.1 / §7.1 (Theorem 3.2, Cor. 3.3, Algorithm 1) ---
@@ -418,68 +419,107 @@ struct UnionFind {
     }
 };
 
-// Corollary 3.3 (dual detection): scale rows where column k appears so that
-// a_jk = ±1 and all other coefficients / RHS are integral.
-std::uint64_t infer_dual_rational(model::LpProblem& p, f64 tol,
-                    const IiDeadline& dl) {
+inline f64 gcd_integral(f64 a, f64 b) {
+    // Exact for integral doubles below 2^53 (fmod of such values is exact).
+    while (b != 0.0) {
+        const f64 t = std::fmod(a, b);
+        a = b;
+        b = t;
+    }
+    return a;
+}
+
+// Corollary 3.3 (dual detection). Continuous x_k whose every row is an
+// equality or a one-sided row with integral data, in which k's coefficient
+// divides every coefficient and the side (|a_k| = gcd of the row), and whose
+// every other term sits on an integer or integer-fixed column. With those
+// columns at integral values each row bounds x_k by an integer, and an
+// equality pins it to one. Without an equality, x_k ranges over an interval
+// whose endpoints are those row bounds AND x_k's own bounds; an optimum sits
+// at an endpoint (any integer of the interval when c_k = 0), so x_k is
+// integral at some optimum only when its own finite bounds are integral too.
+// That check was missing: x_k in [0.5, 10] with x_k >= y (y integer) and
+// c_k > 0 was marked, its lower bound snapped to 1, and the optimum 0.5 cut
+// off (the netlib d2q06c wrong optimum that the pure-LP guard in bab.cpp
+// papered over).
+//
+// Incremental like infer_equality_pm1: cont[i] counts row i's terms on
+// columns that are not integer-like; a usable row serves k when k is its
+// only such term.
+std::uint64_t infer_dual_rational(model::LpProblem& p, const MergedMatrix& M,
+                                  const Box& b, const std::vector<char>& eq,
+                                  f64 tol, const IiDeadline& dl) {
     const Index m = p.n_rows(), n = p.n_cols();
-    if (p.is_integer.size() != sz(n))
-        p.is_integer.assign(sz(n), false);
-
-    const auto& rp = p.A.pattern.row_ptr();
-    const auto& ci = p.A.pattern.col_idx();
-    const auto& av = p.A.vals;
-
-    std::uint64_t added = 0;
-    for (Index k = 0; k < n; ++k) {
-        if ((static_cast<std::uint64_t>(k) & kIiPollMask) == 0 && dl.over())
-            break;
-        if (p.is_integer[sz(k)] || fixed_int(p, k, tol)) continue;
-
-        bool appears = false, ok = true;
-        for (Index i = 0; i < m && ok; ++i) {
-            f64 ak = 0.0;
-            for (core::Offset off = rp[sz(i)]; off < rp[sz(i) + 1]; ++off)
-                if (ci[sz(off)] == k) ak += av[sz(off)];
-            if (std::fabs(ak) <= tol) continue;
-            appears = true;
-            if (!row_integral_data(p, i, tol) || !row_tu_sense_ok(p, i, tol)) {
-                ok = false;
-                break;
-            }
-            const f64 pivot = ak;
-            f64 rhs = 0.0;
-            if (is_eq_row(p, i, tol)) {
-                rhs = p.row_lo[sz(i)];
-            } else if (!std::isfinite(p.row_lo[sz(i)])) {
-                rhs = p.row_hi[sz(i)];
-            } else if (!std::isfinite(p.row_hi[sz(i)])) {
-                rhs = p.row_lo[sz(i)];
-            } else {
-                ok = false;
-                break;
-            }
-            if (!nearly_int(rhs / pivot, tol)) {
-                ok = false;
-                break;
-            }
-            for (core::Offset off = rp[sz(i)]; off < rp[sz(i) + 1]; ++off) {
-                const Index s = ci[sz(off)];
-                if (std::fabs(av[sz(off)]) <= tol) continue;
-                if (!nearly_int(av[sz(off)] / pivot, tol)) {
-                    ok = false;
-                    break;
-                }
-                if (s == k) continue;
-                if (!p.is_integer[sz(s)] && !fixed_int(p, s, tol)) {
-                    ok = false;
-                    break;
-                }
-            }
+    const auto int_like = [&](Index j) { return p.is_integer[sz(j)] || b.fixed_int(j); };
+    const auto candidate = [&](Index j) { return !p.is_integer[sz(j)] && !b.fixed_int(j); };
+    const auto deg = [&](Index j) { return M.cptr[sz(j) + 1] - M.cptr[sz(j)]; };
+    constexpr f64 kExactInt = 9007199254740992.0;   // 2^53
+    std::vector<char> usable(sz(m), 0);
+    std::vector<f64> g(sz(m), 0.0), side(sz(m), 0.0);
+    for (Index i = 0; i < m; ++i) {
+        const f64 rl = p.row_lo[sz(i)], rh = p.row_hi[sz(i)];
+        f64 s;
+        if (eq[sz(i)]) s = rl;
+        else if (std::isfinite(rl) && !std::isfinite(rh)) s = rl;
+        else if (!std::isfinite(rl) && std::isfinite(rh)) s = rh;
+        else continue;   // ranged (or free) row
+        if (!nearly_int(s, tol)) continue;
+        f64 gg = 0.0;
+        bool ok = M.rptr[sz(i) + 1] > M.rptr[sz(i)];
+        for (core::Offset t = M.rptr[sz(i)]; t < M.rptr[sz(i) + 1] && ok; ++t) {
+            const f64 a = M.rval[szo(t)];
+            if (!nearly_int(a, tol) || std::fabs(a) >= kExactInt) ok = false;
+            else gg = gcd_integral(gg, std::fabs(std::round(a)));
         }
-        if (appears && ok) {
-            p.is_integer[sz(k)] = true;
-            ++added;
+        if (!ok || gg == 0.0) continue;
+        usable[sz(i)] = 1;
+        g[sz(i)] = gg;
+        side[sz(i)] = s;
+    }
+    std::vector<Index> cont(sz(m), 0);
+    for (Index i = 0; i < m; ++i)
+        for (core::Offset t = M.rptr[sz(i)]; t < M.rptr[sz(i) + 1]; ++t)
+            if (!int_like(M.rcol[szo(t)])) ++cont[sz(i)];
+    const auto serves = [&](Index i, f64 a) {
+        return usable[sz(i)] && cont[sz(i)] == 1 &&
+               std::fabs(std::fabs(std::round(a)) - g[sz(i)]) <= tol &&
+               nearly_int(side[sz(i)] / a, tol);
+    };
+    // Own-bound condition: integral finite bounds, or an equality row pins
+    // x_k to an integer at every feasible point anyway.
+    const auto bounds_ok = [&](Index k) {
+        if (b.int_bounds(k)) return true;
+        for (core::Offset t = M.cptr[sz(k)]; t < M.cptr[sz(k) + 1]; ++t)
+            if (eq[sz(M.crow[szo(t)])]) return true;
+        return false;
+    };
+    std::vector<core::Offset> served(sz(n), 0);
+    std::vector<Index> queue;
+    for (Index k = 0; k < n; ++k) {
+        if (!candidate(k) || deg(k) == 0) continue;
+        for (core::Offset t = M.cptr[sz(k)]; t < M.cptr[sz(k) + 1]; ++t)
+            if (serves(M.crow[szo(t)], M.cval[szo(t)])) ++served[sz(k)];
+        if (served[sz(k)] == deg(k) && bounds_ok(k)) queue.push_back(k);
+    }
+    std::uint64_t added = 0;
+    for (std::size_t head = 0; head < queue.size(); ++head) {
+        if ((head & kIiPollMask) == 0 && dl.over()) break;
+        const Index k = queue[head];
+        if (p.is_integer[sz(k)]) continue;
+        p.is_integer[sz(k)] = true;
+        ++added;
+        for (core::Offset t = M.cptr[sz(k)]; t < M.cptr[sz(k) + 1]; ++t) {
+            const Index i = M.crow[szo(t)];
+            if (--cont[sz(i)] != 1) continue;
+            for (core::Offset u = M.rptr[sz(i)]; u < M.rptr[sz(i) + 1]; ++u) {
+                const Index q = M.rcol[szo(u)];
+                if (int_like(q)) continue;
+                // The row's one remaining continuous term.
+                if (candidate(q) && serves(i, M.rval[szo(u)]) &&
+                    ++served[sz(q)] == deg(q) && bounds_ok(q))
+                    queue.push_back(q);
+                break;
+            }
         }
     }
     return added;
@@ -744,46 +784,57 @@ ImpliedIntDiagnostics infer_implied_integers_ex(
     std::vector<f64>* col_lo, std::vector<f64>* col_hi) {
     ImpliedIntDiagnostics diag;
     if (!opts.enabled) return diag;
-    // Deadline between rules. Each rule is a full pass over the matrix, so a
-    // per-rule check is both cheap and the right granularity.
-    const auto ii_t0 = std::chrono::steady_clock::now();
+    // Deadline between rules and inside each rule's loop.
+    const auto ii_t0 = forge::core::SolverClock::now();
     const IiDeadline dl{ii_t0, opts.time_limit_s};
     const auto ii_over = [&]() {
         return opts.time_limit_s > 0.0 &&
                std::chrono::duration<double>(
-                   std::chrono::steady_clock::now() - ii_t0).count() >
+                   forge::core::SolverClock::now() - ii_t0).count() >
                    opts.time_limit_s;
     };
     if (ii_over()) { diag.aborted_on_time = 1; return diag; }
+    const Index n = lp.n_cols(), m = lp.n_rows();
+    if (lp.is_integer.size() != sz(n)) lp.is_integer.assign(sz(n), false);
     // These rules change the discrete feasible set. A near-zero coefficient,
     // near-unit matrix entry, near-integer RHS, or near-equality is not an
     // exact TU/equality pattern: over a wide domain the discarded difference
     // can force a fractional value. Use exact representable data for the
     // structural proof; opts.tol remains only for conservative bound snaps.
     constexpr f64 proof_tol = 0.0;
+    const bool own_box = col_lo != nullptr && col_hi != nullptr &&
+                         col_lo->size() == sz(n) && col_hi->size() == sz(n);
+    const Box box{own_box ? *col_lo : lp.col_lo, own_box ? *col_hi : lp.col_hi,
+                  proof_tol};
+    const MergedMatrix M = build_merged(lp);
+    std::vector<char> eq(sz(m), 0);
+    for (Index i = 0; i < m; ++i) eq[sz(i)] = is_eq_row(lp, i, proof_tol) ? 1 : 0;
+
     if (opts.equality_pm1)
-        diag.equality_pm1 = infer_equality_pm1(lp, proof_tol, dl);
+        diag.equality_pm1 = infer_equality_pm1(lp, M, box, eq, proof_tol, dl);
     if (ii_over()) { diag.aborted_on_time = 1; return diag; }
-    if (opts.network) diag.network = infer_network(lp, proof_tol, dl);
-    if (ii_over()) { diag.aborted_on_time = 1; return diag; }
-    if (opts.consecutive_ones)
-        diag.consecutive_ones = infer_consecutive_ones(lp, proof_tol, dl);
+    if (opts.network || opts.consecutive_ones) {
+        const auto c = infer_tu_components(lp, M, box, eq, opts.network,
+                                           opts.consecutive_ones, proof_tol, dl);
+        diag.network = c.network;
+        diag.consecutive_ones = c.consecutive_ones;
+    }
     if (ii_over()) { diag.aborted_on_time = 1; return diag; }
     if (opts.dual_rational)
-        diag.dual_rational = infer_dual_rational(lp, proof_tol, dl);
+        diag.dual_rational = infer_dual_rational(lp, M, box, eq, proof_tol, dl);
     if (ii_over()) { diag.aborted_on_time = 1; return diag; }
     if (opts.tu_network_block) {
         diag.tu_network_block = infer_tu_network_block(lp, proof_tol, dl);
         diag.tu_network_transpose = infer_tu_network_transpose(lp, proof_tol, dl);
     }
-    // Cascade: TU marks may unlock more ±1 / dual inferences.
+    // Cascade: subsystem marks may unlock more +-1 / dual inferences.
     const std::uint64_t tu_extra = diag.network + diag.consecutive_ones +
                                    diag.tu_network_block +
                                    diag.tu_network_transpose;
-    if (opts.equality_pm1 && tu_extra > 0)
-        diag.equality_pm1 += infer_equality_pm1(lp, proof_tol, dl);
-    if (opts.dual_rational && tu_extra > 0)
-        diag.dual_rational += infer_dual_rational(lp, proof_tol, dl);
+    if (opts.equality_pm1 && tu_extra > 0 && !ii_over())
+        diag.equality_pm1 += infer_equality_pm1(lp, M, box, eq, proof_tol, dl);
+    if (opts.dual_rational && tu_extra > 0 && !ii_over())
+        diag.dual_rational += infer_dual_rational(lp, M, box, eq, proof_tol, dl);
     diag.total = diag.equality_pm1 + diag.network + diag.consecutive_ones +
                  diag.dual_rational + diag.tu_network_block +
                  diag.tu_network_transpose;

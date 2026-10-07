@@ -226,6 +226,10 @@ private:
     std::vector<bool> binary_;
     std::vector<Index> binary_cols_;
     std::vector<std::vector<Index>> adj_;  // indexed by literal
+    // adj_[l][0, adj_sorted_[l]) is a sorted base run; the rest is sorted
+    // runs plus a short unsorted tail of recent additions (see add_edge).
+    std::vector<std::uint32_t> adj_sorted_;
+    void absorb_tail(Index l);
     std::vector<std::vector<Index>> lit_cliques_;  // literal -> clique ids
     std::vector<Clique> cliques_;
     std::vector<ImpliedBound> implied_;

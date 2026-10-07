@@ -1000,13 +1000,52 @@ void test_cut_merge_requires_exact_normalized_coefficients() {
     cut.vals = {2.0, 2e-12}; cut.row_hi = 2.0 + 2e-6;
     forge::search::apply_cuts_inplace(lp, {cut}, o);
     CHECK(lp.n_rows() == 1);
-    CHECK(lp.row_hi[0] == cut.row_hi / 2.0);
+    // The cut enters with its derived-row margin (CutOptions::
+    // derived_cut_*_margin): reach 1 for x0, 1e6 for x1.
+    const double reach_sum = 2.0 * 1.0 + 2e-12 * 1e6;
+    const double margin = o.derived_cut_rel_margin * (std::fabs(cut.row_hi) + reach_sum) +
+                          o.derived_cut_abs_margin;
+    CHECK(std::fabs(lp.row_hi[0] - (cut.row_hi + margin) / 2.0) <= 1e-15);
 }
+
+// A cut computed in floating point is only as valid as that arithmetic, and
+// everything downstream reads the stored row as data. So a non-integral cut
+// is stored relaxed outward by its margin, an exact integer cut (cover,
+// clique, zero-half, nogood) is stored as given, and model rows are never
+// touched.
+void test_derived_cuts_enter_with_their_margin() {
+    forge::model::LpProblem lp;
+    lp.A = forge::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
+    lp.c = {0.0, 0.0}; lp.is_integer = {true, false};
+    lp.col_lo = {0.0, -3.0}; lp.col_hi = {1.0, 2.0};
+    lp.row_lo = {-forge::model::kInf}; lp.row_hi = {2.5};
+    forge::search::CutOptions o;
+    forge::search::CutRow frac;
+    frac.cols = {0, 1}; frac.vals = {0.5, -0.25};
+    frac.row_lo = -1.25; frac.row_hi = 0.75;
+    forge::search::CutRow exact;
+    exact.cols = {0}; exact.vals = {3.0};
+    exact.row_lo = -forge::model::kInf; exact.row_hi = 2.0;
+    forge::search::apply_cuts_inplace(lp, {frac, exact}, o);
+    CHECK(lp.n_rows() == 3);
+    CHECK(lp.row_hi[0] == 2.5);                       // model row untouched
+    const double reach_sum = 0.5 * 1.0 + 0.25 * 3.0;
+    const auto margin = [&](double side) {
+        return o.derived_cut_rel_margin * (std::fabs(side) + reach_sum) +
+               o.derived_cut_abs_margin;
+    };
+    CHECK(lp.row_hi[1] == 0.75 + margin(0.75));
+    CHECK(lp.row_lo[1] == -1.25 - margin(-1.25));
+    CHECK(lp.row_hi[2] == 2.0);                       // exact integer data
+    CHECK(lp.row_lo[2] == -forge::model::kInf);
+}
+
 
 int main() {
     test_gmi_dynamism_recovery();
     test_cut_merge_preserves_original_rows();
     test_cut_merge_requires_exact_normalized_coefficients();
+    test_derived_cuts_enter_with_their_margin();
     test_rc_tightening_skips_infinite_to_astronomical();
     test_gmi_structural_drop_relaxes_rhs();
     test_cut_retraction_round_trip();

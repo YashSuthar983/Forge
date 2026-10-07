@@ -165,11 +165,18 @@ void test_partial_is_not_optimal() {
 // each child's absolute gap is large; whatever is claimed Optimal must still
 // have a certified bound within the parent's own tolerance, and no reported
 // bound may pass the optimum.
+//
+// The optimum is the oracle's, not a solve's. With costs scaled by 1e5, a
+// solve's Optimal point may sit inside the feasibility tolerance and still be
+// worth 7e-4 less than the true optimum (seed 67: solver -7.0e-4, oracle 0;
+// the models have continuous columns), and an offset taken from it put "the
+// optimum" below bounds that were valid.
 void test_parent_gap_uses_parent_objective() {
     std::uint64_t optimal = 0;
     for (std::uint32_t seed = 1; seed <= 400; ++seed) {
         LpProblem a = as_minimize(make_random_milp(seed)), b = as_minimize(make_random_milp(seed + 500));
-        if (!solve_oracle(a).feasible || !solve_oracle(b).feasible) continue;
+        const auto oa = solve_oracle(a), ob = solve_oracle(b);
+        if (!oa.feasible || !ob.feasible) continue;
         for (auto* p : {&a, &b})
             for (auto& v : p->c) v *= 1e5;               // large child objectives
         auto lp = union_of({a, b}, 0, {});
@@ -177,12 +184,9 @@ void test_parent_gap_uses_parent_objective() {
         o.gap_tol = 1e-2;
         o.abs_gap_tol = 1e-6;
         // Make the parent objective small: cancel the components' optimum.
-        auto probe = options();
-        probe.component_solve = false;
-        BabDiagnostics pd;
-        auto pr = forge::search::solve_milp(lp, probe, pd);
-        if (pr.proposed_status != Status::Optimal) continue;
-        lp.obj_offset = -pr.objective + 1.0;
+        std::vector<double> x_opt = oa.x;
+        x_opt.insert(x_opt.end(), ob.x.begin(), ob.x.end());
+        lp.obj_offset += 1.0 - lp.objective(x_opt);
         BabDiagnostics d;
         auto raw = forge::search::solve_milp(lp, o, d);
         if (raw.proposed_status == Status::Optimal) {

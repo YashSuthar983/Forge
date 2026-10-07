@@ -1,4 +1,5 @@
 #include "forge/search/milp_presolve.hpp"
+#include "forge/core/work_clock.hpp"
 #include "forge/search/propagate.hpp"
 #include "binary_substitution.hpp"
 #include "column_merge.hpp"
@@ -14,7 +15,7 @@
 namespace forge::search {
 namespace {
 
-using Clock = std::chrono::steady_clock;
+using Clock = forge::core::SolverClock;
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 
 inline bool nearly_eq(f64 a, f64 b, f64 tol) {
@@ -60,6 +61,15 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
     for (Index i = 0; i < m0; ++i)
         for (const auto& rc : rows[sz(i)]) col_rows[sz(rc.first)].push_back(i);
 
+    // A fixed column leaves its rows in one pass per row, not one pass per
+    // (row, column): fix_column only marks the rows it touches, and
+    // clean_row substitutes every fixed column of a row and drops it. Erasing
+    // each column on its own rescanned the whole row every time, quadratic in
+    // the row length (supportcase7: 9 of 10 s of structural presolve). Row
+    // entries keep their column order, so the sides take the substitutions
+    // in the same order as before.
+    std::vector<char> row_dirty(sz(m0), 0);
+    std::vector<Index> dirty_rows;
     auto fix_column = [&](Index j, f64 value) {
         if (col_dead[sz(j)]) return;
         col_dead[sz(j)] = 1;
@@ -70,18 +80,31 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
         ++stats.fixed_cols;
         obj_offset += c[sz(j)] * value;
         for (const Index i : col_rows[sz(j)]) {
-            if (row_dead[sz(i)]) continue;
-            auto& row = rows[sz(i)];
-            for (const auto& rc : row) {
-                if (rc.first != j) continue;
-                if (std::isfinite(row_lo[sz(i)])) row_lo[sz(i)] -= rc.second * value;
-                if (std::isfinite(row_hi[sz(i)])) row_hi[sz(i)] -= rc.second * value;
-                break;
-            }
-            row.erase(std::remove_if(row.begin(), row.end(),
-                                     [&](const auto& p) { return p.first == j; }),
-                      row.end());
+            if (row_dead[sz(i)] || row_dirty[sz(i)]) continue;
+            row_dirty[sz(i)] = 1;
+            dirty_rows.push_back(i);
         }
+    };
+    auto clean_row = [&](Index i) {
+        if (!row_dirty[sz(i)]) return;
+        row_dirty[sz(i)] = 0;
+        auto& row = rows[sz(i)];
+        std::size_t keep = 0;
+        for (const auto& rc : row) {
+            if (!col_dead[sz(rc.first)]) {
+                row[keep++] = rc;
+                continue;
+            }
+            const f64 value = fixed_value[sz(rc.first)];
+            if (std::isfinite(row_lo[sz(i)])) row_lo[sz(i)] -= rc.second * value;
+            if (std::isfinite(row_hi[sz(i)])) row_hi[sz(i)] -= rc.second * value;
+        }
+        core::work_add(row.size(), ::forge::core::WorkTag::MilpPresolve);
+        row.resize(keep);
+    };
+    auto clean_rows = [&]() {
+        for (const Index i : dirty_rows) clean_row(i);
+        dirty_rows.clear();
     };
 
     const bool have_int = !lp.is_integer.empty();
@@ -93,9 +116,19 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
     };
 
     bool changed = true;
+    const auto out_of_time = [&]() {
+        return opts.time_limit_s > 0.0 &&
+               std::chrono::duration<double>(Clock::now() - t0).count() > opts.time_limit_s;
+    };
     while (changed && stats.rounds < opts.max_rounds) {
+        if (stats.rounds > 0 && out_of_time()) {
+            ++stats.rounds_stopped_on_time;
+            break;
+        }
         changed = false;
         ++stats.rounds;
+        core::work_add(static_cast<std::uint64_t>(lp.nnz()) / 2 +
+                       static_cast<std::uint64_t>(lp.n_rows() + lp.n_cols()), ::forge::core::WorkTag::MilpPresolve);
 
         // Bound propagation on the CURRENT rows (the working copy every other
         // reduction here edits: fixed columns removed, coefficients
@@ -122,24 +155,39 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
             const f64 kHuge = 1e9;   // a derived bound beyond this is noise, not information
             for (int sweep = 0; sweep < cap; ++sweep) {
                 std::uint64_t tightened_now = 0;
+                std::uint64_t rescan_work = 0;
                 for (Index i = 0; i < m0; ++i) {
                     if (row_dead[sz(i)]) continue;
                     const auto& row = rows[sz(i)];
                     if (row.empty()) continue;
                     const f64 rl = row_lo[sz(i)], rh = row_hi[sz(i)];
+                    // The row's activity range: finite parts, count of
+                    // infinite contributions (and the column behind a lone
+                    // one), and the magnitude every rounding error in the
+                    // sums is bounded by. `ops` counts the terms that went
+                    // into the sums: the row once, plus two per incremental
+                    // update below.
                     f64 min_fin = 0.0, max_fin = 0.0;
                     int min_inf = 0, max_inf = 0;
                     Index min_culprit = -1, max_culprit = -1;
                     f64 row_min_abs = 0.0, row_max_abs = 0.0;
-                    for (const auto& [j, a] : row) {
-                        const f64 lo = col_lo[sz(j)], hi = col_hi[sz(j)];
-                        const f64 lo_side = a > 0.0 ? lo : hi;     // minimises a*x
-                        const f64 hi_side = a > 0.0 ? hi : lo;     // maximises a*x
-                        if (std::isfinite(lo_side)) { min_fin += a * lo_side; row_min_abs += std::fabs(a * lo_side); }
-                        else { ++min_inf; min_culprit = j; }
-                        if (std::isfinite(hi_side)) { max_fin += a * hi_side; row_max_abs += std::fabs(a * hi_side); }
-                        else { ++max_inf; max_culprit = j; }
-                    }
+                    std::size_t ops = 0;
+                    const auto scan_row = [&]() {
+                        min_fin = max_fin = 0.0;
+                        min_inf = max_inf = 0;
+                        row_min_abs = row_max_abs = 0.0;
+                        for (const auto& [j, a] : row) {
+                            const f64 lo = col_lo[sz(j)], hi = col_hi[sz(j)];
+                            const f64 lo_side = a > 0.0 ? lo : hi;     // minimises a*x
+                            const f64 hi_side = a > 0.0 ? hi : lo;     // maximises a*x
+                            if (std::isfinite(lo_side)) { min_fin += a * lo_side; row_min_abs += std::fabs(a * lo_side); }
+                            else { ++min_inf; min_culprit = j; }
+                            if (std::isfinite(hi_side)) { max_fin += a * hi_side; row_max_abs += std::fabs(a * hi_side); }
+                            else { ++max_inf; max_culprit = j; }
+                        }
+                        ops = row.size();
+                    };
+                    scan_row();
                     for (const auto& [j, a] : row) {
                         if (a == 0.0 || !std::isfinite(a)) continue;
                         const f64 lo = col_lo[sz(j)], hi = col_hi[sz(j)];
@@ -158,7 +206,7 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
                         // budget of the sums it came from (not a fixed
                         // tolerance: a coarse one keeps a bound from ever
                         // landing exactly on a point, so nothing gets fixed).
-                        const f64 fac = (4.0 * static_cast<f64>(row.size()) + 8.0) *
+                        const f64 fac = (4.0 * static_cast<f64>(ops) + 8.0) *
                                         std::numeric_limits<f64>::epsilon();
                         const f64 inf = std::numeric_limits<f64>::infinity();
                         // a x + rmin <= ... <= rh  ->  a x <= rh - rmin
@@ -204,20 +252,46 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
                                 mark_infeasible();
                                 return out;
                             }
-                            // The row's activity changed with this bound: refresh it
-                            // for the columns still to come in this row.
-                            min_fin = 0.0; max_fin = 0.0; min_inf = max_inf = 0;
-                            for (const auto& [jj, aa] : row) {
-                                const f64 l2 = col_lo[sz(jj)], h2 = col_hi[sz(jj)];
-                                const f64 ls = aa > 0.0 ? l2 : h2, hs = aa > 0.0 ? h2 : l2;
-                                if (std::isfinite(ls)) min_fin += aa * ls; else { ++min_inf; min_culprit = jj; }
-                                if (std::isfinite(hs)) max_fin += aa * hs; else { ++max_inf; max_culprit = jj; }
+                            // The row's activity changed with this bound: move
+                            // column j's term for the columns still to come in
+                            // this row. Rescanning the row after every move was
+                            // quadratic in the row length and left the
+                            // magnitudes (the error budget) stale. An update
+                            // adds both terms' magnitudes and two terms to
+                            // `ops`, so the budget still bounds every rounding
+                            // in the sums. A rescan is needed only when a
+                            // second infinite contribution goes and the one
+                            // left is unknown, or when the updates outgrow the
+                            // row (keeps the budget near the fresh one).
+                            const f64 nlo_side = a > 0.0 ? col_lo[sz(j)] : col_hi[sz(j)];
+                            const f64 nhi_side = a > 0.0 ? col_hi[sz(j)] : col_lo[sz(j)];
+                            bool rescan = false;
+                            const auto shift = [&](f64 old_s, f64 new_s, f64& fin, int& n_inf,
+                                                   f64& abs_sum) {
+                                if (old_s == new_s) return;
+                                if (std::isfinite(old_s)) {
+                                    fin -= a * old_s;
+                                    abs_sum += std::fabs(a * old_s);
+                                } else if (--n_inf == 1) {
+                                    rescan = true;
+                                }
+                                fin += a * new_s;
+                                abs_sum += std::fabs(a * new_s);
+                            };
+                            shift(lo_side, nlo_side, min_fin, min_inf, row_min_abs);
+                            shift(hi_side, nhi_side, max_fin, max_inf, row_max_abs);
+                            ops += 2;
+                            if (rescan || ops > 2 * row.size() + 8) {
+                                scan_row();
+                                rescan_work += row.size();
                             }
                         }
                     }
                 }
                 stats.structural_fbbt_rounds += 1;
                 stats.structural_fbbt_work += live_nnz;
+                core::work_add(static_cast<std::uint64_t>(live_nnz) + rescan_work,
+                               ::forge::core::WorkTag::MilpPresolve);
                 stats.structural_fbbt_tightenings += tightened_now;
                 if (tightened_now > 0) changed = true;
                 else break;
@@ -256,6 +330,7 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
                 changed = true;
             }
         }
+        clean_rows();
 
         // 2a) Empty rows (every term eliminated by step 1, e.g. a row's only
         // column was fixed): the row's activity is now the constant 0, so it
@@ -309,8 +384,6 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
             row_dead[sz(i)] = 1;
             ++stats.singleton_rows;
             ++stats.redundant_rows;
-            auto& cr = col_rows[sz(j)];
-            cr.erase(std::remove(cr.begin(), cr.end(), i), cr.end());
             changed = true;
         }
 
@@ -358,10 +431,6 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
                     row_dead[sz(i)] = 1;
                     ++stats.redundant_rows;
                     ++stats.redundant_by_activity;
-                    for (const auto& rc : row) {
-                        auto& cr = col_rows[sz(rc.first)];
-                        cr.erase(std::remove(cr.begin(), cr.end(), i), cr.end());
-                    }
                     changed = true;
                     continue;
                 }
@@ -410,6 +479,58 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
             }
         }
 
+        // 2d) Side rounding. On a row whose columns are all integer and whose
+        // coefficients are all integers, every integer point's activity is a
+        // multiple of g = gcd|a_k|, so  activity <= b  is the same set as
+        // activity <= g*floor(b/g)  (and >= likewise with ceil). The integer
+        // points are unchanged and the LP relaxation only tightens; nothing
+        // changes in postsolve. An equality whose side is not a multiple of g
+        // has no integer point at all. The rounding treats a side within a
+        // relative 1e-9 of a multiple as that multiple, so a side like
+        // 5.9999999999 is never rounded down past a point the feasibility
+        // tolerance admits.
+        if (have_int && opts.side_rounding) {
+            const auto integral = [](f64 v) {
+                return std::isfinite(v) && std::fabs(v) < 0x1p52 && v == std::trunc(v);
+            };
+            for (Index i = 0; i < m0; ++i) {
+                if (row_dead[sz(i)]) continue;
+                clean_row(i);
+                const auto& row = rows[sz(i)];
+                if (row.empty()) continue;
+                f64 g = 0.0;
+                bool eligible = true;
+                for (const auto& [j, a] : row) {
+                    if (!lp.is_integer[sz(j)] || !integral(a) || a == 0.0) {
+                        eligible = false;
+                        break;
+                    }
+                    f64 p = g, q = std::fabs(a);
+                    while (q > 0.5) { const f64 t = std::fmod(p, q); p = q; q = t; }
+                    g = p;
+                }
+                if (!eligible || !(g >= 1.0)) continue;
+                const auto snap = [&](f64 side, bool upper) {
+                    const f64 t = side / g;
+                    const f64 eps = 1e-9 * std::max(1.0, std::fabs(t));
+                    return g * (upper ? std::floor(t + eps) : std::ceil(t - eps));
+                };
+                const f64 lo = row_lo[sz(i)], hi = row_hi[sz(i)];
+                const f64 new_hi = std::isfinite(hi) ? snap(hi, true) : hi;
+                const f64 new_lo = std::isfinite(lo) ? snap(lo, false) : lo;
+                if (new_lo > new_hi) {
+                    mark_infeasible();
+                    return out;
+                }
+                if (new_hi < hi || new_lo > lo) {
+                    row_hi[sz(i)] = std::min(hi, new_hi);
+                    row_lo[sz(i)] = std::max(lo, new_lo);
+                    ++stats.sides_rounded;
+                    changed = true;
+                }
+            }
+        }
+
         // A row's discrete support can be much smaller than its activity
         // interval (e.g. 3x+2y+2z=4 forces x=0,y=z=1). Enumerate only this
         // row, with no speculative global propagation. A fixing is published
@@ -418,6 +539,7 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
         if (have_int && opts.binary_row_support) {
             for (Index i = 0; i < m0; ++i) {
                 if (row_dead[sz(i)]) continue;
+                clean_row(i);
                 const auto& row = rows[sz(i)];
                 const auto k = row.size();
                 if (k < 2 || k > static_cast<std::size_t>(
@@ -441,6 +563,7 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
                 if (stats.binary_row_work > opts.binary_row_max_work ||
                     work > opts.binary_row_max_work - stats.binary_row_work) continue;
                 stats.binary_row_work += work;
+                core::work_add(work, ::forge::core::WorkTag::MilpPresolve);
                 ++stats.binary_rows_checked;
                 // Outward relaxation covers input feasibility tolerance and
                 // roundoff in the short long-double sum. It can miss fixings,
@@ -471,8 +594,8 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
                     mark_infeasible();
                     return out;
                 }
-                // Copy the support before fix_column mutates this and other
-                // row vectors. Existing postsolve stores every fixed value.
+                // Decide every fixing from the enumeration before applying
+                // any. Existing postsolve stores every fixed value.
                 std::vector<std::pair<Index, double>> fixes;
                 for (std::size_t t = 0; t < k; ++t) {
                     const auto bit = std::uint64_t{1} << t;
@@ -486,6 +609,7 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
                 }
             }
         }
+        clean_rows();
     }
 
     // Bounds and row sides that crossed by less than the tolerance (the
@@ -614,6 +738,7 @@ void add_core_stats(MilpPresolveStats& total, const MilpPresolveStats& part) {
     total.redundant_rows += part.redundant_rows;
     total.bounds_tightened += part.bounds_tightened;
     total.coefs_tightened += part.coefs_tightened;
+    total.sides_rounded += part.sides_rounded;
     total.redundant_by_activity += part.redundant_by_activity;
     total.structural_fbbt_rounds += part.structural_fbbt_rounds;
     total.structural_fbbt_work += part.structural_fbbt_work;
@@ -676,6 +801,7 @@ std::vector<BinaryRelation> saturate_monotone_binary_pairs(
 
 MilpPresolveResult run_structural_presolve(const model::LpProblem& lp,
     const MilpPresolveOptions& opts, MilpPresolveStats& stats) {
+    core::WorkScope work_scope_(core::WorkCat::Presolve);
     const auto start = Clock::now();
     auto out = structural_core(lp, opts, stats);
     if (!out.infeasible && opts.monotone_binary_pairs && opts.max_rounds > 0) {

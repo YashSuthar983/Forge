@@ -1,5 +1,6 @@
 #include "forge/engines/simplex.hpp"
 #include "forge/core/env_switches.hpp"
+#include "forge/core/work_clock.hpp"
 #include "forge/la/basis_numerics.hpp"
 #include "forge/engines/dual_simplex.hpp"
 #include "simplex_prepared.hpp"
@@ -36,7 +37,7 @@ using core::Offset;
 using la::BasisFactor;
 using model::kInf;
 
-using Clock = std::chrono::steady_clock;
+using Clock = forge::core::SolverClock;
 inline double ms_since(Clock::time_point t0) {
     FORGE_FN();
     return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
@@ -2703,6 +2704,8 @@ core::RawResult solve_primal_simplex_prepared(
             expand_eps = expand_start;
         }
 
+        // Deterministic work outside the factor solves (counted in la).
+        core::work_add(64 + static_cast<std::uint64_t>(nt / 8), ::forge::core::WorkTag::PrimalIter);
         ++iter;
         if (phase == 1) {
             ++diag.phase1_iterations;
@@ -3041,6 +3044,10 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
                               SimplexDiagnostics& diag,
                               SimplexBasis* out_basis,
                               std::unique_ptr<DualProbeSession>* out_session) {
+    core::WorkScope work_scope_(core::WorkCat::Simplex);
+    // Per-solve setup (copies, preparation, start state, post-solve checks)
+    // that no iteration charge sees.
+    core::work_add(1000 + static_cast<std::uint64_t>(problem.n_rows() + problem.n_cols()), ::forge::core::WorkTag::LpSolve);
     FORGE_FN();
     core::RouteSpan solve_span(1, "simplex", "solve", "solve", "", core::RouteLedgerBucket::Engine);
     problem.validate(/*allow_empty_domains=*/true);
@@ -3870,6 +3877,8 @@ core::RawResult PrimalCostSession::solve(const SimplexOptions& opts,
                                          SimplexDiagnostics& diag,
                                          SimplexBasis* out_basis,
                                          const SimplexBasis* warm) {
+    core::WorkScope work_scope_(core::WorkCat::Simplex);
+    core::work_add(1000, ::forge::core::WorkTag::LpSolve);   // per-solve setup outside the pivots
     const auto t0 = Clock::now();
     auto& im = *impl_;
     const double prep = im.prep_reported ? 0.0 : im.prepared.total_ms;

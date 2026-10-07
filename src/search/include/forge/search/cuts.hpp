@@ -160,7 +160,10 @@ struct CutOptions {
     bool marginal_gate = false;
     int marginal_gate_round = 0;
     f64 marginal_gate_min_rel = 1e-6;
-    bool purge_nonbinding_cuts = false;
+    // On (2026-10-05): deterministic runs, root bound unchanged by
+    // construction; timtab1 purges 410 of 566 cut rows, node LPs 5.2 ->
+    // 1.6 ms, 4973 -> 17360 nodes; pg purges 215 of 1484, 58.9 -> 48.1 ms.
+    bool purge_nonbinding_cuts = true;
     f64 purge_dual_tol = 1e-9;
     f64 purge_slack_tol = 1e-7;
     // Reject a cut whose max|coef|/min|coef| exceeds this. 1e6 (the old
@@ -308,6 +311,20 @@ struct CutOptions {
     // proved on miplib-easy became 11. It also did not fix the problem it was
     // written for (see MILP_PRIMAL_20260907.md 3c).
     f64 parallel_to_row_max = 2.0;
+    // Every cut row that is not exact integer data enters the model relaxed
+    // outward by rel * (|side| + sum |a_j| * reach_j) + abs, reach_j the
+    // larger magnitude of x_j's finite bounds (1 when unbounded). A cut is
+    // computed in floating point from tableau rows or aggregations, and is
+    // only as valid as that arithmetic: on a random 6x6 binary model
+    // (test_milp_oracle seed 770) a MIR row and a GMI row were tight at the
+    // optimum and violated it by 1.2e-9 and 1.0e-9 at magnitudes of 8 and
+    // 24. Everything downstream reads the stored row as data -- covers round
+    // it, propagation rounds bounds from it, a restart folds it into the
+    // model and presolves it -- so the stored row is the one that must hold.
+    // Rows with integral coefficients and sides (covers, cliques, zero-half,
+    // nogoods) are exact by construction and enter unchanged.
+    f64 derived_cut_rel_margin = 1e-9;
+    f64 derived_cut_abs_margin = 1e-9;
 };
 
 struct CutDiagnostics {

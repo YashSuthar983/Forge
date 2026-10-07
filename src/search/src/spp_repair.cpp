@@ -1,4 +1,5 @@
 #include "forge/search/spp_repair.hpp"
+#include "forge/core/work_clock.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -8,7 +9,7 @@
 namespace forge::search {
 namespace {
 
-using Clock = std::chrono::steady_clock;
+using Clock = forge::core::SolverClock;
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 
 struct Rng {

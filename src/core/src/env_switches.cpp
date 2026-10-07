@@ -51,6 +51,7 @@ EnvSwitches read_environment() {
     s.presolve_no_retry = flag("FORGE_PRESOLVE_NO_RETRY");
     s.certificate_debug = flag("FORGE_CERTIFICATE_DEBUG");
     s.farkas_debug = flag("FORGE_FARKAS_DEBUG");
+    s.ref_trace = flag("FORGE_REF_TRACE");
     s.fgmres_profile = flag("FORGE_FGMRES_PROFILE");
     s.dump_kkt = text("FORGE_DUMP_KKT");
     s.stall_window = static_cast<int>(number("FORGE_STALL_WINDOW"));

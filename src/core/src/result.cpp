@@ -25,6 +25,7 @@ std::string_view to_string(ProofLevel p) noexcept {
         case ProofLevel::FeasibleOnly:           return "FeasibleOnly";
         case ProofLevel::FeasibleWithGap:        return "FeasibleWithGap";
         case ProofLevel::ProvedKKT:              return "ProvedKKT";
+        case ProofLevel::ProvedGlobalFP:         return "ProvedGlobalFP";
         case ProofLevel::ProvedGlobalEpsilon:    return "ProvedGlobalEpsilon";
         case ProofLevel::ProvedOptimalFP:        return "ProvedOptimalFP";
         case ProofLevel::ProvedOptimalExact:     return "ProvedOptimalExact";

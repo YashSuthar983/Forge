@@ -1,4 +1,5 @@
 #include "forge/search/feasjump.hpp"
+#include "forge/core/work_clock.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -11,7 +12,7 @@
 namespace forge::search {
 namespace {
 
-using Clock = std::chrono::steady_clock;
+using Clock = forge::core::SolverClock;
 
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 inline std::size_t sz(core::Offset i) { return static_cast<std::size_t>(i); }
@@ -61,6 +62,10 @@ struct Search {
     std::mt19937 rng;
     // Reused breakpoint scratch, so the inner loop does not allocate.
     std::vector<std::pair<f64, f64>> bp_;
+    // Matrix entries visited so far: what a move really costs. One move
+    // re-derives the jumps of up to max_refresh_per_move columns, each in
+    // O(deg log deg), so on a dense model a move is thousands of entries.
+    std::uint64_t ops = 0;
 
     Search(const model::LpProblem& p, const std::vector<f64>& l,
            const std::vector<f64>& h, const FeasJumpOptions& o)
@@ -196,6 +201,7 @@ void Search::seed(const std::vector<f64>* x_start) {
 }
 
 void Search::recompute_activity() {
+    ops += static_cast<std::uint64_t>(col_ptr[sz(n)]) + static_cast<std::uint64_t>(m_all);
     std::fill(act.begin(), act.end(), 0.0);
     for (Index j = 0; j < n; ++j)
         for (core::Offset k = col_ptr[sz(j)]; k < col_ptr[sz(j) + 1]; ++k)
@@ -232,6 +238,7 @@ f64 Search::local_cost(Index j, f64 v) const {
 // O(deg^2). On mcsched (two rows of ~1500 nonzeros, columns of degree ~30)
 // that held the whole search to 13k moves in 3 s against timtab1's 150k/s.
 void Search::compute_jump(Index j) {
+    ops += 4 + static_cast<std::uint64_t>(col_ptr[sz(j) + 1] - col_ptr[sz(j)]);
     ++stamp[sz(j)];
     score[sz(j)] = 0.0;
     jump_to[sz(j)] = x[sz(j)];
@@ -323,6 +330,7 @@ void Search::compute_jump(Index j) {
 }
 
 void Search::apply_move(Index j, f64 v) {
+    ops += static_cast<std::uint64_t>(col_ptr[sz(j) + 1] - col_ptr[sz(j)]);
     const f64 d = v - x[sz(j)];
     x[sz(j)] = v;
     for (core::Offset k = col_ptr[sz(j)]; k < col_ptr[sz(j) + 1]; ++k) {
@@ -386,6 +394,7 @@ bool Search::run(std::vector<f64>& x_out, FeasJumpDiagnostics& diag) {
         const auto len = static_cast<std::size_t>(end - beg);
         if (len == 0 || refresh_budget == 0) return;
         const std::size_t take = std::min(len, refresh_budget);
+        ops += take;
         const std::size_t start =
             len > take ? static_cast<std::size_t>(row_cursor % len) : 0;
         for (std::size_t q = 0; q < take; ++q) {
@@ -401,12 +410,28 @@ bool Search::run(std::vector<f64>& x_out, FeasJumpDiagnostics& diag) {
 
     for (Index j = 0; j < n; ++j) refresh(j);
 
+    // The clock is read by work done, not only by move count: one move on a
+    // dense model re-scores up to max_refresh_per_move columns of hundreds of
+    // entries, and a check every 1024 moves let a 0.2 s call run 2.1-2.6 s
+    // (neos-860300, 384k nonzeros on 850 rows, in sub-MIP children with a 1-2 s
+    // budget). The same count is what the work clock is charged: 3 units per
+    // entry, the propagator's rate; the flat 128 per move undercounted such
+    // models by the same factor.
     const bool timed = opts.time_limit_s > 0.0;
+    constexpr std::uint64_t kOpsPerCheck = 1u << 15;
+    std::uint64_t ops_charged = 0, ops_checked = 0;
+    const auto charge = [&]() {
+        core::work_add(3 * (ops - ops_charged), ::forge::core::WorkTag::FeasJump);
+        ops_charged = ops;
+    };
     while (diag.iterations < opts.max_iterations) {
         ++diag.iterations;
-        if ((diag.iterations & 0x3FF) == 0 && timed &&
-            ms_since(t0) > opts.time_limit_s * 1000.0)
-            break;
+        ops += 8;   // queue pops and pushes
+        if (ops - ops_checked >= kOpsPerCheck || (diag.iterations & 0x3FF) == 0) {
+            ops_checked = ops;
+            charge();
+            if (timed && ms_since(t0) > opts.time_limit_s * 1000.0) break;
+        }
 
         if (viol_list.empty()) break;  // weighted or not, nothing is violated
 
@@ -443,6 +468,7 @@ bool Search::run(std::vector<f64>& x_out, FeasJumpDiagnostics& diag) {
             // the whole mechanism, and it is why this does not stop where
             // bab.cpp's try_round() stops.
             ++diag.weight_updates;
+            ops += viol_list.size();
             f64 wmax = 0.0;
             for (const Index i : viol_list) {
                 weight[sz(i)] += opts.weight_increment;
@@ -459,6 +485,7 @@ bool Search::run(std::vector<f64>& x_out, FeasJumpDiagnostics& diag) {
                 if (i < m) {
                     gather_row(i, dirty);
                 } else {
+                    ops += static_cast<std::uint64_t>(n);
                     for (Index j = 0; j < n; ++j) {
                         if (lp.c[sz(j)] == 0.0) continue;
                         if (touched[sz(j)] == touch_mark) continue;
@@ -484,6 +511,7 @@ bool Search::run(std::vector<f64>& x_out, FeasJumpDiagnostics& diag) {
                 std::fill(weight.begin(), weight.end(), 1.0);
                 if (has_obj_row) weight[sz(m)] = opts.objective_weight;
                 std::uniform_real_distribution<double> u(0.0, 1.0);
+                ops += static_cast<std::uint64_t>(n);
                 for (Index j = 0; j < n; ++j) {
                     if (u(rng) > opts.restart_perturb_frac) continue;
                     const f64 l = lo[sz(j)], h = hi[sz(j)];
@@ -527,6 +555,7 @@ bool Search::run(std::vector<f64>& x_out, FeasJumpDiagnostics& diag) {
         }
     }
 
+    charge();
     diag.ms = ms_since(t0);
     diag.best_violated_rows = std::min(best_viol, viol_list.size());
 
@@ -562,6 +591,7 @@ bool feasibility_jump(const model::LpProblem& lp,
                       const FeasJumpOptions& opts,
                       std::vector<f64>& x_out,
                       FeasJumpDiagnostics& diag) {
+    core::WorkScope work_scope_(core::WorkCat::Heuristic);
     diag = FeasJumpDiagnostics{};
     const Index n = lp.n_cols();
     if (n <= 0 || static_cast<Index>(col_lo.size()) != n ||

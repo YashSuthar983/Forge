@@ -55,6 +55,26 @@ PropagateResult propagate_bounds_trail(const model::LpProblem& lp,
                                        f64 tol = 1e-9,
                                        int max_rounds = 10);
 
+// Objective-cutoff propagation: the objective as one more (virtual) row.
+// Every point worth keeping satisfies  sense*(c'x) <= rhs  (rhs is the
+// cutoff minus the objective offset, in minimisation sense; points above it
+// cannot beat the incumbent by the allowed gap, so the search discards them
+// anyway). Over the box the row's minimum activity is
+// m = sum_j min(d_j lo_j, d_j hi_j) with d = sense*c; if m > rhs the box
+// holds nothing better (feasible = false), and otherwise each column with
+// d_j != 0 is limited to  d_j x_j <= rhs - (m - own_j).  The row is NOT added
+// to any LP -- a dense row in every basis is exactly the cost this avoids --
+// and the arithmetic is padded by a bound on its own round-off, so a tightened
+// bound is implied, not merely probable. Integer columns round inward.
+// `changed` (optional) receives every column tightened. Because only the far
+// side of each term moves, one pass is a fixpoint of this row by itself.
+PropagateResult propagate_objective_cutoff(const model::LpProblem& lp,
+                                           f64 rhs,
+                                           std::vector<f64>& col_lo,
+                                           std::vector<f64>& col_hi,
+                                           f64 tol,
+                                           std::vector<Index>* changed);
+
 // Column -> rows incidence for event-driven propagation (built once per
 // matrix revision).
 struct ColumnRowIndex {
