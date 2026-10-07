@@ -28,8 +28,8 @@ inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 namespace {
 
 // The whole of presolve, with the outcome it reached. presolve() and the
-// presolve_lp() compatibility wrapper are thin shells over this.
-PresolveMap run_presolve(const model::LpProblem& in,
+// presolve_lp() compatibility wrapper are thin shells over run_presolve().
+PresolveMap run_presolve_until_deadline(const model::LpProblem& in,
                          const PresolveOptions& options,
                          PresolveStatus& status,
                          Index& witness_row, Index& witness_col,
@@ -39,6 +39,7 @@ PresolveMap run_presolve(const model::LpProblem& in,
         options.sparsification_passes < 0 || options.max_domain_probes < 0)
         throw std::invalid_argument("presolve: invalid advanced reduction policy");
     const auto presolve_t0 = PresolveClock::now();
+    std::uint32_t deadline_polls = 0;
     const bool implied_slack = options.implied_slack;
     status = PresolveStatus::Reduced;
     witness_row = -1;
@@ -118,11 +119,13 @@ PresolveMap run_presolve(const model::LpProblem& in,
 
     bool changed = true;
     for (int pass = 0; pass < options.max_passes && changed; ++pass) {
+        detail::check_deadline(options);
         changed = false;
         ++out.stats.passes;
 
         // Fixed columns (lo == hi).
         for (Index j = 0; j < n; ++j) {
+            detail::poll_deadline(options, deadline_polls);
             if (!col_live[sz(j)]) continue;
             if (work_lo[sz(j)] == work_hi[sz(j)]) {
                 col_live[sz(j)] = 0;
@@ -140,6 +143,7 @@ PresolveMap run_presolve(const model::LpProblem& in,
         // pass: still linear, unlike scanning every row for every column.
         std::fill(col_nnz.begin(), col_nnz.end(), 0);
         for (Index i = 0; i < m; ++i) {
+            detail::poll_deadline(options, deadline_polls);
             if (!row_live[sz(i)]) continue;
             for (Offset k = in.A.pattern.row_ptr()[sz(i)];
                  k < in.A.pattern.row_ptr()[sz(i) + 1]; ++k) {
@@ -149,6 +153,7 @@ PresolveMap run_presolve(const model::LpProblem& in,
             }
         }
         for (Index j = 0; j < n; ++j) {
+            detail::poll_deadline(options, deadline_polls);
             if (!col_live[sz(j)] || col_nnz[sz(j)] != 0) continue;
             // Earlier substitutions may have changed this coefficient. Using
             // the original objective here chooses the wrong bound for a column
@@ -181,6 +186,7 @@ PresolveMap run_presolve(const model::LpProblem& in,
 
         // Empty rows after substituting fixed columns.
         for (Index i = 0; i < m; ++i) {
+            detail::poll_deadline(options, deadline_polls);
             if (!row_live[sz(i)]) continue;
             model::ExactSum activity_sum;
             bool has_live = false;
@@ -224,6 +230,7 @@ PresolveMap run_presolve(const model::LpProblem& in,
         // inside their bounds. This is a reversible redundant-row reduction;
         // the lifted multiplier is zero, which is valid by construction.
         for (Index i = 0; i < m; ++i) {
+            detail::poll_deadline(options, deadline_polls);
             if (!row_live[sz(i)]) continue;
             model::ExactIntervalSum activity;
             for (Offset k = in.A.pattern.row_ptr()[sz(i)];
@@ -251,6 +258,7 @@ PresolveMap run_presolve(const model::LpProblem& in,
         // eliminated. Columns are fixed immediately so later rows in this
         // same pass see the transformed problem and cascades remain ordered.
         for (Index i = 0; i < m; ++i) {
+            detail::poll_deadline(options, deadline_polls);
             if (!row_live[sz(i)]) continue;
             model::ExactIntervalSum activity;
             Index live_count = 0;
@@ -337,6 +345,7 @@ PresolveMap run_presolve(const model::LpProblem& in,
         // different transformation.
         std::vector<Index> live_col_nnz(sz(n), 0);
         for (Index i = 0; i < m; ++i) {
+            detail::poll_deadline(options, deadline_polls);
             if (!row_live[sz(i)]) continue;
             for (Offset k = in.A.pattern.row_ptr()[sz(i)];
                  k < in.A.pattern.row_ptr()[sz(i) + 1]; ++k) {
@@ -346,6 +355,7 @@ PresolveMap run_presolve(const model::LpProblem& in,
             }
         }
         for (Index i = 0; i < m; ++i) {
+            detail::poll_deadline(options, deadline_polls);
             if (!row_live[sz(i)] || in.row_lo[sz(i)] != in.row_hi[sz(i)])
                 continue;
 
@@ -464,6 +474,7 @@ PresolveMap run_presolve(const model::LpProblem& in,
         // ORIGINAL bounds are wrong for cascaded rows (x+y=0 with x fixed at
         // 5 pins y at -5, not 0).
         for (Index i = 0; i < m; ++i) {
+            detail::poll_deadline(options, deadline_polls);
             if (!row_live[sz(i)]) continue;
             Index col = -1;
             f64 a = 0.0;
@@ -634,6 +645,7 @@ post_fixed_point:
     std::vector<f64>& mutable_row_hi = live.row_hi;
     Offset mutable_nnz = 0;
     for (Index i = 0; i < m; ++i) {
+        detail::poll_deadline(options, deadline_polls);
         if (!row_live[sz(i)]) continue;
         for (const auto& [j, a] : mutable_rows[sz(i)]) {
             if (a == 0.0) continue;
@@ -771,6 +783,7 @@ post_fixed_point:
 
     for (Index i = 0; i < m; ++i) push_best_candidate(i);
     while (!candidates.empty()) {
+        detail::poll_deadline(options, deadline_polls);
         const AggregationCandidate candidate = candidates.top();
         candidates.pop();
         const Index pivot_row = candidate.row;
@@ -944,6 +957,7 @@ post_fixed_point:
     // is often the cascade that turns one equality substitution into hundreds
     // of structural removals on network models.
     for (Index j = 0; j < n; ++j) {
+        detail::poll_deadline(options, deadline_polls);
         if (!col_live[sz(j)] || !column_rows[sz(j)].empty()) continue;
         const f64 canonical_cost = in.maximize ? -work_cost[sz(j)]
                                                :  work_cost[sz(j)];
@@ -1085,6 +1099,7 @@ post_fixed_point:
     }
 
     for (Index i = 0; i < m; ++i) {
+        detail::poll_deadline(options, deadline_polls);
         if (!row_live[sz(i)] || !mutable_rows[sz(i)].empty()) continue;
         if (mutable_row_lo[sz(i)] <= 0.0 && 0.0 <= mutable_row_hi[sz(i)]) {
             row_live[sz(i)] = 0;
@@ -1096,6 +1111,7 @@ post_fixed_point:
     out.fixed_value.assign(sz(n), 0.0);
     Index new_j = 0;
     for (Index j = 0; j < n; ++j) {
+        detail::poll_deadline(options, deadline_polls);
         if (!col_live[sz(j)]) {
             out.fixed_value[sz(j)] = fixed[sz(j)];
             ++out.stats.cols_removed;
@@ -1111,6 +1127,7 @@ post_fixed_point:
     out.row_orig_to_new.assign(sz(m), -1);
     out.row_new_to_orig.clear();
     for (Index i = 0; i < m; ++i) {
+        detail::poll_deadline(options, deadline_polls);
         if (!row_live[sz(i)]) continue;
         out.row_orig_to_new[sz(i)] = new_i++;
         out.row_new_to_orig.push_back(i);
@@ -1142,6 +1159,7 @@ post_fixed_point:
             red.col_names.emplace_back();
     }
     for (Index i = 0; i < m; ++i) {
+        detail::poll_deadline(options, deadline_polls);
         if (row_map[sz(i)] < 0) continue;
         const Index ni = row_map[sz(i)];
         // Fixed-column shifts and aggregation row operations have already
@@ -1157,6 +1175,7 @@ post_fixed_point:
     std::vector<Index> rows, cols;
     std::vector<f64> vals;
     for (Index i = 0; i < m; ++i) {
+        detail::poll_deadline(options, deadline_polls);
         if (row_map[sz(i)] < 0) continue;
         const Index ni = row_map[sz(i)];
         for (const auto& [j, value] : mutable_rows[sz(i)]) {
@@ -1215,6 +1234,32 @@ post_fixed_point:
     return out;
 }
 
+
+// Past PresolveOptions::deadline the reductions are abandoned and the result
+// is the identity map, valid and postsolvable like the disabled one: whoever
+// set the deadline has no time left to solve the reduced model.
+PresolveMap run_presolve(const model::LpProblem& in,
+                         const PresolveOptions& options,
+                         PresolveStatus& status,
+                         Index& witness_row, Index& witness_col,
+                         std::string& reason) {
+    const auto t0 = std::chrono::steady_clock::now();
+    try {
+        return run_presolve_until_deadline(in, options, status, witness_row,
+                                           witness_col, reason);
+    } catch (const detail::DeadlineReached&) {
+        PresolveOptions identity = options;
+        identity.enabled = false;
+        identity.deadline = std::chrono::steady_clock::time_point::max();
+        reason.clear();
+        PresolveMap out = run_presolve_until_deadline(
+            in, identity, status, witness_row, witness_col, reason);
+        out.stats.stopped_at_deadline = true;
+        out.stats.elapsed_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        return out;
+    }
+}
 }  // namespace
 
 const char* to_string(PresolveStatus s) {

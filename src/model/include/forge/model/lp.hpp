@@ -60,7 +60,25 @@ struct LpProblem {
     // Internal bound overlays may represent an empty domain. Data/shape and
     // bound-direction checks remain mandatory when allow_empty_domains is true.
     void validate(bool allow_empty_domains = false) const;
+
+    // A column or row whose lower bound exceeds its upper bound. Such a model
+    // is infeasible, and the bound data alone proves it: no point can sit in
+    // an empty interval, whatever the rest of the model says.
+    struct EmptyDomain {
+        bool is_row = false;
+        Index index = -1;  // -1: every domain is nonempty
+    };
+    // The first empty column domain, else the first empty row domain.
+    EmptyDomain find_empty_domain() const noexcept;
+    // "column 'x' has lower bound 3 above upper bound 2", for messages.
+    std::string describe(const EmptyDomain& d) const;
 };
+
+// The same model as a minimization. For a maximization the costs AND the
+// objective offset are negated, so minimization_form(p).objective(x) is
+// exactly -p.objective(x) and an original-sense value is sense * the copy's,
+// with sense = -1 for a maximization. Engines solve this form.
+LpProblem minimization_form(LpProblem p);
 
 // Validate policy once before engine setup and numerical hot loops.
 void validate_lp_policy(f64 primal_tol, f64 dual_tol, f64 gap_tol, f64 time_limit_s);

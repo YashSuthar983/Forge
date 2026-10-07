@@ -277,6 +277,7 @@ ProofEvidence check_lp_point(const model::LpProblem& problem,
     ev.dual_feas_tol = dual_feas_tol;
     ev.gap_tol = gap_tol;
     ev.claimed_level = raw.proposed_level;
+    ev.empty_domain = problem.find_empty_domain().index >= 0;
     ev.lp_values_checked = true;
 
     const auto m = static_cast<std::size_t>(problem.n_rows());
@@ -742,7 +743,8 @@ SolveResult finalize_result(RawResult raw, const ProofEvidence& ev) {
                               residuals_within_tolerance(ev);
     if (r.status == Status::Infeasible && global_proof)
         r.proof = ProofLevel::ProvedGlobalEpsilon;
-    if (r.status == Status::Infeasible && !checked_dual_ray && !global_proof) {
+    if (r.status == Status::Infeasible && !checked_dual_ray && !global_proof &&
+        !ev.empty_domain) {
         r.status = Status::NoSolutionFound;
         r.ray.clear();
         r.dual_farkas_ray = core::DualFarkasRay{};

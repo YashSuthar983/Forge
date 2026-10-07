@@ -138,6 +138,7 @@ forge_add_python_test(test_compare)
 forge_add_python_test(test_fetch_benchmarks)
 forge_add_python_test(test_qplib_eval)
 forge_add_python_test(test_python_api)
+forge_add_python_test(test_web_lp_text)
 forge_add_python_test(test_bound_snapshots)
 forge_add_python_test(test_forbidden_dependencies)
 set_tests_properties(test_python_api test_bound_snapshots PROPERTIES

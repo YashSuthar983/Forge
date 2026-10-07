@@ -531,12 +531,8 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
         diag.degraded_features.emplace_back("transactional step (adaptive eta)");
     }
 
-    model::LpProblem p = problem;
-    const f64 sense = p.maximize ? -1.0 : 1.0;
-    if (p.maximize) {
-        for (f64& value : p.c) value = -value;
-        p.maximize = false;
-    }
+    model::LpProblem p = model::minimization_form(problem);
+    const f64 sense = problem.maximize ? -1.0 : 1.0;
 
     const auto t_scale = Clock::now();
     backend::ScaledLp scaled = build_scaled_lp(

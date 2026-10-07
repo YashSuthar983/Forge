@@ -3422,6 +3422,8 @@ bool node_lp_infeasibility_proved_impl(const model::LpProblem& node_lp,
     if (!node_lp_status_proves_infeasible(raw.proposed_status,
                                           root_relaxation_bounded))
         return false;
+    // A crossed bound in the node LP proves infeasibility by itself.
+    if (node_lp.find_empty_domain().index >= 0) return true;
     const auto& ray = !raw.dual_farkas_ray.multipliers.empty()
                           ? raw.dual_farkas_ray.multipliers : raw.ray;
     return !ray.empty() &&
