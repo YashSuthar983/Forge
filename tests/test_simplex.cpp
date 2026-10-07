@@ -7,6 +7,7 @@
 #include "sor/certify/finalize.hpp"
 #include "sor/engines/dual_simplex.hpp"
 #include "sor/engines/farkas.hpp"
+#include "sor/engines/lp.hpp"
 #include "sor/engines/simplex.hpp"
 #include "sor/io/mps.hpp"
 #include "sor/presolve/presolve.hpp"
@@ -91,6 +92,133 @@ Run solve_problem(const sor::model::LpProblem& problem,
     ev = sor::certify::check_lp_result(out.problem, raw, ev);
     out.r = sor::certify::finalize_result(std::move(raw), ev);
     return out;
+}
+
+// A crossed bound is infeasible by the data alone, and no row-multiplier
+// Farkas ray can show it when the column sits in no row or the row's own
+// sides cross. The dual used to stop with "no primal-infeasible basic
+// variable" and NoSolutionFound; finalize_result accepts the empty domain
+// as the proof, re-derived from the model.
+void test_empty_domain_is_infeasible() {
+    SOR_FN();
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(1, 2, {0}, {0}, {1.0});
+    lp.c = {1.0, 1.0};
+    lp.row_lo = {-sor::model::kInf};
+    lp.row_hi = {10.0};
+    lp.col_lo = {0.0, 3.0};
+    lp.col_hi = {5.0, 2.0};  // column 1 is empty and in no row
+    lp.col_names = {"x", "z"};
+    for (const bool presolve : {true, false}) {
+        SimplexOptions opts;
+        opts.presolve = presolve;
+        const auto run = solve_problem(lp, opts);
+        CHECK(run.r.status == Status::Infeasible);
+        CHECK(run.r.downgrade_reason.empty());
+        CHECK(run.r.termination_reason ==
+              "column 'z' has lower bound 3 above upper bound 2");
+    }
+
+    sor::model::LpProblem rows = lp;
+    rows.col_lo = {0.0, 0.0};
+    rows.col_hi = {5.0, 5.0};
+    rows.row_lo = {4.0};
+    rows.row_hi = {1.0};  // the row's sides cross
+    const auto run = solve_problem(rows);
+    CHECK(run.r.status == Status::Infeasible);
+    const auto empty = rows.find_empty_domain();
+    CHECK(empty.is_row && empty.index == 0);
+
+    // Every strategy, including the first-order ones that cannot represent
+    // an empty interval, reports it the same way.
+    for (const auto strategy : {sor::core::LpStrategy::Auto,
+                                sor::core::LpStrategy::Hpr,
+                                sor::core::LpStrategy::Barrier}) {
+        sor::core::LpOptions o;
+        o.strategy = strategy;
+        sor::core::LpDiagnostics d;
+        sor::core::ProofEvidence ev;
+        auto raw = sor::engines::solve_lp(lp, o, d, &ev);
+        const auto r = sor::certify::finalize_result(
+            sor::certify::check_lp_candidate(lp, std::move(raw), ev));
+        CHECK(r.status == Status::Infeasible);
+    }
+
+    // The evidence comes from the model, never from the engine's word: the
+    // same bare claim (no ray) is accepted for the crossed model and refused
+    // once the crossing is gone.
+    sor::core::RawResult claim;
+    claim.proposed_status = Status::Infeasible;
+    const auto accepted = sor::certify::finalize_result(
+        claim, sor::certify::check_lp_result(lp, claim, sor::core::ProofEvidence{}));
+    CHECK(accepted.status == Status::Infeasible);
+    sor::model::LpProblem feasible = lp;
+    feasible.col_lo[1] = 0.0;
+    const auto refused = sor::certify::finalize_result(
+        claim, sor::certify::check_lp_result(feasible, claim, sor::core::ProofEvidence{}));
+    CHECK(refused.status == Status::NoSolutionFound);
+}
+
+// The time limit is a wall for the whole call: once presolve has used it,
+// neither scaling nor any simplex stage runs.
+void test_time_limit_covers_presolve_and_preparation() {
+    SOR_FN();
+    for (const bool presolve : {true, false}) {
+        SimplexOptions opts;
+        opts.presolve = presolve;
+        opts.time_limit_s = 1e-9;
+        const auto run = solve_text(sor::test::kTestLpMps, opts);
+        CHECK(run.r.status == Status::Interrupted);
+        CHECK(run.diag.iterations == 0);
+        CHECK(run.r.termination_reason.find(
+                  presolve ? "reached in presolve" : "reached before the solve") !=
+              std::string::npos);
+    }
+}
+
+// A maximization with an objective offset, through every place that turns
+// the minimization form's numbers back into the model's sense. The copy used
+// to keep the offset un-negated and each consumer compensated by hand.
+void test_maximization_offset_is_reported_in_model_sense() {
+    SOR_FN();
+    // max 3x + 2y + 10 s.t. x + y <= 4, x <= 3; optimum x=3, y=1: 21.
+    sor::model::LpProblem lp;
+    lp.maximize = true;
+    lp.obj_offset = 10.0;
+    lp.A = sor::sparse::from_triplets(2, 2, {0, 0, 1}, {0, 1, 0}, {1.0, 1.0, 1.0});
+    lp.c = {3.0, 2.0};
+    lp.row_lo = {-sor::model::kInf, -sor::model::kInf};
+    lp.row_hi = {4.0, 3.0};
+    lp.col_lo = {0.0, 0.0};
+    lp.col_hi = {sor::model::kInf, sor::model::kInf};
+
+    const auto pmin = sor::model::minimization_form(lp);
+    CHECK(!pmin.maximize && pmin.obj_offset == -10.0 && pmin.c[0] == -3.0);
+    CHECK(pmin.objective({3.0, 1.0}) == -lp.objective({3.0, 1.0}));
+
+    for (const auto method : {sor::engines::SimplexMethod::Dual,
+                              sor::engines::SimplexMethod::Primal}) {
+        SimplexOptions opts;
+        opts.method = method;
+        opts.exact_proof = true;
+        const auto run = solve_problem(lp, opts);
+        CHECK(run.r.status == Status::Optimal);
+        CHECK_NEAR(run.r.objective, 21.0, 1e-9);
+        CHECK_NEAR(run.diag.primal_objective, 21.0, 1e-9);
+        CHECK(std::isfinite(run.r.dual_bound));
+        CHECK_NEAR(run.r.dual_bound, 21.0, 1e-9);
+    }
+    for (const auto strategy : {sor::core::LpStrategy::Hpr,
+                                sor::core::LpStrategy::Barrier}) {
+        sor::core::LpOptions o;
+        o.strategy = strategy;
+        sor::core::LpDiagnostics d;
+        sor::core::ProofEvidence ev;
+        auto raw = sor::engines::solve_lp(lp, o, d, &ev);
+        const auto r = sor::certify::finalize_result(
+            sor::certify::check_lp_candidate(lp, std::move(raw), ev));
+        CHECK_NEAR(r.objective, 21.0, 1e-5);
+    }
 }
 
 void test_fixture_lp() {
@@ -2109,6 +2237,9 @@ int main() {
     test_residual_monitor_tracks_pivoted_dual_vector();
     test_unrepresentable_scaling_preserves_original_model();
     SOR_FN();
+    test_empty_domain_is_infeasible();
+    test_time_limit_covers_presolve_and_preparation();
+    test_maximization_offset_is_reported_in_model_sense();
     test_fixture_lp();
     test_auto_commits_to_one_engine_without_a_discarded_probe();
     test_route_features_describe_the_model();

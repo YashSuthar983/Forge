@@ -30,6 +30,11 @@ PRESETS = {
 }
 
 
+# sor_solve exits 0 for Optimal and 6 for Feasible: both return a checked
+# point. Other codes are 4 Interrupted, 5 failure, 7 Infeasible, 8 Unbounded.
+_POINT_EXIT_CODES = (0, 6)
+
+
 class _ResultMapping(Mapping[str, Any]):
     """Compatibility bridge for callers that previously consumed dicts."""
 
@@ -208,7 +213,8 @@ def solve(model: str | Path, *, engine: str = "simplex", backend: str = "cpu",
             key, _, value = line.partition(":")
             fields[key.strip().lower().replace(" ", "_")] = value.strip()
     return SolveResult(
-        ok=(proc.returncode == 0 and not proc.timed_out and not proc.cancelled),
+        ok=(proc.returncode in _POINT_EXIT_CODES and not proc.timed_out
+            and not proc.cancelled),
         returncode=proc.returncode, command=tuple(argv), model=model_path,
         solution=output, status=fields.get("status"),
         proof_level=fields.get("proof_level"),

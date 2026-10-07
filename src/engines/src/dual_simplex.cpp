@@ -219,6 +219,13 @@ static core::RawResult dual_prepared_pass(
     FactorCarrier* factor_carrier) {
     SOR_FN();
     const auto t_all = Clock::now();
+    // The all-row DSE rebuild is m BTRANs and runs before the first clock
+    // check of the iteration loop; past this point it falls back to unit
+    // weights instead.
+    const auto dse_deadline = opts.time_limit_s > 0.0
+        ? t_all + std::chrono::duration_cast<Clock::duration>(
+                      std::chrono::duration<double>(opts.time_limit_s))
+        : Clock::time_point::max();
 
     // Take the incoming weights and leave the carrier EMPTY: every early exit
     // (infeasible, limit, primal clean-up hand-off) then reports "no weights"
@@ -1186,7 +1193,7 @@ static core::RawResult dual_prepared_pass(
                 ++diag.dse_weight_rebuilds;
                 const auto t_dse = Clock::now();
                 if (!rebuild_dual_edge_weights(m, do_btran, row_w,
-                                               dse_rebuild_btran))
+                                               dse_rebuild_btran, dse_deadline))
                     std::fill(row_w.begin(), row_w.end(), 1.0);
                 diag.dse_rebuild_ms += ms_since(t_dse);
             }
@@ -1205,7 +1212,8 @@ static core::RawResult dual_prepared_pass(
         SOR_FN();
         ++diag.dse_weight_rebuilds;
         ++diag.dse_drift_rebuilds;
-        if (!rebuild_dual_edge_weights(m, do_btran, row_w, dse_rebuild_btran))
+        if (!rebuild_dual_edge_weights(m, do_btran, row_w, dse_rebuild_btran,
+                                       dse_deadline))
             std::fill(row_w.begin(), row_w.end(), 1.0);
         average_log_low_dse_error = 0.0;
         average_log_high_dse_error = 0.0;
@@ -2633,7 +2641,7 @@ static core::RawResult dual_prepared_pass(
         dse_tau_precomputed = false;
         if (phase == 2 && iter > 0 && (iter % 32) == 0 && d_valid &&
             opts.objective_limit < std::numeric_limits<f64>::infinity() &&
-            working_objective() + sense * pmin.obj_offset >= opts.objective_limit) {
+            working_objective() + pmin.obj_offset >= opts.objective_limit) {
             ++diag.objective_limit_checks;
             std::vector<f64> multipliers(sz(m));
             for (Index i = 0; i < m; ++i) multipliers[sz(i)] = cost[sz(basis[sz(i)])];
@@ -2643,8 +2651,7 @@ static core::RawResult dual_prepared_pass(
                 pmin, multipliers, pmin.col_lo, pmin.col_hi);
             const f64 margin = 1e-9 * (1.0 + std::fabs(opts.objective_limit));
             const bool reached = bound.finite &&
-                model::Rational(bound.value) - model::Rational(pmin.obj_offset) +
-                model::Rational(sense) * model::Rational(pmin.obj_offset) >=
+                model::Rational(bound.value) >=
                 model::Rational(opts.objective_limit) + model::Rational(margin);
             if (reached) {
                 status = core::Status::Interrupted;
@@ -3565,7 +3572,7 @@ static core::RawResult dual_prepared_pass(
             std::printf("  iter %8llu  phase %d  dual-infeas %.6e  prim-infeas %.6e  obj %.10e\n",
                         static_cast<unsigned long long>(iter), phase,
                         true_dual_infeasibility(), primal_infeasibility(),
-                        sense * obj + pmin.obj_offset);
+                        sense * (obj + pmin.obj_offset));
         }
     }
     diag.loop_ms = ms_since(t_loop);
@@ -3737,7 +3744,7 @@ static core::RawResult dual_prepared_pass(
 
     f64 obj_min = 0.0;
     for (Index j = 0; j < ns; ++j) obj_min += pmin.c[sz(j)] * x[sz(j)];
-    diag.primal_objective = sense * obj_min + pmin.obj_offset;
+    diag.primal_objective = sense * (obj_min + pmin.obj_offset);
 
     report_simplex_dual_bound(pmin, sense, yout, aty, diag);
 
@@ -3813,9 +3820,8 @@ static core::RawResult dual_prepared_pass(
                 opts.time_limit_s - ms_since(t_all) / 1000) : 0})) {
         const auto exact = certify::exact_dual_lower_bound(pmin, raw.exact_dual);
         if (exact.finite) {
-            const model::Rational reported = model::Rational(sense) *
-                (model::Rational(exact.value) - model::Rational(pmin.obj_offset)) +
-                model::Rational(pmin.obj_offset);
+            const model::Rational reported =
+                model::Rational(sense) * model::Rational(exact.value);
             raw.dual_bound = diag.dual_objective = sense > 0
                 ? model::rounded_down(reported) : model::rounded_up(reported);
             diag.dual_bound_finite = std::isfinite(raw.dual_bound);

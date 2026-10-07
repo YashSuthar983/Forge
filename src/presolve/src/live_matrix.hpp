@@ -12,6 +12,20 @@
 
 namespace sor::presolve::detail {
 
+// Thrown at a checkpoint once PresolveOptions::deadline has passed, and
+// caught in run_presolve, which then returns the identity map. The caller is
+// out of time and will not solve, so the partial reductions are discarded and
+// a checkpoint may sit anywhere, mid-reduction included.
+struct DeadlineReached {};
+inline void check_deadline(const PresolveOptions& o) {
+    if (o.past_deadline()) throw DeadlineReached{};
+}
+// The same, reading the clock once per 1024 calls, for loops whose body is a
+// few operations per row or column.
+inline void poll_deadline(const PresolveOptions& o, std::uint32_t& calls) {
+    if ((++calls & 1023u) == 0) check_deadline(o);
+}
+
 struct FlatMap {
     using value_type = std::pair<Index, f64>;
     std::vector<value_type> v;

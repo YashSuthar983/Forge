@@ -239,6 +239,7 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
             return target.entries.empty() && target.rhs == 0;
         };
         for (Index i = 0; i < matrix.m && operations < operation_cap; ++i) {
+            check_deadline(options);
             if (!row_live[sz(i)] || matrix.row_lo[sz(i)] != matrix.row_hi[sz(i)] ||
                 !std::isfinite(matrix.row_lo[sz(i)]) || matrix.rows[sz(i)].size() >
                     static_cast<std::size_t>(options.max_aggregation_row_nnz)) continue;
@@ -339,6 +340,7 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
         for (int pass = 0; pass < options.sparsification_passes; ++pass) {
             bool changed = false;
             for (Index source = 0; source < matrix.m; ++source) {
+                check_deadline(options);
                 if (!row_live[sz(source)] || matrix.row_lo[sz(source)] != matrix.row_hi[sz(source)] ||
                     !std::isfinite(matrix.row_lo[sz(source)])) continue;
                 const auto equation = matrix.rows[sz(source)];
@@ -467,6 +469,7 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
         // For continuous LPs arbitrary integer coefficient strengthening is
         // invalid. Exact power-of-two row normalization preserves the polytope.
         for (Index i = 0; i < matrix.m; ++i) {
+            check_deadline(options);
             if (!row_live[sz(i)] || matrix.rows[sz(i)].empty()) continue;
             f64 maximum = 0;
             for (const auto& [j, a] : matrix.rows[sz(i)]) {
@@ -493,6 +496,7 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
     if (options.domain_probing) {
         Index probes = 0;
         for (Index j = 0; j < matrix.n && probes < options.max_domain_probes; ++j) {
+            check_deadline(options);
             if (!col_live[sz(j)] || !std::isfinite(lo[sz(j)]) || !std::isfinite(hi[sz(j)]) || lo[sz(j)] >= hi[sz(j)]) continue;
             const f64 midpoint = std::midpoint(lo[sz(j)], hi[sz(j)]);
             if (midpoint == lo[sz(j)] || midpoint == hi[sz(j)]) continue;

@@ -1,9 +1,13 @@
 #include "sor/io/gzip.hpp"
 #include "sor/io/mps.hpp"
+#include "sor/io/write_mps.hpp"
 #include "fixtures.hpp"
 #include "test_helpers.hpp"
 
 #include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <sstream>
 
 using namespace sor;
@@ -31,6 +35,173 @@ int index_of(const std::vector<std::string>& v, const std::string& n) {
 }  // namespace
 
 int main() {
+    // ---- crossed bounds read as an infeasible model, with a warning ----
+    // The reader used to throw "col_lo > col_hi", so the CLI reported a parse
+    // failure for a model whose answer is Infeasible.
+    {
+        std::istringstream in(
+            "NAME          CROSSED\n"
+            "ROWS\n"
+            " N  COST\n"
+            " L  R1\n"
+            "COLUMNS\n"
+            "    X         COST      1.0        R1        1.0\n"
+            "RHS\n"
+            "    RHS       R1        10.0\n"
+            "BOUNDS\n"
+            " LO BND       X          3.0\n"
+            " UP BND       X          2.0\n"
+            "ENDATA\n");
+        io::MpsReadReport rep;
+        const auto p = io::read_mps(in, rep);
+        CHECK(p.col_lo[0] == 3.0 && p.col_hi[0] == 2.0);
+        bool warned = false;
+        for (const auto& w : rep.warnings)
+            warned |= w == "column 'X' has lower bound 3 above upper bound 2; "
+                           "the model is infeasible";
+        CHECK(warned);
+    }
+
+    // ---- duplicate entries are summed exactly; exact zeros are not stored ----
+    {
+        // X: 0.1 + 0.2 - 0.3 on R1, which in floating point is 2^-54 in this
+        // order and 2^-55 in another; exactly it is 2^-55. Y: 1 and -1 on R1
+        // cancel. Z: an explicit 0 on R2. W: the only real entry of R2.
+        std::istringstream in(
+            "NAME          DUPS\n"
+            "ROWS\n"
+            " N  COST\n"
+            " L  R1\n"
+            " L  R2\n"
+            "COLUMNS\n"
+            "    X         R1        0.1\n"
+            "    X         R1        0.2\n"
+            "    X         R1        -0.3\n"
+            "    Y         R1        1.0        R1        -1.0\n"
+            "    Z         R2        0.0\n"
+            "    W         R2        2.0\n"
+            "RHS\n"
+            "    RHS       R1        1.0        R2        1.0\n"
+            "ENDATA\n");
+        io::MpsReadReport rep;
+        const auto p = io::read_mps(in, rep);
+        CHECK(p.nnz() == 2);
+        CHECK(p.A.vals[0] == std::ldexp(1.0, -55));
+        CHECK(p.A.vals[1] == 2.0);
+        CHECK(rep.duplicate_entries_summed == 3);
+        CHECK(rep.zero_entries_dropped == 2);
+        bool warned = false;
+        for (const auto& w : rep.warnings)
+            warned |= w.find("3 duplicate matrix entries summed") != std::string::npos;
+        CHECK(warned);
+    }
+
+    // ---- tiny coefficients are kept, counted and warned about ----
+    {
+        const std::string text =
+            "NAME          TINY\n"
+            "ROWS\n"
+            " N  COST\n"
+            " L  R1\n"
+            "COLUMNS\n"
+            "    X         R1        1e-12\n"
+            "    Y         R1        3e-10      COST      1.0\n"
+            "    Z         R1        1.0\n"
+            "RHS\n"
+            "    RHS       R1        1.0\n"
+            "ENDATA\n";
+        std::istringstream in(text);
+        io::MpsReadReport rep;
+        const auto p = io::read_mps(in, rep);
+        CHECK(p.nnz() == 3);
+        CHECK(rep.tiny_entries == 2);
+        CHECK(rep.smallest_entry == 1e-12);
+        bool warned = false;
+        for (const auto& w : rep.warnings)
+            warned |= w.find("2 matrix coefficient(s) below 1e-9") != std::string::npos &&
+                      w.find("--small-matrix-value") != std::string::npos;
+        CHECK(warned);
+
+        std::istringstream again(text);
+        io::MpsReadReport dropped;
+        io::MpsReadOptions o;
+        o.small_matrix_value = 1e-9;
+        CHECK(io::read_mps(again, dropped, o).nnz() == 1);
+        CHECK(dropped.tiny_entries == 0 && dropped.small_values_dropped == 2);
+    }
+
+    // ---- free-format data lines may start in column 1 ----
+    // Only a keyword alone (or NAME/OBJSENSE with an argument) is a header.
+    // These lines used to be "unknown section" headers: strict reading
+    // refused the file, lenient reading dropped the rest of the section.
+    {
+        std::istringstream in(
+            "NAME          COLONE\n"
+            "OBJSENSE\n"
+            "MAX\n"
+            "ROWS\n"
+            "N  COST\n"
+            "L  R1\n"
+            "COLUMNS\n"
+            "X         COST      1.0        R1        1.0\n"
+            "RHS       COST      2.0        R1        1.0\n"
+            "RHS\n"
+            "RHS       R1        4.0\n"
+            "BOUNDS\n"
+            "UP BND       X          3.0\n"
+            "ENDATA\n");
+        io::MpsReadReport rep;
+        const auto p = io::read_mps(in, rep);
+        CHECK(p.maximize);
+        CHECK(p.n_rows() == 1 && p.n_cols() == 2);
+        CHECK(p.col_names[1] == "RHS");  // a column named like a section
+        CHECK(p.c[0] == 1.0 && p.c[1] == 2.0);
+        CHECK(p.row_hi[0] == 4.0);
+        CHECK(p.col_hi[0] == 3.0);
+        CHECK(rep.column_one_data_lines == 7);
+    }
+
+    // ---- several RHS/RANGES/BOUNDS sets: the first named one is used ----
+    // All of them used to be applied, the last write winning. A valueless
+    // bound without a set name ("FR Y") used to be "too short".
+    {
+        std::istringstream in(
+            "NAME          SETS\n"
+            "ROWS\n"
+            " N  COST\n"
+            " L  R1\n"
+            " G  R2\n"
+            "COLUMNS\n"
+            "    X         COST      1.0        R1        1.0\n"
+            "    Y         R2        1.0\n"
+            "RHS\n"
+            "    RHS1      R1        4.0\n"
+            "    RHS2      R1        9.0        R2        9.0\n"
+            "    R2        1.0\n"
+            "    RHS1      R2        2.0\n"
+            "RANGES\n"
+            "    RNG1      R1        1.0\n"
+            "    RNG2      R1        5.0\n"
+            "BOUNDS\n"
+            " UP BND1      X          3.0\n"
+            " UP BND2      X          7.0\n"
+            " UP BND1      X          2.0\n"
+            " FR Y\n"
+            "ENDATA\n");
+        io::MpsReadReport rep;
+        const auto p = io::read_mps(in, rep);
+        CHECK(p.row_hi[0] == 4.0 && p.row_lo[0] == 3.0);  // RHS1 and RNG1
+        CHECK(p.row_lo[1] == 2.0);   // unnamed 1.0, then RHS1's 2.0
+        CHECK(p.col_hi[0] == 2.0);   // BND1, its last value
+        CHECK(p.col_lo[1] == -sor::model::kInf && p.col_hi[1] == sor::model::kInf);
+        CHECK(rep.ignored_set_lines == 3);
+        CHECK(rep.repeated_entries == 2);  // R2 in RHS1, X's UP in BND1
+        int set_warnings = 0;
+        for (const auto& w : rep.warnings)
+            set_warnings += w.find("is the one used") != std::string::npos;
+        CHECK(set_warnings == 3);
+    }
+
     // ---- basic LP ----
     {
         std::istringstream in(sor::test::kTestLpMps);
@@ -229,6 +400,129 @@ int main() {
         CHECK(!coefficient("nan", v));
     }
 
+    // ---- infinity tokens where infinity is meaningful ----
+    // Writers spell an absent bound as "Inf", "Infinity" or "-inf" (any case).
+    // Rejecting the token made such files unreadable; a matrix coefficient or
+    // cost of infinity stays an error (checked above and below).
+    {
+        const auto read = [](const std::string& body, sor::model::LpProblem& out) {
+            std::istringstream in("NAME T\nROWS\n N  OBJ\n G  R1\n L  R2\n E  R3\n"
+                                  "COLUMNS\n    X  OBJ  1  R1  1\n    X  R2  1  R3  1\n"
+                                  "    Y  OBJ  1  R1  1\n" + body + "ENDATA\n");
+            io::MpsReadReport rep;
+            try { out = io::read_mps(in, rep); return true; }
+            catch (const std::exception&) { return false; }
+        };
+        sor::model::LpProblem p;
+        CHECK(read("RHS\n    RHS  R1  -Infinity  R2  INF\n    RHS  R3  2\n"
+                   "RANGES\n    RNG  R3  inf\n"
+                   "BOUNDS\n UP BND  X  Infinity\n LO BND  Y  -inf\n UP BND  Y  +Inf\n", p));
+        CHECK(p.row_lo[0] == -sor::model::kInf && p.row_hi[0] == sor::model::kInf);
+        CHECK(p.row_lo[1] == -sor::model::kInf && p.row_hi[1] == sor::model::kInf);
+        CHECK(p.row_lo[2] == 2.0 && p.row_hi[2] == sor::model::kInf);
+        CHECK(p.col_lo[0] == 0.0 && p.col_hi[0] == sor::model::kInf);
+        CHECK(p.col_lo[1] == -sor::model::kInf && p.col_hi[1] == sor::model::kInf);
+        // Infinity where no finite model can carry it is still refused.
+        CHECK(!read("RHS\n    RHS  R3  inf\n", p));            // equality side
+        CHECK(!read("BOUNDS\n LO BND  X  inf\n", p));            // lower bound +inf
+        CHECK(!read("BOUNDS\n FX BND  X  -inf\n", p));           // fixed at infinity
+        CHECK(!read("BOUNDS\n UP BND  X  nan\n", p));
+    }
+
+    // ---- writer round trip: every number and bound reads back exactly ----
+    // The writer used six significant digits, gave integer (-inf, u] columns
+    // no MI record (read back with lower bound 0), gave integer [0, +inf)
+    // columns no record at all (read back as binary), and wrote a free row as
+    // an equation with no RHS (read back as "= 0").
+    {
+        sor::model::LpProblem w;
+        w.name = "RT";
+        w.maximize = true;
+        w.obj_offset = 1.0 / 7.0;
+        w.A = sparse::from_triplets(4, 4, {0,0,1,1,2,3,3}, {0,1,1,2,3,0,3},
+                                    {1.0 / 3.0, 0.1, 2.0, -1.0 / 7.0, 1.0, 3.0, 1e-7});
+        w.c = {0.1, -1.0 / 3.0, 0.0, 2.5};
+        w.col_lo = {0.0, -kInf, -2.0, -kInf};
+        w.col_hi = {kInf, 5.0, 1.0 / 3.0, 7.25};
+        w.is_integer = {true, true, false, false};
+        w.row_lo = {-kInf, 0.3, -1.5, -kInf};
+        w.row_hi = {2.0 / 3.0, 0.3, 2.5, kInf};       // L, E, exact range, free
+        std::ostringstream text;
+        io::write_mps(text, w);
+        std::istringstream in(text.str());
+        io::MpsReadReport rep;
+        const auto r = io::read_mps(in, rep);
+        CHECK(r.maximize && r.obj_offset == w.obj_offset);
+        CHECK(r.n_rows() == 4 && r.n_cols() == 4);
+        CHECK(r.c == w.c && r.A.vals == w.A.vals);
+        CHECK(r.col_lo == w.col_lo && r.col_hi == w.col_hi);
+        CHECK(r.row_lo == w.row_lo && r.row_hi == w.row_hi);
+        CHECK(r.is_integer == w.is_integer);
+        CHECK(text.precision() == 6);          // the caller's stream state is kept
+    }
+
+    // ---- quadratic sections: an error when strict, unless a caller reads them ----
+    {
+        const std::string qp =
+            "NAME T\nROWS\n N  OBJ\nCOLUMNS\n    X  OBJ  -4\nBOUNDS\n UP BND  X  5\n"
+            "QUADOBJ\n    X  X  2\nENDATA\n";
+        {
+            std::istringstream in(qp);
+            io::MpsReadReport rep;
+            io::MpsReadOptions strict;
+            strict.strict = true;
+            CHECK_THROWS(io::read_mps(in, rep, strict));
+        }
+        {
+            std::istringstream in(qp);
+            io::MpsReadReport rep;
+            io::MpsReadOptions handled;
+            io::QuadraticTerms terms;
+            handled.strict = true;
+            handled.quadratic = &terms;
+            CHECK(io::read_mps(in, rep, handled).n_cols() == 1);
+            CHECK(rep.warnings.empty());
+            CHECK(terms.vals.size() == 1 && terms.vals[0] == 2.0 && !terms.full_matrix);
+        }
+        {
+            std::istringstream in(qp);
+            io::MpsReadReport rep;
+            CHECK(io::read_mps(in, rep).n_cols() == 1);     // lenient: warn
+            CHECK(rep.warnings.size() == 1);
+        }
+    }
+
+    // ---- 1e20 and beyond spell "no bound" (CPLEX/HiGHS convention) ----
+    // Kept finite, UP 1e30 is a box the simplex flips to, and every basic
+    // value it touches becomes ~1e30. Only bounds and row sides convert;
+    // a lower side converts only downward and an upper side only upward.
+    {
+        const std::string body =
+            "NAME T\nROWS\n N  OBJ\n L  R1\n G  R2\nCOLUMNS\n"
+            "    X  OBJ  1  R1  1\n    X  R2  1\n    Y  OBJ  1  R1  1e30\n"
+            "RHS\n    RHS  R1  1e20  R2  -1e30\n"
+            "BOUNDS\n UP BND  X  1e30\n LO BND  Y  -1e25\n UP BND  Y  9.9e19\nENDATA\n";
+        {
+            std::istringstream in(body);
+            io::MpsReadReport rep;
+            const auto p = io::read_mps(in, rep);
+            CHECK(p.row_hi[0] == kInf && p.row_lo[1] == -kInf);
+            CHECK(p.col_hi[0] == kInf);
+            CHECK(p.col_lo[1] == -kInf && p.col_hi[1] == 9.9e19);   // below threshold
+            CHECK(p.A.vals[1] == 1e30);   // row R1 = (X, Y): coefficients untouched
+            CHECK(rep.infinite_bounds_read == 4);
+        }
+        {
+            std::istringstream in(body);
+            io::MpsReadReport rep;
+            io::MpsReadOptions literal;
+            literal.infinite_bound = 0.0;
+            const auto p = io::read_mps(in, rep, literal);
+            CHECK(p.row_hi[0] == 1e20 && p.col_hi[0] == 1e30 && p.col_lo[1] == -1e25);
+            CHECK(rep.infinite_bounds_read == 0);
+        }
+    }
+
     // ---- integrality relaxation ----
     //
     // A MIPLIB root LP relaxation must be formed from the ORIGINAL file, by
@@ -382,6 +676,69 @@ int main() {
         CHECK_THROWS(io::gunzip(stub.data(), stub.size()));
         const char only_magic[2] = {'\x1f', '\x8b'};
         CHECK_THROWS(io::gunzip(only_magic, 2));
+
+        // The file reader inflates as it reads instead of holding the
+        // compressed and decompressed file (it used to keep about five
+        // copies at once). Same results, same refusals, and an error inside
+        // the stream reaches the caller rather than a quiet end of file.
+        const auto member = [](const std::string& text) {
+            std::string m;
+            m += '\x1f'; m += '\x8b'; m += '\x08'; m += '\x00';
+            m.append(4, '\x00');
+            m += '\x00'; m += '\x03'; m += '\x01';
+            const auto len = static_cast<unsigned>(text.size());
+            m += static_cast<char>(len & 0xff);
+            m += static_cast<char>((len >> 8) & 0xff);
+            m += static_cast<char>(~len & 0xff);
+            m += static_cast<char>((~len >> 8) & 0xff);
+            m += text;
+            const auto c = io::crc32(text.data(), text.size());
+            for (int i = 0; i < 4; ++i) m += static_cast<char>((c >> (8 * i)) & 0xff);
+            for (int i = 0; i < 4; ++i) m += static_cast<char>((len >> (8 * i)) & 0xff);
+            return m;
+        };
+        const auto path = std::filesystem::temp_directory_path() / "sor_test_stream.gz";
+        const auto write = [&](const std::string& bytes) {
+            std::ofstream f(path, std::ios::binary);
+            f << bytes;
+        };
+        const auto slurp = [&]() {
+            io::GzipFileStream in(path.string());
+            return std::string(std::istreambuf_iterator<char>(in),
+                               std::istreambuf_iterator<char>());
+        };
+        write(gz);
+        CHECK(slurp() == payload);
+        // Three 60000-byte members: crosses both the 64 KiB read chunks and
+        // the member boundaries.
+        std::string big, big_gz;
+        for (int k = 0; k < 3; ++k) {
+            std::string part(60000, static_cast<char>('a' + k));
+            big += part;
+            big_gz += member(part);
+        }
+        write(big_gz);
+        CHECK(slurp() == big);
+        for (const std::string& bad : {broken, cut, stub, std::string(only_magic, 2),
+                                       gz + "junk"}) {
+            write(bad);
+            CHECK_THROWS(slurp());
+        }
+        // Through the MPS reader: a model, and a truncated one.
+        write(member("NAME          GZ\nROWS\n N  OBJ\n L  R1\nCOLUMNS\n"
+                     "    X         OBJ       1.0        R1        1.0\n"
+                     "RHS\n    RHS       R1        2.0\nENDATA\n"));
+        {
+            io::MpsReadReport rep;
+            const auto p = io::read_mps_file(path.string(), rep);
+            CHECK(rep.used_gzip && p.n_rows() == 1 && p.n_cols() == 1);
+        }
+        write(cut);
+        {
+            io::MpsReadReport rep;
+            CHECK_THROWS(io::read_mps_file(path.string(), rep));
+        }
+        std::filesystem::remove(path);
     }
 
     return sor::test::finish("test_mps");

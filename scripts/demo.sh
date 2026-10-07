@@ -27,12 +27,20 @@ mkdir -p "$OUT"
 
 banner() { printf '\n======== %s ========\n' "$1"; }
 
+# sor_solve exits 6 for Feasible (a checked point without an optimality
+# proof), which the first-order and time-limited steps may honestly report.
+solve() {
+  local rc=0
+  "$BIN/sor_solve" "$@" || rc=$?
+  [[ $rc -eq 0 || $rc -eq 6 ]] || return "$rc"
+}
+
 run_blend() {
   banner "1. Blend LP  (simplex → Optimal + ProvedOptimalFP)"
   echo "INPUT:  $EX/crude_blending/blend_s42.mps"
   echo "OPTS:   --engine simplex --method auto --solution-out $OUT/blend.sol"
   echo "OUTPUT: status / proof_level / objective / timing → $OUT/blend.sol"
-  "$BIN/sor_solve" "$EX/crude_blending/blend_s42.mps" \
+  solve "$EX/crude_blending/blend_s42.mps" \
     --engine simplex --method auto \
     --solution-out "$OUT/blend.sol" | tee "$OUT/blend.log"
 }
@@ -54,7 +62,7 @@ run_qp() {
   banner "3. Dispatch QP  (convex QP → Optimal + ProvedKKT)"
   echo "INPUT:  $EX/dispatch/dispatch_s42.qps"
   echo "OPTS:   --engine qp --solution-out $OUT/dispatch.sol"
-  "$BIN/sor_solve" "$EX/dispatch/dispatch_s42.qps" \
+  solve "$EX/dispatch/dispatch_s42.qps" \
     --engine qp \
     --solution-out "$OUT/dispatch.sol" | tee "$OUT/dispatch.log"
 }
@@ -64,7 +72,7 @@ run_milp() {
   echo "INPUT:  $EX/scheduling/schedule_s42.mps"
   echo "OPTS:   --engine milp --time-limit 30 --verbose --solution-out $OUT/schedule.sol"
   echo "NOTE:   say Feasible honestly if not Optimal"
-  "$BIN/sor_solve" "$EX/scheduling/schedule_s42.mps" \
+  solve "$EX/scheduling/schedule_s42.mps" \
     --engine milp --time-limit 30 --verbose \
     --solution-out "$OUT/schedule.sol" | tee "$OUT/schedule.log"
 }
@@ -73,7 +81,7 @@ run_hpr_cpu() {
   banner "5a. HPR first-order (CPU)  - FO ≠ proved Optimal"
   echo "INPUT:  $EX/sparse500.mps"
   echo "OPTS:   --engine hpr --backend cpu --max-iter 50000 --time-limit 15"
-  "$BIN/sor_solve" "$EX/sparse500.mps" \
+  solve "$EX/sparse500.mps" \
     --engine hpr --backend cpu \
     --max-iter 50000 --time-limit 15 \
     --solution-out "$OUT/hpr_cpu.sol" | tee "$OUT/hpr_cpu.log"
@@ -84,7 +92,7 @@ run_hpr_vulkan() {
   echo "INPUT:  $EX/sparse500.mps"
   echo "OPTS:   --engine hpr --backend vulkan --max-iter 50000 --time-limit 30"
   echo "LOOK:   host->device / device->host lines"
-  "$BIN/sor_solve" "$EX/sparse500.mps" \
+  solve "$EX/sparse500.mps" \
     --engine hpr --backend vulkan \
     --max-iter 50000 --time-limit 30 \
     --solution-out "$OUT/hpr_vulkan.sol" | tee "$OUT/hpr_vulkan.log"
@@ -146,8 +154,11 @@ case "$cmd" in
     run_qp
     run_milp
     run_hpr_cpu
-    # Vulkan may be slow/unavailable - still film if present
-    if "$BIN/sor_solve" "$EX/testlp.mps" --engine hpr --backend vulkan --max-iter 10 --time-limit 5 >/dev/null 2>&1; then
+    # Vulkan may be slow/unavailable - still film if present. Ten iterations
+    # rarely converge, so a limit stop (4) or a point (6) means it ran.
+    vk_rc=0
+    "$BIN/sor_solve" "$EX/testlp.mps" --engine hpr --backend vulkan --max-iter 10 --time-limit 5 >/dev/null 2>&1 || vk_rc=$?
+    if [[ $vk_rc -eq 0 || $vk_rc -eq 4 || $vk_rc -eq 6 ]]; then
       run_hpr_vulkan
     else
       echo "(skip hpr-vulkan - backend not available)"

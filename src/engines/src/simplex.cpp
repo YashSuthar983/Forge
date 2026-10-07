@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <chrono>
+#include <optional>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -196,12 +197,8 @@ void rematerialize_original(const model::LpProblem& original,
         return;
     }
 
-    model::LpProblem pmin = original;
+    const model::LpProblem pmin = model::minimization_form(original);
     const f64 sense = original.maximize ? -1.0 : 1.0;
-    if (pmin.maximize) {
-        for (auto& v : pmin.c) v = -v;
-        pmin.maximize = false;
-    }
     std::vector<f64> yout(sz(m), 0.0);
     for (Index i = 0; i < m; ++i) yout[sz(i)] = sense * raw.y[sz(i)];
 
@@ -643,9 +640,7 @@ void report_simplex_dual_bound(const model::LpProblem& pmin, f64 sense,
     diag.dual_bound_finite = bound.finite;
     diag.dual_objective = std::numeric_limits<f64>::quiet_NaN();
     if (bound.finite) {
-        const model::Rational reported = model::Rational(sense) *
-            (model::Rational(bound.value) - model::Rational(pmin.obj_offset)) +
-            model::Rational(pmin.obj_offset);
+        const model::Rational reported = model::Rational(sense) * model::Rational(bound.value);
         diag.dual_objective = sense > 0 ? model::rounded_down(reported) : model::rounded_up(reported);
         diag.dual_bound_finite = std::isfinite(diag.dual_objective);
     }
@@ -894,11 +889,7 @@ SimplexPrepared prepare_simplex_model(const model::LpProblem& problem,
     const auto t_all = Clock::now();
     SimplexPrepared out;
     out.sense = problem.maximize ? -1.0 : 1.0;
-    out.pmin = problem;
-    if (out.pmin.maximize) {
-        for (auto& v : out.pmin.c) v = -v;
-        out.pmin.maximize = false;
-    }
+    out.pmin = model::minimization_form(problem);
     out.scaled = out.pmin;
     const auto t_scale = Clock::now();
     try {
@@ -2618,7 +2609,7 @@ core::RawResult solve_primal_simplex_prepared(
                 if (st[sz(j)] != NonbasicStatus::Basic) obj += cost[sz(j)] * value[sz(j)];
             std::printf("  iter %8llu  phase %d  infeas %.6e  obj %.10e\n",
                         static_cast<unsigned long long>(iter), phase,
-                        primal_infeasibility(), sense * obj + pmin.obj_offset);
+                        primal_infeasibility(), sense * (obj + pmin.obj_offset));
         }
     }
     diag.loop_ms = ms_since(t_loop);
@@ -2807,7 +2798,7 @@ core::RawResult solve_primal_simplex_prepared(
 
     f64 obj_min = 0.0;
     for (Index j = 0; j < ns; ++j) obj_min += pmin.c[sz(j)] * x[sz(j)];
-    diag.primal_objective = sense * obj_min + pmin.obj_offset;
+    diag.primal_objective = sense * (obj_min + pmin.obj_offset);
 
     // Check the true, unscaled Lagrangian. Numerical feasibility tolerance
     // cannot turn a nonzero reduced cost times infinity into zero.
@@ -2882,9 +2873,8 @@ core::RawResult solve_primal_simplex_prepared(
                 opts.time_limit_s - ms_since(t_all) / 1000) : 0})) {
         const auto exact = certify::exact_dual_lower_bound(pmin, raw.exact_dual);
         if (exact.finite) {
-            const model::Rational reported = model::Rational(sense) *
-                (model::Rational(exact.value) - model::Rational(pmin.obj_offset)) +
-                model::Rational(pmin.obj_offset);
+            const model::Rational reported =
+                model::Rational(sense) * model::Rational(exact.value);
             raw.dual_bound = diag.dual_objective = sense > 0
                 ? model::rounded_down(reported) : model::rounded_up(reported);
             diag.dual_bound_finite = std::isfinite(raw.dual_bound);
@@ -2925,6 +2915,18 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
     core::RouteSpan solve_span(1, "simplex", "solve", "solve", "", core::RouteLedgerBucket::Engine);
     problem.validate(/*allow_empty_domains=*/true);
     model::validate_lp_policy(opts.primal_feas_tol, opts.dual_feas_tol, opts.gap_tol, opts.time_limit_s);
+    // A crossed bound is infeasible by the data alone; the checker re-derives
+    // that from the model (ProofEvidence::empty_domain). Neither presolve nor
+    // the basis code handles it: the dual reported "no primal-infeasible basic
+    // variable" and gave up with NoSolutionFound.
+    if (const auto empty = problem.find_empty_domain(); empty.index >= 0) {
+        core::RawResult raw;
+        raw.proposed_status = core::Status::Infeasible;
+        raw.engine = "simplex";
+        raw.termination_reason = problem.describe(empty);
+        diag.status = raw.proposed_status;
+        return raw;
+    }
     const model::LpProblem* work = &problem;
     presolve::PresolveMap pmap;
     bool used_presolve = false;
@@ -2938,6 +2940,10 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         popts.implied_slack = opts.presolve_implied_slack;
         popts.live_reductions = opts.presolve_live_reductions;
         popts.parallel_rows = opts.presolve_live_reductions;
+        if (opts.time_limit_s > 0.0)
+            popts.deadline = presolve_t0 +
+                std::chrono::duration_cast<Clock::duration>(
+                    std::chrono::duration<double>(opts.time_limit_s));
         auto outcome = presolve::presolve(problem, popts);
         presolve_status = outcome.status;
         pmap = std::move(outcome.map);
@@ -2977,10 +2983,40 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         copy_presolve_diag(diag);
         return terminal;
     }
+    // The time limit is a wall for the whole call. Presolve stops at it, and
+    // neither scaling, factorization nor the all-row DSE rebuild runs once it
+    // has passed: on a 1.5M-nonzero model a 1 s limit used to return after
+    // 2.7 s, with presolve alone at 1.65 s.
+    const auto out_of_time = [&](const char* where) -> std::optional<core::RawResult> {
+        if (!(opts.time_limit_s > 0.0) ||
+            std::chrono::duration<double>(Clock::now() - presolve_t0).count() <
+                opts.time_limit_s)
+            return std::nullopt;
+        diag = SimplexDiagnostics{};
+        diag.status = core::Status::Interrupted;
+        diag.presolve_ms = presolve_ms;
+        diag.total_ms = ms_since(presolve_t0);
+        copy_presolve_diag(diag);
+        core::RawResult raw;
+        raw.proposed_status = core::Status::Interrupted;
+        raw.engine = "simplex";
+        raw.termination_reason = "time limit (" + std::to_string(opts.time_limit_s) +
+                                 "s) reached " + where;
+        return raw;
+    };
+    if (auto stop = out_of_time(opts.presolve ? "in presolve" : "before the solve"))
+        return *std::move(stop);
     // Build the immutable numeric representation once. Auto may run a dual
     // primary engine and a failure fallback; all stages solve the identical
     // transformed model and share this scaling and CSC.
     auto prepared = prepare_simplex_model(*work, opts);
+    if (auto stop = out_of_time("while scaling the model")) {
+        diag.scaling_ms = prepared.scaling_ms;
+        diag.csc_ms = prepared.csc_ms;
+        diag.preprocessing_ms = prepared.total_ms;
+        diag.preprocessing_builds = 1;
+        return *std::move(stop);
+    }
     const bool retain_prepared = out_session != nullptr && !used_presolve;
     SimplexBasis retained_basis;
     DualEdgeWeightCarrier retained_weights;

@@ -226,6 +226,38 @@ void test_mip_gap_is_explicit_and_validated() {
     CHECK(contains(r.output, "mip gap tolerance: 0"));
 }
 
+// The same quadratic model saved as .mps used to be read as its LP part: the
+// simplex reported Optimal for min -4x (x = 5, objective -20), and sor_check,
+// reading it the same way, printed VERIFIED. Both must refuse the file, and the
+// .qps spelling must keep working.
+void test_quadratic_section_in_mps_is_refused() {
+    const fs::path mps = fs::temp_directory_path() / "sor_cli_quadobj.mps";
+    const fs::path qps = fs::temp_directory_path() / "sor_cli_quadobj.qps";
+    const fs::path claim = fs::temp_directory_path() / "sor_cli_quadobj.sol";
+    const char* text =
+        "NAME CHECKQP\nROWS\n N OBJ\nCOLUMNS\n X OBJ -4\nRHS\nBOUNDS\n"
+        " LO BND X 0\n UP BND X 5\nQUADOBJ\n X X 2\nENDATA\n";
+    { std::ofstream out(mps); out << text; }
+    { std::ofstream out(qps); out << text; }
+
+    const Run lp = run({solve_exe, mps.string(), "--engine", "simplex"});
+    CHECK(lp.exit_code != 0);
+    CHECK(contains(lp.output, "QUADOBJ"));
+    CHECK(!contains(lp.output, "status:"));
+
+    write_solution_claim(claim, "Optimal", "ProvedKKT", -20.0, "1 5");
+    const Run checked = run({check_exe, mps.string(), claim.string()});
+    CHECK(checked.exit_code != 0);
+    CHECK(!contains(checked.output, "VERIFIED"));
+
+    const Run qp = run({solve_exe, qps.string(), "--engine", "qp"});
+    CHECK(qp.exit_code == 0);
+    CHECK(!contains(qp.output, "QUADOBJ"));
+    fs::remove(mps);
+    fs::remove(qps);
+    fs::remove(claim);
+}
+
 void test_sor_check_recomputes_qp_objective_without_claiming_proof() {
     const fs::path qp_model = fs::temp_directory_path() / "sor_check_qp.qps";
     const fs::path qp_claim = fs::temp_directory_path() / "sor_check_qp.sol";
@@ -849,6 +881,143 @@ void test_sor_check_unbounded_requires_feasible_point() {
     fs::remove(missing_point, ec);
 }
 
+// A limit stop, a failed search or a numerical failure asserts nothing about
+// the model. sor_check used to answer such a solution file with "FAIL no
+// independent check" and REJECTED, which reads as a refuted claim.
+void test_sor_check_status_without_claim_is_unverified() {
+    const fs::path claim =
+        fs::temp_directory_path() / "sor_check_no_claim.sol";
+    for (const char* status : {"Interrupted", "NoSolutionFound",
+                               "NumericalFailure", "NotSolved"}) {
+        write_solution_claim(claim, status, "None", 0.0, "0");
+        const Run checked = run({check_exe, model, claim.string()});
+        ::sor::test::report(checked.exit_code == 3 &&
+                                contains(checked.output, "validation: no_claim") &&
+                                contains(checked.output, "\nUNVERIFIED\n") &&
+                                !contains(checked.output, "REJECTED") &&
+                                !contains(checked.output, "FAIL"),
+                            "a status without a claim is unverified, not rejected",
+                            __FILE__, __LINE__,
+                            std::string(status) + ": " + checked.output);
+    }
+    std::error_code ec;
+    fs::remove(claim, ec);
+}
+
+// sor_solve's exit status names the outcome: a proved Infeasible or
+// Unbounded used to share exit 5 with a numerical failure, so a script could
+// not tell an answer from a breakdown without parsing stdout.
+void test_sor_solve_exit_status_names_the_outcome() {
+    const fs::path infeasible =
+        fs::temp_directory_path() / "sor_solve_exit_infeasible.mps";
+    {
+        std::ofstream out(infeasible);
+        out << "NAME          EXITINF\n"
+               "ROWS\n"
+               " N  COST\n"
+               " G  R1\n"
+               "COLUMNS\n"
+               "    X         COST      1.0        R1        1.0\n"
+               "RHS\n"
+               "    RHS       R1        2.0\n"
+               "BOUNDS\n"
+               " UP BND       X          1.0\n"
+               "ENDATA\n";
+    }
+    const Run optimal = run({solve_exe, model});
+    ::sor::test::report(optimal.exit_code == 0 &&
+                            contains(optimal.output, "status:            Optimal"),
+                        "Optimal exits 0", __FILE__, __LINE__, optimal.output);
+    for (const bool presolve : {true, false}) {
+        const auto args = [&](const std::string& path) {
+            std::vector<std::string> a{solve_exe, path};
+            if (!presolve) a.push_back("--no-presolve");
+            return a;
+        };
+        const char* label = presolve ? "presolve" : "no presolve";
+        const Run inf = run(args(infeasible.string()));
+        ::sor::test::report(inf.exit_code == 7 &&
+                                contains(inf.output, "status:            Infeasible"),
+                            "Infeasible exits 7", __FILE__, __LINE__,
+                            std::string(label) + ": " + inf.output);
+        const Run unb = run(args(checker_unbounded_model));
+        ::sor::test::report(unb.exit_code == 8 &&
+                                contains(unb.output, "status:            Unbounded"),
+                            "Unbounded exits 8", __FILE__, __LINE__,
+                            std::string(label) + ": " + unb.output);
+    }
+    std::error_code ec;
+    fs::remove(infeasible, ec);
+}
+
+// An LP engine on a model with integer columns answers its LP relaxation.
+// The claim used to say nothing about that, so sor_check checked the point
+// as a MILP incumbent and rejected it as fractional.
+void test_lp_engine_on_milp_claims_the_relaxation() {
+    const fs::path claim = fs::temp_directory_path() / "sor_lp_relaxation.sol";
+    const Run solved = run({solve_exe, checker_milp_infeasible_model,
+                            "--engine", "simplex", "--solution-out", claim.string()});
+    CHECK(solved.exit_code == 0);
+    CHECK(contains(solved.output, "solving the LP RELAXATION"));
+    const Run checked = run({check_exe, checker_milp_infeasible_model, claim.string()});
+    ::sor::test::report(checked.exit_code == 0 &&
+                            contains(checked.output, "integrality relaxed") &&
+                            contains(checked.output, "validation: lp_") &&
+                            contains(checked.output, "\nVERIFIED\n"),
+                        "an LP-relaxation claim verifies as one", __FILE__, __LINE__,
+                        checked.output);
+    std::error_code ec;
+    fs::remove(claim, ec);
+}
+
+// A crossed bound is a readable, infeasible model. The readers used to throw,
+// so every route said "parse failed"; with that gone, the quadratic engines
+// could not represent the empty interval and hprqp claimed Optimal.
+void test_crossed_bounds_are_infeasible_on_every_route() {
+    const fs::path lp = fs::temp_directory_path() / "sor_crossed.mps";
+    const fs::path qp = fs::temp_directory_path() / "sor_crossed.qps";
+    const fs::path claim = fs::temp_directory_path() / "sor_crossed.sol";
+    const std::string body =
+        "ROWS\n"
+        " N  COST\n"
+        " L  R1\n"
+        "COLUMNS\n"
+        "    X         COST      1.0        R1        1.0\n"
+        "    Y         COST      1.0        R1        1.0\n"
+        "RHS\n"
+        "    RHS       R1        10.0\n"
+        "BOUNDS\n"
+        " LO BND       X          3.0\n"
+        " UP BND       X          2.0\n";
+    { std::ofstream out(lp); out << "NAME          CROSSED\n" << body << "ENDATA\n"; }
+    { std::ofstream out(qp); out << "NAME          CROSSEDQ\n" << body
+                                 << "QUADOBJ\n    X         X         2.0\n"
+                                 << "ENDATA\n"; }
+    const std::vector<std::pair<std::string, std::string>> routes = {
+        {lp.string(), "simplex"}, {lp.string(), "auto"}, {lp.string(), "hpr"},
+        {lp.string(), "barrier"}, {lp.string(), "milp"}, {qp.string(), "qp"},
+        {qp.string(), "qpipm"},   {qp.string(), "hprqp"}};
+    for (const auto& [model_path, engine] : routes) {
+        const Run solved = run({solve_exe, model_path, "--engine", engine,
+                                "--solution-out", claim.string()});
+        ::sor::test::report(solved.exit_code == 7 &&
+                                contains(solved.output, "status:            Infeasible") &&
+                                contains(solved.output, "lower bound 3 above upper bound 2"),
+                            "crossed bounds solve to Infeasible", __FILE__, __LINE__,
+                            engine + ": " + solved.output);
+        const Run checked = run({check_exe, model_path, claim.string()});
+        ::sor::test::report(checked.exit_code == 0 &&
+                                contains(checked.output, "validation: empty_domain") &&
+                                contains(checked.output, "\nVERIFIED\n"),
+                            "sor_check verifies the empty domain", __FILE__, __LINE__,
+                            engine + ": " + checked.output);
+    }
+    std::error_code ec;
+    fs::remove(lp, ec);
+    fs::remove(qp, ec);
+    fs::remove(claim, ec);
+}
+
 }  // namespace
 
 
@@ -1087,6 +1256,7 @@ int main() {
     test_route_trace_requires_instrumented_build();
     test_mip_gap_is_explicit_and_validated();
     test_sor_check_recomputes_qp_objective_without_claiming_proof();
+    test_quadratic_section_in_mps_is_refused();
     test_missing_values_at_end_of_argv();
     test_enum_flags_reject_unknown_names();
     test_q_diag_rejects_malformed_entries();
@@ -1102,6 +1272,10 @@ int main() {
     test_sor_check_milp_integrality_tolerance_agreement();
     test_sor_check_milp_infeasible_without_lp_ray_is_unverified();
     test_sor_check_unbounded_requires_feasible_point();
+    test_sor_check_status_without_claim_is_unverified();
+    test_sor_solve_exit_status_names_the_outcome();
+    test_crossed_bounds_are_infeasible_on_every_route();
+    test_lp_engine_on_milp_claims_the_relaxation();
     test_lp_file_solver_and_checker();
 
     std::error_code ec;

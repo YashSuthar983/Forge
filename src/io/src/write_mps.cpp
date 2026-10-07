@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <fstream>
+#include <ios>
 #include <stdexcept>
 
 namespace sor::io {
@@ -33,9 +34,10 @@ void write_body(std::ostream& out, const model::LpProblem& p) {
         if (lo == hi) kind = 'E';
         else if (lo > -model::kInf && hi >= model::kInf) kind = 'G';
         else if (lo <= -model::kInf && hi < model::kInf) kind = 'L';
-        else kind = 'E';  // ranged: emit as E with mid - writer keeps lo/hi via RHS+RANGES later; use L/G prefer
-        // Two-sided with finite lo and hi: emit as E only if equal; else L and rely on RANGES.
-        if (lo > -model::kInf && hi < model::kInf && lo != hi) kind = 'L';
+        // Two-sided with finite lo and hi: L with the RHS at hi and a RANGE of
+        // hi - lo. A free row (no finite side) is an L row whose RHS reads as
+        // infinite; it used to fall through to E with no RHS, i.e. "= 0".
+        else kind = 'L';
         out << " " << kind << "  " << name_or(p.row_names, i, "R") << "\n";
     }
 
@@ -88,6 +90,9 @@ void write_body(std::ostream& out, const model::LpProblem& p) {
         if (lo == hi) { rhs = lo; write = true; }
         else if (hi < model::kInf) { rhs = hi; write = true; }
         else if (lo > -model::kInf) { rhs = lo; write = true; }
+        // A free row: 1e30 is the conventional "no bound", read as +inf by
+        // this reader and by the CPLEX/HiGHS convention.
+        else { rhs = 1e30; write = true; }
         if (write && rhs != 0.0) {
             out << "    RHS       " << name_or(p.row_names, i, "R") << "  " << rhs << "\n";
             any_rhs = true;
@@ -103,7 +108,9 @@ void write_body(std::ostream& out, const model::LpProblem& p) {
         const f64 lo = p.row_lo[sz(i)], hi = p.row_hi[sz(i)];
         if (lo > -model::kInf && hi < model::kInf && lo != hi) {
             if (!any_range) { out << "RANGES\n"; any_range = true; }
-            // For L row with RHS=hi, range = hi - lo.
+            // For L row with RHS=hi, range = hi - lo. MPS can only state the
+            // range, so lo reads back as hi - (hi - lo): exact whenever the
+            // subtraction is, within an ulp of the row's magnitude otherwise.
             out << "    RNG       " << name_or(p.row_names, i, "R") << "  "
                 << (hi - lo) << "\n";
         }
@@ -126,16 +133,39 @@ void write_body(std::ostream& out, const model::LpProblem& p) {
                 // Use UP for both (not UI): PuLP/CBC's MPS reader rejects UI.
                 if (hi < model::kInf)
                     out << " UP BND       " << cj << "  " << hi << "\n";
-                if (lo <= -model::kInf && hi < model::kInf && !is_int)
+                // MI for integer columns too: without it (-inf, u] read back
+                // with lower bound 0.
+                if (lo <= -model::kInf && hi < model::kInf)
                     out << " MI BND       " << cj << "\n";
+                // An integer column without any bound record reads as binary
+                // (the MPS convention), so [l, +inf) must say PL explicitly.
+                if (is_int && hi >= model::kInf)
+                    out << " PL BND       " << cj << "\n";
             }
         }
     }
 }
 
+// Seventeen significant digits make every double read back bit for bit; the
+// stream default (six) rounded every coefficient, bound, side and quadratic
+// term. The caller's stream state is restored when the file is written.
+struct ExactDigits {
+    std::ostream& out;
+    std::streamsize precision;
+    std::ios_base::fmtflags flags;
+    explicit ExactDigits(std::ostream& o)
+        : out(o), precision(o.precision(17)), flags(o.flags()) {
+        out.unsetf(std::ios_base::floatfield);
+    }
+    ~ExactDigits() { out.precision(precision); out.flags(flags); }
+    ExactDigits(const ExactDigits&) = delete;
+    ExactDigits& operator=(const ExactDigits&) = delete;
+};
+
 }  // namespace
 
 void write_mps(std::ostream& out, const model::LpProblem& p) {
+    const ExactDigits exact(out);
     write_body(out, p);
     out << "ENDATA\n";
 }
@@ -150,6 +180,7 @@ void write_qps(std::ostream& out, const model::LpProblem& p,
                const std::vector<f64>& q_diag) {
     if (static_cast<Index>(q_diag.size()) != p.n_cols())
         throw std::invalid_argument("write_qps: q_diag size != n_cols");
+    const ExactDigits exact(out);
     write_body(out, p);
     out << "QUADOBJ\n";
     for (Index j = 0; j < p.n_cols(); ++j) {

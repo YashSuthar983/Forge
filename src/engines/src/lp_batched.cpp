@@ -102,12 +102,8 @@ std::vector<BatchBoundProbeResult> batch_bound_probes_hpr(
     std::vector<BatchBoundProbeResult> out;
     if (probes.empty()) return out;
 
-    model::LpProblem p = problem;
-    const f64 sense = p.maximize ? -1.0 : 1.0;
-    if (p.maximize) {
-        for (f64& value : p.c) value = -value;
-        p.maximize = false;
-    }
+    model::LpProblem p = model::minimization_form(problem);
+    const f64 sense = problem.maximize ? -1.0 : 1.0;
     // Probe c vectors are already minimize-sense from the caller when set.
 
     backend::ScaledLp scaled = build_scaled_lp(
@@ -150,8 +146,10 @@ std::vector<BatchBoundProbeResult> batch_bound_probes_hpr(
     for (std::size_t i = 0; i < kkts.size(); ++i) {
         const auto& k = kkts[i];
         BatchBoundProbeResult r;
-        // Minimize-sense original objective (matches bab lp_obj_min).
-        r.primal_obj = k.primal_obj + problem.obj_offset;
+        // Minimize-sense original objective (matches bab lp_obj_min, which
+        // is sense * objective): the minimization form's offset, not the
+        // original's, which had the wrong sign for a maximization.
+        r.primal_obj = k.primal_obj + p.obj_offset;
         r.primal_res = k.primal_res;
         r.dual_res = k.dual_res;
         r.gap_rel = k.gap_rel;

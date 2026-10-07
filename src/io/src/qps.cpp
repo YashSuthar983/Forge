@@ -1,137 +1,99 @@
 #include "sor/io/qps.hpp"
 
+#include "sor/model/dyadic.hpp"
+
 #include <algorithm>
-#include <cctype>
-#include <cstdlib>
-#include <fstream>
-#include <sstream>
+#include <map>
 #include <stdexcept>
-#include <unordered_map>
+#include <utility>
 
 namespace sor::io {
-namespace {
-
-std::string upper(std::string s) {
-    for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    return s;
-}
-
-std::vector<std::string> split_ws(const std::string& line) {
-    std::vector<std::string> out;
-    std::istringstream in(line);
-    std::string tok;
-    while (in >> tok) out.push_back(tok);
-    return out;
-}
-
-}  // namespace
 
 QpsProblem read_qps_file(const std::string& path, QpsReadReport& rep,
                          const MpsReadOptions& opt) {
-    // Linear part via the existing MPS reader (QUADOBJ is warned/ignored there).
+    // One pass of the MPS reader reads the linear part and the quadratic
+    // section together, gzip and fixed format included. (A second plain
+    // ifstream scan used to read the quadratic section: on a .qps.gz it found
+    // nothing and the QP was silently solved as an LP.)
     MpsReadReport mrep;
     QpsProblem qp;
-    qp.linear = read_mps_file_auto(path, mrep, opt);
+    QuadraticTerms terms;
+    MpsReadOptions linear_opt = opt;
+    linear_opt.quadratic = &terms;
+    qp.linear = read_mps_file_auto(path, mrep, linear_opt);
     static_cast<MpsReadReport&>(rep) = mrep;
-    // QUADOBJ is re-parsed below; drop the LP-only ignore warning.
-    rep.warnings.erase(
-        std::remove_if(rep.warnings.begin(), rep.warnings.end(),
-                       [](const std::string& w) {
-                           return w.find("QUADOBJ") != std::string::npos &&
-                                  w.find("ignored") != std::string::npos;
-                       }),
-        rep.warnings.end());
-    qp.q_diag.assign(static_cast<std::size_t>(qp.linear.n_cols()), 0.0);
-    // QPS quadratic sections conventionally contain one triangle.  Accumulate
-    // unordered pairs, then mirror off-diagonals to the full symmetric CSR
-    // representation expected by the engine.
-    struct QEntry { core::Index i, j; core::f64 value; };
-    std::vector<QEntry> quadratic;
+    const auto n = qp.linear.n_cols();
+    qp.q_diag.assign(static_cast<std::size_t>(n), 0.0);
 
-    // Map column names → indices.
-    std::unordered_map<std::string, core::Index> col_of;
-    for (core::Index j = 0; j < qp.linear.n_cols(); ++j) {
-        if (static_cast<std::size_t>(j) < qp.linear.col_names.size() &&
-            !qp.linear.col_names[static_cast<std::size_t>(j)].empty())
-            col_of[qp.linear.col_names[static_cast<std::size_t>(j)]] = j;
-        else
-            col_of["X" + std::to_string(j + 1)] = j;
+    // Collect each (i, j) pair's entries; key by the unordered pair.
+    struct Pair {
+        model::DyadicSum lower, upper;  // entries written as (i>=j) / (i<j)
+        std::size_t n_lower = 0, n_upper = 0, line = 0;
+    };
+    std::map<std::pair<core::Index, core::Index>, Pair> pairs;
+    for (std::size_t k = 0; k < terms.vals.size(); ++k) {
+        const core::Index i = terms.rows[k], j = terms.cols[k];
+        auto& e = pairs[{std::max(i, j), std::min(i, j)}];
+        if (e.n_lower + e.n_upper == 0) e.line = terms.lines[k];
+        if (i >= j) { e.lower.add(terms.vals[k]); ++e.n_lower; }
+        else        { e.upper.add(terms.vals[k]); ++e.n_upper; }
     }
-
-    std::ifstream in(path);
-    if (!in) throw std::runtime_error("cannot open " + path);
-    std::string line;
-    bool in_quad = false;
-    std::size_t line_no = 0;
-    while (std::getline(in, line)) {
-        ++line_no;
-        if (line.empty()) continue;
-        // Strip CR.
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty()) continue;
-
-        const bool header = !std::isspace(static_cast<unsigned char>(line[0]));
-        if (header) {
-            const auto f = split_ws(line);
-            if (f.empty()) continue;
-            const std::string key = upper(f[0]);
-            if (key == "QUADOBJ" || key == "QMATRIX" || key == "QSECTION") {
-                in_quad = true;
-                continue;
-            }
-            if (key == "ENDATA") break;
-            if (in_quad) in_quad = false;  // left the section
-            continue;
+    const auto where = [&](const Pair& e, core::Index i, core::Index j) {
+        return " (line " + std::to_string(e.line) + ", columns '" +
+               qp.linear.col_names[static_cast<std::size_t>(i)] + "' and '" +
+               qp.linear.col_names[static_cast<std::size_t>(j)] + "')";
+    };
+    std::size_t repeated = 0;
+    std::vector<core::Index> rows, cols;
+    std::vector<core::f64> values;
+    for (const auto& [key, e] : pairs) {
+        const auto [i, j] = key;
+        core::f64 value = 0.0;
+        if (i == j) {
+            value = e.lower.nearest();
+            repeated += e.n_lower - 1;
+        } else if (terms.full_matrix) {
+            // QMATRIX: both triangles, and they must agree.
+            if (e.n_lower == 0 || e.n_upper == 0 || e.lower.nearest() != e.upper.nearest())
+                throw std::runtime_error(
+                    "QMATRIX is not symmetric: the (i,j) and (j,i) entries differ" +
+                    where(e, i, j));
+            value = e.lower.nearest();
+            repeated += e.n_lower - 1 + e.n_upper - 1;
+        } else {
+            // QUADOBJ: one triangle. Both orientations means the full matrix
+            // was written in the wrong section; mirroring it would double
+            // every off-diagonal, keeping one would guess.
+            if (e.n_lower > 0 && e.n_upper > 0)
+                throw std::runtime_error(
+                    "QUADOBJ lists both (i,j) and (j,i): it takes one triangle of "
+                    "Q, QMATRIX the full matrix" + where(e, i, j));
+            const auto& sum = e.n_lower > 0 ? e.lower : e.upper;
+            value = sum.nearest();
+            repeated += (e.n_lower > 0 ? e.n_lower : e.n_upper) - 1;
         }
-        if (!in_quad) continue;
-
-        const auto f = split_ws(line);
-        if (f.size() < 3) continue;
-        // Forms:  col row value   OR   set col row value
-        std::size_t k = (f.size() >= 4) ? 1 : 0;
-        for (; k + 2 < f.size() || (k + 1 < f.size() && f.size() - k >= 3);) {
-            if (k + 2 >= f.size()) break;
-            const std::string& c1 = f[k];
-            const std::string& c2 = f[k + 1];
-            const double v = std::strtod(f[k + 2].c_str(), nullptr);
-            auto i1 = col_of.find(c1);
-            auto i2 = col_of.find(c2);
-            if (i1 == col_of.end() || i2 == col_of.end()) {
-                rep.warnings.push_back("QUADOBJ unknown column at line " +
-                                       std::to_string(line_no));
-                k += 3;
-                continue;
-            }
-            ++rep.n_quad_entries;
-            quadratic.push_back({i1->second, i2->second, v});
-            if (i1->second != i2->second) {
-                rep.has_off_diagonal = true;
-            } else {
-                qp.q_diag[static_cast<std::size_t>(i1->second)] += v;
-            }
-            k += 3;
-            break;  // one triple per line is the common case
+        if (value == 0.0) continue;
+        ++rep.n_quad_entries;
+        if (i == j) {
+            qp.q_diag[static_cast<std::size_t>(i)] = value;
+        } else {
+            rep.has_off_diagonal = true;
+        }
+        rows.push_back(i);
+        cols.push_back(j);
+        values.push_back(value);
+        if (i != j) {
+            rows.push_back(j);
+            cols.push_back(i);
+            values.push_back(value);
         }
     }
-    if (rep.has_off_diagonal) {
-        std::vector<core::Index> rows, cols;
-        std::vector<core::f64> values;
-        rows.reserve(quadratic.size() * 2);
-        cols.reserve(quadratic.size() * 2);
-        values.reserve(quadratic.size() * 2);
-        for (const auto& e : quadratic) {
-            rows.push_back(e.i);
-            cols.push_back(e.j);
-            values.push_back(e.value);
-            if (e.i != e.j) {
-                rows.push_back(e.j);
-                cols.push_back(e.i);
-                values.push_back(e.value);
-            }
-        }
-        qp.q_matrix = sparse::from_triplets(qp.linear.n_cols(), qp.linear.n_cols(),
-                                             rows, cols, values);
-    }
+    if (repeated > 0)
+        rep.warnings.push_back(std::to_string(repeated) +
+                               " quadratic entr" + (repeated == 1 ? "y" : "ies") +
+                               " repeated for the same pair; summed exactly");
+    if (rep.has_off_diagonal)
+        qp.q_matrix = sparse::from_triplets(n, n, rows, cols, values);
     return qp;
 }
 

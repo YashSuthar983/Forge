@@ -388,7 +388,6 @@ void Parser::parse_constraint() {
     }
     if (std::isnan(lo) || std::isnan(hi) || lo == kInf || hi == -kInf)
         fail(line, "invalid infinite constraint side");
-    if (lo > hi) fail(line, "ranged constraint lower side exceeds upper side");
 
     const Index row = static_cast<Index>(row_names_.size());
     row_names_.push_back(name.empty() ? "R" + std::to_string(row + 1) : name);
@@ -539,18 +538,24 @@ model::LpProblem Parser::run(MpsReadReport& rep, std::size_t lines) {
         if (lo_[j] == kInf || hi_[j] == -kInf)
             fail(1, "invalid infinite bound for variable '" + col_names_[j] + "'");
         if (lo_[j] > hi_[j])
-            throw std::runtime_error(
-                "LP format: variable '" + col_names_[j] + "' has lower bound " +
+            rep.warnings.push_back(
+                "variable '" + col_names_[j] + "' has lower bound " +
                 std::to_string(lo_[j]) + " above upper bound " + std::to_string(hi_[j]) +
-                " (a variable with only a negative upper bound keeps the default lower bound 0)");
+                "; the model is infeasible (a variable with only a negative upper "
+                "bound keeps the default lower bound 0)");
     }
+    for (std::size_t i = 0; i < row_lo_.size(); ++i)
+        if (row_lo_[i] > row_hi_[i])
+            rep.warnings.push_back("constraint '" + row_names_[i] +
+                                   "' has lower side above upper side; the model "
+                                   "is infeasible");
     const auto ms_parse = std::chrono::duration<double, std::milli>(RClock::now() - t_parse).count();
     const auto t_assemble = RClock::now();
 
     model::LpProblem p;
     p.name = obj_name_.empty() ? std::string("LP") : obj_name_;
     p.maximize = maximize_;
-    p.A = sparse::from_triplets(n_rows, n_cols, tri_r_, tri_c_, tri_v_);
+    p.A = assemble_matrix(n_rows, n_cols, tri_r_, tri_c_, tri_v_, rep);
     p.c = obj_;
     p.obj_offset = offset_;
     p.col_lo = lo_;
@@ -566,7 +571,10 @@ model::LpProblem Parser::run(MpsReadReport& rep, std::size_t lines) {
         p.is_integer.assign(p.is_integer.size(), false);
         rep.relaxed_integrality = true;
     }
-    p.validate();
+    apply_infinite_bound(p, opt_, rep);
+    // A crossed bound is a well-formed, infeasible model; the solver reports
+    // it as Infeasible rather than the reader as unreadable.
+    p.validate(/*allow_empty_domains=*/true);
 
     rep.lines_read = lines;
     rep.n_rows = static_cast<std::size_t>(n_rows);
@@ -606,9 +614,11 @@ model::LpProblem read_lp(std::istream& in, MpsReadReport& rep, const MpsReadOpti
 
 model::LpProblem read_lp_file(const std::string& path, MpsReadReport& rep, const MpsReadOptions& opt) {
     if (file_has_gzip_magic(path)) {
-        std::istringstream in(read_maybe_gzip_file(path));
+        GzipFileStream in(path);
         rep.used_gzip = true;
-        return read_lp(in, rep, opt);
+        auto p = read_lp(in, rep, opt);
+        in.finish();
+        return p;
     }
     std::ifstream in(path);
     if (!in) throw std::runtime_error("cannot open LP file: " + path);

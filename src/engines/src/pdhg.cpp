@@ -182,12 +182,8 @@ core::RawResult solve_pdhg(const model::LpProblem& problem,
     const auto stop_requested = [&] { return Clock::now() >= deadline; };
 
     // ---- 1. convert to minimize form and scale --------------------------
-    model::LpProblem p = problem;
-    const f64 sense = p.maximize ? -1.0 : 1.0;
-    if (p.maximize) {
-        for (auto& v : p.c) v = -v;
-        p.maximize = false;
-    }
+    model::LpProblem p = model::minimization_form(problem);
+    const f64 sense = problem.maximize ? -1.0 : 1.0;
 
     const auto t_scale = Clock::now();
     RuizScaling scaling = ruiz_scale(p, opts.ruiz_iterations, false, stop_requested);

@@ -114,7 +114,8 @@ void usage() {
         "  --dual-perturbation-at-start  also perturb up front when costs repeat\n"
         "  --dse-weight-floor F  lower bound on updated DSE weights (default 1e-4)\n"
         "  --mip-gap G      relative MILP proof gap (default 1e-4)\n"
-        "  --time-limit S   wall-clock limit in seconds\n"
+        "  --time-limit S   wall-clock limit in seconds, presolve included\n"
+        "                   (simplex default 900; 0 = none)\n"
         "  --no-scaling     skip Ruiz equilibration\n"
         "  --pow2-scaling   round Ruiz factors to powers of two (exact scaling)\n"
         "  --no-presolve    skip presolve (simplex/milp)\n"
@@ -286,7 +287,12 @@ void usage() {
         "  --pivot-trace-every=N    emit 1 of every N level-3 pivot events\n"
         "  --verbose        iteration / node log\n"
         "  --hpr-vanilla | --hpr-full\n"
-        "  --solution-out PATH   write a plain-text solution file for sor_check\n",
+        "  --solution-out PATH   write a plain-text solution file for sor_check\n"
+        "exit status: 0 Optimal; 1 error (unreadable model, ...); 2 bad option;\n"
+        "  3 engine unavailable; 4 Interrupted (limit hit, no point);\n"
+        "  5 NumericalFailure, NoSolutionFound or Unsupported; 6 Feasible (a\n"
+        "  checked point without an optimality proof); 7 Infeasible;\n"
+        "  8 Unbounded or InfeasibleOrUnbounded\n",
         stderr);
 }
 
@@ -358,6 +364,10 @@ unsigned long long parse_uint(const std::string& text, const char* what,
     return v;
 }
 
+// Set when an LP engine answers a model with integer columns: the claim is
+// about the LP relaxation, and the solution file says so for sor_check.
+bool answering_lp_relaxation = false;
+
 // No-op when `path` is empty (the common case: --solution-out wasn't given).
 void write_solution_out(const std::string& path, const sor::core::SolveResult& r) {
     if (path.empty()) return;
@@ -368,7 +378,7 @@ void write_solution_out(const std::string& path, const sor::core::SolveResult& r
                      path.c_str());
         return;
     }
-    sor::io::write_solution(out, r);
+    sor::io::write_solution(out, r, answering_lp_relaxation);
 }
 
 void print_result(const sor::core::SolveResult& r) {
@@ -416,16 +426,47 @@ struct RouteSession {
     }
 };
 
+// One code per kind of outcome, so a script can tell a proved answer from a
+// failure without parsing stdout: a Feasible point (an LP optimum the checker
+// downgraded, or a MILP incumbent at a limit) is not an optimum, and a proved
+// Infeasible is not a numerical failure.
 int exit_code_for(sor::core::Status s) {
     switch (s) {
         case sor::core::Status::Optimal:
-        case sor::core::Status::Feasible:
             return 0;
         case sor::core::Status::Interrupted:
             return 4;
+        case sor::core::Status::Feasible:
+            return 6;
+        case sor::core::Status::Infeasible:
+            return 7;
+        case sor::core::Status::Unbounded:
+        case sor::core::Status::InfeasibleOrUnbounded:
+            return 8;
         default:
             return 5;
     }
+}
+
+// A crossed bound (lower above upper) makes the model infeasible by its data
+// alone, which finalize_result and sor_check re-derive from the model. The
+// quadratic engines cannot represent it (one claimed Optimal), so their routes
+// stop here. Returns the exit status, or -1 when every domain is nonempty.
+int report_empty_domain(const sor::model::LpProblem& p,
+                        const std::string& solution_out) {
+    const auto empty = p.find_empty_domain();
+    if (empty.index < 0) return -1;
+    sor::core::RawResult raw;
+    raw.proposed_status = sor::core::Status::Infeasible;
+    raw.engine = "model";
+    raw.termination_reason = p.describe(empty);
+    sor::core::ProofEvidence ev;
+    ev.empty_domain = true;
+    const auto r = sor::certify::finalize_result(std::move(raw), ev);
+    print_result(r);
+    write_solution_out(solution_out, r);
+    std::printf("termination:       %s\n", r.termination_reason.c_str());
+    return exit_code_for(r.status);
 }
 
 void print_transfer(const sor::backend::TransferStats& s) {
@@ -974,7 +1015,13 @@ int main(int argc, char** argv) {
     sor::engines::PdhgOptions pdhg_opts;
     sor::engines::HprOptions hpr_opts;
     sor::engines::SimplexOptions sx_opts;
+    // Every route reports a result about the file, so the file must be read
+    // completely: an unknown section, or a quadratic objective on a route
+    // that cannot use it, is an error rather than a warning. (A QP solved
+    // as an LP, then checked by sor_check reading the same way, used to be
+    // reported VERIFIED.)
     sor::io::MpsReadOptions mps_opts;
+    mps_opts.strict = true;
     bool mps_format_forced = false;
     bool tol_given = false;
     double lp_gap_tolerance = 0.0;
@@ -2700,6 +2747,8 @@ int main(int argc, char** argv) {
             if (!load_qp_problem(qp, path, q_diag_arg, path_is_qps,
                                  mps_format_forced, mps_opts))
                 return 2;
+            if (const int rc = report_empty_domain(qp.linear, solution_out); rc >= 0)
+                return rc;
 
             std::printf("model:             %s\n",
                         qp.linear.name.empty() ? path.c_str()
@@ -2850,6 +2899,8 @@ int main(int argc, char** argv) {
             if (!load_qp_problem(qp, path, q_diag_arg, path_is_qps,
                                  mps_format_forced, mps_opts))
                 return 2;
+            if (const int rc = report_empty_domain(qp.linear, solution_out); rc >= 0)
+                return rc;
 
             std::printf("model:             %s\n",
                         qp.linear.name.empty() ? path.c_str()
@@ -2921,6 +2972,8 @@ int main(int argc, char** argv) {
             if (!load_qp_problem(qp, path, q_diag_arg, path_is_qps,
                                  mps_format_forced, mps_opts))
                 return 2;
+            if (const int rc = report_empty_domain(qp.linear, solution_out); rc >= 0)
+                return rc;
 
             std::printf("model:             %s\n",
                         qp.linear.name.empty() ? path.c_str()
@@ -2988,13 +3041,21 @@ int main(int argc, char** argv) {
             return exit_code_for(r.status);
         }
 
-        // MILP proof claims must be about the whole model: fail on an MPS
-        // section the reader does not understand instead of ignoring it.
-        if (engine_name == "milp") mps_opts.strict = true;
         sor::io::MpsReadReport rep;
+        // An LP engine answers the LP relaxation of a model with integer
+        // columns. Read it relaxed so presolve sees the model it solves
+        // (integer flags block aggregation and other LP reductions), and mark
+        // the claim so sor_check checks that model instead of rejecting the
+        // point as a fractional incumbent.
+        const bool lp_engine =
+            engine_name == "auto" || engine_name == "simplex" ||
+            engine_name == "primal" || engine_name == "dual" ||
+            engine_name == "hpr" || engine_name == "pdhg" || engine_name == "barrier";
+        if (lp_engine) mps_opts.relax_integrality = true;
         const auto problem = mps_format_forced
             ? sor::io::read_mps_file(path, rep, mps_opts)
             : sor::io::read_mps_file_auto(path, rep, mps_opts);
+        answering_lp_relaxation = rep.relaxed_integrality;
         for (const auto& w : rep.warnings)
             std::fprintf(stderr, "warning: %s\n", w.c_str());
         if (refuse_if_no_columns(path, problem.n_cols())) return 2;
@@ -4146,7 +4207,7 @@ int main(int argc, char** argv) {
         }
 
         if (engine_name == "auto") {
-            if (rep.n_integer > 0 && !mps_opts.relax_integrality) {
+            if (answering_lp_relaxation) {
                 std::printf("NOTE:              solving the LP RELAXATION "
                             "(use --engine milp for branch-and-bound)\n");
             }
@@ -4202,7 +4263,7 @@ int main(int argc, char** argv) {
                 sx_opts.method = sor::engines::SimplexMethod::Primal;
             else if (engine_name == "dual")
                 sx_opts.method = sor::engines::SimplexMethod::Dual;
-            if (rep.n_integer > 0) {
+            if (answering_lp_relaxation) {
                 std::printf("NOTE:              solving the LP RELAXATION "
                             "(use --engine milp for branch-and-bound)\n");
             }
@@ -4408,7 +4469,7 @@ int main(int argc, char** argv) {
             // Explicit and ablated FO engines share the same model preparation,
             // original-space recovery, and crossover policy.
             {
-                if (rep.n_integer > 0 && !mps_opts.relax_integrality) {
+                if (answering_lp_relaxation) {
                     std::printf("NOTE:              solving the LP RELAXATION "
                                 "(use --engine milp for branch-and-bound)\n");
                 }

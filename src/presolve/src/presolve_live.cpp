@@ -75,7 +75,9 @@ void LiveMatrix::build(const model::LpProblem& problem,
     col_queued.assign(sz(n), 0);
 
     original_column_entries.assign(sz(n), {});
+    std::uint32_t polls = 0;
     for (Index i = 0; i < m; ++i) {
+        poll_deadline(options, polls);
         for (Offset k = problem.A.pattern.row_ptr()[sz(i)];
              k < problem.A.pattern.row_ptr()[sz(i) + 1]; ++k) {
             const Index j = problem.A.pattern.col_idx()[sz(k)];
@@ -85,6 +87,7 @@ void LiveMatrix::build(const model::LpProblem& problem,
     }
 
     for (Index i = 0; i < m; ++i) {
+        poll_deadline(options, polls);
         if (!row_active[sz(i)]) continue;
         f64 shift = 0.0;
         for (Offset k = problem.A.pattern.row_ptr()[sz(i)];
@@ -914,12 +917,15 @@ bool LiveMatrix::run_until_stable() {
     SOR_FN();
     seed_all_queues();
     int inner = 0;
+    std::uint32_t polls = 0;
     while ((!changed_rows.empty() || !changed_cols.empty()) &&
            inner < options.max_passes && *status == PresolveStatus::Reduced) {
+        check_deadline(options);
         ++inner;
         ++out->stats.passes;
 
         while (!changed_rows.empty() && *status == PresolveStatus::Reduced) {
+            poll_deadline(options, polls);
             const Index i = changed_rows.front();
             changed_rows.pop_front();
             row_queued[sz(i)] = 0;
@@ -944,6 +950,7 @@ bool LiveMatrix::run_until_stable() {
         }
 
         while (!changed_cols.empty() && *status == PresolveStatus::Reduced) {
+            poll_deadline(options, polls);
             const Index j = changed_cols.front();
             changed_cols.pop_front();
             col_queued[sz(j)] = 0;

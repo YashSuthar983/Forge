@@ -2,6 +2,7 @@
 
 #include "sor/core/result.hpp"
 
+#include <chrono>
 #include <functional>
 #include <cstdint>
 #include <vector>
@@ -41,11 +42,15 @@ using SeededUnitBtran =
 
 // Supplying `btran_seeded` makes the rebuild cost O(sum of reach sizes)
 // instead of O(m^2) + m dense solves. Weights are bit-identical either way.
+// Past `deadline` the rebuild gives up and returns false, like any other
+// failure: the caller falls back to unit weights, which are always valid.
 bool rebuild_dual_edge_weights(
     core::Index m,
     const std::function<void(std::vector<core::f64>&)>& btran,
     std::vector<core::f64>& weights,
-    const SeededUnitBtran& btran_seeded = {});
+    const SeededUnitBtran& btran_seeded = {},
+    std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::time_point::max());
 
 // Exact Devex weight of a pivotal row for the current reference framework.
 // `reference[j] != 0` identifies the variables that were basic when the
