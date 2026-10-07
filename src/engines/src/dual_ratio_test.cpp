@@ -112,7 +112,17 @@ DualRatioResult dual_ratio_test(const DualRatioInput& in,
         ws.alpha_signed.push_back(a);
         ws.dual.push_back(d);
         ws.ratio.push_back(dpos / aa);
-        ws.relaxed.push_back((dpos + slack) / aa);
+        // Harris's bound uses the RAW feasible-direction reduced cost. Every
+        // candidate j left nonbasic then ends the step with
+        //   d_feas_j - t |alpha_rj| >= d_feas_j - (d_feas_j + slack) = -slack,
+        // so the band [-slack, inf) is invariant from pivot to pivot. Clamping
+        // d_feas_j to 0 first handed a column already at -0.5 slack a fresh
+        // full slack every iteration, and the band drifted: refactor-time
+        // repairs on neos-950242 met reduced costs at -8.8e-7 against a
+        // 1e-7 tolerance and shifted costs on 10,203 of 11,136 pivots. A
+        // column already outside the band gets a zero bound (it blocks
+        // immediately), never a negative one, so relaxed >= ratio still holds.
+        ws.relaxed.push_back(std::max(dfeas + slack, 0.0) / aa);
         ws.range.push_back(boxed ? (u - l) : kInfRange);
         ws.wrong_sign.push_back(static_cast<std::uint8_t>(dfeas < 0.0));
     }

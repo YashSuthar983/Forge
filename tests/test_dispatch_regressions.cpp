@@ -5,6 +5,7 @@
 // remaining stable across machines and build hosts. Every solve is still sent
 // through the independent proof gate, so a faster but incorrect path fails.
 #include "forge/certify/finalize.hpp"
+#include "forge/core/env_switches.hpp"
 #include "forge/engines/dual_edge_weights.hpp"
 #include "forge/engines/simplex.hpp"
 #include "forge/io/mps.hpp"
@@ -278,9 +279,11 @@ void test_primal_phase1_rebuilds_only_when_objective_changes() {
     // this focused run. It is deliberately off in production because it
     // performs the full work that the composite update is meant to avoid.
     setenv("FORGE_PRIMAL_VERIFY_COMPOSITE", "1", 1);
+    forge::core::reload_env_switches();
     SimplexDiagnostics diag;
     auto raw = forge::engines::solve_simplex(problem, opts, diag);
     unsetenv("FORGE_PRIMAL_VERIFY_COMPOSITE");
+    forge::core::reload_env_switches();
     const auto checked = forge::certify::check_lp_result(
         problem, raw, forge::engines::simplex_evidence(diag, opts));
     const auto result = forge::certify::finalize_result(std::move(raw), checked);
@@ -320,9 +323,11 @@ void test_primal_phase1_composite_sparse_and_dense_paths() {
         opts.max_iterations = 1000;
 
         setenv("FORGE_PRIMAL_VERIFY_COMPOSITE", "1", 1);
+    forge::core::reload_env_switches();
         SimplexDiagnostics diag;
         auto raw = forge::engines::solve_simplex(problem, opts, diag);
         unsetenv("FORGE_PRIMAL_VERIFY_COMPOSITE");
+    forge::core::reload_env_switches();
         const auto checked = forge::certify::check_lp_result(
             problem, raw, forge::engines::simplex_evidence(diag, opts));
         const auto result = forge::certify::finalize_result(std::move(raw), checked);
@@ -342,17 +347,20 @@ void test_primal_phase1_composite_sparse_and_dense_paths() {
     };
 
     // AGG changes basic phase-1 coefficients and its composite BTRAN remains
-    // hypersparse. SCAGR7 forces the same exact update through the dense
-    // fallback, so both sides of the support-density gate stay covered.
+    // hypersparse. SCAGR7 used to force the same update through a dense
+    // fallback; since a support-requesting BTRAN reports its support on the
+    // dense triangular path too (the dense pass writes every row, so the
+    // support is exact and free), the composite update always takes its
+    // support branch, whichever triangular path ran. Every incremental result
+    // is still compared with an independent full BTRAN above, with the
+    // original error threshold, which is the property under test.
     using forge::la::UpdateMethod;
     check("agg.mps", true, false, UpdateMethod::ProductForm);
-    check("scagr7.mps", false, true, UpdateMethod::ProductForm);
+    check("scagr7.mps", true, false, UpdateMethod::ProductForm);
     // Threading FTRAN spike support changes the FT representation. AGG has
-    // one legitimate full rebuild after refactorization; SCAGR7 now exercises
-    // both support paths. Every incremental result is still compared with an
-    // independent full BTRAN above, with the original error threshold.
+    // one legitimate full rebuild after refactorization.
     check("agg.mps", true, false, UpdateMethod::ForrestTomlin, 1);
-    check("scagr7.mps", true, true, UpdateMethod::ForrestTomlin);
+    check("scagr7.mps", true, false, UpdateMethod::ForrestTomlin);
 }
 
 }  // namespace

@@ -50,6 +50,16 @@ core::RawResult solve_lp_concurrent(const model::LpProblem& problem,
                 simplex.cancel = &stop; simplex.pricing_threads = 1;
                 simplex.perturbation_seed += arm * 104729u;
                 if (arm % 3 == 2) simplex.dual_cost_perturbation_multiplier = 1;
+                // A model with more rows than columns gets one arm that
+                // solves its dual LP (one basis row per column). Alone that
+                // is a gamble -- 20x faster on some tall relaxations, 6x
+                // slower on others -- but as one arm of the race it costs
+                // only that arm's thread when it loses.
+                if (count >= 2 && arm == count - 1 &&
+                    problem.n_rows() > problem.n_cols()) {
+                    arm_options.strategy = LpStrategy::DualSimplex;
+                    simplex.dualize = DualizePolicy::Always;
+                }
                 auto& result = arms[arm];
                 result.raw = solve_lp(problem, arm_options, result.diagnostics, &result.evidence, &simplex);
                 const auto checked = certify::finalize_result(certify::check_lp_candidate(problem, result.raw, result.evidence));
@@ -85,7 +95,8 @@ core::RawResult solve_lp_concurrent(const model::LpProblem& problem,
     diagnostics.iterations = total_iterations;
     diagnostics.simplex_iterations = total_simplex;
     diagnostics.elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
-    diagnostics.route_rationale = "concurrent simplex: selected original-model checked arm " + std::to_string(winner);
+    diagnostics.route_rationale = "concurrent simplex: selected original-model checked arm " + std::to_string(winner) +
+        (arms[winner].raw.engine.find("dual LP") != std::string::npos ? " (dual LP)" : "");
     if (evidence) *evidence = arms[winner].evidence;
     auto raw = std::move(arms[winner].raw);
     raw.iterations = total_iterations;

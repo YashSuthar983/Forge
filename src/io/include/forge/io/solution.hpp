@@ -28,6 +28,9 @@ struct SolutionFile {
     std::vector<f64> primal_ray;
     std::vector<std::string> exact_primal_ray;
     std::vector<f64> dual_farkas_ray;
+    // The claim answers the model's LP relaxation (an LP engine on a model
+    // with integer columns): it is checked with integrality dropped.
+    bool integrality_relaxed = false;
 };
 
 // Format:
@@ -43,7 +46,11 @@ struct SolutionFile {
 //   exact_dual <m> <rational> ...
 //   exact_dual_farkas <m> <rational> ...
 //   exact_primal_ray <n> <rational> ...
-void write_solution(std::ostream& out, const core::SolveResult& r);
+// and, when the claim answers the LP relaxation of a model with integer
+// columns:
+//   integrality_relaxed 1
+void write_solution(std::ostream& out, const core::SolveResult& r,
+                    bool integrality_relaxed = false);
 
 // Throws std::runtime_error on a malformed file (missing field, size
 // mismatch between a declared count and the values that follow, or an

@@ -247,6 +247,11 @@ struct ProofEvidence {
     f64 primal_ray_objective = kNaN;
     f64 dual_farkas_violation = kPosInf;
     f64 dual_farkas_contradiction = 0.0;
+
+    // The model's own data has a column or row with lower bound above upper
+    // bound: infeasible with no certificate needed, and none exists in row
+    // multipliers when the column sits in no row or the row itself is empty.
+    bool empty_domain = false;
 };
 
 // What an engine reports upward. Never shown to a user directly.

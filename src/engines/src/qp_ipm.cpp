@@ -41,6 +41,7 @@
 // ORIGINAL data -- the same independent check PDHCG-II's claim rests on --
 // and only that check can return Optimal.
 #include "forge/engines/qp.hpp"
+#include "forge/core/env_switches.hpp"
 #include "forge/engines/qcqp.hpp"
 #include "forge/la/ldlt.hpp"
 #include "forge/sparse/csr.hpp"
@@ -597,7 +598,8 @@ Result run_ipm(const Core& k, const QpOptions& opts, Clock::time_point t0,
         // factorization can be timed and checked in isolation on a real
         // instance's system.  Read once; costs nothing when unset.
         if (it == 0)
-            if (const char* dump = std::getenv("FORGE_DUMP_KKT")) la::write_sym_csc(dump, K, sign);
+            if (!core::env_switches().dump_kkt.empty())
+                la::write_sym_csc(core::env_switches().dump_kkt.c_str(), K, sign);
         const auto tf0 = Clock::now();
         const bool fac_ok = fac.factorize(K, sign, 1e-12);
         fac_ms += ms_since(tf0);

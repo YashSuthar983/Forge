@@ -9,6 +9,7 @@
 #include <functional>
 #include <cstdint>
 #include <iterator>
+#include <limits>
 #include <numeric>
 #include <set>
 #include <map>
@@ -101,38 +102,91 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
             const std::uint64_t r = mod_mul(mantissa % P, mod_pow2(e - 53));
             return v < 0 ? (r == 0 ? 0 : P - r) : r;
         };
-        struct ModRow {
-            std::vector<std::pair<Index, std::uint64_t>> entries;   // ascending columns
-            std::uint64_t inverse_lead = 0;                           // 1 / entries.front()
-            std::vector<Index> provenance;                           // original rows, sorted
-            // The row as a combination of original rows (mod P), when certifiable.
-            std::vector<std::pair<Index, std::uint64_t>> combination;
-            bool certifiable = true;
+        // Elimination order. The active equations are eliminated right-looking
+        // with Markowitz pivots: the next pivot (row, column) minimizes
+        // (row length - 1) * (column count - 1) over the active submatrix.
+        // Over GF(p) every nonzero is an acceptable pivot, so sparsity is the
+        // only criterion and no stability threshold is needed. The previous
+        // left-looking echelon took the rows in index order and pivoted on
+        // each row's smallest column; on qap10 that filled the assignment
+        // rows until the operation budget ran out after 28 of its 272
+        // dependent equations.
+        //
+        // Each row records its eliminations (pivot row, multiplier): one
+        // entry per update. The row as a combination of original rows is
+        // expanded only when the row becomes empty, through the pivot rows'
+        // own records, each pivot row expanded at most once. Tracking every
+        // row's combination eagerly made each update cost the length of the
+        // target's combination as well; on highschool1-aigio that was 2.9 s
+        // for 44k updates, almost all of it for rows that were never empty.
+        //
+        // Pivot rows are never removed, and a row that becomes empty is a
+        // combination of itself and pivot rows only, so the rows removed as
+        // dependent are combinations of rows that stay.
+        struct ActiveRow {
+            std::vector<std::pair<Index, std::uint64_t>> entries;        // ascending columns
+            std::vector<std::pair<Index, std::uint64_t>> eliminations;   // (pivot slot, factor)
+            // A row that fills past its original length plus the substitution
+            // fill allowance leaves the active submatrix and stays in the
+            // model (a missed dependency at worst). Without it a linking row
+            // of highschool1-aigio filled to 55,570 entries and every later
+            // pivot merged into it: 976M entry visits, 2.4 s.
+            std::size_t fill_limit = 0;
+            bool active = true;
         };
-        std::vector<std::uint64_t> accumulator(sz(matrix.n), 0);
-        std::vector<char> in_heap(sz(matrix.n), 0);
-        std::vector<Index> touched, heap;
-        std::size_t live_entries = 0;
-        constexpr std::size_t kProvenanceCap = 256;
-        std::map<Index, ModRow> echelon;   // pivot column -> row whose first entry it is
-        // Linear budget in the equality block: a complete echelon of a
-        // filled-in block is O(m^2 n) (fit1p: 120 ms) and found no
-        // dependency on any Netlib model; presolve's share of a small solve
-        // must stay proportional to its input.
+        constexpr std::size_t kProvenanceCap = 256;   // support of the rational fallback
+        std::vector<Index> origin;   // slot -> original row
+        std::vector<ActiveRow> active_rows;
+        std::vector<std::vector<Index>> column_slots(sz(matrix.n));   // may hold stale slots
+        std::vector<Index> column_count(sz(matrix.n), 0);              // exact
         std::uint64_t equality_nnz = 0;
-        for (Index i = 0; i < matrix.m; ++i)
-            if (row_live[sz(i)] && matrix.row_lo[sz(i)] == matrix.row_hi[sz(i)])
-                equality_nnz += matrix.rows[sz(i)].size();
+        for (Index i = 0; i < matrix.m; ++i) {
+            if (!row_live[sz(i)] || matrix.row_lo[sz(i)] != matrix.row_hi[sz(i)] ||
+                !std::isfinite(matrix.row_lo[sz(i)]) || matrix.rows[sz(i)].size() >
+                    static_cast<std::size_t>(options.max_aggregation_row_nnz)) continue;
+            ActiveRow row;
+            for (const auto& [j, a] : matrix.rows[sz(i)])
+                if (a != 0) row.entries.emplace_back(j, to_mod(a));
+            if (row.entries.empty()) continue;
+            std::sort(row.entries.begin(), row.entries.end());
+            row.fill_limit = row.entries.size() +
+                static_cast<std::size_t>(std::max<Offset>(0, options.max_substitution_fill));
+            const Index slot = static_cast<Index>(active_rows.size());
+            for (const auto& [j, v] : row.entries) {
+                column_slots[sz(j)].push_back(slot);
+                ++column_count[sz(j)];
+            }
+            equality_nnz += row.entries.size();
+            origin.push_back(i);
+            active_rows.push_back(std::move(row));
+        }
+        // Linear budget in the equality block: presolve's share of a small
+        // solve must stay proportional to its input. It counts every entry a
+        // merge visits (both rows) and every term of an expansion. Measured
+        // need per equality nonzero: qap10 55, satellites2-40 16, dfl001 and
+        // huahum 6, highschool1-aigio 0.5.
         std::uint64_t operations = 0;
-        const std::uint64_t operation_cap = 32 * equality_nnz + 100'000;
-        // Provenance of the trial row: original rows its reduction used, as
-        // an unsorted list deduplicated by stamp (sorted when it is read).
-        std::vector<std::uint32_t> provenance_stamp(sz(matrix.m), 0);
-        std::uint32_t stamp = 0;
-        // Combination of original rows the trial row has become (mod P).
-        std::vector<std::uint64_t> combination(sz(matrix.m), 0);
-        std::vector<std::uint32_t> combination_stamp(sz(matrix.m), 0);
-        std::vector<Index> combination_rows;
+        const std::uint64_t operation_cap = 64 * equality_nnz + 100'000;
+        const auto value_at = [&](const ActiveRow& row, Index j) -> std::uint64_t {
+            const auto it = std::lower_bound(row.entries.begin(), row.entries.end(),
+                std::make_pair(j, std::uint64_t{0}),
+                [](const auto& x, const auto& y) { return x.first < y.first; });
+            return it != row.entries.end() && it->first == j ? it->second : 0;
+        };
+        // Buckets by current row length and column count. Entries go stale
+        // when a count changes (the new count gets a fresh entry) and are
+        // validated when read.
+        std::vector<std::vector<Index>> row_bucket(1), column_bucket(1);
+        const auto bucket_push = [](std::vector<std::vector<Index>>& b, std::size_t k, Index x) {
+            if (b.size() <= k) b.resize(k + 1);
+            b[k].push_back(x);
+        };
+        for (Index s = 0; s < static_cast<Index>(active_rows.size()); ++s)
+            bucket_push(row_bucket, active_rows[sz(s)].entries.size(), s);
+        for (Index j = 0; j < matrix.n; ++j)
+            if (column_count[sz(j)] > 0) bucket_push(column_bucket, sz(column_count[sz(j)]), j);
+        std::size_t remaining = active_rows.size();
+
         // Exact and cheap: the modular combination sum_r c_r row_r = 0 names
         // rational weights c_r = n_r/d_r (rational reconstruction, |n|,|d| <
         // 2^30). Scaled to integers below 2^53 they are binary64 numbers, so
@@ -160,12 +214,12 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
                                               : static_cast<std::uint64_t>(num) % P;
             return lhs % P == mod_mul(c, static_cast<std::uint64_t>(den));
         };
-        const auto combination_proves_dependent = [&]() {
+        const auto combination_proves_dependent =
+            [&](const std::vector<std::pair<Index, std::uint64_t>>& combination) {
             std::vector<std::pair<Index, std::int64_t>> weights;   // row, n_r
             std::vector<std::int64_t> dens;
             std::int64_t common = 1;
-            for (const Index r : combination_rows) {
-                const std::uint64_t c = combination[sz(r)];
+            for (const auto& [r, c] : combination) {
                 if (c == 0) continue;
                 std::int64_t num = 0, den = 1;
                 if (!reconstruct(c, num, den)) return false;
@@ -238,107 +292,209 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
             reduce(target);
             return target.entries.empty() && target.rhs == 0;
         };
-        for (Index i = 0; i < matrix.m && operations < operation_cap; ++i) {
-            if (!row_live[sz(i)] || matrix.row_lo[sz(i)] != matrix.row_hi[sz(i)] ||
-                !std::isfinite(matrix.row_lo[sz(i)]) || matrix.rows[sz(i)].size() >
-                    static_cast<std::size_t>(options.max_aggregation_row_nnz)) continue;
-            // Dense accumulator + min-heap of touched columns: the leading
-            // column is the heap top (stale entries skipped lazily), and an
-            // update is two word operations instead of a tree node.
-            const auto clear_trial = [&] {
-                for (const Index j : touched) { accumulator[sz(j)] = 0; in_heap[sz(j)] = 0; }
-                touched.clear();
-                heap.clear();
-                live_entries = 0;
-            };
-            const auto set_entry = [&](Index j, std::uint64_t v) {
-                if (accumulator[sz(j)] == 0 && v != 0) ++live_entries;
-                else if (accumulator[sz(j)] != 0 && v == 0) --live_entries;
-                accumulator[sz(j)] = v;
-                if (v != 0 && !in_heap[sz(j)]) {
-                    in_heap[sz(j)] = 1;
-                    touched.push_back(j);
-                    heap.push_back(j);
-                    std::push_heap(heap.begin(), heap.end(), std::greater<Index>());
+        // Pivot search over columns of count k and rows of length k for
+        // k = 1, 2, ..., a few candidates each (Markowitz with a search limit).
+        constexpr int kSearch = 4;
+        std::vector<std::uint32_t> slot_stamp(active_rows.size(), 0);
+        std::uint32_t stamp = 0;
+        std::vector<std::pair<Index, std::uint64_t>> merged;
+        // Expansion of rows into original-row combinations (see ActiveRow).
+        std::vector<std::vector<std::pair<Index, std::uint64_t>>> expanded(active_rows.size());
+        std::vector<char> is_expanded(active_rows.size(), 0);
+        std::vector<Index> pivot_sequence(active_rows.size(), 0);
+        Index pivots_made = 0;
+        std::vector<std::uint64_t> weight(sz(matrix.m), 0);
+        std::vector<Index> weight_rows;
+        std::vector<char> queued(active_rows.size(), 0);
+        // Returns false when the operation budget runs out first.
+        const auto expand = [&](Index slot, std::vector<std::pair<Index, std::uint64_t>>& out) {
+            // Pivot rows this one depends on, expanded oldest first: a pivot
+            // row's eliminations name only earlier pivots.
+            std::vector<Index> needed, stack{slot};
+            while (!stack.empty()) {
+                const Index s = stack.back();
+                stack.pop_back();
+                for (const auto& [p, f] : active_rows[sz(s)].eliminations) {
+                    (void)f;
+                    if (is_expanded[sz(p)] || queued[sz(p)]) continue;
+                    queued[sz(p)] = 1;
+                    needed.push_back(p);
+                    stack.push_back(p);
                 }
-            };
-            const auto leading = [&]() -> Index {
-                while (!heap.empty() && accumulator[sz(heap.front())] == 0) {
-                    std::pop_heap(heap.begin(), heap.end(), std::greater<Index>());
-                    in_heap[sz(heap.back())] = 0;
-                    heap.pop_back();
-                }
-                return heap.empty() ? Index{-1} : heap.front();
-            };
-            clear_trial();
-            for (const auto& [j, a] : matrix.rows[sz(i)]) set_entry(j, to_mod(a));
-            std::vector<Index> provenance;
-            ++stamp;
-            for (const Index r : combination_rows) combination[sz(r)] = 0;
-            combination_rows.assign(1, i);
-            combination[sz(i)] = 1;
-            combination_stamp[sz(i)] = stamp;
-            bool certifiable = true, filled = false;
-            const std::size_t fill_cap = matrix.rows[sz(i)].size() +
-                static_cast<std::size_t>(std::max<Offset>(0, options.max_substitution_fill));
-            for (Index lead = leading(); lead >= 0; lead = leading()) {
-                const auto source = echelon.find(lead);
-                if (source == echelon.end()) break;
-                const auto& row = source->second;
-                const std::uint64_t multiplier = mod_mul(accumulator[sz(lead)], row.inverse_lead);
-                if (operations + row.entries.size() > operation_cap) { filled = true; break; }
-                for (const auto& [j, a] : row.entries) {
-                    ++operations;
-                    set_entry(j, mod_add(accumulator[sz(j)], P - mod_mul(multiplier, a)));
-                }
-                certifiable = certifiable && row.certifiable;
-                if (certifiable) {
-                    for (const auto& [r, c] : row.combination) {
-                        if (combination_stamp[sz(r)] != stamp) {
-                            combination_stamp[sz(r)] = stamp;
-                            combination_rows.push_back(r);
-                        }
-                        combination[sz(r)] = mod_add(combination[sz(r)], P - mod_mul(multiplier, c));
-                    }
-                    for (const Index r : row.provenance)
-                        if (provenance_stamp[sz(r)] != stamp) {
-                            provenance_stamp[sz(r)] = stamp;
-                            provenance.push_back(r);
-                        }
-                    if (provenance.size() > kProvenanceCap) { certifiable = false; provenance.clear(); }
-                }
-                if (live_entries > fill_cap) { filled = true; break; }
             }
-            if (filled) continue;
-            std::sort(provenance.begin(), provenance.end());
-            if (live_entries == 0) {
-                // Candidate: verify exactly over the rows the reduction used.
-                if (!certifiable ||
-                    (!combination_proves_dependent() && !exactly_dependent(i, provenance)))
+            std::sort(needed.begin(), needed.end(), [&](Index x, Index y) {
+                return pivot_sequence[sz(x)] < pivot_sequence[sz(y)];
+            });
+            const auto combine = [&](Index s, std::vector<std::pair<Index, std::uint64_t>>& result) {
+                weight_rows.assign(1, origin[sz(s)]);
+                weight[sz(origin[sz(s)])] = 1;
+                for (const auto& [p, f] : active_rows[sz(s)].eliminations) {
+                    operations += expanded[sz(p)].size();
+                    for (const auto& [r, c] : expanded[sz(p)]) {
+                        if (weight[sz(r)] == 0) weight_rows.push_back(r);
+                        weight[sz(r)] = mod_add(weight[sz(r)], mod_mul(f, c));
+                        if (weight[sz(r)] == 0) weight[sz(r)] = P;   // cancelled, still listed
+                    }
+                }
+                std::sort(weight_rows.begin(), weight_rows.end());
+                weight_rows.erase(std::unique(weight_rows.begin(), weight_rows.end()), weight_rows.end());
+                result.clear();
+                for (const Index r : weight_rows) {
+                    const std::uint64_t c = weight[sz(r)] == P ? 0 : weight[sz(r)];
+                    if (c != 0) result.emplace_back(r, c);
+                    weight[sz(r)] = 0;
+                }
+            };
+            bool within_budget = true;
+            for (const Index p : needed) {
+                queued[sz(p)] = 0;
+                if (!within_budget) continue;
+                combine(p, expanded[sz(p)]);
+                is_expanded[sz(p)] = 1;
+                within_budget = operations < operation_cap;
+            }
+            if (!within_budget) return false;
+            combine(slot, out);
+            return operations < operation_cap;
+        };
+        std::vector<std::pair<Index, std::uint64_t>> combination;
+        while (remaining > 0 && operations < operation_cap) {
+            check_deadline(options);
+            Index best_slot = -1, best_column = -1;
+            std::uint64_t best_cost = std::numeric_limits<std::uint64_t>::max();
+            int examined = 0;
+            const std::size_t k_end = std::max(row_bucket.size(), column_bucket.size());
+            for (std::size_t k = 1; k < k_end; ++k) {
+                if (k < column_bucket.size()) {
+                    auto& bucket = column_bucket[k];
+                    for (std::size_t t = 0; t < bucket.size() && examined < kSearch;) {
+                        const Index j = bucket[t];
+                        if (sz(column_count[sz(j)]) != k) {
+                            bucket[t] = bucket.back();
+                            bucket.pop_back();
+                            continue;
+                        }
+                        ++t;
+                        ++examined;
+                        for (const Index s : column_slots[sz(j)]) {
+                            const auto& row = active_rows[sz(s)];
+                            if (!row.active || value_at(row, j) == 0) continue;
+                            const std::uint64_t cost = (row.entries.size() - 1) * (k - 1);
+                            if (cost < best_cost) { best_cost = cost; best_slot = s; best_column = j; }
+                        }
+                    }
+                }
+                if (best_slot >= 0 && best_cost <= (k - 1) * (k - 1)) break;
+                if (k < row_bucket.size()) {
+                    auto& bucket = row_bucket[k];
+                    for (std::size_t t = 0; t < bucket.size() && examined < 2 * kSearch;) {
+                        const Index s = bucket[t];
+                        const auto& row = active_rows[sz(s)];
+                        if (!row.active || row.entries.size() != k) {
+                            bucket[t] = bucket.back();
+                            bucket.pop_back();
+                            continue;
+                        }
+                        ++t;
+                        ++examined;
+                        for (const auto& [j, v] : row.entries) {
+                            const std::uint64_t cost = (k - 1) * (sz(column_count[sz(j)]) - 1);
+                            if (cost < best_cost) { best_cost = cost; best_slot = s; best_column = j; }
+                        }
+                    }
+                }
+                if (best_slot >= 0 && (best_cost <= (k - 1) * k || examined >= 2 * kSearch)) break;
+            }
+            if (best_slot < 0) break;
+
+            ActiveRow& pivot = active_rows[sz(best_slot)];
+            const std::uint64_t inverse = mod_inv(value_at(pivot, best_column));
+            ++stamp;
+            slot_stamp[sz(best_slot)] = stamp;
+            std::vector<Index> targets;
+            for (const Index s : column_slots[sz(best_column)]) {
+                if (slot_stamp[sz(s)] == stamp) continue;
+                slot_stamp[sz(s)] = stamp;
+                if (active_rows[sz(s)].active && value_at(active_rows[sz(s)], best_column) != 0)
+                    targets.push_back(s);
+            }
+            // The pivot row leaves the active submatrix.
+            pivot.active = false;
+            pivot_sequence[sz(best_slot)] = pivots_made++;
+            --remaining;
+            for (const auto& [j, v] : pivot.entries) {
+                if (--column_count[sz(j)] > 0 && j != best_column)
+                    bucket_push(column_bucket, sz(column_count[sz(j)]), j);
+            }
+            for (const Index t : targets) {
+                ActiveRow& row = active_rows[sz(t)];
+                const std::uint64_t negated =
+                    P - mod_mul(value_at(row, best_column), inverse);   // nonzero
+                merged.clear();
+                std::size_t a = 0, b = 0;
+                while (a < row.entries.size() || b < pivot.entries.size()) {
+                    if (b == pivot.entries.size() ||
+                        (a < row.entries.size() && row.entries[a].first < pivot.entries[b].first)) {
+                        merged.push_back(row.entries[a++]);
+                    } else if (a == row.entries.size() ||
+                               pivot.entries[b].first < row.entries[a].first) {
+                        // Fill: a product of nonzeros is nonzero in a field.
+                        const Index j = pivot.entries[b].first;
+                        merged.emplace_back(j, mod_mul(negated, pivot.entries[b++].second));
+                        column_slots[sz(j)].push_back(t);
+                        bucket_push(column_bucket, sz(++column_count[sz(j)]), j);
+                    } else {
+                        const Index j = row.entries[a].first;
+                        const std::uint64_t v = mod_add(row.entries[a++].second,
+                                                        mod_mul(negated, pivot.entries[b++].second));
+                        if (v != 0) {
+                            merged.emplace_back(j, v);
+                        } else if (--column_count[sz(j)] > 0 && j != best_column) {
+                            bucket_push(column_bucket, sz(column_count[sz(j)]), j);
+                        }
+                    }
+                }
+                operations += row.entries.size() + pivot.entries.size();
+                row.entries.swap(merged);
+                row.eliminations.emplace_back(best_slot, negated);
+                if (row.entries.size() > row.fill_limit) {
+                    row.active = false;
+                    --remaining;
+                    for (const auto& [j, v] : row.entries)
+                        if (--column_count[sz(j)] > 0 && j != best_column)
+                            bucket_push(column_bucket, sz(column_count[sz(j)]), j);
                     continue;
-                for (const auto& [j,a] : matrix.rows[sz(i)]) { (void)a; matrix.col_rows[sz(j)].erase(i); }
+                }
+                if (!row.entries.empty()) {
+                    bucket_push(row_bucket, row.entries.size(), t);
+                    continue;
+                }
+                // Empty modulo P: a candidate, verified exactly before removal.
+                row.active = false;
+                --remaining;
+                const Index i = origin[sz(t)];
+                if (!expand(t, combination)) continue;
+                if (!combination_proves_dependent(combination)) {
+                    // The rational fallback grows superlinearly in its support;
+                    // the combination check above is linear and has no cap.
+                    if (combination.size() > kProvenanceCap) continue;
+                    std::vector<Index> support;
+                    for (const auto& [r, c] : combination)
+                        if (r != i && c != 0) support.push_back(r);
+                    if (!exactly_dependent(i, support)) continue;
+                }
+                for (const auto& entry : matrix.rows[sz(i)]) matrix.col_rows[sz(entry.first)].erase(i);
                 matrix.rows[sz(i)].clear(); row_live[sz(i)] = 0;
                 ++map.stats.rows_removed; ++map.stats.linear_dependencies_removed;
-            } else {
-                ModRow row;
-                for (const Index j : touched) if (accumulator[sz(j)] != 0) row.entries.emplace_back(j, accumulator[sz(j)]);
-                std::sort(row.entries.begin(), row.entries.end());
-                row.inverse_lead = mod_inv(row.entries.front().second);
-                row.certifiable = certifiable;
-                if (certifiable) {
-                    provenance.insert(std::upper_bound(provenance.begin(), provenance.end(), i), i);
-                    row.provenance = std::move(provenance);
-                    for (const Index r : combination_rows)
-                        if (combination[sz(r)] != 0) row.combination.emplace_back(r, combination[sz(r)]);
-                }
-                echelon.emplace(row.entries.front().first, std::move(row));
             }
+            column_slots[sz(best_column)].clear();
         }
     }
     if (options.equation_sparsification) {
         for (int pass = 0; pass < options.sparsification_passes; ++pass) {
             bool changed = false;
             for (Index source = 0; source < matrix.m; ++source) {
+                check_deadline(options);
                 if (!row_live[sz(source)] || matrix.row_lo[sz(source)] != matrix.row_hi[sz(source)] ||
                     !std::isfinite(matrix.row_lo[sz(source)])) continue;
                 const auto equation = matrix.rows[sz(source)];
@@ -467,6 +623,7 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
         // For continuous LPs arbitrary integer coefficient strengthening is
         // invalid. Exact power-of-two row normalization preserves the polytope.
         for (Index i = 0; i < matrix.m; ++i) {
+            check_deadline(options);
             if (!row_live[sz(i)] || matrix.rows[sz(i)].empty()) continue;
             f64 maximum = 0;
             for (const auto& [j, a] : matrix.rows[sz(i)]) {
@@ -493,6 +650,7 @@ void advanced_reductions(LiveMatrix& matrix, std::vector<char>& row_live,
     if (options.domain_probing) {
         Index probes = 0;
         for (Index j = 0; j < matrix.n && probes < options.max_domain_probes; ++j) {
+            check_deadline(options);
             if (!col_live[sz(j)] || !std::isfinite(lo[sz(j)]) || !std::isfinite(hi[sz(j)]) || lo[sz(j)] >= hi[sz(j)]) continue;
             const f64 midpoint = std::midpoint(lo[sz(j)], hi[sz(j)]);
             if (midpoint == lo[sz(j)] || midpoint == hi[sz(j)]) continue;
