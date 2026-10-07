@@ -471,9 +471,15 @@ PostsolveBasis lift_basis(const model::LpProblem& original,
         // duals in lift_row_duals): keep is basic in the original and elim
         // sits at the matching own bound (x_e = (b - a_k x_k)/a_e,
         // decreasing in x_k when a_k/a_e > 0).
+        // Only when keep is not basic already: in the reduced basis, or made
+        // basic for another row above (a later transfer, or an aggregation).
+        // Basic, its reduced cost is zero and the transferred bound carries
+        // no multiplier, so elim takes this row's slot as in the default
+        // case. Taking it anyway put keep in two slots (blend2: 7 columns).
         const Index keep = rec.keep_col;
         const signed char which = r < transfer_case.size() ? transfer_case[r] : 0;
-        if (which != 0 && keep >= 0 && keep < ns) {
+        if (which != 0 && keep >= 0 && keep < ns &&
+            outb.status[sz(keep)] != PostsolveNonbasicStatus::Basic) {
             const bool at_lo = which == 1;
             {
                 const bool elim_upper = at_lo == (rec.keep_coeff / rec.elim_coeff > 0.0);
@@ -604,6 +610,13 @@ PostsolveBasis lift_basis(const model::LpProblem& original,
         at_upper = false;   // decided per step below
         return true;
     };
+    // Slot of each basic variable, built once and kept current below. The
+    // slot of a kept row's logical was found by scanning all m slots per
+    // step: O(steps * m) on a large model.
+    std::vector<Index> slot_of(sz(ns + m), -1);
+    for (Index s = 0; s < m; ++s)
+        if (outb.basic[sz(s)] >= 0 && outb.basic[sz(s)] < ns + m)
+            slot_of[sz(outb.basic[sz(s)])] = s;
     for (std::size_t t = pmap.recovery_steps.size(); t-- > 0;) {
         const auto& step = pmap.recovery_steps[t];
         if (step.kind != DualRecoveryKind::BoundTightening) continue;
@@ -615,13 +628,8 @@ PostsolveBasis lift_basis(const model::LpProblem& original,
         // A removed row's logical sits in its own slot. A row kept in the
         // reduced model (outward rounding left the bound a hair looser than
         // the row, so the row was not provably redundant) may hold it anywhere.
-        Index slot = step.row;
-        if (outb.basic[sz(slot)] != ns + step.row) {
-            slot = -1;
-            for (Index s = 0; s < m; ++s)
-                if (outb.basic[sz(s)] == ns + step.row) { slot = s; break; }
-            if (slot < 0) continue;
-        }
+        const Index slot = slot_of[sz(ns + step.row)];
+        if (slot < 0) continue;
         // A row the dual lift priced is tight at the priced side, also when
         // x_j sits where its own bound and the tightened one meet.
         const signed char priced = t < choices.row_side.size() ? choices.row_side[t] : 0;
@@ -646,6 +654,8 @@ PostsolveBasis lift_basis(const model::LpProblem& original,
                                        : original.row_lo[sz(step.row)];
         if (!std::isfinite(row_side)) continue;
         outb.basic[sz(slot)] = step.col;
+        slot_of[sz(ns + step.row)] = -1;
+        slot_of[sz(step.col)] = slot;
         outb.status[sz(step.col)] = PostsolveNonbasicStatus::Basic;
         outb.status[sz(ns + step.row)] = row_upper ? PostsolveNonbasicStatus::AtUpper
                                                    : PostsolveNonbasicStatus::AtLower;
@@ -666,6 +676,20 @@ PostsolveBasis lift_basis(const model::LpProblem& original,
                 outb.status[sz(j)] = PostsolveNonbasicStatus::AtZeroFree;
         }
     }
+    // Every slot holds one variable, no variable holds two, and the statuses
+    // agree. The records above are applied by kind rather than in reverse
+    // journal order, so a combination they do not anticipate could still
+    // collide; such a basis is refused here (the caller then has none and
+    // says so) instead of reaching a warm start or a certificate as one.
+    std::vector<char> seen(sz(ns + m), 0);
+    for (Index s = 0; s < m; ++s) {
+        const Index v = outb.basic[sz(s)];
+        if (v < 0 || v >= ns + m || seen[sz(v)]) return PostsolveBasis{};
+        seen[sz(v)] = 1;
+    }
+    for (Index v = 0; v < ns + m; ++v)
+        if ((outb.status[sz(v)] == PostsolveNonbasicStatus::Basic) != (seen[sz(v)] != 0))
+            return PostsolveBasis{};
     return outb;
 }
 
@@ -690,6 +714,7 @@ PresolveRecoveryResult recover_solution(
     else if (map.problem.n_rows() == 0 && map.problem.n_cols() == 0)
         out.basis = lift_basis(original, map, PostsolveBasis{}, opts, out.raw.x, choices);
 
+    out.basis_rejected = reduced.has_basis && out.basis.status.empty();
     out.raw.certificate_basis = out.basis.basic;
     if (!opts.check_point) {
         out.failure_reason = "lifted point not checked (check_point off)";

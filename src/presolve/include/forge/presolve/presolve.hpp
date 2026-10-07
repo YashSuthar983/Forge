@@ -278,6 +278,10 @@ struct PresolveRecoveryResult {
     PostsolveBasis basis;
     core::ProofEvidence evidence;
     bool validated = false;
+    // A reduced basis was given but its lift was not a well-formed basis of
+    // the original (a variable in two slots, an empty slot, or statuses that
+    // disagree); `basis` is then empty.
+    bool basis_rejected = false;
     std::string failure_reason;
 };
 

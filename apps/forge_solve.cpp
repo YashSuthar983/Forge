@@ -4316,6 +4316,9 @@ int main(int argc, char** argv) {
                         static_cast<long long>(diag.presolve_aggregation_fill));
             std::printf("    retries       %10llu\n",
                         static_cast<unsigned long long>(diag.presolve_retries));
+            if (diag.lifted_basis_rejections > 0)
+                std::printf("    basis lift    %10llu  rejected (malformed; no basis returned)\n",
+                            static_cast<unsigned long long>(diag.lifted_basis_rejections));
             std::printf("  factorization    %10.3f\n", diag.factor_ms);
             std::printf("  pricing          %10.3f\n", diag.price_ms);
             std::printf("  triangular solve %10.3f\n", diag.solve_ms);

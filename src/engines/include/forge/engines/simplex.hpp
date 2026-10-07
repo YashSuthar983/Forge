@@ -551,6 +551,9 @@ struct SimplexDiagnostics {
     Index presolve_equality_aggregations = 0;
     Offset presolve_aggregation_fill = 0;
     std::uint64_t presolve_retries = 0;
+    // The reduced basis lifted to a malformed basis of the original and was
+    // dropped (the result then carries no basis).
+    std::uint64_t lifted_basis_rejections = 0;
 
     // The dual engine's merit function (total primal infeasibility) at the start
     // of the run and the best value it reached. Diagnostic only: it shows at a
