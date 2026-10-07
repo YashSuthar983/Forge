@@ -1,4 +1,5 @@
 #include "sor/search/mip_presolve.hpp"
+#include "sor/core/work_clock.hpp"
 
 #include "sor/search/component_presolve.hpp"
 #include "sor/search/gf2_presolve.hpp"
@@ -14,7 +15,7 @@
 namespace sor::search {
 namespace {
 
-using Clock = std::chrono::steady_clock;
+using Clock = sor::core::SolverClock;
 
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 
@@ -149,6 +150,7 @@ CliqueProbeDiagnostics apply_clique_probing(const model::LpProblem& lp,
                                             std::vector<f64>& col_lo,
                                             std::vector<f64>& col_hi,
                                             const MipPresolveOptions& opts) {
+    core::WorkScope work_scope_(core::WorkCat::Probing);
     CliqueProbeDiagnostics diag;
     if (!opts.clique_probing || cg.cliques().empty()) return diag;
     // Bounded. This ran 82.2 s in a SINGLE call on MIPLIB2017 ex10
@@ -162,7 +164,6 @@ CliqueProbeDiagnostics apply_clique_probing(const model::LpProblem& lp,
                std::chrono::duration<double>(Clock::now() - cp_t0).count() >
                    opts.time_limit_s;
     };
-    std::uint64_t cp_seen = 0;
 
     const Index n = lp.n_cols();
     const Index m = lp.n_rows();
@@ -207,8 +208,10 @@ CliqueProbeDiagnostics apply_clique_probing(const model::LpProblem& lp,
     }
 
     for (const Clique& c : cg.cliques()) {
-        // Per-clique cost scales with clique size, so poll often.
-        if (((cp_seen++) & 0x0F) == 0 && cp_over()) {
+        // Per-clique cost scales with clique size times the propagation each
+        // literal triggers; on a dense model one clique is milliseconds, so
+        // poll every clique (a clock read is tens of nanoseconds).
+        if (cp_over()) {
             diag.truncated = true;
             break;
         }
@@ -291,7 +294,16 @@ CliqueProbeDiagnostics apply_clique_probing(const model::LpProblem& lp,
         // no global tightening from that alone, and no hull contribution.
         if (!run_case(-1)) ++diag.exactly_one_upgrades;
 
+        // The clock is also read between cases: a clique of k literals is
+        // k + 1 propagations. A fixing from a case that ran stays valid on its
+        // own; the hull and the all-cases-infeasible conclusion need every
+        // case, so a clique cut short contributes neither.
+        bool cut_short = false;
         for (Index on : bins) {
+            if (cp_over()) {
+                cut_short = true;
+                break;
+            }
             if (!run_case(on)) {
                 // x_on = 1 is impossible -> fix to 0.
                 if (col_hi[sz(on)] > 0.5) {
@@ -305,6 +317,10 @@ CliqueProbeDiagnostics apply_clique_probing(const model::LpProblem& lp,
             }
         }
 
+        if (cut_short) {
+            diag.truncated = true;
+            break;
+        }
         if (feasible_cases == 0) {
             // Every case infeasible -> global infeasibility.
             diag.infeasible = true;
@@ -475,6 +491,7 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
                                         const ProbingOptions& probe_opts,
                                         const engines::SimplexOptions* lp_opts,
                                         ProbingState* probing_state) {
+    core::WorkScope work_scope_(core::WorkCat::Presolve);
     MipPresolveDiagnostics diag;
     const auto t0 = Clock::now();
     // Root presolve must live inside the solver's budget. Checked at the
@@ -544,7 +561,7 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
     // or to call from the wrong scope.
     struct PhaseTimer {
         double& sink;
-        std::chrono::steady_clock::time_point start;
+        sor::core::SolverClock::time_point start;
         explicit PhaseTimer(double& s) : sink(s), start(Clock::now()) {}
         ~PhaseTimer() {
             sink += std::chrono::duration<double, std::milli>(
@@ -588,8 +605,14 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
         if (out_of_time()) { ++diag.aborted_on_time; return true; }
         if (opts.clique_probing) {
             PhaseTimer _t(diag.ms_clique_probe);
+            // What is LEFT of the presolve budget, as the later phases get.
+            // Handed the whole limit, clique probing restarted the clock after
+            // probing had spent its share: neos-860300 at a 15 s limit ran
+            // probing 1.55 s, then clique probing 2.37 s, against 3 s for both.
+            MipPresolveOptions cpo = opts;
+            cpo.time_limit_s = remaining_budget();
             const auto cp =
-                apply_clique_probing(lp, cg, col_lo, col_hi, opts);
+                apply_clique_probing(lp, cg, col_lo, col_hi, cpo);
             diag.clique_probe.cliques_probed += cp.cliques_probed;
             diag.clique_probe.fixings += cp.fixings;
             diag.clique_probe.tightenings += cp.tightenings;

@@ -1,4 +1,5 @@
 #include "sor/search/symmetry.hpp"
+#include "sor/core/work_clock.hpp"
 
 #include "sor/sparse/csr.hpp"
 
@@ -13,7 +14,7 @@
 namespace sor::search {
 namespace {
 
-using Clock = std::chrono::steady_clock;
+using Clock = sor::core::SolverClock;
 
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 
@@ -176,8 +177,11 @@ void refine_colors(std::vector<std::uint64_t>& color,
                    int max_iters, std::uint64_t& iters_out) {
     const int cap = max_iters > 0 ? max_iters : 64;
     iters_out = 0;
+    std::uint64_t adj_entries = 0;
+    for (const auto& a : adj) adj_entries += a.size();
     for (int it = 0; it < cap; ++it) {
         ++iters_out;
+        core::work_add(2 * adj_entries + 4 * color.size(), ::sor::core::WorkTag::Symmetry);   // hash, sort, rehash
         std::vector<std::uint64_t> next = color;
         for (std::size_t u = 0; u < color.size(); ++u) {
             std::vector<std::uint64_t> sig;
@@ -256,6 +260,8 @@ std::vector<Orbit> detect_permutation_orbits(const model::LpProblem& lp,
     // the first node LP. Same signatures, linear cost (2026-09-14).
     const std::size_t nnz = av.size();
     std::vector<core::Offset> cptr(sz(n) + 1, 0);
+    core::work_add(6 * static_cast<std::uint64_t>(nnz) + 4 * static_cast<std::uint64_t>(n + m),
+                   ::sor::core::WorkTag::Symmetry);   // adjacency build and per-column sort
     for (std::size_t k = 0; k < nnz; ++k) ++cptr[sz(ci[k]) + 1];
     for (Index j = 0; j < n; ++j) cptr[sz(j) + 1] += cptr[sz(j)];
     std::vector<std::pair<Index, f64>> cent(nnz);
@@ -317,6 +323,9 @@ std::vector<Orbit> detect_permutation_orbits(const model::LpProblem& lp,
             break;
         }
         ++iters;
+        // Two hashed, sorted sweeps of the matrix per refinement round.
+        core::work_add(4 * static_cast<std::uint64_t>(nnz) + 8 * static_cast<std::uint64_t>(n + m),
+                       ::sor::core::WorkTag::Symmetry);
         vnew = vcol;
         rnew = rcol;
         for (Index j = 0; j < n; ++j) {
@@ -1117,6 +1126,7 @@ SymmetryDiagnostics apply_symmetry(model::LpProblem& lp,
                                    std::vector<f64>& col_lo,
                                    std::vector<f64>& col_hi,
                                    const SymmetryOptions& opts) {
+    core::WorkScope work_scope_(core::WorkCat::Symmetry);
     SymmetryDiagnostics diag;
     const auto t0 = Clock::now();
     if (!opts.enabled) {

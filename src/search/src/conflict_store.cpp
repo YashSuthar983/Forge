@@ -1,4 +1,5 @@
 #include "sor/search/conflict_store.hpp"
+#include "sor/core/work_clock.hpp"
 
 #include "sor/certify/finalize.hpp"
 #include "sor/search/prop_trail.hpp"
@@ -203,6 +204,7 @@ void ConflictStore::evict_to_budget() {
 bool ConflictStore::propagate(std::vector<f64>& lo, std::vector<f64>& hi,
                               const std::vector<f64>& root_lo,
                               const std::vector<f64>& root_hi, bool* converged) {
+    core::WorkScope work_scope_(core::WorkCat::Conflict);
     if (converged != nullptr) *converged = true;
     ++stats_.scans;
     if (clauses_.empty()) return true;
@@ -249,6 +251,7 @@ bool ConflictStore::propagate(std::vector<f64>& lo, std::vector<f64>& hi,
             }
             --budget;
             Clause& cl = clauses_[ci];
+            core::work_add(2 + cl.lits.size(), ::sor::core::WorkTag::ClauseScan);
             const ConflictLiteral* open = nullptr;
             std::size_t n_open = 0;
             bool satisfied = false;
@@ -341,6 +344,7 @@ std::vector<ConflictLiteral> explain_conflict_clause(
     const std::vector<char>& is_int, const std::vector<f64>& root_lo,
     const std::vector<f64>& root_hi, const std::vector<f64>& cur_lo,
     const std::vector<f64>& cur_hi, Index conflict_var) {
+    core::WorkScope work_scope_(core::WorkCat::Conflict);
     const auto& es = trail.entries();
     const Index n = lp.n_cols();
     if (conflict_var < 0 || conflict_var >= n || es.empty()) return {};
@@ -475,6 +479,7 @@ std::vector<ConflictLiteral> farkas_conflict_clause(
     const model::LpProblem& lp, const std::vector<f64>& ray, f64 tolerance,
     const std::vector<char>& is_int, const std::vector<f64>& root_lo,
     const std::vector<f64>& root_hi, std::size_t* relaxed_bounds) {
+    core::WorkScope work_scope_(core::WorkCat::Conflict);
     std::vector<ConflictLiteral> out;
     const Index n = lp.n_cols();
     if (!(tolerance >= 0.0) || !std::isfinite(tolerance) ||

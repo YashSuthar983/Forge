@@ -263,8 +263,8 @@ shares no code with the solver and also checks integrality.
 `NumericalFailure` · `Unsupported`
 
 **ProofLevel** (in increasing strength): `None` · `BoundOnly` · `FeasibleOnly`
-· `FeasibleWithGap` · `ProvedKKT` · `ProvedGlobalEpsilon` · `ProvedOptimalFP`
-· `ProvedOptimalExact` · `ProvedOptimalCertified`
+· `FeasibleWithGap` · `ProvedKKT` · `ProvedGlobalFP` · `ProvedGlobalEpsilon`
+· `ProvedOptimalFP` · `ProvedOptimalExact` · `ProvedOptimalCertified`
 
 Only `finalize_result()` may set `Optimal`, and only when the proof is
 sufficient and the internal checker has passed. `tests/test_no_unproved_optimal`
@@ -274,7 +274,8 @@ no engine produces them yet.
 | Level | Typical source |
 |---|---|
 | `ProvedOptimalFP` | simplex basis, or a basis from crossover, with residuals in tolerance |
-| `ProvedGlobalEpsilon` | MILP / MIQP / global tree closed within the gap tolerance |
+| `ProvedGlobalEpsilon` | MILP / MIQP / global tree closed within the gap tolerance, every relaxation bound proved (safe Lagrangian bound or exact certificate) |
+| `ProvedGlobalFP` | MILP tree closed within the gap tolerance, some node bounds taken at f64 tolerances (default without `--exact-proof`: a tolerance-optimal node LP with no finite safe bound counts at its objective) |
 | `ProvedKKT` | convex QP from the IPM or a first-order method passing the KKT check |
 | `FeasibleWithGap` | incumbent plus a valid bound, gap still open |
 | `FeasibleOnly` | verified feasible point, no bound |

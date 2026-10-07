@@ -51,6 +51,7 @@ EnvSwitches read_environment() {
     s.presolve_no_retry = flag("SOR_PRESOLVE_NO_RETRY");
     s.certificate_debug = flag("SOR_CERTIFICATE_DEBUG");
     s.farkas_debug = flag("SOR_FARKAS_DEBUG");
+    s.ref_trace = flag("SOR_REF_TRACE");
     s.fgmres_profile = flag("SOR_FGMRES_PROFILE");
     s.dump_kkt = text("SOR_DUMP_KKT");
     s.stall_window = static_cast<int>(number("SOR_STALL_WINDOW"));

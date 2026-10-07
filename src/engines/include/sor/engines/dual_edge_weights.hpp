@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sor/core/result.hpp"
+#include "sor/core/work_clock.hpp"
 
 #include <chrono>
 #include <functional>
@@ -49,8 +50,7 @@ bool rebuild_dual_edge_weights(
     const std::function<void(std::vector<core::f64>&)>& btran,
     std::vector<core::f64>& weights,
     const SeededUnitBtran& btran_seeded = {},
-    std::chrono::steady_clock::time_point deadline =
-        std::chrono::steady_clock::time_point::max());
+    core::SolverClock::time_point deadline = core::SolverClock::time_point::max());
 
 // Exact Devex weight of a pivotal row for the current reference framework.
 // `reference[j] != 0` identifies the variables that were basic when the

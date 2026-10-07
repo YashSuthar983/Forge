@@ -77,6 +77,10 @@ void test_strong_branch_child_certificates_close_gap() {
     opts.time_limit_s = 0.0;
     opts.gap_tol = opts.abs_gap_tol = 1e-9;
     opts.rb_startup_ms = 1e12;
+    // The scenario (strong branching closing both children of an open node)
+    // depends on the root cut rows; purging the non-binding ones changes the
+    // path, so pin it off. This test is about certificate bookkeeping.
+    opts.cut.purge_nonbinding_cuts = false;
     BabDiagnostics diag;
     const auto raw = sor::search::solve_milp(lp, opts, diag);
     const auto result = sor::certify::finalize_result(raw,

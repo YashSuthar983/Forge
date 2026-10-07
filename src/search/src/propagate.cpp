@@ -1,4 +1,5 @@
 #include "sor/search/propagate.hpp"
+#include "sor/core/work_clock.hpp"
 
 #include <cmath>
 #include <limits>
@@ -24,6 +25,7 @@ bool process_row(const model::LpProblem& lp, Index i,
     if (!std::isfinite(row_lo) && !std::isfinite(row_hi)) return true;
 
     const core::Offset beg = rp[sz(i)], end = rp[sz(i) + 1];
+    core::work_add(8 + 3 * static_cast<std::uint64_t>(end - beg), ::sor::core::WorkTag::Propagate);
 
     f64 min_finite = 0.0, max_finite = 0.0;
     f64 min_abs = 0.0, max_abs = 0.0;
@@ -100,28 +102,55 @@ bool process_row(const model::LpProblem& lp, Index i,
             rmax_finite = false;
         }
 
+        // widen() only loosens a candidate, and integer rounding is
+        // monotone, so a raw candidate that cannot tighten the current bound
+        // is skipped before paying for widen()'s divisions and nextafter --
+        // about half of root probing's time. Results are unchanged.
+        const bool integral_j = !lp.is_integer.empty() && lp.is_integer[sz(j)];
+        const auto may_lower = [&](f64 raw) {
+            const f64 b = integral_j ? std::ceil(raw - tol) : raw;
+            return b > col_lo[sz(j)] + tol;
+        };
+        const auto may_upper = [&](f64 raw) {
+            const f64 b = integral_j ? std::floor(raw + tol) : raw;
+            return b < col_hi[sz(j)] - tol;
+        };
         f64 new_lo = -kInf, new_hi = kInf;
         if (aj > 0.0) {
-            if (std::isfinite(row_hi) && rmin_finite)
-                new_hi = widen((row_hi - rmin) / aj, min_abs,
-                               row_hi, aj, false);
-            if (std::isfinite(row_lo) && rmax_finite)
-                new_lo = widen((row_lo - rmax) / aj, max_abs,
-                               row_lo, aj, true);
+            if (std::isfinite(row_hi) && rmin_finite) {
+                const f64 raw = (row_hi - rmin) / aj;
+                if (may_upper(raw)) new_hi = widen(raw, min_abs, row_hi, aj, false);
+            }
+            if (std::isfinite(row_lo) && rmax_finite) {
+                const f64 raw = (row_lo - rmax) / aj;
+                if (may_lower(raw)) new_lo = widen(raw, max_abs, row_lo, aj, true);
+            }
         } else {
-            if (std::isfinite(row_hi) && rmin_finite)
-                new_lo = widen((row_hi - rmin) / aj, min_abs,
-                               row_hi, aj, true);
-            if (std::isfinite(row_lo) && rmax_finite)
-                new_hi = widen((row_lo - rmax) / aj, max_abs,
-                               row_lo, aj, false);
+            if (std::isfinite(row_hi) && rmin_finite) {
+                const f64 raw = (row_hi - rmin) / aj;
+                if (may_lower(raw)) new_lo = widen(raw, min_abs, row_hi, aj, true);
+            }
+            if (std::isfinite(row_lo) && rmax_finite) {
+                const f64 raw = (row_lo - rmax) / aj;
+                if (may_upper(raw)) new_hi = widen(raw, max_abs, row_lo, aj, false);
+            }
         }
 
-        if (!lp.is_integer.empty() && lp.is_integer[sz(j)]) {
+        if (integral_j) {
             if (new_lo > -kInf) new_lo = std::ceil(new_lo - tol);
             if (new_hi < kInf) new_hi = std::floor(new_hi + tol);
         }
 
+        // A derived bound that crosses the opposite bound by no more than
+        // the tolerance is not a proof of emptiness (the test below accepts
+        // it as feasible), so it must not leave the box crossed either: snap
+        // it onto the opposite bound. Left crossed, every exact consumer of
+        // the box (e.g. intersecting a node with the root box) reads it as
+        // empty -- supportcase7 lost the node holding its optimum to a
+        // continuous column with box [0, -4e-16] and claimed 952.69 optimal
+        // against a true optimum of -1132.22.
+        if (new_hi < col_lo[sz(j)] && new_hi >= col_lo[sz(j)] - tol) new_hi = col_lo[sz(j)];
+        if (new_lo > col_hi[sz(j)] && new_lo <= col_hi[sz(j)] + tol) new_lo = col_hi[sz(j)];
         if (new_lo > col_lo[sz(j)] + tol) {
             if (trail) {
                 trail->push(j, BoundDir::Lower, new_lo, col_lo[sz(j)],
@@ -197,6 +226,92 @@ PropagateResult propagate_bounds_trail(const model::LpProblem& lp,
 
 namespace sor::search {
 
+PropagateResult propagate_objective_cutoff(const model::LpProblem& lp, f64 rhs,
+                                           std::vector<f64>& col_lo,
+                                           std::vector<f64>& col_hi, f64 tol,
+                                           std::vector<Index>* changed) {
+    PropagateResult res;
+    const Index n = lp.n_cols();
+    if (!std::isfinite(rhs) || static_cast<Index>(col_lo.size()) != n ||
+        static_cast<Index>(col_hi.size()) != n)
+        return res;
+    const f64 sense = lp.maximize ? -1.0 : 1.0;
+    core::work_add(4 + 2 * static_cast<std::uint64_t>(n), ::sor::core::WorkTag::Propagate);
+    // Minimum activity of sense*c'x over the box, with the one infinite term
+    // (if exactly one) remembered; the sum of |terms| bounds its round-off.
+    long double min_fin = 0.0L, abs_sum = 0.0L;
+    int n_inf = 0;
+    Index inf_col = -1;
+    for (Index j = 0; j < n; ++j) {
+        const f64 d = sense * lp.c[sz(j)];
+        if (d == 0.0) continue;
+        const f64 b = d > 0.0 ? col_lo[sz(j)] : col_hi[sz(j)];
+        if (!std::isfinite(b)) { ++n_inf; inf_col = j; continue; }
+        const long double t = static_cast<long double>(d) * b;
+        min_fin += t;
+        abs_sum += std::fabs(t);
+    }
+    if (n_inf >= 2) return res;
+    // Round-off. Each long double product and sum carries a relative error
+    // of at most u = 2^-64, so the computed minimum activity is within
+    // n*u*abs_sum (first order) of the exact one; `rest` adds one more
+    // operation, rhs itself is f64 (2^-53*|rhs|), and the division below
+    // rounds once to f64 (2^-53 of a quotient whose numerator is at most
+    // |rhs| + abs_sum + pad). The pad 1e-9*(1 + abs_sum + |rhs|) exceeds the
+    // sum of these by orders of magnitude for any n below 10^10, so a bound
+    // derived from it is implied by the exact row. Looser is always safe.
+    const long double pad = 1e-9L * (1.0L + abs_sum + std::fabs(static_cast<long double>(rhs)));
+    if (n_inf == 0 && min_fin > static_cast<long double>(rhs) + pad) {
+        res.feasible = false;
+        return res;
+    }
+    for (Index j = 0; j < n; ++j) {
+        const f64 d = sense * lp.c[sz(j)];
+        if (d == 0.0) continue;
+        if (n_inf == 1 && j != inf_col) continue;
+        const f64 own_b = d > 0.0 ? col_lo[sz(j)] : col_hi[sz(j)];
+        long double rest = min_fin;
+        if (n_inf == 0) rest -= static_cast<long double>(d) * own_b;
+        // d_j x_j <= rhs - rest  (+ pad)
+        const long double room = static_cast<long double>(rhs) - rest + pad;
+        const bool integral = !lp.is_integer.empty() && lp.is_integer[sz(j)];
+        if (d > 0.0) {
+            f64 nh = static_cast<f64>(room / d);
+            if (integral) nh = std::floor(nh + tol);
+            const f64 cur = col_hi[sz(j)];
+            // An infinite bound is improved by any finite one (the step test
+            // would evaluate inf - inf).
+            if (std::isfinite(nh) &&
+                (!std::isfinite(cur) ||
+                 nh < cur - std::max(tol, integral ? 0.5 : 1e-7 * (1.0 + std::fabs(cur))))) {
+                if (nh < col_lo[sz(j)]) {
+                    if (nh < col_lo[sz(j)] - tol) { res.feasible = false; res.conflict_var = j; return res; }
+                    nh = col_lo[sz(j)];
+                }
+                col_hi[sz(j)] = nh;
+                ++res.tightened;
+                if (changed) changed->push_back(j);
+            }
+        } else {
+            f64 nl = static_cast<f64>(room / d);   // d < 0: x_j >= room/d
+            if (integral) nl = std::ceil(nl - tol);
+            const f64 cur = col_lo[sz(j)];
+            if (std::isfinite(nl) &&
+                (!std::isfinite(cur) ||
+                 nl > cur + std::max(tol, integral ? 0.5 : 1e-7 * (1.0 + std::fabs(cur))))) {
+                if (nl > col_hi[sz(j)]) {
+                    if (nl > col_hi[sz(j)] + tol) { res.feasible = false; res.conflict_var = j; return res; }
+                    nl = col_hi[sz(j)];
+                }
+                col_lo[sz(j)] = nl;
+                ++res.tightened;
+                if (changed) changed->push_back(j);
+            }
+        }
+    }
+    return res;
+}
+
 ColumnRowIndex build_column_row_index(const model::LpProblem& lp) {
     ColumnRowIndex idx;
     const Index n = lp.n_cols();
@@ -221,6 +336,7 @@ PropagateResult propagate_bounds_events(const model::LpProblem& lp,
                                         PropagationScratch& scratch,
                                         PropTrail* trail, int depth, f64 tol,
                                         std::uint64_t max_row_visits) {
+    core::WorkScope work_scope_(core::WorkCat::Propagation);
     PropagateResult res;
     const Index m = lp.n_rows();
     const Index n = lp.n_cols();

@@ -84,12 +84,12 @@ int test_rebuild_stops_at_deadline() {
     int solves = 0;
     const auto btran = [&](std::vector<double>&) { ++solves; };
     if (!sor::engines::rebuild_dual_edge_weights(4, btran, weights, {},
-            std::chrono::steady_clock::now() + std::chrono::hours(1)))
+            sor::core::SolverClock::now() + std::chrono::hours(1)))
         ++failures;
     if (solves != 4) ++failures;
     solves = 0;
     if (sor::engines::rebuild_dual_edge_weights(4, btran, weights, {},
-            std::chrono::steady_clock::now() - std::chrono::seconds(1)))
+            sor::core::SolverClock::now() - std::chrono::seconds(1)))
         ++failures;
     if (solves != 0) ++failures;
     return failures;

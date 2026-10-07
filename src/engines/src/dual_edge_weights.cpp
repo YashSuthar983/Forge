@@ -37,7 +37,7 @@ bool rebuild_dual_edge_weights(
     const std::function<void(std::vector<core::f64>&)>& btran,
     std::vector<core::f64>& weights,
     const SeededUnitBtran& btran_seeded,
-    const std::chrono::steady_clock::time_point deadline) {
+    const core::SolverClock::time_point deadline) {
     if (m < 0 || !btran) return false;
     weights.assign(static_cast<std::size_t>(m), 1.0);
     std::vector<core::f64> rhs(static_cast<std::size_t>(m), 0.0);
@@ -58,9 +58,11 @@ bool rebuild_dual_edge_weights(
         return s;
     };
     std::vector<core::Index> support;
-    const bool timed = deadline != std::chrono::steady_clock::time_point::max();
+    // Solver clock: work time under --deterministic, so whether the rebuild
+    // finishes (and every pivot after it) does not depend on machine load.
+    const bool timed = deadline != core::SolverClock::time_point::max();
     for (core::Index i = 0; i < m; ++i) {
-        if (timed && (i & 63) == 0 && std::chrono::steady_clock::now() >= deadline)
+        if (timed && (i & 63) == 0 && core::SolverClock::now() >= deadline)
             return false;
         // rhs is all-zero here (start of loop, or restored by the tail below).
         rhs[static_cast<std::size_t>(i)] = 1.0;

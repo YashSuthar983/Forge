@@ -422,6 +422,38 @@ void test_pc_random_validity() {
     CHECK(pc_cuts + gns_cuts >= 1);  // non-vacuous SI path on this seed
 }
 
+// A cover rounds its row, so the row's own error matters. Here the row's
+// capacity is 5e-9 short of 3 -- the size of the error a GMI or MIR row
+// carries when it is tight at an integer point (test_milp_oracle seed 770 had
+// two such rows; covers on them cut the optimum off by a whole unit). As
+// model data the row is exact and (1, 1) really is excluded, so the cover
+// x0 + x1 <= 1 is valid. As a derived row (past exact_rows) the 5e-9 excess is
+// below the row's uncertainty and no cover may be claimed.
+void test_derived_row_cover_needs_real_excess() {
+    LpProblem lp;
+    lp.name = "derived";
+    lp.A = from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 2.0});
+    lp.c = {-1.0, -1.0};
+    lp.row_lo = {-kInf};
+    lp.row_hi = {3.0 - 5e-9};
+    lp.col_lo = {0.0, 0.0};
+    lp.col_hi = {1.0, 1.0};
+    lp.is_integer = {true, true};
+    const std::vector<f64> x = {1.0, 0.9999999975};
+
+    CoverOptions o;
+    CoverDiagnostics d;
+    const auto exact = separate_lifted_covers(lp, x, lp.col_lo, lp.col_hi, o, d);
+    CHECK(exact.size() == 1);
+    for (const auto& c : exact) CHECK(cut_lhs(c, {1.0, 1.0}) > c.row_hi + 0.5);
+
+    o.exact_rows = 0;   // row 0 was appended by an earlier cut round
+    CoverDiagnostics d2;
+    const auto derived = separate_lifted_covers(lp, x, lp.col_lo, lp.col_hi, o, d2);
+    CHECK(derived.empty());
+    CHECK(d2.knapsacks_built == 1);   // considered, and declined
+}
+
 }  // namespace
 
 int main() {
@@ -433,5 +465,6 @@ int main() {
     test_pc_sequence_independent_lifting_valid();
     test_prasad_pc_half_integral_example();
     test_pc_random_validity();
+    test_derived_row_cover_needs_real_excess();
     return sor::test::finish("test_covers");
 }

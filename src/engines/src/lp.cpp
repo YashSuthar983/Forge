@@ -1,4 +1,5 @@
 #include "sor/engines/lp.hpp"
+#include "sor/core/work_clock.hpp"
 
 #include "sor/backend/kernel_backend.hpp"
 #include "sor/backend/lp_device.hpp"
@@ -32,7 +33,7 @@ struct CandidateSpace {
 };
 
 
-using Clock = std::chrono::steady_clock;
+using Clock = sor::core::SolverClock;
 
 double elapsed_seconds(Clock::time_point start) {
     return std::chrono::duration<double>(Clock::now() - start).count();

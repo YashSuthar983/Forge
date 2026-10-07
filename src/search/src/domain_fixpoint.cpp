@@ -1,4 +1,5 @@
 #include "sor/search/domain_fixpoint.hpp"
+#include "sor/core/work_clock.hpp"
 
 #include <algorithm>
 #include <utility>
@@ -12,6 +13,7 @@ int DomainFixpoint::add(std::string name, Step step) {
 }
 
 FixpointRun DomainFixpoint::run(int max_steps, const std::vector<char>& initially_stale) const {
+    core::WorkScope work_scope_(core::WorkCat::Propagation);
     const std::size_t k = steps_.size();
     FixpointRun out;
     std::vector<char> stale(k, 1);

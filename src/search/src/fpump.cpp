@@ -1,4 +1,6 @@
 #include "sor/search/fpump.hpp"
+#include "heuristic_lp.hpp"
+#include "sor/core/work_clock.hpp"
 
 #include "sor/engines/simplex.hpp"
 #include "sor/sparse/csr.hpp"
@@ -13,7 +15,7 @@
 namespace sor::search {
 namespace {
 
-using Clock = std::chrono::steady_clock;
+using Clock = sor::core::SolverClock;
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 
 struct Rng {
@@ -40,6 +42,7 @@ bool feasibility_pump(const model::LpProblem& lp,
                       const FeasPumpOptions& opts,
                       std::vector<f64>& x_out,
                       FeasPumpDiagnostics& diag) {
+    core::WorkScope work_scope_(core::WorkCat::Heuristic);
     const auto t0 = Clock::now();
     const auto elapsed_s = [&]() {
         return std::chrono::duration<double>(Clock::now() - t0).count();
@@ -193,6 +196,7 @@ bool feasibility_pump(const model::LpProblem& lp,
                 else if (std::isfinite(col_hi[sz(j)]) && t >= col_hi[sz(j)]) costs[sz(j)] -= beta0;
             }
             engines::SimplexOptions so;
+            heuristic_lp_options(so);
             so.presolve = false;
             so.primal_feas_tol = opts.feas_tol;
             so.max_iterations = opts.lp_max_iterations;
@@ -328,6 +332,7 @@ bool feasibility_pump(const model::LpProblem& lp,
             pump.A = sparse::from_triplets(dist_base + 2 * na, n + na, rows, cols, vals);
         }
         engines::SimplexOptions so;
+        heuristic_lp_options(so);
         so.presolve = true;
         so.primal_feas_tol = opts.feas_tol;
         so.max_iterations = opts.lp_max_iterations;

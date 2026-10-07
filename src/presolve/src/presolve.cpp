@@ -1,4 +1,5 @@
 #include "sor/presolve/presolve.hpp"
+#include "sor/core/work_clock.hpp"
 #include "sor/model/dyadic.hpp"
 #include "sor/model/exact.hpp"
 
@@ -34,7 +35,8 @@ PresolveMap run_presolve_until_deadline(const model::LpProblem& in,
                          PresolveStatus& status,
                          Index& witness_row, Index& witness_col,
                          std::string& reason) {
-    using PresolveClock = std::chrono::steady_clock;
+    core::WorkScope work_scope_(core::WorkCat::Presolve);
+    using PresolveClock = sor::core::SolverClock;
     if (options.max_aggregation_row_nnz < 2 || options.max_substitution_fill < 0 ||
         options.sparsification_passes < 0 || options.max_domain_probes < 0)
         throw std::invalid_argument("presolve: invalid advanced reduction policy");
@@ -118,10 +120,15 @@ PresolveMap run_presolve_until_deadline(const model::LpProblem& in,
     };
 
     bool changed = true;
+    // A pass sweeps the live rows and columns; charged as one sweep of the
+    // input (the deterministic clock cannot see presolve otherwise).
+    const auto pass_work = static_cast<std::uint64_t>(in.nnz()) / 2 +
+                           static_cast<std::uint64_t>(in.n_rows() + in.n_cols());
     for (int pass = 0; pass < options.max_passes && changed; ++pass) {
         detail::check_deadline(options);
         changed = false;
         ++out.stats.passes;
+        core::work_add(pass_work, ::sor::core::WorkTag::LpPresolve);
 
         // Fixed columns (lo == hi).
         for (Index j = 0; j < n; ++j) {
@@ -1255,7 +1262,7 @@ PresolveMap run_presolve(const model::LpProblem& in,
     } catch (const detail::DeadlineReached&) {
         PresolveOptions identity = options;
         identity.enabled = false;
-        identity.deadline = std::chrono::steady_clock::time_point::max();
+        identity.deadline = core::SolverClock::time_point::max();
         reason.clear();
         PresolveMap out = run_presolve_until_deadline(
             in, identity, status, witness_row, witness_col, reason);

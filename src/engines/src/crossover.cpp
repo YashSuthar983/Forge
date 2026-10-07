@@ -1,4 +1,5 @@
 #include "sor/engines/crossover.hpp"
+#include "sor/core/work_clock.hpp"
 
 #include "sor/certify/finalize.hpp"
 #include "sor/engines/dual_simplex.hpp"
@@ -19,7 +20,7 @@
 namespace sor::engines {
 namespace {
 
-using Clock = std::chrono::steady_clock;
+using Clock = sor::core::SolverClock;
 inline double ms_since(Clock::time_point t0) {
     SOR_FN();
     return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();

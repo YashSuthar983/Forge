@@ -1,4 +1,5 @@
 #include "sor/search/conflict.hpp"
+#include "sor/core/work_clock.hpp"
 
 #include "sor/search/mip_presolve.hpp"
 #include "sor/search/propagate.hpp"
@@ -15,7 +16,7 @@
 namespace sor::search {
 namespace {
 
-using Clock = std::chrono::steady_clock;
+using Clock = sor::core::SolverClock;
 
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 inline std::size_t sz(core::Offset i) { return static_cast<std::size_t>(i); }
@@ -47,6 +48,7 @@ void ConflictGraph::reset(Index n_cols) {
     binary_.assign(sz(n_cols), false);
     binary_cols_.clear();
     adj_.assign(sz(2 * n_cols), {});
+    adj_sorted_.assign(sz(2 * n_cols), 0);
     cliques_.clear();
     lit_cliques_.assign(sz(2 * n_cols), {});
     n_edges_ = 0;
@@ -195,22 +197,72 @@ bool ProbingCarry::usable_for(const model::LpProblem& lp) const {
     return true;
 }
 
+// A literal's adjacency list is a sorted base run (adj_sorted_[l] long,
+// rebuilt by sort_adjacency), then sorted runs of kAdjBlock * 2^k entries
+// for the set bits k of q = (size - base) / kAdjBlock, largest first, then
+// an unsorted tail of fewer than kAdjBlock recent additions. A full tail is
+// sorted into a run and merged like a binary-counter increment, so an entry
+// is merged O(log degree) times and a lookup is one binary search per run
+// plus a short scan. The previous scheme (one sorted prefix, merged every 32
+// additions) was still quadratic in the degree: 37% of structural presolve
+// on nw04, whose probe literals reach tens of thousands of neighbours.
+namespace {
+constexpr std::size_t kAdjBlock = 32;
+
+bool adjacency_contains(const std::vector<Index>& av, std::size_t base, Index x) {
+    const auto first = av.begin();
+    if (std::binary_search(first, first + static_cast<std::ptrdiff_t>(base), x)) return true;
+    const std::size_t rest = av.size() - base;
+    std::size_t q = rest / kAdjBlock;
+    auto pos = first + static_cast<std::ptrdiff_t>(base);
+    while (q != 0) {
+        const int k = 63 - __builtin_clzll(static_cast<unsigned long long>(q));
+        const auto len = static_cast<std::ptrdiff_t>(kAdjBlock << k);
+        if (std::binary_search(pos, pos + len, x)) return true;
+        pos += len;
+        q &= ~(std::size_t{1} << k);
+    }
+    return std::find(pos, av.end(), x) != av.end();
+}
+}  // namespace
+
 bool ConflictGraph::add_edge(Index l1, Index l2) {
     if (l1 == l2) return false;
     if (lit_var(l1) == lit_var(l2)) return false;  // x=0 vs x=1 is not news
     if (n_edges_ >= kMaxEdges) return false;
     const Index a = std::min(l1, l2), b = std::max(l1, l2);
     if (a < 0 || b >= 2 * n_cols_) return false;
-    auto& av = adj_[sz(a)];
-    // The adjacency lists are built append-only and sorted once at the end, so
-    // duplicate suppression here is a linear scan. Probing produces few edges
-    // per literal in practice; row extraction is deduplicated by the sort.
-    if (std::find(av.begin(), av.end(), b) != av.end()) return false;
-    av.push_back(b);
+    // Edges are symmetric, so a's list alone answers whether {a, b} is
+    // present.
+    core::work_add(3, ::sor::core::WorkTag::ProbeEdge);
+    if (adjacency_contains(adj_[sz(a)], adj_sorted_[sz(a)], b)) return false;
+    adj_[sz(a)].push_back(b);
+    absorb_tail(a);
     adj_[sz(b)].push_back(a);
+    absorb_tail(b);
     ++n_edges_;
     sorted_ = false;
     return true;
+}
+
+// Called after every append: once the tail fills a block, sort it into a run
+// and merge equal-sized runs from the end. Lists hold no duplicates
+// (add_edge checks first), so these are plain merges.
+void ConflictGraph::absorb_tail(Index l) {
+    auto& av = adj_[sz(l)];
+    const std::size_t rest = av.size() - adj_sorted_[sz(l)];
+    if (rest == 0 || rest % kAdjBlock != 0) return;
+    const auto end = av.end();
+    std::sort(end - static_cast<std::ptrdiff_t>(kAdjBlock), end);
+    std::uint64_t moved = 4 * kAdjBlock;
+    std::size_t run = kAdjBlock;
+    for (std::size_t q = rest / kAdjBlock; (q & 1u) == 0; q >>= 1) {
+        const auto len = static_cast<std::ptrdiff_t>(run);
+        std::inplace_merge(end - 2 * len, end - len, end);
+        moved += 2 * run;
+        run *= 2;
+    }
+    core::work_add(moved / 4, ::sor::core::WorkTag::ProbeEdge);
 }
 
 bool ConflictGraph::conflicts(Index l1, Index l2) const {
@@ -218,7 +270,7 @@ bool ConflictGraph::conflicts(Index l1, Index l2) const {
     if (l1 < 0 || l2 < 0 || l1 >= 2 * n_cols_ || l2 >= 2 * n_cols_) return false;
     const auto& av = adj_[sz(l1)];
     if (sorted_) return std::binary_search(av.begin(), av.end(), l2);
-    return std::find(av.begin(), av.end(), l2) != av.end();
+    return adjacency_contains(av, adj_sorted_[sz(l1)], l2);
 }
 
 const std::vector<Index>& ConflictGraph::neighbors(Index l) const {
@@ -243,9 +295,11 @@ void ConflictGraph::add_clique(Clique c) {
 }
 
 void ConflictGraph::sort_adjacency() {
-    for (auto& a : adj_) {
+    for (std::size_t l = 0; l < adj_.size(); ++l) {
+        auto& a = adj_[l];
         std::sort(a.begin(), a.end());
         a.erase(std::unique(a.begin(), a.end()), a.end());
+        adj_sorted_[l] = static_cast<std::uint32_t>(a.size());
     }
     sorted_ = true;
 }
@@ -254,22 +308,34 @@ void ConflictGraph::forget_columns(const std::vector<char>& drop) {
     const auto dropped = [&](Index j) {
         return j >= 0 && sz(j) < drop.size() && drop[sz(j)] != 0;
     };
+    // One pass per list that loses entries (finding and erasing each edge
+    // on its own was quadratic in the degree); a touched list is re-sorted
+    // whole, which also restores its run structure.
+    std::vector<char> touched(adj_.size(), 0);
+    std::vector<Index> touched_lits;
     for (Index j = 0; j < n_cols_; ++j) {
         if (!dropped(j)) continue;
         for (int v = 0; v < 2; ++v) {
             const Index l = lit_of(j, v);
-            for (const Index b : adj_[sz(l)]) {
-                auto& bv = adj_[sz(b)];
-                const auto it = std::find(bv.begin(), bv.end(), l);
-                if (it != bv.end()) {
-                    bv.erase(it);
-                    --n_edges_;
-                }
-            }
+            for (const Index b : adj_[sz(l)])
+                if (!touched[sz(b)]) { touched[sz(b)] = 1; touched_lits.push_back(b); }
             adj_[sz(l)].clear();
+            adj_sorted_[sz(l)] = 0;
         }
         binary_[sz(j)] = false;
     }
+    for (const Index b : touched_lits) {
+        auto& bv = adj_[sz(b)];
+        bv.erase(std::remove_if(bv.begin(), bv.end(),
+                                [&](Index x) { return dropped(lit_var(x)); }),
+                 bv.end());
+        std::sort(bv.begin(), bv.end());
+        adj_sorted_[sz(b)] = static_cast<std::uint32_t>(bv.size());
+        core::work_add(4 * bv.size() + 4, ::sor::core::WorkTag::ProbeEdge);
+    }
+    std::size_t ends = 0;
+    for (const auto& av : adj_) ends += av.size();
+    n_edges_ = ends / 2;
     binary_cols_.erase(std::remove_if(binary_cols_.begin(), binary_cols_.end(),
                                       dropped),
                        binary_cols_.end());
@@ -477,6 +543,7 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
                                          ConflictGraph& out,
                                          const ProbingOptions& opts,
                                          ProbingState* state) {
+    core::WorkScope work_scope_(core::WorkCat::Probing);
     ConflictDiagnostics diag;
     const auto t0 = Clock::now();
     const Index n = lp.n_cols();
@@ -684,13 +751,40 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
             return feasible;
         };
 
-        const auto& bins = out.binaries();
+        // Probe in a fixed pseudo-random order rather than column order.
+        // Productive binaries are often a contiguous block late in the index
+        // order (drayage: nothing fixed by the first ~4000 of 9909, then 1162
+        // columns), so column order made the yield -- and the unproductive
+        // give-up below -- depend on how fast the first second went: the same
+        // model reached root bound 99.7k on one core and 11.7k on another.
+        // A splitmix64 hash of the column index spreads every block over the
+        // whole run, deterministically.
+        std::vector<Index> bins(out.binaries().begin(), out.binaries().end());
+        {
+            const auto mix = [](std::uint64_t z) {
+                z += 0x9e3779b97f4a7c15ull;
+                z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+                z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+                return z ^ (z >> 31);
+            };
+            std::stable_sort(bins.begin(), bins.end(), [&](Index a, Index b) {
+                return mix(static_cast<std::uint64_t>(a)) < mix(static_cast<std::uint64_t>(b));
+            });
+        }
         std::size_t budget =
             std::min<std::size_t>(bins.size(), sz(opts.max_binaries_probed));
         if (state != nullptr && state->gave_up) budget = 0;   // it did not pay last time
         if (budget < bins.size()) diag.probing_truncated = true;
 
         for (std::size_t idx = 0; idx < budget; ++idx) {
+            // Every 16 binaries, and that granularity is part of the budget:
+            // probe_time_limit_s was tuned with it. Checking every binary held
+            // probing to its nominal 0.3 s on ex10 (134 binaries probed over
+            // presolve and root, against 255), clique probing then fixed 99
+            // columns instead of 160, fixprop found no incumbent and the root
+            // LP ran out the clock: Optimal in 20 s became Interrupted. The
+            // cost is an overrun of up to 15 binaries, which a small child
+            // allowance feels most (neos-860300: 0.06-0.2 s ran 0.32-0.42 s).
             if ((idx & 0xF) == 0 && opts.probe_time_limit_s > 0.0 &&
                 ms_since(t0) > opts.probe_time_limit_s * 1000.0) {
                 diag.probing_truncated = true;
@@ -890,6 +984,7 @@ f64 clique_activity(const std::vector<Index>& lits, const std::vector<f64>& x) {
 std::vector<CutRow> separate_clique_cuts(const ConflictGraph& cg,
                                          const std::vector<f64>& x,
                                          const ProbingOptions& opts) {
+    core::WorkScope work_scope_(core::WorkCat::Separation);
     std::vector<CutRow> cuts;
     if (cg.n_cols() <= 0 || static_cast<Index>(x.size()) != cg.n_cols())
         return cuts;
@@ -968,6 +1063,7 @@ std::vector<CutRow> separate_clique_cuts(const ConflictGraph& cg,
 std::vector<CutRow> separate_implied_bound_cuts(const ConflictGraph& cg,
                                                 const std::vector<f64>& x,
                                                 const ProbingOptions& opts) {
+    core::WorkScope work_scope_(core::WorkCat::Separation);
     std::vector<CutRow> cuts;
     if (cg.n_cols() <= 0 || static_cast<Index>(x.size()) != cg.n_cols())
         return cuts;

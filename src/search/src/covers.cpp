@@ -1,4 +1,5 @@
 #include "sor/search/covers.hpp"
+#include "sor/core/work_clock.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -30,11 +31,15 @@ inline bool is_binary(const model::LpProblem& lp, const std::vector<f64>& lo,
            std::fabs(lo[sz(j)]) <= 1e-9 && std::fabs(hi[sz(j)] - 1.0) <= 1e-9;
 }
 
+// `mag` returns |bound| + the magnitudes of the terms folded into `cap`: the
+// scale of the capacity's rounding error, and of a derived row's own error.
 bool build_knapsack(const model::LpProblem& lp, Index row, f64 sign,
                     const std::vector<f64>& x, const std::vector<f64>& lo,
                     const std::vector<f64>& hi, const CoverOptions& opts,
-                    std::vector<Item>& items, f64& cap,
+                    std::vector<Item>& items, f64& cap, f64& mag,
                     CoverDiagnostics& diag) {
+    core::work_add(4 + static_cast<std::uint64_t>(lp.A.pattern.row_ptr()[sz(row) + 1] -
+                                                  lp.A.pattern.row_ptr()[sz(row)]), ::sor::core::WorkTag::Cover);
     const f64 bound = sign > 0.0 ? lp.row_hi[sz(row)] : -lp.row_lo[sz(row)];
     if (!std::isfinite(bound)) return false;
 
@@ -44,12 +49,17 @@ bool build_knapsack(const model::LpProblem& lp, Index row, f64 sign,
 
     items.clear();
     cap = bound;
+    mag = std::fabs(bound);
     for (core::Offset k = rp[sz(row)]; k < rp[sz(row) + 1]; ++k) {
         const Index j = ci[sz(k)];
         const f64 a = sign * av[sz(k)];
-        if (std::fabs(a) <= opts.tol) continue;
+        if (a == 0.0) continue;
 
-        if (is_binary(lp, lo, hi, j)) {
+        // A tiny coefficient is not an item, but it is not zero either: it
+        // goes to the capacity at its minimizing bound like a continuous
+        // term. Dropping a negative one would tighten the row.
+        if (std::fabs(a) > opts.tol && is_binary(lp, lo, hi, j)) {
+            mag += std::fabs(a);
             Item it;
             it.col = j;
             if (a > 0.0) {
@@ -77,6 +87,7 @@ bool build_knapsack(const model::LpProblem& lp, Index row, f64 sign,
             return false;
         }
         cap -= a * at_min;
+        mag += std::fabs(a * at_min);
     }
 
     if (items.size() < 2) return false;
@@ -88,7 +99,7 @@ bool build_knapsack(const model::LpProblem& lp, Index row, f64 sign,
     return true;
 }
 
-bool find_violated_cover(const std::vector<Item>& items, f64 cap,
+bool find_violated_cover(const std::vector<Item>& items, f64 cap, f64 cap_tol,
                          const CoverOptions& opts, std::vector<std::size_t>& cover,
                          f64& violation) {
     std::vector<std::size_t> order(items.size());
@@ -104,9 +115,9 @@ bool find_violated_cover(const std::vector<Item>& items, f64 cap,
     for (const std::size_t idx : order) {
         cover.push_back(idx);
         w += items[idx].weight;
-        if (w > cap + opts.tol) break;
+        if (w > cap + cap_tol) break;
     }
-    if (w <= cap + opts.tol) return false;
+    if (w <= cap + cap_tol) return false;
 
     std::sort(cover.begin(), cover.end(), [&](std::size_t a, std::size_t b) {
         return (1.0 - items[a].value) > (1.0 - items[b].value);
@@ -114,7 +125,7 @@ bool find_violated_cover(const std::vector<Item>& items, f64 cap,
     std::vector<std::size_t> kept;
     for (std::size_t p = 0; p < cover.size(); ++p) {
         const f64 without = w - items[cover[p]].weight;
-        if (without > cap + opts.tol) {
+        if (without > cap + cap_tol) {
             w = without;
         } else {
             kept.push_back(cover[p]);
@@ -317,6 +328,7 @@ bool sequence_independent_lift(const std::vector<f64>& cover_w, f64 cap,
 void sequential_up_lift(std::vector<Item>& items,
                         const std::vector<std::size_t>& cover,
                         f64 cap,
+                        f64 cap_tol,
                         f64 beta,
                         const CoverOptions& opts,
                         CoverDiagnostics& diag) {
@@ -354,12 +366,12 @@ void sequential_up_lift(std::vector<Item>& items,
         if (vmax >= opts.lift_value_cap) break;
         const f64 room = cap - items[k].weight;
         f64 alpha;
-        if (room < -opts.tol) {
+        if (room < -cap_tol) {
             alpha = beta;
         } else {
             int best_v = 0;
             for (int v = vmax; v >= 0; --v)
-                if (minw[sz(static_cast<Index>(v))] <= room + opts.tol) {
+                if (minw[sz(static_cast<Index>(v))] <= room + cap_tol) {
                     best_v = v;
                     break;
                 }
@@ -390,6 +402,7 @@ std::vector<CutRow> separate_lifted_covers(const model::LpProblem& lp,
                                            const std::vector<f64>& col_hi,
                                            const CoverOptions& opts,
                                            CoverDiagnostics& diag) {
+    core::WorkScope work_scope_(core::WorkCat::Separation);
     std::vector<CutRow> cuts;
     const Index n = lp.n_cols();
     if (!opts.enabled || static_cast<Index>(x.size()) != n ||
@@ -408,13 +421,23 @@ std::vector<CutRow> separate_lifted_covers(const model::LpProblem& lp,
 
         for (const f64 sign : {1.0, -1.0}) {
             if (static_cast<int>(cuts.size()) >= opts.max_cuts) break;
-            f64 cap = 0.0;
+            f64 cap = 0.0, mag = 0.0;
             if (!build_knapsack(lp, i, sign, x, col_lo, col_hi, opts, items, cap,
-                                diag))
+                                mag, diag))
                 continue;
+            // The capacity's uncertainty. Every test against `cap` below reads
+            // it in the safe direction: a cover must exceed cap + cap_tol, and
+            // a lifting pattern within cap + cap_tol counts as feasible. On the
+            // model's own rows the only error is the floating sum that built
+            // `cap` (n * u * mag; 1e-12 * mag covers rows of ~10^4 terms).
+            const bool derived = opts.exact_rows >= 0 && i >= opts.exact_rows;
+            const f64 cap_tol = derived
+                ? std::max(opts.tol, opts.derived_row_tol * std::max(1.0, mag))
+                : std::max(opts.tol, 1e-12 * mag);
 
             f64 violation = 0.0;
-            if (!find_violated_cover(items, cap, opts, cover, violation)) continue;
+            if (!find_violated_cover(items, cap, cap_tol, opts, cover, violation))
+                continue;
             ++diag.covers_found;
 
             for (auto& it : items) it.alpha = 0.0;
@@ -442,12 +465,12 @@ std::vector<CutRow> separate_lifted_covers(const model::LpProblem& lp,
                 std::vector<f64> alphas_pc, alphas_gns;
                 f64 score_pc = -1.0, score_gns = -1.0;
                 bool ok_pc = sequence_independent_lift(
-                    cover_w, cap, outside_w, outside_vals, opts.tol, /*PC*/ 0,
+                    cover_w, cap, outside_w, outside_vals, cap_tol, /*PC*/ 0,
                     alphas_pc, score_pc);
                 ok_pc = ok_pc && opts.sequence_independent_lifting;
                 const bool ok_gns = opts.sequence_independent_lifting &&
                     sequence_independent_lift(
-                    cover_w, cap, outside_w, outside_vals, opts.tol, /*GNS*/ 1,
+                    cover_w, cap, outside_w, outside_vals, cap_tol, /*GNS*/ 1,
                     alphas_gns, score_gns);
 
                 const std::vector<f64>* best = nullptr;
@@ -481,7 +504,7 @@ std::vector<CutRow> separate_lifted_covers(const model::LpProblem& lp,
             }
 
             if (can_lift && beta > 0.0 && used == SiLiftKind::None)
-                sequential_up_lift(items, cover, cap, beta, opts, diag);
+                sequential_up_lift(items, cover, cap, cap_tol, beta, opts, diag);
 
             CutRow cut;
             f64 rhs = beta;

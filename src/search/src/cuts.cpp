@@ -1,4 +1,5 @@
 #include "sor/search/cuts.hpp"
+#include "sor/core/work_clock.hpp"
 #include "sor/search/mir.hpp"
 #include <bit>
 
@@ -577,6 +578,7 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
                                        const engines::SimplexBasis& basis,
                                        const CutOptions& opts,
                                        CutDiagnostics& diag) {
+    core::WorkScope work_scope_(core::WorkCat::Separation);
     SOR_FN();
     const Index m = lp.n_rows();
     const Index ns = lp.n_cols();
@@ -714,10 +716,10 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
             });
     }
     int tableau_trials = 0;
-    const auto gmi_started = std::chrono::steady_clock::now();
+    const auto gmi_started = sor::core::SolverClock::now();
     for (const auto& candidate : tableau_candidates) {
         if (opts.time_limit_s > 0.0 && (tableau_trials & 7) == 0 &&
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - gmi_started).count() >=
+            std::chrono::duration<double>(sor::core::SolverClock::now() - gmi_started).count() >=
                 opts.time_limit_s) {
             ++diag.time_stops;
             break;
@@ -740,11 +742,18 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
         y[sz(slot)] = 1.0;
         factor.btran(y);
 
+        // Rows with y_i = 0 add exact zeros: skipping them leaves tab
+        // bit-identical and makes the sweep cost y's support, not nnz(A).
         std::vector<f64> tab(sz(nt), 0.0);
-        for (Index i = 0; i < m; ++i)
+        std::uint64_t swept = static_cast<std::uint64_t>(nt);
+        for (Index i = 0; i < m; ++i) {
+            if (y[sz(i)] == 0.0) continue;
+            swept += static_cast<std::uint64_t>(rp[sz(i) + 1] - rp[sz(i)]);
             for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
                 tab[sz(ci[sz(k)])] += y[sz(i)] * av[sz(k)];
+        }
         for (Index i = 0; i < m; ++i) tab[sz(ns + i)] = -y[sz(i)];
+        core::work_add(swept, ::sor::core::WorkTag::Gmi);
 
         CutRow gmi_cut;
         bool have_gmi = false;
@@ -1065,6 +1074,8 @@ f64 max_row_parallelism(const model::LpProblem& lp,
     for (const Index j : cut.cols)
         if (j < 0 || j >= n) return 0.0;
 
+    // Two dense scratch vectors per candidate: O(n + m) before any row.
+    core::work_add(static_cast<std::uint64_t>(n + lp.n_rows()) / 8 + cut.cols.size(), ::sor::core::WorkTag::Parallelism);
     std::vector<f64> dense(sz(n), 0.0);
     for (std::size_t k = 0; k < cut.cols.size(); ++k)
         dense[sz(cut.cols[k])] = cut.vals[k];
@@ -1100,6 +1111,7 @@ void apply_cuts_inplace(model::LpProblem& lp,
                         const std::vector<CutRow>& cuts,
                         const CutOptions& opts,
                         CutUndo* undo) {
+    core::WorkScope work_scope_(core::WorkCat::Separation);
     SOR_FN();
     if (undo != nullptr) {
         *undo = CutUndo{};
@@ -1155,8 +1167,40 @@ void apply_cuts_inplace(model::LpProblem& lp,
             if (j < 0 || j >= n) return false;
         return true;
     };
-    for (const auto& cut : cuts) {
-        if (!cut_cols_in_range(cut)) continue;
+    // The stored row is the one every consumer reads as data, so a cut
+    // derived in floating point enters with its outward margin
+    // (CutOptions::derived_cut_*_margin); exact integer rows enter unchanged.
+    const auto exact_integer_data = [](f64 v) {
+        return !std::isfinite(v) ||
+               (std::fabs(v) < 9007199254740992.0 && v == std::round(v));
+    };
+    const auto with_margin = [&](const CutRow& in) -> CutRow {
+        bool exact = exact_integer_data(in.row_lo) && exact_integer_data(in.row_hi);
+        for (std::size_t k = 0; k < in.vals.size() && exact; ++k)
+            exact = std::isfinite(in.vals[k]) && exact_integer_data(in.vals[k]);
+        if (exact) return in;
+        CutRow out = in;
+        f64 reach_sum = 0.0;
+        for (std::size_t k = 0; k < in.cols.size(); ++k) {
+            const Index j = in.cols[k];
+            const f64 lo = lp.col_lo[sz(j)], hi = lp.col_hi[sz(j)];
+            f64 reach = 0.0;
+            if (std::isfinite(lo)) reach = std::max(reach, std::fabs(lo));
+            if (std::isfinite(hi)) reach = std::max(reach, std::fabs(hi));
+            if (!std::isfinite(lo) || !std::isfinite(hi)) reach = std::max(reach, 1.0);
+            reach_sum += std::fabs(in.vals[k]) * reach;
+        }
+        const auto margin = [&](f64 side) {
+            return opts.derived_cut_rel_margin * (std::fabs(side) + reach_sum) +
+                   opts.derived_cut_abs_margin;
+        };
+        if (std::isfinite(out.row_lo)) out.row_lo -= margin(out.row_lo);
+        if (std::isfinite(out.row_hi)) out.row_hi += margin(out.row_hi);
+        return out;
+    };
+    for (const auto& raw_cut : cuts) {
+        if (!cut_cols_in_range(raw_cut)) continue;
+        const CutRow cut = with_margin(raw_cut);
         f64 cs = 0.0;
         const std::string key = row_signature(cut.cols, cut.vals, cs);
         const auto it = key.empty() ? shape_of.end() : shape_of.find(key);

@@ -1,5 +1,6 @@
 #include "sor/certify/finalize.hpp"
 #include "sor/core/env_switches.hpp"
+#include "sor/core/work_clock.hpp"
 #include "padic_solve.hpp"
 #include "sor/la/lu.hpp"
 #include "sor/sparse/csc.hpp"
@@ -101,9 +102,9 @@ bool solve_basis_transpose(const model::LpProblem& p,
     const auto m = static_cast<std::size_t>(p.n_rows());
     const auto n = p.n_cols();
     if (basis.size() != m) return false;
-    const auto started = std::chrono::steady_clock::now();
+    const auto started = sor::core::SolverClock::now();
     const auto expired = [&] { return policy.time_limit_s > 0 &&
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() >= policy.time_limit_s; };
+        std::chrono::duration<double>(sor::core::SolverClock::now() - started).count() >= policy.time_limit_s; };
     std::vector<Row> source_rows(m);
     std::vector<Rational> source_rhs(m), source_direction(m);
     std::vector<std::set<std::size_t>> incidence(m);
@@ -163,7 +164,7 @@ bool solve_basis_transpose(const model::LpProblem& p,
         // fallback with its own operation budget (see padic_solve.hpp).
         std::vector<std::vector<Rational>> solved;
         detail::PadicStats stats;
-        const auto t0 = std::chrono::steady_clock::now();
+        const auto t0 = sor::core::SolverClock::now();
         // Dense nucleus: each row takes >= 64 structural updates on average
         // (see padic_solve.hpp for the measured crossover).
         const bool lifted = detail::padic_solve(rows, {rhs, rhs_direction}, solved,
@@ -176,7 +177,7 @@ bool solve_basis_transpose(const model::LpProblem& p,
                 m, lifted ? "solved" : stats.declined ? "declined" : "fell back", static_cast<unsigned long long>(stats.operations),
                 static_cast<unsigned long long>(stats.lifting_steps),
                 static_cast<unsigned long long>(stats.reconstruction_attempts), stats.denominator_bits,
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                std::chrono::duration<double>(sor::core::SolverClock::now() - t0).count());
         if (lifted) {
             y = std::move(solved[0]);
             direction = std::move(solved[1]);
@@ -225,6 +226,7 @@ bool solve_basis_transpose(const model::LpProblem& p,
                 value *= scale;
             }
             for (const auto& [j, v] : rows[chosen]) {
+                core::work_add(32, ::sor::core::WorkTag::ExactSolve);
                 if (++operations > policy.max_operations || ((operations % 16) == 0 && expired())) {
                     if (core::env_switches().certificate_debug) std::fprintf(stderr, "exact certificate: operation limit m=%zu step=%zu\n", m, step);
                     return false;
@@ -733,18 +735,18 @@ bool repair_basis_certificate(const model::LpProblem& problem, core::RawResult& 
     struct Trace {
         const model::LpProblem& problem;
         const core::RawResult& raw;
-        std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+        sor::core::SolverClock::time_point started = sor::core::SolverClock::now();
         ~Trace() {
             if (core::env_switches().certificate_debug)
                 std::fprintf(stderr, "exact certificate: m=%d n=%d witness=%zu elapsed=%.6f\n",
                     problem.n_rows(), problem.n_cols(), raw.exact_dual.size(),
-                    std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+                    std::chrono::duration<double>(sor::core::SolverClock::now() - started).count());
         }
     } trace{problem, raw};
     raw.exact_dual.clear();
-    const auto started = std::chrono::steady_clock::now();
+    const auto started = sor::core::SolverClock::now();
     const auto expired = [&] { return policy.time_limit_s > 0 &&
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() >= policy.time_limit_s; };
+        std::chrono::duration<double>(sor::core::SolverClock::now() - started).count() >= policy.time_limit_s; };
     std::vector<Rational> y, direction;
     // The inward direction only matters when y leaves a declared-unbounded
     // term with the wrong sign; an exact basis dual usually leaves none
@@ -973,9 +975,9 @@ SafeLpBound lower_bound_from_terms(const model::LpProblem& p,
 bool repair_dual_certificate(const model::LpProblem& problem, core::RawResult& raw,
                              const ExactCertificatePolicy& policy) {
     validate_certificate_policy(policy);
-    const auto started = std::chrono::steady_clock::now();
+    const auto started = sor::core::SolverClock::now();
     const auto expired = [&] { return policy.time_limit_s > 0 &&
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() >= policy.time_limit_s; };
+        std::chrono::duration<double>(sor::core::SolverClock::now() - started).count() >= policy.time_limit_s; };
     std::vector<std::string> tokens;
     const char* reason = "";
     const bool targeted = targeted_basis_certificate(problem, raw.certificate_basis, policy,
@@ -983,7 +985,7 @@ bool repair_dual_certificate(const model::LpProblem& problem, core::RawResult& r
     if (core::env_switches().certificate_debug)
         std::fprintf(stderr, "exact certificate: targeted %s (%s) m=%d elapsed=%.6f\n",
             targeted ? "accepted" : "declined", targeted ? "" : reason, problem.n_rows(),
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+            std::chrono::duration<double>(sor::core::SolverClock::now() - started).count());
     if (targeted && raw.x.size() == static_cast<std::size_t>(problem.n_cols())) {
         // A finite bound is not enough: a round-off reduced cost charged to a
         // huge declared bound (1e308) is finite and useless. The witness must
@@ -1011,7 +1013,7 @@ bool repair_dual_certificate(const model::LpProblem& problem, core::RawResult& r
     auto remaining = policy;
     if (policy.time_limit_s > 0)
         remaining.time_limit_s = std::max(std::numeric_limits<double>::min(), policy.time_limit_s -
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+            std::chrono::duration<double>(sor::core::SolverClock::now() - started).count());
     return repair_basis_certificate(problem, raw, remaining);
 }
 
@@ -1040,6 +1042,7 @@ SafeLpBound exact_dual_lower_bound(const model::LpProblem& p,
 
 ExactDualAssessment assess_exact_dual(const model::LpProblem& p,
     const std::vector<std::string>& witness, const std::vector<int>& allowed_directions) {
+    core::WorkScope work_scope_(core::WorkCat::Exact);
     ExactDualAssessment out;
     if (witness.size() != static_cast<std::size_t>(p.n_rows())) return out;
     try {

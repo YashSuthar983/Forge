@@ -1361,7 +1361,7 @@ int main() {
         CHECK(normal.map.problem.n_cols() < 3);
         CHECK(!normal.map.stats.stopped_at_deadline);
 
-        opts.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+        opts.deadline = sor::core::SolverClock::now() - std::chrono::seconds(1);
         const auto late = sor::presolve::presolve(p, opts);
         CHECK(late.status == sor::presolve::PresolveStatus::Reduced);
         CHECK(late.map.stats.stopped_at_deadline);

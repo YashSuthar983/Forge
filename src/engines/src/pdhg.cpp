@@ -1,4 +1,5 @@
 #include "sor/engines/pdhg.hpp"
+#include "sor/core/work_clock.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -42,6 +43,7 @@ static f64 nearest_power_of_two(f64 x) {
 
 RuizScaling ruiz_scale(model::LpProblem& p, int iterations,
                        bool power_of_two, const std::function<bool()>& stop_requested) {
+    core::WorkScope work_scope_(core::WorkCat::Presolve);
     p.validate(/*allow_empty_domains=*/true);
     if (iterations < 0) throw std::invalid_argument("Ruiz scaling: negative iteration count");
     const auto nr = static_cast<std::size_t>(p.n_rows());
@@ -61,6 +63,8 @@ RuizScaling ruiz_scale(model::LpProblem& p, int iterations,
     std::vector<f64> rmax(nr), cmax(nc), dr(nr), dc(nc);
     for (int it = 0; it < iterations; ++it) {
         if (stop_requested && stop_requested()) break;
+        core::work_add(static_cast<std::uint64_t>(p.nnz()) / 2 +
+                       static_cast<std::uint64_t>(nr + nc), ::sor::core::WorkTag::Scaling);
         std::fill(rmax.begin(), rmax.end(), 0.0);
         std::fill(cmax.begin(), cmax.end(), 0.0);
         for (std::size_t r = 0; r < nr; ++r) {

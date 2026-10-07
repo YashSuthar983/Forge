@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <limits>
 #include <mutex>
 #include <cmath>
 #include <string>
@@ -301,9 +302,16 @@ core::RawResult solve_milp_portfolio(const model::LpProblem& problem,
             result.proposed_status = core::Status::Feasible;
     }
 
+    // The proof rests on one arm that exhausted its tree; with several, the
+    // most rigorous one (fewest bounds taken at f64 tolerances).
     bool cutoff_proved = false;
+    std::uint64_t proving_float_bounds = std::numeric_limits<std::uint64_t>::max();
     for (const auto& a : arms)
-        if (a.diag.proved_no_better_than_cutoff) cutoff_proved = true;
+        if (a.diag.proved_no_better_than_cutoff) {
+            cutoff_proved = true;
+            proving_float_bounds =
+                std::min(proving_float_bounds, a.diag.float_relaxation_bounds);
+        }
     if (cutoff_proved && !result.x.empty() && std::isfinite(result.objective) &&
         portfolio_point_is_feasible(problem, result.x, base.primal_feas_tol,
                                     base.int_tol) &&
@@ -313,15 +321,22 @@ core::RawResult solve_milp_portfolio(const model::LpProblem& problem,
         // The proving arm searched the entire space, so the pool's point is a
         // global optimum. out_diag carries the flag certify reads.
         result.proposed_status = core::Status::Optimal;
-        // The LEVEL matters as much as the status: finalize_result is the sole
-        // writer of Status::Optimal and will downgrade a claim whose evidence
-        // does not reach the ladder, which is exactly what it should do.
-        result.proposed_level = core::ProofLevel::ProvedGlobalEpsilon;
         out_diag_globally_proved = true;
     }
 
     out_diag = std::move(arms[report].diag);
-    if (out_diag_globally_proved) out_diag.globally_proved = true;
+    if (out_diag_globally_proved) {
+        // The reported arm's own complete search, if it has one, is another
+        // proof of the same claim.
+        out_diag.float_relaxation_bounds = out_diag.globally_proved
+            ? std::min(out_diag.float_relaxation_bounds, proving_float_bounds)
+            : proving_float_bounds;
+        out_diag.globally_proved = true;
+        // The LEVEL matters as much as the status: finalize_result is the sole
+        // writer of Status::Optimal and will downgrade a claim whose evidence
+        // does not reach the ladder, which is exactly what it should do.
+        result.proposed_level = milp_global_proof(out_diag);
+    }
     pdiag.workers_used = n;
     pdiag.winner = arms[report].name;
     pdiag.log = std::move(log);

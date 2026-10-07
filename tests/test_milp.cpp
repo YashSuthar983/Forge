@@ -3,6 +3,7 @@
 #include "sor/certify/finalize.hpp"
 #include "sor/io/mps.hpp"
 #include "sor/search/bab.hpp"
+#include "sor/search/propagate.hpp"
 #include "sor/sparse/csr.hpp"
 
 #include "test_helpers.hpp"
@@ -172,6 +173,69 @@ void test_small_coefficient_optimum_is_not_cut_off() {
     }
 }
 
+// An integral-looking LP point closes its node only when the canonical point
+// (integers rounded; continuous columns re-solved if that broke a row) meets
+// the node's bound. min 0.5x + t, 1e7 x + t >= 1, x binary, t >= 0: the LP
+// optimum x = 1e-7, t = 0 (cost 5e-8) is integral within 1e-6; rounding gives
+// x = 0 and the repair t = 1 (cost 1), but x = 1, t = 0 costs 0.5. Every layer
+// that could settle the model before the root LP is off, so the root node
+// itself must split on x instead of closing on the repaired point.
+const char* kRepairGap = R"(NAME          REPAIRGAP
+ROWS
+ N  OBJ
+ G  R1
+COLUMNS
+    MARKER    'MARKER'  'INTORG'
+    X         OBJ       0.5
+    X         R1        10000000
+    MARKER    'MARKER'  'INTEND'
+    T         OBJ       1
+    T         R1        1
+RHS
+    RHS1      R1        1
+BOUNDS
+ UP BND1      X         1
+ENDATA
+)";
+
+void test_repaired_integral_point_does_not_close_node() {
+    auto lp = read_text(kRepairGap);
+    CHECK(lp.n_integer() == 1);
+    BabOptions opts;
+    opts.max_nodes = 100;
+    opts.time_limit_s = 5.0;
+    opts.mip_presolve = false;
+    opts.probing = false;
+    opts.symmetry = false;
+    opts.cuts_enabled = false;
+    opts.component_solve = false;
+    opts.root_primal_early = false;
+    opts.root_primal_final = false;
+    opts.feasibility_jump = false;
+    opts.feasibility_pump_root = false;
+    opts.feasibility_pump_improve = false;
+    opts.fixprop = false;
+    opts.rounding_heuristic = false;
+    opts.integer_dive = false;
+    opts.integer_neighborhood = false;
+    opts.integer_row_rounding = false;
+    opts.sub_mip_lns = false;
+    opts.objective_face = false;
+    opts.spp_repair = false;
+    opts.session_dive = false;
+    opts.root_restart = false;
+    opts.tree_restart = false;
+    BabDiagnostics diag;
+    auto raw = sor::search::solve_milp(lp, opts, diag);
+    const auto ev = sor::search::milp_evidence(diag, opts);
+    const auto r = sor::certify::finalize_result(std::move(raw), ev);
+    CHECK(r.status == Status::Optimal);
+    CHECK_NEAR(r.objective, 0.5, 1e-9);
+    CHECK(r.x.size() == 2);
+    if (r.x.size() == 2) CHECK_NEAR(r.x[0], 1.0, 0.0);
+    CHECK(diag.integral_closures_reopened >= 1);
+}
+
 void test_knapsack() {
     auto lp = read_text(kKnapsack);
     CHECK(lp.n_integer() == 3);
@@ -188,6 +252,43 @@ void test_knapsack() {
     CHECK(r.status == Status::Feasible || r.status == Status::Optimal);
     CHECK_NEAR(r.objective, -7.0, 1e-6);  // minimize -value → -7
     CHECK(diag.nodes > 0);
+}
+
+std::string make_equality_knapsack(int n, int rhs);  // below
+
+// The claimed level follows the evidence. Under lp.exact_proof (the library
+// default) the tree's LPs certify their bounds, so none is taken at f64
+// tolerances and a complete search claims ProvedGlobalEpsilon. Without it
+// (the command-line default) a node LP whose safe bound is not finite is
+// accepted at tolerance and counted; any such bound makes the claim
+// ProvedGlobalFP. Either way, Optimal and Infeasible claims are
+// milp_global_proof(diag), and the two modes agree on the answer.
+void test_proof_level_follows_floating_bounds() {
+    const auto knap = read_text(make_equality_knapsack(14, 9));
+    const auto infeas = read_text(kInfeasMip);
+    for (const bool exact : {true, false}) {
+        for (const auto* lp : {&knap, &infeas}) {
+            BabOptions opts;
+            opts.max_nodes = 100000;
+            opts.lp.exact_proof = exact;
+            BabDiagnostics diag;
+            auto raw = sor::search::solve_milp(*lp, opts, diag);
+            const auto ev = sor::search::milp_evidence(diag, opts);
+            const auto r = sor::certify::finalize_result(std::move(raw), ev);
+            CHECK(diag.globally_proved);
+            CHECK(r.proof == sor::search::milp_global_proof(diag));
+            if (exact) {
+                CHECK(diag.float_relaxation_bounds == 0);
+                CHECK(r.proof == sor::core::ProofLevel::ProvedGlobalEpsilon);
+            }
+            if (lp == &knap) {
+                CHECK(r.status == Status::Optimal);
+                CHECK_NEAR(r.objective, 25.0, 1e-9);  // nine cheapest of 1..7, 1..7
+            } else {
+                CHECK(r.status == Status::Infeasible);
+            }
+        }
+    }
 }
 
 void test_infeasible_mip() {
@@ -476,27 +577,37 @@ void test_objective_lattice_requires_exact_costs() {
 void test_node_cutoff_values() {
     struct Case { double inc, g, offset, gap, expected; };
     const Case cases[] = {
-        {5.0, 1.0, 0.0, 1e-4, 4.9995},
-        {5.0, 1.0, 0.0, 0.5, 4.000005},
-        {5.0000001, 1.0, 0.0, 0.5, 4.0 + 5.0000001e-6},
-        {5.3, 1.0, 0.0, 0.5, 5.0 + 5.3e-6},
+        // Lattice rule wins: no point better than 5 has a bound above 4.
+        {5.0, 1.0, 0.0, 1e-4, 4.0 + 5e-6},
+        {100.0, 1.0, 0.0, 1e-4, 99.0 + 1e-4},
+        // Gap rule wins: a gap of 0.5 already allows pruning at 2.5.
+        {5.0, 1.0, 0.0, 0.5, 2.5},
+        {5.0000001, 1.0, 0.0, 0.5, 5.0000001 * 0.5},
+        {5.3, 1.0, 0.0, 0.5, 2.65},
+        {5.5, 1.0, 0.5, 0.5, 2.75},
+        // A margin wider than g leaves the gap rule in force, below inc.
+        {1e7, 1.0, 0.0, 1e-4, 1e7 - 1e3},
         {100.0, 0.0, 0.0, 1e-4, 99.99},
-        {5.5, 1.0, 0.5, 0.5, 4.5 + 5.5e-6},
         {0.0, 0.0, 0.0, 1e-4, -1e-6},
     };
     for (const auto& t : cases) {
         const double c = sor::search::node_cutoff(t.inc, t.g, t.offset, t.gap, 1e-6);
-        CHECK(std::fabs(c - t.expected) <= 1e-12);
-        CHECK(c <= t.inc);
+        CHECK(std::fabs(c - t.expected) <= 1e-9 * std::max(1.0, std::fabs(t.inc)));
+        CHECK(c < t.inc);
+        // Never weaker than the gap rule alone.
+        const double gap_rule =
+            t.inc - std::max(1e-6, t.gap * std::fabs(t.inc));
+        CHECK(c <= gap_rule);
         if (t.g > 0.0) {
+            // A prune at c either loses no better lattice point, or loses
+            // only points the gap rule already allows to be lost.
             double b = -std::numeric_limits<double>::infinity();
             for (int j = -10; j <= 10; ++j) {
                 const double point = t.offset + j * t.g;
                 if (point < t.inc - 1e-6 * std::max(1.0, std::fabs(t.inc)))
                     b = std::max(b, point);
             }
-            CHECK(std::isfinite(b));
-            CHECK(b < c);
+            CHECK(b < c || c == gap_rule);
         }
     }
 }
@@ -960,17 +1071,102 @@ void test_folded_incumbents_stay_in_original_space() {
     }
 }
 
+// Objective-cutoff propagation: a virtual objective row  sense*c'x <= rhs.
+void test_objective_cutoff_propagation() {
+    using sor::search::propagate_objective_cutoff;
+    const double inf = sor::model::kInf;
+    auto make = [&](bool maximize, bool integer) {
+        sor::model::LpProblem lp;
+        lp.A = sor::sparse::from_triplets(0, 3, {}, {}, {});
+        lp.c = {3.0, 2.0, -1.0};
+        lp.col_lo = {0.0, 0.0, 0.0};
+        lp.col_hi = {4.0, 4.0, 4.0};
+        lp.is_integer = {integer, integer, integer};
+        lp.maximize = maximize;
+        return lp;
+    };
+    {   // min 3x0 + 2x1 - x2: minimum activity -4 (x2 = 4). rhs 1 leaves room 5.
+        auto lp = make(false, false);
+        auto lo = lp.col_lo, hi = lp.col_hi;
+        std::vector<sor::core::Index> moved;
+        const auto r = propagate_objective_cutoff(lp, 1.0, lo, hi, 1e-9, &moved);
+        CHECK(r.feasible);
+        CHECK_NEAR(hi[0], 5.0 / 3.0, 1e-6);   // 3 x0 <= 1 - (-4)
+        CHECK_NEAR(hi[1], 2.5, 1e-6);         // 2 x1 <= 5
+        CHECK_NEAR(lo[2], 0.0, 0.0);          // -x2 <= 1 + 0: no limit
+        CHECK(moved.size() == 2);
+    }
+    {   // The same row over integers rounds inward.
+        auto lp = make(false, true);
+        auto lo = lp.col_lo, hi = lp.col_hi;
+        const auto r = propagate_objective_cutoff(lp, 1.0, lo, hi, 1e-9, nullptr);
+        CHECK(r.feasible);
+        CHECK_NEAR(hi[0], 1.0, 0.0);
+        CHECK_NEAR(hi[1], 2.0, 0.0);
+    }
+    {   // Nothing in the box costs less than the cutoff.
+        auto lp = make(false, false);
+        auto lo = lp.col_lo, hi = lp.col_hi;
+        CHECK(!propagate_objective_cutoff(lp, -5.0, lo, hi, 1e-9, nullptr).feasible);
+        // Exactly at the minimum is still feasible.
+        lo = lp.col_lo; hi = lp.col_hi;
+        CHECK(propagate_objective_cutoff(lp, -4.0, lo, hi, 1e-9, nullptr).feasible);
+    }
+    {   // Maximise: sense*c = (-3, -2, 1); the minimum activity is -20 + 0.
+        auto lp = make(true, false);
+        auto lo = lp.col_lo, hi = lp.col_hi;
+        // rhs -17. x0: rest = -20 + 12 = -8, so -3 x0 <= -9, x0 >= 3.
+        // x1: rest = -20 + 8 = -12, so -2 x1 <= -5, x1 >= 2.5.
+        const auto r = propagate_objective_cutoff(lp, -17.0, lo, hi, 1e-9, nullptr);
+        CHECK(r.feasible);
+        CHECK_NEAR(lo[0], 3.0, 1e-6);
+        CHECK_NEAR(lo[1], 2.5, 1e-6);
+        CHECK_NEAR(hi[0], 4.0, 0.0);
+    }
+    {   // One unbounded term: only that column can be limited.
+        auto lp = make(false, false);
+        lp.col_hi[2] = inf;     // -x2 has no lower activity bound
+        auto lo = lp.col_lo, hi = lp.col_hi;
+        const auto r = propagate_objective_cutoff(lp, 1.0, lo, hi, 1e-9, nullptr);
+        CHECK(r.feasible);
+        CHECK_NEAR(hi[0], 4.0, 0.0);   // untouched
+        CHECK_NEAR(hi[1], 4.0, 0.0);
+        CHECK_NEAR(lo[2], 0.0, 0.0);   // x2 >= -1 is below its bound: no change
+    }
+    {   // An infinite far bound is limited by the row (the step test used to
+        // compute inf - inf and reject every finite bound).
+        auto lp = make(false, false);
+        lp.col_hi[0] = inf;
+        auto lo = lp.col_lo, hi = lp.col_hi;
+        const auto r = propagate_objective_cutoff(lp, 1.0, lo, hi, 1e-9, nullptr);
+        CHECK(r.feasible);
+        CHECK_NEAR(hi[0], 5.0 / 3.0, 1e-6);
+        lp.maximize = true;           // and the lower side: -3 x0 >= ... on [-inf, 4]
+        lp.col_lo[0] = -inf;
+        lp.col_hi[0] = 4.0;
+        lo = lp.col_lo; hi = lp.col_hi;
+        // sense*c = (-3,-2,1): min activity over the others -8 + 0; rhs -17
+        // leaves -3 x0 <= -9, x0 >= 3.
+        const auto r2 = propagate_objective_cutoff(lp, -17.0, lo, hi, 1e-9, nullptr);
+        CHECK(r2.feasible);
+        CHECK_NEAR(lo[0], 3.0, 1e-6);
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--root-handoff") {
         test_proved_cut_loop_root_is_reused_only_at_identical_bounds(true);
         return sor::test::finish("test_milp_root_handoff");
     }
     CHECK(!BabOptions{}.batch_lp_strong_branch);
+    test_objective_cutoff_propagation();
+    test_repaired_integral_point_does_not_close_node();
     test_incumbent_point_validation();
     test_folded_incumbents_stay_in_original_space();
     test_small_coefficient_optimum_is_not_cut_off();
     test_knapsack();
     test_infeasible_mip();
+    test_proof_level_follows_floating_bounds();
     test_folding_invalidates_probed_implied_bounds();
     test_integer_row_rounding();
     test_implied_integer_slack();

@@ -50,6 +50,9 @@ struct EnvSwitches {
     bool certificate_debug = false;               // SOR_CERTIFICATE_DEBUG
     bool farkas_debug = false;                    // SOR_FARKAS_DEBUG
 
+    // MILP search.
+    bool ref_trace = false;                       // SOR_REF_TRACE (with --verify-cuts)
+
     // Quadratic engines.
     bool fgmres_profile = false;                  // SOR_FGMRES_PROFILE
     std::string dump_kkt;                         // SOR_DUMP_KKT=<file>

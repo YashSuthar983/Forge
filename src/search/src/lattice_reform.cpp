@@ -3,6 +3,7 @@
 
 #include "sor/sparse/csr.hpp"
 
+#include <functional>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -781,18 +782,43 @@ solve_milp_lattice(const model::LpProblem& lp,
     out.fixed_cols = map->fixed_cols.size();
     out.note = map->note;
 
-    out.raw = solve_milp(map->transformed, bab, out.diag);
+    // The transformed search prunes on its incumbents, so they pass the same
+    // acceptance rule as a presolved model's (BabOptions::point_validator):
+    // an incumbent counts only if its image is a canonical feasible point of
+    // `lp`. The transformed rows are combinations of the original ones, so a
+    // point within tolerance there need not be within tolerance here.
+    BabOptions inner = bab;
+    const std::function<f64(const std::vector<f64>&)> validate =
+        [&](const std::vector<f64>& mu) -> f64 {
+            std::vector<f64> x;
+            try {
+                x = lattice_postsolve(*map, mu);
+            } catch (const std::exception&) {
+                return core::kNaN;
+            }
+            if (!canonicalize_milp_point(lp, x, bab.int_tol, bab.primal_feas_tol, 1.0))
+                return core::kNaN;
+            if (bab.point_validator != nullptr) return (*bab.point_validator)(x);
+            return lp.objective(x);
+        };
+    inner.point_validator = &validate;
+    out.raw = solve_milp(map->transformed, inner, out.diag);
 
-    // Postsolve any incumbent into original x-space (exact integer map).
+    // Postsolve any incumbent into original x-space (exact integer map),
+    // and hold it to the original model's own check.
     bool have_incumbent = false;
     core::RawResult kept;
     if (!out.raw.x.empty()) {
         try {
             kept = out.raw;
             kept.x = lattice_postsolve(*map, out.raw.x);
-            kept.objective = lp.objective(kept.x);
-            kept.dual_bound = core::kNaN;
-            have_incumbent = true;
+            if (canonicalize_milp_point(lp, kept.x, bab.int_tol, bab.primal_feas_tol, 1.0)) {
+                kept.objective = lp.objective(kept.x);
+                kept.dual_bound = core::kNaN;
+                have_incumbent = true;
+            } else {
+                out.note += "; postsolved point fails the original model";
+            }
         } catch (const std::exception& ex) {
             out.note += "; postsolve failed: " + std::string(ex.what());
         }
@@ -800,6 +826,20 @@ solve_milp_lattice(const model::LpProblem& lp,
 
     const bool terminal = out.raw.proposed_status == core::Status::Optimal ||
                           out.raw.proposed_status == core::Status::Infeasible;
+    // A point of the transformed problem lives in mu coordinates: without a
+    // valid image in x-space it must not leave this function, and a claim
+    // that rests on a point (Optimal, Feasible) has nothing to stand on.
+    const auto drop_transformed_point = [&]() {
+        out.raw.x.clear();
+        if (out.raw.proposed_status == core::Status::Optimal ||
+            out.raw.proposed_status == core::Status::Feasible) {
+            out.raw.proposed_status = core::Status::NoSolutionFound;
+            out.raw.proposed_level = core::ProofLevel::None;
+            out.raw.objective = core::kNaN;
+            out.diag.globally_proved = false;
+            out.diag.incumbent = core::kNaN;
+        }
+    };
 
     if (map->exact_equivalence) {
         // The transform is an exact bijection (mu bounds are the exact LP
@@ -813,6 +853,7 @@ solve_milp_lattice(const model::LpProblem& lp,
             kept.dual_bound = out.diag.dual_bound;  // same objective scale
             out.raw = std::move(kept);
         } else {
+            drop_transformed_point();
             out.raw.dual_bound = out.diag.dual_bound;
         }
         return out;
@@ -823,6 +864,8 @@ solve_milp_lattice(const model::LpProblem& lp,
             kept.proposed_status = core::Status::Feasible;
             kept.proposed_level = core::ProofLevel::FeasibleOnly;
             out.raw = std::move(kept);
+        } else {
+            drop_transformed_point();
         }
         // A transformed-space dual bound is a bound on the RESTRICTED
         // problem (forced-zero continuous columns excluded), not on the
@@ -850,7 +893,12 @@ solve_milp_lattice(const model::LpProblem& lp,
         auto lp_relax = engines::solve_simplex(lp, sopts, sdiag);
         if (lp_relax.proposed_status == core::Status::Optimal &&
             std::isfinite(lp_relax.objective)) {
-            const f64 V_LP = lp_relax.objective;
+            // V_LP must be a lower bound on the original optimum: the safe
+            // Lagrangian bound when the solve certified one, otherwise the
+            // LP's primal objective, which is that only at f64 tolerances.
+            const bool safe_lp_bound =
+                sdiag.dual_bound_finite && std::isfinite(lp_relax.dual_bound);
+            const f64 V_LP = safe_lp_bound ? lp_relax.dual_bound : lp_relax.objective;
             const f64 V_r = kept.objective;
             const f64 tol = 1e-6 * (1.0 + std::fabs(V_LP));
             const bool matches =
@@ -868,8 +916,11 @@ solve_milp_lattice(const model::LpProblem& lp,
                 out.certified = true;
                 out.note +=
                     "; certified optimal (incumbent matches original LP bound)";
+                // The proof is V_LP alone (V_r is a checked feasible point);
+                // the restricted search's own bounds play no part in it.
+                out.diag.float_relaxation_bounds = safe_lp_bound ? 0 : 1;
                 kept.proposed_status = core::Status::Optimal;
-                kept.proposed_level = core::ProofLevel::ProvedGlobalEpsilon;
+                kept.proposed_level = milp_global_proof(out.diag);
                 kept.dual_bound = V_LP;
                 out.raw = std::move(kept);
                 out.diag.incumbent = V_r;

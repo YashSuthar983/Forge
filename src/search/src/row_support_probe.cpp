@@ -1,4 +1,5 @@
 #include "sor/search/row_support_probe.hpp"
+#include "sor/core/work_clock.hpp"
 
 #include "sor/search/conflict.hpp"
 #include "sor/search/prop_trail.hpp"
@@ -13,7 +14,7 @@
 namespace sor::search {
 namespace {
 
-using Clock = std::chrono::steady_clock;
+using Clock = sor::core::SolverClock;
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 constexpr f64 kInf = std::numeric_limits<f64>::infinity();
 
