@@ -33,6 +33,13 @@ enum class SimplexPricing : std::uint8_t {
     Choose  = 3,  // start with DSE; rebuild DSE on drift (Devex handoff opt-in)
 };
 
+// Whether solve_simplex may solve a tall LP through its dual LP.
+enum class DualizePolicy : std::uint8_t {
+    Auto  = 0,   // when the shape suggests it (see detail::should_dualize)
+    Never = 1,
+    Always = 2,  // whenever it is allowed at all (tests, experiments)
+};
+
 enum class SimplexMethod : std::uint8_t {
     Auto   = 0,   // dual first, primal fallback
     Primal = 1,
@@ -46,6 +53,14 @@ struct SimplexBasis {
 };
 
 struct SimplexOptions {
+    // Solve a tall LP (many more rows than columns) through its dual LP,
+    // whose basis has one row per column of this one. See solve_simplex().
+    // Off by default: measured on the nine MIPLIB 2017 relaxations with
+    // rows >= 2 x columns the gain is large on some (fastxgemm-n2r6s0t2 26x,
+    // neos-1171448 20x, seymour1 1.75x) and a loss on others
+    // (neos-1122047 2.6x, neos-950242 6x slower), and no shape rule tried
+    // separates them. Auto applies that shape rule, for experiments.
+    DualizePolicy dualize = DualizePolicy::Never;
     // Targeted continuation may price an exact unsupported dual term even
     // when its numerical reduced cost lies below the search tolerance.
     bool certificate_pricing = false;
@@ -557,6 +572,10 @@ struct SimplexDiagnostics {
     std::uint64_t presolve_retries = 0;
     // Primal/dual equation drift checks the dual ran (each O(nnz)).
     std::uint64_t residual_checks = 0;
+    // The model was solved through its dual LP (and how many dual-LP
+    // attempts fell back to the model itself).
+    bool dualized = false;
+    std::uint64_t dualize_fallbacks = 0;
     // The reduced basis lifted to a malformed basis of the original and was
     // dropped (the result then carries no basis).
     std::uint64_t lifted_basis_rejections = 0;
@@ -728,6 +747,23 @@ bool simplex_optimum_accepted(const core::RawResult& result,
 bool dual_stage_needs_fallback(const core::RawResult& result,
                                const SimplexDiagnostics& diag,
                                bool infeasibility_certified);
+
+// The dual LP of a minimization: one equality row per column j,
+//   sum_i a_ij y_i + z_j = c_j,
+// with a variable per finite row side (y_i >= 0 on a lower side, <= 0 on an
+// upper side, free on an equation) and per finite column bound (z_j likewise),
+// a ranged row or boxed column getting one of each, costed so that
+// minimizing gives minus the model's optimum. `var_row[k]` / `var_col[k]` name
+// the row or column dual variable k belongs to (-1 otherwise).
+struct DualLp {
+    model::LpProblem lp;
+    std::vector<Index> var_row, var_col;
+};
+DualLp build_dual_lp(const model::LpProblem& pmin);
+
+// Whether solve_simplex would solve `problem` through its dual LP.
+bool should_dualize(const model::LpProblem& problem, const SimplexOptions& opts,
+                    bool wants_basis);
 
 }  // namespace detail
 

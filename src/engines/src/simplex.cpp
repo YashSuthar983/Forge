@@ -887,6 +887,76 @@ bool detail::prefer_simplex_candidate(const core::RawResult& candidate,
     return false;
 }
 
+detail::DualLp detail::build_dual_lp(const model::LpProblem& pmin) {
+    SOR_FN();
+    const Index m = pmin.n_rows(), n = pmin.n_cols();
+    DualLp out;
+    out.lp.name = pmin.name.empty() ? std::string("dual") : pmin.name + "_dual";
+    out.lp.maximize = false;
+    // max  sum_i (L_i y+_i - U_i y-_i) + sum_j (l_j z+_j - u_j z-_j) + offset
+    // s.t. A'y + z = c, as a minimization of minus that.
+    out.lp.obj_offset = -pmin.obj_offset;
+    std::vector<Index> rows, cols;
+    std::vector<f64> vals;
+    const auto& rp = pmin.A.pattern.row_ptr();
+    const auto& ci = pmin.A.pattern.col_idx();
+    const auto add_var = [&](f64 cost, f64 lo, f64 hi, Index row, Index col) {
+        out.lp.c.push_back(cost);
+        out.lp.col_lo.push_back(lo);
+        out.lp.col_hi.push_back(hi);
+        out.var_row.push_back(row);
+        out.var_col.push_back(col);
+        return static_cast<Index>(out.lp.c.size() - 1);
+    };
+    const auto row_entries = [&](Index i, Index var) {
+        for (Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+            rows.push_back(ci[sz(k)]);
+            cols.push_back(var);
+            vals.push_back(pmin.A.vals[sz(k)]);
+        }
+    };
+    for (Index i = 0; i < m; ++i) {
+        const f64 lo = pmin.row_lo[sz(i)], hi = pmin.row_hi[sz(i)];
+        const bool has_lo = lo > -model::kInf, has_hi = hi < model::kInf;
+        if (has_lo && has_hi && lo == hi) {
+            row_entries(i, add_var(-lo, -model::kInf, model::kInf, i, -1));
+        } else {
+            if (has_lo) row_entries(i, add_var(-lo, 0.0, model::kInf, i, -1));
+            if (has_hi) row_entries(i, add_var(-hi, -model::kInf, 0.0, i, -1));
+        }
+    }
+    for (Index j = 0; j < n; ++j) {
+        const f64 lo = pmin.col_lo[sz(j)], hi = pmin.col_hi[sz(j)];
+        const bool has_lo = lo > -model::kInf, has_hi = hi < model::kInf;
+        const auto unit = [&](Index var) { rows.push_back(j); cols.push_back(var); vals.push_back(1.0); };
+        if (has_lo && has_hi && lo == hi) {
+            unit(add_var(-lo, -model::kInf, model::kInf, -1, j));
+        } else {
+            if (has_lo) unit(add_var(-lo, 0.0, model::kInf, -1, j));
+            if (has_hi) unit(add_var(-hi, -model::kInf, 0.0, -1, j));
+        }
+    }
+    out.lp.A = sparse::from_triplets(n, static_cast<Index>(out.lp.c.size()), rows, cols, vals);
+    out.lp.row_lo = pmin.c;
+    out.lp.row_hi = pmin.c;
+    return out;
+}
+
+bool detail::should_dualize(const model::LpProblem& problem, const SimplexOptions& opts,
+                            bool wants_basis) {
+    SOR_FN();
+    // The dual path returns no basis, and the exact certificate is built
+    // from one, so it never runs for a caller that needs either.
+    if (opts.dualize == DualizePolicy::Never || wants_basis || opts.exact_proof)
+        return false;
+    if (opts.dualize == DualizePolicy::Always) return true;
+    // A basis has one row per row of the model; the dual LP's has one per
+    // column. Worth it when rows outnumber columns well beyond the cost of a
+    // second model build (ex10: 69,608 x 17,680).
+    const Index m = problem.n_rows(), n = problem.n_cols();
+    return m >= 4000 && static_cast<double>(m) >= 2.5 * static_cast<double>(n);
+}
+
 bool detail::dual_stage_needs_fallback(const core::RawResult& result,
                                        const SimplexDiagnostics& diag,
                                        bool infeasibility_certified) {
@@ -2985,6 +3055,68 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         raw.engine = "simplex";
         raw.termination_reason = problem.describe(empty);
         diag.status = raw.proposed_status;
+        return raw;
+    }
+    // A tall LP is solved through its dual LP, whose basis has one row per
+    // column here. Its optimal equation multipliers are minus x, its variable
+    // values sum to y, and the point is then judged on this model exactly as
+    // any other result; anything short of that falls back to the model itself
+    // with the time left.
+    if (detail::should_dualize(problem, opts, out_basis != nullptr || out_session != nullptr)) {
+        const auto t_dual = Clock::now();
+        const auto pmin = model::minimization_form(problem);
+        const f64 sense = problem.maximize ? -1.0 : 1.0;
+        const auto dual = detail::build_dual_lp(pmin);
+        SimplexOptions dual_opts = opts;
+        dual_opts.dualize = DualizePolicy::Never;
+        // At most half of a time limit: the dual LP can be the harder one
+        // (ex10's stays in dual phase 1), and the model itself must keep
+        // time to report its own point.
+        if (opts.time_limit_s > 0.0) dual_opts.time_limit_s = 0.5 * opts.time_limit_s;
+        SimplexDiagnostics dual_diag;
+        core::RawResult dual_raw = solve_simplex(dual.lp, dual_opts, dual_diag);
+        if (dual_raw.proposed_status == core::Status::Optimal &&
+            dual_raw.y.size() == sz(problem.n_cols()) &&
+            dual_raw.x.size() == dual.var_row.size()) {
+            core::RawResult raw;
+            raw.proposed_status = core::Status::Optimal;
+            raw.proposed_level = dual_raw.proposed_level;
+            raw.iterations = dual_raw.iterations;
+            raw.engine = "simplex(dual LP)";
+            raw.termination_reason = dual_raw.termination_reason;
+            raw.x.resize(sz(problem.n_cols()));
+            for (std::size_t j = 0; j < raw.x.size(); ++j) raw.x[j] = -dual_raw.y[j];
+            std::vector<f64> y_min(sz(problem.n_rows()), 0.0);
+            for (std::size_t k = 0; k < dual.var_row.size(); ++k)
+                if (dual.var_row[k] >= 0) y_min[sz(dual.var_row[k])] += dual_raw.x[k];
+            raw.y.resize(y_min.size());
+            for (std::size_t i = 0; i < y_min.size(); ++i) raw.y[i] = sense * y_min[i];
+            diag = dual_diag;
+            diag.dualized = true;
+            rematerialize_original(problem, raw, diag, opts);
+            if (detail::simplex_optimum_accepted(raw, diag, opts)) {
+                diag.status = core::Status::Optimal;
+                diag.total_ms = ms_since(t_dual);
+                return raw;
+            }
+        }
+        // Not solved that way: the model itself, with the time left.
+        SimplexOptions direct = simplex_options_after_elapsed(
+            opts, std::chrono::duration<double>(Clock::now() - t_dual).count());
+        direct.dualize = DualizePolicy::Never;
+        if (opts.time_limit_s > 0.0 &&
+            std::chrono::duration<double>(Clock::now() - t_dual).count() >= opts.time_limit_s) {
+            diag = dual_diag;
+            ++diag.dualize_fallbacks;
+            dual_raw.x.clear();
+            dual_raw.y.clear();
+            dual_raw.proposed_status = core::Status::Interrupted;
+            dual_raw.termination_reason = "time limit reached in the dual LP";
+            return dual_raw;
+        }
+        core::RawResult raw = solve_simplex(problem, direct, diag, out_basis, out_session);
+        accumulate_simplex_work(diag, dual_diag);
+        ++diag.dualize_fallbacks;
         return raw;
     }
     const model::LpProblem* work = &problem;

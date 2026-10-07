@@ -285,6 +285,68 @@ void test_candidate_chuzr_matches_full_scan() {
     CHECK(plain.diag.residual_checks * 32 * 4 < plain.diag.iterations);
 }
 
+// Solving through the dual LP (DualizePolicy::Always) must give the model's
+// own optimum, x and y that pass the original-model checks, and say so.
+// The fixtures cover equations, ranges, MI/FR/FX bounds, an objective
+// constant, and (built below) a maximization with an offset and a free row.
+void test_dual_lp_path_matches_direct_solve() {
+    SOR_FN();
+    std::vector<sor::model::LpProblem> models;
+    for (const std::string& text : {std::string(sor::test::kTestLpMps),
+                                     std::string(sor::test::kFeaturesMps)}) {
+        std::istringstream in(text);
+        sor::io::MpsReadReport rep;
+        models.push_back(sor::io::read_mps(in, rep));
+    }
+    sor::model::LpProblem lp;
+    lp.maximize = true;
+    lp.obj_offset = 10.0;
+    lp.A = sor::sparse::from_triplets(3, 3, {0, 0, 1, 2, 2}, {0, 1, 0, 1, 2},
+                                      {1.0, 1.0, 1.0, 1.0, 1.0});
+    lp.c = {3.0, 2.0, 1.0};
+    lp.row_lo = {-sor::model::kInf, -sor::model::kInf, -sor::model::kInf};
+    lp.row_hi = {4.0, 3.0, sor::model::kInf};   // row 2 is free
+    lp.col_lo = {0.0, 0.0, 0.0};
+    lp.col_hi = {sor::model::kInf, sor::model::kInf, 2.0};
+    models.push_back(lp);
+    for (const auto& model : models) {
+        // As the CLI solves: tolerance-level KKT, no exact proof (the dual
+        // path is never taken with it).
+        SimplexOptions direct_opts;
+        direct_opts.exact_proof = false;
+        direct_opts.dualize = sor::engines::DualizePolicy::Never;
+        SimplexOptions dual_opts = direct_opts;
+        dual_opts.dualize = sor::engines::DualizePolicy::Always;
+        // No basis requested: a caller that wants one never gets the dual path.
+        const auto solve = [&](const SimplexOptions& o) {
+            Run out;
+            out.problem = model;
+            auto raw = sor::engines::solve_simplex(out.problem, o, out.diag);
+            auto ev = sor::engines::simplex_evidence(out.diag, o);
+            ev = sor::certify::check_lp_result(out.problem, raw, ev);
+            out.r = sor::certify::finalize_result(std::move(raw), ev);
+            return out;
+        };
+        const auto direct = solve(direct_opts);
+        const auto via_dual = solve(dual_opts);
+        CHECK(direct.r.status == Status::Optimal);
+        CHECK(via_dual.r.status == Status::Optimal);
+        CHECK(via_dual.diag.dualized);
+        CHECK_NEAR(via_dual.r.objective, direct.r.objective,
+                   1e-9 * (1.0 + std::fabs(direct.r.objective)));
+        CHECK(via_dual.r.max_primal_violation <= 1e-7);
+        CHECK(via_dual.r.max_dual_violation <= 1e-7);
+    }
+    // Never for a caller that needs a basis back, or with the exact proof.
+    SimplexOptions always;
+    always.exact_proof = false;
+    always.dualize = sor::engines::DualizePolicy::Always;
+    CHECK(sor::engines::detail::should_dualize(lp, always, false));
+    CHECK(!sor::engines::detail::should_dualize(lp, always, true));
+    always.exact_proof = true;
+    CHECK(!sor::engines::detail::should_dualize(lp, always, false));
+}
+
 void test_fixture_lp() {
     SOR_FN();
     const auto run = solve_text(sor::test::kTestLpMps);
@@ -2402,6 +2464,7 @@ int main() {
     test_time_limit_covers_presolve_and_preparation();
     test_maximization_offset_is_reported_in_model_sense();
     test_candidate_chuzr_matches_full_scan();
+    test_dual_lp_path_matches_direct_solve();
     test_fixture_lp();
     test_auto_commits_to_one_engine_without_a_discarded_probe();
     test_route_features_describe_the_model();

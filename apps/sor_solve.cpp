@@ -274,6 +274,9 @@ void usage() {
         "  --gcs-reinject N    GCS reinject top cuts every N nodes (0=off cadence)\n"
         "  --lp-concurrent N  race N independently checked simplex arms (auto route)\n"
         "  --lp-parallel-basis  evaluate paired basis solves with private worker factors\n"
+        "  --lp-dualize off|on|auto  solve the LP through its dual LP (simplex, no\n"
+        "                   exact proof; default off; auto: rows >= 4000 and\n"
+        "                   >= 2.5 x columns, experimental)\n"
         "  --lp-domain-probing  enable bounded continuous-domain probing in presolve\n"
         "  --no-lp-sparsification  disable exact equation sparsification\n"
         "  --[no-]dual-crash  zero-cost triangular dual cold start (default: on)\n"
@@ -1433,6 +1436,16 @@ int main(int argc, char** argv) {
         else if (a == "--dual-crash") sx_opts.dual_crash = true;
         else if (a == "--no-dual-crash") sx_opts.dual_crash = false;
         else if (a == "--lp-parallel-basis") sx_opts.parallel_basis_solves = true;
+        else if (a == "--lp-dualize") {
+            const std::string v = next("--lp-dualize");
+            if (v == "auto") sx_opts.dualize = sor::engines::DualizePolicy::Auto;
+            else if (v == "on") sx_opts.dualize = sor::engines::DualizePolicy::Always;
+            else if (v == "off") sx_opts.dualize = sor::engines::DualizePolicy::Never;
+            else {
+                std::fprintf(stderr, "error: --lp-dualize expects auto|on|off, got '%s'\n", v.c_str());
+                return 2;
+            }
+        }
         else if (a == "--lp-domain-probing") sx_opts.presolve_domain_probing = true;
         else if (a == "--no-lp-sparsification") sx_opts.presolve_equation_sparsification = false;
         else if (a == "--no-scaling") {
@@ -4285,6 +4298,10 @@ int main(int argc, char** argv) {
                 std::printf("dual bound:        %.10e\n", r.dual_bound);
                 std::printf("rel gap:           %.3e\n", r.gap_rel);
             }
+            if (diag.dualized)
+                std::printf("solved via:        dual LP (%d rows)\n", problem.n_cols());
+            else if (diag.dualize_fallbacks > 0)
+                std::printf("solved via:        model (dual LP attempt fell back)\n");
             std::printf("max primal viol:   %.3e\n", r.max_primal_violation);
             std::printf("dual residual:     %.3e\n", r.max_dual_violation);
             std::printf("iterations:        %llu  (phase1 %llu, phase2 %llu)\n",
