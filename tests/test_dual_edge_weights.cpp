@@ -3,6 +3,7 @@
 #include "sor/la/lu.hpp"
 #include "sor/sparse/csr.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
@@ -71,6 +72,26 @@ int test_rebuild_small_fixture() {
         if (std::fabs(weights[0] - 0.25) > 1e-12) ++failures;
         if (std::fabs(weights[1] - (5.0 / 36.0)) > 1e-12) ++failures;
     }
+    return failures;
+}
+
+// Past its deadline the all-row rebuild gives up like any other failure, so
+// the dual falls back to unit weights instead of spending m BTRANs after the
+// time limit.
+int test_rebuild_stops_at_deadline() {
+    int failures = 0;
+    std::vector<double> weights;
+    int solves = 0;
+    const auto btran = [&](std::vector<double>&) { ++solves; };
+    if (!sor::engines::rebuild_dual_edge_weights(4, btran, weights, {},
+            std::chrono::steady_clock::now() + std::chrono::hours(1)))
+        ++failures;
+    if (solves != 4) ++failures;
+    solves = 0;
+    if (sor::engines::rebuild_dual_edge_weights(4, btran, weights, {},
+            std::chrono::steady_clock::now() - std::chrono::seconds(1)))
+        ++failures;
+    if (solves != 0) ++failures;
     return failures;
 }
 
@@ -703,6 +724,7 @@ int main() {
     failures += test_initial_pricing_content_boundaries();
     failures += test_dse_accuracy_switch_chain();
     failures += test_rebuild_small_fixture();
+    failures += test_rebuild_stops_at_deadline();
     failures += test_devex_reference_weight_and_reset_policy();
     failures += test_dse_matches_other_pricing_on_larger_lps();
     failures += test_seeded_rebuild_is_bit_identical();

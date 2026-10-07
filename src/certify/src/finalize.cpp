@@ -1,4 +1,5 @@
 #include "sor/certify/finalize.hpp"
+#include "sor/core/env_switches.hpp"
 #include "sor/model/dyadic.hpp"
 #include "sor/model/exact.hpp"
 
@@ -277,6 +278,7 @@ ProofEvidence check_lp_point(const model::LpProblem& problem,
     ev.dual_feas_tol = dual_feas_tol;
     ev.gap_tol = gap_tol;
     ev.claimed_level = raw.proposed_level;
+    ev.empty_domain = problem.find_empty_domain().index >= 0;
     ev.lp_values_checked = true;
 
     const auto m = static_cast<std::size_t>(problem.n_rows());
@@ -549,7 +551,7 @@ core::DualFarkasRay check_dual_farkas_ray(
             if (!std::isfinite(b)) {
                 incompatible_unbounded_support = true;
                 sign_res = std::max(sign_res, d.convert_to<f64>());
-                if (std::getenv("SOR_FARKAS_DEBUG"))
+                if (core::env_switches().farkas_debug)
                     std::fprintf(stderr, "[farkas] col %d d=%.3Lg bounds [%g,%g]\n",
                                  (int)j, d.convert_to<long double>(), problem.col_lo[sz(j)], problem.col_hi[sz(j)]);
                 continue;
@@ -564,7 +566,7 @@ core::DualFarkasRay check_dual_farkas_ray(
             if (!std::isfinite(b)) {
                 incompatible_unbounded_support = true;
                 sign_res = std::max(sign_res, (-d).convert_to<f64>());
-                if (std::getenv("SOR_FARKAS_DEBUG"))
+                if (core::env_switches().farkas_debug)
                     std::fprintf(stderr, "[farkas] col %d d=%.3Lg bounds [%g,%g]\n",
                                  (int)j, d.convert_to<long double>(), problem.col_lo[sz(j)], problem.col_hi[sz(j)]);
                 continue;
@@ -742,7 +744,8 @@ SolveResult finalize_result(RawResult raw, const ProofEvidence& ev) {
                               residuals_within_tolerance(ev);
     if (r.status == Status::Infeasible && global_proof)
         r.proof = ProofLevel::ProvedGlobalEpsilon;
-    if (r.status == Status::Infeasible && !checked_dual_ray && !global_proof) {
+    if (r.status == Status::Infeasible && !checked_dual_ray && !global_proof &&
+        !ev.empty_domain) {
         r.status = Status::NoSolutionFound;
         r.ray.clear();
         r.dual_farkas_ray = core::DualFarkasRay{};

@@ -4,11 +4,14 @@
 
 #include "sor/io/gzip.hpp"
 #include "sor/io/lp_format.hpp"
+#include "sor/model/dyadic.hpp"
 
 #include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <cstdio>
 #include <limits>
+#include <numeric>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -87,8 +90,9 @@ f64 parse_num(const std::string& s, std::size_t line_no) {
     // Fast path: a plain decimal that std::from_chars consumes entirely and
     // reads as a normal, nonzero, finite double. Both it and strtod round
     // correctly, so the value is the same; anything else (a '+' sign
-    // followed by a second sign, hex, zero, subnormal or out-of-range
-    // values, trailing text) takes the strtod path and its exact behavior.
+    // followed by a second sign, hex, zero, subnormal, infinity tokens or
+    // out-of-range values, trailing text) takes the strtod path and its
+    // exact behavior.
     {
         const char* first = s.data();
         const char* last = s.data() + s.size();
@@ -101,10 +105,15 @@ f64 parse_num(const std::string& s, std::size_t line_no) {
             std::fabs(v) >= std::numeric_limits<f64>::min())
             return v;
     }
+    // strtod reads "inf"/"infinity" (any case, optional sign) as an infinite
+    // value and reports overflow as out of range, so an infinite result here
+    // is an explicit infinity token. Bounds, sides and ranges legitimately
+    // use it; LpProblem::validate rejects it wherever it is meaningless (a
+    // matrix coefficient, a cost, a lower bound of +inf).
     try {
         std::size_t used = 0;
         const f64 v = std::stod(s, &used);
-        if (used != s.size() || !std::isfinite(v)) throw std::invalid_argument("nonfinite or trailing");
+        if (used != s.size() || std::isnan(v)) throw std::invalid_argument("nan or trailing");
         return v;
     } catch (...) {
         throw std::runtime_error("MPS line " + std::to_string(line_no) +
@@ -132,7 +141,24 @@ struct Builder {
     f64 obj_rhs = 0.0;                               // RHS on objective row
 
     std::vector<f64> rhs, ranges;
-    std::vector<bool> has_range;
+    std::vector<bool> has_range, has_rhs;
+    bool has_obj_rhs = false;
+    // A file may carry several RHS, RANGES and BOUNDS vectors, told apart by
+    // set name; one model uses one of each. The first explicit name seen in a
+    // section is the one used. Lines without a name apply to it; lines naming
+    // another set are skipped and counted.
+    struct SetChoice {
+        std::string name;  // empty until a named line is seen
+        std::size_t skipped = 0;
+        std::string first_skipped;
+        bool use(const std::string& n) {
+            if (name.empty()) name = n;
+            if (n == name) return true;
+            if (skipped++ == 0) first_skipped = n;
+            return false;
+        }
+    } rhs_set, range_set, bound_set;
+    std::size_t repeated_rhs = 0, repeated_ranges = 0, repeated_bounds = 0;
     std::vector<f64> col_lo, col_hi;
     std::vector<bool> lo_set, hi_set, integer_flag;
 
@@ -170,6 +196,8 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
     std::string name;
     bool maximize = false;
     bool in_integer_marker = false;
+    int quadratic_kind = 0;  // 0 none yet, 1 QUADOBJ, 2 QMATRIX
+    if (opt.quadratic) opt.quadratic->clear();
     std::size_t line_no = 0;
     std::string line;
 
@@ -183,7 +211,33 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
         if (line.empty()) continue;
         if (line[0] == '*') continue;                       // comment
 
-        const bool is_header = !std::isspace(static_cast<unsigned char>(line[0]));
+        bool is_header = !std::isspace(static_cast<unsigned char>(line[0]));
+        if (is_header && !opt.fixed_format) {
+            // Free format: a line starting in column 1 is a header only if it
+            // has a header's shape, a section keyword alone (NAME and OBJSENSE
+            // may carry an argument). Inside a data section anything else is
+            // data written without indentation: "MAX" under OBJSENSE, or a
+            // column named RHS. Reading those as unknown headers refused the
+            // file, or (lenient) silently dropped the rest of the section.
+            const auto f = split_ws(line);
+            const std::string key = f.empty() ? std::string() : upper(f[0]);
+            const bool keyword =
+                key == "NAME" || key == "OBJSENSE" || key == "OBJSENS" ||
+                key == "ROWS" || key == "COLUMNS" || key == "RHS" ||
+                key == "RANGES" || key == "BOUNDS" || key == "QUADOBJ" ||
+                key == "QMATRIX" || key == "ENDATA";
+            const bool takes_argument =
+                key == "NAME" || key == "OBJSENSE" || key == "OBJSENS";
+            const bool header_shape = keyword && (f.size() == 1 || takes_argument);
+            const bool in_data = sec == Section::ObjSense || sec == Section::Rows ||
+                                 sec == Section::Columns || sec == Section::Rhs ||
+                                 sec == Section::Ranges || sec == Section::Bounds ||
+                                 sec == Section::Quadobj;
+            if (!header_shape && in_data) {
+                is_header = false;
+                ++rep.column_one_data_lines;
+            }
+        }
         if (is_header) {
             const auto f = split_ws(line);
             if (f.empty()) continue;
@@ -199,10 +253,23 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
             else if (key == "RANGES")   { sec = Section::Ranges; }
             else if (key == "BOUNDS")   { sec = Section::Bounds; }
             else if (key == "QUADOBJ" || key == "QMATRIX") {
-                if (opt.strict)
-                    throw std::runtime_error("MPS line " + std::to_string(line_no) +
-                                             ": QUADOBJ present; this reader is LP-only");
-                rep.warnings.push_back("QUADOBJ section ignored (LP-only reader)");
+                if (opt.quadratic) {
+                    const bool full = key == "QMATRIX";
+                    if (quadratic_kind != 0 && quadratic_kind != (full ? 2 : 1))
+                        throw std::runtime_error(
+                            "MPS line " + std::to_string(line_no) +
+                            ": both QUADOBJ and QMATRIX present; a file gives Q "
+                            "one way (one triangle, or the full matrix)");
+                    quadratic_kind = full ? 2 : 1;
+                    opt.quadratic->full_matrix = full;
+                } else {
+                    if (opt.strict)
+                        throw std::runtime_error(
+                            "MPS line " + std::to_string(line_no) + ": " + f[0] +
+                            " (quadratic objective) present; an LP/MILP route would "
+                            "drop it -- use a .qps file with a QP engine");
+                    rep.warnings.push_back("QUADOBJ section ignored (LP-only reader)");
+                }
                 sec = Section::Quadobj;
             }
             else if (key == "ENDATA")   { sec = Section::End; break; }
@@ -255,6 +322,7 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
                     b.rhs.push_back(0.0);
                     b.ranges.push_back(0.0);
                     b.has_range.push_back(false);
+                    b.has_rhs.push_back(false);
                 }
                 break;
             }
@@ -305,6 +373,7 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
             case Section::Rhs: {
                 // First token may be an RHS-set name, or may be omitted.
                 std::size_t k = (f.size() % 2 == 1) ? 1 : 0;
+                if (k == 1 && !b.rhs_set.use(f[0])) break;
                 for (; k + 1 < f.size(); k += 2) {
                     auto it = b.row_of.find(f[k]);
                     if (it == b.row_of.end())
@@ -315,16 +384,24 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
                     if (b.row_kind[static_cast<std::size_t>(slot)] == RowKind::Objective) {
                         // Convention: RHS on the objective row is the NEGATIVE
                         // of the objective constant.
-                        if (slot == b.obj_slot) b.obj_rhs = -v;
+                        if (slot == b.obj_slot) {
+                            if (b.has_obj_rhs) ++b.repeated_rhs;
+                            b.has_obj_rhs = true;
+                            b.obj_rhs = -v;
+                        }
                     } else {
-                        b.rhs[static_cast<std::size_t>(
-                            b.constraint_index[static_cast<std::size_t>(slot)])] = v;
+                        const auto ci = static_cast<std::size_t>(
+                            b.constraint_index[static_cast<std::size_t>(slot)]);
+                        if (b.has_rhs[ci]) ++b.repeated_rhs;
+                        b.has_rhs[ci] = true;
+                        b.rhs[ci] = v;
                     }
                 }
                 break;
             }
             case Section::Ranges: {
                 std::size_t k = (f.size() % 2 == 1) ? 1 : 0;
+                if (k == 1 && !b.range_set.use(f[0])) break;
                 for (; k + 1 < f.size(); k += 2) {
                     auto it = b.row_of.find(f[k]);
                     if (it == b.row_of.end())
@@ -335,6 +412,7 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
                         continue;
                     const auto ci = static_cast<std::size_t>(
                         b.constraint_index[static_cast<std::size_t>(slot)]);
+                    if (b.has_range[ci]) ++b.repeated_ranges;
                     b.ranges[ci] = parse_num(f[k + 1], line_no);
                     b.has_range[ci] = true;
                     rep.had_ranges = true;
@@ -342,14 +420,17 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
                 break;
             }
             case Section::Bounds: {
-                if (f.size() < 3)
+                if (f.size() < 2)
                     throw std::runtime_error("MPS line " + std::to_string(line_no) +
                                              ": BOUNDS entry too short");
                 const std::string type = upper(f[0]);
                 // Layout is  TYPE  setname  colname  [value]  but the set name is
-                // sometimes omitted. Disambiguate by looking for a known column.
+                // sometimes omitted ("FR X" is a whole record). Disambiguate by
+                // looking for a known column.
                 std::size_t ci = 2, vi = 3;
-                if (!b.col_of.count(f[2]) && b.col_of.count(f[1])) { ci = 1; vi = 2; }
+                if (f.size() == 2 ||
+                    (!b.col_of.count(f[2]) && b.col_of.count(f[1]))) { ci = 1; vi = 2; }
+                if (ci == 2 && !b.bound_set.use(f[1])) break;
                 const auto cit = b.col_of.find(f[ci]);
                 if (cit == b.col_of.end())
                     throw std::runtime_error("MPS line " + std::to_string(line_no) +
@@ -362,6 +443,11 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
                     throw std::runtime_error("MPS line " + std::to_string(line_no) +
                                              ": bound type " + type + " needs a value");
                 const f64 v = needs_value ? parse_num(f[vi], line_no) : 0.0;
+                // A side given twice by the same kind of record: the last
+                // value is used, and the report says so.
+                if (((type == "UP" || type == "UI" || type == "PL") && b.hi_set[j]) ||
+                    ((type == "LO" || type == "LI" || type == "MI") && b.lo_set[j]))
+                    ++b.repeated_bounds;
 
                 if (type == "UP" || type == "UI") {
                     b.col_hi[j] = v;
@@ -394,7 +480,24 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
                 }
                 break;
             }
-            case Section::Quadobj:
+            case Section::Quadobj: {
+                if (!opt.quadratic) break;
+                if (f.size() != 3)
+                    throw std::runtime_error(
+                        "MPS line " + std::to_string(line_no) +
+                        ": a quadratic entry needs column, column, value");
+                const auto a = b.col_of.find(f[0]);
+                const auto c = b.col_of.find(f[1]);
+                if (a == b.col_of.end() || c == b.col_of.end())
+                    throw std::runtime_error(
+                        "MPS line " + std::to_string(line_no) + ": unknown column '" +
+                        (a == b.col_of.end() ? f[0] : f[1]) + "' in a quadratic section");
+                opt.quadratic->rows.push_back(a->second);
+                opt.quadratic->cols.push_back(c->second);
+                opt.quadratic->vals.push_back(parse_num(f[2], line_no));
+                opt.quadratic->lines.push_back(line_no);
+                break;
+            }
             case Section::Name:
             case Section::None:
             case Section::End:
@@ -423,7 +526,7 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
     model::LpProblem p;
     p.name = name;
     p.maximize = maximize;
-    p.A = sparse::from_triplets(n_rows, n_cols, b.tri_r, b.tri_c, b.tri_v);
+    p.A = assemble_matrix(n_rows, n_cols, b.tri_r, b.tri_c, b.tri_v, rep);
     p.c = b.obj;
     p.obj_offset = b.obj_rhs;
     p.col_lo = b.col_lo;
@@ -470,7 +573,31 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
         rep.relaxed_integrality = true;
     }
 
-    p.validate();
+    const auto report_sets = [&](const char* section, const Builder::SetChoice& set) {
+        if (set.skipped == 0) return;
+        rep.ignored_set_lines += set.skipped;
+        rep.warnings.push_back(std::to_string(set.skipped) + " " + section +
+                               " line(s) of set '" + set.first_skipped +
+                               "' ignored; the first set, '" + set.name +
+                               "', is the one used");
+    };
+    report_sets("RHS", b.rhs_set);
+    report_sets("RANGES", b.range_set);
+    report_sets("BOUNDS", b.bound_set);
+    rep.repeated_entries = b.repeated_rhs + b.repeated_ranges + b.repeated_bounds;
+    if (rep.repeated_entries > 0)
+        rep.warnings.push_back(
+            std::to_string(rep.repeated_entries) + " RHS, RANGES or BOUNDS value(s) "
+            "given more than once for the same row or column side (" +
+            std::to_string(b.repeated_rhs) + " RHS, " +
+            std::to_string(b.repeated_ranges) + " RANGES, " +
+            std::to_string(b.repeated_bounds) + " BOUNDS); the last one is used");
+    apply_infinite_bound(p, opt, rep);
+    // A crossed bound is a well-formed, infeasible model; the solver reports
+    // it as Infeasible rather than the reader as unreadable.
+    p.validate(/*allow_empty_domains=*/true);
+    if (const auto empty = p.find_empty_domain(); empty.index >= 0)
+        rep.warnings.push_back(p.describe(empty) + "; the model is infeasible");
 
     if (rep.small_values_dropped > 0)
         rep.warnings.push_back(
@@ -494,15 +621,99 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
     return p;
 }
 
+sparse::CsrMatrix assemble_matrix(Index n_rows, Index n_cols,
+                                  const std::vector<Index>& rows,
+                                  const std::vector<Index>& cols,
+                                  const std::vector<f64>& vals,
+                                  MpsReadReport& rep) {
+    std::vector<std::size_t> order(rows.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        return rows[a] != rows[b] ? rows[a] < rows[b] : cols[a] < cols[b];
+    });
+    std::vector<Index> r, c;
+    std::vector<f64> v;
+    r.reserve(order.size());
+    c.reserve(order.size());
+    v.reserve(order.size());
+    std::size_t first_duplicate = order.size();
+    for (std::size_t q = 0; q < order.size();) {
+        std::size_t end = q + 1;
+        while (end < order.size() && rows[order[end]] == rows[order[q]] &&
+               cols[order[end]] == cols[order[q]])
+            ++end;
+        f64 value = vals[order[q]];
+        if (end - q > 1) {
+            model::DyadicSum sum;
+            for (std::size_t t = q; t < end; ++t) sum.add(vals[order[t]]);
+            value = sum.nearest();
+            rep.duplicate_entries_summed += end - q - 1;
+            if (first_duplicate == order.size()) first_duplicate = order[q];
+        }
+        if (value == 0.0) {
+            ++rep.zero_entries_dropped;
+        } else {
+            const f64 magnitude = std::fabs(value);
+            if (rep.smallest_entry == 0.0 || magnitude < rep.smallest_entry)
+                rep.smallest_entry = magnitude;
+            if (magnitude < kTinyMatrixValue) ++rep.tiny_entries;
+            r.push_back(rows[order[q]]);
+            c.push_back(cols[order[q]]);
+            v.push_back(value);
+        }
+        q = end;
+    }
+    if (rep.duplicate_entries_summed > 0)
+        rep.warnings.push_back(
+            std::to_string(rep.duplicate_entries_summed) +
+            " duplicate matrix entr" +
+            (rep.duplicate_entries_summed == 1 ? "y" : "ies") +
+            " summed (first at row " + std::to_string(rows[first_duplicate]) +
+            ", column " + std::to_string(cols[first_duplicate]) + ")");
+    if (rep.tiny_entries > 0) {
+        char smallest[32];
+        std::snprintf(smallest, sizeof smallest, "%.3g", rep.smallest_entry);
+        rep.warnings.push_back(
+            std::to_string(rep.tiny_entries) + " matrix coefficient(s) below " +
+            "1e-9 in magnitude (smallest " + smallest + ") are kept; scaling "
+            "may amplify them (--small-matrix-value drops them)");
+    }
+    return sparse::from_triplets(n_rows, n_cols, r, c, v);
+}
+
+void apply_infinite_bound(model::LpProblem& p, const MpsReadOptions& opt,
+                          MpsReadReport& rep) {
+    const f64 limit = opt.infinite_bound;
+    if (!(limit > 0.0) || !std::isfinite(limit)) return;
+    std::size_t converted = 0;
+    // Only a lower side at or below -limit and an upper side at or above
+    // +limit move, each further out, so a domain can widen but never cross.
+    const auto widen = [&](std::vector<f64>& lo, std::vector<f64>& hi) {
+        for (auto& v : lo)
+            if (v <= -limit && v > -kInf) { v = -kInf; ++converted; }
+        for (auto& v : hi)
+            if (v >= limit && v < kInf) { v = kInf; ++converted; }
+    };
+    widen(p.col_lo, p.col_hi);
+    widen(p.row_lo, p.row_hi);
+    rep.infinite_bounds_read += converted;
+    if (converted > 0)
+        rep.warnings.push_back(std::to_string(converted) +
+                               " bound(s) or row side(s) with magnitude >= " +
+                               std::to_string(limit) + " read as infinite");
+}
+
 model::LpProblem read_mps_file(const std::string& path, MpsReadReport& rep,
                                const MpsReadOptions& opt) {
     // Gzip is detected from the CONTENT, not the extension: MIPLIB ships
     // `.mps.gz`, but a corpus unpacked in place keeps that name, and a file
     // named `.mps` is sometimes compressed.
     if (file_has_gzip_magic(path)) {
-        std::istringstream in(read_maybe_gzip_file(path));
+        GzipFileStream in(path);
         rep.used_gzip = true;
-        return read_mps(in, rep, opt);
+        auto p = read_mps(in, rep, opt);
+        in.finish();
+        return p;
     }
     std::ifstream in(path);
     if (!in) throw std::runtime_error("cannot open MPS file: " + path);

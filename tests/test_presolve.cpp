@@ -1,6 +1,7 @@
 #include "sor/presolve/presolve.hpp"
 #include "test_helpers.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -1103,6 +1104,26 @@ int main() {
             CHECK_NEAR(rec.raw.x[0] + rec.raw.x[1], 3.0, 1e-9);
         }
 
+        // Parallel rows led by a coefficient of exactly 1.0: x0 + 3x1 <= 5 and
+        // 2x0 + 6x1 <= 8 are one row (x0 + 3x1 <= 4). The lead was found with
+        // 1.0 as its "not found" marker, so the first row was normalized by
+        // 3 and the pair never shared a bucket.
+        {
+            PresolveOptions par = v2;
+            par.parallel_rows = true;
+            LpProblem p;
+            p.A = sor::sparse::from_triplets(
+                2, 2, {0, 0, 1, 1}, {0, 1, 0, 1}, {1.0, 3.0, 2.0, 6.0});
+            p.c = {-1.0, -1.0};
+            p.row_lo = {-sor::model::kInf, -sor::model::kInf};
+            p.row_hi = {5.0, 8.0};
+            p.col_lo = {0.0, 0.0};
+            p.col_hi = {10.0, 10.0};
+            const auto out = sor::presolve::presolve(p, par);
+            CHECK(out.stats().duplicate_rows_merged == 1);
+            CHECK(out.map.problem.n_rows() == 1);
+        }
+
         // Parallel rows: the multiplier and the tight logical belong to the
         // row that supplied the active merged side.
         //
@@ -1323,6 +1344,31 @@ int main() {
         CHECK(x[3] == -1);
         CHECK(p.max_row_violation(x) == 0);
         CHECK(p.objective(x) == -1);
+    }
+    // A deadline that has passed abandons the reductions and returns the
+    // identity map, valid and postsolvable, rather than finishing presolve:
+    // the caller has no time left to solve the reduced model.
+    {
+        LpProblem p;
+        p.A = sor::sparse::from_triplets(2, 3, {0,0,1}, {0,1,2}, {1,1,1});
+        p.c = {1,1,1};
+        p.col_lo = {0,2,0};
+        p.col_hi = {5,2,5};  // column 1 is fixed: normally removed
+        p.row_lo = {3,1};
+        p.row_hi = {9,1};    // row 1 is a singleton equality
+        sor::presolve::PresolveOptions opts;
+        const auto normal = sor::presolve::presolve(p, opts);
+        CHECK(normal.map.problem.n_cols() < 3);
+        CHECK(!normal.map.stats.stopped_at_deadline);
+
+        opts.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+        const auto late = sor::presolve::presolve(p, opts);
+        CHECK(late.status == sor::presolve::PresolveStatus::Reduced);
+        CHECK(late.map.stats.stopped_at_deadline);
+        CHECK(late.map.problem.n_rows() == 2 && late.map.problem.n_cols() == 3);
+        CHECK(late.map.recovery_steps.empty());
+        const auto x = postsolve(late.map, {1.0, 2.0, 1.0});
+        CHECK(x.size() == 3 && x[0] == 1.0 && x[1] == 2.0 && x[2] == 1.0);
     }
     return sor::test::finish("test_presolve");
 }

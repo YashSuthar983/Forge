@@ -50,5 +50,44 @@ int main() {
     CHECK(parallel_diag.dual_crash_columns == 2);
     CHECK(parallel_diag.iterations == 0);
     CHECK(p.max_row_violation(crashed.x) < 1e-7);
+    // A tall model: the race's last arm solves the dual LP. Whichever arm
+    // wins, the answer is the model's optimum and passes its checks. The
+    // dual LP arm alone must give that answer too (it is never used with the
+    // exact proof, so the policy turns that off as the CLI does).
+    {
+        // min sum x  s.t.  x_j >= 1 + j%3 (one row each) and x_0 + ... in
+        // pairs >= 2: 3n rows over n columns.
+        constexpr sor::core::Index n = 50;
+        std::vector<sor::core::Index> r, c; std::vector<double> v;
+        sor::model::LpProblem tall;
+        sor::core::Index row = 0;
+        for (sor::core::Index j = 0; j < n; ++j) {
+            r.push_back(row); c.push_back(j); v.push_back(1); ++row;
+            tall.row_lo.push_back(1 + j % 3); tall.row_hi.push_back(sor::model::kInf);
+            r.push_back(row); c.push_back(j); v.push_back(2); ++row;
+            tall.row_lo.push_back(-sor::model::kInf); tall.row_hi.push_back(20);
+            r.push_back(row); c.push_back(j); v.push_back(1);
+            r.push_back(row); c.push_back((j + 1) % n); v.push_back(1); ++row;
+            tall.row_lo.push_back(4); tall.row_hi.push_back(sor::model::kInf);
+        }
+        tall.A = sor::sparse::from_triplets(row, n, r, c, v);
+        tall.c.assign(n, 1); tall.col_lo.assign(n, 0); tall.col_hi.assign(n, 50);
+        sor::engines::SimplexOptions policy; policy.exact_proof = false;
+        sor::core::LpOptions race; race.concurrent_solves = 3; race.time_limit_s = 30;
+        sor::core::LpOptions single; single.time_limit_s = 30;
+        policy.dualize = sor::engines::DualizePolicy::Always;
+        double objectives[2];
+        int k = 0;
+        for (const auto* o : {&race, &single}) {
+            sor::core::LpDiagnostics d; sor::core::ProofEvidence e;
+            auto raw2 = sor::engines::solve_lp(tall, *o, d, &e, &policy);
+            const auto res = sor::certify::finalize_result(
+                sor::certify::check_lp_candidate(tall, std::move(raw2), e));
+            CHECK(res.status == sor::core::Status::Optimal);
+            CHECK(res.max_primal_violation <= 1e-7 && res.max_dual_violation <= 1e-7);
+            objectives[k++] = res.objective;
+        }
+        CHECK(std::fabs(objectives[0] - objectives[1]) <= 1e-8 * (1 + std::fabs(objectives[1])));
+    }
     return sor::test::finish("test_lp_concurrent");
 }

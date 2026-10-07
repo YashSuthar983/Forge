@@ -133,7 +133,29 @@ void test_subnormal_and_complete_number_parsing() {
 
 }  // namespace
 
+// The LP-relaxation mark round-trips, and a file without it still reads as
+// not relaxed.
+void test_integrality_relaxed_mark() {
+    sor::core::SolveResult r;
+    r.status = Status::Optimal;
+    r.proof = ProofLevel::ProvedKKT;
+    r.objective = 1.5;
+    r.x = {0.5, 1.0};
+    std::ostringstream marked, plain;
+    sor::io::write_solution(marked, r, true);
+    sor::io::write_solution(plain, r);
+    std::istringstream a(marked.str()), b(plain.str());
+    const auto relaxed = sor::io::read_solution(a);
+    const auto unmarked = sor::io::read_solution(b);
+    CHECK(relaxed.integrality_relaxed);
+    CHECK(!unmarked.integrality_relaxed);
+    CHECK(relaxed.x == unmarked.x);
+    std::istringstream twice(marked.str() + "integrality_relaxed 1\n");
+    CHECK_THROWS(sor::io::read_solution(twice));
+}
+
 int main() {
+    test_integrality_relaxed_mark();
     test_round_trip_optimal();
     test_round_trip_infeasible_with_ray();
     test_round_trip_unbounded_with_primal_ray();

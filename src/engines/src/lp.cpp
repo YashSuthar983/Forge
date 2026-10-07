@@ -71,12 +71,21 @@ core::ProofEvidence independently_checked(
     return certify::check_lp_result(problem, raw, proposed);
 }
 
+// A basis candidate that meets the standard its producer claims, the rule
+// detail::simplex_optimum_accepted applies inside the simplex: residuals
+// within tolerance always, and the safe dual bound closing the gap only for
+// a claim of ProvedOptimalFP or above. A simplex run without the exact proof
+// claims tolerance-level KKT optimality; requiring the bound here rejected
+// it, so a crossover's cold simplex fallback lost to the interior point it
+// was meant to finish (scsd6 --engine barrier: Feasible instead of Optimal).
 bool proved_basis(const core::RawResult& raw, const core::ProofEvidence& ev) {
-    return raw.proposed_status == core::Status::Optimal && ev.has_basis &&
-           ev.claimed_level >= core::ProofLevel::ProvedOptimalFP &&
-           ev.checker_passed && ev.max_primal_violation <= ev.primal_feas_tol &&
-           ev.max_dual_violation <= ev.dual_feas_tol &&
-           std::isfinite(ev.gap_rel) && ev.gap_rel <= ev.gap_tol;
+    if (raw.proposed_status != core::Status::Optimal || !ev.has_basis ||
+        !ev.checker_passed || !(ev.max_primal_violation <= ev.primal_feas_tol) ||
+        !(ev.max_dual_violation <= ev.dual_feas_tol))
+        return false;
+    if (ev.claimed_level >= core::ProofLevel::ProvedOptimalFP)
+        return std::isfinite(ev.gap_rel) && ev.gap_rel <= ev.gap_tol;
+    return ev.claimed_level == core::ProofLevel::ProvedKKT;
 }
 
 bool certified_terminal(const core::RawResult& raw,
@@ -388,14 +397,9 @@ core::RawResult solve_lp_barrier(const model::LpProblem& problem,
                                  const core::LpOptions& options, double time_limit_s,
                                  core::ProofEvidence& producer) {
     QpProblem qp;
-    qp.linear = problem;
+    qp.linear = model::minimization_form(problem);
     qp.q_diag.assign(static_cast<std::size_t>(problem.n_cols()), 0.0);   // Q = 0, diagonal form
     const double sense = problem.maximize ? -1.0 : 1.0;
-    if (problem.maximize) {
-        qp.linear.maximize = false;
-        for (auto& c : qp.linear.c) c = -c;
-        qp.linear.obj_offset = -qp.linear.obj_offset;
-    }
     QpOptions ipm;
     ipm.time_limit_s = time_limit_s;
     if (options.max_iterations > 0) ipm.max_iterations = options.max_iterations;
@@ -516,8 +520,22 @@ core::RawResult solve_lp(const model::LpProblem& problem,
                          const SimplexOptions* simplex_policy,
                          const HprOptions* hpr_policy,
                          const PdhgOptions* pdhg_policy) {
-    problem.validate();
+    problem.validate(/*allow_empty_domains=*/true);
     model::validate_lp_policy(options.primal_feas_tol, options.dual_feas_tol, options.gap_tol, options.time_limit_s);
+    // A crossed bound is infeasible by the data alone, for every strategy;
+    // the first-order engines cannot even represent it.
+    if (const auto empty = problem.find_empty_domain(); empty.index >= 0) {
+        diagnostics = LpDiagnostics{};
+        core::RawResult raw;
+        raw.proposed_status = core::Status::Infeasible;
+        raw.engine = "lp";
+        raw.termination_reason = problem.describe(empty);
+        diagnostics.termination_reason = raw.termination_reason;
+        core::ProofEvidence ev;
+        ev.empty_domain = true;
+        copy_evidence(evidence, ev);
+        return raw;
+    }
     if (options.concurrent_solves < 1 || options.concurrent_solves > 16)
         throw std::invalid_argument("LP concurrent_solves must be in [1,16]");
     if (options.concurrent_solves > 1)

@@ -5,8 +5,10 @@
 // refuse to claim Optimal when it should not". A solver that is right on afiro
 // and wrong about infeasibility is worse than useless.
 #include "sor/certify/finalize.hpp"
+#include "sor/core/env_switches.hpp"
 #include "sor/engines/dual_simplex.hpp"
 #include "sor/engines/farkas.hpp"
+#include "sor/engines/lp.hpp"
 #include "sor/engines/simplex.hpp"
 #include "sor/io/mps.hpp"
 #include "sor/presolve/presolve.hpp"
@@ -16,6 +18,7 @@
 #include "test_helpers.hpp"
 
 #include <cmath>
+#include <fstream>
 #include <cstdlib>
 #include <random>
 #include <sstream>
@@ -50,12 +53,14 @@ public:
             old_ = old;
         }
         ::setenv(name, value, 1);
+        sor::core::reload_env_switches();
     }
 
     ~ScopedEnvironment() {
         SOR_FN();
         if (had_old_) ::setenv(name_.c_str(), old_.c_str(), 1);
         else ::unsetenv(name_.c_str());
+        sor::core::reload_env_switches();
     }
 
     ScopedEnvironment(const ScopedEnvironment&) = delete;
@@ -91,6 +96,255 @@ Run solve_problem(const sor::model::LpProblem& problem,
     ev = sor::certify::check_lp_result(out.problem, raw, ev);
     out.r = sor::certify::finalize_result(std::move(raw), ev);
     return out;
+}
+
+// A crossed bound is infeasible by the data alone, and no row-multiplier
+// Farkas ray can show it when the column sits in no row or the row's own
+// sides cross. The dual used to stop with "no primal-infeasible basic
+// variable" and NoSolutionFound; finalize_result accepts the empty domain
+// as the proof, re-derived from the model.
+void test_empty_domain_is_infeasible() {
+    SOR_FN();
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(1, 2, {0}, {0}, {1.0});
+    lp.c = {1.0, 1.0};
+    lp.row_lo = {-sor::model::kInf};
+    lp.row_hi = {10.0};
+    lp.col_lo = {0.0, 3.0};
+    lp.col_hi = {5.0, 2.0};  // column 1 is empty and in no row
+    lp.col_names = {"x", "z"};
+    for (const bool presolve : {true, false}) {
+        SimplexOptions opts;
+        opts.presolve = presolve;
+        const auto run = solve_problem(lp, opts);
+        CHECK(run.r.status == Status::Infeasible);
+        CHECK(run.r.downgrade_reason.empty());
+        CHECK(run.r.termination_reason ==
+              "column 'z' has lower bound 3 above upper bound 2");
+    }
+
+    sor::model::LpProblem rows = lp;
+    rows.col_lo = {0.0, 0.0};
+    rows.col_hi = {5.0, 5.0};
+    rows.row_lo = {4.0};
+    rows.row_hi = {1.0};  // the row's sides cross
+    const auto run = solve_problem(rows);
+    CHECK(run.r.status == Status::Infeasible);
+    const auto empty = rows.find_empty_domain();
+    CHECK(empty.is_row && empty.index == 0);
+
+    // Every strategy, including the first-order ones that cannot represent
+    // an empty interval, reports it the same way.
+    for (const auto strategy : {sor::core::LpStrategy::Auto,
+                                sor::core::LpStrategy::Hpr,
+                                sor::core::LpStrategy::Barrier}) {
+        sor::core::LpOptions o;
+        o.strategy = strategy;
+        sor::core::LpDiagnostics d;
+        sor::core::ProofEvidence ev;
+        auto raw = sor::engines::solve_lp(lp, o, d, &ev);
+        const auto r = sor::certify::finalize_result(
+            sor::certify::check_lp_candidate(lp, std::move(raw), ev));
+        CHECK(r.status == Status::Infeasible);
+    }
+
+    // The evidence comes from the model, never from the engine's word: the
+    // same bare claim (no ray) is accepted for the crossed model and refused
+    // once the crossing is gone.
+    sor::core::RawResult claim;
+    claim.proposed_status = Status::Infeasible;
+    const auto accepted = sor::certify::finalize_result(
+        claim, sor::certify::check_lp_result(lp, claim, sor::core::ProofEvidence{}));
+    CHECK(accepted.status == Status::Infeasible);
+    sor::model::LpProblem feasible = lp;
+    feasible.col_lo[1] = 0.0;
+    const auto refused = sor::certify::finalize_result(
+        claim, sor::certify::check_lp_result(feasible, claim, sor::core::ProofEvidence{}));
+    CHECK(refused.status == Status::NoSolutionFound);
+}
+
+// The time limit is a wall for the whole call: once presolve has used it,
+// neither scaling nor any simplex stage runs.
+void test_time_limit_covers_presolve_and_preparation() {
+    SOR_FN();
+    for (const bool presolve : {true, false}) {
+        SimplexOptions opts;
+        opts.presolve = presolve;
+        opts.time_limit_s = 1e-9;
+        const auto run = solve_text(sor::test::kTestLpMps, opts);
+        CHECK(run.r.status == Status::Interrupted);
+        CHECK(run.diag.iterations == 0);
+        CHECK(run.r.termination_reason.find(
+                  presolve ? "reached in presolve" : "reached before the solve") !=
+              std::string::npos);
+    }
+}
+
+// A maximization with an objective offset, through every place that turns
+// the minimization form's numbers back into the model's sense. The copy used
+// to keep the offset un-negated and each consumer compensated by hand.
+void test_maximization_offset_is_reported_in_model_sense() {
+    SOR_FN();
+    // max 3x + 2y + 10 s.t. x + y <= 4, x <= 3; optimum x=3, y=1: 21.
+    sor::model::LpProblem lp;
+    lp.maximize = true;
+    lp.obj_offset = 10.0;
+    lp.A = sor::sparse::from_triplets(2, 2, {0, 0, 1}, {0, 1, 0}, {1.0, 1.0, 1.0});
+    lp.c = {3.0, 2.0};
+    lp.row_lo = {-sor::model::kInf, -sor::model::kInf};
+    lp.row_hi = {4.0, 3.0};
+    lp.col_lo = {0.0, 0.0};
+    lp.col_hi = {sor::model::kInf, sor::model::kInf};
+
+    const auto pmin = sor::model::minimization_form(lp);
+    CHECK(!pmin.maximize && pmin.obj_offset == -10.0 && pmin.c[0] == -3.0);
+    CHECK(pmin.objective({3.0, 1.0}) == -lp.objective({3.0, 1.0}));
+
+    for (const auto method : {sor::engines::SimplexMethod::Dual,
+                              sor::engines::SimplexMethod::Primal}) {
+        SimplexOptions opts;
+        opts.method = method;
+        opts.exact_proof = true;
+        const auto run = solve_problem(lp, opts);
+        CHECK(run.r.status == Status::Optimal);
+        CHECK_NEAR(run.r.objective, 21.0, 1e-9);
+        CHECK_NEAR(run.diag.primal_objective, 21.0, 1e-9);
+        CHECK(std::isfinite(run.r.dual_bound));
+        CHECK_NEAR(run.r.dual_bound, 21.0, 1e-9);
+    }
+    for (const auto strategy : {sor::core::LpStrategy::Hpr,
+                                sor::core::LpStrategy::Barrier}) {
+        sor::core::LpOptions o;
+        o.strategy = strategy;
+        sor::core::LpDiagnostics d;
+        sor::core::ProofEvidence ev;
+        auto raw = sor::engines::solve_lp(lp, o, d, &ev);
+        const auto r = sor::certify::finalize_result(
+            sor::certify::check_lp_candidate(lp, std::move(raw), ev));
+        CHECK_NEAR(r.objective, 21.0, 1e-5);
+    }
+}
+
+// With m >= 4096 the dual keeps a candidate set for CHUZR instead of
+// scanning every row each pivot. It must choose exactly what the full scan
+// chooses: verified on every pivot here, and the run must match a forced
+// full-scan run pivot for pivot.
+void test_candidate_chuzr_matches_full_scan() {
+    SOR_FN();
+    constexpr Index m = 5000, n = 7000;
+    std::vector<Index> rows, cols;
+    std::vector<f64> vals;
+    std::uint32_t state = 12345u;
+    const auto next = [&state]() { state = state * 1664525u + 1013904223u; return state >> 8; };
+    for (Index j = 0; j < n; ++j) {
+        const Index count = 2 + static_cast<Index>(next() % 3);
+        for (Index t = 0; t < count; ++t) {
+            rows.push_back(static_cast<Index>(next() % static_cast<std::uint32_t>(m)));
+            cols.push_back(j);
+            vals.push_back(0.5 + static_cast<f64>(next() % 8) / 4.0);
+        }
+    }
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(m, n, rows, cols, vals);
+    lp.c.resize(n);
+    for (Index j = 0; j < n; ++j) lp.c[static_cast<std::size_t>(j)] = 1.0 + static_cast<f64>(next() % 10);
+    lp.col_lo.assign(n, 0.0);
+    lp.col_hi.assign(n, 10.0);
+    lp.row_lo.assign(m, -sor::model::kInf);
+    lp.row_hi.assign(m, sor::model::kInf);
+    // A covering row needs at least one column; rows that drew none stay free.
+    std::vector<int> row_count(static_cast<std::size_t>(m), 0);
+    for (const Index i : rows) ++row_count[static_cast<std::size_t>(i)];
+    for (Index i = 0; i < m; ++i)
+        if (row_count[static_cast<std::size_t>(i)] > 0)
+            lp.row_lo[static_cast<std::size_t>(i)] = 1.0 + static_cast<f64>(next() % 3);
+    SimplexOptions opts;
+    opts.method = sor::engines::SimplexMethod::Dual;
+    opts.presolve = false;
+    Run verified, plain, full;
+    {
+        ScopedEnvironment verify("SOR_DUAL_VERIFY_CHUZR", "1");
+        verified = solve_problem(lp, opts);
+    }
+    plain = solve_problem(lp, opts);
+    {
+        ScopedEnvironment scan("SOR_DUAL_FULLSCAN_CHUZR", "1");
+        full = solve_problem(lp, opts);
+    }
+    CHECK(verified.r.status == Status::Optimal);
+    CHECK(verified.r.termination_reason.find("disagreed") == std::string::npos);
+    CHECK(plain.diag.iterations > 100);
+    CHECK(plain.diag.iterations == full.diag.iterations);
+    CHECK(verified.diag.iterations == full.diag.iterations);
+    CHECK(plain.r.objective == full.r.objective);
+    CHECK(plain.diag.chuzr_full_scans < full.diag.chuzr_full_scans);
+    // The O(nnz) drift check runs only once the pivots since the last one
+    // have done 16 times its work: on this hypersparse model that is far
+    // rarer than every 32 pivots (8 checks in about 3,300 pivots).
+    CHECK(plain.diag.residual_checks > 0);
+    CHECK(plain.diag.residual_checks * 32 * 4 < plain.diag.iterations);
+}
+
+// Solving through the dual LP (DualizePolicy::Always) must give the model's
+// own optimum, x and y that pass the original-model checks, and say so.
+// The fixtures cover equations, ranges, MI/FR/FX bounds, an objective
+// constant, and (built below) a maximization with an offset and a free row.
+void test_dual_lp_path_matches_direct_solve() {
+    SOR_FN();
+    std::vector<sor::model::LpProblem> models;
+    for (const std::string& text : {std::string(sor::test::kTestLpMps),
+                                     std::string(sor::test::kFeaturesMps)}) {
+        std::istringstream in(text);
+        sor::io::MpsReadReport rep;
+        models.push_back(sor::io::read_mps(in, rep));
+    }
+    sor::model::LpProblem lp;
+    lp.maximize = true;
+    lp.obj_offset = 10.0;
+    lp.A = sor::sparse::from_triplets(3, 3, {0, 0, 1, 2, 2}, {0, 1, 0, 1, 2},
+                                      {1.0, 1.0, 1.0, 1.0, 1.0});
+    lp.c = {3.0, 2.0, 1.0};
+    lp.row_lo = {-sor::model::kInf, -sor::model::kInf, -sor::model::kInf};
+    lp.row_hi = {4.0, 3.0, sor::model::kInf};   // row 2 is free
+    lp.col_lo = {0.0, 0.0, 0.0};
+    lp.col_hi = {sor::model::kInf, sor::model::kInf, 2.0};
+    models.push_back(lp);
+    for (const auto& model : models) {
+        // As the CLI solves: tolerance-level KKT, no exact proof (the dual
+        // path is never taken with it).
+        SimplexOptions direct_opts;
+        direct_opts.exact_proof = false;
+        direct_opts.dualize = sor::engines::DualizePolicy::Never;
+        SimplexOptions dual_opts = direct_opts;
+        dual_opts.dualize = sor::engines::DualizePolicy::Always;
+        // No basis requested: a caller that wants one never gets the dual path.
+        const auto solve = [&](const SimplexOptions& o) {
+            Run out;
+            out.problem = model;
+            auto raw = sor::engines::solve_simplex(out.problem, o, out.diag);
+            auto ev = sor::engines::simplex_evidence(out.diag, o);
+            ev = sor::certify::check_lp_result(out.problem, raw, ev);
+            out.r = sor::certify::finalize_result(std::move(raw), ev);
+            return out;
+        };
+        const auto direct = solve(direct_opts);
+        const auto via_dual = solve(dual_opts);
+        CHECK(direct.r.status == Status::Optimal);
+        CHECK(via_dual.r.status == Status::Optimal);
+        CHECK(via_dual.diag.dualized);
+        CHECK_NEAR(via_dual.r.objective, direct.r.objective,
+                   1e-9 * (1.0 + std::fabs(direct.r.objective)));
+        CHECK(via_dual.r.max_primal_violation <= 1e-7);
+        CHECK(via_dual.r.max_dual_violation <= 1e-7);
+    }
+    // Never for a caller that needs a basis back, or with the exact proof.
+    SimplexOptions always;
+    always.exact_proof = false;
+    always.dualize = sor::engines::DualizePolicy::Always;
+    CHECK(sor::engines::detail::should_dualize(lp, always, false));
+    CHECK(!sor::engines::detail::should_dualize(lp, always, true));
+    always.exact_proof = true;
+    CHECK(!sor::engines::detail::should_dualize(lp, always, false));
 }
 
 void test_fixture_lp() {
@@ -666,6 +920,65 @@ void test_auto_candidate_order_uses_feasibility_before_gap() {
         later, later_diag, early, early_diag, opts, false));
 }
 
+// The presolved candidate and its unpresolved retry must be accepted by the
+// same rule. Without the exact proof a tolerance-level optimum is accepted
+// even when no finite dual bound closes the gap; the retry used to demand
+// that bound anyway, so a clean retry lost to a lifted point that had failed
+// its residual check.
+void test_optimum_acceptance_follows_exact_proof_setting() {
+    SOR_FN();
+    sor::core::RawResult result;
+    result.proposed_status = Status::Optimal;
+    SimplexDiagnostics diag;
+    diag.primal_residual = 1e-9;
+    diag.dual_residual = 1e-9;
+    diag.dual_bound_finite = false;
+    diag.gap_rel = sor::core::kPosInf;
+
+    SimplexOptions tolerance_only;
+    tolerance_only.exact_proof = false;
+    SimplexOptions exact = tolerance_only;
+    exact.exact_proof = true;
+    CHECK(sor::engines::detail::simplex_optimum_accepted(result, diag, tolerance_only));
+    CHECK(!sor::engines::detail::simplex_optimum_accepted(result, diag, exact));
+
+    // A closed gap satisfies both settings.
+    diag.dual_bound_finite = true;
+    diag.gap_rel = 0.0;
+    CHECK(sor::engines::detail::simplex_optimum_accepted(result, diag, exact));
+
+    // Residuals outside tolerance, or a non-Optimal status, fail either way.
+    diag.primal_residual = 1e-5;
+    CHECK(!sor::engines::detail::simplex_optimum_accepted(result, diag, tolerance_only));
+    diag.primal_residual = 1e-9;
+    diag.dual_residual = 1e-5;
+    CHECK(!sor::engines::detail::simplex_optimum_accepted(result, diag, tolerance_only));
+    diag.dual_residual = 1e-9;
+    result.proposed_status = Status::Feasible;
+    CHECK(!sor::engines::detail::simplex_optimum_accepted(result, diag, tolerance_only));
+}
+
+// Which dual finishes hand the remaining allowance to the primal fallback. A
+// "cycling detected" stop used to be returned as Interrupted with time left;
+// a checked infeasibility proof no longer triggers a second solve.
+void test_dual_stage_fallback_decision() {
+    SOR_FN();
+    using sor::engines::detail::dual_stage_needs_fallback;
+    sor::core::RawResult r;
+    SimplexDiagnostics d;
+    r.proposed_status = Status::NumericalFailure;
+    CHECK(dual_stage_needs_fallback(r, d, false));
+    r.proposed_status = Status::Infeasible;
+    CHECK(dual_stage_needs_fallback(r, d, false));
+    CHECK(!dual_stage_needs_fallback(r, d, true));
+    r.proposed_status = Status::Interrupted;           // time or pivot limit
+    CHECK(!dual_stage_needs_fallback(r, d, false));
+    d.cycling_exits = 1;                               // gave up cycling
+    CHECK(dual_stage_needs_fallback(r, d, false));
+    r.proposed_status = Status::Optimal;
+    CHECK(!dual_stage_needs_fallback(r, d, false));
+}
+
 // Every row must have exactly one basic variable and the basis must be a
 // permutation of distinct variables. A duplicated basic variable is the classic
 // symptom of a mishandled leaving-variable update.
@@ -687,6 +1000,39 @@ void test_basis_wellformed() {
     for (const auto s : run.basis.status)
         if (s == NonbasicStatus::Basic) ++n_basic;
     CHECK(n_basic == static_cast<std::size_t>(m));
+}
+
+// blend2's LP relaxation lifts doubleton bound transfers whose keep column
+// is basic already. The lift used to make keep basic in the removed row's
+// slot as well: seven columns sat in two slots each, and that basis went to
+// callers and to the exact certificate. The lift now gives elim the slot and
+// refuses any basis that is still malformed.
+void test_lifted_basis_is_wellformed_on_blend2() {
+    SOR_FN();
+    const std::string path = SOR_SOURCE_DIR "/benchmarks/miplib-easy/mps/blend2.mps";
+    if (!std::ifstream(path)) {
+        ::sor::test::skip("test_lifted_basis_is_wellformed_on_blend2", path);
+        return;
+    }
+    sor::io::MpsReadReport rep;
+    sor::io::MpsReadOptions ro;
+    ro.relax_integrality = true;
+    const auto lp = sor::io::read_mps_file(path, rep, ro);
+    const auto run = solve_problem(lp);
+    CHECK(run.r.status == Status::Optimal);
+    CHECK(run.diag.lifted_basis_rejections == 0);
+    const Index m = lp.n_rows();
+    CHECK(static_cast<Index>(run.basis.basic.size()) == m);
+    std::vector<int> seen(run.basis.status.size(), 0);
+    for (const Index v : run.basis.basic) {
+        CHECK(v >= 0 && v < static_cast<Index>(seen.size()));
+        if (v >= 0 && v < static_cast<Index>(seen.size())) ++seen[static_cast<std::size_t>(v)];
+    }
+    int duplicated = 0;
+    for (const int k : seen) duplicated += k > 1;
+    CHECK(duplicated == 0);
+    for (std::size_t v = 0; v < seen.size(); ++v)
+        CHECK((run.basis.status[v] == NonbasicStatus::Basic) == (seen[v] == 1));
 }
 
 void test_features_mps_agrees_with_model() {
@@ -904,14 +1250,19 @@ ENDATA
     CHECK(direct_diag.phase1_iterations > 0);
     CHECK(!direct.ray.empty());
 
+    // The dual's phase 1 hands this model to the primal inside its own pass,
+    // and that finish carries a Farkas ray that checks. A checked ray is a
+    // proof, so the dispatcher no longer re-solves with a second primal
+    // stage; it used to (dual_stages 1, primal_stages 1, stages 2).
     const auto dispatched = solve_text(mps, opts);
     CHECK(dispatched.r.status == Status::Infeasible);
     CHECK(dispatched.r.proof < ProofLevel::ProvedOptimalFP);
+    CHECK(dispatched.r.ray_certified);
     CHECK(dispatched.diag.dual_stages == 1);
-    CHECK(dispatched.diag.primal_stages == 1);
-    CHECK(dispatched.diag.stages == 2);
-    // Cross-checking the infeasibility candidate must spend the remainder of
-    // the caller's allowance, rather than giving each engine a fresh cap.
+    CHECK(dispatched.diag.primal_stages == 0);
+    CHECK(dispatched.diag.stages == 1);
+    // Any fallback stage must spend the remainder of the caller's allowance,
+    // rather than giving each engine a fresh cap.
     for (const auto method : {sor::engines::SimplexMethod::Dual,
                               sor::engines::SimplexMethod::Auto}) {
         opts.method = method;
@@ -2109,6 +2460,11 @@ int main() {
     test_residual_monitor_tracks_pivoted_dual_vector();
     test_unrepresentable_scaling_preserves_original_model();
     SOR_FN();
+    test_empty_domain_is_infeasible();
+    test_time_limit_covers_presolve_and_preparation();
+    test_maximization_offset_is_reported_in_model_sense();
+    test_candidate_chuzr_matches_full_scan();
+    test_dual_lp_path_matches_direct_solve();
     test_fixture_lp();
     test_auto_commits_to_one_engine_without_a_discarded_probe();
     test_route_features_describe_the_model();
@@ -2120,7 +2476,10 @@ int main() {
     test_partitioned_price_matches_full_scan_on_random_bases();
     test_numerical_trouble_trigger_and_shift_bound();
     test_auto_candidate_order_uses_feasibility_before_gap();
+    test_optimum_acceptance_follows_exact_proof_setting();
+    test_dual_stage_fallback_decision();
     test_basis_wellformed();
+    test_lifted_basis_is_wellformed_on_blend2();
     test_features_mps_agrees_with_model();
     test_infeasible();
     test_primal_phase1_exports_checked_farkas_certificate();

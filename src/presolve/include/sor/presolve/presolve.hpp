@@ -7,6 +7,7 @@
 #include "sor/core/result.hpp"
 #include "sor/model/lp.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -46,6 +47,10 @@ struct PresolveStats {
     Index duplicate_rows_merged = 0;
     Index duplicate_columns_merged = 0;
 
+    // Reductions stopped at PresolveOptions::deadline; the map is complete
+    // and valid for the reductions made, the rest were never started.
+    bool stopped_at_deadline = false;
+
     double elapsed_ms = 0.0;
 };
 
@@ -73,6 +78,15 @@ struct PresolveOptions {
     Index max_aggregation_row_nnz = 32;
     int sparsification_passes = 2;
     Index max_domain_probes = 64;
+    // Wall-clock point after which no new reduction starts. Every reduction
+    // is complete and journaled when it is made, so stopping between two of
+    // them leaves a valid, smaller presolve. max() = no deadline.
+    std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::time_point::max();
+    bool past_deadline() const {
+        return deadline != std::chrono::steady_clock::time_point::max() &&
+               std::chrono::steady_clock::now() >= deadline;
+    }
 };
 
 enum class PresolveStatus : std::uint8_t {
@@ -264,6 +278,10 @@ struct PresolveRecoveryResult {
     PostsolveBasis basis;
     core::ProofEvidence evidence;
     bool validated = false;
+    // A reduced basis was given but its lift was not a well-formed basis of
+    // the original (a variable in two slots, an empty slot, or statuses that
+    // disagree); `basis` is then empty.
+    bool basis_rejected = false;
     std::string failure_reason;
 };
 

@@ -94,7 +94,8 @@ std::vector<f64> read_vec(std::istream& in, const char* expect_tag) {
 
 }  // namespace
 
-void write_solution(std::ostream& out, const core::SolveResult& r) {
+void write_solution(std::ostream& out, const core::SolveResult& r,
+                    bool integrality_relaxed) {
     out << "status " << core::to_string(r.status) << '\n';
     out << "proof " << core::to_string(r.proof) << '\n';
     out.precision(17);
@@ -119,6 +120,7 @@ void write_solution(std::ostream& out, const core::SolveResult& r) {
         for (const auto& value : r.primal_ray.exact_direction) out << ' ' << value;
         out << '\n';
     }
+    if (integrality_relaxed) out << "integrality_relaxed 1\n";
 }
 
 SolutionFile read_solution(std::istream& in) {
@@ -151,6 +153,11 @@ SolutionFile read_solution(std::istream& in) {
         while (in.peek() != std::char_traits<char>::eof()) {
             std::size_t count = 0;
             if (!(in >> tag >> count)) throw std::runtime_error("solution file: invalid exact field");
+            if (tag == "integrality_relaxed" && count == 1 && !s.integrality_relaxed) {
+                s.integrality_relaxed = true;
+                in >> std::ws;
+                continue;
+            }
             std::vector<std::string>* destination = nullptr;
             if (tag == "exact_dual" && !saw_dual && count == s.y.size()) {
                 destination = &s.exact_dual; saw_dual = true;

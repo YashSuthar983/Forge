@@ -1,4 +1,5 @@
 #include "sor/la/basis_numerics.hpp"
+#include "sor/core/fp_environment.hpp"
 #include "sor/core/parallel.hpp"
 #if defined(__SIZEOF_FLOAT128__)
 #include "quad_accumulator.hpp"
@@ -219,15 +220,24 @@ void BasisFactor::solve_batch(std::vector<std::vector<f64>>& rhs, core::ThreadPo
             if (transpose) btran(rhs[i]); else ftran(rhs[i], spikes ? &(*spikes)[i] : nullptr);
         return;
     }
+    // Every worker solves against this one factor with its own scratch. It
+    // used to copy the whole factor (L, U and the update file) per worker per
+    // call, which made the parallel paired FTRAN slower than the serial one.
     const auto workers = std::min<std::size_t>(pool->size(),rhs.size());
-    std::vector<BasisFactor> factors(workers, *this);
-    const auto before = work_since_factor_;
+    if (worker_scratch_.size() < workers) worker_scratch_.resize(workers);
+    for (std::size_t w = 0; w < workers; ++w)
+        if (worker_scratch_[w].factor_gen != factor_gen_) reset_scratch(worker_scratch_[w]);
     pool->run(static_cast<int>(workers), [&](int worker) {
-        auto& local = factors[static_cast<std::size_t>(worker)];
+        const core::ScopedFlushSubnormals fp_scope;
+        auto& sc = worker_scratch_[static_cast<std::size_t>(worker)];
         for (auto i = static_cast<std::size_t>(worker); i < rhs.size(); i += workers) {
-            if (transpose) local.btran(rhs[i]); else local.ftran(rhs[i], spikes ? &(*spikes)[i] : nullptr);
+            if (transpose) (void)btran_impl(sc, rhs[i], nullptr, nullptr);
+            else (void)ftran_impl(sc, rhs[i], nullptr, nullptr, spikes ? &(*spikes)[i] : nullptr);
         }
     });
-    for (const auto& local : factors) work_since_factor_ += local.work_since_factor_ - before;
+    for (std::size_t w = 0; w < workers; ++w) {
+        scratch_.work_since_factor_ += worker_scratch_[w].work_since_factor_;
+        worker_scratch_[w].work_since_factor_ = 0;
+    }
 }
 } // namespace sor::la

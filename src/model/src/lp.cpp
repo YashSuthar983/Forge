@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <stdexcept>
 
 namespace sor::model {
@@ -100,6 +101,40 @@ void LpProblem::validate(bool allow_empty_domains) const {
                                         std::to_string(i));
     }
     A.pattern.validate();
+}
+
+LpProblem::EmptyDomain LpProblem::find_empty_domain() const noexcept {
+    EmptyDomain out;
+    for (std::size_t j = 0; j < col_lo.size() && j < col_hi.size(); ++j)
+        if (col_lo[j] > col_hi[j]) { out.index = static_cast<Index>(j); return out; }
+    for (std::size_t i = 0; i < row_lo.size() && i < row_hi.size(); ++i)
+        if (row_lo[i] > row_hi[i]) {
+            out.is_row = true;
+            out.index = static_cast<Index>(i);
+            return out;
+        }
+    return out;
+}
+
+std::string LpProblem::describe(const EmptyDomain& d) const {
+    if (d.index < 0) return "no empty domain";
+    const auto k = static_cast<std::size_t>(d.index);
+    const auto& names = d.is_row ? row_names : col_names;
+    const std::string label = k < names.size() && !names[k].empty()
+        ? "'" + names[k] + "'" : std::to_string(d.index);
+    char bounds[96];
+    std::snprintf(bounds, sizeof bounds, " has lower bound %.17g above upper bound %.17g",
+                  d.is_row ? row_lo[k] : col_lo[k], d.is_row ? row_hi[k] : col_hi[k]);
+    return std::string(d.is_row ? "row " : "column ") + label + bounds;
+}
+
+LpProblem minimization_form(LpProblem p) {
+    if (p.maximize) {
+        for (f64& v : p.c) v = -v;
+        p.obj_offset = -p.obj_offset;
+        p.maximize = false;
+    }
+    return p;
 }
 
 void validate_lp_policy(f64 primal_tol, f64 dual_tol, f64 gap_tol, f64 time_limit_s) {

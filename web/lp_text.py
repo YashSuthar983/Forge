@@ -342,10 +342,10 @@ def to_mps(model: _Model, name: str = "TEXTLP") -> str:
             chunk = entries[i : i + 2]
             if len(chunk) == 1:
                 r, a = chunk[0]
-                lines.append(f"    {v:<8}  {r:<8}  {a:.10g}")
+                lines.append(f"    {v:<8}  {r:<8}  {a!r}")
             else:
                 (r1, a1), (r2, a2) = chunk
-                lines.append(f"    {v:<8}  {r1:<8}  {a1:.10g}   {r2:<8}  {a2:.10g}")
+                lines.append(f"    {v:<8}  {r1:<8}  {a1!r}   {r2:<8}  {a2!r}")
 
     if ints:
         lines.append("    MARK0000  'MARKER'                 'INTORG'")
@@ -357,7 +357,7 @@ def to_mps(model: _Model, name: str = "TEXTLP") -> str:
 
     lines.append("RHS")
     for rname, _, _, rhs in model.rows:
-        lines.append(f"    RHS1      {rname:<8}  {rhs:.10g}")
+        lines.append(f"    RHS1      {rname:<8}  {rhs!r}")
 
     lines.append("BOUNDS")
     for v in cols:
@@ -367,11 +367,11 @@ def to_mps(model: _Model, name: str = "TEXTLP") -> str:
             lines.append(f" FR BND1      {v}")
         else:
             if lo != 0.0 and lo != float("-inf"):
-                lines.append(f" LO BND1      {v:<8}  {lo:.10g}")
+                lines.append(f" LO BND1      {v:<8}  {lo!r}")
             if lo == float("-inf"):
                 lines.append(f" MI BND1      {v}")
             if hi != float("inf"):
-                lines.append(f" UP BND1      {v:<8}  {hi:.10g}")
+                lines.append(f" UP BND1      {v:<8}  {hi!r}")
             elif v in model.binary:
                 lines.append(f" UP BND1      {v:<8}  1")
     lines.append("ENDATA")

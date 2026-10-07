@@ -168,6 +168,31 @@ void test_boxed_row_still_sorts_nothing_when_the_first_group_blocks() {
     CHECK(out.sorted_candidates == 0);
 }
 
+// Harris's band is invariant: no candidate may end a step below -slack. Column
+// 0 sits inside the band at -0.9 slack; column 1 is feasible with the larger
+// |alpha|. Clamping column 0's reduced cost to 0 before adding the slack gave it
+// a full slack of room, put both columns in one group and pivoted on column 1
+// (step 2.5e-10), leaving column 0 at -1.15e-9 -- outside the band, and a step
+// further out on every later pivot. With the raw bound column 0 blocks first.
+void test_harris_band_is_invariant_for_wrong_signed_candidates() {
+    Row r;
+    r.j = {0, 1};
+    r.alpha = {-1.0, -2.0};
+    r.dual = {-0.9e-9, 0.5e-9};
+    r.status = {NonbasicStatus::AtLower, NonbasicStatus::AtLower};
+    r.lo = {0.0, 0.0};
+    r.hi = {kInf, kInf};
+    const auto out = run(r, 1.0, -1.0);   // slack 1e-9
+    CHECK(out.ok);
+    CHECK(out.pivot == 0);
+    // Whatever enters, the step must keep every other candidate in the band.
+    const f64 t = out.theta;
+    for (std::size_t c = 0; c < r.j.size(); ++c) {
+        if (r.j[c] == out.pivot) continue;
+        CHECK(r.dual[c] - t * std::fabs(r.alpha[c]) >= -1e-9);
+    }
+}
+
 // The differential test. A speedup that changes a pivot is not a speedup, and
 // the only way to know is to run both implementations on the same input.
 // Rows are randomized over the shapes that matter: mixed bound classes, ties
@@ -256,6 +281,7 @@ int main() {
     test_wrong_sign_entering_is_reported_with_its_row_entry();
     test_one_sided_row_sorts_nothing();
     test_boxed_row_still_sorts_nothing_when_the_first_group_blocks();
+    test_harris_band_is_invariant_for_wrong_signed_candidates();
     test_fast_paths_agree_with_the_exhaustive_reference();
     return sor::test::finish("test_dual_ratio_test");
 }

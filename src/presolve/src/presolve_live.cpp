@@ -75,7 +75,9 @@ void LiveMatrix::build(const model::LpProblem& problem,
     col_queued.assign(sz(n), 0);
 
     original_column_entries.assign(sz(n), {});
+    std::uint32_t polls = 0;
     for (Index i = 0; i < m; ++i) {
+        poll_deadline(options, polls);
         for (Offset k = problem.A.pattern.row_ptr()[sz(i)];
              k < problem.A.pattern.row_ptr()[sz(i) + 1]; ++k) {
             const Index j = problem.A.pattern.col_idx()[sz(k)];
@@ -85,6 +87,7 @@ void LiveMatrix::build(const model::LpProblem& problem,
     }
 
     for (Index i = 0; i < m; ++i) {
+        poll_deadline(options, polls);
         if (!row_active[sz(i)]) continue;
         f64 shift = 0.0;
         for (Offset k = problem.A.pattern.row_ptr()[sz(i)];
@@ -715,17 +718,22 @@ bool LiveMatrix::try_duplicate_rows() {
     // zeros hashed as +0 since the key compares -0 == +0) and give only rows
     // whose hash repeats to the ordered map. Buckets, their order and the
     // row order within them are unchanged.
+    //
+    // Rows of every length take part. A 32-entry cap predates the hash and
+    // only bounded the key building it now avoids; it excluded every row of
+    // neos-957323 (median length 161), which has 514 exactly parallel rows.
+    // The first active nonzero. Its value cannot double as the "not found
+    // yet" marker: with 1.0 as the marker, a row led by an actual 1.0 was
+    // normalized by its next coefficient instead, so x0 + 3x1 and 2x0 + 6x1
+    // got different keys and were never merged.
     const auto row_lead = [&](Index i) {
-        f64 lead = 1.0;
-        for (const auto& [j, a] : rows[sz(i)]) {
-            if (!col_active[sz(j)]) continue;
-            if (lead == 1.0 && a != 0.0) lead = a;
-        }
-        return lead;
+        for (const auto& [j, a] : rows[sz(i)])
+            if (col_active[sz(j)] && a != 0.0) return a;
+        return 0.0;
     };
     std::vector<std::pair<std::uint64_t, Index>> hashed;
     for (Index i = 0; i < m; ++i) {
-        if (!row_active[sz(i)] || rows[sz(i)].size() > 32) continue;
+        if (!row_active[sz(i)]) continue;
         const f64 lead = row_lead(i);
         if (lead == 0.0) continue;
         std::uint64_t h = 1469598103934665603ull;
@@ -755,13 +763,8 @@ bool LiveMatrix::try_duplicate_rows() {
     for (Index i = 0; i < m; ++i) {
         if (!repeated[sz(i)]) continue;
         if (!row_active[sz(i)]) continue;
-        if (rows[sz(i)].size() > 32) continue;
         std::vector<std::pair<Index, f64>> norm;
-        f64 lead = 1.0;
-        for (const auto& [j, a] : rows[sz(i)]) {
-            if (!col_active[sz(j)]) continue;
-            if (lead == 1.0 && a != 0.0) lead = a;
-        }
+        const f64 lead = row_lead(i);
         if (lead == 0.0) continue;
         for (const auto& [j, a] : rows[sz(i)]) {
             if (!col_active[sz(j)]) continue;
@@ -782,7 +785,7 @@ bool LiveMatrix::try_duplicate_rows() {
         for (std::size_t t = 0; t < indices.size(); ++t) {
             const Index rem = indices[t];
             if (rem == keep || !row_active[sz(rem)]) continue;
-            f64 scale = 1.0;
+            f64 scale = 0.0;
             bool ok = true;
             for (const auto& [j, a_keep] : rows[sz(keep)]) {
                 const auto it = rows[sz(rem)].find(j);
@@ -790,7 +793,7 @@ bool LiveMatrix::try_duplicate_rows() {
                     ok = false;
                     break;
                 }
-                if (scale == 1.0 && a_keep != 0.0) scale = it->second / a_keep;
+                if (scale == 0.0 && a_keep != 0.0) scale = it->second / a_keep;
             }
             if (!ok || scale == 0.0) continue;
             bool exact = std::isfinite(scale);
@@ -843,10 +846,10 @@ bool LiveMatrix::try_duplicate_columns() {
         if (!col_active[sz(j)]) continue;
         if (col_rows[sz(j)].size() > 32) continue;
         std::vector<std::pair<Index, f64>> norm;
-        f64 lead = 1.0;
+        f64 lead = 0.0;   // the first nonzero (see row_lead in try_duplicate_rows)
         for (const Index i : col_rows[sz(j)]) {
             const f64 a = rows[sz(i)].at(j);
-            if (lead == 1.0 && a != 0.0) lead = a;
+            if (a != 0.0) { lead = a; break; }
         }
         if (lead == 0.0) continue;
         for (const Index i : col_rows[sz(j)]) {
@@ -861,7 +864,7 @@ bool LiveMatrix::try_duplicate_columns() {
         for (std::size_t t = 1; t < indices.size(); ++t) {
             const Index rem = indices[t];
             if (!col_active[sz(rem)]) continue;
-            f64 scale = 1.0;
+            f64 scale = 0.0;
             bool ok = true;
             for (const Index i : col_rows[sz(keep)]) {
                 const f64 a_keep = rows[sz(i)].at(keep);
@@ -870,7 +873,7 @@ bool LiveMatrix::try_duplicate_columns() {
                     ok = false;
                     break;
                 }
-                if (scale == 1.0 && a_keep != 0.0) scale = it->second / a_keep;
+                if (scale == 0.0 && a_keep != 0.0) scale = it->second / a_keep;
             }
             if (!ok || scale == 0.0) continue;
             if (!in->is_integer.empty() && (in->is_integer[sz(keep)] || in->is_integer[sz(rem)])) continue;
@@ -914,12 +917,15 @@ bool LiveMatrix::run_until_stable() {
     SOR_FN();
     seed_all_queues();
     int inner = 0;
+    std::uint32_t polls = 0;
     while ((!changed_rows.empty() || !changed_cols.empty()) &&
            inner < options.max_passes && *status == PresolveStatus::Reduced) {
+        check_deadline(options);
         ++inner;
         ++out->stats.passes;
 
         while (!changed_rows.empty() && *status == PresolveStatus::Reduced) {
+            poll_deadline(options, polls);
             const Index i = changed_rows.front();
             changed_rows.pop_front();
             row_queued[sz(i)] = 0;
@@ -944,6 +950,7 @@ bool LiveMatrix::run_until_stable() {
         }
 
         while (!changed_cols.empty() && *status == PresolveStatus::Reduced) {
+            poll_deadline(options, polls);
             const Index j = changed_cols.front();
             changed_cols.pop_front();
             col_queued[sz(j)] = 0;

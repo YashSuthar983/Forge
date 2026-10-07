@@ -1,4 +1,5 @@
 #include "simplex_prepared.hpp"
+#include "sor/core/env_switches.hpp"
 #include "sor/certify/finalize.hpp"
 #include "sor/model/exact.hpp"
 
@@ -163,7 +164,7 @@ bool repair_simplex_dual(const model::LpProblem& p, core::RawResult& raw,
     if (raw.exact_dual.empty()) {
         const auto refinement_started = std::chrono::steady_clock::now();
         const bool refined = refined_basis_dual(p, raw, opts, diag);
-        if (std::getenv("SOR_CERTIFICATE_DEBUG"))
+        if (core::env_switches().certificate_debug)
             std::fprintf(stderr, "certificate dyadic refinement: m=%zu n=%zu accepted=%d elapsed=%.6f\n",
                 m, n, refined ? 1 : 0,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - refinement_started).count());

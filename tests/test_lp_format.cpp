@@ -141,15 +141,27 @@ End
         CHECK(p.c[0] == 150.0 && p.c[1] == 0.5 && p.c[2] == 2.0);
         CHECK(std::fabs(coeff(p, 0, 0) - 0.3) < 1e-15);
         CHECK(p.row_lo[0] == -100.0);
-        CHECK(p.row_hi[1] == 1e30);                    // finite sides stay finite
+        CHECK(p.row_hi[1] == kInf);                    // 1e30 is "no bound" by default
         CHECK(p.col_lo[0] == -kInf);
+    }
+    // With the infinite-bound convention disabled the number is taken literally.
+    {
+        io::MpsReadOptions literal;
+        literal.infinite_bound = 0.0;
+        const auto p = parse("Minimize\n obj: x\nSubject To\n d: x <= 1e30\n"
+                             " e: x >= -1e20\nEnd\n", literal);
+        CHECK(p.row_hi[0] == 1e30);
+        CHECK(p.row_lo[1] == -1e20);
+        // Just below the default threshold stays finite with it enabled.
+        const auto q = parse("Minimize\n obj: x\nSubject To\n d: x <= 9.9e19\nEnd\n");
+        CHECK(q.row_hi[0] == 9.9e19);
     }
 
     // ---- reader options ----
     {
         const auto p = parse("Minimize\n obj: b + v\nBounds\n b = 1\n v <= 1e30\nBinary\n b v\nEnd\n");
         CHECK(p.col_lo[0] == 1.0 && p.col_hi[0] == 1.0);
-        CHECK(p.col_hi[1] == 1e30 && p.n_integer() == 2);
+        CHECK(p.col_hi[1] == kInf && p.n_integer() == 2);
         const auto wrapped = parse("Minimize\n obj: 2\n x + y\nSubject To\n bounds: 3\n x + y >= 4\nEnd\n");
         CHECK(wrapped.c[0] == 2.0 && coeff(wrapped, 0, 0) == 3.0);
     }
@@ -167,6 +179,29 @@ End
         CHECK(p.nnz() == 1);
     }
 
+    // ---- crossed bounds: a well-formed model that is infeasible ----
+    // The reader used to throw, so the CLI said "parse failed" for a model
+    // the solver should report Infeasible. It now reads it and warns.
+    {
+        std::istringstream in("Minimize\n obj: x\nSubject To\n c: 3 <= x + y <= 2\n"
+                              "Bounds\n x <= -1\nEnd\n");
+        io::MpsReadReport rep;
+        const auto p = io::read_lp(in, rep);
+        CHECK(p.col_lo[0] == 0.0 && p.col_hi[0] == -1.0);
+        CHECK(p.row_lo[0] == 3.0 && p.row_hi[0] == 2.0);
+        const auto empty = p.find_empty_domain();
+        CHECK(!empty.is_row && empty.index == 0);
+        bool column_warned = false, row_warned = false;
+        for (const auto& w : rep.warnings) {
+            column_warned |= w.find("variable 'x' has lower bound") != std::string::npos &&
+                             w.find("negative upper") != std::string::npos;
+            row_warned |= w.find("constraint 'c' has lower side above upper side") !=
+                          std::string::npos;
+        }
+        CHECK(column_warned);
+        CHECK(row_warned);
+    }
+
     // ---- rejected constructs are errors, never silently dropped ----
     CHECK(rejects("Minimize\n obj: 1e-999 x\nEnd\n", "underflows"));
     CHECK(rejects("Minimize\n obj: x\nSubject To\n c: x <= 1e308 + 1e308\nEnd\n", "overflows"));
@@ -179,7 +214,6 @@ End
     CHECK(rejects("Minimize\n obj: x\nSubject To\n c: x * y >= 1\nEnd\n", "products"));
     CHECK(rejects("Subject To\n c: x >= 1\nEnd\n", "Minimize or Maximize"));
     CHECK(rejects("Minimize\n obj: x\nSubject To\n c: x 1\nEnd\n", "expected"));
-    CHECK(rejects("Minimize\n obj: x\nBounds\n x <= -1\nEnd\n", "lower bound"));
     CHECK(rejects("Minimize\n obj: x\nSubject To\n c: 1 <= x >= 3\nEnd\n", "ranged"));
     CHECK(rejects("Minimize\n obj: x\nBounds\n 1 <= x >= 3\nEnd\n", "ranged bound"));
     CHECK(rejects("Minimize\n obj: x\nBounds\n x <= 1e999\nEnd\n", "overflows"));

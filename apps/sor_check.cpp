@@ -39,7 +39,10 @@ void usage() {
         "  above (sor_solve --exact-proof) also by a safe dual bound within the gap\n"
         "  tolerance. --strict demands that bound for every LP optimum.\n"
         "  Exit 0: the claim independently verifies. Exit 1: rejected.\n"
-        "  Exit 3: unverified claim (insufficient certificate).\n",
+        "  Exit 3: unverified claim (insufficient certificate), or a status\n"
+        "  that makes no claim (Interrupted, NoSolutionFound, ...).\n"
+        "  The model is always read strictly: an unknown section, or a quadratic\n"
+        "  objective in a non-.qps file, is an error (--strict-mps is the default).\n",
         stderr);
 }
 
@@ -201,7 +204,11 @@ int main(int argc, char** argv) {
     double tol = 1e-7;
     std::optional<double> gap_tol;
     bool strict = false;
+    // Read the model completely, as sor_solve does: a section the reader
+    // would skip (QUADOBJ in a .mps, SOS, ...) means the claim cannot be
+    // checked against the file's model. --strict-mps is kept as a no-op.
     sor::io::MpsReadOptions mps_opts;
+    mps_opts.strict = true;
     bool mps_format_forced = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -295,6 +302,11 @@ int main(int argc, char** argv) {
             return 2;
         }
         const auto sol = sor::io::read_solution(sfile);
+        if (sol.integrality_relaxed && lp.n_integer() > 0) {
+            // The claim answers the LP relaxation, and says so.
+            std::printf("integrality relaxed: the claim answers the LP relaxation\n");
+            lp.is_integer.assign(lp.is_integer.size(), false);
+        }
 
         std::printf("model:     %s  (%d rows x %d cols, nnz %lld)\n",
                     model_path.c_str(), lp.n_rows(), lp.n_cols(),
@@ -435,6 +447,14 @@ int main(int argc, char** argv) {
                     : has_integer
                     ? "milp_infeasible_via_lp_farkas_f64"
                     : "lp_farkas_f64";
+                // A crossed bound in the model's own data proves
+                // infeasibility, of the LP and of any integer restriction.
+                if (const auto empty = lp.find_empty_domain(); empty.index >= 0) {
+                    validation_scope = "empty_domain";
+                    std::printf("info  %s\n", lp.describe(empty).c_str());
+                    pass("empty domain", 0.0, tol);
+                    break;
+                }
                 const auto& ray = sol.dual_farkas_ray.empty()
                                       ? sol.ray : sol.dual_farkas_ray;
                 if (ray.empty()) {
@@ -505,6 +525,21 @@ int main(int argc, char** argv) {
                                                        cert.max_bound_sign_residual), tol);
                 break;
             }
+            // These statuses assert nothing about the model: a limit stop, a
+            // search that found no point, a detected numerical failure, a
+            // refusal. There is no claim to verify, and none to reject; a
+            // point written with them (an interrupted iterate) is not
+            // claimed feasible either.
+            case sor::core::Status::NotSolved:
+            case sor::core::Status::NoSolutionFound:
+            case sor::core::Status::Interrupted:
+            case sor::core::Status::NumericalFailure:
+            case sor::core::Status::Unsupported:
+                validation_scope = "no_claim";
+                std::printf("UNVERIFIED  status=%s makes no claim to check\n",
+                            std::string(sor::core::to_string(sol.status)).c_str());
+                unverified = true;
+                break;
             default:
                 std::printf(
                     "FAIL  no independent check implemented for status=%s\n",

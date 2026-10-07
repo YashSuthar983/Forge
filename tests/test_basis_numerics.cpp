@@ -205,5 +205,60 @@ int main() {
         CHECK(band.stats().dense_tail_blocks == 0);
         CHECK(band.stats().blocked_nucleus_blocks == 0);
     }
+    // solve_batch on a larger sparse factor, after an update and after a
+    // refactorization of a different size. Workers share the factor and keep
+    // their own scratch (they used to copy the whole factor per call), so a
+    // worker's scratch must follow updates and be reset for a new
+    // factorization; the results must be the serial ones exactly.
+    {
+        const auto build = [](Index size, std::uint32_t seed, std::vector<Offset>& cpv,
+                              std::vector<Index>& riv, std::vector<f64>& vv) {
+            cpv = {0}; riv.clear(); vv.clear();
+            std::uint32_t state = seed;
+            const auto next = [&state]() { state = state * 1664525u + 1013904223u; return state >> 8; };
+            for (Index j = 0; j < size; ++j) {
+                riv.push_back(j); vv.push_back(4.0 + static_cast<f64>(next() % 5));
+                for (int k = 0; k < 3; ++k) {
+                    const Index i = static_cast<Index>(next() % static_cast<std::uint32_t>(size));
+                    if (i == j || std::find(riv.begin() + cpv.back(), riv.end(), i) != riv.end()) continue;
+                    riv.push_back(i); vv.push_back(static_cast<f64>(next() % 7) / 8.0 - 0.4);
+                }
+                cpv.push_back(static_cast<Offset>(riv.size()));
+            }
+        };
+        const auto rhs_set = [](Index size) {
+            std::vector<std::vector<f64>> b;
+            for (Index k = 0; k < 7; ++k) {
+                std::vector<f64> v(static_cast<std::size_t>(size), 0.0);
+                if (k < 4) v[static_cast<std::size_t>((k * 37) % size)] = 1.0;        // hypersparse
+                else for (Index i = 0; i < size; ++i) v[static_cast<std::size_t>(i)] = ((i * (k + 3)) % 11) - 5.0;
+                b.push_back(std::move(v));
+            }
+            return b;
+        };
+        const auto agree = [&](BasisFactor& f, Index size) {
+            for (const bool trans : {false, true}) {
+                auto parallel = rhs_set(size);
+                auto expected_solves = parallel;
+                for (auto& v : expected_solves) { if (trans) f.btran(v); else f.ftran(v); }
+                f.solve_batch(parallel, &pool, trans);
+                CHECK(parallel == expected_solves);
+            }
+        };
+        std::vector<Offset> cpv; std::vector<Index> riv; std::vector<f64> vv;
+        BasisFactor big;
+        build(300, 7u, cpv, riv, vv);
+        CHECK(big.factorize(300, cpv, riv, vv, {}));
+        agree(big, 300);
+        // Replace slot 5 with a new column: alpha = B^-1 a.
+        std::vector<f64> alpha(300, 0.0);
+        alpha[5] = 3.0; alpha[17] = 0.5; alpha[200] = -0.25;
+        big.ftran(alpha);
+        CHECK(big.update(5, alpha));
+        agree(big, 300);
+        build(211, 11u, cpv, riv, vv);
+        CHECK(big.factorize(211, cpv, riv, vv, {}));
+        agree(big, 211);
+    }
     return sor::test::finish("test_basis_numerics");
 }

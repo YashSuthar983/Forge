@@ -40,9 +40,10 @@ class BoundSnapshotTests(unittest.TestCase):
              '--engine', 'milp', '--time-limit', budget, '--bab-threads', '1'],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             preexec_fn=limit_files if limited else None, timeout=60)
-        # The large model may exhaust the short solve budget without an
-        # incumbent (CLI exit 4); this test concerns diagnostic I/O only.
-        self.assertIn(result.returncode, (0, 4) if limited else (0,),
+        # The large model may exhaust the short solve budget with an
+        # incumbent (CLI exit 6) or without one (exit 4); this test concerns
+        # diagnostic I/O only.
+        self.assertIn(result.returncode, (0, 4, 6) if limited else (0,),
                       result.stderr.decode())
         return [json.loads(line) for line in Path(str(base) + '.invocations.jsonl').read_text().splitlines()]
 
