@@ -3,6 +3,7 @@
 // never trusted, so every accepted proof here comes from the LP checker.
 #include "sor/certify/finalize.hpp"
 #include "sor/engines/lp.hpp"
+#include "sor/engines/simplex.hpp"
 #include "sor/io/mps.hpp"
 #include "sor/model/lp.hpp"
 #include "test_helpers.hpp"
@@ -79,6 +80,28 @@ int main() {
         CHECK(std::fabs(result.objective + 464.7531428571) < 1e-5);
         CHECK(result.proof != core::ProofLevel::ProvedOptimalFP);
         CHECK(!diagnostics.crossover_attempted);
+    }
+    // Without the exact proof (as the CLI runs) the cold simplex fallback
+    // after a crossover that found no valid basis claims tolerance-level KKT
+    // optimality. The route must accept it: it used to require the exact
+    // dual bound and kept the interior point instead, Feasible on scsd6.
+    if (test::data_available(netlib_path("scsd6"))) {
+        const auto scsd6 = read_netlib("scsd6");
+        core::LpOptions options;
+        options.strategy = core::LpStrategy::Barrier;
+        options.time_limit_s = 60;
+        engines::SimplexOptions policy;
+        policy.exact_proof = false;
+        core::LpDiagnostics diagnostics;
+        core::ProofEvidence evidence;
+        auto raw = engines::solve_lp(scsd6, options, diagnostics, &evidence, &policy);
+        const auto result = certify::finalize_result(
+            certify::check_lp_candidate(scsd6, std::move(raw), evidence));
+        CHECK(result.status == core::Status::Optimal);
+        CHECK(result.proof == core::ProofLevel::ProvedKKT ||
+              result.proof == core::ProofLevel::ProvedOptimalFP);
+        CHECK(std::fabs(result.objective - 50.5) < 1e-6);
+        CHECK(diagnostics.crossover_attempted);
     }
     return test::finish("test_lp_barrier");
 }

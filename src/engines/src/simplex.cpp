@@ -880,6 +880,29 @@ bool detail::prefer_simplex_candidate(const core::RawResult& candidate,
     return false;
 }
 
+bool detail::dual_stage_needs_fallback(const core::RawResult& result,
+                                       const SimplexDiagnostics& diag,
+                                       bool infeasibility_certified) {
+    SOR_FN();
+    switch (result.proposed_status) {
+        case core::Status::NumericalFailure: return true;
+        case core::Status::Infeasible:       return !infeasibility_certified;
+        case core::Status::Interrupted:      return diag.cycling_exits > 0;
+        default:                             return false;
+    }
+}
+
+bool detail::simplex_optimum_accepted(const core::RawResult& result,
+                                      const SimplexDiagnostics& diag,
+                                      const SimplexOptions& opts) {
+    SOR_FN();
+    return result.proposed_status == core::Status::Optimal &&
+           diag.primal_residual <= opts.primal_feas_tol &&
+           diag.dual_residual <= opts.dual_feas_tol &&
+           (!opts.exact_proof ||
+            (diag.dual_bound_finite && diag.gap_rel <= opts.gap_tol));
+}
+
 SimplexPrepared prepare_simplex_model(const model::LpProblem& problem,
                                       const SimplexOptions& opts) {
     validate_simplex_numerics(opts);
@@ -2078,7 +2101,13 @@ core::RawResult solve_primal_simplex_prepared(
             // under the row/column scaling used here), so this is the same
             // quantity the certificate gate measures. Bounded: at most three
             // escalations, then the basis is accepted as-is.
-            if (dtol_scale > 1e-4) {
+            //
+            // Only when the result will claim that gap (exact_proof). The
+            // default claim is tolerance-level KKT, checked by residuals, and
+            // chasing a 1e-9 gap there bought nothing it reports: extra
+            // pivots on reduced costs a hundred to ten thousand times below
+            // the tolerance, the numerically riskiest kind.
+            if (opts.exact_proof && dtol_scale > 1e-4) {
                 f64 pobj = 0.0, dval = 0.0;
                 bool dbound_finite = true;
                 for (Index j = 0; j < nt; ++j) {
@@ -2826,7 +2855,14 @@ core::RawResult solve_primal_simplex_prepared(
     raw.proposed_status = status;
     raw.termination_reason = reason;
 
+    // Exact ray repair is the exact proof's work, as in the dual engine:
+    // without it a floating-point certificate that passes the result gate's
+    // own check stands, and only a failing one is repaired. certify_rays off
+    // (internal candidate-generator solves) skips the repair altogether.
     if (status == core::Status::Unbounded && ray_entering_variable >= 0 &&
+        opts.certify_rays &&
+        (opts.exact_proof ||
+         !certify::check_primal_ray(pmin, raw.primal_ray.direction, opts.primal_feas_tol).certified) &&
         (opts.time_limit_s <= 0 || ms_since(t_all) < 1000*opts.time_limit_s))
         certify::repair_basis_primal_ray(pmin, raw, ray_entering_variable, ray_entering_sign,
             {.time_limit_s = opts.time_limit_s > 0
@@ -2835,7 +2871,10 @@ core::RawResult solve_primal_simplex_prepared(
 
     if (!phase1_farkas.empty())
         raw.dual_farkas_ray.multipliers = std::move(phase1_farkas);
-    if (!phase1_farkas_rhs.empty() &&
+    if (!phase1_farkas_rhs.empty() && opts.certify_rays &&
+        (opts.exact_proof ||
+         !certify::check_dual_farkas_ray(pmin, raw.dual_farkas_ray.multipliers,
+                                         opts.primal_feas_tol).certified) &&
         (opts.time_limit_s <= 0 || ms_since(t_all) < 1000*opts.time_limit_s))
         certify::repair_basis_farkas_certificate(pmin, raw, phase1_farkas_rhs,
             {.time_limit_s = opts.time_limit_s > 0
@@ -3135,6 +3174,20 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
                                        static_cast<std::uint64_t>(b.basic.size()) / 5;
     };
 
+    // A dual Infeasible finish whose Farkas ray checks on the model it
+    // solved is a proof, and a primal re-run can only repeat it. Only an
+    // uncertified one is treated as a failure that the primal must decide.
+    const auto infeasibility_certified = [&](const core::RawResult& r) {
+        if (r.proposed_status != core::Status::Infeasible) return false;
+        if (!r.dual_farkas_ray.exact_multipliers.empty())
+            return certify::check_exact_dual_farkas_ray(
+                *work, r.dual_farkas_ray.exact_multipliers, opts.primal_feas_tol).certified;
+        const auto& y = !r.dual_farkas_ray.multipliers.empty()
+            ? r.dual_farkas_ray.multipliers : r.ray;
+        return !y.empty() &&
+               certify::check_dual_farkas_ray(*work, y, opts.primal_feas_tol).certified;
+    };
+
     core::RawResult raw;
     if (opts.method == SimplexMethod::Primal) {
         raw = run(false, opts, &prim_basis);
@@ -3147,9 +3200,8 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         // basis). The primal is a complete solver; finishing the instance
         // with it beats reporting a failure. Measured on fit2d/fit2p before
         // the BFRT fix; kept as the safety net for whatever comes next.
-        const bool dual_failed =
-            raw.proposed_status == core::Status::NumericalFailure ||
-            raw.proposed_status == core::Status::Infeasible;
+        const bool dual_failed = detail::dual_stage_needs_fallback(
+            raw, diag, infeasibility_certified(raw));
         double fallback_time_left = opts.time_limit_s;
         if (opts.time_limit_s > 0.0)
             fallback_time_left -=
@@ -3228,9 +3280,8 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         const auto dual_diag = diag;
         winner = &dual_basis;
 
-        const bool dual_failed =
-            raw.proposed_status == core::Status::NumericalFailure ||
-            raw.proposed_status == core::Status::Infeasible;
+        const bool dual_failed = detail::dual_stage_needs_fallback(
+            raw, diag, infeasibility_certified(raw));
         const bool time_left = opts.time_limit_s <= 0.0 ||
             elapsed(dual_t0) < opts.time_limit_s * 0.95;
         if (dual_failed && time_left && have_pivot_allowance()) {
@@ -3462,11 +3513,7 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         // reason to solve the model again.
         const bool presolved_proved =
             (presolve_recovery_validated || !opts.exact_proof) &&
-            raw.proposed_status == core::Status::Optimal &&
-            diag.primal_residual <= opts.primal_feas_tol &&
-            diag.dual_residual <= opts.dual_feas_tol &&
-            (!opts.exact_proof ||
-             (diag.dual_bound_finite && diag.gap_rel <= opts.gap_tol));
+            detail::simplex_optimum_accepted(raw, diag, opts);
         const double retry_time_left = opts.time_limit_s > 0.0
             ? opts.time_limit_s -
                   std::chrono::duration<double>(Clock::now() - presolve_t0).count()
@@ -3522,11 +3569,11 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
                 pmap.stats.equality_aggregations;
             retry_diag.presolve_aggregation_fill =
                 pmap.stats.aggregation_fill;
+            // Same standard as the presolved candidate: without the exact
+            // proof a tolerance-level retry is a proved answer, and must not
+            // lose to a lifted point that failed its residual check.
             const bool retry_proved =
-                retry_raw.proposed_status == core::Status::Optimal &&
-                retry_diag.primal_residual <= retry_opts.primal_feas_tol &&
-                retry_diag.dual_residual <= retry_opts.dual_feas_tol &&
-                retry_diag.dual_bound_finite && retry_diag.gap_rel <= retry_opts.gap_tol;
+                detail::simplex_optimum_accepted(retry_raw, retry_diag, retry_opts);
             const bool take_retry = retry_proved || checked_terminal(retry_raw, retry_diag) ||
                 (retry_raw.proposed_status == core::Status::Optimal &&
                  raw.proposed_status != core::Status::Optimal) ||

@@ -4228,6 +4228,10 @@ int main(int argc, char** argv) {
             lp_opts.backend = backend_name;
             sor::core::LpDiagnostics diag;
             sor::core::ProofEvidence ev;
+            // As in the simplex route: the exact dual-bound proof only when
+            // asked for (--exact-proof). The SimplexOptions default is on, which
+            // the auto and first-order routes inherited silently.
+            sx_opts.exact_proof = lp_exact_proof;
             auto raw = sor::engines::solve_lp(problem, lp_opts, diag, &ev, &sx_opts, &hpr_opts, &pdhg_opts);
             const auto r = sor::certify::finalize_result(
                 sor::certify::check_lp_candidate(problem, std::move(raw), ev));
@@ -4498,6 +4502,10 @@ int main(int argc, char** argv) {
                 lp_opts.backend = backend_name;
                 sor::core::LpDiagnostics diag;
                 sor::core::ProofEvidence ev;
+                // As in the simplex route: the exact dual-bound proof only when
+                // asked for (--exact-proof). The SimplexOptions default is on, which
+                // the auto and first-order routes inherited silently.
+                sx_opts.exact_proof = lp_exact_proof;
                 auto raw = sor::engines::solve_lp(problem, lp_opts, diag, &ev, &sx_opts, &hpr_opts, &pdhg_opts);
                 const auto r = sor::certify::finalize_result(
                     sor::certify::check_lp_candidate(problem, std::move(raw), ev));

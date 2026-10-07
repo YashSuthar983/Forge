@@ -794,6 +794,65 @@ void test_auto_candidate_order_uses_feasibility_before_gap() {
         later, later_diag, early, early_diag, opts, false));
 }
 
+// The presolved candidate and its unpresolved retry must be accepted by the
+// same rule. Without the exact proof a tolerance-level optimum is accepted
+// even when no finite dual bound closes the gap; the retry used to demand
+// that bound anyway, so a clean retry lost to a lifted point that had failed
+// its residual check.
+void test_optimum_acceptance_follows_exact_proof_setting() {
+    SOR_FN();
+    sor::core::RawResult result;
+    result.proposed_status = Status::Optimal;
+    SimplexDiagnostics diag;
+    diag.primal_residual = 1e-9;
+    diag.dual_residual = 1e-9;
+    diag.dual_bound_finite = false;
+    diag.gap_rel = sor::core::kPosInf;
+
+    SimplexOptions tolerance_only;
+    tolerance_only.exact_proof = false;
+    SimplexOptions exact = tolerance_only;
+    exact.exact_proof = true;
+    CHECK(sor::engines::detail::simplex_optimum_accepted(result, diag, tolerance_only));
+    CHECK(!sor::engines::detail::simplex_optimum_accepted(result, diag, exact));
+
+    // A closed gap satisfies both settings.
+    diag.dual_bound_finite = true;
+    diag.gap_rel = 0.0;
+    CHECK(sor::engines::detail::simplex_optimum_accepted(result, diag, exact));
+
+    // Residuals outside tolerance, or a non-Optimal status, fail either way.
+    diag.primal_residual = 1e-5;
+    CHECK(!sor::engines::detail::simplex_optimum_accepted(result, diag, tolerance_only));
+    diag.primal_residual = 1e-9;
+    diag.dual_residual = 1e-5;
+    CHECK(!sor::engines::detail::simplex_optimum_accepted(result, diag, tolerance_only));
+    diag.dual_residual = 1e-9;
+    result.proposed_status = Status::Feasible;
+    CHECK(!sor::engines::detail::simplex_optimum_accepted(result, diag, tolerance_only));
+}
+
+// Which dual finishes hand the remaining allowance to the primal fallback. A
+// "cycling detected" stop used to be returned as Interrupted with time left;
+// a checked infeasibility proof no longer triggers a second solve.
+void test_dual_stage_fallback_decision() {
+    SOR_FN();
+    using sor::engines::detail::dual_stage_needs_fallback;
+    sor::core::RawResult r;
+    SimplexDiagnostics d;
+    r.proposed_status = Status::NumericalFailure;
+    CHECK(dual_stage_needs_fallback(r, d, false));
+    r.proposed_status = Status::Infeasible;
+    CHECK(dual_stage_needs_fallback(r, d, false));
+    CHECK(!dual_stage_needs_fallback(r, d, true));
+    r.proposed_status = Status::Interrupted;           // time or pivot limit
+    CHECK(!dual_stage_needs_fallback(r, d, false));
+    d.cycling_exits = 1;                               // gave up cycling
+    CHECK(dual_stage_needs_fallback(r, d, false));
+    r.proposed_status = Status::Optimal;
+    CHECK(!dual_stage_needs_fallback(r, d, false));
+}
+
 // Every row must have exactly one basic variable and the basis must be a
 // permutation of distinct variables. A duplicated basic variable is the classic
 // symptom of a mishandled leaving-variable update.
@@ -1032,14 +1091,19 @@ ENDATA
     CHECK(direct_diag.phase1_iterations > 0);
     CHECK(!direct.ray.empty());
 
+    // The dual's phase 1 hands this model to the primal inside its own pass,
+    // and that finish carries a Farkas ray that checks. A checked ray is a
+    // proof, so the dispatcher no longer re-solves with a second primal
+    // stage; it used to (dual_stages 1, primal_stages 1, stages 2).
     const auto dispatched = solve_text(mps, opts);
     CHECK(dispatched.r.status == Status::Infeasible);
     CHECK(dispatched.r.proof < ProofLevel::ProvedOptimalFP);
+    CHECK(dispatched.r.ray_certified);
     CHECK(dispatched.diag.dual_stages == 1);
-    CHECK(dispatched.diag.primal_stages == 1);
-    CHECK(dispatched.diag.stages == 2);
-    // Cross-checking the infeasibility candidate must spend the remainder of
-    // the caller's allowance, rather than giving each engine a fresh cap.
+    CHECK(dispatched.diag.primal_stages == 0);
+    CHECK(dispatched.diag.stages == 1);
+    // Any fallback stage must spend the remainder of the caller's allowance,
+    // rather than giving each engine a fresh cap.
     for (const auto method : {sor::engines::SimplexMethod::Dual,
                               sor::engines::SimplexMethod::Auto}) {
         opts.method = method;
@@ -2251,6 +2315,8 @@ int main() {
     test_partitioned_price_matches_full_scan_on_random_bases();
     test_numerical_trouble_trigger_and_shift_bound();
     test_auto_candidate_order_uses_feasibility_before_gap();
+    test_optimum_acceptance_follows_exact_proof_setting();
+    test_dual_stage_fallback_decision();
     test_basis_wellformed();
     test_features_mps_agrees_with_model();
     test_infeasible();
