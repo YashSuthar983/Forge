@@ -4407,6 +4407,9 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(
                             diag.wrong_sign_entering_shifts),
                         diag.cost_shift_max);
+            std::printf("  backward steps   %10llu  (wrong-sign entering, no shift)\n",
+                        static_cast<unsigned long long>(
+                            diag.wrong_sign_backward_steps));
             std::printf("  primal cleanup   %10llu  (%llu pivots, handed dual "
                         "infeas %.3e / primal infeas %.3e)\n",
                         static_cast<unsigned long long>(diag.primal_cleanups),

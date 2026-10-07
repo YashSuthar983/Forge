@@ -31,7 +31,7 @@ namespace sor::engines {
 //     cannot be passed.
 //
 // Algorithm: candidates are visited in Harris GROUPS. For the remaining
-// candidates, theta_k = min_j (max(d_feas_j, 0) + slack) / |alpha_rj|; the
+// candidates, theta_k = min_j max(d_feas_j + slack, 0) / |alpha_rj|; the
 // group is every remaining candidate with ratio <= theta_k. A group is passed
 // (all of it flipped) while the slope stays positive and no member is
 // non-flippable; otherwise it is the FINAL group and the pivot is its member
@@ -76,7 +76,7 @@ struct DualRatioWorkspace {
     std::vector<core::f64> alpha_signed;
     std::vector<core::f64> dual;
     std::vector<core::f64> ratio;      // te  = max(d_feas, 0) / |alpha|
-    std::vector<core::f64> relaxed;    // tb  = (max(d_feas, 0) + slack) / |alpha|
+    std::vector<core::f64> relaxed;    // tb  = max(d_feas + slack, 0) / |alpha|
     std::vector<core::f64> range;      // hi - lo for boxed, +inf otherwise
     std::vector<std::uint8_t> wrong_sign;
     std::vector<core::Index> order;    // indices sorted by ratio

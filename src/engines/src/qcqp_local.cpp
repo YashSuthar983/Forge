@@ -46,6 +46,7 @@
 // judged only by evaluate_qcqp on the ORIGINAL model (feasibility within
 // feas_tol), and reported as Status::Feasible at best.
 #include "sor/engines/dual_simplex.hpp"
+#include "sor/core/env_switches.hpp"
 #include "sor/engines/qcqp.hpp"
 #include "sor/la/ldlt.hpp"
 #include "sor/model/lp.hpp"
@@ -686,8 +687,7 @@ LocalRun LocalIpm::run(std::vector<f64> x, int max_it, f64 tol, Clock::time_poin
     // instances; whichever wins on the FULL 52-sweep gets hardcoded and the
     // env-var plumbing can be deleted then.
     const int kStallWindow = [] {
-        if (const char* e = std::getenv("SOR_STALL_WINDOW")) { try { return std::stoi(e); } catch (...) {} }
-        return 40;
+        return core::env_switches().stall_window > 0 ? core::env_switches().stall_window : 40;
     }();
     constexpr f64 kStallMinDecrease = 0.10;
     // RESTART ON STALL.  The paper's answer to a line search that keeps
@@ -784,8 +784,7 @@ LocalRun LocalIpm::run(std::vector<f64> x, int max_it, f64 tol, Clock::time_poin
             // cannot eat the whole multi-start budget.
             if (!nested_) {
                 static const long kRestoMs = [] {
-                    if (const char* e = std::getenv("SOR_RESTO_MS")) { try { return std::stol(e); } catch (...) {} }
-                    return 500L;
+                    return core::env_switches().resto_ms > 0 ? core::env_switches().resto_ms : 500L;
                 }();
                 const auto resto_dl = std::min(deadline, Clock::now() + std::chrono::milliseconds(kRestoMs));
                 std::vector<f64> xcur(z.begin(), z.begin() + n);

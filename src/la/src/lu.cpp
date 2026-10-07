@@ -1,4 +1,5 @@
 #include "sor/la/lu.hpp"
+#include "sor/core/env_switches.hpp"
 #include "sor/la/basis_numerics.hpp"
 #include "sor/la/ldlt.hpp"
 #include "dense_lu.hpp"
@@ -124,7 +125,7 @@ bool BasisFactor::factorize(Index m,
     stats_ = LuStats{};
     stats_.dimension = m;
     stats_.input_nnz = static_cast<Offset>(row_idx.size());
-    force_comparison_sort_ = std::getenv("SOR_LU_COMPARISON_SORT") != nullptr;
+    force_comparison_sort_ = core::env_switches().lu_comparison_sort;
 
     piv_row_.clear();  piv_slot_.clear();  piv_val_.clear();
     u_off_.clear();    u_len_.clear();     u_cap_.clear();
@@ -1971,9 +1972,9 @@ namespace {
 // is not worth defending. Off, this costs nothing at all.
 #ifdef SOR_LU_UPDATE_LOG_ENABLED
 std::FILE* const g_lu_update_log = [] {
-    const char* path = std::getenv("SOR_LU_UPDATE_LOG");
-    if (!path) return static_cast<std::FILE*>(nullptr);
-    std::FILE* f = std::fopen(path, "w");
+    const std::string& path = core::env_switches().lu_update_log;
+    if (path.empty()) return static_cast<std::FILE*>(nullptr);
+    std::FILE* f = std::fopen(path.c_str(), "w");
     if (f)
         std::fputs("# kind update spike_nnz bump_width delta_nnz u_nnz "
                    "factor_nnz max_atilde tiny_nnz\n", f);

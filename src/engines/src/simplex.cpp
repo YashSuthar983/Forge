@@ -1,4 +1,5 @@
 #include "sor/engines/simplex.hpp"
+#include "sor/core/env_switches.hpp"
 #include "sor/la/basis_numerics.hpp"
 #include "sor/engines/dual_simplex.hpp"
 #include "simplex_prepared.hpp"
@@ -260,7 +261,7 @@ void rematerialize_original(const model::LpProblem& original,
         accum_dual(i, true, static_cast<f64>(ax[sz(i)]), pmin.row_lo[sz(i)], pmin.row_hi[sz(i)],
                    yout[sz(i)]);
     diag.dual_residual = dres;
-    if (std::getenv("SOR_PRESOLVE_TRACE_RECOVERY") != nullptr && dres_index >= 0) {
+    if (core::env_switches().presolve_trace_recovery && dres_index >= 0) {
         std::fprintf(stderr,
                      "presolve recovery max dual residual: %s %d value %.17g "
                      "bounds [%.17g, %.17g] reduced %.17g violation %.17g\n",
@@ -356,6 +357,7 @@ void accumulate_work(SimplexDiagnostics& total,
     total.cycling_recovered += stage.cycling_recovered;
     total.cost_shifts += stage.cost_shifts;
     total.wrong_sign_entering_shifts += stage.wrong_sign_entering_shifts;
+    total.wrong_sign_backward_steps += stage.wrong_sign_backward_steps;
     total.cost_shift_max = std::max(total.cost_shift_max, stage.cost_shift_max);
     total.primal_cleanups += stage.primal_cleanups;
     total.primal_cleanup_iterations += stage.primal_cleanup_iterations;
@@ -431,6 +433,7 @@ void accumulate_work(SimplexDiagnostics& total,
     total.presolve_ms += stage.presolve_ms;
     total.presolve_retries += stage.presolve_retries;
     total.lifted_basis_rejections += stage.lifted_basis_rejections;
+    total.residual_checks += stage.residual_checks;
     total.ftran_seeded_sparse_calls += stage.ftran_seeded_sparse_calls;
     total.ftran_seeded_dense_calls += stage.ftran_seeded_dense_calls;
     total.ftran_unseeded_calls += stage.ftran_unseeded_calls;
@@ -518,6 +521,7 @@ void install_work_totals(SimplexDiagnostics& chosen,
     chosen.stall_perturbations = total.stall_perturbations;
     chosen.cost_shifts = total.cost_shifts;
     chosen.wrong_sign_entering_shifts = total.wrong_sign_entering_shifts;
+    chosen.wrong_sign_backward_steps = total.wrong_sign_backward_steps;
     chosen.cost_shift_max = total.cost_shift_max;
     chosen.primal_cleanups = total.primal_cleanups;
     chosen.primal_cleanup_iterations = total.primal_cleanup_iterations;
@@ -596,6 +600,7 @@ void install_work_totals(SimplexDiagnostics& chosen,
     chosen.presolve_ms = total.presolve_ms;
     chosen.presolve_retries = total.presolve_retries;
     chosen.lifted_basis_rejections = total.lifted_basis_rejections;
+    chosen.residual_checks = total.residual_checks;
     chosen.ftran_seeded_sparse_calls = total.ftran_seeded_sparse_calls;
     chosen.ftran_seeded_dense_calls = total.ftran_seeded_dense_calls;
     chosen.ftran_unseeded_calls = total.ftran_unseeded_calls;
@@ -1009,18 +1014,18 @@ core::RawResult solve_primal_simplex_prepared(
     const auto t_all = Clock::now();
     const bool time_detail = opts.verbose;   // see the note on clock cost below
     const bool force_dense_primal_btran =
-        std::getenv("SOR_PRIMAL_DENSE_BTRAN") != nullptr;
+        core::env_switches().primal_dense_btran;
     const bool force_dense_primal_ftran =
-        std::getenv("SOR_PRIMAL_DENSE_FTRAN") != nullptr;
+        core::env_switches().primal_dense_ftran;
     const bool force_phase1_full_rebuild =
-        std::getenv("SOR_PRIMAL_PHASE1_FULL_REBUILD") != nullptr;
+        core::env_switches().primal_phase1_full_rebuild;
     const bool verify_phase1_composite =
-        std::getenv("SOR_PRIMAL_VERIFY_COMPOSITE") != nullptr;
+        core::env_switches().primal_verify_composite;
     const bool force_primal_full_scan =
-        std::getenv("SOR_PRIMAL_FULLSCAN") != nullptr;
+        core::env_switches().primal_fullscan;
 #ifdef NDEBUG
     const bool verify_primal_heap =
-        std::getenv("SOR_PRIMAL_VERIFY_HEAP") != nullptr;
+        core::env_switches().primal_verify_heap;
 #else
     const bool verify_primal_heap = true;
 #endif
@@ -1418,8 +1423,14 @@ core::RawResult solve_primal_simplex_prepared(
         }
     };
 
+    // True while cB holds the phase-1 costs of the current xB and bounds.
+    // The post-pivot inspection keeps them so (it visits every row whose xB
+    // moved), so the loop top reclassifies all m rows only after xB was
+    // recomputed or the phase changed.
+    bool phase1_costs_current = false;
     const auto recompute_xB = [&]() {
         SOR_FN();
+        phase1_costs_current = false;
         std::fill(rhs.begin(), rhs.end(), 0.0);
         for (const Index j : nonbasic) {
             const f64 vj = value[sz(j)];
@@ -1876,8 +1887,8 @@ core::RawResult solve_primal_simplex_prepared(
      // Debug/profiling (P2 trace-diff): SOR_PRIMAL_TRACE=<file> dumps one
      // line per committed pivot. Opened once; closed at loop exit.
      std::FILE* trace_fp = nullptr;
-     if (const char* tp = std::getenv("SOR_PRIMAL_TRACE"))
-         trace_fp = std::fopen(tp, "a");
+     if (!core::env_switches().primal_trace.empty())
+         trace_fp = std::fopen(core::env_switches().primal_trace.c_str(), "a");
      if (trace_fp)
          std::fprintf(trace_fp, "# begin primal rows=%d cols=%d warm=%d limit=%llu time=%.9g\n",
                       m, ns, warm_installed ? 1 : 0,
@@ -1971,19 +1982,27 @@ core::RawResult solve_primal_simplex_prepared(
         // invalidates d[] exactly when that piecewise-linear objective changes;
         // otherwise the ordinary pivotal-row update remains exact and a full
         // BTRAN + matrix pricing pass would just reconstruct the same d[].
+        // cB was rebuilt here over all m rows on every pivot; in phase 2 it
+        // is read only by the dual rebuild below, and phase 1 keeps it
+        // current incrementally (phase1_costs_current).
         if (phase == 1) {
-            for (Index i = 0; i < m; ++i) {
-                const Index v = basis[sz(i)];
-                if (xB[sz(i)] < lo[sz(v)] - ptol[sz(v)])      cB[sz(i)] = -1.0;
-                else if (xB[sz(i)] > hi[sz(v)] + ptol[sz(v)]) cB[sz(i)] = +1.0;
-                else                                                   cB[sz(i)] =  0.0;
+            if (!phase1_costs_current) {
+                for (Index i = 0; i < m; ++i) {
+                    const Index v = basis[sz(i)];
+                    if (xB[sz(i)] < lo[sz(v)] - ptol[sz(v)])      cB[sz(i)] = -1.0;
+                    else if (xB[sz(i)] > hi[sz(v)] + ptol[sz(v)]) cB[sz(i)] = +1.0;
+                    else                                                   cB[sz(i)] =  0.0;
+                }
+                phase1_costs_current = true;
             }
             if (force_phase1_full_rebuild) d_valid = false;
         } else {
-            for (Index i = 0; i < m; ++i) cB[sz(i)] = cost[sz(basis[sz(i)])];
+            phase1_costs_current = false;
         }
 
         if (!d_valid) {
+            if (phase != 1)
+                for (Index i = 0; i < m; ++i) cB[sz(i)] = cost[sz(basis[sz(i)])];
             y = cB;
             if (time_detail) t_part = Clock::now();
             do_btran(y);
@@ -3361,7 +3380,7 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
             checked = certify::check_lp_result(problem, candidate,
                 simplex_evidence(continuation_work, continuation));
         }
-        if (std::getenv("SOR_CERTIFICATE_DEBUG"))
+        if (core::env_switches().certificate_debug)
             std::fprintf(stderr, "[certificate-continuation] status=%s reason=%s pivots=%llu primal=%.9g dual=%.9g gap=%.9g\n",
                 core::to_string(candidate.proposed_status).data(), candidate.termination_reason.c_str(),
                 static_cast<unsigned long long>(continuation_work.iterations),
@@ -3539,7 +3558,7 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
             (opts.exact_proof && diag.dual_bound_finite && diag.gap_rel > opts.gap_tol);
         if (used_presolve && !presolved_proved && search_or_lift_needs_retry &&
             (opts.max_iterations == 0 || diag.iterations < opts.max_iterations) &&
-            std::getenv("SOR_PRESOLVE_NO_RETRY") == nullptr &&
+            !core::env_switches().presolve_no_retry &&
             (opts.time_limit_s <= 0.0 || retry_time_left > 0.0) &&
             (raw.proposed_status == core::Status::Optimal ||
              raw.proposed_status == core::Status::Feasible || terminal_needs_retry)) {

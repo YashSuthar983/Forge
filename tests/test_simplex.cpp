@@ -5,6 +5,7 @@
 // refuse to claim Optimal when it should not". A solver that is right on afiro
 // and wrong about infeasibility is worse than useless.
 #include "sor/certify/finalize.hpp"
+#include "sor/core/env_switches.hpp"
 #include "sor/engines/dual_simplex.hpp"
 #include "sor/engines/farkas.hpp"
 #include "sor/engines/lp.hpp"
@@ -52,12 +53,14 @@ public:
             old_ = old;
         }
         ::setenv(name, value, 1);
+        sor::core::reload_env_switches();
     }
 
     ~ScopedEnvironment() {
         SOR_FN();
         if (had_old_) ::setenv(name_.c_str(), old_.c_str(), 1);
         else ::unsetenv(name_.c_str());
+        sor::core::reload_env_switches();
     }
 
     ScopedEnvironment(const ScopedEnvironment&) = delete;
@@ -220,6 +223,66 @@ void test_maximization_offset_is_reported_in_model_sense() {
             sor::certify::check_lp_candidate(lp, std::move(raw), ev));
         CHECK_NEAR(r.objective, 21.0, 1e-5);
     }
+}
+
+// With m >= 4096 the dual keeps a candidate set for CHUZR instead of
+// scanning every row each pivot. It must choose exactly what the full scan
+// chooses: verified on every pivot here, and the run must match a forced
+// full-scan run pivot for pivot.
+void test_candidate_chuzr_matches_full_scan() {
+    SOR_FN();
+    constexpr Index m = 5000, n = 7000;
+    std::vector<Index> rows, cols;
+    std::vector<f64> vals;
+    std::uint32_t state = 12345u;
+    const auto next = [&state]() { state = state * 1664525u + 1013904223u; return state >> 8; };
+    for (Index j = 0; j < n; ++j) {
+        const Index count = 2 + static_cast<Index>(next() % 3);
+        for (Index t = 0; t < count; ++t) {
+            rows.push_back(static_cast<Index>(next() % static_cast<std::uint32_t>(m)));
+            cols.push_back(j);
+            vals.push_back(0.5 + static_cast<f64>(next() % 8) / 4.0);
+        }
+    }
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(m, n, rows, cols, vals);
+    lp.c.resize(n);
+    for (Index j = 0; j < n; ++j) lp.c[static_cast<std::size_t>(j)] = 1.0 + static_cast<f64>(next() % 10);
+    lp.col_lo.assign(n, 0.0);
+    lp.col_hi.assign(n, 10.0);
+    lp.row_lo.assign(m, -sor::model::kInf);
+    lp.row_hi.assign(m, sor::model::kInf);
+    // A covering row needs at least one column; rows that drew none stay free.
+    std::vector<int> row_count(static_cast<std::size_t>(m), 0);
+    for (const Index i : rows) ++row_count[static_cast<std::size_t>(i)];
+    for (Index i = 0; i < m; ++i)
+        if (row_count[static_cast<std::size_t>(i)] > 0)
+            lp.row_lo[static_cast<std::size_t>(i)] = 1.0 + static_cast<f64>(next() % 3);
+    SimplexOptions opts;
+    opts.method = sor::engines::SimplexMethod::Dual;
+    opts.presolve = false;
+    Run verified, plain, full;
+    {
+        ScopedEnvironment verify("SOR_DUAL_VERIFY_CHUZR", "1");
+        verified = solve_problem(lp, opts);
+    }
+    plain = solve_problem(lp, opts);
+    {
+        ScopedEnvironment scan("SOR_DUAL_FULLSCAN_CHUZR", "1");
+        full = solve_problem(lp, opts);
+    }
+    CHECK(verified.r.status == Status::Optimal);
+    CHECK(verified.r.termination_reason.find("disagreed") == std::string::npos);
+    CHECK(plain.diag.iterations > 100);
+    CHECK(plain.diag.iterations == full.diag.iterations);
+    CHECK(verified.diag.iterations == full.diag.iterations);
+    CHECK(plain.r.objective == full.r.objective);
+    CHECK(plain.diag.chuzr_full_scans < full.diag.chuzr_full_scans);
+    // The O(nnz) drift check runs only once the pivots since the last one
+    // have done 16 times its work: on this hypersparse model that is far
+    // rarer than every 32 pivots (8 checks in about 3,300 pivots).
+    CHECK(plain.diag.residual_checks > 0);
+    CHECK(plain.diag.residual_checks * 32 * 4 < plain.diag.iterations);
 }
 
 void test_fixture_lp() {
@@ -2338,6 +2401,7 @@ int main() {
     test_empty_domain_is_infeasible();
     test_time_limit_covers_presolve_and_preparation();
     test_maximization_offset_is_reported_in_model_sense();
+    test_candidate_chuzr_matches_full_scan();
     test_fixture_lp();
     test_auto_commits_to_one_engine_without_a_discarded_probe();
     test_route_features_describe_the_model();

@@ -5,6 +5,7 @@
 // remaining stable across machines and build hosts. Every solve is still sent
 // through the independent proof gate, so a faster but incorrect path fails.
 #include "sor/certify/finalize.hpp"
+#include "sor/core/env_switches.hpp"
 #include "sor/engines/dual_edge_weights.hpp"
 #include "sor/engines/simplex.hpp"
 #include "sor/io/mps.hpp"
@@ -278,9 +279,11 @@ void test_primal_phase1_rebuilds_only_when_objective_changes() {
     // this focused run. It is deliberately off in production because it
     // performs the full work that the composite update is meant to avoid.
     setenv("SOR_PRIMAL_VERIFY_COMPOSITE", "1", 1);
+    sor::core::reload_env_switches();
     SimplexDiagnostics diag;
     auto raw = sor::engines::solve_simplex(problem, opts, diag);
     unsetenv("SOR_PRIMAL_VERIFY_COMPOSITE");
+    sor::core::reload_env_switches();
     const auto checked = sor::certify::check_lp_result(
         problem, raw, sor::engines::simplex_evidence(diag, opts));
     const auto result = sor::certify::finalize_result(std::move(raw), checked);
@@ -320,9 +323,11 @@ void test_primal_phase1_composite_sparse_and_dense_paths() {
         opts.max_iterations = 1000;
 
         setenv("SOR_PRIMAL_VERIFY_COMPOSITE", "1", 1);
+    sor::core::reload_env_switches();
         SimplexDiagnostics diag;
         auto raw = sor::engines::solve_simplex(problem, opts, diag);
         unsetenv("SOR_PRIMAL_VERIFY_COMPOSITE");
+    sor::core::reload_env_switches();
         const auto checked = sor::certify::check_lp_result(
             problem, raw, sor::engines::simplex_evidence(diag, opts));
         const auto result = sor::certify::finalize_result(std::move(raw), checked);

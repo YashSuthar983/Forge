@@ -1,4 +1,5 @@
 #include "sor/certify/finalize.hpp"
+#include "sor/core/env_switches.hpp"
 #include "padic_solve.hpp"
 #include "sor/la/lu.hpp"
 #include "sor/sparse/csc.hpp"
@@ -170,7 +171,7 @@ bool solve_basis_transpose(const model::LpProblem& p,
             [&](std::size_t, const std::vector<std::vector<Rational>>& solved_so_far) {
                 return !direction_needed || direction_needed(solved_so_far[0]);
             });
-        if (std::getenv("SOR_CERTIFICATE_DEBUG"))
+        if (core::env_switches().certificate_debug)
             std::fprintf(stderr, "exact certificate: p-adic m=%zu %s ops=%llu lifts=%llu attempts=%llu den_bits=%zu elapsed=%.6f\n",
                 m, lifted ? "solved" : stats.declined ? "declined" : "fell back", static_cast<unsigned long long>(stats.operations),
                 static_cast<unsigned long long>(stats.lifting_steps),
@@ -225,7 +226,7 @@ bool solve_basis_transpose(const model::LpProblem& p,
             }
             for (const auto& [j, v] : rows[chosen]) {
                 if (++operations > policy.max_operations || ((operations % 16) == 0 && expired())) {
-                    if (std::getenv("SOR_CERTIFICATE_DEBUG")) std::fprintf(stderr, "exact certificate: operation limit m=%zu step=%zu\n", m, step);
+                    if (core::env_switches().certificate_debug) std::fprintf(stderr, "exact certificate: operation limit m=%zu step=%zu\n", m, step);
                     return false;
                 }
                 auto& entry = rows[r][j];
@@ -248,7 +249,7 @@ bool solve_basis_transpose(const model::LpProblem& p,
             for (const auto& [j, value] : rows[r]) {
                 (void)j;
                 if (value != 0 && boost::multiprecision::msb(value < 0 ? -value : value) > policy.max_bits) {
-                    if (std::getenv("SOR_CERTIFICATE_DEBUG")) std::fprintf(stderr, "exact certificate: integer size limit m=%zu step=%zu\n", m, step);
+                    if (core::env_switches().certificate_debug) std::fprintf(stderr, "exact certificate: integer size limit m=%zu step=%zu\n", m, step);
                     return false;
                 }
             }
@@ -734,7 +735,7 @@ bool repair_basis_certificate(const model::LpProblem& problem, core::RawResult& 
         const core::RawResult& raw;
         std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
         ~Trace() {
-            if (std::getenv("SOR_CERTIFICATE_DEBUG"))
+            if (core::env_switches().certificate_debug)
                 std::fprintf(stderr, "exact certificate: m=%d n=%d witness=%zu elapsed=%.6f\n",
                     problem.n_rows(), problem.n_cols(), raw.exact_dual.size(),
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
@@ -943,7 +944,7 @@ SafeLpBound lower_bound_from_terms(const model::LpProblem& p,
         if (yi == 0) continue;
         const double side = yi > 0 ? p.row_lo[i] : p.row_hi[i];
         if (!std::isfinite(side)) {
-            if (std::getenv("SOR_CERTIFICATE_DEBUG")) std::fprintf(stderr, "exact certificate: unsupported row %zu\n", i);
+            if (core::env_switches().certificate_debug) std::fprintf(stderr, "exact certificate: unsupported row %zu\n", i);
             return out;
         }
         bound.add_scaled_product(side, yi);
@@ -956,7 +957,7 @@ SafeLpBound lower_bound_from_terms(const model::LpProblem& p,
             if (implied.first.empty()) implied = implied_lp_column_bounds(p);
             side = sign > 0 ? implied.first[j] : implied.second[j];
             if (!std::isfinite(side)) {
-                if (std::getenv("SOR_CERTIFICATE_DEBUG")) std::fprintf(stderr, "exact certificate: unsupported column %zu\n", j);
+                if (core::env_switches().certificate_debug) std::fprintf(stderr, "exact certificate: unsupported column %zu\n", j);
                 return out;
             }
             ++out.implied_bound_uses;
@@ -979,7 +980,7 @@ bool repair_dual_certificate(const model::LpProblem& problem, core::RawResult& r
     const char* reason = "";
     const bool targeted = targeted_basis_certificate(problem, raw.certificate_basis, policy,
                                                      expired, tokens, reason, &raw.x);
-    if (std::getenv("SOR_CERTIFICATE_DEBUG"))
+    if (core::env_switches().certificate_debug)
         std::fprintf(stderr, "exact certificate: targeted %s (%s) m=%d elapsed=%.6f\n",
             targeted ? "accepted" : "declined", targeted ? "" : reason, problem.n_rows(),
             std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
@@ -1000,7 +1001,7 @@ bool repair_dual_certificate(const model::LpProblem& problem, core::RawResult& r
         // dual infeasible, so the exact basis duals cannot be tighter: keep
         // this witness for the caller's gap test and continuation pricing.
         if (bound.finite) {
-            if (std::getenv("SOR_CERTIFICATE_DEBUG"))
+            if (core::env_switches().certificate_debug)
                 std::fprintf(stderr, "exact certificate: targeted witness weaker than the basis point (kept)\n");
             raw.exact_dual = std::move(tokens);
             return true;

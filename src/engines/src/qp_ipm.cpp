@@ -41,6 +41,7 @@
 // ORIGINAL data -- the same independent check PDHCG-II's claim rests on --
 // and only that check can return Optimal.
 #include "sor/engines/qp.hpp"
+#include "sor/core/env_switches.hpp"
 #include "sor/engines/qcqp.hpp"
 #include "sor/la/ldlt.hpp"
 #include "sor/sparse/csr.hpp"
@@ -597,7 +598,8 @@ Result run_ipm(const Core& k, const QpOptions& opts, Clock::time_point t0,
         // factorization can be timed and checked in isolation on a real
         // instance's system.  Read once; costs nothing when unset.
         if (it == 0)
-            if (const char* dump = std::getenv("SOR_DUMP_KKT")) la::write_sym_csc(dump, K, sign);
+            if (!core::env_switches().dump_kkt.empty())
+                la::write_sym_csc(core::env_switches().dump_kkt.c_str(), K, sign);
         const auto tf0 = Clock::now();
         const bool fac_ok = fac.factorize(K, sign, 1e-12);
         fac_ms += ms_since(tf0);

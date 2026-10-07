@@ -5,6 +5,7 @@
 // number. So every check here is against a matrix multiply the test does itself,
 // never against the factorization's own view of things.
 #include "sor/la/lu.hpp"
+#include "sor/core/env_switches.hpp"
 
 #include "test_helpers.hpp"
 
@@ -35,11 +36,13 @@ public:
         }
         if (value) ::setenv(name, value, 1);
         else ::unsetenv(name);
+        sor::core::reload_env_switches();
     }
 
     ~ScopedEnvironment() {
         if (had_old_) ::setenv(name_.c_str(), old_.c_str(), 1);
         else ::unsetenv(name_.c_str());
+        sor::core::reload_env_switches();
     }
 
     ScopedEnvironment(const ScopedEnvironment&) = delete;

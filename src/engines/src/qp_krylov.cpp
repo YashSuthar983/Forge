@@ -15,6 +15,7 @@
 // clustered.  Implemented from the textbook algorithm (Saad, Iterative
 // Methods for Sparse Linear Systems, 2nd ed., s.9.4.1).
 #include "qp_common.hpp"
+#include "sor/core/env_switches.hpp"
 
 #include "sor/core/parallel.hpp"
 
@@ -173,7 +174,7 @@ f64 fgmres_solve(const la::Ldlt& fac, const SymMul& mul, std::vector<f64>& rhs,
     // Off unless SOR_FGMRES_PROFILE is set: the interior point calls this
     // dozens of times per solve, so an unconditional print would bury the
     // solver's own output.
-    static const bool profile = std::getenv("SOR_FGMRES_PROFILE") != nullptr;
+    static const bool profile = core::env_switches().fgmres_profile;
     const f64 total_ms = ms_since(solve_start);
     if (profile && total_ms > 1.0 && (prec_ms > 0.0 || matvec_ms > 0.0)) {
         if (phase) {
