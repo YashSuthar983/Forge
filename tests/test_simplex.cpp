@@ -17,6 +17,7 @@
 #include "test_helpers.hpp"
 
 #include <cmath>
+#include <fstream>
 #include <cstdlib>
 #include <random>
 #include <sstream>
@@ -874,6 +875,39 @@ void test_basis_wellformed() {
     for (const auto s : run.basis.status)
         if (s == NonbasicStatus::Basic) ++n_basic;
     CHECK(n_basic == static_cast<std::size_t>(m));
+}
+
+// blend2's LP relaxation lifts doubleton bound transfers whose keep column
+// is basic already. The lift used to make keep basic in the removed row's
+// slot as well: seven columns sat in two slots each, and that basis went to
+// callers and to the exact certificate. The lift now gives elim the slot and
+// refuses any basis that is still malformed.
+void test_lifted_basis_is_wellformed_on_blend2() {
+    SOR_FN();
+    const std::string path = SOR_SOURCE_DIR "/benchmarks/miplib-easy/mps/blend2.mps";
+    if (!std::ifstream(path)) {
+        ::sor::test::skip("test_lifted_basis_is_wellformed_on_blend2", path);
+        return;
+    }
+    sor::io::MpsReadReport rep;
+    sor::io::MpsReadOptions ro;
+    ro.relax_integrality = true;
+    const auto lp = sor::io::read_mps_file(path, rep, ro);
+    const auto run = solve_problem(lp);
+    CHECK(run.r.status == Status::Optimal);
+    CHECK(run.diag.lifted_basis_rejections == 0);
+    const Index m = lp.n_rows();
+    CHECK(static_cast<Index>(run.basis.basic.size()) == m);
+    std::vector<int> seen(run.basis.status.size(), 0);
+    for (const Index v : run.basis.basic) {
+        CHECK(v >= 0 && v < static_cast<Index>(seen.size()));
+        if (v >= 0 && v < static_cast<Index>(seen.size())) ++seen[static_cast<std::size_t>(v)];
+    }
+    int duplicated = 0;
+    for (const int k : seen) duplicated += k > 1;
+    CHECK(duplicated == 0);
+    for (std::size_t v = 0; v < seen.size(); ++v)
+        CHECK((run.basis.status[v] == NonbasicStatus::Basic) == (seen[v] == 1));
 }
 
 void test_features_mps_agrees_with_model() {
@@ -2318,6 +2352,7 @@ int main() {
     test_optimum_acceptance_follows_exact_proof_setting();
     test_dual_stage_fallback_decision();
     test_basis_wellformed();
+    test_lifted_basis_is_wellformed_on_blend2();
     test_features_mps_agrees_with_model();
     test_infeasible();
     test_primal_phase1_exports_checked_farkas_certificate();

@@ -430,6 +430,7 @@ void accumulate_work(SimplexDiagnostics& total,
     total.dse_drift_rebuilds += stage.dse_drift_rebuilds;
     total.presolve_ms += stage.presolve_ms;
     total.presolve_retries += stage.presolve_retries;
+    total.lifted_basis_rejections += stage.lifted_basis_rejections;
     total.ftran_seeded_sparse_calls += stage.ftran_seeded_sparse_calls;
     total.ftran_seeded_dense_calls += stage.ftran_seeded_dense_calls;
     total.ftran_unseeded_calls += stage.ftran_unseeded_calls;
@@ -594,6 +595,7 @@ void install_work_totals(SimplexDiagnostics& chosen,
     chosen.dse_drift_rebuilds = total.dse_drift_rebuilds;
     chosen.presolve_ms = total.presolve_ms;
     chosen.presolve_retries = total.presolve_retries;
+    chosen.lifted_basis_rejections = total.lifted_basis_rejections;
     chosen.ftran_seeded_sparse_calls = total.ftran_seeded_sparse_calls;
     chosen.ftran_seeded_dense_calls = total.ftran_seeded_dense_calls;
     chosen.ftran_unseeded_calls = total.ftran_unseeded_calls;
@@ -3436,6 +3438,7 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         ropts.check_point = opts.exact_proof;
         const auto recovered =
             presolve::recover_solution(problem, pmap, rs, ropts);
+        if (recovered.basis_rejected) ++diag.lifted_basis_rejections;
         raw.x = recovered.raw.x;
         raw.y = recovered.raw.y;
         raw.objective = recovered.raw.objective;
