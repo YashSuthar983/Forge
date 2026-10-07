@@ -674,10 +674,16 @@ post_fixed_point:
 
     const auto kMaxAggregationRowNnz = static_cast<std::size_t>(std::max<Index>(2, options.max_aggregation_row_nnz));
     const Offset kMaxStepFill = std::max<Offset>(0, options.max_substitution_fill);
+    // Fill is bounded per substitution (kMaxStepFill) and in total (gross
+    // positive fill at most half the starting nonzeros). There used to be a
+    // third, tighter bound -- live nonzeros at most 1.1x the start -- and it
+    // was the one that bound: app1-1 stopped after 365 of the 791
+    // substitutions the other two allow (2,395 -> 610 dual pivots without it)
+    // and fastxgemm-n2r6s0t2 went from 5,900 pivots to 511. A substitution
+    // removes a row AND a column, which shrinks the basis and every pivot; a
+    // few more nonzeros per remaining row cost far less than that.
     const Offset aggregation_initial_nnz = mutable_nnz;
     const Offset max_positive_fill = aggregation_initial_nnz / 2;
-    const Offset max_live_nnz = aggregation_initial_nnz +
-                                aggregation_initial_nnz / 10;
     Offset positive_fill = 0;
 
     // `whole` (optional) is the exact activity interval of the entire row;
@@ -876,8 +882,7 @@ post_fixed_point:
                                 new_lo, new_hi});
         }
         if (!safe || step_fill > kMaxStepFill ||
-            positive_fill + step_fill > max_positive_fill ||
-            mutable_nnz + net_delta > max_live_nnz)
+            positive_fill + step_fill > max_positive_fill)
             continue;
 
         EqualityAggregation recovery;
