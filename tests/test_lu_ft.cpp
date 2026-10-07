@@ -20,7 +20,9 @@
 // wrong matrix, (2) passes while a mirror silently rots until the update that
 // finally reads the rotten part.
 #include <cstdlib>
+#include <cstdio>
 #include "sor/la/lu.hpp"
+#include "sor/core/parallel.hpp"
 
 #include "test_helpers.hpp"
 
@@ -355,6 +357,57 @@ void test_sparse_and_dense_paths_agree_after_updates() {
             CHECK(max_abs_diff(b.apply_t(y), e) <= 1e-7);
         }
     }
+}
+
+// The hypersparse and dense kernels must agree BIT FOR BIT, not just to
+// rounding: FTRAN/BTRAN choose between them from the history of earlier solves
+// (per-scratch density tables), so a serial run, a rerun and a parallel worker
+// with a fresh scratch can take different paths for the same input. Each
+// right-hand side is solved once with each path forced, on random factors
+// with Forrest-Tomlin updates (so U's elimination order is not the index
+// order), and the answers must be identical. The hypersparse runs are counted
+// so the comparison cannot pass by both sides falling back to dense.
+void test_path_choice_never_changes_the_answer() {
+    std::mt19937 rng(4242u);
+    int hypersparse_runs = 0;
+    for (const f64 density : {0.004, 0.008, 0.015}) {
+        const Index m = 300;
+        ColMat b = random_basis(m, density, rng);
+        BasisFactor f;
+        if (!factorize(f, b)) continue;
+        for (int step = 0; step < 40; ++step) {
+            std::vector<Index> rows;
+            std::vector<f64> vals;
+            gen_column(m, step, rng, rows, vals);
+            do_update(f, b, static_cast<Index>((step * 13 + 5) % m), rows, vals);
+            if (step % 8 != 7) continue;
+            for (Index unit = 0; unit < m; unit += 7) {
+                std::vector<f64> e(static_cast<std::size_t>(m), 0.0);
+                e[static_cast<std::size_t>(unit)] = 1.0;
+                e[static_cast<std::size_t>((unit * 5 + 3) % m)] += 0.3;
+                for (const bool trans : {false, true}) {
+                    std::vector<f64> hyper = e, dense = e;
+                    std::vector<Index> support;
+                    f.set_solve_path_for_testing(BasisFactor::SolvePath::Hypersparse);
+                    const std::uint64_t before = f.hypersparse_solves();
+                    if (trans) f.btran_with_support(hyper, support);
+                    else       f.ftran_with_support(hyper, support);
+                    if (f.hypersparse_solves() > before) ++hypersparse_runs;
+                    // The support variant may leave slots outside its
+                    // support stale; compare on the support alone.
+                    std::vector<f64> full(static_cast<std::size_t>(m), 0.0);
+                    for (const Index i : support)
+                        full[static_cast<std::size_t>(i)] = hyper[static_cast<std::size_t>(i)];
+                    hyper = full;
+                    f.set_solve_path_for_testing(BasisFactor::SolvePath::Dense);
+                    if (trans) f.btran(dense); else f.ftran(dense);
+                    CHECK(hyper == dense);
+                }
+            }
+        }
+        f.set_solve_path_for_testing(BasisFactor::SolvePath::Auto);
+    }
+    CHECK(hypersparse_runs > 100);
 }
 
 // ftran_with_support() promises the SAME values as ftran() on the slots it
@@ -884,6 +937,7 @@ int main() {
     test_long_update_chain();
     test_ftran_btran_are_transposes();
     test_sparse_and_dense_paths_agree_after_updates();
+    test_path_choice_never_changes_the_answer();
     test_support_variant_matches_plain_ftran();
     test_storage_growth_and_compaction();
     test_spike_capture_beats_recomputed_u_alpha();

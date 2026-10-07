@@ -48,6 +48,8 @@
 #include <cstdint>
 #include <string>
 #include <type_traits>
+#include <memory>
+#include <array>
 #include <vector>
 
 namespace sor::core { class ThreadPool; }
@@ -135,6 +137,95 @@ struct SpikeCapture {
 // index -- the caller owns that mapping). Vectors passed to ftran/btran are
 // indexed by row for the input of ftran and by basis slot for its output; see
 // each method.
+// Everything a solve writes. A factor is only read by FTRAN/BTRAN, so
+// solves on one factor may run concurrently, each with its own scratch
+// (solve_batch); the factor keeps one for ordinary calls. Each scratch is
+// tied to one factorization (factor_gen) and reset for the next.
+// One node of a depth-first traversal: the node and its children still to
+// visit.
+struct DfsFrame {
+    Index node = -1;
+    const Index* cur = nullptr;
+    const Index* end = nullptr;
+};
+
+struct SolveScratch {
+    std::vector<f64> work_;        // primary solve scratch, size m
+    std::vector<f64> pair_work_;   // second dense FTRAN RHS, size m
+    std::vector<char> mark_;                // DFS marks, size n
+    std::vector<Index> dfs_stack_, reach_, order_, seed_;  // DFS scratch
+    std::vector<DfsFrame> dfs_frames_;  // post-order DFS path
+    // sort_support() scratch: radix staging, and a bitmap of m bits that is
+    // all zero between calls.
+    std::vector<Index> sort_tmp_;
+    std::vector<std::uint64_t> sort_bits_;
+    // Slot-space support stamps for ftran_with_support's partial-write eta
+    // loop (O(1) "is this slot in the current support" tests; a fresh
+    // generation per call).
+    std::vector<std::uint32_t> support_stamp_;  // size m (slot space)
+    std::uint32_t support_gen_ = 0;
+    // Position-space stamps for capture_spike()'s de-duplication: the seed it
+    // reads is a union (L reach + row-eta touches) and may repeat a position.
+    std::vector<std::uint32_t> spike_stamp_;
+    std::uint32_t spike_gen_ = 0;
+    // Firing-set worklist membership stamps for btran_impl (fresh generation
+    // per call; indexed by eta number).
+    std::vector<std::uint32_t> fire_stamp_;
+    std::uint32_t fire_gen_ = 0;
+    // Reusable buffers for btran_impl's firing set. These were fresh
+    // std::vectors per call, i.e. two heap allocations on every BTRAN (50k+
+    // per HUGE solve).
+    std::vector<Index> fire_input_seed_;
+    std::vector<Index> fire_heap_;
+    // Slots written by the firing-set eta pass. The seeded BTRAN permute needs
+    // these on top of the caller's declared input seed, because a fired eta
+    // writes its pivot slot and that slot then feeds the U' solve.
+    std::vector<Index> fire_touched_;
+    // Seeded-solve bookkeeping. The classic permute overwrites every entry of
+    // work_, so it can be read blind; a SEEDED permute writes only the seeded
+    // pivot positions and therefore requires work_ to be zero everywhere else.
+    // work_dirty_ lists the pivot positions written since the last clear, and
+    // work_all_dirty_ records that a dense/classic pass wrote all of work_ (so
+    // the next seeded call must pay one full clear before it can trust it).
+    std::vector<Index> work_dirty_;
+    bool work_all_dirty_ = true;
+    // Positions the row-eta passes turned nonzero, folded into work_dirty_ so a
+    // seeded solve still knows exactly what it must clear.
+    std::vector<Index> row_eta_touched_;
+    // Predicted OUTPUT density of a solve, by the size of its input: entry b
+    // holds a running average of nnz(out)/n over solves whose sparse input
+    // had bit_width(nnz(in)) == b. A hypersparse solve pays a DFS for its
+    // reach before any arithmetic, and pays it again when the reach outgrows
+    // the cutoff; once the output is a sizeable fraction of n, one zero-
+    // skipping pass in elimination order is cheaper. Keyed by input size
+    // because one caller mixes very different solves in one scratch: the
+    // dual's entering column (a few nonzeros) and its DSE tau (thousands).
+    std::array<f64, 33> ftran_density_{};
+    std::array<f64, 33> btran_density_{};
+    // Solves whose final triangular solve took the reach-set path.
+    std::uint64_t hypersparse_solves_ = 0;
+    // Solve work since the factorization (see work_since_factor()).
+    Offset work_since_factor_ = 0;
+    std::uint64_t factor_gen = 0;
+};
+
+// The factorization's elimination workspace (defined in lu.cpp), kept with
+// the factor so a refactorization reuses its storage. A copied factor gets
+// an empty one of its own: workspaces are never shared.
+struct FactorWorkspace;
+class FactorWorkspaceHolder {
+public:
+    FactorWorkspaceHolder();
+    ~FactorWorkspaceHolder();
+    FactorWorkspaceHolder(const FactorWorkspaceHolder&);
+    FactorWorkspaceHolder& operator=(const FactorWorkspaceHolder&);
+    FactorWorkspaceHolder(FactorWorkspaceHolder&&) noexcept;
+    FactorWorkspaceHolder& operator=(FactorWorkspaceHolder&&) noexcept;
+    FactorWorkspace& get();
+private:
+    std::unique_ptr<FactorWorkspace> ws_;
+};
+
 class BasisFactor {
 public:
     // Factorize the matrix given column-wise (col_ptr/row_idx/vals, length m
@@ -162,12 +253,13 @@ public:
     void ftran(std::vector<f64>& b, SpikeCapture* spike = nullptr) const;
 
     // Same solve, additionally returning an over-approximation of the
-    // nonzero support of the slot-indexed result when the final U solve
-    // stayed hypersparse (U-reach plus eta-touched positions; entries may
-    // be zero, so downstream loops still guard on the value). Returns false
-    // (and clears `support`) when the dense path was selected. PARTIAL-WRITE
-    // contract in the sparse case: only the reach slots of b are written
-    // (values bit-identical to ftran()'s); everything else is left STALE.
+    // nonzero support of the slot-indexed result (on the hypersparse path the
+    // U-reach plus eta-touched positions, whose entries may be zero, so
+    // downstream loops still guard on the value; on the dense path the exact
+    // nonzeros, with every other slot written as zero). Always returns true.
+    // PARTIAL-WRITE contract on the hypersparse path: only the reach slots of
+    // b are written (values bit-identical to ftran()'s); everything else is
+    // left STALE.
     // Valid only for callers that reset the previous support (and their
     // scatter rows) before the next call -- the dual engine's alpha
     // discipline maintains exactly that.
@@ -207,14 +299,24 @@ public:
     // Independent candidate solves, using one private factor/scratch copy per
     // worker because FTRAN/BTRAN mutate traversal workspace even when const.
     // Null pool executes serially. Optional FTRAN spikes preserve FT updates.
+    // Which triangular-solve path FTRAN/BTRAN take for a sparse input. Auto
+    // chooses from the scratch's density history; the other two exist so a
+    // test can run both paths on one input and demand identical answers,
+    // which is the property that makes a history-dependent choice safe.
+    enum class SolvePath { Auto, Hypersparse, Dense };
+    void set_solve_path_for_testing(SolvePath path) noexcept { solve_path_ = path; }
+    // Ordinary (non-batch) solves that took the reach-set path, since the
+    // factor was created.
+    std::uint64_t hypersparse_solves() const noexcept { return scratch_.hypersparse_solves_; }
+
     void solve_batch(std::vector<std::vector<f64>>& rhs, core::ThreadPool* pool = nullptr,
                      bool transpose = false, std::vector<SpikeCapture>* spikes = nullptr) const;
 
     // Same solve, additionally returning the nonzero support of the
-    // row-indexed result when the final L' solve stayed hypersparse.
-    // Returns false (and clears `support`) when the dense path was selected.
-    // This lets the dual form rho'A without rescanning all m rows after
-    // BTRAN. PARTIAL-WRITE contract (sparse case): only the reach rows of d
+    // row-indexed result, on the hypersparse and the dense path alike (the
+    // dense path writes zeros everywhere else). Always returns true. This
+    // lets the dual form rho'A without rescanning all m rows after BTRAN.
+    // PARTIAL-WRITE contract (hypersparse path): only the reach rows of d
     // are written (values bit-identical); the caller MUST zero the previous
     // support AND the previous input seed slot before the next call -- see
     // the dual engine's rho discipline.
@@ -331,17 +433,23 @@ public:
         add(uord_); add(upos_);
         add(u_cstart_); add(u_clen_); add(u_ccap_); add(u_crow_); add(u_cval_);
         add(r_pos_); add(r_start_); add(r_idx_); add(r_val_);
-        add(spike_stamp_);
         add(ft_atilde_); add(ft_v_); add(ft_support_); add(ft_vsupport_);
         add(ft_seed_); add(ft_stamp_); add(ft_move_idx_); add(ft_move_val_);
-        add(l_start_); add(l_idx_); add(l_val_); add(l_col_start_); add(l_col_row_);
+        add(l_start_); add(l_idx_); add(l_val_); add(l_col_start_); add(l_col_row_); add(l_row_val_);
         add(eta_p_); add(eta_start_); add(eta_idx_); add(eta_val_); add(eta_pivot_);
-        add(work_); add(pair_work_); add(mark_); add(dfs_stack_); add(reach_);
-        add(order_); add(seed_); add(support_stamp_);
         for (const auto& r : rev_) total += r.capacity() * sizeof(Index);
         total += rev_.capacity() * sizeof(std::vector<Index>);
-        add(fire_stamp_); add(fire_input_seed_); add(fire_heap_);
-        add(fire_touched_); add(work_dirty_); add(row_eta_touched_);
+        const auto add_scratch = [&add](const SolveScratch& sc) {
+            add(sc.work_); add(sc.pair_work_); add(sc.mark_); add(sc.dfs_stack_);
+            add(sc.reach_); add(sc.order_); add(sc.seed_); add(sc.dfs_frames_);
+            add(sc.sort_tmp_); add(sc.sort_bits_);
+            add(sc.support_stamp_);
+            add(sc.spike_stamp_); add(sc.fire_stamp_); add(sc.fire_input_seed_);
+            add(sc.fire_heap_); add(sc.fire_touched_); add(sc.work_dirty_);
+            add(sc.row_eta_touched_);
+        };
+        add_scratch(scratch_);
+        for (const auto& sc : worker_scratch_) add_scratch(sc);
         return total;
     }
 
@@ -354,7 +462,7 @@ public:
     // longer a net loss even if the eta file / bump width triggers haven't
     // individually fired yet -- this is the trigger that actually tracks
     // solve COST, where the other two track proxies for it.
-    Offset work_since_factor() const noexcept { return work_since_factor_; }
+    Offset work_since_factor() const noexcept { return scratch_.work_since_factor_; }
     bool  is_valid()   const noexcept { return valid_; }
     const LuStats& stats() const noexcept { return stats_; }
 
@@ -392,22 +500,25 @@ private:
     // coordinates). Marks are set on success and left cleared on failure,
     // when the reach outgrew `dense_below_` and the dense solve is cheaper.
     // reach_ (the marked positions) and mark_ are valid on success only.
-    bool sparse_lower(const std::vector<Index>& seed, std::vector<f64>& v) const;
-    bool sparse_upper(const std::vector<Index>& seed, std::vector<f64>& v) const;
-    bool sparse_upper_t(const std::vector<Index>& seed, std::vector<f64>& v) const;
-    bool sparse_lower_t(const std::vector<Index>& seed, std::vector<f64>& v) const;
+    void order_by_elimination(SolveScratch& sc) const;   // reach -> order_
+    bool sparse_lower(SolveScratch& sc, const std::vector<Index>& seed, std::vector<f64>& v) const;
+    bool sparse_upper(SolveScratch& sc, const std::vector<Index>& seed, std::vector<f64>& v) const;
+    bool sparse_upper_t(SolveScratch& sc, const std::vector<Index>& seed, std::vector<f64>& v) const;
+    bool sparse_lower_t(SolveScratch& sc, const std::vector<Index>& seed, std::vector<f64>& v) const;
 
     // seed_rows / seed_slots: caller-declared INPUT nonzero positions, or
     // null for the classic self-scanning path.
-    bool ftran_impl(std::vector<f64>& b, std::vector<Index>* support,
+    bool ftran_impl(SolveScratch& sc, std::vector<f64>& b, std::vector<Index>* support,
                     const std::vector<Index>* seed_rows,
                     SpikeCapture* spike = nullptr) const;
     // Record work_ between the row etas and the U solve -- the exact spike.
-    void capture_spike(SpikeCapture& out, bool have_seed) const;
-    bool btran_impl(std::vector<f64>& d, std::vector<Index>* support,
+    void capture_spike(SolveScratch& sc, SpikeCapture& out, bool have_seed) const;
+    bool btran_impl(SolveScratch& sc, std::vector<f64>& d, std::vector<Index>* support,
                     const std::vector<Index>* seed_slots) const;
 
     void build_col_patterns();
+    // Size and clear a scratch for the current factorization.
+    void reset_scratch(SolveScratch& sc) const;
 
     // ---- Forrest-Tomlin helpers -------------------------------------------
     // Row/column edits on U's two mirrored stores. Each pair keeps the other
@@ -429,8 +540,6 @@ private:
     // Sort a reach set into U's elimination order. While u_reordered_ is false
     // that is the index order and this is the plain sort the hypersparse
     // kernels always did; afterwards it is a sort on upos_.
-    void sort_by_elimination_order(std::vector<Index>& v) const;
-    void sort_by_index_order(std::vector<Index>& v) const;
 
     // Row etas, in position coordinates. `touched` (optional) collects the
     // positions each pass may have turned nonzero, which is what a seeded
@@ -443,7 +552,11 @@ private:
     Index m_ = 0;
     bool valid_ = false;
     Index bump_width_ = 0;  // current_bump_width(); 0 until update_ft() runs
-    mutable Offset work_since_factor_ = 0;  // work_since_factor(); reset by factorize()
+    FactorWorkspaceHolder workspace_;
+    // The scratch of ordinary solves, and one per solve_batch worker.
+    mutable SolveScratch scratch_;
+    mutable std::vector<SolveScratch> worker_scratch_;
+    std::uint64_t factor_gen_ = 0;  // bumped by factorize()
 
     // Pivot sequence. Pivot k sits at (piv_row_[k], piv_slot_[k]) with value
     // piv_val_[k]. rpos_/cpos_ are the inverse maps, row/slot -> pivot order.
@@ -516,10 +629,6 @@ private:
     std::vector<Index>  r_idx_;
     std::vector<f64>    r_val_;
 
-    // Position-space stamps for capture_spike()'s de-duplication: the seed it
-    // reads is a union (L reach + row-eta touches) and may repeat a position.
-    mutable std::vector<std::uint32_t> spike_stamp_;
-    mutable std::uint32_t spike_gen_ = 0;
 
     // update_ft() scratch, kept as members so an update costs no allocation.
     std::vector<f64>   ft_atilde_, ft_v_;
@@ -541,6 +650,9 @@ private:
     // Built once by build_col_patterns(); no update path touches L.
     std::vector<Offset> l_col_start_;
     std::vector<Index>  l_col_row_;
+    // ...with values: L by rows, which turns L' w = v into a scatter that
+    // skips zeros (sparse and dense alike) instead of a gather over all of L.
+    std::vector<f64>    l_row_val_;
 
     // Eta file: update k replaced basis slot eta_p_[k] with a column whose
     // image was eta_val_[eta_start_[k] .. eta_start_[k+1]).
@@ -553,15 +665,6 @@ private:
     Offset u_live_nnz_ = 0;     // nnz actually referenced by live rows
     Offset u_alloc_nnz_ = 0;    // live + dead (refactor trigger)
 
-    mutable std::vector<f64> work_;        // primary solve scratch, size m
-    mutable std::vector<f64> pair_work_;   // second dense FTRAN RHS, size m
-    mutable std::vector<char> mark_;                // DFS marks, size n
-    mutable std::vector<Index> dfs_stack_, reach_, order_, seed_;  // DFS scratch
-    // Slot-space support stamps for ftran_with_support's partial-write eta
-    // loop (O(1) "is this slot in the current support" tests; a fresh
-    // generation per call).
-    mutable std::vector<std::uint32_t> support_stamp_;  // size m (slot space)
-    mutable std::uint32_t support_gen_ = 0;
     // Reverse eta incidence for btran's firing-set path: rev_[i] lists the
     // etas that READ slot i (their pivot position p_t == i or i is in their
     // slice). Maintained by update() (append), factorize() and
@@ -570,32 +673,8 @@ private:
     // slice unconditionally - output is bit-identical because a skipped eta
     // is an exact no-op (all its reads are zero).
     std::vector<std::vector<Index>> rev_;  // size m (slot space)
-    // Firing-set worklist membership stamps for btran_impl (fresh generation
-    // per call; indexed by eta number).
-    mutable std::vector<std::uint32_t> fire_stamp_;
-    mutable std::uint32_t fire_gen_ = 0;
-    // Reusable buffers for btran_impl's firing set. These were fresh
-    // std::vectors per call, i.e. two heap allocations on every BTRAN (50k+
-    // per HUGE solve).
-    mutable std::vector<Index> fire_input_seed_;
-    mutable std::vector<Index> fire_heap_;
-    // Slots written by the firing-set eta pass. The seeded BTRAN permute needs
-    // these on top of the caller's declared input seed, because a fired eta
-    // writes its pivot slot and that slot then feeds the U' solve.
-    mutable std::vector<Index> fire_touched_;
-    // Seeded-solve bookkeeping. The classic permute overwrites every entry of
-    // work_, so it can be read blind; a SEEDED permute writes only the seeded
-    // pivot positions and therefore requires work_ to be zero everywhere else.
-    // work_dirty_ lists the pivot positions written since the last clear, and
-    // work_all_dirty_ records that a dense/classic pass wrote all of work_ (so
-    // the next seeded call must pay one full clear before it can trust it).
-    mutable std::vector<Index> work_dirty_;
-    mutable bool work_all_dirty_ = true;
-    bool force_comparison_sort_ = false;  // diagnostic A/B hook, set at factorize
-    // Positions the row-eta passes turned nonzero, folded into work_dirty_ so a
-    // seeded solve still knows exactly what it must clear.
-    mutable std::vector<Index> row_eta_touched_;
     Index dense_below_ = 0;          // reach larger than this -> dense solve
+    SolvePath solve_path_ = SolvePath::Auto;
     LuStats stats_{};
 };
 

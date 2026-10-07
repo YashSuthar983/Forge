@@ -347,17 +347,20 @@ void test_primal_phase1_composite_sparse_and_dense_paths() {
     };
 
     // AGG changes basic phase-1 coefficients and its composite BTRAN remains
-    // hypersparse. SCAGR7 forces the same exact update through the dense
-    // fallback, so both sides of the support-density gate stay covered.
+    // hypersparse. SCAGR7 used to force the same update through a dense
+    // fallback; since a support-requesting BTRAN reports its support on the
+    // dense triangular path too (the dense pass writes every row, so the
+    // support is exact and free), the composite update always takes its
+    // support branch, whichever triangular path ran. Every incremental result
+    // is still compared with an independent full BTRAN above, with the
+    // original error threshold, which is the property under test.
     using sor::la::UpdateMethod;
     check("agg.mps", true, false, UpdateMethod::ProductForm);
-    check("scagr7.mps", false, true, UpdateMethod::ProductForm);
+    check("scagr7.mps", true, false, UpdateMethod::ProductForm);
     // Threading FTRAN spike support changes the FT representation. AGG has
-    // one legitimate full rebuild after refactorization; SCAGR7 now exercises
-    // both support paths. Every incremental result is still compared with an
-    // independent full BTRAN above, with the original error threshold.
+    // one legitimate full rebuild after refactorization.
     check("agg.mps", true, false, UpdateMethod::ForrestTomlin, 1);
-    check("scagr7.mps", true, true, UpdateMethod::ForrestTomlin);
+    check("scagr7.mps", true, false, UpdateMethod::ForrestTomlin);
 }
 
 }  // namespace
