@@ -488,6 +488,10 @@ struct SimplexDiagnostics {
     // primal_cleanup_iterations (included in `iterations`).
     std::uint64_t cost_shifts = 0;
     std::uint64_t wrong_sign_entering_shifts = 0;
+    // Wrong-sign entering columns pivoted WITHOUT a shift: the dual step
+    // theta_D = d_q / alpha_rq then has the wrong sign and LOWERS the dual
+    // objective by |d_q * delta_primal / alpha_rq|.
+    std::uint64_t wrong_sign_backward_steps = 0;
     f64 cost_shift_max = 0.0;
     std::uint64_t primal_cleanups = 0;
     std::uint64_t primal_cleanup_iterations = 0;
@@ -551,6 +555,8 @@ struct SimplexDiagnostics {
     Index presolve_equality_aggregations = 0;
     Offset presolve_aggregation_fill = 0;
     std::uint64_t presolve_retries = 0;
+    // Primal/dual equation drift checks the dual ran (each O(nnz)).
+    std::uint64_t residual_checks = 0;
     // The reduced basis lifted to a malformed basis of the original and was
     // dropped (the result then carries no basis).
     std::uint64_t lifted_basis_rejections = 0;

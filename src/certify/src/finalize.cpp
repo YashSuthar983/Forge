@@ -1,4 +1,5 @@
 #include "forge/certify/finalize.hpp"
+#include "forge/core/env_switches.hpp"
 #include "forge/model/dyadic.hpp"
 #include "forge/model/exact.hpp"
 
@@ -550,7 +551,7 @@ core::DualFarkasRay check_dual_farkas_ray(
             if (!std::isfinite(b)) {
                 incompatible_unbounded_support = true;
                 sign_res = std::max(sign_res, d.convert_to<f64>());
-                if (std::getenv("FORGE_FARKAS_DEBUG"))
+                if (core::env_switches().farkas_debug)
                     std::fprintf(stderr, "[farkas] col %d d=%.3Lg bounds [%g,%g]\n",
                                  (int)j, d.convert_to<long double>(), problem.col_lo[sz(j)], problem.col_hi[sz(j)]);
                 continue;
@@ -565,7 +566,7 @@ core::DualFarkasRay check_dual_farkas_ray(
             if (!std::isfinite(b)) {
                 incompatible_unbounded_support = true;
                 sign_res = std::max(sign_res, (-d).convert_to<f64>());
-                if (std::getenv("FORGE_FARKAS_DEBUG"))
+                if (core::env_switches().farkas_debug)
                     std::fprintf(stderr, "[farkas] col %d d=%.3Lg bounds [%g,%g]\n",
                                  (int)j, d.convert_to<long double>(), problem.col_lo[sz(j)], problem.col_hi[sz(j)]);
                 continue;
