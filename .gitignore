@@ -57,8 +57,10 @@ benchmarks/results/*
 !benchmarks/results/compare-netlib-20260905-140353.jsonl
 !benchmarks/results/miplib-easy-20260905-141554.md
 !benchmarks/results/miplib-easy-20260905-141554.jsonl
+!benchmarks/results/netlib-gpu-crossover-20260921-171500.md
+!benchmarks/results/netlib-gpu-crossover-20260921-171500.txt
 
-# Third-party papers read for the clean-room work (docs/paper_bibliography.md
+# Third-party papers read for the clean-room work (docs/paper_bibliography.md)
 # cites them by DOI/arXiv). 38 MB of published PDFs, so they are kept locally
 # rather than redistributed through this repository's history.
 docs/papers/
