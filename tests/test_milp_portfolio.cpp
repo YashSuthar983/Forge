@@ -4,6 +4,7 @@
 // soundness reasoning (see the extensive comments in portfolio_solve.cpp):
 // it checks the portfolio driver runs, terminates, and agrees with the
 // single-arm solve_milp on small known-answer models.
+#include "forge/sparse/csr.hpp"
 #include "forge/certify/finalize.hpp"
 #include "forge/io/mps.hpp"
 #include "forge/search/bab.hpp"
@@ -117,7 +118,30 @@ void test_portfolio_single_worker() {
 
 }  // namespace
 
+// The cross-arm gate and the cut net decide on exact activities (audit
+// section 11): with M = 2^52 and five binaries at 1, the row
+// M p + M q + r - M s - M t <= 0 has activity 1 and the point is infeasible;
+// the binary64 sum read 0 and admitted it.
+void test_portfolio_gate_is_exact() {
+    const double M = 0x1p52;
+    forge::model::LpProblem lp;
+    lp.c.assign(5, 0.0);
+    lp.col_lo.assign(5, 0.0);
+    lp.col_hi.assign(5, 1.0);
+    lp.is_integer.assign(5, true);
+    lp.row_lo = {-forge::model::kInf};
+    lp.row_hi = {0.0};
+    lp.A = forge::sparse::from_triplets(1, 5, {0, 0, 0, 0, 0}, {0, 1, 2, 3, 4},
+                                      {M, M, 1.0, -M, -M});
+    lp.validate();
+    const std::vector<double> ones(5, 1.0);
+    CHECK(!forge::search::portfolio_point_is_feasible(lp, ones, 1e-9, 1e-6));
+    CHECK(!forge::search::cut_admits_point({0, 1, 2, 3, 4}, {M, M, 1.0, -M, -M},
+                                         -forge::model::kInf, 0.0, ones, 1e-9));
+}
+
 int main() {
+    test_portfolio_gate_is_exact();
     test_portfolio_matches_single_arm_on_knapsack();
     test_portfolio_without_sharing_still_correct();
     test_portfolio_single_worker();

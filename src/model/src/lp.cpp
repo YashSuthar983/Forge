@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <stdexcept>
 
@@ -27,16 +28,38 @@ f64 LpProblem::max_row_violation(const std::vector<f64>& x) const {
     for (f64 value : x) if (!std::isfinite(value)) return kInf;
     const auto& rp = A.pattern.row_ptr();
     const auto& ci = A.pattern.col_idx();
+    // A row whose activity is certainly inside its sides has violation
+    // exactly 0, and most rows of a point being checked are: the activity in
+    // long double with Higham's bound |fl(a'x) - a'x| <= gamma_{k+1} |a|'|x|
+    // (k terms, u = 2^-64; one more for the comparison) decides them. Only
+    // rows within that error of a side, or past it, take the exact sum, so
+    // the result is identical to summing every row exactly.
+    constexpr long double u = std::numeric_limits<long double>::epsilon() / 2.0L;
     f64 worst = 0.0;
     for (Index r = 0; r < A.n_rows(); ++r) {
+        const f64 lo = row_lo[static_cast<std::size_t>(r)];
+        const f64 hi = row_hi[static_cast<std::size_t>(r)];
+        const core::Offset beg = rp[static_cast<std::size_t>(r)];
+        const core::Offset end = rp[static_cast<std::size_t>(r) + 1];
+        {
+            long double s = 0.0L, mag = 0.0L;
+            for (core::Offset k = beg; k < end; ++k) {
+                const long double t = static_cast<long double>(A.vals[static_cast<std::size_t>(k)]) *
+                    x[static_cast<std::size_t>(ci[static_cast<std::size_t>(k)])];
+                s += t;
+                mag += std::fabs(t);
+            }
+            const long double kk = static_cast<long double>(end - beg) + 2.0L;
+            const long double err = (kk * u) / (1.0L - kk * u) * mag;
+            if (std::isfinite(mag) && (!std::isfinite(lo) || s - err >= lo) &&
+                (!std::isfinite(hi) || s + err <= hi))
+                continue;
+        }
         DyadicSum act;
-        for (core::Offset k = rp[static_cast<std::size_t>(r)];
-             k < rp[static_cast<std::size_t>(r) + 1]; ++k) {
+        for (core::Offset k = beg; k < end; ++k) {
             act.add_product(A.vals[static_cast<std::size_t>(k)],
                             x[static_cast<std::size_t>(ci[static_cast<std::size_t>(k)])]);
         }
-        const f64 lo = row_lo[static_cast<std::size_t>(r)];
-        const f64 hi = row_hi[static_cast<std::size_t>(r)];
         // Exact distance to the violated side, rounded up.
         if (std::isfinite(lo) && act.compare(lo) < 0) {
             DyadicSum gap = act;

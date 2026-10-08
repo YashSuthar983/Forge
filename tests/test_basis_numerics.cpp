@@ -96,8 +96,10 @@ int main() {
         CHECK(std::fabs(transposed[i]-expected[i]) < 1e-12);
     }
     // A small sparse component must survive alongside the blocked component
-    // and finish through ordinary Markowitz elimination.
-    constexpr Index mixed = 43;
+    // and finish through ordinary Markowitz elimination. (A 6-cycle: 12 of 36
+    // entries, below the dense kernel's density; a small DENSE component
+    // takes the dense kernel too.)
+    constexpr Index mixed = 46;
     cp = {0}; ri.clear(); dense.clear();
     expected.resize(mixed); normal.assign(mixed, 0); transposed.assign(mixed, 0);
     for (Index i = 0; i < mixed; ++i) expected[i] = (i%7)-3;
@@ -112,7 +114,7 @@ int main() {
                 append(i, i == j ? 100.0 : ((i*11+j*7)%13-6)/16.0);
         } else {
             append(j, 2.0);
-            append(40+(j-40+1)%3, 1.0);
+            append(40+(j-40+1)%6, 1.0);
         }
         cp.push_back(static_cast<Offset>(dense.size()));
     }

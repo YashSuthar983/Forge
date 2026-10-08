@@ -309,9 +309,19 @@ public:
 
     DynSepDecision decide(const DynSepRoundInput& in);
     void observe(const DynSepObserve& obs);
-    // Convenience: attribute selected cuts by name prefix after pool select.
-    void observe_selected_names(const std::vector<std::string>& names,
-                                f64 mean_efficacy);
+    // The family a cut's name says it came from.
+    static SepFamily family_of_name(const std::string& name);
+    // Selected cuts are counted at selection (labels read the counts)...
+    void note_selected(const std::array<int, kSepFamilyCount>& selected);
+    // ...and rewarded once the round's re-solve has MEASURED its progress
+    // (gap-relative, cut_round_progress): each selected family gets that
+    // progress times its share of the round's violation at the LP point; a
+    // family that ran and contributed no cut is a zero-reward play. A round
+    // never re-solved is never observed.
+    void observe_round(const DynSepDecision& ran,
+                       const std::array<int, kSepFamilyCount>& selected,
+                       const std::array<f64, kSepFamilyCount>& violation,
+                       f64 progress);
     // Call after a round's decisions+observations to record an imitation sample.
     void collect_round_labels(const DynSepDecision& decided);
 

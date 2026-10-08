@@ -278,7 +278,24 @@ void test_proximity_excludes_the_incumbent() {
     CHECK(build_neighborhood(Neighborhood::Proximity, lp, lp.col_lo, lp.col_hi,
                              {}, inc, pool, 0.5, 1e-6, rs, np));
     CHECK(np.replace_objective);
-    CHECK(np.has_objective_cutoff);
+    // The improvement target is the caller's (strictly-better cutoff in the
+    // parent's offset-free, lattice-aware units); the builder only requires it.
+    CHECK(np.requires_objective_cutoff);
+    CHECK(!np.has_objective_cutoff);
+    np.has_objective_cutoff = true;
+    np.objective_cutoff = 2.0;   // next value of the integral objective below 3
+    // A shifted objective builds the same neighbourhood: its target no longer
+    // depends on the constant.
+    {
+        LpProblem shifted = lp;
+        shifted.obj_offset = 1048576.0;
+        NeighborhoodProblem np2;
+        std::uint32_t rs2 = 3u;
+        CHECK(build_neighborhood(Neighborhood::Proximity, shifted, shifted.col_lo, shifted.col_hi,
+                                 {}, inc, pool, 0.5, 1e-6, rs2, np2));
+        CHECK(np2.requires_objective_cutoff && !np2.has_objective_cutoff);
+        CHECK(np2.objective == np.objective);
+    }
     const LpProblem sub = apply_neighborhood(lp, np);
     CHECK(!point_feasible(sub, inc));                 // must be cut off
     const std::vector<f64> better = {1.0, 0.0, 0.0, 0.0, 0.0};  // objective 1

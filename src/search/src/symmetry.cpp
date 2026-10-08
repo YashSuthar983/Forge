@@ -169,6 +169,18 @@ void append_sbc_rows(model::LpProblem& lp,
     }
 }
 
+// Number of distinct colors. Refinement never merges classes (a new color
+// hashes the old one in), so a round that keeps the count keeps the
+// partition, and every later round would too: that is the fixpoint. The
+// color VALUES change every round regardless, so they cannot be compared.
+std::size_t color_classes(const std::vector<std::uint64_t>& color,
+                          std::vector<std::uint64_t>& scratch) {
+    scratch = color;
+    std::sort(scratch.begin(), scratch.end());
+    return static_cast<std::size_t>(std::unique(scratch.begin(), scratch.end()) -
+                                    scratch.begin());
+}
+
 // Weisfeiler-Leman-style color refinement on a node list with adjacency
 // signatures (neighbor_color, edge_tag) multisets.
 void refine_colors(std::vector<std::uint64_t>& color,
@@ -179,6 +191,8 @@ void refine_colors(std::vector<std::uint64_t>& color,
     iters_out = 0;
     std::uint64_t adj_entries = 0;
     for (const auto& a : adj) adj_entries += a.size();
+    std::vector<std::uint64_t> scratch;
+    std::size_t classes = color_classes(color, scratch);
     for (int it = 0; it < cap; ++it) {
         ++iters_out;
         core::work_add(2 * adj_entries + 4 * color.size(), ::forge::core::WorkTag::Symmetry);   // hash, sort, rehash
@@ -195,11 +209,10 @@ void refine_colors(std::vector<std::uint64_t>& color,
             for (std::uint64_t s : sig) h = mix64(h ^ s);
             next[u] = h;
         }
-        if (next == color) {
-            color = std::move(next);
-            break;
-        }
         color = std::move(next);
+        const std::size_t now = color_classes(color, scratch);
+        if (now == classes || now == color.size()) break;   // stable, or discrete
+        classes = now;
     }
 }
 
@@ -316,8 +329,12 @@ std::vector<Orbit> detect_permutation_orbits(const model::LpProblem& lp,
     };
     std::vector<std::uint64_t> sig;
     sig.reserve(64);
-    std::vector<std::uint64_t> vnew, rnew;
+    std::vector<std::uint64_t> vnew, rnew, scratch;
+    std::size_t vclasses = color_classes(vcol, scratch);
+    std::size_t rclasses = color_classes(rcol, scratch);
     for (int it = 0; it < cap; ++it) {
+        // Every column in a class of its own: no two can be interchangeable.
+        if (vclasses == sz(n)) break;
         if (refine_over_budget()) {
             if (diag != nullptr) diag->aborted_on_time = 1;
             break;
@@ -352,13 +369,13 @@ std::vector<Orbit> detect_permutation_orbits(const model::LpProblem& lp,
             for (std::uint64_t s : sig) h = mix64(h ^ s);
             rnew[sz(i)] = h;
         }
-        if (vnew == vcol && rnew == rcol) {
-            vcol = std::move(vnew);
-            rcol = std::move(rnew);
-            break;
-        }
         vcol = std::move(vnew);
         rcol = std::move(rnew);
+        const std::size_t vnow = color_classes(vcol, scratch);
+        const std::size_t rnow = color_classes(rcol, scratch);
+        if (vnow == vclasses && rnow == rclasses) break;   // the partition is stable
+        vclasses = vnow;
+        rclasses = rnow;
     }
     if (diag) {
         diag->color_iters = iters;

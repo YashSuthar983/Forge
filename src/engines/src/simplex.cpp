@@ -3602,6 +3602,10 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         raw.objective = recovered.raw.objective;
         raw.certificate_basis = recovered.basis.basic;
         raw.exact_dual = recovered.raw.exact_dual;
+        // The reduced-cost enclosure described the presolved model.
+        raw.rc_lo.clear();
+        raw.rc_hi.clear();
+        raw.rc_bound = core::kNaN;
         if (raw.proposed_status == core::Status::Unbounded &&
             !raw.primal_ray.direction.empty()) {
             raw.primal_ray = presolve::recover_primal_ray(
@@ -3870,6 +3874,29 @@ void PrimalCostSession::set_costs(const std::vector<core::f64>& c) {
         pr.pmin.c[jj] = pr.sense * c[jj];
         pr.scaled.c[jj] = pr.pmin.c[jj] * pr.scaling.col_scale[jj];
         pr.cost[jj] = pr.scaled.c[jj];
+    }
+}
+
+void PrimalCostSession::set_column_bounds(const std::vector<core::f64>& lo,
+                                          const std::vector<core::f64>& hi) {
+    auto& pr = impl_->prepared;
+    const Index n = pr.scaled.n_cols();
+    if (static_cast<Index>(lo.size()) != n || static_cast<Index>(hi.size()) != n)
+        throw std::invalid_argument("PrimalCostSession::set_column_bounds: size");
+    for (Index j = 0; j < n; ++j)
+        if (std::isnan(lo[sz(j)]) || std::isnan(hi[sz(j)]))
+            throw std::invalid_argument("PrimalCostSession::set_column_bounds: NaN bound");
+    for (Index j = 0; j < n; ++j) {
+        const auto jj = sz(j);
+        const f64 sc = pr.scaling.col_scale[jj];
+        pr.pmin.col_lo[jj] = lo[jj];
+        pr.pmin.col_hi[jj] = hi[jj];
+        const f64 slo = std::isfinite(lo[jj]) ? lo[jj] / sc : lo[jj];
+        const f64 shi = std::isfinite(hi[jj]) ? hi[jj] / sc : hi[jj];
+        pr.scaled.col_lo[jj] = slo;
+        pr.scaled.col_hi[jj] = shi;
+        pr.lo[jj] = slo;
+        pr.hi[jj] = shi;
     }
 }
 

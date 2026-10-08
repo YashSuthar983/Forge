@@ -162,8 +162,14 @@ CliqueProbeDiagnostics apply_clique_probing(const model::LpProblem& lp,
                                             std::vector<f64>& col_hi,
                                             const MipPresolveOptions& opts);
 
-// OBBT-lite on up to max_obbt_vars integer columns with width > 1 (prefer
-// fractional LP tip if `x_hint` given). On LP failure, deepen FBBT.
+// OBBT over up to max_obbt_vars columns -- integer (beyond binary) and
+// continuous, infinite endpoints included -- ranked by the share of their
+// rows' activity ranges their domains span (x_hint, when given, favours
+// fractional integers). One PrimalCostSession serves every probe: min x_j and
+// min -x_j are warm cost changes of one prepared model whose bounds follow
+// each tightening. A bound is taken from whatever multipliers a solve returns,
+// as a safe Lagrangian bound over the box (no optimality requirement);
+// integer columns round inward. One FBBT pass follows when anything moved.
 ObbtDiagnostics apply_obbt_lite(const model::LpProblem& lp,
                                 std::vector<f64>& col_lo,
                                 std::vector<f64>& col_hi,
@@ -174,7 +180,10 @@ ObbtDiagnostics apply_obbt_lite(const model::LpProblem& lp,
 // Full root MIP-presolve pass. When `run_probing` is true, builds/refreshes
 // `cg` via build_conflict_graph with dual_fix_in_probing set from opts.
 // Writes globally valid tightenings into col_lo/col_hi (and optionally
-// lp.col_lo/hi when `write_into_lp`).
+// lp.col_lo/hi when `write_into_lp`). `probing_state` (optional) is resumed:
+// probing covers only what it lacks. `coverage` (optional) receives what the
+// final graph covers; without a state to resume, every probing cycle still
+// rebuilds the graph from scratch on its narrower box.
 MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
                                         std::vector<f64>& col_lo,
                                         std::vector<f64>& col_hi,
@@ -183,6 +192,7 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
                                         bool run_probing,
                                         const ProbingOptions& probe_opts,
                                         const engines::SimplexOptions* lp_opts = nullptr,
-                                        ProbingState* probing_state = nullptr);
+                                        ProbingState* probing_state = nullptr,
+                                        ProbingState* coverage = nullptr);
 
 }  // namespace forge::search

@@ -60,7 +60,7 @@ const ArmSpec kArms[] = {
         o.lifted_cover_cuts = true;
         o.mir_cuts = true;
         o.zerohalf_cuts = true;
-        // o.flow_cover_cuts -- INVALID, see flowcover.cpp
+        // o.flow_cover_cuts -- exact, but unmeasured: opt-in only (flowcover.hpp)
     }},
 
     // Restart-heavy: same separators as default, different search shape.

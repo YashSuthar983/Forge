@@ -769,7 +769,42 @@ void test_lifted_cover_on_integral_bases_is_valid_by_lp() {
     CHECK(checked > 500);
 }
 
+// A negative slack coefficient may not be dropped for being small (audit
+// section 2). M = 2^40, binary x, y, 0 <= z <= M; M x + z <= M/2 and
+// z <= M y. At x = 0, y = 1/2, z = M/2 the variable upper bound is tight;
+// substituting it gives x + y - s/M <= 1/2 after scaling by 1/M, and the
+// -s/M term fell below tol. MIR then produced x + y <= 0, which cuts off the
+// feasible x = 0, y = 1, z = M/2.
+void test_small_negative_slack_is_kept() {
+    const f64 M = 0x1p40;
+    LpProblem lp;
+    lp.c = {0.0, 1e-3, -1.0};
+    lp.col_lo = {0.0, 0.0, 0.0};
+    lp.col_hi = {1.0, 1.0, M};
+    lp.is_integer = {true, true, false};
+    lp.row_lo = {-kInf, -kInf};
+    lp.row_hi = {M / 2, 0.0};
+    lp.A = forge::sparse::from_triplets(2, 3, {0, 0, 1, 1}, {0, 2, 2, 1}, {M, 1.0, 1.0, -M});
+    lp.validate();
+    const std::vector<f64> x = {0.0, 0.5, M / 2};
+    MirOptions o;
+    o.variable_bounds = true;
+    o.violation_min = 1e-9;
+    MirDiagnostics d;
+    const auto cuts = separate_mir(lp, x, lp.col_lo, lp.col_hi, o, d);
+    const std::vector<std::vector<f64>> feasible = {
+        {0.0, 1.0, M / 2}, {0.0, 1.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 1.0, M / 4}};
+    for (const auto& c : cuts)
+        for (const auto& pt : feasible) {
+            long double lhs = 0.0L;
+            for (std::size_t k = 0; k < c.cols.size(); ++k)
+                lhs += static_cast<long double>(c.vals[k]) * pt[static_cast<std::size_t>(c.cols[k])];
+            CHECK(lhs <= static_cast<long double>(c.row_hi) + 1e-6L * (1.0L + std::fabs(c.row_hi)));
+        }
+}
+
 int main() {
+    test_small_negative_slack_is_kept();
     test_shared_cmir_uses_variable_bounds();
     test_mir_base_drop_relaxes_rhs();
     test_variable_bound_cuts_are_valid_by_lp();

@@ -1180,6 +1180,205 @@ SafeLpBound safe_lagrangian_lower_bound(const model::LpProblem& problem,
     return lagrangian_bound_impl(problem, y_min, col_lo, col_hi, nullptr);
 }
 
+RcEnclosure enclose_reduced_costs_from_sums(const model::LpProblem& problem,
+                                            const std::vector<f64>& y_min,
+                                            const std::vector<long double>& aty,
+                                            const std::vector<long double>& ab,
+                                            const std::vector<std::uint32_t>& cnt,
+                                            const std::vector<f64>& col_lo,
+                                            const std::vector<f64>& col_hi) {
+    core::WorkScope work_scope_(core::WorkCat::Exact);
+    RcEnclosure out;
+    const core::Index m = problem.n_rows(), n = problem.n_cols();
+    if (y_min.size() != sz(m) || aty.size() != sz(n) || ab.size() != sz(n) ||
+        cnt.size() != sz(n) || col_lo.size() != sz(n) || col_hi.size() != sz(n))
+        return out;
+    constexpr long double u = std::numeric_limits<long double>::epsilon() / 2.0L;
+    const auto gamma = [&](long double k) { return (k * u) / (1.0L - k * u); };
+    const auto down = [](long double v) {
+        f64 f = static_cast<f64>(v);
+        if (static_cast<long double>(f) > v) f = std::nextafter(f, -std::numeric_limits<f64>::infinity());
+        return f;
+    };
+    const auto up = [](long double v) {
+        f64 f = static_cast<f64>(v);
+        if (static_cast<long double>(f) < v) f = std::nextafter(f, std::numeric_limits<f64>::infinity());
+        return f;
+    };
+    const f64 sense = problem.maximize ? -1.0 : 1.0;
+    long double L = static_cast<long double>(sense * problem.obj_offset);
+    long double absL = std::fabs(L);
+    std::uint64_t terms = 1;
+    // A multiplier on a side its row does not have (round-off around 0)
+    // is taken as 0: weak duality holds for any y. Its contribution, already
+    // in the sums, then widens the reduced costs of that row's columns.
+    thread_local std::vector<long double> widen;
+    bool widened = false;
+    const auto& rp = problem.A.pattern.row_ptr();
+    const auto& ci = problem.A.pattern.col_idx();
+    for (core::Index i = 0; i < m; ++i) {
+        const f64 yi = y_min[sz(i)];
+        if (yi == 0.0) continue;
+        if (!std::isfinite(yi)) return out;
+        const f64 b = yi > 0.0 ? problem.row_lo[sz(i)] : problem.row_hi[sz(i)];
+        if (!std::isfinite(b)) {
+            if (!widened) { widen.assign(sz(n), 0.0L); widened = true; }
+            for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
+                widen[sz(ci[sz(k)])] += std::fabs(static_cast<long double>(yi) *
+                                                  problem.A.vals[sz(k)]) * (1.0L + 4.0L * u);
+            continue;
+        }
+        const long double t = static_cast<long double>(yi) * b;
+        L += t;
+        absL += std::fabs(t);
+        ++terms;
+    }
+    out.lo.resize(sz(n));
+    out.hi.resize(sz(n));
+    for (core::Index j = 0; j < n; ++j) {
+        const long double c = static_cast<long double>(sense * problem.c[sz(j)]);
+        const long double d = c - aty[sz(j)];
+        const long double e = gamma(static_cast<long double>(cnt[sz(j)]) + 2.0L) *
+                              (std::fabs(c) + ab[sz(j)]) +
+                              (widened ? widen[sz(j)] * (1.0L + 4.0L * u) : 0.0L);
+        const long double lo_d = d - e, hi_d = d + e;
+        out.lo[sz(j)] = down(lo_d);
+        out.hi[sz(j)] = up(hi_d);
+        if (lo_d == 0.0L && hi_d == 0.0L) continue;
+        const f64 l = col_lo[sz(j)], h = col_hi[sz(j)];
+        long double contrib;
+        if (lo_d >= 0.0L) {
+            if (!std::isfinite(l)) return out;
+            contrib = l >= 0.0 ? lo_d * l : hi_d * l;
+        } else if (hi_d <= 0.0L) {
+            if (!std::isfinite(h)) return out;
+            contrib = h >= 0.0 ? lo_d * h : hi_d * h;
+        } else {
+            if (!std::isfinite(l) || !std::isfinite(h)) return out;
+            contrib = std::min(std::min(lo_d * l, lo_d * h), std::min(hi_d * l, hi_d * h));
+        }
+        L += contrib;
+        absL += std::fabs(contrib);
+        ++terms;
+    }
+    const f64 bound = down(L - gamma(static_cast<long double>(terms) + 2.0L) * absL);
+    if (!std::isfinite(bound)) return out;
+    out.bound = bound;
+    out.finite = true;
+    return out;
+}
+
+RcEnclosure enclose_reduced_costs(const model::LpProblem& problem,
+                                  const std::vector<f64>& y_min,
+                                  const std::vector<f64>& col_lo,
+                                  const std::vector<f64>& col_hi) {
+    const core::Index m = problem.n_rows(), n = problem.n_cols();
+    if (y_min.size() != sz(m)) return {};
+    // Per-thread scratch: called for every node LP without a carried enclosure.
+    thread_local std::vector<long double> aty, ab;
+    thread_local std::vector<std::uint32_t> cnt;
+    aty.assign(sz(n), 0.0L);
+    ab.assign(sz(n), 0.0L);
+    cnt.assign(sz(n), 0);
+    const auto& rp = problem.A.pattern.row_ptr();
+    const auto& ci = problem.A.pattern.col_idx();
+    // Multipliers on sides their rows do not have are zeroed here, before
+    // summing, so they cost no widening.
+    thread_local std::vector<f64> y;
+    y.assign(y_min.begin(), y_min.end());
+    for (core::Index i = 0; i < m; ++i) {
+        if (y[sz(i)] > 0.0 && !std::isfinite(problem.row_lo[sz(i)])) y[sz(i)] = 0.0;
+        if (y[sz(i)] < 0.0 && !std::isfinite(problem.row_hi[sz(i)])) y[sz(i)] = 0.0;
+    }
+    for (core::Index i = 0; i < m; ++i) {
+        const f64 yi = y[sz(i)];
+        if (yi == 0.0) continue;
+        for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+            const auto j = sz(ci[sz(k)]);
+            const long double t = static_cast<long double>(yi) * problem.A.vals[sz(k)];
+            aty[j] += t;
+            ab[j] += std::fabs(t);
+            ++cnt[j];
+        }
+    }
+    core::work_add(static_cast<std::uint64_t>(problem.A.vals.size()) +
+                       static_cast<std::uint64_t>(n) + static_cast<std::uint64_t>(m),
+                   core::WorkTag::Interval);
+    return enclose_reduced_costs_from_sums(problem, y, aty, ab, cnt, col_lo, col_hi);
+}
+
+IntervalRcFixing reduced_cost_tightenings_from(const std::vector<f64>& rc_lo,
+                                               const std::vector<f64>& rc_hi, f64 bound,
+                                               const std::vector<f64>& col_lo,
+                                               const std::vector<f64>& col_hi,
+                                               f64 cutoff_min,
+                                               const std::vector<char>& integer_mask,
+                                               std::vector<unsigned char>* sides) {
+    IntervalRcFixing out;
+    const std::size_t n = col_lo.size();
+    if (rc_lo.size() != n || rc_hi.size() != n || col_hi.size() != n ||
+        integer_mask.size() < n || !std::isfinite(bound) || !std::isfinite(cutoff_min))
+        return out;
+    out.finite = true;
+    out.bound = bound;
+    if (sides != nullptr) {
+        sides->assign(n, 0);
+        for (std::size_t j = 0; j < n; ++j) {
+            if (rc_lo[j] == 0.0 && rc_hi[j] == 0.0) continue;
+            (*sides)[j] = rc_lo[j] >= 0.0 ? 1 : rc_hi[j] <= 0.0 ? 2 : 3;
+        }
+    }
+    if (!(cutoff_min >= bound)) return out;
+    constexpr long double u = std::numeric_limits<long double>::epsilon() / 2.0L;
+    // room = cutoff - L rounded up; the quotient room / |d| rounded up.
+    const long double room_ld = static_cast<long double>(cutoff_min) - static_cast<long double>(bound);
+    const long double room = room_ld + std::fabs(room_ld) * u * 2.0L;
+    const auto integral = [](f64 v) {
+        return std::isfinite(v) && std::fabs(v) < 0x1p52 && v == std::trunc(v);
+    };
+    for (std::size_t j = 0; j < n; ++j) {
+        if (!integer_mask[j]) continue;
+        const f64 lo = col_lo[j], hi = col_hi[j];
+        if (!(hi > lo)) continue;
+        const bool up = rc_lo[j] > 0.0;
+        const bool down = rc_hi[j] < 0.0;
+        if (!up && !down) continue;
+        const f64 base = up ? lo : hi;
+        if (!integral(base)) continue;
+        const long double mag = up ? static_cast<long double>(rc_lo[j])
+                                   : -static_cast<long double>(rc_hi[j]);
+        long double q = room / mag;
+        q += std::fabs(q) * u * 2.0L;   // the quotient, rounded up
+        if (!std::isfinite(static_cast<double>(q))) continue;
+        const long double steps = std::floor(q);
+        if (steps >= static_cast<long double>(hi) - static_cast<long double>(lo)) continue;
+        const f64 nb = up ? static_cast<f64>(static_cast<long double>(base) + steps)
+                          : static_cast<f64>(static_cast<long double>(base) - steps);
+        if (!integral(nb)) continue;   // the sum must be exact to be the bound
+        if (up ? !(nb < hi) : !(nb > lo)) continue;
+        out.changes.push_back(RcBoundChange{static_cast<core::Index>(j), up, nb});
+    }
+    return out;
+}
+
+IntervalRcFixing interval_reduced_cost_tightenings(
+    const model::LpProblem& problem, const std::vector<f64>& y_min,
+    const std::vector<f64>& col_lo, const std::vector<f64>& col_hi,
+    f64 cutoff_min, const std::vector<char>* integer_mask,
+    std::vector<unsigned char>* sides) {
+    const auto enc = enclose_reduced_costs(problem, y_min, col_lo, col_hi);
+    if (!enc.finite) return {};
+    std::vector<char> mask;
+    if (integer_mask == nullptr) {
+        mask.assign(col_lo.size(), 0);
+        for (std::size_t j = 0; j < mask.size() && j < problem.is_integer.size(); ++j)
+            mask[j] = problem.is_integer[j] ? 1 : 0;
+        integer_mask = &mask;
+    }
+    return reduced_cost_tightenings_from(enc.lo, enc.hi, enc.bound, col_lo, col_hi, cutoff_min,
+                                         *integer_mask, sides);
+}
+
 std::vector<RcBoundChange> safe_reduced_cost_tightenings(
     const model::LpProblem& problem, const std::vector<f64>& y_min,
     const std::vector<f64>& col_lo, const std::vector<f64>& col_hi,

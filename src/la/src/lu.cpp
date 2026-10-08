@@ -216,6 +216,7 @@ bool BasisFactor::factorize(Index m,
     u_live_nnz_ = 0;
     u_alloc_nnz_ = 0;
     scratch_.work_since_factor_ = 0;
+    scratch_.eta_work_since_factor_ = 0;
     if (singular_slots) singular_slots->clear();
     if (vacant_rows)    vacant_rows->clear();
 
@@ -645,34 +646,42 @@ bool BasisFactor::factorize(Index m,
         Offset nnz = 0;
         for (Index i : rows) nnz += static_cast<Offset>(e.row_cols[sz(i)].size());
         const auto n = static_cast<Index>(rows.size());
-        if (n < 32 || n > opts.dense_nucleus_limit || rows.size() != columns.size() ||
+        // A nucleus this dense fills in under any pivot order, so the dense
+        // kernel (partial row pivoting) is the right tool at every size; only
+        // the fill-reducing column order is worth its setup on larger blocks.
+        // Small dense nuclei used to go through Markowitz instead: a sorted
+        // lookup per entry and a vector push per fill. mas76's 12-row bases
+        // spent most of their factorization time there (8% of its search).
+        if (n < 2 || n > opts.dense_nucleus_limit || rows.size() != columns.size() ||
             static_cast<f64>(nnz) < opts.dense_nucleus_density * n * n) return false;
-        // AMD on the symmetrized local nucleus supplies a fill-reducing
-        // column order; numerical row pivoting supplies stability.
         if (dense_col_position.empty()) dense_col_position.assign(sz(m), -1);
         auto& col_position = dense_col_position;
         for (Index i = 0; i < n; ++i) {
             col_position[sz(columns[sz(i)])] = i;
         }
-        std::vector<std::vector<Index>> graph(sz(n));
-        for (Index i = 0; i < n; ++i)
-            for (Index j : e.row_cols[sz(rows[sz(i)])]) {
-                const Index col = col_position[sz(j)];
-                if (col < 0) continue;
-                graph[sz(std::max(i,col))].push_back(std::min(i,col));
+        if (n >= 32) {
+            // AMD on the symmetrized local nucleus supplies a fill-reducing
+            // column order; numerical row pivoting supplies stability.
+            std::vector<std::vector<Index>> graph(sz(n));
+            for (Index i = 0; i < n; ++i)
+                for (Index j : e.row_cols[sz(rows[sz(i)])]) {
+                    const Index col = col_position[sz(j)];
+                    if (col < 0) continue;
+                    graph[sz(std::max(i,col))].push_back(std::min(i,col));
+                }
+            SymCsc pattern; pattern.n = n; pattern.col_ptr = {0};
+            for (auto& column : graph) {
+                std::sort(column.begin(), column.end());
+                column.erase(std::unique(column.begin(), column.end()), column.end());
+                pattern.row_idx.insert(pattern.row_idx.end(), column.begin(), column.end());
+                pattern.col_ptr.push_back(static_cast<Offset>(pattern.row_idx.size()));
             }
-        SymCsc pattern; pattern.n = n; pattern.col_ptr = {0};
-        for (auto& column : graph) {
-            std::sort(column.begin(), column.end());
-            column.erase(std::unique(column.begin(), column.end()), column.end());
-            pattern.row_idx.insert(pattern.row_idx.end(), column.begin(), column.end());
-            pattern.col_ptr.push_back(static_cast<Offset>(pattern.row_idx.size()));
-        }
-        const auto order = amd_order(pattern);
-        const auto original_columns = columns;
-        for (Index j = 0; j < n; ++j) {
-            columns[sz(j)] = original_columns[sz(order[sz(j)])];
-            col_position[sz(columns[sz(j)])] = j;
+            const auto order = amd_order(pattern);
+            const auto original_columns = columns;
+            for (Index j = 0; j < n; ++j) {
+                columns[sz(j)] = original_columns[sz(order[sz(j)])];
+                col_position[sz(columns[sz(j)])] = j;
+            }
         }
         std::vector<f64> dense(sz(n)*sz(n), 0);
         for (Index i = 0; i < n; ++i)
@@ -843,8 +852,9 @@ bool BasisFactor::factorize(Index m,
     stats_.factor_nnz = static_cast<Offset>(u_idx_.size() + l_idx_.size()) +
                         static_cast<Offset>(piv_val_.size());
     // Deterministic work: loading, elimination and the produced factor.
-    core::work_add(static_cast<std::uint64_t>(16 * m + 6 * static_cast<Offset>(row_idx.size()) +
-                                              4 * stats_.factor_nnz), ::forge::core::WorkTag::LuFactor);
+    stats_.factor_work = 16 * static_cast<Offset>(m) + 6 * static_cast<Offset>(row_idx.size()) +
+                         4 * stats_.factor_nnz;
+    core::work_add(static_cast<std::uint64_t>(stats_.factor_work), ::forge::core::WorkTag::LuFactor);
     valid_ = (n_piv == m);
     stats_.effective_threshold = opts.markowitz_threshold;
     if (valid_ && opts.adaptive_threshold) {
@@ -857,6 +867,7 @@ bool BasisFactor::factorize(Index m,
         }
     }
     scratch_.work_since_factor_ = 0; // Estimation is factorization setup, not update-file work.
+    scratch_.eta_work_since_factor_ = 0;
     return valid_;
 }
 
@@ -1521,6 +1532,7 @@ void BasisFactor::ftran_pair(std::vector<f64>& a,
     if (m_ == 0) return;
     const auto n = piv_val_.size();
     if (a.size() != n || b.size() != n) return;
+    scratch_.eta_work_since_factor_ += 2 * eta_nnz();
 
     // Dense permutation. scratch_.work_ is the ordinary FTRAN scratch, so record that
     // every entry was overwritten before a later seeded solve tries to reuse
@@ -1607,6 +1619,7 @@ bool BasisFactor::ftran_impl(SolveScratch& sc, std::vector<f64>& b,
     if (support) support->clear();
     if (spike) spike->clear();
     if (m_ == 0) return true;
+    sc.eta_work_since_factor_ += eta_nnz();
     const auto n = piv_val_.size();
     bool seed_is_sparse = n >= 64;
     sc.seed_.clear();
@@ -1901,6 +1914,7 @@ bool BasisFactor::btran_impl(SolveScratch& sc, std::vector<f64>& d,
                              const std::vector<Index>* seed_slots) const {
     if (support) support->clear();
     if (m_ == 0) return true;
+    sc.eta_work_since_factor_ += eta_nnz();
 
     // B_k^-T = B_0^-T E_1^-T ... E_k^-T, so the etas apply newest first.
     //

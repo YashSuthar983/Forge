@@ -130,7 +130,44 @@ void test_branch_key_ordering() {
 
 }  // namespace
 
+// A censored observation (an unfinished probe's certified lower bound) is
+// not a completed sample: it never reaches the reliability count or the
+// completed mean, and only floors the estimate where no completed sample
+// exists (audit section 7).
+void test_censored_samples_are_kept_apart() {
+    forge::search::BranchStats s;
+    s.resize(2);
+    using forge::search::BranchOutcome;
+    CHECK(s.record(0, -1, 0.5, BranchOutcome::Censored, 2.0, -1.0));
+    CHECK(s.pc_count[0][0] == 0);
+    CHECK(s.observed[0][0] == 0);
+    CHECK(s.censored_samples == 1);
+    // No completed sample: the floor (4 per unit) beats a fallback of 1.
+    CHECK(s.pc_estimate(0, -1, 1.0) == 4.0);
+    // A fallback above the floor stays.
+    CHECK(s.pc_estimate(0, -1, 9.0) == 9.0);
+    // A completed sample is the estimate, censored data no longer mixes in.
+    CHECK(s.record(0, -1, 0.5, BranchOutcome::ProvedOptimal, 0.5, -1.0));
+    CHECK(s.pc_count[0][0] == 1);
+    CHECK(s.pc_estimate(0, -1, 9.0) == 1.0);
+}
+
+// A child that refines a strong-branch sample replaces it, count unchanged.
+void test_child_refines_probe_sample() {
+    forge::search::BranchStats s;
+    s.resize(1);
+    using forge::search::BranchOutcome;
+    CHECK(s.record(0, 1, 0.5, BranchOutcome::ProvedOptimal, 1.0, -1.0));   // probe: unit 2
+    bool consumed = true;            // the child inherits the probe's sample
+    double unit = 2.0;
+    CHECK(s.record_child(0, 1, 0.5, BranchOutcome::ProvedOptimal, 1.5, 3.0, consumed, unit));
+    CHECK(s.pc_count[1][0] == 1);
+    CHECK(s.pc_sum[1][0] == 3.0);
+}
+
 int main() {
+    test_censored_samples_are_kept_apart();
+    test_child_refines_probe_sample();
     test_branch_key_ordering();
     test_proved_zero_gain_counts_once();
     test_incomplete_contributes_nothing();

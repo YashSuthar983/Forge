@@ -77,6 +77,20 @@ struct TreeCutOptions {
     // at the separation site, no extra reinject cadence).
     std::uint64_t gcs_reinject_every_nodes = 50;
     int gcs_reinject_max = 5;
+    // Tree-promoted rows of the global LP are a working set, not a log. A
+    // promoted row ages by one at every proved node LP whose basis has its
+    // logical basic (the row does not bind there) and resets when it binds;
+    // every purge_every_nodes nodes, rows of age >= row_age_limit leave the
+    // LP. They stay in the pool, and any retained cut enters the LP only when
+    // the LP point at hand violates it. row_age_limit 0 keeps every row.
+    int row_age_limit = 32;
+    std::uint64_t purge_every_nodes = 64;
+    // A global row costs every node LP, while the node that derived a cut
+    // already uses it through its own re-solve (resolve_with_local). So a
+    // retained cut enters the global LP only once the pool has seen it
+    // violated at this many distinct node LP points: evidence that it bears
+    // on more than the node that made it.
+    int min_violation_nodes = 2;
     // Optional on-disk GCS policy (FORGE_GCS). Empty = heuristic global score.
     std::string gcs_model_path;
     bool gcs_prefer_heuristic = false;
@@ -90,8 +104,9 @@ struct TreeCutOptions {
 // The historical bug was testing only the first: bounds were checked, rows were
 // not, and the separator's own derivation was trusted by name.
 struct CutScopeConditions {
-    // No column the derivation touched was branch-tightened: node bounds are
-    // still the root bounds.
+    // Every bound the derivation consumed is implied by the root box: either
+    // the separator reported so (CutRow::used_local_bound false, computed
+    // against the root box it was handed), or the node box is the root box.
     bool bounds_are_root = false;
     // The model it was derived from carried no subtree-local row. node_lp is
     // global_lp plus the node's active local cuts, so a separator can consume
@@ -113,20 +128,34 @@ inline bool cut_may_leave_subtree(const CutScopeConditions& s) {
            s.admits_incumbent;
 }
 
-// Whether a separator family's NODE-side derivation is established enough to
-// hand a cut to the global model.
+// Whether a separator family's derivation is established for the global
+// model, given that its scope conditions hold.
 //
-// ZH_ / MIR_ / FC_ / GMI_ stay off this whitelist. An earlier n5-3 campaign
-// reported cuts that excluded a reference optimum, but that campaign is not a
-// derivation proof: one sweep deleted the detector, and the later flags were
-// references lying outside the generating node's bounds. A local cut may
-// exclude a point outside its subtree. A node-feasible point excluded by a
-// cut would refute that cut; failing to find one does not prove validity.
-// These families stay quarantined until their derivations and scope are
-// established for global use.
+// A node derivation is the root derivation run under a different box and LP
+// point: the point only selects which valid inequality is produced, the box
+// is what bounds_are_root accounts for, and the rows what rows_are_global
+// does. So a family is trusted at a node exactly when its root cuts already
+// enter the global model and it reports which bounds it consumed: lifted
+// covers, c-MIR (with its lifted covers), GMI and zero-half. Flow cover is
+// not: its root use needs an explicit opt-in because its cuts have been
+// refuted, and it reports no provenance (CutRow::used_local_bound stays true).
+//
+// History: an n5-3 campaign once reported MIR cuts excluding a reference
+// optimum; the later flags were references outside the generating node's
+// bounds, which a subtree-local cut may exclude. The two provenance holes that
+// did exist -- the MIR lifted cover read both bounds of a column but checked
+// one, and the dynamism repair compared a bound with either root side --
+// are closed, and both are tested.
+// Clique, odd-cycle and implied-bound rows restate facts of the root
+// conflict graph; mixing rows are proved from the model's own rows and bounds
+// (all four exact): derivations that hold globally whenever the separator
+// says it used no local bound.
 inline bool cut_family_derivation_trusted(const std::string& name) {
     return name.rfind("COV_", 0) == 0 || name.rfind("COVPC_", 0) == 0 ||
-           name.rfind("COVGNS_", 0) == 0;
+           name.rfind("COVGNS_", 0) == 0 || name.rfind("MIR_", 0) == 0 ||
+           name.rfind("GMI_", 0) == 0 || name.rfind("ZH_", 0) == 0 ||
+           name.rfind("CLQ_", 0) == 0 || name.rfind("OCY_", 0) == 0 ||
+           name.rfind("VUB_", 0) == 0 || name.rfind("MIX_", 0) == 0;
 }
 
 struct ManagedCut {
@@ -192,6 +221,7 @@ struct GcsCandidate {
     int first_depth = -1;
     f64 best_violation = 0.0;
     f64 promote_label = 0.0;  // training: bound gain after promote
+    std::uint64_t last_violated_point = 0;   // GcsPool::set_point id of the last count
 };
 
 // Heuristic global score (fallback): mean_eff * (1 + log1p(violation_nodes)).
@@ -275,6 +305,11 @@ struct GcsPool {
     GcsModel model;
     GcsDiagnostics diag;
     bool prefer_heuristic = false;
+    // The LP point being observed (nonzero: e.g. the node serial). With it set,
+    // a candidate's violation_nodes counts each point once however often the
+    // point re-derives or re-checks it; unset (0), every report counts.
+    std::uint64_t point = 0;
+    void set_point(std::uint64_t id) { point = id; }
 
     void observe(const CutRow& row,
                  const CutFeatureVec& feats,
@@ -290,8 +325,11 @@ struct GcsPool {
                      int depth = 0, f64 gap_rel = 0.0, f64 dual_bound = 0.0);
     // Rank globally-valid candidates by GCS score. Never returns local cuts.
     // Skips ids already in promoted_ids when skip_promoted is true.
+    // min_violation_nodes: only candidates violated at that many distinct
+    // observed LP points.
     std::vector<CutRow> select_global(int max_keep, f64 min_score,
-                                      bool skip_promoted = false);
+                                      bool skip_promoted = false,
+                                      int min_violation_nodes = 1);
     void mark_promoted(const std::vector<CutRow>& rows);
     void trim();
 };

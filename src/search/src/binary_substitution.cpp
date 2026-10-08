@@ -130,6 +130,7 @@ MilpPresolveResult substitute_binary_relations(const model::LpProblem &lp,
             return rejected();
         if (r != j) {
             out.eliminated[j] = 1;
+            out.journal.push_back({PostsolveKind::Binary, out.binary_substitution_steps.size()});
             out.binary_substitution_steps.push_back({j, r, parity[j] != 0});
         } else {
             out.reduced_col[j] = k;

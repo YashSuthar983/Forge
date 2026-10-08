@@ -68,7 +68,9 @@ void test_certificate_rules() {
 // has an open gap. The child certificates, rather than the weaker parent
 // bound, must survive in the final frontier bound.
 void test_strong_branch_child_certificates_close_gap() {
-    const auto lp = make_random_milp(1526);
+    // A seed whose search has such a node (1526 until GMI kept its tiny
+    // integer terms, which moved that model's root cuts).
+    const auto lp = make_random_milp(1623);
     const auto oracle = solve_oracle(lp);
     CHECK(oracle.feasible);
     BabOptions opts;

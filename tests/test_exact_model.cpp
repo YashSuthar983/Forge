@@ -1,13 +1,76 @@
 #include "forge/model/dyadic.hpp"
 #include "forge/model/exact.hpp"
 #include "forge/model/lp.hpp"
+#include "forge/sparse/csr.hpp"
 #include "test_helpers.hpp"
 
 #include <cmath>
 #include <limits>
 #include <random>
 
+// max_row_violation decides rows whose activity is certainly inside their
+// sides in long double and sums only the others exactly. The result must be
+// the exact maximum violation, rounded up, bit for bit -- including rows built
+// to sit within an ulp of a side and rows whose terms cancel.
+void test_max_row_violation_matches_exact() {
+    using forge::model::ExactSum;
+    using forge::model::Rational;
+    std::mt19937 random(9161);
+    int near_side = 0;
+    for (int trial = 0; trial < 300; ++trial) {
+        const int m = 6, n = 8;
+        std::vector<forge::core::Index> r, c;
+        std::vector<double> v;
+        std::vector<double> x(n);
+        for (int j = 0; j < n; ++j)
+            x[j] = std::ldexp(static_cast<double>(static_cast<int>(random() % 2001) - 1000),
+                              static_cast<int>(random() % 60) - 30);
+        forge::model::LpProblem lp;
+        lp.c.assign(n, 0.0);
+        lp.col_lo.assign(n, -1e300);
+        lp.col_hi.assign(n, 1e300);
+        for (int i = 0; i < m; ++i) {
+            ExactSum act;
+            for (int j = 0; j < n; ++j) {
+                if (random() % 2) continue;
+                const double a = std::ldexp(static_cast<double>(static_cast<int>(random() % 2001) - 1000),
+                                            static_cast<int>(random() % 80) - 40);
+                if (a == 0.0) continue;
+                r.push_back(i); c.push_back(j); v.push_back(a);
+                act.add_product(a, x[j]);
+            }
+            // Sides at the exact activity's neighbouring doubles, or far.
+            const double near = forge::model::rounded_down(act.value());
+            const int kind = static_cast<int>(random() % 4);
+            double lo = -std::numeric_limits<double>::infinity();
+            double hi = std::numeric_limits<double>::infinity();
+            if (kind == 0) { lo = near; hi = std::nextafter(near, 1e300); ++near_side; }
+            else if (kind == 1) { lo = std::nextafter(near, 1e300); }
+            else if (kind == 2) { hi = std::nextafter(near, -1e300); }
+            else { lo = near - 1e3; hi = near + 1e3; }
+            lp.row_lo.push_back(lo);
+            lp.row_hi.push_back(hi);
+        }
+        lp.A = forge::sparse::from_triplets(m, n, r, c, v);
+        double expect = 0.0;
+        const auto& rp = lp.A.pattern.row_ptr();
+        const auto& ci = lp.A.pattern.col_idx();
+        for (int i = 0; i < m; ++i) {
+            ExactSum act;
+            for (auto k = rp[i]; k < rp[i + 1]; ++k) act.add_product(lp.A.vals[k], x[ci[k]]);
+            const Rational a = act.value();
+            if (std::isfinite(lp.row_lo[i]) && a < Rational(lp.row_lo[i]))
+                expect = std::max(expect, forge::model::rounded_up(Rational(lp.row_lo[i]) - a));
+            if (std::isfinite(lp.row_hi[i]) && a > Rational(lp.row_hi[i]))
+                expect = std::max(expect, forge::model::rounded_up(a - Rational(lp.row_hi[i])));
+        }
+        CHECK(lp.max_row_violation(x) == expect);
+    }
+    CHECK(near_side > 30);
+}
+
 int main() {
+    test_max_row_violation_matches_exact();
     using forge::model::ExactSum;
     using forge::model::Rational;
     {

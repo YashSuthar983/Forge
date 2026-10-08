@@ -88,6 +88,14 @@ struct MilpPresolveOptions {
     // re-presolve drop 3.6k rows.
     bool probing_presolve = true;
     double probing_presolve_time_s = 4.0;
+    // MIP-valid aggregation of equality rows (aggregate_presolve.hpp): a
+    // column is substituted out through an equality of at most
+    // aggregation_max_row entries when it sits in at most
+    // aggregation_max_col_rows rows, integrality survives exactly, every
+    // rewrite is exact and the matrix gets no denser.
+    bool aggregation = true;
+    int aggregation_max_row = 8;
+    int aggregation_max_col_rows = 8;
     // Two bounds compare equal (a fixed column, or a tightened bound closing
     // to a point) within this absolute tolerance.
     f64 tol = 1e-9;
@@ -102,17 +110,30 @@ struct MilpPresolveStats {
     int rounds = 0;
     // Rounds the time limit stopped before the fixed point.
     int rounds_stopped_on_time = 0;
-    // Reductions this pass implements. (Aggregation and
-    // dominated/parallel reductions are not implemented yet; see
-    // milp_capability_inventory() in bab.hpp.)
+    // Reductions this pass implements. (Dominated/parallel-column
+    // reductions are not implemented yet; see milp_capability_inventory()
+    // in bab.hpp.)
     int fixed_cols = 0;
+    // Fixed columns the reduced model keeps at their value, because a row's
+    // exact residual side or the objective constant is no double without them.
+    int fixed_cols_kept_exact = 0;
     int singleton_rows = 0;
+    int singleton_rows_kept = 0;   // bound tightened, row kept: no exact bound states it
     int redundant_rows = 0;
     int bounds_tightened = 0;
     int coefs_tightened = 0;      // big-M coefficient strengthenings
+    // Strengthenings declined because the exact new coefficient or side is
+    // not a double (rounding it would move the row).
+    int coefs_inexact_skipped = 0;
+    // Duplicate columns left unmerged because their summed domain would not
+    // be exact.
+    int merge_inexact_skipped = 0;
     int sides_rounded = 0;        // all-integer rows whose sides went to the gcd lattice
     int monotone_pairs_saturated = 0;  // optimality-preserving exactly-one pairs
     int merged_cols = 0;          // columns removed by duplicate-column merging
+    int aggregated_cols = 0;              // columns substituted out through equalities
+    int aggregation_rows_removed = 0;     // pivot rows that left with their column
+    int aggregation_inexact_skipped = 0;  // candidates declined: a rewrite was not exact
     int probing_fixings = 0;      // columns fixed / bounds moved by presolve probing
     double probing_ms = 0.0;
     int merge_groups = 0;
@@ -144,13 +165,32 @@ struct MilpPresolveStats {
 // through postsolve_point(); the reduced problem is what the caller actually
 // solves.
 // A group of columns replaced by one representative (members[0]) that carries
-// their sum. `after_binary_steps` is how many binary substitution steps had
-// been recorded when the merge was made, which fixes its place in the
-// backwards postsolve replay. Column indices belong to the original model.
+// their sum. Column indices belong to the original model.
 struct ColumnMerge {
     std::vector<Index> members;
     std::vector<f64> lo, hi;   // original bounds of each member
-    std::size_t after_binary_steps = 0;
+};
+
+// An equality the reduced model no longer carries as a definition of `col`:
+//     coef * x_col + sum_k vals[k] * x_{cols[k]} = rhs.
+// Postsolve sets x_col from the other columns' values. Every column named is
+// an original-model index; the others all have values by the time this step
+// is undone (later steps are undone first).
+struct LinearSubstitution {
+    Index col = -1;
+    f64 coef = 0.0;
+    std::vector<Index> cols;
+    std::vector<f64> vals;
+    f64 rhs = 0.0;
+};
+
+// The transformation journal: every non-fixing elimination in the order it
+// was made, each naming its record in the per-kind vector. Postsolve undoes
+// them newest first after filling surviving and fixed columns.
+enum class PostsolveKind : std::uint8_t { Binary, Merge, Linear };
+struct PostsolveStep {
+    PostsolveKind kind = PostsolveKind::Binary;
+    std::size_t index = 0;
 };
 
 struct MilpPresolveResult {
@@ -169,6 +209,10 @@ struct MilpPresolveResult {
     std::vector<BinaryRelation> binary_substitution_steps;
     // Duplicate-column merges, in the order they were made.
     std::vector<ColumnMerge> column_merges;
+    // Columns defined by an equality they were aggregated out of.
+    std::vector<LinearSubstitution> linear_substitutions;
+    // Chronological order of all three kinds (see PostsolveStep).
+    std::vector<PostsolveStep> journal;
     // What presolve probing learned, over `reduced`'s columns, for the search to
     // resume from (see ProbingCarry). Empty (fingerprint 0) when probing did not run.
     ProbingCarry probing_carry;
@@ -189,6 +233,17 @@ MilpPresolveResult run_structural_presolve(const model::LpProblem& lp,
 // substitutions replay in reverse). Used for restarts, where the reduced
 // model is presolved again after its box was tightened.
 void compose_presolve(MilpPresolveResult& outer, MilpPresolveResult inner);
+
+// Probing facts over the columns of a model presolve started from (or passed
+// through), moved onto `pre.reduced`. `snapshot[o]` is original column o's
+// column in the probed model (the identity when the facts describe the
+// original model itself); `merges_before` counts the column merges made
+// before the probe. Facts naming an eliminated column, a merged sum or two
+// columns that became one are dropped; the result describes pre.reduced.
+ProbingCarry carry_into_reduced(const ConflictGraph& graph, const ProbingState& state,
+                                const MilpPresolveResult& pre,
+                                const std::vector<Index>& snapshot,
+                                std::size_t merges_before);
 
 // Expands a feasible point of `pre.reduced` (size pre.reduced.n_cols()) back
 // to the original column space (size = the n_cols() of the problem passed to

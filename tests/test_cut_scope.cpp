@@ -118,19 +118,26 @@ void test_pool_dedup_keeps_weaker_scope() {
     CHECK(!cut_may_leave_subtree(merged));   // dedup must not launder scope
 }
 
-// 6. The family whitelist is a quarantine. The earlier n5-3 campaign is not
-//    a derivation proof: one sweep deleted the detector, and later flags were
-//    references outside the generating node.
+// 6. Trusted families are those whose root cuts already enter the global
+//    model and which report the bounds they consumed (CutRow::used_local_bound,
+//    tested against the root box in test_cut_provenance). A node GMI is local
+//    only through the bounds its nonbasic columns sit at, which it reports.
+//    Flow cover reports nothing and has refuted cuts: it stays out. Clique,
+//    odd-cycle and implied-bound rows restate root conflict-graph facts and
+//    mixing rows the model's own rows; all four report used_local_bound.
 void test_family_derivation_whitelist() {
     CHECK(cut_family_derivation_trusted("COV_3"));
     CHECK(cut_family_derivation_trusted("COVPC_0"));
     CHECK(cut_family_derivation_trusted("COVGNS_7"));
+    CHECK(cut_family_derivation_trusted("MIR_12"));
+    CHECK(cut_family_derivation_trusted("ZH_1"));
+    CHECK(cut_family_derivation_trusted("GMI_4"));
+    CHECK(cut_family_derivation_trusted("CLQ_2"));
+    CHECK(cut_family_derivation_trusted("OCY_0"));
+    CHECK(cut_family_derivation_trusted("VUB_5"));
+    CHECK(cut_family_derivation_trusted("MIX_1"));
 
-    CHECK(!cut_family_derivation_trusted("MIR_12"));
-    CHECK(!cut_family_derivation_trusted("ZH_1"));
     CHECK(!cut_family_derivation_trusted("FC_0"));
-    // Tableau GMI is node-local by construction.
-    CHECK(!cut_family_derivation_trusted("GMI_4"));
 
     // A trusted family is still not promotable on its own.
     CutScopeConditions s;

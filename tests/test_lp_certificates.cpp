@@ -514,6 +514,73 @@ void test_interval_lagrangian_matches_exact() {
     CHECK(compared > 300);
 }
 
+// interval_reduced_cost_tightenings may only be weaker than the exactly
+// evaluated rule (safe_reduced_cost_tightenings with the same multipliers):
+// for every column, its bound must contain the exact one. Integer columns
+// with integral boxes; the cutoff a random room above the exact Lagrangian,
+// so that both tight and loose fixings occur.
+void test_interval_rc_never_tighter_than_exact() {
+    std::mt19937 rng(20261008u);
+    std::uniform_real_distribution<double> U(-1.0, 1.0);
+    int fixed = 0, same = 0;
+    for (int trial = 0; trial < 400; ++trial) {
+        const core::Index m = 2 + static_cast<core::Index>(rng() % 6);
+        const core::Index n = 2 + static_cast<core::Index>(rng() % 8);
+        model::LpProblem lp;
+        lp.maximize = (rng() & 1u) != 0;
+        lp.obj_offset = U(rng) * 10.0;
+        std::vector<core::Index> rows, cols;
+        std::vector<double> vals;
+        for (core::Index i = 0; i < m; ++i)
+            for (core::Index j = 0; j < n; ++j)
+                if (rng() % 3 != 0) {
+                    rows.push_back(i); cols.push_back(j);
+                    vals.push_back(U(rng) * std::pow(10.0, static_cast<double>(rng() % 5) - 2.0));
+                }
+        lp.A = sparse::from_triplets(m, n, rows, cols, vals);
+        lp.c.resize(n); lp.col_lo.resize(n); lp.col_hi.resize(n);
+        lp.is_integer.assign(n, true);
+        for (core::Index j = 0; j < n; ++j) {
+            lp.c[j] = U(rng) * 5.0;
+            lp.col_lo[j] = -static_cast<double>(rng() % 4);
+            lp.col_hi[j] = lp.col_lo[j] + 1.0 + static_cast<double>(rng() % 6);
+        }
+        lp.row_lo.resize(m); lp.row_hi.resize(m);
+        for (core::Index i = 0; i < m; ++i) {
+            lp.row_lo[i] = -2.0 + U(rng);
+            lp.row_hi[i] = (rng() % 4 == 0) ? model::kInf : lp.row_lo[i] + 3.0;
+        }
+        std::vector<double> y(m);
+        for (auto& v : y) v = U(rng) * std::pow(10.0, static_cast<double>(rng() % 5) - 2.0);
+        certify::SafeLpBound exact_lb;
+        (void)certify::safe_reduced_cost_tightenings(lp, y, lp.col_lo, lp.col_hi,
+                                                     std::numeric_limits<double>::infinity(),
+                                                     &exact_lb, nullptr);
+        if (!exact_lb.finite) continue;
+        const double cutoff = exact_lb.value + std::fabs(U(rng)) * 6.0;
+        const auto exact = certify::safe_reduced_cost_tightenings(lp, y, lp.col_lo, lp.col_hi,
+                                                                  cutoff, nullptr, nullptr);
+        const auto fast = certify::interval_reduced_cost_tightenings(
+            lp, y, lp.col_lo, lp.col_hi, cutoff, nullptr);
+        if (!fast.finite) continue;
+        CHECK(fast.bound <= exact_lb.value);
+        for (const auto& f : fast.changes) {
+            ++fixed;
+            bool found = false;
+            for (const auto& e : exact) {
+                if (e.col != f.col || e.upper != f.upper) continue;
+                found = true;
+                // Valid: the interval bound keeps everything the exact one keeps.
+                CHECK(f.upper ? f.value >= e.value : f.value <= e.value);
+                if (f.value == e.value) ++same;
+            }
+            CHECK(found);   // the exact rule tightens wherever the interval one does
+        }
+    }
+    CHECK(fixed > 100);
+    CHECK(same * 10 >= fixed * 9);   // the enclosure is tight: nearly always the same bound
+}
+
 // check_dual_farkas_ray certifies by interval arithmetic when that decides
 // and exactly otherwise. Either way the verdict must be the exact rule's:
 // lower - upper > tol * (1 + max(|lower|, |upper|)) (rounded down against
@@ -655,6 +722,7 @@ void test_farkas_check_matches_exact_rule() {
 }
 
 int main() {
+    test_interval_rc_never_tighter_than_exact();
     test_float_rays_skip_exact_repair_without_exact_proof();
     test_farkas_check_matches_exact_rule();
     test_presolved_terminal_witnesses();

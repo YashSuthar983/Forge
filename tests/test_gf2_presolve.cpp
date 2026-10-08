@@ -127,7 +127,37 @@ void test_gf2_declines_unrepresentable_parity() {
 
 }  // namespace
 
+// Even integer terms vanish mod 2 (audit section 13): x + y - 2k = 1 is
+// x XOR y = 1, and x - 2m = 0 makes x even, so x = 0 and y = 1.
+void test_gf2_even_integer_terms_vanish() {
+    forge::model::LpProblem lp;
+    // columns: x, y, k, m
+    lp.c = {0.0, 0.0, 0.0, 0.0};
+    lp.col_lo = {0.0, 0.0, 0.0, 0.0};
+    lp.col_hi = {1.0, 1.0, 5.0, 5.0};
+    lp.is_integer = {true, true, true, true};
+    lp.row_lo = {1.0, 0.0};
+    lp.row_hi = {1.0, 0.0};
+    lp.A = forge::sparse::from_triplets(2, 4, {0, 0, 0, 1, 1}, {0, 1, 2, 0, 3},
+                                      {1.0, 1.0, -2.0, 1.0, -2.0});
+    lp.validate();
+    auto lo = lp.col_lo, hi = lp.col_hi;
+    forge::search::Gf2PresolveOptions o;
+    const auto d = forge::search::apply_gf2_presolve(lp, lo, hi, o);
+    CHECK(!d.infeasible);
+    CHECK(hi[0] == 0.0);
+    CHECK(lo[1] == 1.0);
+    // k integral only in some optimum, not at every point: no parity there.
+    std::vector<char> mask = {1, 1, 0, 1};
+    o.integer_mask = &mask;
+    lo = lp.col_lo; hi = lp.col_hi;
+    forge::search::apply_gf2_presolve(lp, lo, hi, o);
+    CHECK(hi[0] == 0.0);            // still from x - 2m = 0
+    CHECK(lo[1] == 0.0);            // the first row is not a parity relation
+}
+
 int main() {
+    test_gf2_even_integer_terms_vanish();
     test_gf2_singleton_fix();
     test_gf2_detects_infeas();
     test_gf2_keeps_pair_feasible();

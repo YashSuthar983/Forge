@@ -1,3 +1,4 @@
+#include "forge/model/dyadic.hpp"
 #include "forge/search/portfolio.hpp"
 
 #include <cmath>
@@ -84,18 +85,24 @@ bool portfolio_point_is_feasible(const model::LpProblem& p,
             std::fabs(v - std::round(v)) > int_tol)
             return false;
     }
+    // Row activities are exact (the tolerance is relative to their size, as
+    // before). A binary64 sum can admit an infeasible point: with M = 2^52
+    // and five binaries at 1, M p + M q + r - M s - M t <= 0 has activity 1,
+    // but its sum in column order loses r at 2^53 + 1 and reads 0.
     const Index m = p.n_rows();
     const auto& rp = p.A.pattern.row_ptr();
     const auto& ci = p.A.pattern.col_idx();
     for (Index i = 0; i < m; ++i) {
-        f64 act = 0.0;
+        model::DyadicSum act;
         for (core::Offset k = rp[static_cast<std::size_t>(i)]; k < rp[static_cast<std::size_t>(i) + 1]; ++k)
-            act += p.A.vals[static_cast<std::size_t>(k)] * x[static_cast<std::size_t>(ci[static_cast<std::size_t>(k)])];
-        if (!std::isfinite(act)) return false;
-        const f64 scale = 1.0 + std::fabs(act);
+            act.add_product(p.A.vals[static_cast<std::size_t>(k)],
+                            x[static_cast<std::size_t>(ci[static_cast<std::size_t>(k)])]);
+        const f64 approx = act.nearest();
+        if (!std::isfinite(approx)) return false;
+        const f64 scale = 1.0 + std::fabs(approx);
         const f64 lo = p.row_lo[static_cast<std::size_t>(i)], hi = p.row_hi[static_cast<std::size_t>(i)];
-        if (std::isfinite(lo) && act < lo - feas_tol * scale) return false;
-        if (std::isfinite(hi) && act > hi + feas_tol * scale) return false;
+        if (std::isfinite(lo) && act.compare(lo - feas_tol * scale) < 0) return false;
+        if (std::isfinite(hi) && act.compare(hi + feas_tol * scale) > 0) return false;
     }
     return true;
 }
@@ -117,16 +124,20 @@ bool cut_admits_point(const std::vector<Index>& cols,
                       const std::vector<f64>& vals, f64 row_lo, f64 row_hi,
                       const std::vector<f64>& x, f64 tol) {
     if (x.empty()) return true;  // nothing to check against
-    f64 act = 0.0;
+    // Exact activity: a rounded one can hide the violation this net exists
+    // to catch (see portfolio_point_is_feasible).
+    model::DyadicSum act;
     for (std::size_t k = 0; k < cols.size(); ++k) {
         const std::size_t j = static_cast<std::size_t>(cols[k]);
         if (j >= x.size()) return true;  // shape mismatch: not ours to judge
-        act += vals[k] * x[j];
+        if (!std::isfinite(vals[k]) || !std::isfinite(x[j])) return true;
+        act.add_product(vals[k], x[j]);
     }
-    if (!std::isfinite(act)) return true;
-    const f64 scale = tol * (1.0 + std::fabs(act));
-    if (std::isfinite(row_lo) && act < row_lo - scale) return false;
-    if (std::isfinite(row_hi) && act > row_hi + scale) return false;
+    const f64 approx = act.nearest();
+    if (!std::isfinite(approx)) return true;
+    const f64 scale = tol * (1.0 + std::fabs(approx));
+    if (std::isfinite(row_lo) && act.compare(row_lo - scale) < 0) return false;
+    if (std::isfinite(row_hi) && act.compare(row_hi + scale) > 0) return false;
     return true;
 }
 

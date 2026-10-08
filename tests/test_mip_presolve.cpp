@@ -12,6 +12,8 @@
 #include "test_helpers.hpp"
 
 #include <cmath>
+#include <cstdio>
+#include <random>
 #include <cstdint>
 #include <vector>
 
@@ -412,6 +414,50 @@ void test_components_do_not_fix_columns_with_relaxed_rows() {
     CHECK_NEAR(diag.incumbent, 2.0, 1e-7);
 }
 
+// Component presolve's independence and enumeration are exact (audit
+// section 2): a small coefficient still connects, and enumeration may not
+// reject an assignment on a rounded activity.
+void test_components_connect_small_coefficients() {
+    // min x + y, binary x, y, continuous z in [0, 1e13],
+    // x + y + 1e-13 z >= 2: x = 1, y = 0, z = 1e13 is feasible. With z left
+    // out of the component, enumeration at z = 0 fixed x = y = 1.
+    LpProblem lp;
+    lp.c = {1.0, 1.0, 0.0};
+    lp.col_lo = {0.0, 0.0, 0.0};
+    lp.col_hi = {1.0, 1.0, 1e13};
+    lp.is_integer = {true, true, false};
+    lp.row_lo = {2.0};
+    lp.row_hi = {forge::model::kInf};
+    lp.A = from_triplets(1, 3, {0, 0, 0}, {0, 1, 2}, {1.0, 1.0, 1e-13});
+    auto lo = lp.col_lo, hi = lp.col_hi;
+    forge::search::ComponentPresolveOptions o;
+    const auto d = forge::search::apply_component_presolve(lp, lo, hi, o);
+    CHECK(!d.infeasible);
+    CHECK(d.n_components == 1);
+    CHECK(lo[0] == 0.0 && lo[1] == 0.0);
+}
+
+void test_component_enumeration_is_exact() {
+    // min -x, binary x, y, z, M x + y - M z = 1 with M = 2^67: (0,1,0) and
+    // (1,1,1) are feasible, the second optimal. In f64 the latter's activity
+    // is 0 (M + 1 rounds to M), and the hull fixed x = z = 0.
+    const double M = 0x1p67;
+    LpProblem lp;
+    lp.c = {-1.0, 0.0, 0.0};
+    lp.col_lo = {0.0, 0.0, 0.0};
+    lp.col_hi = {1.0, 1.0, 1.0};
+    lp.is_integer = {true, true, true};
+    lp.row_lo = {1.0};
+    lp.row_hi = {1.0};
+    lp.A = from_triplets(1, 3, {0, 0, 0}, {0, 1, 2}, {M, 1.0, -M});
+    auto lo = lp.col_lo, hi = lp.col_hi;
+    forge::search::ComponentPresolveOptions o;
+    const auto d = forge::search::apply_component_presolve(lp, lo, hi, o);
+    CHECK(!d.infeasible);
+    CHECK(hi[0] == 1.0 && hi[2] == 1.0);
+    CHECK(lo[1] <= 1.0 && hi[1] >= 1.0);
+}
+
 void test_gf2_in_mip_presolve() {
     LpProblem lp;
     lp.name = "gf2_mip";
@@ -471,7 +517,79 @@ void test_milp_knapsack_still_optimal() {
 
 }  // namespace
 
+// OBBT: on random models with continuous and integer columns (some free),
+// every bound it sets contains the true MILP extremum of its column (solved
+// independently to a zero gap) -- its probes run over integer-rounded bounds
+// of earlier columns, so LP extrema of the original box are no reference --
+// and continuous columns get tightened too.
+void test_obbt_bounds_contain_lp_extrema() {
+    std::mt19937 rng(77);
+    int tightened = 0, continuous_tightened = 0, checked = 0;
+    for (int trial = 0; trial < 150; ++trial) {
+        const Index n = 3 + static_cast<Index>(rng() % 3);
+        const Index m = 2 + static_cast<Index>(rng() % 3);
+        LpProblem lp;
+        lp.name = "obbt";
+        std::vector<Index> ri, cj;
+        std::vector<f64> v;
+        for (Index i = 0; i < m; ++i)
+            for (Index j = 0; j < n; ++j)
+                if (rng() % 3 != 0) {
+                    ri.push_back(i); cj.push_back(j);
+                    v.push_back(static_cast<f64>(static_cast<int>(rng() % 9) - 4) + 0.5);
+                }
+        lp.A = from_triplets(m, n, ri, cj, v);
+        lp.c.assign(static_cast<std::size_t>(n), 0.0);
+        lp.col_lo.assign(static_cast<std::size_t>(n), -6.0);
+        lp.col_hi.assign(static_cast<std::size_t>(n), 6.0);
+        lp.is_integer.assign(static_cast<std::size_t>(n), false);
+        for (Index j = 0; j < n; ++j) {
+            if (rng() % 2 == 0) lp.is_integer[static_cast<std::size_t>(j)] = true;
+            if (rng() % 5 == 0) lp.col_hi[static_cast<std::size_t>(j)] = forge::model::kInf;
+        }
+        lp.row_lo.assign(static_cast<std::size_t>(m), -forge::model::kInf);
+        lp.row_hi.resize(static_cast<std::size_t>(m));
+        for (auto& r : lp.row_hi) r = static_cast<f64>(rng() % 7);
+        std::vector<f64> lo = lp.col_lo, hi = lp.col_hi;
+        MipPresolveOptions mo;
+        mo.max_obbt_vars = 20;
+        forge::engines::SimplexOptions so;
+        so.presolve = false;
+        (void)forge::search::apply_obbt_lite(lp, lo, hi, mo, &so, nullptr);
+        for (Index j = 0; j < n; ++j) {
+            const auto z = static_cast<std::size_t>(j);
+            for (int sense = 0; sense < 2; ++sense) {
+                LpProblem q = lp;
+                q.c.assign(static_cast<std::size_t>(n), 0.0);
+                q.c[z] = sense == 0 ? 1.0 : -1.0;
+                forge::search::BabOptions bo;
+                bo.para_bab.threads = 1;
+                bo.gap_tol = bo.abs_gap_tol = 0.0;
+                bo.time_limit_s = 10.0;
+                forge::search::BabDiagnostics bd;
+                const auto r = forge::search::solve_milp(q, bo, bd);
+                if (r.proposed_status != forge::core::Status::Optimal) continue;
+                const f64 ext = sense == 0 ? r.objective : -r.objective;   // MILP min / max of x_j
+                if (sense == 0) CHECK(lo[z] <= ext + 1e-7);
+                else CHECK(hi[z] >= ext - 1e-7);
+                ++checked;
+            }
+            if (lo[z] > lp.col_lo[z] || hi[z] < lp.col_hi[z]) {
+                ++tightened;
+                if (!lp.is_integer[z]) ++continuous_tightened;
+            }
+        }
+    }
+    std::printf("OBBT checked=%d tightened=%d continuous=%d\n", checked, tightened, continuous_tightened);
+    CHECK(checked > 300);
+    CHECK(tightened > 50);
+    CHECK(continuous_tightened > 20);
+}
+
 int main() {
+    test_obbt_bounds_contain_lp_extrema();
+    test_components_connect_small_coefficients();
+    test_component_enumeration_is_exact();
     test_dual_fixing_fixes_unlocked();
     test_dual_fixing_respects_small_objective_coefficient();
     test_dual_fixing_counts_small_nonzero_row_coefficient();

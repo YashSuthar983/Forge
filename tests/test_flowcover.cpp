@@ -1,11 +1,13 @@
 // Flow-cover cut validity tests - VUB projection + SI lifting.
 #include "forge/search/flowcover.hpp"
+#include "forge/engines/simplex.hpp"
 #include "forge/sparse/csr.hpp"
 
 #include "test_helpers.hpp"
 
 #include <cmath>
 #include <cstdint>
+#include <iostream>
 #include <random>
 #include <vector>
 
@@ -437,6 +439,101 @@ void test_random_small_flow_cuts_against_all_vertices() {
     CHECK(checked_cuts >= 25);
 }
 
+// Every row, lifted arcs included, is checked against the whole mixed-integer
+// set: for each assignment of the integer columns an LP maximizes the row's
+// activity over the continuous ones. Random flow models with VUB rows in
+// three forms (scaled, >=-form), extra integer/continuous terms of either
+// sign, an arc indicator also in the capacity row, and tight capacities so
+// covers and lifting are frequent.
+void test_rows_valid_against_lp_oracle() {
+    std::mt19937 rng(5);
+    int checked = 0;
+    std::uint64_t lifted = 0;
+    for (int trial = 0; trial < 2500; ++trial) {
+        const int k = 2 + static_cast<int>(rng() % 5);
+        const int extra = static_cast<int>(rng() % 3);
+        const Index n = 2 * k + extra;
+        LpProblem lp;
+        lp.name = "fc_oracle";
+        lp.c.assign(static_cast<std::size_t>(n), 0.0);
+        lp.col_lo.assign(static_cast<std::size_t>(n), 0.0);
+        lp.col_hi.assign(static_cast<std::size_t>(n), 1.0);
+        lp.is_integer.assign(static_cast<std::size_t>(n), false);
+        std::vector<Index> ri, cj;
+        std::vector<f64> v;
+        Index row = 0;
+        const auto put = [&](Index r, Index c, f64 a) { ri.push_back(r); cj.push_back(c); v.push_back(a); };
+        for (int j = 0; j < k; ++j) {
+            lp.is_integer[static_cast<std::size_t>(k + j)] = true;
+            lp.col_hi[static_cast<std::size_t>(j)] = 1.0 + static_cast<f64>(rng() % 20);
+            const int form = static_cast<int>(rng() % 3);
+            const f64 u = 1.0 + static_cast<f64>(rng() % 15);
+            if (form == 0) { put(row, j, 1.0); put(row, k + j, -u); lp.row_lo.push_back(-kInf); lp.row_hi.push_back(0.0); }
+            else if (form == 1) { const f64 sc = 1.0 + static_cast<f64>(rng() % 3) / 2.0; put(row, j, sc); put(row, k + j, -u * sc); lp.row_lo.push_back(-kInf); lp.row_hi.push_back(0.0); }
+            else { put(row, j, -1.0); put(row, k + j, u); lp.row_lo.push_back(0.0); lp.row_hi.push_back(kInf); }
+            ++row;
+        }
+        for (int e = 0; e < extra; ++e) {
+            const auto c = static_cast<std::size_t>(2 * k + e);
+            const int kind = static_cast<int>(rng() % 3);
+            if (kind == 0) { lp.is_integer[c] = true; lp.col_hi[c] = 2.0; }
+            else if (kind == 1) { lp.col_lo[c] = -2.0; lp.col_hi[c] = 3.0; }
+            else { lp.is_integer[c] = true; }
+        }
+        f64 b = 0.0;
+        for (int j = 0; j < k; ++j) { const f64 a = 1.0 + static_cast<f64>(rng() % 3) / 2.0; put(row, j, a); b += a * 3.0; }
+        for (int e = 0; e < extra; ++e) put(row, 2 * k + e, (rng() % 2 ? 1.0 : -1.0) * (1.0 + static_cast<f64>(rng() % 3)));
+        if (rng() % 3 == 0) put(row, k, 1.0 + static_cast<f64>(rng() % 4));
+        lp.row_lo.push_back(-kInf);
+        lp.row_hi.push_back(std::floor(b * (0.2 + 0.1 * static_cast<f64>(rng() % 4))));
+        ++row;
+        lp.A = from_triplets(row, n, ri, cj, v);
+        std::vector<f64> x(static_cast<std::size_t>(n));
+        for (Index j = 0; j < n; ++j) {
+            const auto z = static_cast<std::size_t>(j);
+            x[z] = lp.col_lo[z] + (lp.col_hi[z] - lp.col_lo[z]) * static_cast<f64>(rng() % 101) / 100.0;
+        }
+        FlowCoverOptions fo;
+        fo.violation_min = 1e-9;
+        FlowCoverDiagnostics fd;
+        const auto cuts = separate_flow_covers(lp, x, lp.col_lo, lp.col_hi, fo, fd);
+        lifted += fd.si_lifted_arcs;
+        for (const CutRow& c : cuts) {
+            CHECK(c.exact);
+            std::vector<Index> ints;
+            for (Index j = 0; j < n; ++j) if (lp.is_integer[static_cast<std::size_t>(j)]) ints.push_back(j);
+            std::vector<int> val(ints.size(), 0);
+            for (;;) {
+                LpProblem sub = lp;
+                for (std::size_t t = 0; t < ints.size(); ++t) {
+                    const auto z = static_cast<std::size_t>(ints[t]);
+                    sub.col_lo[z] = sub.col_hi[z] = lp.col_lo[z] + val[t];
+                }
+                sub.c.assign(static_cast<std::size_t>(n), 0.0);
+                sub.maximize = true;
+                for (std::size_t q = 0; q < c.cols.size(); ++q) sub.c[static_cast<std::size_t>(c.cols[q])] += c.vals[q];
+                forge::engines::SimplexOptions so;
+                forge::engines::SimplexDiagnostics sd;
+                const auto r = forge::engines::solve_simplex(sub, so, sd);
+                if (r.proposed_status == forge::core::Status::Optimal)
+                    CHECK(r.objective <= c.row_hi + 1e-7);
+                std::size_t t = 0;
+                while (t < ints.size()) {
+                    const auto z = static_cast<std::size_t>(ints[t]);
+                    if (lp.col_lo[z] + val[t] + 1 <= lp.col_hi[z]) { ++val[t]; break; }
+                    val[t] = 0;
+                    ++t;
+                }
+                if (t == ints.size()) break;
+            }
+            ++checked;
+        }
+    }
+    std::cout << "FLOWCOVER_ORACLE rows=" << checked << " lifted_arcs=" << lifted << '\n';
+    CHECK(checked > 300);
+    CHECK(lifted > 300);
+}
+
 }  // namespace
 
 int main() {
@@ -449,5 +546,6 @@ int main() {
     test_positive_vub_slack_is_not_discarded();
     test_scaled_flow_row_keeps_flow_coefficients();
     test_random_small_flow_cuts_against_all_vertices();
+    test_rows_valid_against_lp_oracle();
     return forge::test::finish("test_flowcover");
 }

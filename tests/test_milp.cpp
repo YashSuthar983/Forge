@@ -1,6 +1,7 @@
 // Minimal MILP branch-and-bound: a tiny binary knapsack that must find the
 // proven incumbent, and an infeasible integer program that must say so.
 #include "forge/certify/finalize.hpp"
+#include "forge/core/work_clock.hpp"
 #include "forge/io/mps.hpp"
 #include "forge/search/bab.hpp"
 #include "forge/search/propagate.hpp"
@@ -234,6 +235,234 @@ void test_repaired_integral_point_does_not_close_node() {
     CHECK(r.x.size() == 2);
     if (r.x.size() == 2) CHECK_NEAR(r.x[0], 1.0, 0.0);
     CHECK(diag.integral_closures_reopened >= 1);
+}
+
+// The legacy root row helpers (tighten_integral_rows, add_binary_cover_cuts)
+// may not drop a small coefficient: its term times its domain is large.
+BabOptions bare_root_options() {
+    BabOptions opts;
+    opts.max_nodes = 1000;
+    opts.time_limit_s = 10.0;
+    opts.mip_presolve = false;
+    opts.probing = false;
+    opts.symmetry = false;
+    opts.component_solve = false;
+    return opts;
+}
+
+void test_small_coefficient_keeps_row_sides() {
+    // min x, integer x in [1, 2], integer z in [-6e12, 0], x + 1e-13 z <= 0.5:
+    // x = 1, z = -6e12 is feasible (activity 0.4). Rounding the side as if
+    // the activity were integral (ignoring z) gave 0: Infeasible.
+    forge::model::LpProblem lp;
+    lp.c = {1.0, 0.0};
+    lp.col_lo = {1.0, -6e12};
+    lp.col_hi = {2.0, 0.0};
+    lp.is_integer = {true, true};
+    lp.row_lo = {-forge::model::kInf};
+    lp.row_hi = {0.5};
+    lp.A = forge::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1e-13});
+    lp.validate();
+    auto opts = bare_root_options();
+    BabDiagnostics diag;
+    auto raw = forge::search::solve_milp(lp, opts, diag);
+    const auto r = forge::certify::finalize_result(std::move(raw),
+                                                 forge::search::milp_evidence(diag, opts));
+    CHECK(r.status == Status::Optimal);
+    CHECK_NEAR(r.objective, 1.0, 1e-9);
+    CHECK(diag.integer_row_roundings == 0);
+}
+
+void test_small_coefficient_blocks_binary_cover() {
+    // max x + y, binary x, y, integer z in [-1e13, 0],
+    // 2x + 2y + 1e-13 z <= 3.1: x = y = 1, z = -1e13 is feasible (3 <= 3.1).
+    // Dropping z made x + y <= 1 a "cover" and the answer 1.
+    forge::model::LpProblem lp;
+    lp.maximize = true;
+    lp.c = {1.0, 1.0, 0.0};
+    lp.col_lo = {0.0, 0.0, -1e13};
+    lp.col_hi = {1.0, 1.0, 0.0};
+    lp.is_integer = {true, true, true};
+    lp.row_lo = {-forge::model::kInf};
+    lp.row_hi = {3.1};
+    lp.A = forge::sparse::from_triplets(1, 3, {0, 0, 0}, {0, 1, 2}, {2.0, 2.0, 1e-13});
+    lp.validate();
+    auto opts = bare_root_options();
+    BabDiagnostics diag;
+    auto raw = forge::search::solve_milp(lp, opts, diag);
+    const auto r = forge::certify::finalize_result(std::move(raw),
+                                                 forge::search::milp_evidence(diag, opts));
+    CHECK(r.status == Status::Optimal);
+    CHECK_NEAR(r.objective, 2.0, 1e-9);
+    CHECK(diag.binary_cover_cuts == 0);
+}
+
+// Certified unbounded exit (audit section 21): a feasible point plus an
+// exactly checked integral improving ray of the original model.
+Status solve_status(const forge::model::LpProblem& lp, double* obj = nullptr) {
+    BabOptions opts;
+    opts.time_limit_s = 10.0;
+    BabDiagnostics diag;
+    auto raw = forge::search::solve_milp(lp, opts, diag);
+    const auto r = forge::certify::finalize_result(std::move(raw),
+                                                 forge::search::milp_evidence(diag, opts));
+    if (obj) *obj = r.objective;
+    return r.status;
+}
+
+forge::model::LpProblem two_col(std::vector<double> c, std::vector<double> lo,
+                              std::vector<double> hi, std::vector<char> integer,
+                              std::vector<double> rlo, std::vector<double> rhi,
+                              std::vector<forge::core::Index> ri,
+                              std::vector<forge::core::Index> rj, std::vector<double> rv) {
+    forge::model::LpProblem lp;
+    lp.c = std::move(c);
+    lp.col_lo = std::move(lo);
+    lp.col_hi = std::move(hi);
+    lp.is_integer.assign(integer.begin(), integer.end());
+    lp.row_lo = std::move(rlo);
+    lp.row_hi = std::move(rhi);
+    lp.A = forge::sparse::from_triplets(static_cast<forge::core::Index>(lp.row_lo.size()),
+                                      static_cast<forge::core::Index>(lp.c.size()), ri, rj, rv);
+    lp.validate();
+    return lp;
+}
+
+void test_unbounded_milp_is_certified() {
+    const double inf = forge::model::kInf;
+    // min -x - y, integer x in [0, 10], y >= 0, x - y <= 3.
+    CHECK(solve_status(two_col({-1.0, -1.0}, {0.0, 0.0}, {10.0, inf}, {1, 0}, {-inf}, {3.0},
+                               {0, 0}, {0, 1}, {1.0, -1.0})) == Status::Unbounded);
+    // Integer x with 2x = 1 and an independent ray on y: the LP is unbounded,
+    // the MILP has no point at all.
+    CHECK(solve_status(two_col({0.0, -1.0}, {0.0, 0.0}, {10.0, inf}, {1, 0}, {1.0}, {1.0},
+                               {0}, {0}, {2.0})) == Status::Infeasible);
+    // The same with x = 0 feasible: unbounded.
+    CHECK(solve_status(two_col({0.0, -1.0}, {0.0, 0.0}, {10.0, inf}, {1, 0}, {0.0}, {0.0},
+                               {0}, {0}, {2.0})) == Status::Unbounded);
+    // A rational ray: min -x, integer x >= 0, continuous y >= 0, 2x - 3y = 0.
+    // Its direction (1, 2/3) scales to the integral (3, 2).
+    CHECK(solve_status(two_col({-1.0, 0.0}, {0.0, 0.0}, {inf, inf}, {1, 0}, {0.0}, {0.0},
+                               {0, 0}, {0, 1}, {2.0, -3.0})) == Status::Unbounded);
+    // Bounded: not claimed.
+    double obj = 0.0;
+    CHECK(solve_status(two_col({-1.0, -1.0}, {0.0, 0.0}, {10.0, 5.0}, {1, 0}, {-inf}, {3.0},
+                               {0, 0}, {0, 1}, {1.0, -1.0}), &obj) == Status::Optimal);
+}
+
+// Objective propagation charges an at-most-one group once (audit 9).
+void test_objective_propagation_uses_cliques() {
+    using forge::search::propagate_objective_cutoff;
+    using forge::search::ObjectiveCliques;
+    forge::model::LpProblem lp;
+    lp.A = forge::sparse::from_triplets(0, 3, {}, {}, {});
+    lp.c = {-3.0, -2.0, -1.0};
+    lp.col_lo = {0.0, 0.0, 0.0};
+    lp.col_hi = {1.0, 1.0, 1.0};
+    lp.is_integer = {true, true, true};
+    ObjectiveCliques amo;
+    amo.groups = {{2 * 0 + 1, 2 * 1 + 1, 2 * 2 + 1}};   // x0 + x1 + x2 <= 1
+    {   // Box minimum -6, group minimum -3: rhs -4 empties the box.
+        auto lo = lp.col_lo, hi = lp.col_hi;
+        CHECK(propagate_objective_cutoff(lp, -4.0, lo, hi, 1e-9, nullptr).feasible);
+        lo = lp.col_lo; hi = lp.col_hi;
+        CHECK(!propagate_objective_cutoff(lp, -4.0, lo, hi, 1e-9, nullptr, &amo).feasible);
+    }
+    {   // rhs -2.5: only x0 can still be the one; x1 and x2 are fixed to 0.
+        auto lo = lp.col_lo, hi = lp.col_hi;
+        const auto r = propagate_objective_cutoff(lp, -2.5, lo, hi, 1e-9, nullptr, &amo);
+        CHECK(r.feasible);
+        CHECK(hi[0] == 1.0 && hi[1] == 0.0 && hi[2] == 0.0);
+        lo = lp.col_lo; hi = lp.col_hi;   // the box rule alone fixes nothing
+        propagate_objective_cutoff(lp, -2.5, lo, hi, 1e-9, nullptr);
+        CHECK(hi[1] == 1.0 && hi[2] == 1.0);
+    }
+    {   // Negative literals: min 3y0 + 2y1 with at most one of y0, y1 at 0
+        // (y0 + y1 >= 1): the box minimum is 0, the true minimum 2.
+        forge::model::LpProblem q = lp;
+        q.A = forge::sparse::from_triplets(0, 2, {}, {}, {});
+        q.c = {3.0, 2.0};
+        q.col_lo = {0.0, 0.0};
+        q.col_hi = {1.0, 1.0};
+        q.is_integer = {true, true};
+        ObjectiveCliques neg;
+        neg.groups = {{2 * 0 + 0, 2 * 1 + 0}};
+        auto lo = q.col_lo, hi = q.col_hi;
+        CHECK(!propagate_objective_cutoff(q, 1.5, lo, hi, 1e-9, nullptr, &neg).feasible);
+        lo = q.col_lo; hi = q.col_hi;
+        // rhs 2.5: y1 = 0 would cost 3 (y0 = 1): y1 is fixed to 1.
+        CHECK(propagate_objective_cutoff(q, 2.5, lo, hi, 1e-9, nullptr, &neg).feasible);
+        CHECK(lo[1] == 1.0 && lo[0] == 0.0);
+    }
+}
+
+// Search decisions are invariant under a constant added to the objective
+// (audit section 14): plunge continuation, the dual-stall clock, the
+// incumbent-jump restart trigger and FJ's improvement target used |value|
+// as their scale.
+// Search decisions are invariant under a constant added to the objective
+// (audit section 14): plunge continuation, the dual-stall clock, the
+// incumbent-jump restart trigger and FJ's improvement target used |value|
+// as their scale. A three-row 0-1 knapsack big enough to need a tree,
+// solved on the deterministic clock.
+void test_objective_offset_does_not_change_search() {
+    forge::model::LpProblem base;
+    const int n = 60, m = 4;
+    std::uint32_t st = 12345u;
+    const auto rnd = [&]() { st = st * 1664525u + 1013904223u; return static_cast<int>((st >> 8) % 97) + 3; };
+    base.maximize = true;
+    base.c.resize(n);
+    base.col_lo.assign(n, 0.0);
+    base.col_hi.assign(n, 1.0);
+    base.is_integer.assign(n, true);
+    std::vector<forge::core::Index> ri, rj;
+    std::vector<double> rv;
+    for (int j = 0; j < n; ++j) base.c[static_cast<std::size_t>(j)] = rnd();
+    for (int i = 0; i < m; ++i) {
+        double sum = 0.0;
+        for (int j = 0; j < n; ++j) {
+            const double a = rnd();
+            ri.push_back(i); rj.push_back(j); rv.push_back(a); sum += a;
+        }
+        base.row_lo.push_back(-forge::model::kInf);
+        base.row_hi.push_back(std::floor(0.37 * sum));
+    }
+    base.A = forge::sparse::from_triplets(m, n, ri, rj, rv);
+    base.validate();
+    // Twice: with tree cuts, and without them (that search reaches node
+    // reduced-cost fixing, whose padding once scaled with the constant).
+    for (const bool tree_cuts : {true, false}) {
+    std::uint64_t nodes[2] = {0, 0};
+    double obj[2] = {0.0, 0.0};
+    forge::core::set_deterministic_time(true);
+    for (int k = 0; k < 2; ++k) {
+        auto lp = base;
+        lp.obj_offset = k == 0 ? 0.0 : 1e7;
+        BabOptions opts;
+        opts.max_nodes = 100000;
+        opts.time_limit_s = 60.0;
+        opts.hybrid_node_selection = true;
+        opts.cuts_enabled = false;
+        opts.root_primal_early = false;
+        opts.root_primal_final = false;
+        opts.tree_cut.enabled = tree_cuts;
+        // The relative-gap CONTRACT is defined on the objective value
+        // including its constant (a separate, user-facing choice); hold it
+        // fixed in absolute terms to compare the search itself.
+        opts.gap_tol = 0.0;
+        opts.abs_gap_tol = 1e-6;
+        BabDiagnostics diag;
+        auto raw = forge::search::solve_milp(lp, opts, diag);
+        nodes[k] = diag.nodes;
+        obj[k] = raw.objective - lp.obj_offset;
+    }
+    forge::core::set_deterministic_time(false);
+    std::printf("OFFSET nodes %llu vs %llu obj %g vs %g\n", (unsigned long long)nodes[0],
+                (unsigned long long)nodes[1], obj[0], obj[1]);
+    CHECK(nodes[0] > 10);
+    CHECK(nodes[0] == nodes[1]);
+    CHECK(obj[0] == obj[1]);
+    }
 }
 
 void test_knapsack() {
@@ -572,6 +801,20 @@ void test_objective_lattice_requires_exact_costs() {
     BabDiagnostics tiny_diag;
     forge::search::solve_milp(lp, opts, tiny_diag);
     CHECK_NEAR(tiny_diag.objective_granularity, 0.0, 1e-12);
+    // Exact dyadic costs give a fractional lattice (audit section 14):
+    // every cost a multiple of 1/2 makes every objective value one.
+    for (std::size_t j = 0; j < lp.c.size(); ++j) lp.c[j] = 0.0;
+    lp.c[0] = -1.5;
+    lp.c[1] = -0.5;
+    lp.c[2] = -2.0;
+    BabDiagnostics half_diag;
+    forge::search::solve_milp(lp, opts, half_diag);
+    CHECK(half_diag.objective_granularity == 0.5);
+    // Integer costs keep their gcd.
+    lp.c[0] = -4.0; lp.c[1] = -6.0; lp.c[2] = 0.0;
+    BabDiagnostics int_diag;
+    forge::search::solve_milp(lp, opts, int_diag);
+    CHECK(int_diag.objective_granularity == 2.0);
 }
 
 void test_node_cutoff_values() {
@@ -588,6 +831,8 @@ void test_node_cutoff_values() {
         // A margin wider than g leaves the gap rule in force, below inc.
         {1e7, 1.0, 0.0, 1e-4, 1e7 - 1e3},
         {100.0, 0.0, 0.0, 1e-4, 99.99},
+        // The lattice rule does not depend on a constant in the objective.
+        {1e7 + 5.0, 1.0, 1e7, 0.0, 1e7 + 4.0 + 5e-6},
         {0.0, 0.0, 0.0, 1e-4, -1e-6},
     };
     for (const auto& t : cases) {
@@ -713,7 +958,9 @@ void test_gap_pruning_reports_honest_dual_bound(int threads) {
             CHECK(lp.max_bound_violation(result.x) <= opts.primal_feas_tol);
             for (double x : result.x) CHECK(std::fabs(x - std::round(x)) <= opts.int_tol);
         }
-        CHECK(diag.objective_granularity == 0.0);
+        // Costs like 1.234 have an exact lattice step near 2^-52: far below
+        // the bounds' own precision, so it must take no part in this test.
+        CHECK(diag.granularity_tightenings == 0);
         CHECK(result.objective >= optimum - gap * std::fabs(optimum) - 1e-6);
         CHECK(diag.dual_bound >= optimum - 1e-6);
         if (diag.gap_prunes > 0) {
@@ -1161,6 +1408,11 @@ int main(int argc, char** argv) {
     CHECK(!BabOptions{}.batch_lp_strong_branch);
     test_objective_cutoff_propagation();
     test_repaired_integral_point_does_not_close_node();
+    test_small_coefficient_keeps_row_sides();
+    test_small_coefficient_blocks_binary_cover();
+    test_unbounded_milp_is_certified();
+    test_objective_propagation_uses_cliques();
+    test_objective_offset_does_not_change_search();
     test_incumbent_point_validation();
     test_folded_incumbents_stay_in_original_space();
     test_small_coefficient_optimum_is_not_cut_off();

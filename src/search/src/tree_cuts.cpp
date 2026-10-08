@@ -507,7 +507,10 @@ void GcsPool::observe(const CutRow& row,
             c.feats = feats;
             c.efficacy_sum += efficacy;
             ++c.seen_nodes;
-            if (violated) ++c.violation_nodes;
+            if (violated && (point == 0 || c.last_violated_point != point)) {
+                ++c.violation_nodes;
+                c.last_violated_point = point;
+            }
             // Conservative policy, not a theorem. One exact global derivation
             // of an identical inequality is enough to keep it global; a later
             // local derivation does not cancel that. cut_content_id uses only
@@ -529,6 +532,7 @@ void GcsPool::observe(const CutRow& row,
     c.efficacy_sum = efficacy;
     c.seen_nodes = 1;
     c.violation_nodes = violated ? 1 : 0;
+    c.last_violated_point = violated ? point : 0;
     c.globally_valid = globally_valid;
     c.id = id;
     c.depth_sum = static_cast<f64>(std::max(0, depth));
@@ -562,7 +566,10 @@ void GcsPool::touch_point(const std::vector<f64>& x, f64 viol_tol, int depth,
             viol = std::max(viol, c.row.row_lo - activity);
         ++c.seen_nodes;
         c.efficacy_sum += std::max(0.0, viol);
-        if (viol > viol_tol) ++c.violation_nodes;
+        if (viol > viol_tol && (point == 0 || c.last_violated_point != point)) {
+            ++c.violation_nodes;
+            c.last_violated_point = point;
+        }
         c.depth_sum += static_cast<f64>(std::max(0, depth));
         c.best_violation = std::max(c.best_violation, viol);
         GcsObservation ob;
@@ -575,7 +582,8 @@ void GcsPool::touch_point(const std::vector<f64>& x, f64 viol_tol, int depth,
 }
 
 std::vector<CutRow> GcsPool::select_global(int max_keep, f64 min_score,
-                                           bool skip_promoted) {
+                                           bool skip_promoted,
+                                           int min_violation_nodes) {
     struct Ranked {
         f64 score;
         std::size_t idx;
@@ -591,6 +599,7 @@ std::vector<CutRow> GcsPool::select_global(int max_keep, f64 min_score,
         const GcsCandidate& c = cands[i];
         // Paper / product invariant: never promote local cuts.
         if (!c.globally_valid || c.seen_nodes <= 0) continue;
+        if (c.violation_nodes < min_violation_nodes) continue;
         if (skip_promoted && promoted_ids.count(c.id)) continue;
         const f64 score = model.score(c, prefer_h);
         ++diag.scored;

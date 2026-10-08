@@ -193,6 +193,16 @@ public:
     void set_column_bounds(const std::vector<core::f64>& lo,
                            const std::vector<core::f64>& hi);
 
+    // Row `slot` of the inverse of the final basis, in the unscaled model's
+    // row space: y = B^-T e_slot for B the basis matrix (columns of [A | -I],
+    // A the problem the session was built for) of `basic`, in that slot
+    // order. One btran on the final factor: the factor is of the scaled
+    // basis B_s = R B C_B, so y = c_B[slot] * R * B_s^-T e_slot (a logical's
+    // scale is 1 / its row's). False when the session holds no factor of
+    // `basic`. The caller checks what it needs (y^T B = e_slot^T).
+    bool basis_inverse_row(const std::vector<core::Index>& basic, core::Index slot,
+                           std::vector<core::f64>& y) const;
+
     // DSE weights at solve()'s final basis (empty when DSE was not the live
     // pricing at exit, or the solve ended early).
     const std::vector<core::f64>& final_weights() const;
@@ -201,6 +211,13 @@ public:
     core::RawResult probe(core::Index j, core::f64 lo, core::f64 hi,
                           const SimplexOptions& opts, SimplexDiagnostics& diag,
                           const SimplexBasis& base);
+    // The same with several columns' bounds changed at once (a propagated
+    // child box): cols[k] gets [lo[k], hi[k]] for the solve and is restored.
+    core::RawResult probe_box(const std::vector<core::Index>& cols,
+                              const std::vector<core::f64>& lo,
+                              const std::vector<core::f64>& hi,
+                              const SimplexOptions& opts, SimplexDiagnostics& diag,
+                              const SimplexBasis& base);
 
 private:
     // Only engine wrappers may transfer their own exact prepared model and

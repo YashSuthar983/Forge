@@ -55,6 +55,11 @@ public:
     std::size_t record_diff(const std::vector<double>& lo0, const std::vector<double>& hi0,
                             const std::vector<double>& lo1, const std::vector<double>& hi1,
                             int level, int source);
+    // One update, when the propagator already knows what it moved (its trail).
+    void record(std::int32_t var, bool upper, double old_bound, double new_bound,
+                int level, int source) {
+        events_.push_back({var, upper, old_bound, new_bound, level, source});
+    }
     std::size_t size() const { return events_.size(); }
     const std::vector<DomainEvent>& events() const { return events_; }
     // Distinct columns with an update at index >= cursor (order of first update).

@@ -207,7 +207,39 @@ void test_small_nonzero_integer_term_is_not_dropped() {
 
 }  // namespace
 
+// Aggregation before CG rounding is exact (audit section 11). M = 2^53,
+// nonnegative integers x, y, rows (all <=, in this order)
+//   M x <= M,   3x - 2y <= 1,   -M x + 2y <= -M + 2.
+// (1, 1) satisfies all three with zero slack. Their exact sum is 3x <= 3,
+// but binary64 merging rounded M + 3 to M + 4 and M + 1 to M, giving
+// 4x + 0y <= 2 and the half-CG cut 2x <= 1, which cuts off (1, 1).
+void test_zerohalf_aggregation_is_exact() {
+    const f64 M = 0x1p53;
+    LpProblem lp;
+    lp.c = {0.0, 0.0};
+    lp.col_lo = {0.0, 0.0};
+    lp.col_hi = {kInf, kInf};
+    lp.is_integer = {true, true};
+    lp.row_lo = {-kInf, -kInf, -kInf};
+    lp.row_hi = {M, 1.0, -M + 2.0};
+    lp.A = from_triplets(3, 2, {0, 1, 1, 2, 2}, {0, 0, 1, 0, 1}, {M, 3.0, -2.0, -M, 2.0});
+    lp.validate();
+    const std::vector<f64> pt = {1.0, 1.0};
+    CHECK(row_feasible(lp, pt));
+    ZeroHalfOptions o;
+    o.violation_min = 0.5;
+    ZeroHalfDiagnostics d;
+    const auto cuts = separate_zerohalf(lp, pt, lp.col_lo, lp.col_hi, o, d);
+    for (const auto& c : cuts) {
+        long double lhs = 0.0L;
+        for (std::size_t k = 0; k < c.cols.size(); ++k)
+            lhs += static_cast<long double>(c.vals[k]) * pt[static_cast<std::size_t>(c.cols[k])];
+        CHECK(lhs <= static_cast<long double>(c.row_hi));
+    }
+}
+
 int main() {
+    test_zerohalf_aggregation_is_exact();
     test_textbook_odd_knapsack();
     test_mod2_gaussian_nonvacuous();
     test_random_zh_valid_by_enumeration();

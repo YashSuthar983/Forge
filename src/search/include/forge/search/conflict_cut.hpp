@@ -127,6 +127,10 @@ struct ConflictAnalysisContext {
     // Those inequalities may depend on local bounds and must never seed a
     // *global* conflict cut. <0 means "all rows of lp are treated as global".
     Index n_global_rows = -1;
+    // Rows the tree working set retired while trails named them
+    // (ReasonKind::Retired). Null: such reasons cannot be resolved.
+    // Antecedents reasons are no inequality and always abort this analysis.
+    const ReasonStore* reasons = nullptr;
 };
 
 // Build a violated >= constraint for empty-domain / row conflict.

@@ -19,11 +19,26 @@ struct BaseRow {
     std::vector<f64> coef;  // integer-valued after construction
     f64 rhs = 0.0;          // integer-valued
     f64 slack = 0.0;        // rhs − a·x* at build time
+    // Rests on x_j >= 0 for a column whose root box does not imply it.
+    bool local = false;
 };
 
 inline bool exact_integer(f64 v) {
     return std::isfinite(v) && std::fabs(v) <= 9007199254740992.0 &&
            v == std::round(v);
+}
+
+// a + b for exact integers when the sum is again one (|sum| <= 2^53),
+// computed in 64-bit integers. A rounded sum before CG rounding changes the
+// parity the cut rests on: with M = 2^53, M + 3 rounds to M + 4 and M + 1
+// to M, and three valid rows aggregated to 4x <= 2, whose half-CG cut
+// 2x <= 1 cuts off the feasible x = 1.
+bool add_exact_integer(f64 a, f64 b, f64& out) {
+    if (!exact_integer(a) || !exact_integer(b)) return false;
+    const std::int64_t s = static_cast<std::int64_t>(a) + static_cast<std::int64_t>(b);
+    if (s > (std::int64_t{1} << 53) || s < -(std::int64_t{1} << 53)) return false;
+    out = static_cast<f64>(s);
+    return true;
 }
 
 // Build ∑ a_j x_j ≤ b from an exact-integer, nonnegative-variable row.
@@ -33,7 +48,9 @@ inline bool exact_integer(f64 v) {
 bool build_integer_base(const model::LpProblem& lp, Index row, f64 sign,
                         const std::vector<f64>& lo,
                         const std::vector<f64>& x,
-                        BaseRow& out, ZeroHalfDiagnostics& diag) {
+                        BaseRow& out, ZeroHalfDiagnostics& diag,
+                        const std::vector<f64>* root_lo,
+                        const std::vector<f64>* root_hi) {
     core::work_add(4 + static_cast<std::uint64_t>(lp.A.pattern.row_ptr()[sz(row) + 1] -
                                                   lp.A.pattern.row_ptr()[sz(row)]), ::forge::core::WorkTag::ZeroHalf);
     const f64 bound = sign > 0.0 ? lp.row_hi[sz(row)] : -lp.row_lo[sz(row)];
@@ -46,6 +63,7 @@ bool build_integer_base(const model::LpProblem& lp, Index row, f64 sign,
     out.cols.clear();
     out.coef.clear();
     out.rhs = bound;
+    out.local = false;
     f64 activity = 0.0;
 
     for (core::Offset k = rp[sz(row)]; k < rp[sz(row) + 1]; ++k) {
@@ -58,6 +76,7 @@ bool build_integer_base(const model::LpProblem& lp, Index row, f64 sign,
         if (!is_int) return false;
         // floor(a/2) x <= floor(b/2) uses x >= 0 when rounding a downward.
         if (!std::isfinite(lo[sz(j)]) || lo[sz(j)] < 0.0) return false;
+        if (!root_implies_bound(root_lo, root_hi, j, false, 0.0)) out.local = true;
         if (!exact_integer(a)) return false;
         out.cols.push_back(j);
         out.coef.push_back(a);
@@ -89,7 +108,8 @@ bool merge_bases(const BaseRow& a, const BaseRow& b, BaseRow& out,
     core::work_add(4 + 2 * (a.cols.size() + b.cols.size()), ::forge::core::WorkTag::ZeroHalf);
     out.cols = a.cols;
     out.coef = a.coef;
-    out.rhs = a.rhs + b.rhs;
+    out.local = a.local || b.local;
+    if (!add_exact_integer(a.rhs, b.rhs, out.rhs)) return false;
     if (++ms.cur == 0) {
         std::fill(ms.stamp.begin(), ms.stamp.end(), 0u);
         ms.cur = 1;
@@ -103,7 +123,8 @@ bool merge_bases(const BaseRow& a, const BaseRow& b, BaseRow& out,
     for (std::size_t t = 0; t < b.cols.size(); ++t) {
         const Index j = b.cols[t];
         if (ms.stamp[sz(j)] == ms.cur) {
-            out.coef[ms.pos[sz(j)]] += b.coef[t];
+            f64& c = out.coef[ms.pos[sz(j)]];
+            if (!add_exact_integer(c, b.coef[t], c)) return false;
         } else {
             ms.stamp[sz(j)] = ms.cur;
             ms.pos[sz(j)] = out.cols.size();
@@ -246,7 +267,9 @@ std::vector<CutRow> separate_zerohalf(const model::LpProblem& lp,
                                       const std::vector<f64>& col_lo,
                                       const std::vector<f64>& col_hi,
                                       const ZeroHalfOptions& opts,
-                                      ZeroHalfDiagnostics& diag) {
+                                      ZeroHalfDiagnostics& diag,
+                                      const std::vector<f64>* root_lo,
+                                      const std::vector<f64>* root_hi) {
     core::WorkScope work_scope_(core::WorkCat::Separation);
     std::vector<CutRow> cuts;
     const Index n = lp.n_cols();
@@ -265,7 +288,7 @@ std::vector<CutRow> separate_zerohalf(const model::LpProblem& lp,
         for (const f64 sign : {1.0, -1.0}) {
             BaseRow b;
             if (!build_integer_base(lp, i, sign, col_lo, x, b,
-                                    diag))
+                                    diag, root_lo, root_hi))
                 continue;
             bases.push_back(std::move(b));
         }
@@ -283,6 +306,8 @@ std::vector<CutRow> separate_zerohalf(const model::LpProblem& lp,
             return;
         }
         cut.name = "ZH_" + std::to_string(cuts.size());
+        cut.exact = true;   // exact integer bases, exact merges, exact CG rounding
+        cut.used_local_bound = base.local;
         cuts.push_back(std::move(cut));
         ++diag.cuts_emitted;
     };

@@ -65,11 +65,16 @@ struct ZeroHalfDiagnostics {
 
 // Separates violated zero-half cuts from `lp` at `x` under [col_lo, col_hi].
 // Every returned inequality is valid for every integer-feasible point of `lp`.
+// The derivation's only bound premise is x_j >= 0 on each column of the rows
+// it combines; with the root box given, used_local_bound reports whether the
+// root box fails to imply one of them.
 std::vector<CutRow> separate_zerohalf(const model::LpProblem& lp,
                                       const std::vector<f64>& x,
                                       const std::vector<f64>& col_lo,
                                       const std::vector<f64>& col_hi,
                                       const ZeroHalfOptions& opts,
-                                      ZeroHalfDiagnostics& diag);
+                                      ZeroHalfDiagnostics& diag,
+                                      const std::vector<f64>* root_lo = nullptr,
+                                      const std::vector<f64>* root_hi = nullptr);
 
 }  // namespace forge::search

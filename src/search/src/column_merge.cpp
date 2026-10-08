@@ -11,6 +11,19 @@
 namespace forge::search::detail {
 namespace {
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
+// a + b when that sum is a double (error-free TwoSum); infinities add as
+// usual. A merged column's domain is the exact sum of its members' domains:
+// a rounded sum is a different domain (integer x in [0, 2^53] and y in
+// [0, 1] sum to [0, 2^53 + 1]; binary64 stores 2^53 and loses the point
+// x = 2^53, y = 1).
+bool exact_add(double a, double b, double& sum) {
+    sum = a + b;
+    if (std::isnan(sum)) return false;
+    if (!std::isfinite(a) || !std::isfinite(b)) return true;
+    if (!std::isfinite(sum)) return false;
+    const double bv = sum - a, av = sum - bv;
+    return (a - av) + (b - bv) == 0.0;
+}
 }  // namespace
 
 MilpPresolveResult merge_duplicate_columns(const model::LpProblem& lp,
@@ -90,12 +103,29 @@ MilpPresolveResult merge_duplicate_columns(const model::LpProblem& lp,
         for (std::size_t a = 0; a < cols.size(); ++a) {
             if (used[a]) continue;
             std::vector<Index> g{cols[a]};
+            double lo_sum = lp.col_lo[sz(cols[a])], hi_sum = lp.col_hi[sz(cols[a])];
             for (std::size_t b = a + 1; b < cols.size(); ++b) {
                 if (used[b]) continue;
                 const Index ja = cols[a], jb = cols[b];
                 if (lp.c[sz(ja)] != lp.c[sz(jb)]) continue;
                 if ((have_int && lp.is_integer[sz(ja)]) != (have_int && lp.is_integer[sz(jb)])) continue;
                 if (!same_column(ja, jb)) continue;
+                // The group's domain must stay exactly representable; an
+                // integer group must also keep every value in it a double,
+                // so the postsolve split is exact.
+                double nlo = 0.0, nhi = 0.0;
+                if (!exact_add(lo_sum, lp.col_lo[sz(jb)], nlo) ||
+                    !exact_add(hi_sum, lp.col_hi[sz(jb)], nhi)) {
+                    ++stats.merge_inexact_skipped;
+                    continue;
+                }
+                if (have_int && lp.is_integer[sz(ja)] &&
+                    (std::fabs(nlo) > 0x1p53 || (std::isfinite(nhi) && std::fabs(nhi) > 0x1p53))) {
+                    ++stats.merge_inexact_skipped;
+                    continue;
+                }
+                lo_sum = nlo;
+                hi_sum = nhi;
                 used[b] = 1;
                 g.push_back(jb);
             }
@@ -141,7 +171,6 @@ MilpPresolveResult merge_duplicate_columns(const model::LpProblem& lp,
     }
     for (const auto& g : groups) {
         ColumnMerge mg;
-        mg.after_binary_steps = 0;
         double lo = 0.0, hi = 0.0;
         for (const Index j : g) {
             mg.members.push_back(j);
@@ -153,6 +182,7 @@ MilpPresolveResult merge_duplicate_columns(const model::LpProblem& lp,
         const Index k = new_of[sz(g.front())];
         red.col_lo[sz(k)] = lo;
         red.col_hi[sz(k)] = hi;
+        out.journal.push_back({PostsolveKind::Merge, out.column_merges.size()});
         out.column_merges.push_back(std::move(mg));
         stats.merged_cols += static_cast<int>(g.size()) - 1;
         ++stats.merge_groups;

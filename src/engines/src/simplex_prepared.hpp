@@ -97,11 +97,107 @@ core::RawResult solve_primal_simplex_prepared(
 // (and copied) at the initial factorization when it validates against `warm`;
 // overwritten with this run's final factor on the one normal exit, same
 // discipline as `carrier`.
+// The dual simplex's nonbasic-partitioned row store (each row of the scaled
+// A permuted so its active columns -- nonbasic, not permanently fixed -- form
+// a prefix), kept between solves on one preparation. Its static parts (entry
+// rows, column entry lists) depend only on the matrix; the permutation
+// depends on which columns are active, which consecutive solves of a tree
+// change in a few columns. `active` is the activity the permutation encodes
+// when `valid`; a solve brings it to its own start state by moving only the
+// columns that differ, instead of allocating and filling eight nnz-sized
+// arrays and repartitioning every row. Owned by the caller (a session);
+// `prepared` names the preparation it belongs to.
+// The dual pass's per-solve arrays (sized by the rows and columns of the
+// preparation), kept between solves so a solve reuses their storage instead
+// of allocating some sixty vectors: every pass re-initializes each one before
+// use, so no value carries over. On a node-throughput tree (mas76) the
+// allocator was ~10% of the profile, most of it these.
+struct DualPassWorkspace {
+    std::vector<core::Index> carried_basis;
+    std::vector<core::f64> carried_weights;
+    std::vector<core::Index> carried_factor_basis;
+    std::vector<std::uint8_t> permanently_fixed;
+    std::vector<core::f64> lo;
+    std::vector<core::f64> hi;
+    std::vector<core::f64> work_cost;
+    std::vector<core::Index> basis;
+    std::vector<core::Index> slot_of;
+    std::vector<NonbasicStatus> st;
+    std::vector<core::f64> value;
+    std::vector<core::f64> xB;
+    std::vector<core::Index> nonbasic;
+    std::vector<core::Index> nonbasic_pos;
+    std::vector<std::uint8_t> pivotal_active;
+    std::vector<core::Index> ftran_seed;
+    std::vector<core::Index> btran_seed;
+    std::vector<core::Index> dse_seed;
+    std::vector<core::Offset> bcp;
+    std::vector<core::Index> bri;
+    std::vector<core::Index> bad_slots;
+    std::vector<core::Index> vacant_rows;
+    std::vector<core::f64> bvals;
+    std::vector<core::f64> rhs;
+    std::vector<core::f64> y;
+    std::vector<core::f64> alpha;
+    std::vector<core::f64> cB;
+    std::vector<core::f64> rho;
+    std::vector<core::f64> slot_lo;
+    std::vector<core::f64> slot_hi;
+    std::vector<core::f64> slot_ptol;
+    std::vector<core::f64> row_w;
+    std::vector<core::Index> leave_heap_dirty_rows;
+    std::vector<std::uint32_t> leave_heap_dirty_stamp;
+    std::vector<core::Index> chuzr_candidates;
+    std::vector<std::uint32_t> chuzr_candidate_stamp;
+    std::vector<std::uint8_t> devex_reference;
+    std::vector<core::f64> tau;
+    std::vector<core::Index> tau_support;
+    std::vector<std::uint32_t> tau_stamp;
+    std::vector<core::Index> cand_j;
+    std::vector<core::f64> cand_aj;
+    std::vector<core::f64> cand_d;
+    std::vector<core::f64> redcost;
+    std::vector<core::f64> prow;
+    std::vector<std::uint32_t> prow_stamp;
+    std::vector<std::uint8_t> prow_kept;
+    std::vector<core::Index> prow_idx;
+    std::vector<core::Index> rho_support;
+    std::vector<core::Index> alpha_support;
+    std::vector<std::uint32_t> alpha_stamp;
+    std::vector<core::f64> dense_prices;
+    std::vector<core::Index> bmat_basis;
+    std::vector<core::f64> cost_shift;
+    std::vector<core::f64> parallel_row_scores;
+    std::vector<std::pair<core::f64, core::Index>> chuzr_scored;
+    std::vector<std::pair<core::f64, core::Index>> row_slice_winners;
+    std::vector<long double> equation_residual;
+    std::vector<long double> equation_scale;
+    std::vector<core::f64> farkas_ray;
+    std::vector<core::f64> x;
+    std::vector<core::f64> yout;
+    std::vector<long double> aty;
+    std::vector<long double> aty_abs;
+    std::vector<long double> ax;
+    std::vector<std::uint32_t> aty_cnt;
+};
+
+struct DualPartitionState {
+    const SimplexPrepared* prepared = nullptr;
+    bool valid = false;
+    std::vector<core::Index> pr_act, pr_col, pr_row;
+    std::vector<core::f64> pr_val;
+    std::vector<core::Offset> pr_slot, pr_at, pr_cstart, pr_centry;
+    std::vector<std::uint8_t> active;
+    // Storage for the pass itself (no state: see DualPassWorkspace).
+    DualPassWorkspace work;
+};
+
 core::RawResult solve_dual_simplex_prepared(
     const SimplexPrepared& prepared, const SimplexOptions& opts,
     SimplexDiagnostics& diag, SimplexBasis* out_basis,
     const SimplexBasis* warm, DualEdgeWeightCarrier* carrier = nullptr,
-    FactorCarrier* factor_carrier = nullptr);
+    FactorCarrier* factor_carrier = nullptr,
+    DualPartitionState* partition = nullptr);
 
 // Add one stage's work counters and timers into `total` (and count a stage).
 // Shared by the Auto dispatcher and by the dual engine's primal clean-up so a
