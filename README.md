@@ -65,6 +65,19 @@ the GPU backend you also need the Vulkan SDK (`libvulkan-dev`,
 `glslang-tools`) and a GPU with fp64 shader support (NVIDIA or AMD). Python 3
 is needed only for the tests and scripts.
 
+### Docker
+
+```bash
+docker compose up --build             # web console on http://localhost:8765
+docker build -t forge .               # add --build-arg RUN_TESTS=1 to run ctest during the build
+docker run --rm -p 8765:8765 forge    # same web console without compose
+docker run --rm -v "$PWD:/work" -w /work forge …   # CLI entrypoints on PATH
+```
+
+The image uses the same Ubuntu 24.04 / GCC 13 toolchain and CMake defaults as a
+host build, so results match. `--backend vulkan` runs on Mesa's CPU Vulkan driver
+unless a GPU is passed into the container.
+
 ### Interfaces
 
 | Interface | What it is |
