@@ -211,6 +211,20 @@ struct SimplexOptions {
     // at 171k pivots with a 6.3e+47 cost shift. FT has its own cadence in
     // refactor_u_nnz_ratio / ft_update_limit below.
     int refactor_interval = 5000;
+    // At a would-be optimum on a factor carrying updates, the duals and basic
+    // values are always re-derived from the factor before the dual simplex
+    // concludes. Whether the factor is rebuilt first is an economy question:
+    // with this on it is rebuilt only once the work its update file has added
+    // to solves since the last factorization (carried factors included)
+    // exceeds a factorization's cost, when a refinement since then needed a
+    // correction, or when the ordinary triggers ask; otherwise the updated
+    // factor is used for the re-derivation and handed on. Off (default):
+    // rebuild at every such exit. Measured 2026-10-08, 30 s serial wall:
+    // nu25-pr12 4024 vs 3772 nodes and mas76 226.6k vs 220.1k for the rebuild.
+    // The saved factorization is outweighed by what a carried update file
+    // costs the next node's solves and refinement (nu25-pr12: refinement
+    // 7.6% -> 16.5% of samples before the accuracy condition was added).
+    bool exit_refactor_by_economy = false;
     // Also refactor when update nnz exceeds this fraction of factor nnz (0
     // disables). The classical product-form break-even is ~1.0: solve cost
     // doubles once the eta file matches the factors. Measured cliff on
@@ -628,6 +642,13 @@ struct SimplexDiagnostics {
     // Kept separate deliberately -- the reuse/copy tradeoff must be visible,
     // not assumed. Zero when no FactorCarrier was supplied or adopted.
     double factor_reuse_ms = 0.0;
+    // Dual row-store partition carried from the previous solve of a session
+    // (DualPartitionState), and the columns moved to bring it up to date.
+    std::uint64_t partition_carried = 0;
+    // Would-be optima concluded on a re-derivation from the updated factor
+    // (exit_refactor_by_economy) instead of a rebuild.
+    std::uint64_t exit_rederives = 0;
+    std::uint64_t partition_moved_columns = 0;
     // 1 if this solve adopted a carried factorization (skipped the initial
     // do_factorize()), 0 otherwise. Distinguishes "carrier supplied but
     // rejected" (basis/dims/token mismatch -> fell back to a full factorize,
@@ -800,6 +821,10 @@ public:
     // Replace the objective (in the sense of the problem given to the
     // constructor, size n_cols). O(n).
     void set_costs(const std::vector<core::f64>& c);
+
+    // Replace all column bounds (O(n), the transform prepare applies).
+    void set_column_bounds(const std::vector<core::f64>& lo,
+                           const std::vector<core::f64>& hi);
 
     // Solve from `warm` (empty / null: cold). The basis reached is returned in
     // `out_basis` for the next round.

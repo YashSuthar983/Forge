@@ -132,7 +132,13 @@ void test_original_model_oracle() {
             auto raw = sor::search::solve_milp(lp, opts, diag);
             const auto ev = sor::search::milp_evidence(diag, opts);
             const auto result = sor::certify::finalize_result(std::move(raw), ev);
-            if (seed == 15) CHECK_NEAR(diag.objective_granularity, 0.0, 0.0);
+            // A granularity is a proof only if every cost is an exact
+            // multiple of it (half-integer costs give 1/2).
+            if (diag.objective_granularity > 0.0)
+                for (const double cj : lp.c) {
+                    const double q = cj / diag.objective_granularity;
+                    CHECK(q == std::trunc(q));
+                }
             CHECK(!(oracle.feasible && result.status == Status::Infeasible));
             CHECK(!(!oracle.feasible && result.status == Status::Optimal));
             if (result.status == Status::Optimal) {
@@ -167,7 +173,9 @@ void test_fractional_root_branches_and_proves() {
     LpProblem lp;
     lp.name = "fractional_root_oracle";
     lp.maximize = true;
-    lp.c = {1.1, 1.1, 1.1};
+    // Unrelated costs: no usable objective lattice (equal costs 1.1 would
+    // form one with step 1.1 and close the root without branching).
+    lp.c = {1.1, 1.3, 1.7};
     lp.col_lo = {0.0, 0.0, 0.0};
     lp.col_hi = {1.0, 1.0, 1.0};
     lp.is_integer = {true, true, true};
@@ -195,7 +203,7 @@ void test_fractional_root_branches_and_proves() {
     auto result = sor::certify::finalize_result(std::move(raw), ev);
     CHECK(diag.nodes > 1);
     CHECK(result.status == Status::Optimal);
-    CHECK_NEAR(result.objective, 1.1, 1e-7);
+    CHECK_NEAR(result.objective, 1.7, 1e-7);
 }
 
 void test_continuous_objective_disables_lattice_rounding() {

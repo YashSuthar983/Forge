@@ -1,3 +1,4 @@
+#include "sor/model/dyadic.hpp"
 #include "sor/search/conflict_cut.hpp"
 
 #include "sor/search/mir.hpp"
@@ -96,7 +97,7 @@ bool extract_row_geq_upper(const model::LpProblem& lp, Index row,
     for (core::Offset k = rp[sz(row)]; k < rp[sz(row) + 1]; ++k) {
         const Index j = ci[sz(k)];
         const f64 a = lp.A.vals[sz(k)];
-        if (std::fabs(a) <= 1e-15) continue;
+        if (a == 0.0) continue;   // a tiny coefficient is still part of the inequality
         out.cols.push_back(j);
         out.vals.push_back(-a);
     }
@@ -116,7 +117,7 @@ bool extract_row_geq_lower(const model::LpProblem& lp, Index row,
     for (core::Offset k = rp[sz(row)]; k < rp[sz(row) + 1]; ++k) {
         const Index j = ci[sz(k)];
         const f64 a = lp.A.vals[sz(k)];
-        if (std::fabs(a) <= 1e-15) continue;
+        if (a == 0.0) continue;   // a tiny coefficient is still part of the inequality
         out.cols.push_back(j);
         out.vals.push_back(a);
     }
@@ -176,13 +177,70 @@ bool branch_as_geq(const PropTrailEntry& e, GeqConstraint& out) {
     return e.var >= 0;
 }
 
+// A retired global row (ReasonKind::Retired), oriented like
+// extract_reason_geq orients a model row.
+bool retired_reason_geq(const RetiredRow& row, Index var, BoundDir dir,
+                        GeqConstraint& out) {
+    const f64 want = (dir == BoundDir::Lower) ? 1.0 : -1.0;
+    f64 a_var = 0.0;
+    for (std::size_t k = 0; k < row.cols.size(); ++k)
+        if (row.cols[k] == var) a_var += row.vals[k];
+    const auto build = [&](bool upper) {
+        out.cols.clear();
+        out.vals.clear();
+        for (std::size_t k = 0; k < row.cols.size(); ++k) {
+            if (row.vals[k] == 0.0) continue;
+            out.cols.push_back(row.cols[k]);
+            out.vals.push_back(upper ? -row.vals[k] : row.vals[k]);
+        }
+        out.rhs = upper ? -row.hi : row.lo;
+        return !out.cols.empty();
+    };
+    // >= form of the upper side has coefficient -a_var on var.
+    if (std::isfinite(row.hi) && -a_var * want > 0.0) return build(true);
+    if (std::isfinite(row.lo) && a_var * want > 0.0) return build(false);
+    if (std::isfinite(row.hi) && a_var != 0.0) return build(true);
+    if (std::isfinite(row.lo) && a_var != 0.0) return build(false);
+    return false;
+}
+
 bool entry_as_reason(const model::LpProblem& lp, const PropTrailEntry& e,
-                     GeqConstraint& out) {
-    if (e.kind == ReasonKind::Row || e.kind == ReasonKind::Cut ||
-        e.kind == ReasonKind::Conflict) {
+                     GeqConstraint& out, const ReasonStore* reasons) {
+    // A Cut reason is a subtree-local row: it is no global inequality; an
+    // Antecedents reason is no inequality at all.
+    if (e.kind == ReasonKind::Cut || e.kind == ReasonKind::Antecedents) return false;
+    if (e.kind == ReasonKind::Retired) {
+        if (reasons == nullptr || e.reason_id < 0 ||
+            static_cast<std::size_t>(e.reason_id) >= reasons->rows.size())
+            return false;
+        return retired_reason_geq(reasons->rows[sz(e.reason_id)], e.var, e.dir, out);
+    }
+    if (e.kind == ReasonKind::Row || e.kind == ReasonKind::Conflict) {
         return extract_reason_geq(lp, e.reason_id, e.var, e.dir, out);
     }
     if (e.kind == ReasonKind::Branch) return branch_as_geq(e, out);
+    if (e.kind == ReasonKind::Implication) {
+        // A conflict-graph pair: the true literal t and the literal f this
+        // bound falsified cannot both hold, lv(t) + lv(f) <= 1 with
+        // lv(j,1) = x_j and lv(j,0) = 1 - x_j; as >=: -lv(t) - lv(f) >= -1.
+        const Index t = e.reason_id;
+        if (t < 0 || e.var < 0) return false;
+        int fval;
+        if (e.dir == BoundDir::Upper && e.new_bound == 0.0) fval = 1;        // x_k <= 0: (k,1) false
+        else if (e.dir == BoundDir::Lower && e.new_bound == 1.0) fval = 0;   // x_k >= 1: (k,0) false
+        else return false;
+        out.cols.clear();
+        out.vals.clear();
+        out.rhs = -1.0;
+        const auto add_lit = [&](Index var, int val) {
+            if (val == 1) { out.cols.push_back(var); out.vals.push_back(-1.0); }
+            else { out.cols.push_back(var); out.vals.push_back(1.0); out.rhs += 1.0; }
+        };
+        add_lit(t >> 1, static_cast<int>(t & 1));
+        if ((t >> 1) == e.var) return false;
+        add_lit(e.var, fval);
+        return true;
+    }
     return false;
 }
 
@@ -511,7 +569,8 @@ ReduceResult reduce_mixed_binary(GeqConstraint reason,
                                  const std::vector<f64>& hi,
                                  const PropTrail& trail,
                                  const ConflictCutOptions& opts,
-                                 ConflictCutDiagnostics& diag) {
+                                 ConflictCutDiagnostics& diag,
+                                 const ReasonStore* reasons) {
     ReduceResult res;
     res.reason = std::move(reason);
     const f64 tol = opts.tol;
@@ -549,7 +608,7 @@ ReduceResult reduce_mixed_binary(GeqConstraint reason,
         if (cont < 0) break;
 
         GeqConstraint ccont;
-        if (!entry_as_reason(lp, ents[cont_pos], ccont)) {
+        if (!entry_as_reason(lp, ents[cont_pos], ccont, reasons)) {
             res.became_conflict = false;
             return res;  // caller may abort
         }
@@ -735,9 +794,9 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
         return std::nullopt;
     }
     for (const auto& e : ctx.trail->entries()) {
-        if ((e.kind == ReasonKind::Row || e.kind == ReasonKind::Cut ||
-             e.kind == ReasonKind::Conflict) &&
-            row_is_local(e.reason_id)) {
+        if (e.kind == ReasonKind::Cut ||
+            ((e.kind == ReasonKind::Row || e.kind == ReasonKind::Conflict) &&
+             row_is_local(e.reason_id))) {
             ++diag.aborted;
             ++diag.aborted_local_scope;
             return std::nullopt;
@@ -804,7 +863,7 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
         }
 
         GeqConstraint reason;
-        if (!entry_as_reason(*ctx.lp, e, reason)) {
+        if (!entry_as_reason(*ctx.lp, e, reason, ctx.reasons)) {
             ++diag.aborted;
             ++diag.aborted_reason;
             return std::nullopt;
@@ -835,7 +894,7 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
             }
             const bool use_cmir =
                 opts.use_cmirror || opts.use_cmirror_binary;
-            if (use_cmir && e.kind == ReasonKind::Row &&
+            if (use_cmir && (e.kind == ReasonKind::Row || e.kind == ReasonKind::Retired) &&
                 reason_all_binary(reason, *ctx.lp, opts.tol)) {
                 GeqConstraint mir;
                 if (cmir_prop2_binary(reason, e.var, *ctx.lp, *ctx.col_lo,
@@ -858,7 +917,7 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
             }
             auto red = reduce_mixed_binary(std::move(reason), learn, e.var, idx,
                                            *ctx.lp, *ctx.col_lo, *ctx.col_hi,
-                                           trail, opts, diag);
+                                           trail, opts, diag, ctx.reasons);
             if (red.became_conflict) {
                 learn = std::move(red.reason);
                 apply_coef_tightening(learn, *ctx.lp, opts.tol);
@@ -918,6 +977,36 @@ std::optional<CutRow> analyze_conflict_cuts(const ConflictAnalysisContext& ctx,
     return geq_to_cut(clean);
 }
 
+namespace {
+// Whether x violates the cut by more than tol, decided on the exact
+// activity. Verified means no feasible point does; a rounded activity can
+// hide a violation: with M = 2^52 and p = q = r = s = t = 1, the cut
+// M p + M q + r - M s - M t <= 0 has activity 1, but its binary64 sum in
+// column order loses r at 2^53 + 1 and reads 0.
+bool cut_violated_beyond(const CutRow& cut, const std::vector<f64>& x, f64 tol) {
+    model::DyadicSum act;
+    for (std::size_t t = 0; t < cut.cols.size(); ++t) {
+        const Index j = cut.cols[t];
+        if (j < 0 || sz(j) >= x.size()) continue;
+        act.add_product(cut.vals[t], x[sz(j)]);
+    }
+    if (std::isfinite(cut.row_lo)) {
+        model::DyadicSum d = act;   // row_lo - tol - act > 0
+        d.negate();
+        d.add(cut.row_lo);
+        d.add(-tol);
+        if (d.sign() > 0) return true;
+    }
+    if (std::isfinite(cut.row_hi)) {
+        model::DyadicSum d = act;   // act - row_hi - tol > 0
+        d.add(-cut.row_hi);
+        d.add(-tol);
+        if (d.sign() > 0) return true;
+    }
+    return false;
+}
+}  // namespace
+
 CutValidity conflict_cut_check_binary(const model::LpProblem& lp,
                                       const CutRow& cut,
                                       f64 tol) {
@@ -944,15 +1033,7 @@ CutValidity conflict_cut_check_binary(const model::LpProblem& lp,
     }
 
     auto cut_violated_at = [&](const std::vector<f64>& x) -> bool {
-        f64 lhs = 0.0;
-        for (std::size_t t = 0; t < cut.cols.size(); ++t) {
-            const Index j = cut.cols[t];
-            if (j < 0 || j >= n) continue;
-            lhs += cut.vals[t] * x[sz(j)];
-        }
-        if (std::isfinite(cut.row_lo) && lhs + tol < cut.row_lo) return true;
-        if (std::isfinite(cut.row_hi) && lhs > cut.row_hi + tol) return true;
-        return false;
+        return cut_violated_beyond(cut, x, tol);
     };
 
     // Large pure-binary box: 2^n exceeds the full-enum budget, but FUIP cuts
@@ -1225,15 +1306,9 @@ CutValidity conflict_cut_check_general(const model::LpProblem& lp,
         for (std::size_t i = 0; i < ints.size(); ++i)
             x[sz(ints[i])] = static_cast<f64>(cur[i]);
         if (lp.max_row_violation(x) <= tol &&
-            lp.max_bound_violation(x) <= tol) {
-            f64 lhs = 0.0;
-            for (std::size_t t = 0; t < cut.cols.size(); ++t)
-                lhs += cut.vals[t] * x[sz(cut.cols[t])];
-            if (std::isfinite(cut.row_lo) && lhs + tol < cut.row_lo)
-                return CutValidity::Refuted;
-            if (std::isfinite(cut.row_hi) && lhs > cut.row_hi + tol)
-                return CutValidity::Refuted;
-        }
+            lp.max_bound_violation(x) <= tol &&
+            cut_violated_beyond(cut, x, tol))
+            return CutValidity::Refuted;
         if (!advance()) break;
     }
     return CutValidity::Verified;
@@ -1280,6 +1355,7 @@ std::optional<CutRow> build_nogood_from_branch_trail(const PropTrail& trail,
     }
     CutRow row;
     row.name = "nogood";
+    row.exact = true;   // an assignment nogood: unit coefficients, integer side
     int n_true = 0;
     for (Index j = 0; j < n; ++j) {
         const int a = assign[sz(j)];

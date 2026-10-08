@@ -9,6 +9,8 @@
 // tests on hand-built examples; this catches the case the hand-built example
 // did not think of.
 #include "sor/search/conflict.hpp"
+#include "sor/model/dyadic.hpp"
+#include "sor/search/clique_rows.hpp"
 #include "sor/search/propagate.hpp"
 #include "sor/sparse/csr.hpp"
 
@@ -714,7 +716,276 @@ void test_edge_set_matches_reference() {
     }
 }
 
+// Dual fixing inside a probe side counts only the locks that still bind
+// there (audit section 6). z (cost +1) has one down-lock, from
+// 5x + 5w + z >= 5. With x = 1 that row cannot bind; with x = 0, x + w >= 1
+// forces w = 1 and again it cannot bind. So in each side z drops to its
+// lower bound, 0, and the hull fixes z = 0 -- where the global locks
+// (one down-lock) leave z in [0, 9].
+void test_probing_dual_fix_uses_side_redundancy() {
+    sor::model::LpProblem lp;
+    // columns x, w, z
+    lp.c = {0.0, 0.0, 1.0};
+    lp.col_lo = {0.0, 0.0, 0.0};
+    lp.col_hi = {1.0, 1.0, 10.0};
+    lp.is_integer = {true, true, false};
+    lp.row_lo = {5.0, 1.0, -kInf};
+    lp.row_hi = {kInf, kInf, 9.0};
+    lp.A = sor::sparse::from_triplets(3, 3, {0, 0, 0, 1, 1, 2, 2}, {0, 1, 2, 0, 1, 0, 2},
+                                      {5.0, 5.0, 1.0, 1.0, 1.0, 3.0, 1.0});
+    lp.validate();
+    auto lo = lp.col_lo, hi = lp.col_hi;
+    ConflictGraph cg;
+    ProbingOptions po;
+    po.dual_fix_in_probing = true;
+    sor::search::build_conflict_graph(lp, lo, hi, cg, po);
+    CHECK(hi[2] == 0.0);
+}
+
+// Row cliques rest on an exact activity floor (audit section 2): with
+// M = 2^67, continuous p = q = r = 1 and binary x, y, the row
+// M p - q - M r + x + y <= 1 has floor -1 and slack 2, so x = y = 1 is
+// feasible. Its f64 floor in column order is 0, which gave x + y <= 1.
+void test_row_cliques_use_exact_floor() {
+    const double M = 0x1p67;
+    sor::model::LpProblem lp;
+    lp.c = {0.0, 0.0, 0.0, 0.0, 0.0};
+    lp.col_lo = {1.0, 1.0, 1.0, 0.0, 0.0};
+    lp.col_hi = {1.0, 1.0, 1.0, 1.0, 1.0};
+    lp.is_integer = {false, false, false, true, true};
+    lp.row_lo = {-sor::model::kInf};
+    lp.row_hi = {1.0};
+    lp.A = sor::sparse::from_triplets(1, 5, {0, 0, 0, 0, 0}, {0, 1, 2, 3, 4},
+                                      {M, -1.0, -M, 1.0, 1.0});
+    lp.validate();
+    auto lo = lp.col_lo, hi = lp.col_hi;
+    sor::search::ConflictGraph cg;
+    ProbingOptions po;
+    po.enabled = false;    // the row's own cliques only
+    sor::search::build_conflict_graph(lp, lo, hi, cg, po);
+    CHECK(!cg.conflicts(lit_of(3, 1), lit_of(4, 1)));
+    // With the side at 0.5 the pair really conflicts (slack 1.5 < 2).
+    lp.row_hi = {0.5};
+    lo = lp.col_lo; hi = lp.col_hi;
+    sor::search::ConflictGraph cg2;
+    sor::search::build_conflict_graph(lp, lo, hi, cg2, po);
+    CHECK(cg2.conflicts(lit_of(3, 1), lit_of(4, 1)));
+}
+
+// Odd-cycle cuts: a 5-cycle of conflicts among x0..x4 at x = 1/2 gives
+// x0 + ... + x4 <= 2. On random conflict graphs (with some negative literals)
+// every cut must hold at every 0/1 point that respects all conflicts.
+void test_odd_cycle_cuts() {
+    const auto make_graph = [](Index n) {
+        LpProblem lp;
+        lp.c.assign(static_cast<std::size_t>(n), 0.0);
+        lp.col_lo.assign(static_cast<std::size_t>(n), 0.0);
+        lp.col_hi.assign(static_cast<std::size_t>(n), 1.0);
+        lp.is_integer.assign(static_cast<std::size_t>(n), true);
+        lp.A = sor::sparse::from_triplets(0, n, {}, {}, {});
+        ConflictGraph g;
+        g.reset(n);
+        g.mark_binaries(lp, lp.col_lo, lp.col_hi);
+        return g;
+    };
+    {
+        ConflictGraph g = make_graph(5);
+        for (Index j = 0; j < 5; ++j) g.add_edge(lit_of(j, 1), lit_of((j + 1) % 5, 1));
+        g.sort_adjacency();
+        const std::vector<f64> x(5, 0.5);
+        const auto cuts = sor::search::separate_odd_cycle_cuts(g, x, 10, 10, 1e-4);
+        CHECK(!cuts.empty());
+        if (!cuts.empty()) {
+            CHECK(cuts[0].cols.size() == 5);
+            CHECK(cuts[0].row_hi == 2.0);
+            for (const f64 v : cuts[0].vals) CHECK(v == 1.0);
+        }
+    }
+    {
+        // K5: every odd cycle has a chord, down to triangles (cliques): no
+        // odd-cycle row (sum <= 2 would sit beside the clique's sum <= 1).
+        ConflictGraph g = make_graph(5);
+        for (Index a = 0; a < 5; ++a)
+            for (Index b = a + 1; b < 5; ++b) g.add_edge(lit_of(a, 1), lit_of(b, 1));
+        g.sort_adjacency();
+        const std::vector<f64> x(5, 0.45);   // a 5-cycle weighs 0.5: violated but for its chords
+        CHECK(sor::search::separate_odd_cycle_cuts(g, x, 10, 10, 1e-4).empty());
+    }
+    {
+        // A 5-cycle of explicit edges inside a long stored clique (whose
+        // pairs are no explicit edges): chords through the clique, no row.
+        const Index n = 300;
+        ConflictGraph g = make_graph(n);
+        Clique c;
+        for (Index j = 0; j < n; ++j) c.lits.push_back(lit_of(j, 1));
+        g.add_clique(c);
+        for (Index j = 0; j < 5; ++j) g.add_edge(lit_of(j, 1), lit_of((j + 1) % 5, 1));
+        g.sort_adjacency();
+        std::vector<f64> x(static_cast<std::size_t>(n), 0.0);
+        for (Index j = 0; j < 5; ++j) x[static_cast<std::size_t>(j)] = 0.45;
+        CHECK(sor::search::separate_odd_cycle_cuts(g, x, 10, 10, 1e-4).empty());
+    }
+    std::mt19937 rng(424242);
+    int found = 0;
+    for (int trial = 0; trial < 300; ++trial) {
+        const Index n = 6 + static_cast<Index>(rng() % 5);
+        ConflictGraph g = make_graph(n);
+        std::vector<std::pair<Index, Index>> edges;
+        for (int e = 0; e < 3 * n; ++e) {
+            const Index a = lit_of(static_cast<Index>(rng() % n), static_cast<int>(rng() % 4 != 0));
+            const Index b = lit_of(static_cast<Index>(rng() % n), static_cast<int>(rng() % 4 != 0));
+            if ((a >> 1) == (b >> 1)) continue;
+            if (g.add_edge(a, b)) edges.emplace_back(a, b);
+        }
+        g.sort_adjacency();
+        std::vector<f64> x(static_cast<std::size_t>(n));
+        for (auto& v : x) v = 0.05 + 0.9 * static_cast<f64>(rng() % 1000) / 1000.0;
+        const auto cuts = sor::search::separate_odd_cycle_cuts(g, x, 20, 64, 1e-4);
+        found += static_cast<int>(cuts.size());
+        for (std::uint32_t mask = 0; mask < (1u << n); ++mask) {
+            const auto val = [&](Index l) {
+                const int bit = static_cast<int>((mask >> (l >> 1)) & 1u);
+                return (l & 1) ? bit : 1 - bit;
+            };
+            bool ok = true;
+            for (const auto& [a, b] : edges) ok = ok && !(val(a) && val(b));
+            if (!ok) continue;
+            for (const auto& c : cuts) {
+                f64 act = 0.0;
+                for (std::size_t q = 0; q < c.cols.size(); ++q)
+                    act += c.vals[q] * static_cast<f64>((mask >> c.cols[q]) & 1u);
+                CHECK(act <= c.row_hi + 1e-12);
+            }
+        }
+    }
+    CHECK(found > 10);
+}
+
+// Clique-aware row propagation (clique_rows.hpp) never removes a feasible
+// point. Random models: binaries x0..x5 and an integer z in [0,3]; two
+// set-packing rows make two cliques; two random rows with mixed signs and
+// sides. On random sub-boxes, every integer point of the box that satisfies
+// all rows must survive propagation, and "infeasible" is reported only when
+// none exists.
+void test_clique_rows_are_sound() {
+    std::mt19937 rng(777);
+    int deductions = 0, infeasible_seen = 0;
+    for (int trial = 0; trial < 400; ++trial) {
+        const Index nb = 6, n = 7;   // x0..x5 binary, z = column 6 in [0,3]
+        std::vector<Index> ri, cj;
+        std::vector<f64> v;
+        LpProblem lp;
+        lp.c.assign(n, 0.0);
+        lp.col_lo.assign(n, 0.0);
+        lp.col_hi.assign(n, 1.0);
+        lp.col_hi[6] = 3.0;
+        lp.is_integer.assign(n, true);
+        Index row = 0;
+        // Cliques {x0,x1,x2} and {x3,x4} as packing rows (x3 complemented).
+        for (Index j : {0, 1, 2}) { ri.push_back(row); cj.push_back(j); v.push_back(1.0); }
+        lp.row_lo.push_back(-kInf); lp.row_hi.push_back(1.0); ++row;
+        ri.push_back(row); cj.push_back(3); v.push_back(-1.0);
+        ri.push_back(row); cj.push_back(4); v.push_back(1.0);
+        lp.row_lo.push_back(-kInf); lp.row_hi.push_back(0.0); ++row;   // x4 <= x3: (x3=0) & (x4=1) conflict
+        for (int r = 0; r < 2; ++r, ++row) {
+            for (Index j = 0; j < n; ++j) {
+                if (rng() % 3 == 0) continue;
+                f64 a = static_cast<f64>(1 + rng() % 5);
+                if (rng() % 3 == 0) a = -a;
+                ri.push_back(row); cj.push_back(j); v.push_back(a);
+            }
+            const f64 b = static_cast<f64>(static_cast<int>(rng() % 9) - 2);
+            if (rng() % 2) { lp.row_lo.push_back(b); lp.row_hi.push_back(kInf); }
+            else { lp.row_lo.push_back(-kInf); lp.row_hi.push_back(b + 4.0); }
+        }
+        lp.A = sor::sparse::from_triplets(row, n, ri, cj, v);
+        ConflictGraph g;
+        g.reset(n);
+        g.mark_binaries(lp, lp.col_lo, lp.col_hi);
+        g.add_edge(lit_of(0, 1), lit_of(1, 1));
+        g.add_edge(lit_of(0, 1), lit_of(2, 1));
+        g.add_edge(lit_of(1, 1), lit_of(2, 1));
+        g.add_edge(lit_of(3, 0), lit_of(4, 1));
+        g.sort_adjacency();
+        sor::search::CliqueRowOptions co;
+        const auto idx = sor::search::build_clique_row_index(lp, g, co);
+        // A random sub-box.
+        std::vector<f64> lo = lp.col_lo, hi = lp.col_hi;
+        for (Index j = 0; j < n; ++j) {
+            if (rng() % 4 == 0) { const f64 f = static_cast<f64>(rng() % 2); if (j < nb) lo[j] = hi[j] = f; }
+        }
+        if (rng() % 2) lo[6] = 1.0;
+        const auto feasible_points = [&](const std::vector<f64>& L, const std::vector<f64>& H) {
+            std::vector<std::vector<f64>> pts;
+            for (std::uint32_t mask = 0; mask < (1u << nb); ++mask)
+                for (int z = 0; z <= 3; ++z) {
+                    std::vector<f64> x(n);
+                    for (Index j = 0; j < nb; ++j) x[j] = static_cast<f64>((mask >> j) & 1u);
+                    x[6] = z;
+                    bool in = true;
+                    for (Index j = 0; j < n; ++j) in = in && x[j] >= L[j] && x[j] <= H[j];
+                    if (in && lp.max_row_violation(x) == 0.0) pts.push_back(x);
+                }
+            return pts;
+        };
+        const auto before = feasible_points(lo, hi);
+        sor::search::PropTrail trail;
+        sor::search::ReasonStore store;
+        std::vector<Index> moved;
+        const auto pr = sor::search::propagate_clique_rows(idx, lp, lo, hi, nullptr, lp.col_lo,
+                                                           lp.col_hi, &trail, &store, 1, 1e-9, &moved);
+        deductions += static_cast<int>(pr.tightened);
+        if (!pr.feasible) {
+            ++infeasible_seen;
+            CHECK(before.empty());
+            continue;
+        }
+        for (const auto& x : before)
+            for (Index j = 0; j < n; ++j) CHECK(x[j] >= lo[j] - 1e-12 && x[j] <= hi[j] + 1e-12);
+    }
+    CHECK(deductions > 20);
+}
+
+// An implied bound t <= b0 (b = 0), t <= b1 (b = 1) with b0 = -2^54, b1 = 1:
+// the rounded slope s = 2^54 made  t - s b <= b0  exclude (b, t) = (1, 1).
+// The row must admit both endpoints exactly, and still cut a point violating
+// the implication.
+void test_implied_bound_cut_keeps_its_endpoints() {
+    sor::search::ConflictGraph cg;
+    LpProblem lp;
+    lp.name = "vub_endpoints";
+    lp.A = from_triplets(0, 2, {}, {}, {});
+    lp.c = {0.0, 0.0};
+    lp.col_lo = {-std::ldexp(1.0, 54), 0.0};
+    lp.col_hi = {1.0, 1.0};
+    lp.is_integer = {false, true};
+    cg.reset(2);
+    cg.mark_binaries(lp, lp.col_lo, lp.col_hi);
+    const f64 b0 = -std::ldexp(1.0, 54), b1 = 1.0;
+    cg.add_implied_bound({1, 0, b0, b1, true});
+    const std::vector<f64> x = {1.0, 0.5};   // t = 1 at b = 0.5: t <= b0 + 0.5 s violated
+    const auto cuts = sor::search::separate_implied_bound_cuts(cg, x, {});
+    CHECK(cuts.size() == 1);
+    if (cuts.size() != 1) return;
+    const auto& c = cuts[0];
+    CHECK(c.exact);
+    const auto activity = [&](f64 t, f64 b) {
+        sor::model::DyadicSum a;
+        for (std::size_t k = 0; k < c.cols.size(); ++k)
+            a.add_product(c.vals[k], c.cols[k] == 0 ? t : b);
+        return a;
+    };
+    CHECK(activity(1.0, 1.0).compare(c.row_hi) <= 0);   // b = 1 allows t = 1
+    CHECK(activity(b0, 0.0).compare(c.row_hi) <= 0);    // b = 0 allows t = b0
+    CHECK(activity(1.0, 0.5).compare(c.row_hi) > 0);    // the fractional point is cut
+}
+
 int main() {
+    test_implied_bound_cut_keeps_its_endpoints();
+    test_clique_rows_are_sound();
+    test_odd_cycle_cuts();
+    test_probing_dual_fix_uses_side_redundancy();
+    test_row_cliques_use_exact_floor();
     test_edge_set_matches_reference();
     test_probing_budget_reaches_late_binaries();
     test_set_packing_row_gives_clique();

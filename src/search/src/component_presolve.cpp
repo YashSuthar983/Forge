@@ -3,6 +3,7 @@
 
 #include <chrono>
 
+#include "sor/model/dyadic.hpp"
 #include "sor/search/mip_presolve.hpp"
 #include "sor/search/propagate.hpp"
 
@@ -50,21 +51,61 @@ struct DSU {
     }
 };
 
-// Feasibility of a fully fixed binary assignment against component rows only.
+// Whether some point of the box [lo, hi] (the enumerated binaries at their
+// assigned values, every other component column over its own narrow range)
+// can satisfy each component row within tol. A rejection must be a proof:
+// the row's activity range is screened in f64 with a bound on its rounding
+// error, and decided on exact sums whenever the screen is not conclusive.
+// (With M = 2^67, M x + y - M z = 1 holds at x = y = z = 1, but its f64
+// activity in column order is 0: the assignment, the optimum, was rejected.)
 bool assignment_feasible(const model::LpProblem& lp,
                          const std::vector<Index>& rows,
-                         const std::vector<f64>& x, f64 tol) {
+                         const std::vector<f64>& lo, const std::vector<f64>& hi,
+                         f64 tol) {
     const auto& rp = lp.A.pattern.row_ptr();
     const auto& ci = lp.A.pattern.col_idx();
     const auto& av = lp.A.vals;
+    constexpr f64 eps = std::numeric_limits<f64>::epsilon();
     for (Index i : rows) {
-        f64 act = 0.0;
-        for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
-            act += av[sz(k)] * x[sz(ci[sz(k)])];
         const f64 rlo = lp.row_lo[sz(i)];
         const f64 rhi = lp.row_hi[sz(i)];
-        if (std::isfinite(rlo) && act < rlo - tol) return false;
-        if (std::isfinite(rhi) && act > rhi + tol) return false;
+        f64 mn = 0.0, mx = 0.0, mag = 0.0;
+        const auto len = static_cast<f64>(rp[sz(i) + 1] - rp[sz(i)]);
+        for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+            const f64 a = av[sz(k)];
+            const Index j = ci[sz(k)];
+            const f64 p = a * lo[sz(j)], q = a * hi[sz(j)];
+            mn += std::min(p, q);
+            mx += std::max(p, q);
+            mag += std::max(std::fabs(p), std::fabs(q));
+        }
+        const f64 err = (2.0 * len + 4.0) * eps * mag;
+        // Clearly satisfiable on both sides: next row.
+        const bool lo_ok = !std::isfinite(rlo) || mx >= rlo - tol + err;
+        const bool hi_ok = !std::isfinite(rhi) || mn <= rhi + tol - err;
+        if (lo_ok && hi_ok) continue;
+        // Uncertain or violated: decide exactly.
+        model::DyadicSum emn, emx;
+        for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+            const f64 a = av[sz(k)];
+            const Index j = ci[sz(k)];
+            const f64 l = a > 0.0 ? lo[sz(j)] : hi[sz(j)];
+            const f64 h = a > 0.0 ? hi[sz(j)] : lo[sz(j)];
+            emn.add_product(a, l);
+            emx.add_product(a, h);
+        }
+        // Reject only when the activity range misses [rlo - tol, rhi + tol]
+        // exactly (the tolerance only ever keeps an assignment).
+        if (std::isfinite(rlo)) {
+            emx.add(-rlo);
+            emx.add(tol);
+            if (emx.sign() < 0) return false;
+        }
+        if (std::isfinite(rhi)) {
+            emn.add(-rhi);
+            emn.add(-tol);
+            if (emn.sign() > 0) return false;
+        }
     }
     return true;
 }
@@ -96,13 +137,17 @@ ComponentPresolveDiagnostics apply_component_presolve(
     const auto& ci = lp.A.pattern.col_idx();
     const auto& av = lp.A.vals;
 
-    // Union columns that co-appear in a nonzero row.
+    // Union columns that co-appear in a row. Every nonzero counts: the
+    // independence that enumeration and per-component tightening rely on is
+    // exact, and a small coefficient can carry a large term (x + y +
+    // 1e-13 z >= 2 with z in [0, 1e13]: dropping z's entry put it in another
+    // component and enumeration, with z at 0, fixed x = y = 1).
     DSU dsu(n);
     std::vector<std::vector<Index>> row_cols(sz(m));
     for (Index i = 0; i < m; ++i) {
         Index first = -1;
         for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
-            if (std::fabs(av[sz(k)]) <= opts.tol) continue;
+            if (av[sz(k)] == 0.0) continue;
             const Index j = ci[sz(k)];
             row_cols[sz(i)].push_back(j);
             if (first < 0)
@@ -227,26 +272,24 @@ ComponentPresolveDiagnostics apply_component_presolve(
         const Index nb = static_cast<Index>(free_bins.size());
         if (nb > 20) continue;  // hard guard
         const std::uint64_t nass = 1ULL << static_cast<unsigned>(nb);
-        std::vector<f64> x(sz(n), 0.0);
-        for (Index j = 0; j < n; ++j) {
-            if (nearly_fixed(col_lo[sz(j)], col_hi[sz(j)], opts.tol))
-                x[sz(j)] = col_lo[sz(j)];
-            else
-                x[sz(j)] = col_lo[sz(j)];  // placeholder
-        }
+        // The assignment's box: every column over its current range (the
+        // component's rows reference only its own columns), the enumerated
+        // binaries pinned below.
+        std::vector<f64> x_lo = col_lo, x_hi = col_hi;
 
         std::vector<f64> hull_lo(sz(nb), 1.0), hull_hi(sz(nb), 0.0);
         std::uint64_t feas = 0;
         for (std::uint64_t mask = 0; mask < nass; ++mask) {
-            for (Index t = 0; t < nb; ++t)
-                x[sz(free_bins[sz(t)])] =
-                    ((mask >> static_cast<unsigned>(t)) & 1ULL) ? 1.0 : 0.0;
-            // Fixed binaries already in x; continuous in this component none.
-            if (!assignment_feasible(lp, comp_rows[cid], x, opts.tol))
+            for (Index t = 0; t < nb; ++t) {
+                const f64 v = ((mask >> static_cast<unsigned>(t)) & 1ULL) ? 1.0 : 0.0;
+                x_lo[sz(free_bins[sz(t)])] = v;
+                x_hi[sz(free_bins[sz(t)])] = v;
+            }
+            if (!assignment_feasible(lp, comp_rows[cid], x_lo, x_hi, opts.tol))
                 continue;
             ++feas;
             for (Index t = 0; t < nb; ++t) {
-                const f64 v = x[sz(free_bins[sz(t)])];
+                const f64 v = x_lo[sz(free_bins[sz(t)])];
                 hull_lo[sz(t)] = std::min(hull_lo[sz(t)], v);
                 hull_hi[sz(t)] = std::max(hull_hi[sz(t)], v);
             }

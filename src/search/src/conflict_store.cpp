@@ -47,7 +47,7 @@ std::uint64_t hash_lits(const std::vector<ConflictLiteral>& lits) {
 
 ConflictStore::ConflictStore(Index n_cols, std::size_t byte_budget, std::size_t max_len)
     : n_(n_cols), budget_(byte_budget), max_len_(max_len),
-      by_var_(static_cast<std::size_t>(n_cols)) {}
+      watch_(static_cast<std::size_t>(n_cols)) {}
 
 std::vector<std::vector<ConflictLiteral>> ConflictStore::export_clauses() const {
     std::vector<std::vector<ConflictLiteral>> out;
@@ -58,15 +58,28 @@ std::vector<std::vector<ConflictLiteral>> ConflictStore::export_clauses() const 
 
 void ConflictStore::clear() {
     clauses_.clear();
-    for (auto& v : by_var_) v.clear();
+    by_born_.clear();
+    for (auto& v : watch_) v.clear();
     seen_.clear();
     stats_.live = 0;
     stats_.bytes = 0;
 }
 
+const std::vector<ConflictLiteral>* ConflictStore::clause_by_id(std::uint64_t id) const {
+    const auto it = by_born_.find(id);
+    if (it == by_born_.end() || it->second >= clauses_.size()) return nullptr;
+    const Clause& cl = clauses_[it->second];
+    return cl.live && cl.born == id ? &cl.lits : nullptr;
+}
+
 void ConflictStore::index_clause(std::size_t c) {
-    for (const auto& l : clauses_[c].lits)
-        by_var_[sz(l.var)].push_back(static_cast<std::uint32_t>(c));
+    Clause& cl = clauses_[c];
+    by_born_[cl.born] = c;
+    cl.w[0] = 0;
+    cl.w[1] = 1;
+    watch_[sz(cl.lits[0].var)].push_back(static_cast<std::uint32_t>(c));
+    if (cl.lits[1].var != cl.lits[0].var)
+        watch_[sz(cl.lits[1].var)].push_back(static_cast<std::uint32_t>(c));
 }
 
 bool ConflictStore::add(std::vector<ConflictLiteral> lits,
@@ -193,7 +206,8 @@ void ConflictStore::evict_to_budget() {
     for (auto& c : clauses_)
         if (c.live) kept.push_back(std::move(c));
     clauses_ = std::move(kept);
-    for (auto& v : by_var_) v.clear();
+    by_born_.clear();
+    for (auto& v : watch_) v.clear();
     seen_.clear();
     for (std::size_t c = 0; c < clauses_.size(); ++c) {
         seen_[clauses_[c].hash] = c;
@@ -203,7 +217,8 @@ void ConflictStore::evict_to_budget() {
 
 bool ConflictStore::propagate(std::vector<f64>& lo, std::vector<f64>& hi,
                               const std::vector<f64>& root_lo,
-                              const std::vector<f64>& root_hi, bool* converged) {
+                              const std::vector<f64>& root_hi, bool* converged,
+                              PropTrail* trail, int depth, Index* conflict_var) {
     core::WorkScope work_scope_(core::WorkCat::Conflict);
     if (converged != nullptr) *converged = true;
     ++stats_.scans;
@@ -218,75 +233,152 @@ bool ConflictStore::propagate(std::vector<f64>& lo, std::vector<f64>& hi,
         if (converged != nullptr) *converged = false;
         return true;
     }
-    // A clause can only force or conflict when some literal is false, which
-    // needs a column whose box is tighter than the root's. Start from those
-    // columns and follow the bounds the clauses themselves move.
-    // Scratch is kept between calls: this runs at every node.
+    // Two watched literals. A clause can only force or conflict when at most
+    // one literal is non-false, so then a WATCHED literal is false; and a
+    // literal can only be false on a column whose box is tighter than the
+    // root's (root-false literals were dropped at add). So only the watch
+    // lists of such columns are visited -- not every clause containing them,
+    // and not every literal of each. A false watch moves to another
+    // non-false literal when there is one; otherwise the other watch decides
+    // (true: satisfied; open: forced; false: conflict). Watches moved at one
+    // node stay valid at any other: the test is redone in every box.
     std::vector<Index>& queue = scratch_queue_;
     queue.clear();
     if (queued_.size() != sz(n_)) queued_.assign(sz(n_), 0);
-    std::vector<char>& queued = queued_;
     for (Index j = 0; j < n_; ++j)
-        if (!by_var_[sz(j)].empty() &&
+        if (!watch_[sz(j)].empty() &&
             (lo[sz(j)] > root_lo[sz(j)] + kTol || hi[sz(j)] < root_hi[sz(j)] - kTol)) {
             queue.push_back(j);
-            queued[sz(j)] = 1;
+            queued_[sz(j)] = 1;
         }
+    return run_queue(lo, hi, converged, trail, depth, conflict_var);
+}
+
+bool ConflictStore::propagate_from(std::vector<f64>& lo, std::vector<f64>& hi,
+                                   const std::vector<Index>& seeds, bool* converged,
+                                   PropTrail* trail, int depth, Index* conflict_var) {
+    core::WorkScope work_scope_(core::WorkCat::Conflict);
+    if (converged != nullptr) *converged = true;
+    if (clauses_.empty()) return true;
+    std::vector<Index>& queue = scratch_queue_;
+    queue.clear();
+    if (queued_.size() != sz(n_)) queued_.assign(sz(n_), 0);
+    for (const Index j : seeds)
+        if (j >= 0 && j < n_ && !queued_[sz(j)] && !watch_[sz(j)].empty()) {
+            queue.push_back(j);
+            queued_[sz(j)] = 1;
+        }
+    return run_queue(lo, hi, converged, trail, depth, conflict_var);
+}
+
+bool ConflictStore::run_queue(std::vector<f64>& lo, std::vector<f64>& hi, bool* converged,
+                              PropTrail* trail, int depth, Index* conflict_var) {
+    std::vector<Index>& queue = scratch_queue_;
+    std::vector<char>& queued = queued_;
     std::size_t head = 0;
-    if (seen_stamp_.size() < clauses_.size()) seen_stamp_.resize(clauses_.size(), 0);
-    std::vector<std::uint64_t>& seen_stamp = seen_stamp_;
-    std::uint64_t& stamp = stamp_;
     std::uint64_t budget = 8ull * clauses_.size() + 1000ull;
+    std::vector<std::uint32_t> list;
+    if (seen_stamp_.size() < clauses_.size()) seen_stamp_.resize(clauses_.size(), 0);
     while (head < queue.size()) {
         const Index j = queue[head++];
         queued[sz(j)] = 0;
-        ++stamp;
-        for (const std::uint32_t ci : by_var_[sz(j)]) {
-            if (seen_stamp[ci] == stamp) continue;
-            seen_stamp[ci] = stamp;
-            if (budget == 0) {
-                if (converged != nullptr) *converged = false;
-                finish_scan(queue, head);
-                return true;
-            }
-            --budget;
+        list.swap(watch_[sz(j)]);
+        watch_[sz(j)].clear();
+        ++stamp_;
+        std::size_t k = 0;
+        bool stop = false, conflict = false;
+        for (; k < list.size(); ++k) {
+            const std::uint32_t ci = list[k];
             Clause& cl = clauses_[ci];
-            core::work_add(2 + cl.lits.size(), ::sor::core::WorkTag::ClauseScan);
-            const ConflictLiteral* open = nullptr;
-            std::size_t n_open = 0;
-            bool satisfied = false;
-            for (const auto& l : cl.lits) {
-                if (lit_true(l, lo, hi)) { satisfied = true; break; }
-                if (!lit_false(l, lo, hi)) {
-                    if (++n_open == 1) open = &l;
-                    else break;
+            if (!cl.live) continue;   // stale
+            if (seen_stamp_[ci] == stamp_) continue;   // duplicate entry: drop
+            seen_stamp_[ci] = stamp_;
+            const bool w0_here = cl.lits[cl.w[0]].var == j;
+            const bool w1_here = cl.lits[cl.w[1]].var == j;
+            if (!w0_here && !w1_here) continue;   // stale: both watches moved
+            if (budget == 0) { stop = true; break; }
+            --budget;
+            core::work_add(2, ::sor::core::WorkTag::ClauseScan);
+            bool keep_here = false;
+            for (int s = 0; s < 2 && !conflict; ++s) {
+                const bool here = s == 0 ? w0_here : w1_here;
+                if (!here) continue;
+                const ConflictLiteral& wl = cl.lits[cl.w[s]];
+                if (!lit_false(wl, lo, hi)) { keep_here = true; continue; }
+                const ConflictLiteral& other = cl.lits[cl.w[1 - s]];
+                if (lit_true(other, lo, hi)) { keep_here = true; continue; }
+                // Look for a replacement watch: any literal not false, not
+                // the other watch.
+                std::size_t rep = cl.lits.size();
+                core::work_add(cl.lits.size(), ::sor::core::WorkTag::ClauseScan);
+                for (std::size_t q = 0; q < cl.lits.size(); ++q) {
+                    if (q == cl.w[0] || q == cl.w[1]) continue;
+                    if (!lit_false(cl.lits[q], lo, hi)) { rep = q; break; }
                 }
-            }
-            if (satisfied || n_open >= 2) continue;
-            ++cl.activity;
-            if (n_open == 0) {
-                ++stats_.conflicts;
-                finish_scan(queue, head);
-                return false;
-            }
-            // Exactly one literal can still hold: it must.
-            ++stats_.propagations;
-            const Index v = open->var;
-            if (open->upper) {
-                if (open->bound < hi[sz(v)] - kTol) {
-                    hi[sz(v)] = open->bound;
+                if (rep < cl.lits.size()) {
+                    cl.w[s] = static_cast<std::uint32_t>(rep);
+                    const Index nv = cl.lits[rep].var;
+                    if (nv == j) keep_here = true;
+                    else if (cl.lits[cl.w[1 - s]].var != nv) watch_[sz(nv)].push_back(ci);
+                    continue;
+                }
+                // No replacement: the other watch is the only literal that
+                // can hold.
+                keep_here = true;
+                ++cl.activity;
+                if (lit_false(other, lo, hi)) {
+                    ++stats_.conflicts;
+                    if (conflict_var) *conflict_var = -1;   // a violated clause, no emptied box
+                    conflict = true;
+                    break;
+                }
+                ++stats_.propagations;
+                const Index v = other.var;
+                const auto reason = static_cast<Index>(
+                    std::min<std::uint64_t>(cl.born, static_cast<std::uint64_t>(
+                        std::numeric_limits<Index>::max())));
+                if (other.upper) {
+                    if (other.bound < hi[sz(v)] - kTol) {
+                        if (trail) trail->push(v, BoundDir::Upper, other.bound, hi[sz(v)],
+                                               ReasonKind::Clause, reason, depth);
+                        hi[sz(v)] = other.bound;
+                        ++stats_.tightenings;
+                    }
+                } else if (other.bound > lo[sz(v)] + kTol) {
+                    if (trail) trail->push(v, BoundDir::Lower, other.bound, lo[sz(v)],
+                                           ReasonKind::Clause, reason, depth);
+                    lo[sz(v)] = other.bound;
                     ++stats_.tightenings;
                 }
-            } else if (open->bound > lo[sz(v)] + kTol) {
-                lo[sz(v)] = open->bound;
-                ++stats_.tightenings;
+                if (lo[sz(v)] > hi[sz(v)] + kTol) {
+                    ++stats_.conflicts;
+                    if (conflict_var) *conflict_var = v;
+                    conflict = true;
+                    break;
+                }
+                if (!queued[sz(v)] && !watch_[sz(v)].empty()) {
+                    queued[sz(v)] = 1;
+                    queue.push_back(v);
+                } else if (!queued[sz(v)] && v == j) {
+                    // j's own list is being rebuilt; revisit it.
+                    queued[sz(v)] = 1;
+                    queue.push_back(v);
+                }
             }
-            if (lo[sz(v)] > hi[sz(v)] + kTol) {
-                ++stats_.conflicts;
-                finish_scan(queue, head);
-                return false;
-            }
-            if (!queued[sz(v)]) { queued[sz(v)] = 1; queue.push_back(v); }
+            if (keep_here) watch_[sz(j)].push_back(ci);
+            if (conflict) { ++k; break; }
+        }
+        // Entries not visited (budget or conflict) stay on j's list.
+        for (; k < list.size(); ++k)
+            if (seen_stamp_[list[k]] != stamp_) watch_[sz(j)].push_back(list[k]);
+        if (conflict) {
+            finish_scan(queue, head);
+            return false;
+        }
+        if (stop) {
+            if (converged != nullptr) *converged = false;
+            finish_scan(queue, head);
+            return true;
         }
     }
     finish_scan(queue, head);
@@ -343,7 +435,8 @@ std::vector<ConflictLiteral> explain_conflict_clause(
     const PropTrail& trail, const model::LpProblem& lp, Index n_global_rows,
     const std::vector<char>& is_int, const std::vector<f64>& root_lo,
     const std::vector<f64>& root_hi, const std::vector<f64>& cur_lo,
-    const std::vector<f64>& cur_hi, Index conflict_var) {
+    const std::vector<f64>& cur_hi, Index conflict_var, bool first_uip,
+    const ConflictStore* store, const ReasonStore* reasons) {
     core::WorkScope work_scope_(core::WorkCat::Conflict);
     const auto& es = trail.entries();
     const Index n = lp.n_cols();
@@ -357,8 +450,17 @@ std::vector<ConflictLiteral> explain_conflict_clause(
         series[2 * sz(e.var) + (e.dir == BoundDir::Upper ? 1 : 0)].push_back(
             static_cast<std::uint32_t>(k));
     }
-    // A series is trustworthy when it chains from the root bound to the box's
-    // current bound with no untraced move in between.
+    // A series is trustworthy when no untraced move TIGHTENED the bound: the
+    // explanation attributes each bound to its latest trail entry, so a
+    // tighter value from an unrecorded move would make it claim more than its
+    // premises give. A recorded old bound LOOSER than the chain's value is
+    // harmless: it happens when the root box was tightened after the entry
+    // (root bounds are global facts), and then the explanation assumes the
+    // tighter root bound, a stronger premise than the deduction used.
+    // `tighter(side, a, b)`: a is strictly tighter than b on that side.
+    const auto tighter = [](int side, f64 a, f64 b) {
+        return side == 0 ? a > b + kTol : a < b - kTol;
+    };
     std::vector<signed char> chain(static_cast<std::size_t>(2 * n), -1);   // -1 unknown
     const auto chained = [&](Index v, int side) -> bool {
         signed char& c = chain[2 * sz(v) + side];
@@ -369,21 +471,23 @@ std::vector<ConflictLiteral> explain_conflict_clause(
         bool ok = true;
         f64 prev = root;
         for (const std::uint32_t k : sr) {
-            if (std::fabs(es[k].old_bound - prev) > kTol) { ok = false; break; }
-            prev = es[k].new_bound;
+            if (tighter(side, es[k].old_bound, prev)) { ok = false; break; }
+            if (tighter(side, es[k].new_bound, prev)) prev = es[k].new_bound;
         }
-        if (ok && std::fabs(prev - cur) > kTol) ok = false;
+        if (ok && tighter(side, cur, prev)) ok = false;
         c = ok ? 1 : 0;
         return ok;
     };
-    // Index of the last entry of (v, side) strictly before `before`, -1 for
-    // "the root bound was in force".
+    // Index of the last entry of (v, side) strictly before `before` that is
+    // tighter than the root bound, -1 for "the root bound was in force" (an
+    // entry the root has since overtaken explains nothing the root does not).
     const auto latest_before = [&](Index v, int side, std::size_t before) -> long {
         const auto& sr = series[2 * sz(v) + side];
+        const f64 root = side == 0 ? root_lo[sz(v)] : root_hi[sz(v)];
         long found = -1;
         for (const std::uint32_t k : sr) {
             if (k >= before) break;
-            found = static_cast<long>(k);
+            if (tighter(side, es[k].new_bound, root)) found = static_cast<long>(k);
         }
         return found;
     };
@@ -393,45 +497,162 @@ std::vector<ConflictLiteral> explain_conflict_clause(
 
     std::vector<char> visited(es.size(), 0);
     std::vector<std::size_t> work;
-    std::vector<std::size_t> decisions;
+    std::vector<std::size_t> decisions;   // entries whose negation is a clause literal
+    // First-UIP: entries at the conflict's level are resolved latest first
+    // until only one is pending (the unique implication point); an entry of
+    // an earlier level stops the resolution as soon as its negation is a
+    // literal. Every cut of the implication graph between the conflict and
+    // the decisions is a valid clause: the bounds on the cut, with the root
+    // box, propagate through the same reason rows to the same conflict.
+    int level = 0;
+    for (const auto& e : es) level = std::max(level, e.depth);
+    std::vector<std::size_t> pending;     // level-L entries, max-heap by index
+    const auto literal_ok = [&](std::size_t k) {
+        const auto& e = es[k];
+        return sz(e.var) < is_int.size() && is_int[sz(e.var)] &&
+               std::isfinite(e.new_bound) && e.new_bound == std::trunc(e.new_bound);
+    };
+    const auto schedule = [&](std::size_t k) {
+        if (first_uip && es[k].depth == level) {
+            pending.push_back(k);
+            std::push_heap(pending.begin(), pending.end());
+        } else if (first_uip && es[k].kind != ReasonKind::Branch && literal_ok(k)) {
+            decisions.push_back(k);           // an earlier level's bound: cut here
+        } else {
+            work.push_back(k);
+        }
+    };
     const auto need = [&](Index v, int side, std::size_t before) -> bool {
         if (!chained(v, side)) return false;
         const long k = latest_before(v, side, before);
         if (k >= 0 && !visited[sz(static_cast<Index>(k))]) {
             visited[sz(static_cast<Index>(k))] = 1;
-            work.push_back(static_cast<std::size_t>(k));
+            schedule(static_cast<std::size_t>(k));
         }
         return true;
     };
-    // The emptied domain: its lower and its upper bound.
+    // The emptied domain: its lower and its upper bound. The later of the two
+    // entries is the bound that crossed the other one -- the conflict itself
+    // (a propagator records it before reporting the empty domain). Its
+    // negation is implied by the other side's bound, so it is never a cut
+    // point: it is expanded through its reason whatever its level. Stopping
+    // there made first-UIP learn "not x <= -1" for a binary whose lower
+    // bound was the root's -- always true, so nothing was learned. The other
+    // side's entry stays an ordinary candidate (it is often the UIP).
+    const long crossing = std::max(latest_before(conflict_var, 0, es.size()),
+                                   latest_before(conflict_var, 1, es.size()));
     if (!need(conflict_var, 0, es.size()) || !need(conflict_var, 1, es.size()))
         return {};
-    while (!work.empty()) {
-        const std::size_t k = work.back();
-        work.pop_back();
+    if (first_uip && crossing >= 0 && es[sz(static_cast<Index>(crossing))].kind != ReasonKind::Branch) {
+        const auto c = static_cast<std::size_t>(crossing);
+        const auto it = std::find(pending.begin(), pending.end(), c);
+        if (it != pending.end()) {
+            pending.erase(it);
+            std::make_heap(pending.begin(), pending.end());
+            work.push_back(c);
+        }
+        const auto jt = std::find(decisions.begin(), decisions.end(), c);
+        if (jt != decisions.end()) {
+            decisions.erase(jt);
+            work.push_back(c);
+        }
+    }
+    for (;;) {
+        std::size_t k;
+        if (!work.empty()) {
+            k = work.back();
+            work.pop_back();
+        } else if (!pending.empty()) {
+            // One pending entry of the current level that is a literal: the UIP.
+            if (pending.size() == 1 && literal_ok(pending.front())) {
+                decisions.push_back(pending.front());
+                pending.clear();
+                break;
+            }
+            std::pop_heap(pending.begin(), pending.end());
+            k = pending.back();
+            pending.pop_back();
+        } else {
+            break;
+        }
         const auto& e = es[k];
         if (e.kind == ReasonKind::Branch) {
             decisions.push_back(k);
             continue;
         }
-        if (e.kind != ReasonKind::Row || e.reason_id < 0 ||
-            e.reason_id >= n_global_rows || e.reason_id >= lp.n_rows())
+        // A conflict-graph implication: the antecedent literal was true,
+        // i.e. its column sat at that value (x_j >= 1 for (j,1), x_j <= 0
+        // for (j,0)).
+        if (e.kind == ReasonKind::Implication) {
+            const Index tl = e.reason_id;
+            if (tl < 0 || (tl >> 1) >= n) return {};
+            if (!need(tl >> 1, (tl & 1) != 0 ? 0 : 1, k)) return {};
+            continue;
+        }
+        // A conflict-store clause: every literal but the forced one was false.
+        if (e.kind == ReasonKind::Clause) {
+            const auto* lits_c = store != nullptr && e.reason_id >= 0
+                ? store->clause_by_id(static_cast<std::uint64_t>(e.reason_id)) : nullptr;
+            if (lits_c == nullptr) return {};
+            bool skipped_forced = false;
+            for (const auto& l : *lits_c) {
+                if (!skipped_forced && l.var == e.var && l.upper == (e.dir == BoundDir::Upper) &&
+                    l.bound == e.new_bound) {
+                    skipped_forced = true;
+                    continue;
+                }
+                // x <= b false: lo > b (lower side); x >= b false: hi < b.
+                if (!need(l.var, l.upper ? 0 : 1, k)) return {};
+            }
+            if (!skipped_forced) return {};
+            continue;
+        }
+        // Explicit antecedents: exactly the bounds listed.
+        if (e.kind == ReasonKind::Antecedents) {
+            if (reasons == nullptr || e.reason_id < 0 ||
+                static_cast<std::size_t>(e.reason_id) >= reasons->antecedents.size())
+                return {};
+            for (const BoundRef& b : reasons->antecedents[sz(e.reason_id)]) {
+                if (b.var < 0 || b.var >= n) return {};
+                if (!need(b.var, b.upper ? 1 : 0, k)) return {};
+            }
+            continue;
+        }
+        // The reason row: a global row of `lp`, or a row the working set
+        // retired (still a valid global inequality). A local Cut reason has
+        // no global meaning and stops the explanation.
+        const Index* rcols = nullptr;
+        const f64* rvals = nullptr;
+        std::size_t rlen = 0;
+        if (e.kind == ReasonKind::Row && e.reason_id >= 0 && e.reason_id < n_global_rows &&
+            e.reason_id < lp.n_rows()) {
+            const Index r = e.reason_id;
+            rcols = ci.data() + rp[sz(r)];
+            rvals = av.data() + rp[sz(r)];
+            rlen = static_cast<std::size_t>(rp[sz(r) + 1] - rp[sz(r)]);
+        } else if (e.kind == ReasonKind::Retired && reasons != nullptr && e.reason_id >= 0 &&
+                   static_cast<std::size_t>(e.reason_id) < reasons->rows.size()) {
+            const RetiredRow& rr = reasons->rows[sz(e.reason_id)];
+            rcols = rr.cols.data();
+            rvals = rr.vals.data();
+            rlen = rr.cols.size();
+        } else {
             return {};
-        const Index r = e.reason_id;
+        }
         // Coefficient of the tightened column in its reason row.
         f64 a_v = 0.0;
-        for (core::Offset q = rp[sz(r)]; q < rp[sz(r) + 1]; ++q)
-            if (ci[sz(q)] == e.var) a_v += av[sz(q)];
+        for (std::size_t q = 0; q < rlen; ++q)
+            if (rcols[q] == e.var) a_v += rvals[q];
         if (a_v == 0.0) return {};
         // Upper bound from a positive coefficient (or lower from a negative
         // one) comes from the row's minimum activity; the other two cases from
         // its maximum. Minimum activity uses lower bounds of positive
         // coefficients and upper bounds of negative ones; maximum the reverse.
         const bool use_min = (e.dir == BoundDir::Upper) == (a_v > 0.0);
-        for (core::Offset q = rp[sz(r)]; q < rp[sz(r) + 1]; ++q) {
-            const Index c = ci[sz(q)];
-            if (c == e.var || av[sz(q)] == 0.0) continue;
-            const bool positive = av[sz(q)] > 0.0;
+        for (std::size_t q = 0; q < rlen; ++q) {
+            const Index c = rcols[q];
+            if (c == e.var || rvals[q] == 0.0) continue;
+            const bool positive = rvals[q] > 0.0;
             const int side = (use_min == positive) ? 0 : 1;   // 0: lower, 1: upper
             if (!need(c, side, k)) return {};
         }
@@ -478,7 +699,8 @@ namespace sor::search {
 std::vector<ConflictLiteral> farkas_conflict_clause(
     const model::LpProblem& lp, const std::vector<f64>& ray, f64 tolerance,
     const std::vector<char>& is_int, const std::vector<f64>& root_lo,
-    const std::vector<f64>& root_hi, std::size_t* relaxed_bounds) {
+    const std::vector<f64>& root_hi, std::size_t* relaxed_bounds,
+    const core::DualFarkasRay* prechecked) {
     core::WorkScope work_scope_(core::WorkCat::Conflict);
     std::vector<ConflictLiteral> out;
     const Index n = lp.n_cols();
@@ -486,7 +708,8 @@ std::vector<ConflictLiteral> farkas_conflict_clause(
         static_cast<Index>(root_lo.size()) != n || static_cast<Index>(root_hi.size()) != n ||
         static_cast<Index>(is_int.size()) != n)
         return out;
-    const auto checked = certify::check_dual_farkas_ray(lp, ray, tolerance);
+    const auto checked = prechecked != nullptr
+        ? *prechecked : certify::check_dual_farkas_ray(lp, ray, tolerance);
     if (!checked.certified || checked.multipliers.size() != static_cast<std::size_t>(lp.n_rows()))
         return out;
     const auto sz = [](Index v) { return static_cast<std::size_t>(v); };

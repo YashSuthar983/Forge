@@ -142,9 +142,10 @@ void apply_auto_cuts_policy(BabOptions& o) {
     o.mir_cuts = true;
     o.lifted_cover_cuts = true;
     o.zerohalf_cuts = true;
-    // Flow-cover derivation has a known, gross counterexample on blend2.
-    // Auto policy must never make an unverified separator available.
-    o.flow_cover_cuts = false;
+    // Flow covers are exact rows (flowcover.hpp, checked against an LP
+    // oracle over the whole mixed-integer set), but what they buy beside MIR
+    // is unmeasured: they stay off by default (BabOptions) and the policy
+    // leaves the caller's choice (--flow-cover-cuts) alone.
     // Clique cuts: valid but regressed misc03 node LP cost; keep opt-in only.
 }
 

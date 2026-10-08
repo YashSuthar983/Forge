@@ -285,6 +285,11 @@ void usage() {
         "  --gcs-model PATH    load GCS promote/reinject policy (SOR_GCS)\n"
         "  --gcs-heuristic     use multi-node heuristic score (ignore GNN)\n"
         "  --gcs-reinject N    GCS reinject top cuts every N nodes (0=off cadence)\n"
+        "  --gcs-promote N     at most N retained cuts enter the global LP per separation node (0=none)\n"
+        "  --no-milp-aggregation  no substitution of columns through equality rows in MILP presolve\n"
+        "  --lp-exit-refactor always|economy  rebuild the dual simplex factor at every would-be\n"
+        "                      optimum carrying updates, or only once its update file has cost a\n"
+        "                      factorization (default always)\n"
         "  --lp-concurrent N  race N independently checked simplex arms (auto route)\n"
         "  --lp-parallel-basis  evaluate paired basis solves with private worker factors\n"
         "  --lp-dualize off|on|auto  solve the LP through its dual LP (simplex, no\n"
@@ -1108,6 +1113,8 @@ int main(int argc, char** argv) {
     bool binary_row_support = true;
     bool structural_fbbt = true;
     bool monotone_binary_pairs = true;
+    bool milp_aggregation = true;
+    bool flow_cover_cuts_cli = false;
     bool structural_row_probing = false;
     bool structural_graph_relations = false;
     bool structural_graph_support = false;
@@ -1145,6 +1152,7 @@ int main(int argc, char** argv) {
     std::string gcs_model;
     bool gcs_heuristic = false;
     int gcs_reinject = -1;
+    int gcs_promote = -1;
     bool basis_update_explicit = false;
     std::string milp_policy = "latest";
     bool fixprop_enabled = true;
@@ -1407,6 +1415,15 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+        else if (a == "--lp-exit-refactor") {
+            const std::string mode = next("--lp-exit-refactor");
+            if (mode == "always") sx_opts.exit_refactor_by_economy = false;
+            else if (mode == "economy") sx_opts.exit_refactor_by_economy = true;
+            else {
+                std::fprintf(stderr, "error: --lp-exit-refactor wants always|economy\n");
+                return 2;
+            }
+        }
         else if (a == "--basis-update") {
             const std::string method = next("--basis-update");
             basis_update_explicit = true;
@@ -1535,6 +1552,8 @@ int main(int argc, char** argv) {
         else if (a == "--no-binary-row-support") binary_row_support = false;
         else if (a == "--no-structural-fbbt") structural_fbbt = false;
         else if (a == "--no-monotone-binary-pairs") monotone_binary_pairs = false;
+        else if (a == "--no-milp-aggregation") milp_aggregation = false;
+        else if (a == "--flow-cover-cuts") flow_cover_cuts_cli = true;
         else if (a == "--structural-row-probing") structural_row_probing = true;
         else if (a == "--structural-graph-relations") structural_graph_relations = true;
         else if (a == "--structural-graph-support") structural_graph_support = true;
@@ -1711,6 +1730,9 @@ int main(int argc, char** argv) {
             gcs_reinject = static_cast<int>(
                 parse_uint(next("--gcs-reinject"), "--gcs-reinject", 0,
                            1000000));
+        else if (a == "--gcs-promote")
+            gcs_promote = static_cast<int>(
+                parse_uint(next("--gcs-promote"), "--gcs-promote", 0, 1000000));
         else if (a == "--milp-policy") milp_policy = next("--milp-policy");
         else if (a == "--no-fixprop") fixprop_enabled = false;
         else if (a == "--fixprop-time") {
@@ -3319,6 +3341,8 @@ int main(int argc, char** argv) {
             bab.structural_presolve.binary_row_support = binary_row_support;
             bab.structural_presolve.structural_fbbt = structural_fbbt;
             bab.structural_presolve.monotone_binary_pairs = monotone_binary_pairs;
+            bab.structural_presolve.aggregation = milp_aggregation;
+            if (flow_cover_cuts_cli) bab.flow_cover_cuts = true;
             bab.structural_presolve.row_probe.enabled = structural_row_probing;
             bab.structural_presolve.graph_relation_probe = structural_graph_relations;
             bab.structural_presolve.graph_support_propagation = structural_graph_support;
@@ -3430,6 +3454,7 @@ int main(int argc, char** argv) {
             if (gcs_reinject >= 0)
                 bab.tree_cut.gcs_reinject_every_nodes =
                     static_cast<std::uint64_t>(gcs_reinject);
+            if (gcs_promote >= 0) bab.tree_cut.gcs_promote_max = gcs_promote;
             // --max-iter is the public MILP node limit.  A node LP must not
             // inherit that value as its own pivot cap: doing so interrupted
             // the schedule root relaxation at 5000 pivots and left B&B with
@@ -3602,6 +3627,20 @@ int main(int argc, char** argv) {
                         diag.tree_sep_ms);
             std::printf("  tree separation skipped by cost gate at %llu nodes\n",
                         (unsigned long long)diag.tree_sep_skipped_budget);
+            std::printf("  global tree cuts: %llu promoted to the global LP (%llu reinjected), "
+                        "%llu refused (point satisfied them); working set peak %llu rows, "
+                        "%llu purged in %llu passes; %llu warm starts fitted by LU "
+                        "(%llu repaired, %llu failed), %llu retired reasons\n",
+                        (unsigned long long)diag.gcs_promoted,
+                        (unsigned long long)diag.gcs_reinjected,
+                        (unsigned long long)diag.tree_cuts_entry_refused,
+                        (unsigned long long)diag.tree_rows_peak,
+                        (unsigned long long)diag.tree_rows_purged,
+                        (unsigned long long)diag.tree_row_purges,
+                        (unsigned long long)diag.tree_row_bases_fitted,
+                        (unsigned long long)diag.tree_row_bases_fit_repaired,
+                        (unsigned long long)diag.tree_row_bases_fit_failed,
+                        (unsigned long long)diag.tree_rows_retired_reasons);
             std::printf("GMI trace:         %llu fractional basic candidates, "
                         "%llu missing bases, %llu invalid factors, %llu empty rows, "
                         "%llu free, %llu dynamism, %llu unviolated rejects, "
@@ -3614,6 +3653,11 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(diag.gmi_rejected_dynamism),
                         static_cast<unsigned long long>(diag.gmi_rejected_violation),
                         static_cast<unsigned long long>(diag.gmi_fractional_integer_bound_terms));
+            std::printf("GMI rows:          %llu from the LP engine's factor (%llu failed their "
+                        "check), %llu own factorizations\n",
+                        static_cast<unsigned long long>(diag.gmi_engine_rows),
+                        static_cast<unsigned long long>(diag.gmi_engine_rows_rejected),
+                        static_cast<unsigned long long>(diag.gmi_own_factorizations));
             std::printf("GMI dynamism:      %llu wide cuts repaired by relaxing small terms\n",
                         static_cast<unsigned long long>(diag.gmi_dynamism_repaired));
             std::printf("GMI tableau c-MIR: %llu cuts (%llu beat the GMI, %llu with no GMI)\n",
@@ -3656,9 +3700,18 @@ int main(int argc, char** argv) {
                         "heuristics %.1f ms\n",
                         diag.sub_mip_child_root_setup_ms, diag.sub_mip_child_root_lp_ms,
                         diag.sub_mip_child_cut_ms, diag.sub_mip_child_heur_ms);
-            std::printf("objective prop:    %llu bounds tightened, %llu nodes pruned\n",
+            std::printf("objective prop:    %llu bounds tightened, %llu nodes pruned, "
+                        "%llu at-most-one groups\n",
                         (unsigned long long)diag.objprop_tightenings,
-                        (unsigned long long)diag.objprop_prunes);
+                        (unsigned long long)diag.objprop_prunes,
+                        (unsigned long long)diag.objprop_amo_groups);
+            std::printf("split certs:       %llu node bounds raised, %llu nodes closed; "
+                        "%llu bounds from two-sided probe hulls; %llu probe directions "
+                        "closed by propagation\n",
+                        (unsigned long long)diag.sb_split_bound_raises,
+                        (unsigned long long)diag.sb_split_bound_prunes,
+                        (unsigned long long)diag.domain_probe_hull_tightenings,
+                        (unsigned long long)diag.sb_propagation_dead);
             std::printf("node RC fixing:    %llu bounds at %llu nodes\n",
                         (unsigned long long)diag.node_rc_tightenings,
                         (unsigned long long)diag.node_rc_nodes);
@@ -3675,6 +3728,10 @@ int main(int argc, char** argv) {
                         (unsigned long long)diag.sub_mip_children_searched,
                         diag.sub_mip_build_ms,
                         diag.sub_mip_child_setup_ms, diag.sub_mip_child_search_ms);
+            std::printf("sub-MIP closure:   %llu bounds tightened in the parent, %llu "
+                        "neighbourhoods closed empty\n",
+                        (unsigned long long)diag.sub_mip_closure_tightenings,
+                        (unsigned long long)diag.sub_mip_closed_empty);
             for (const auto& a : diag.lns.arms) {
                 if (a.calls == 0) continue;
                 std::printf("  arm %-12s calls %-5llu hits %-4llu "
@@ -4047,11 +4104,56 @@ int main(int argc, char** argv) {
                             (unsigned long long)ps.sides_rounded,
                             (unsigned long long)diag.structural_postsolve_failures,
                             (unsigned long long)diag.structural_postsolve_polished);
+                if (ps.coefs_inexact_skipped + ps.merge_inexact_skipped > 0)
+                    std::printf("  inexact skipped: %d coefficient strengthenings, %d column merges\n",
+                                ps.coefs_inexact_skipped, ps.merge_inexact_skipped);
                 std::printf("structural FBBT: %llu tightenings, %d sweeps, %llu terms\n",
                             (unsigned long long)ps.structural_fbbt_tightenings,
                             ps.structural_fbbt_rounds,
                             (unsigned long long)ps.structural_fbbt_work);
                 std::printf("monotone binary pairs: %d saturated\n", ps.monotone_pairs_saturated);
+                std::printf("orbitopes:         %llu verified (%llu rows x %llu blocks total; %llu "
+                            "transpositions verified, %llu refuted), %llu node fixings, %llu nodes emptied\n",
+                            (unsigned long long)diag.orbitope_diag.orbitopes,
+                            (unsigned long long)diag.orbitope_diag.orbitope_rows,
+                            (unsigned long long)diag.orbitope_diag.orbitope_blocks,
+                            (unsigned long long)diag.orbitope_diag.transpositions_verified,
+                            (unsigned long long)diag.orbitope_diag.transpositions_refuted,
+                            (unsigned long long)diag.orbitopal_fixings,
+                            (unsigned long long)diag.orbitope_prunes);
+                std::printf("clique rows:       %llu model rows with clique groups, %llu bounds moved, "
+                            "%llu nodes emptied; odd-cycle cuts %llu candidates\n",
+                            (unsigned long long)diag.clique_rows,
+                            (unsigned long long)diag.clique_row_tightenings,
+                            (unsigned long long)diag.clique_row_prunes,
+                            (unsigned long long)diag.odd_cycle_cut_candidates);
+                if (diag.rapid_learning_ran)
+                    std::printf("rapid learning:    %llu decisions, %llu conflicts, %llu clauses filed "
+                                "(%llu units), %llu root bounds, %llu restarts%s%s (%.1f ms)\n",
+                                (unsigned long long)diag.rapid_learning_decisions,
+                                (unsigned long long)diag.rapid_learning_conflicts,
+                                (unsigned long long)diag.rapid_learning_learned,
+                                (unsigned long long)diag.rapid_learning_units,
+                                (unsigned long long)diag.rapid_learning_fixings,
+                                (unsigned long long)diag.rapid_learning_restarts,
+                                diag.rapid_learning_infeasible ? ", root proved empty" : "",
+                                diag.rapid_learning_leaf ? ", reached a full assignment" : "",
+                                diag.rapid_learning_ms);
+                if (diag.face_vertex_lps > 0)
+                    std::printf("optimal face:      %llu auxiliary LPs, %llu vertices (%llu more "
+                                "integral than the root point), %llu incumbents (%.1f ms)\n",
+                                (unsigned long long)diag.face_vertex_lps,
+                                (unsigned long long)diag.face_vertices,
+                                (unsigned long long)diag.face_vertices_more_integral,
+                                (unsigned long long)diag.face_vertex_incumbents,
+                                diag.face_vertex_ms);
+                std::printf("mixing:            %llu families over shared activities, %llu cut candidates\n",
+                            (unsigned long long)diag.mixing_families,
+                            (unsigned long long)diag.mixing_cut_candidates);
+                std::printf("aggregation:       %d columns substituted out (%d rows removed with them), "
+                            "%d declined as inexact\n",
+                            ps.aggregated_cols, ps.aggregation_rows_removed,
+                            ps.aggregation_inexact_skipped);
                 std::printf("row support probing: %llu rows, %llu assignments (%llu rejected), "
                             "%llu visits, %llu fixings, %d substitutions (%d numerical rejects), "
                             "%d passes%s (%.1f ms)\n",
@@ -4326,10 +4428,13 @@ int main(int argc, char** argv) {
             std::printf("  node LP          %10.3f\n", diag.lp_ms);
             std::printf("  node setup       %10.3f\n", diag.ms_node_setup);
             std::printf("  node prop        %10.3f  (%llu event nodes with %llu row visits, "
-                        "%llu full sweeps)\n", diag.ms_node_prop,
+                        "%llu full sweeps; activity cache %llu builds, %llu row re-sums)\n",
+                        diag.ms_node_prop,
                         (unsigned long long)diag.prop_event_nodes,
                         (unsigned long long)diag.prop_event_visits,
-                        (unsigned long long)diag.prop_full_nodes);
+                        (unsigned long long)diag.prop_full_nodes,
+                        (unsigned long long)diag.activity_cache_builds,
+                        (unsigned long long)diag.activity_cache_resums);
             std::printf("  conflict prop    %10.3f\n", diag.ms_conflict_prop);
             std::printf("  nogood learning  %10.3f  (build %.1f, validate %.1f, apply %.1f; "
                         "check binary %.1f general %.1f)\n", diag.ms_nogood_total,

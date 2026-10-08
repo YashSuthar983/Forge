@@ -49,19 +49,33 @@ void test_auto_policy_enables_safe_separators_not_clique() {
     CHECK(!o.cut.pool_parallel_hard_filter);
 }
 
-void test_known_invalid_flow_cover_option_fails_closed() {
+// Flow covers were refused outright while their derivation had invalid
+// rows. Repaired (exact rows, checked against an LP oracle in
+// test_flowcover), the option solves: a fixed-charge model with two
+// arcs gives the same optimum with it on and off.
+void test_flow_cover_option_solves() {
+    // min 3 x1 + 2 x2 - y1 - y2, y1 + y2 <= 5, y1 <= 4 x1, y2 <= 4 x2.
     sor::model::LpProblem lp;
-    lp.c = {1.0};
-    lp.col_lo = {0.0};
-    lp.col_hi = {1.0};
-    lp.is_integer = {true};
-    lp.A = from_triplets(0, 1, {}, {}, {});
-    BabOptions opts;
-    opts.flow_cover_cuts = true;
-    sor::search::BabDiagnostics diag;
-    const auto result = sor::search::solve_milp(lp, opts, diag);
-    CHECK(result.proposed_status == sor::core::Status::Unsupported);
-    CHECK(result.termination_reason.find("known invalid-cut") != std::string::npos);
+    lp.c = {-1.0, -1.0, 3.0, 2.0};
+    lp.col_lo = {0.0, 0.0, 0.0, 0.0};
+    lp.col_hi = {4.0, 4.0, 1.0, 1.0};
+    lp.is_integer = {false, false, true, true};
+    lp.A = from_triplets(3, 4, {0, 0, 1, 1, 2, 2}, {0, 1, 0, 2, 1, 3},
+                         {1.0, 1.0, 1.0, -4.0, 1.0, -4.0});
+    lp.row_lo = {-sor::model::kInf, -sor::model::kInf, -sor::model::kInf};
+    lp.row_hi = {5.0, 0.0, 0.0};
+    double obj[2];
+    for (int on = 0; on < 2; ++on) {
+        BabOptions opts;
+        opts.flow_cover_cuts = on == 1;
+        opts.para_bab.threads = 1;
+        sor::search::BabDiagnostics diag;
+        const auto result = sor::search::solve_milp(lp, opts, diag);
+        CHECK(result.proposed_status == sor::core::Status::Optimal);
+        obj[on] = result.objective;
+    }
+    CHECK(std::fabs(obj[0] - obj[1]) <= 1e-9);
+    CHECK(std::fabs(obj[0] - (-2.0)) <= 1e-9);   // open arc 2 only: 2 - 4
 }
 
 void test_filter_drops_parallel_low_value() {
@@ -211,7 +225,7 @@ void test_round_progress_ignores_objective_constants() {
 
 int main() {
     test_auto_policy_enables_safe_separators_not_clique();
-    test_known_invalid_flow_cover_option_fails_closed();
+    test_flow_cover_option_solves();
     test_filter_drops_parallel_low_value();
     test_exact_duplicates_dominance_and_opposites();
     test_prefilter_cap_is_generous();

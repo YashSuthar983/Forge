@@ -64,9 +64,61 @@ LpProblem take_rows(const LpProblem& lp, const std::vector<Index>& rows) {
     return out;
 }
 
+// Deleting a binding row leaves a surplus basic column, and which one may
+// leave is fixed by the matrix: rows r0: x0 + x1, r1: x1, r2: x2 with basis
+// {x0, x1, x2}. Without r2, x2's column is empty, so x2 must leave; demoting
+// x0 (nearest its bound at x = (0, 3, 3)) would leave {x1, x2} singular.
+void test_fit_drops_the_column_the_rows_force() {
+    using sor::engines::NonbasicStatus;
+    LpProblem lp;
+    lp.name = "fit";
+    lp.A = sor::sparse::from_triplets(2, 3, {0, 0, 1}, {0, 1, 1}, {1.0, 1.0, 1.0});
+    lp.c = {1.0, 1.0, 1.0};
+    lp.col_lo = {0.0, 0.0, 0.0};
+    lp.col_hi = {4.0, 4.0, 4.0};
+    lp.row_lo = {-kInf, -kInf};
+    lp.row_hi = {5.0, 3.0};
+    lp.is_integer.assign(3, false);
+    // Stored over the three old rows minus r2: status for 3 + 2 columns, three basics.
+    sor::engines::SimplexBasis b;
+    b.n_struct = 3;
+    b.basic = {0, 1, 2};
+    b.status = {NonbasicStatus::Basic, NonbasicStatus::Basic, NonbasicStatus::Basic,
+                NonbasicStatus::AtUpper, NonbasicStatus::AtUpper};
+    sor::search::BasisFitStats fs;
+    CHECK(sor::search::fit_stored_basis(lp, 2, 0, b, lp.col_lo, lp.col_hi, &fs));
+    CHECK(fs.dropped == 1 && fs.repaired == 0 && fs.appended == 0);
+    CHECK(b.basic.size() == 2);
+    CHECK(b.status[2] != NonbasicStatus::Basic);
+    CHECK(b.status[0] == NonbasicStatus::Basic && b.status[1] == NonbasicStatus::Basic);
+
+    // The same basis one global row later (appended since) and with one local
+    // row after the globals: the new global row's logical enters basic, the
+    // local logical moves past it, and x2 still leaves.
+    LpProblem lp2 = lp;
+    lp2.A = sor::sparse::from_triplets(4, 3, {0, 0, 1, 2, 3}, {0, 1, 1, 0, 2},
+                                       {1.0, 1.0, 1.0, 1.0, 1.0});
+    lp2.row_lo = {-kInf, -kInf, -kInf, -kInf};
+    lp2.row_hi = {5.0, 3.0, 4.0, 2.0};
+    sor::engines::SimplexBasis b2;
+    b2.n_struct = 3;
+    b2.basic = {0, 1, 2, 3 + 2};   // local row's logical basic, at basis row 2
+    b2.status = {NonbasicStatus::Basic, NonbasicStatus::Basic, NonbasicStatus::Basic,
+                 NonbasicStatus::AtUpper, NonbasicStatus::AtUpper, NonbasicStatus::Basic};
+    CHECK(sor::search::fit_stored_basis(lp2, 3, 1, b2, lp2.col_lo, lp2.col_hi, &fs));
+    CHECK(fs.appended == 1 && fs.dropped == 1 && fs.repaired == 0);
+    CHECK(b2.basic.size() == 4);
+    CHECK(b2.status[3 + 2] == NonbasicStatus::Basic);   // new global row 2
+    CHECK(b2.status[3 + 3] == NonbasicStatus::Basic);   // local row, now lp row 3
+    std::vector<Index> singular, vacant;
+    sor::search::basis_rank_selection(lp2, 4, b2.basic, singular, vacant);
+    CHECK(singular.empty());
+}
+
 }  // namespace
 
 int main() {
+    test_fit_drops_the_column_the_rows_force();
     std::mt19937 rng(5);
     int mapped = 0, agreed = 0, warm_fewer = 0;
     for (int trial = 0; trial < 300; ++trial) {
@@ -90,8 +142,7 @@ int main() {
         for (Index j = 0; j < n; ++j)
             if (rng() % 4 == 0) child.col_hi[static_cast<std::size_t>(j)] = 2.0;
 
-        const auto mb = sor::search::map_basis_to_child(basis, n, m, base, 0, extra, pr.x,
-                                                       lp.col_lo, lp.col_hi);
+        const auto mb = sor::search::map_basis_to_child(basis, n, m, base, 0, extra, pr.x, child);
         CHECK(mb.has_value());
         if (!mb) continue;
         CHECK(static_cast<Index>(mb->basic.size()) == child.n_rows());
@@ -99,6 +150,10 @@ int main() {
         int basics = 0;
         for (const auto s : mb->status) basics += s == sor::engines::NonbasicStatus::Basic;
         CHECK(basics == child.n_rows());
+        // Exact selection: the mapped basis factors over the child's rows.
+        std::vector<Index> singular, vacant;
+        sor::search::basis_rank_selection(child, child.n_rows(), mb->basic, singular, vacant);
+        CHECK(singular.empty());
         ++mapped;
 
         sor::engines::SimplexDiagnostics cold_d, warm_d;

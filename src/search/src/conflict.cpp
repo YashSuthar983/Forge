@@ -1,4 +1,5 @@
 #include "sor/search/conflict.hpp"
+#include "sor/model/dyadic.hpp"
 #include "sor/core/work_clock.hpp"
 
 #include "sor/search/mip_presolve.hpp"
@@ -12,6 +13,8 @@
 #include <cmath>
 #include <string>
 #include <utility>
+#include <queue>
+#include <limits>
 
 namespace sor::search {
 namespace {
@@ -141,6 +144,7 @@ ProbingState ProbingState::remapped(const std::vector<Index>& new_of_old,
     s.n_cols = new_n;
     s.probed.assign(sz(new_n), 0);
     s.gave_up = gave_up;
+    s.rows_covered = rows_covered;
     for (Index j = 0; j < n_cols && sz(j) < new_of_old.size(); ++j) {
         const Index f = new_of_old[sz(j)];
         if (f >= 0 && f < new_n && sz(j) < probed.size()) s.probed[sz(f)] = probed[sz(j)];
@@ -169,26 +173,79 @@ std::uint64_t matrix_fingerprint(const model::LpProblem& lp) {
     return h;
 }
 
+std::uint64_t row_prefix_fingerprint(const model::LpProblem& lp, Index rows) {
+    std::uint64_t h = 1469598103934665603ull;
+    const auto mix = [&h](std::uint64_t v) {
+        h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        h *= 1099511628211ull;
+    };
+    rows = std::max<Index>(0, std::min(rows, lp.n_rows()));
+    mix(static_cast<std::uint64_t>(rows));
+    mix(static_cast<std::uint64_t>(lp.n_cols()));
+    const auto& rp = lp.A.pattern.row_ptr();
+    const auto& ci = lp.A.pattern.col_idx();
+    if (rp.empty()) return h;
+    const core::Offset end = rp[sz(rows)];
+    for (Index i = 0; i <= rows; ++i) mix(static_cast<std::uint64_t>(rp[sz(i)]));
+    for (core::Offset k = 0; k < end; ++k) mix(static_cast<std::uint64_t>(ci[sz(k)]));
+    for (core::Offset k = 0; k < end; ++k) {
+        std::uint64_t bits;
+        std::memcpy(&bits, &lp.A.vals[sz(k)], sizeof bits);
+        mix(bits);
+    }
+    return h;
+}
+
+void ProbingCarry::describe(const model::LpProblem& lp, Index n_rows) {
+    rows = n_rows < 0 ? lp.n_rows() : std::min(n_rows, lp.n_rows());
+    fingerprint = row_prefix_fingerprint(lp, rows);
+    // 0 marks an empty carry.
+    if (fingerprint == 0) fingerprint = 1;
+    row_lo.assign(lp.row_lo.begin(), lp.row_lo.begin() + rows);
+    row_hi.assign(lp.row_hi.begin(), lp.row_hi.begin() + rows);
+    integer.assign(sz(lp.n_cols()), 0);
+    for (Index j = 0; j < lp.n_cols() && sz(j) < lp.is_integer.size(); ++j)
+        integer[sz(j)] = lp.is_integer[sz(j)] ? 1 : 0;
+}
+
 bool ProbingCarry::usable_for(const model::LpProblem& lp) const {
+    const bool debug = std::getenv("SOR_DEBUG_CARRY") != nullptr;
     if (fingerprint == 0 || lp.n_cols() != graph.n_cols() ||
         state.n_cols != lp.n_cols() || sz(lp.n_cols()) != lo.size() ||
-        sz(lp.n_cols()) != hi.size()) {
-        if (std::getenv("SOR_DEBUG_CARRY"))
-            std::fprintf(stderr, "carry: shape fp=%llu n=%d graph=%d state=%d\n",
+        sz(lp.n_cols()) != hi.size() || sz(lp.n_cols()) != integer.size() ||
+        rows > lp.n_rows() || row_lo.size() != sz(rows) || row_hi.size() != sz(rows)) {
+        if (debug)
+            std::fprintf(stderr, "carry: shape fp=%llu n=%d graph=%d state=%d rows=%d/%d\n",
                          (unsigned long long)fingerprint, (int)lp.n_cols(),
-                         (int)graph.n_cols(), (int)state.n_cols);
+                         (int)graph.n_cols(), (int)state.n_cols, (int)rows, (int)lp.n_rows());
         return false;
     }
-    if (matrix_fingerprint(lp) != fingerprint) {
-        if (std::getenv("SOR_DEBUG_CARRY")) std::fprintf(stderr, "carry: matrix differs\n");
+    const std::uint64_t f = row_prefix_fingerprint(lp, rows);
+    if ((f == 0 ? 1 : f) != fingerprint) {
+        if (debug) std::fprintf(stderr, "carry: probed rows differ\n");
         return false;
+    }
+    // A side no wider: the consumer's row admits only points the probed row
+    // admits. Compared exactly -- a side looser by any amount is another model.
+    for (Index i = 0; i < rows; ++i) {
+        if (lp.row_lo[sz(i)] < row_lo[sz(i)] || lp.row_hi[sz(i)] > row_hi[sz(i)]) {
+            if (debug) std::fprintf(stderr, "carry: row %d side wider\n", (int)i);
+            return false;
+        }
+    }
+    for (Index j = 0; j < lp.n_cols(); ++j) {
+        const bool is_int = sz(j) < lp.is_integer.size() && lp.is_integer[sz(j)];
+        if (integer[sz(j)] && !is_int) {
+            if (debug) std::fprintf(stderr, "carry: col %d no longer integer\n", (int)j);
+            return false;
+        }
     }
     // The facts hold on the box they were probed in; a consumer whose box is
     // wider anywhere is a different problem.
     constexpr f64 tol = 1e-9;
     for (Index j = 0; j < lp.n_cols(); ++j) {
         if (lp.col_lo[sz(j)] < lo[sz(j)] - tol || lp.col_hi[sz(j)] > hi[sz(j)] + tol) {
-            if (std::getenv("SOR_DEBUG_CARRY"))
+            if (debug)
                 std::fprintf(stderr, "carry: box wider at col %d [%g,%g] vs [%g,%g]\n", (int)j,
                              lp.col_lo[sz(j)], lp.col_hi[sz(j)], lo[sz(j)], hi[sz(j)]);
             return false;
@@ -468,7 +525,12 @@ void extract_row_cliques(const model::LpProblem& lp, Index row, f64 sign,
     const auto& av = lp.A.vals;
     const core::Offset beg = rp[sz(row)], end = rp[sz(row) + 1];
 
-    f64 minact = 0.0;
+    // The activity floor is summed exactly: a conflict is a proof, and a
+    // rounded floor can understate the slack. With M = 2^67, continuous
+    // p = q = r = 1 and binary x, y, the row M p - q - M r + x + y <= 1 has
+    // floor -1 and slack 2, so x = y = 1 is feasible; summed in f64 the
+    // floor is 0, the slack 1, and x + y <= 1 was derived.
+    model::DyadicSum minact;
     std::vector<std::pair<f64, Index>> deltas;  // (delta, literal)
     deltas.reserve(sz(end - beg));
     for (core::Offset k = beg; k < end; ++k) {
@@ -477,29 +539,45 @@ void extract_row_cliques(const model::LpProblem& lp, Index row, f64 sign,
         if (b == 0.0) continue;
         const f64 min_side = (b > 0.0) ? col_lo[sz(j)] : col_hi[sz(j)];
         if (!std::isfinite(min_side)) return;  // no finite floor, no conflicts
-        minact += b * min_side;
+        minact.add_product(b, min_side);
         if (!cg.is_binary(j)) continue;
         // col_lo = 0, col_hi = 1 for every binary, so the delta is |b|.
         const f64 d = std::fabs(b);
         if (d <= opts.tol) continue;
         deltas.emplace_back(d, b > 0.0 ? lit_of(j, 1) : lit_of(j, 0));
     }
-    if (deltas.size() < 2 || !std::isfinite(minact)) return;
+    if (deltas.size() < 2) return;
 
-    const f64 slack = rhs - minact;
-    // A row that is already violated at its own activity floor is infeasible;
-    // that is propagate_bounds()'s job to report, not this function's.
-    if (slack < 0.0) return;
+    // slack = rhs - floor, exactly. A row that is already violated at its own
+    // activity floor is infeasible; that is propagate_bounds()'s job to
+    // report, not this function's.
+    model::DyadicSum slack = minact;
+    slack.negate();
+    slack.add(rhs);
+    if (slack.sign() < 0) return;
+    // Two literals conflict when their deltas exceed slack + tol. T is that
+    // threshold rounded up (only ever fewer conflicts), and the pair test
+    // is exact: with round-to-nearest, fl(d1 + d2) > T implies d1 + d2 > T,
+    // and at fl(d1 + d2) == T the TwoSum residual decides. The predicate is
+    // monotone in each delta, which the sorted sweeps below rely on.
+    slack.add(opts.tol);
+    const f64 T = slack.up();
+    if (!std::isfinite(T)) return;
+    const auto conflict = [T](f64 d1, f64 d2) {
+        const f64 s = d1 + d2;
+        if (s != T) return s > T;
+        const f64 bv = s - d1, av_ = s - bv;
+        return (d1 - av_) + (d2 - bv) > 0.0;
+    };
 
     std::sort(deltas.begin(), deltas.end(),
               [](const auto& a, const auto& b) { return a.first > b.first; });
-    if (deltas[0].first + deltas[1].first <= slack + opts.tol) return;
+    if (!conflict(deltas[0].first, deltas[1].first)) return;
 
     // Largest k with d[k-2] + d[k-1] > slack (0-based): every pair inside the
     // prefix {0..k-1} then sums to at least that, so the prefix is a clique.
     std::size_t k = 2;
-    while (k < deltas.size() &&
-           deltas[k - 1].first + deltas[k].first > slack + opts.tol)
+    while (k < deltas.size() && conflict(deltas[k - 1].first, deltas[k].first))
         ++k;
 
     Clique base;
@@ -516,11 +594,11 @@ void extract_row_cliques(const model::LpProblem& lp, Index row, f64 sign,
     std::size_t emitted = 0;
     for (std::size_t q = k;
          q < deltas.size() && emitted < opts.max_clique_extensions_per_row; ++q) {
-        const f64 need = slack - deltas[q].first + opts.tol;
-        // count of i with deltas[i] > need, over a descending array
+        const f64 dq = deltas[q].first;
+        // count of i with deltas[i] conflicting with q, over a descending array
         const auto it = std::partition_point(
             deltas.begin(), deltas.begin() + static_cast<std::ptrdiff_t>(k),
-            [need](const auto& e) { return e.first > need; });
+            [&](const auto& e) { return conflict(e.first, dq); });
         const auto r = static_cast<std::size_t>(it - deltas.begin());
         if (r == 0) break;  // deltas descending: no later q can do better
         Clique ext;
@@ -573,14 +651,16 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
         return diag;
     }
 
-    if (!resume && opts.row_cliques && lp.nnz() <= opts.max_nnz) {
+    if (opts.row_cliques && lp.nnz() <= opts.max_nnz) {
         const auto& rp = lp.A.pattern.row_ptr();
-        for (Index i = 0; i < lp.n_rows(); ++i) {
+        const Index first = resume ? std::min(state->rows_covered, lp.n_rows()) : 0;
+        for (Index i = first; i < lp.n_rows(); ++i) {
             if (out.cliques().size() >= opts.max_cliques) break;
             if (sz(rp[sz(i) + 1] - rp[sz(i)]) > opts.max_row_len) continue;
             extract_row_cliques(lp, i, 1.0, col_lo, col_hi, opts, out, diag);
             extract_row_cliques(lp, i, -1.0, col_lo, col_hi, opts, out, diag);
         }
+        if (state != nullptr) state->rows_covered = lp.n_rows();
     }
 
     if (opts.enabled && lp.nnz() <= opts.max_nnz) {
@@ -631,20 +711,82 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
             }
         }
         const bool have_int = !lp.is_integer.empty();
+        // Row sides that cannot bind inside the current side's box. A lock
+        // is the statement "moving the column this way may violate that row
+        // side"; when the side's box keeps the row side satisfied whatever
+        // the column does within its range there, that lock is void inside
+        // the side -- the opportunity probing creates over the global locks
+        // (Wang, Chen and Dai). The verdicts come from the side's own
+        // propagation (PropagationScratch::redundant), stamped per side.
+        std::vector<std::uint32_t> red_stamp(opts.dual_fix_in_probing ? sz(m) : 0, 0);
+        std::vector<signed char> red_lo(red_stamp.size(), 0), red_hi(red_stamp.size(), 0);
+        std::uint32_t side_id = 0;
+        // Rows holding a column the current side moved: only their activity
+        // range differs from the global one, so only they can have become
+        // redundant. Every other row keeps its lock (exactly as globally).
+        std::vector<std::uint32_t> touched(red_stamp.size(), 0);
+        std::vector<Index> touched_rows_list;
+        // a_ik aligned with index.rows (column-wise), built once: a scan of
+        // the row for each coefficient was quadratic in the row length.
+        std::vector<f64> index_vals;
+        if (opts.dual_fix_in_probing) {
+            index_vals.assign(index.rows.size(), 0.0);
+            std::vector<core::Offset> fill(index.ptr.begin(), index.ptr.end() - 1);
+            const auto& rp = lp.A.pattern.row_ptr();
+            const auto& ci = lp.A.pattern.col_idx();
+            for (Index i = 0; i < m; ++i)
+                for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+                    const Index j = ci[sz(k)];
+                    const core::Offset at = fill[sz(j)]++;
+                    if (at < index.ptr[sz(j) + 1] && index.rows[sz(at)] == i)
+                        index_vals[sz(at)] = lp.A.vals[sz(k)];
+                }
+        }
+        // Locks of column k that still bind inside the current side.
+        const auto side_locks = [&](Index k, int& dl, int& ul) {
+            dl = down_locks[sz(k)];
+            ul = up_locks[sz(k)];
+            if (dl == 0 && ul == 0) return;
+            for (core::Offset t = index.ptr[sz(k)]; t < index.ptr[sz(k) + 1]; ++t) {
+                const Index i = index.rows[sz(t)];
+                // Only rows the side's propagation found redundant (it
+                // processed every row of a column it moved; a row it did not
+                // reach keeps its lock).
+                if (touched[sz(i)] != side_id || red_stamp[sz(i)] != side_id) continue;
+                const f64 a = index_vals[sz(t)];
+                if (a == 0.0) continue;
+                const bool lo_red = red_lo[sz(i)] != 0, hi_red = red_hi[sz(i)] != 0;
+                // a > 0: the upper side locks up, the lower side locks down.
+                if (a > 0.0) {
+                    if (hi_red && std::isfinite(lp.row_hi[sz(i)])) --ul;
+                    if (lo_red && std::isfinite(lp.row_lo[sz(i)])) --dl;
+                } else {
+                    if (lo_red && std::isfinite(lp.row_lo[sz(i)])) --ul;
+                    if (hi_red && std::isfinite(lp.row_hi[sz(i)])) --dl;
+                }
+            }
+        };
         // Applies apply_dual_fixing's rule (zero cost allowed) to column k of
         // (lo, hi), logging changes on `log` when given. False: box emptied.
+        // `in_side`: count only the locks that still bind in the side's box.
         const auto dual_fix_col = [&](Index k, std::vector<f64>& lo,
                                       std::vector<f64>& hi, PropTrail* log,
-                                      bool& changed) -> bool {
+                                      bool& changed, bool in_side = false) -> bool {
             changed = false;
             const f64 l = lo[sz(k)], h = hi[sz(k)];
             if (std::isfinite(l) && std::isfinite(h) && h - l <= opts.tol) return true;
             if (!std::isfinite(l) && !std::isfinite(h)) return true;
             const f64 c = lp.maximize ? -lp.c[sz(k)] : lp.c[sz(k)];
+            int dl = down_locks[sz(k)], ul = up_locks[sz(k)];
+            if (in_side) {
+                // Recount only when a few void locks could decide it.
+                const int need = c > 0.0 ? dl : c < 0.0 ? ul : std::min(dl, ul);
+                if (need > 0 && need <= 4) side_locks(k, dl, ul);
+            }
             f64 nl = l, nh = h;
-            if (down_locks[sz(k)] == 0 && c >= 0.0 && std::isfinite(l)) {
+            if (dl == 0 && c >= 0.0 && std::isfinite(l)) {
                 if (h > l + opts.tol) nh = l;
-            } else if (up_locks[sz(k)] == 0 && c <= 0.0 && std::isfinite(h)) {
+            } else if (ul == 0 && c <= 0.0 && std::isfinite(h)) {
                 if (l < h - opts.tol) nl = h;
             }
             if (have_int && lp.is_integer[sz(k)]) {
@@ -665,7 +807,15 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
         };
         std::vector<Index> dirty;
         std::vector<char> is_dirty(sz(n), 0);
+        // Row activities of the global box (propagate.hpp), so a probe visits a
+        // row in O(1) unless the row can move something. Every write to the
+        // global box goes through mark_dirty, which also queues the column
+        // for the cache; each side keeps the cache at its own box and puts it
+        // back when it is undone.
+        RowActivityCache act;
+        std::vector<Index> act_pending;
         const auto mark_dirty = [&](Index k) {
+            act_pending.push_back(k);
             if (opts.dual_fix_in_probing && !is_dirty[sz(k)]) {
                 is_dirty[sz(k)] = 1;
                 dirty.push_back(k);
@@ -699,20 +849,30 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
             for (const auto& e : trail.entries()) mark_dirty(e.var);
             trail.clear();
         }
+        act.build(lp, col_lo, col_hi);
+        act_pending.clear();
         std::vector<Index> seeds(1);
 
         // x_j = v on the global box. Fills `rec`; undoes unless `keep`.
         const auto run_side = [&](Index j, f64 v, std::vector<SideCol>& rec,
                                   bool keep) -> bool {
+            if (!act_pending.empty()) {
+                act.sync_cols(col_lo, col_hi, act_pending);
+                act_pending.clear();
+            }
             const std::size_t mark = trail.size();
             trail.push(j, BoundDir::Lower, v, col_lo[sz(j)], ReasonKind::Branch, -1, 1);
             trail.push(j, BoundDir::Upper, v, col_hi[sz(j)], ReasonKind::Branch, -1, 1);
             col_lo[sz(j)] = v;
             col_hi[sz(j)] = v;
+            act.set_bounds(j, v, v);
             seeds[0] = j;
-            const auto pr = propagate_bounds_events(lp, index, col_lo, col_hi, seeds,
-                                                    scratch, &trail, 1, opts.tol,
-                                                    visit_cap);
+            scratch.record_redundancy = opts.dual_fix_in_probing;
+            scratch.redundant.clear();
+            const auto pr = propagate_bounds_cached(lp, act, col_lo, col_hi, &seeds, nullptr,
+                                                    scratch, &trail, 1, opts.tol, visit_cap,
+                                                    /*sync_box=*/false);
+            scratch.record_redundancy = false;
             bool feasible = pr.feasible;
             rec.clear();
             if (feasible) {
@@ -726,18 +886,83 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
                                    col_lo[sz(k)], col_hi[sz(k)]});
                 }
                 if (opts.dual_fix_in_probing) {
+                    ++side_id;
+                    for (const auto& r : rec)
+                        for (core::Offset t = index.ptr[sz(r.col)]; t < index.ptr[sz(r.col) + 1]; ++t)
+                            touched[sz(index.rows[sz(t)])] = side_id;
+                    // The side's propagation already decided which rows it
+                    // made redundant (on the activity ranges it computed):
+                    // take its verdicts; rows it did not reach fall back to
+                    // row_redundancy.
+                    touched_rows_list.clear();
+                    for (const auto& [i, f] : scratch.redundant) {
+                        if (red_stamp[sz(i)] != side_id) {
+                            red_stamp[sz(i)] = side_id;
+                            red_lo[sz(i)] = 0;
+                            red_hi[sz(i)] = 0;
+                            touched_rows_list.push_back(i);
+                        }
+                        red_lo[sz(i)] = static_cast<signed char>(red_lo[sz(i)] | (f & 1));
+                        red_hi[sz(i)] = static_cast<signed char>(red_hi[sz(i)] | ((f >> 1) & 1));
+                    }
                     for (auto& r : rec) {
                         bool changed = false;
-                        if (!dual_fix_col(r.col, col_lo, col_hi, &trail, changed)) {
+                        if (!dual_fix_col(r.col, col_lo, col_hi, &trail, changed,
+                                          /*in_side=*/true)) {
                             feasible = false;
                             break;
                         }
                         r.lo = col_lo[sz(r.col)];
                         r.hi = col_hi[sz(r.col)];
                     }
+                    // A column the side did not move can still lose its locks
+                    // in the side: the rows the side's changes touched may now
+                    // be redundant. Their other columns are candidates too;
+                    // one that is fixed enters the record with its unchanged
+                    // box as the feasibility pin (so implications, which read
+                    // pins only, are unaffected).
+                    const auto& rp = lp.A.pattern.row_ptr();
+                    const auto& ci = lp.A.pattern.col_idx();
+                    {
+                        for (std::size_t tq = 0; feasible && tq < touched_rows_list.size(); ++tq) {
+                            const Index i = touched_rows_list[tq];
+                            core::work_add(static_cast<std::uint64_t>(rp[sz(i) + 1] - rp[sz(i)]),
+                                           ::sor::core::WorkTag::ProbeEdge);
+                            for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+                                const Index cand = ci[sz(k)];
+                                if (stamp[sz(cand)] == stamp_id) continue;
+                                stamp[sz(cand)] = stamp_id;
+                                // Only a column a few void locks away from a
+                                // dual fixing in its cost's direction.
+                                const f64 cc = lp.maximize ? -lp.c[sz(cand)] : lp.c[sz(cand)];
+                                const int need = cc > 0.0 ? down_locks[sz(cand)]
+                                               : cc < 0.0 ? up_locks[sz(cand)]
+                                               : std::min(down_locks[sz(cand)], up_locks[sz(cand)]);
+                                if (need == 0 || need > 4) continue;
+                                if (!(col_hi[sz(cand)] > col_lo[sz(cand)])) continue;
+                                int touched_rows = 0;
+                                for (core::Offset u = index.ptr[sz(cand)];
+                                     u < index.ptr[sz(cand) + 1] && touched_rows < need; ++u)
+                                    touched_rows += touched[sz(index.rows[sz(u)])] == side_id;
+                                if (touched_rows < need) continue;
+                                const f64 pl = col_lo[sz(cand)], ph = col_hi[sz(cand)];
+                                bool changed = false;
+                                if (!dual_fix_col(cand, col_lo, col_hi, &trail, changed,
+                                                  /*in_side=*/true)) {
+                                    feasible = false;
+                                    break;
+                                }
+                                if (changed)
+                                    rec.push_back({cand, pl, ph, col_lo[sz(cand)], col_hi[sz(cand)]});
+                            }
+                        }
+                    }
                 }
             }
             if (keep && feasible) {
+                // The side's dual fixings moved columns the cache has not seen.
+                for (const auto& e : trail.since(mark))
+                    act.set_bounds(e.var, col_lo[sz(e.var)], col_hi[sz(e.var)]);
                 trail.truncate(mark);
                 for (const auto& r : rec) mark_dirty(r.col);
                 return true;
@@ -747,6 +972,8 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
                 const auto& e = es[t];
                 (e.dir == BoundDir::Lower ? col_lo : col_hi)[sz(e.var)] = e.old_bound;
             }
+            for (std::size_t t = mark; t < es.size(); ++t)
+                act.set_bounds(es[t].var, col_lo[sz(es[t].var)], col_hi[sz(es[t].var)]);
             trail.truncate(mark);
             return feasible;
         };
@@ -926,7 +1153,10 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
                         out.sort_adjacency();
                         return diag;
                     }
-                    if (changed) ++diag.probe_tightenings;
+                    if (changed) {
+                        ++diag.probe_tightenings;
+                        act_pending.push_back(k);
+                    }
                 }
                 dirty.clear();
             }
@@ -970,6 +1200,10 @@ CutRow clique_to_row(const std::vector<Index>& lits, std::size_t index) {
     cut.row_lo = -kInf;
     cut.row_hi = 1.0 - static_cast<f64>(zeros);
     cut.name = "CLQ_" + std::to_string(index);
+    cut.exact = true;   // a clique of the conflict graph, unit coefficients
+    // Graph facts hold at every integer point of the root box they were
+    // probed in, so the row is valid wherever the search goes.
+    cut.used_local_bound = false;
     return cut;
 }
 
@@ -1092,16 +1326,30 @@ std::vector<CutRow> separate_implied_bound_cuts(const ConflictGraph& cg,
         if (static_cast<int>(cuts.size()) >= cap) break;
         (void)viol;
         const auto& ib = ibs[i];
+        // The slope s = fl(b1 - b0) is rounded, so  t - s b <= b0  need not
+        // hold at the endpoint b = 1 (b0 = -2^54, b1 = 1: s = 2^54 and the row
+        // excludes t = 1 by 1). The side is certified at the two endpoints
+        // instead -- b = 0 needs beta >= b0, b = 1 needs beta >= b1 - s,
+        // computed exactly and rounded outward -- which, b being binary,
+        // proves the row for every t the implications allow. The row is then
+        // exact and needs no generic margin downstream.
+        const f64 s = ib.b1 - ib.b0;
+        if (!std::isfinite(s)) continue;
+        model::DyadicSum at_one;
+        at_one.add(ib.b1);
+        at_one.add(-s);
         CutRow cut;
         cut.cols = {ib.col, ib.bin};
-        cut.vals = {1.0, -(ib.b1 - ib.b0)};
+        cut.vals = {1.0, -s};
         if (ib.upper) {
             cut.row_lo = -kInf;
-            cut.row_hi = ib.b0;
+            cut.row_hi = std::max(ib.b0, at_one.up());
         } else {
-            cut.row_lo = ib.b0;
+            cut.row_lo = std::min(ib.b0, at_one.down());
             cut.row_hi = kInf;
         }
+        cut.exact = true;
+        cut.used_local_bound = false;   // probing facts of the root box
         cut.name = "VUB_" + std::to_string(cuts.size());
         cuts.push_back(std::move(cut));
     }
@@ -1114,22 +1362,38 @@ bool propagate_conflicts(const ConflictGraph& cg,
                          std::vector<f64>& col_lo,
                          std::vector<f64>& col_hi,
                          std::uint64_t& tightened,
-                         int max_rounds) {
+                         int max_rounds, PropTrail* trail, int depth,
+                         Index* conflict_var) {
     const Index n = cg.n_cols();
     if (n <= 0 || static_cast<Index>(col_lo.size()) != n ||
         static_cast<Index>(col_hi.size()) != n)
         return true;
     if (cg.empty()) return true;
 
-    // Forcing literal (k,w) false pins x_k to 1-w.
+    // Forcing literal (k,w) false pins x_k to 1-w; `why` is the true literal.
+    // Only the side that falsifies the literal is the deduction (x_k <= 0
+    // for (k,1), x_k >= 1 for (k,0)); it is what the trail records.
+    Index why = -1;
     auto force_false = [&](Index l) -> bool {
         const Index k = lit_var(l);
         const f64 v = lit_val(l) == 1 ? 0.0 : 1.0;
         bool changed = false;
-        if (col_lo[sz(k)] < v - 0.5) { col_lo[sz(k)] = v; changed = true; }
-        if (col_hi[sz(k)] > v + 0.5) { col_hi[sz(k)] = v; changed = true; }
+        if (lit_val(l) == 0 && col_lo[sz(k)] < v - 0.5) {
+            if (trail) trail->push(k, BoundDir::Lower, v, col_lo[sz(k)], ReasonKind::Implication, why, depth);
+            col_lo[sz(k)] = v;
+            changed = true;
+        }
+        if (lit_val(l) == 1 && col_hi[sz(k)] > v + 0.5) {
+            if (trail) trail->push(k, BoundDir::Upper, v, col_hi[sz(k)], ReasonKind::Implication, why, depth);
+            col_hi[sz(k)] = v;
+            changed = true;
+        }
         if (changed) ++tightened;
-        return col_lo[sz(k)] <= col_hi[sz(k)] + 0.5;
+        if (col_lo[sz(k)] > col_hi[sz(k)] + 0.5) {
+            if (conflict_var) *conflict_var = k;
+            return false;
+        }
+        return true;
     };
 
     for (int round = 0; round < max_rounds; ++round) {
@@ -1138,6 +1402,7 @@ bool propagate_conflicts(const ConflictGraph& cg,
             if (col_hi[sz(j)] - col_lo[sz(j)] > 0.5) continue;  // not fixed
             const int v = col_lo[sz(j)] > 0.5 ? 1 : 0;
             const Index tru = lit_of(j, v);
+            why = tru;
             // Everything this literal conflicts with is now false.
             for (const Index nb : cg.neighbors(tru))
                 if (!force_false(nb)) return false;
@@ -1149,6 +1414,261 @@ bool propagate_conflicts(const ConflictGraph& cg,
         if (tightened == before) break;
     }
     return true;
+}
+
+bool propagate_conflicts_from(const ConflictGraph& cg, std::vector<f64>& col_lo,
+                              std::vector<f64>& col_hi, const std::vector<Index>& seeds,
+                              std::uint64_t& tightened, PropTrail* trail, int depth,
+                              Index* conflict_var, std::vector<Index>* changed) {
+    const Index n = cg.n_cols();
+    if (n <= 0 || static_cast<Index>(col_lo.size()) != n ||
+        static_cast<Index>(col_hi.size()) != n || cg.empty())
+        return true;
+    std::vector<Index> queue;
+    for (const Index j : seeds)
+        if (j >= 0 && j < n && cg.is_binary(j) && col_hi[sz(j)] - col_lo[sz(j)] <= 0.5)
+            queue.push_back(j);
+    // Forcing literal l false pins its column; `why` is the true literal.
+    const auto force_false = [&](Index l, Index why) -> bool {
+        const Index k = lit_var(l);
+        const f64 v = lit_val(l) == 1 ? 0.0 : 1.0;
+        bool moved = false;
+        if (lit_val(l) == 0 && col_lo[sz(k)] < v - 0.5) {
+            if (trail) trail->push(k, BoundDir::Lower, v, col_lo[sz(k)], ReasonKind::Implication, why, depth);
+            col_lo[sz(k)] = v;
+            moved = true;
+        }
+        if (lit_val(l) == 1 && col_hi[sz(k)] > v + 0.5) {
+            if (trail) trail->push(k, BoundDir::Upper, v, col_hi[sz(k)], ReasonKind::Implication, why, depth);
+            col_hi[sz(k)] = v;
+            moved = true;
+        }
+        if (col_lo[sz(k)] > col_hi[sz(k)] + 0.5) {
+            if (conflict_var) *conflict_var = k;
+            return false;
+        }
+        if (moved) {
+            ++tightened;
+            if (changed) changed->push_back(k);
+            queue.push_back(k);   // newly fixed: its literal is true now
+        }
+        return true;
+    };
+    for (std::size_t h = 0; h < queue.size(); ++h) {
+        const Index j = queue[h];
+        const Index tru = lit_of(j, col_lo[sz(j)] > 0.5 ? 1 : 0);
+        for (const Index nb : cg.neighbors(tru))
+            if (!force_false(nb, tru)) return false;
+        for (const Index cid : cg.cliques_of(tru))
+            for (const Index l : cg.cliques()[sz(cid)].lits)
+                if (l != tru && !force_false(l, tru)) return false;
+    }
+    return true;
+}
+
+std::vector<CutRow> separate_odd_cycle_cuts(const ConflictGraph& cg,
+                                            const std::vector<f64>& x,
+                                            int max_cuts, int max_starts,
+                                            f64 violation_min) {
+    core::WorkScope work_scope_(core::WorkCat::Separation);
+    std::vector<CutRow> cuts;
+    const Index n = cg.n_cols();
+    if (n <= 0 || static_cast<Index>(x.size()) != n || max_cuts <= 0 || max_starts <= 0)
+        return cuts;
+    constexpr f64 kFrac = 1e-6;
+    // Support: literals strictly between 0 and 1.
+    std::vector<Index> node_of(sz(2 * n), -1);
+    std::vector<Index> lits;
+    for (const Index j : cg.binaries()) {
+        const f64 v = x[sz(j)];
+        if (!(v > kFrac && v < 1.0 - kFrac)) continue;
+        for (int b = 0; b < 2; ++b) {
+            const Index l = lit_of(j, b);
+            node_of[sz(l)] = static_cast<Index>(lits.size());
+            lits.push_back(l);
+        }
+    }
+    const Index N = static_cast<Index>(lits.size());
+    if (N < 5) return cuts;
+    // Adjacency among support literals: explicit conflicts and clique pairs.
+    std::vector<std::vector<std::pair<Index, f64>>> adj(sz(N));
+    std::uint64_t work = 0;
+    const auto weight = [&](Index a, Index b) {
+        return std::max(0.0, 1.0 - lit_value(lits[sz(a)], x) - lit_value(lits[sz(b)], x));
+    };
+    for (Index a = 0; a < N; ++a) {
+        const Index l = lits[sz(a)];
+        for (const Index m : cg.neighbors(l)) {
+            const Index b = node_of[sz(m)];
+            if (b >= 0 && b != a) adj[sz(a)].emplace_back(b, weight(a, b));
+        }
+        for (const Index c : cg.cliques_of(l)) {
+            const auto& cl = cg.cliques()[sz(c)].lits;
+            if (cl.size() > 256) continue;   // a long clique is the clique separator's
+            for (const Index m : cl) {
+                const Index b = node_of[sz(m)];
+                if (b >= 0 && b != a) adj[sz(a)].emplace_back(b, weight(a, b));
+            }
+            work += cl.size();
+        }
+        auto& e = adj[sz(a)];
+        std::sort(e.begin(), e.end());
+        e.erase(std::unique(e.begin(), e.end(),
+                            [](const auto& p, const auto& q) { return p.first == q.first; }),
+                e.end());
+        work += e.size();
+    }
+    // Starts: the most fractional literals (value nearest 1/2).
+    std::vector<Index> order(sz(N));
+    for (Index a = 0; a < N; ++a) order[sz(a)] = a;
+    std::sort(order.begin(), order.end(), [&](Index a, Index b) {
+        const f64 fa = std::fabs(lit_value(lits[sz(a)], x) - 0.5);
+        const f64 fb = std::fabs(lit_value(lits[sz(b)], x) - 0.5);
+        return fa != fb ? fa < fb : a < b;
+    });
+    const f64 bound = 1.0 - violation_min;
+    std::vector<f64> dist(sz(2 * N));
+    std::vector<Index> pred(sz(2 * N));
+    std::vector<std::vector<Index>> emitted;
+    using QE = std::pair<f64, Index>;
+    for (int s = 0; s < std::min<Index>(N, max_starts) && static_cast<int>(cuts.size()) < max_cuts; ++s) {
+        const Index src = order[sz(s)];
+        std::fill(dist.begin(), dist.end(), std::numeric_limits<f64>::infinity());
+        std::fill(pred.begin(), pred.end(), -1);
+        // Double-cover node 2a + p: literal a reached by a walk of parity p.
+        std::priority_queue<QE, std::vector<QE>, std::greater<QE>> pq;
+        dist[sz(2 * src)] = 0.0;
+        pq.emplace(0.0, 2 * src);
+        const Index target = 2 * src + 1;
+        while (!pq.empty()) {
+            const auto [d, u] = pq.top();
+            pq.pop();
+            if (d > dist[sz(u)]) continue;
+            if (u == target || d >= bound) break;
+            const Index a = u / 2, p = u % 2;
+            for (const auto& [b, w] : adj[sz(a)]) {
+                const Index v = 2 * b + (1 - p);
+                const f64 nd = d + w;
+                ++work;
+                if (nd < dist[sz(v)] && nd < bound) {
+                    dist[sz(v)] = nd;
+                    pred[sz(v)] = u;
+                    pq.emplace(nd, v);
+                }
+            }
+        }
+        if (!(dist[sz(target)] < bound)) continue;
+        // The odd closed walk src -> ... -> src.
+        std::vector<Index> walk;
+        for (Index u = target; u >= 0; u = pred[sz(u)]) walk.push_back(u / 2);
+        // walk = [src, ..., src] (k+1 entries, k odd). Remove repeated
+        // sub-walks: an even one is dropped, an odd one is the cycle.
+        std::vector<Index> cycle;
+        {
+            std::vector<Index> w(walk.begin(), walk.end() - 1);   // closed: drop the repeat
+            bool done = false;
+            while (!done) {
+                done = true;
+                std::vector<Index> first_at(sz(N), -1);
+                for (std::size_t i = 0; i < w.size(); ++i) {
+                    const Index a = w[i];
+                    if (first_at[sz(a)] < 0) { first_at[sz(a)] = static_cast<Index>(i); continue; }
+                    const std::size_t i0 = static_cast<std::size_t>(first_at[sz(a)]);
+                    const std::size_t len = i - i0;   // edges of the sub-walk w[i0..i]
+                    std::vector<Index> nw;
+                    if (len % 2 == 1) {
+                        nw.assign(w.begin() + static_cast<std::ptrdiff_t>(i0),
+                                  w.begin() + static_cast<std::ptrdiff_t>(i));
+                    } else {
+                        nw.assign(w.begin(), w.begin() + static_cast<std::ptrdiff_t>(i0));
+                        nw.insert(nw.end(), w.begin() + static_cast<std::ptrdiff_t>(i), w.end());
+                    }
+                    w = std::move(nw);
+                    done = false;
+                    break;
+                }
+            }
+            cycle = std::move(w);
+        }
+        // A chord splits an odd cycle into an odd and an even one; the odd
+        // part is a shorter cycle whose inequality, with the chord's edge,
+        // dominates this one (a triangle is a clique). Reduce to a chordless
+        // cycle -- an odd hole -- before emitting: a cycle inside one
+        // set-partitioning row gave sum <= 2 beside the row's own <= 1.
+        // The whole conflict relation, not the search graph: long cliques
+        // are left out of the search but still make chords (air05's cycles
+        // lay inside one long set-partitioning row).
+        const auto adjacent = [&](Index a, Index b) {
+            for (const auto& [c, w] : adj[sz(a)]) if (c == b) return true;
+            const Index la = lits[sz(a)], lb = lits[sz(b)];
+            if (cg.conflicts(la, lb)) return true;
+            for (const Index ca : cg.cliques_of(la))
+                for (const Index cb : cg.cliques_of(lb))
+                    if (ca == cb) return true;
+            return false;
+        };
+        for (bool reduced = true; reduced && cycle.size() >= 5;) {
+            reduced = false;
+            const std::size_t k = cycle.size();
+            for (std::size_t i = 0; i < k && !reduced; ++i)
+                for (std::size_t j = i + 2; j < k && !reduced; ++j) {
+                    if (i == 0 && j == k - 1) continue;   // consecutive around the cycle
+                    if (!adjacent(cycle[i], cycle[j])) continue;
+                    // Arcs i..j and j..i(wrap): keep the odd one (its length
+                    // counts the chord as an edge).
+                    std::vector<Index> part;
+                    if ((j - i + 1) % 2 == 1) {
+                        part.assign(cycle.begin() + static_cast<std::ptrdiff_t>(i),
+                                    cycle.begin() + static_cast<std::ptrdiff_t>(j) + 1);
+                    } else {
+                        part.assign(cycle.begin() + static_cast<std::ptrdiff_t>(j), cycle.end());
+                        part.insert(part.end(), cycle.begin(),
+                                    cycle.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+                    }
+                    cycle = std::move(part);
+                    reduced = true;
+                }
+        }
+        if (cycle.size() < 5 || cycle.size() % 2 == 0) continue;
+        // Its weight (re-measured on the simple cycle) and the row.
+        f64 cw = 0.0;
+        bool ok = true;
+        for (std::size_t i = 0; i < cycle.size() && ok; ++i) {
+            const Index a = cycle[i], b = cycle[(i + 1) % cycle.size()];
+            bool edge = false;
+            for (const auto& [c, w] : adj[sz(a)]) if (c == b) { edge = true; cw += w; break; }
+            ok = edge;
+        }
+        if (!ok || !(cw < bound)) continue;
+        std::vector<Index> key;
+        for (const Index a : cycle) key.push_back(lits[sz(a)]);
+        std::sort(key.begin(), key.end());
+        if (std::find(emitted.begin(), emitted.end(), key) != emitted.end()) continue;
+        emitted.push_back(key);
+        CutRow cut;
+        f64 rhs = static_cast<f64>((cycle.size() - 1) / 2);
+        std::vector<std::pair<Index, f64>> terms;
+        for (const Index l : key) {
+            if (lit_val(l) == 1) terms.emplace_back(lit_var(l), 1.0);
+            else { terms.emplace_back(lit_var(l), -1.0); rhs -= 1.0; }
+        }
+        std::sort(terms.begin(), terms.end());
+        for (std::size_t q = 0; q < terms.size();) {
+            const Index j = terms[q].first;
+            f64 c = 0.0;
+            while (q < terms.size() && terms[q].first == j) c += terms[q++].second;
+            if (c != 0.0) { cut.cols.push_back(j); cut.vals.push_back(c); }
+        }
+        if (cut.cols.empty()) continue;
+        cut.row_lo = -kInf;
+        cut.row_hi = rhs;
+        cut.name = "OCY_" + std::to_string(cuts.size());
+        cut.exact = true;   // pairwise conflicts of the graph, unit data
+        cut.used_local_bound = false;   // graph facts: valid in the whole root box
+        cuts.push_back(std::move(cut));
+    }
+    core::work_add(work, core::WorkTag::ProbeEdge);
+    return cuts;
 }
 
 }  // namespace sor::search

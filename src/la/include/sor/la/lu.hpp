@@ -108,6 +108,10 @@ struct LuStats {
     f64    largest_multiplier = 0.0;
     f64    condition_estimate = 1.0;
     f64    effective_threshold = 0.0;
+    // Deterministic cost of producing this factor (the work units
+    // factorize() charges): what one refactorization costs, for the economy
+    // of carrying an updated factor instead (eta_work_since_factor()).
+    Offset factor_work     = 0;
 };
 
 // The exact Forrest-Tomlin spike, R_k...R_1 L^-1 a_q, in POSITION coordinates.
@@ -206,6 +210,9 @@ struct SolveScratch {
     std::uint64_t hypersparse_solves_ = 0;
     // Solve work since the factorization (see work_since_factor()).
     Offset work_since_factor_ = 0;
+    // The part of it the update file added: every solve crosses all of
+    // eta_nnz() on top of what the fresh L/U would cost.
+    Offset eta_work_since_factor_ = 0;
     std::uint64_t factor_gen = 0;
 };
 
@@ -463,6 +470,11 @@ public:
     // individually fired yet -- this is the trigger that actually tracks
     // solve COST, where the other two track proxies for it.
     Offset work_since_factor() const noexcept { return scratch_.work_since_factor_; }
+    // Solve work the update file alone has added since the factorization
+    // (sum of eta_nnz() over the solves): once it exceeds stats().factor_work
+    // a refactorization has paid for itself (ski rental -- refactoring then
+    // keeps total cost within twice that of the best schedule in hindsight).
+    Offset eta_work_since_factor() const noexcept { return scratch_.eta_work_since_factor_; }
     bool  is_valid()   const noexcept { return valid_; }
     const LuStats& stats() const noexcept { return stats_; }
 

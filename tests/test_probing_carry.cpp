@@ -7,7 +7,10 @@
 //   * remap: eliminate columns at values taken from a feasible point of the
 //     original model; every remapped edge / clique / implied bound must hold on
 //     ALL feasible points of the reduced model;
-//   * carry validity: a wider box or a different matrix is refused.
+//   * carry validity: a wider box or a different matrix is refused;
+//   * child extension: a model that keeps the probed rows (sides no wider)
+//     and adds its own over a narrower box adopts the carry; resumed without
+//     probing it scans only the added rows, and every fact holds on it.
 #include "sor/search/conflict.hpp"
 #include "sor/sparse/csr.hpp"
 
@@ -237,7 +240,7 @@ void test_carry_validity() {
     (void)sor::search::build_conflict_graph(lp, lo, hi, carry.graph, po, &carry.state);
     carry.lo = lo;
     carry.hi = hi;
-    carry.fingerprint = sor::search::matrix_fingerprint(lp);
+    carry.describe(lp);
     auto same = lp;
     same.col_lo = lo;
     same.col_hi = hi;
@@ -255,6 +258,97 @@ void test_carry_validity() {
     CHECK(!carry.usable_for(other));
     ProbingCarry empty;
     CHECK(!empty.usable_for(same));
+    // Sides: a tighter side is a restriction, a wider one is not.
+    if (same.n_rows() > 0) {
+        auto tighter = same;
+        tighter.row_hi[0] -= 1.0;
+        CHECK(carry.usable_for(tighter));
+        auto looser = same;
+        looser.row_hi[0] += 1.0;
+        CHECK(!carry.usable_for(looser));
+    }
+    // Integrality: more is a restriction, less is not.
+    auto relaxed = same;
+    relaxed.is_integer[0] = false;
+    CHECK(!carry.usable_for(relaxed));
+}
+
+// A row appended to `lp`: a random packing-style row over a few binaries.
+LpProblem with_extra_row(const LpProblem& lp, std::mt19937& rng) {
+    const Index n = lp.n_cols(), m = lp.n_rows();
+    std::vector<Index> r, c;
+    std::vector<f64> v;
+    const auto& rp = lp.A.pattern.row_ptr();
+    const auto& ci = lp.A.pattern.col_idx();
+    for (Index i = 0; i < m; ++i)
+        for (auto k = rp[static_cast<std::size_t>(i)]; k < rp[static_cast<std::size_t>(i) + 1]; ++k) {
+            r.push_back(i); c.push_back(ci[static_cast<std::size_t>(k)]); v.push_back(lp.A.vals[static_cast<std::size_t>(k)]);
+        }
+    f64 pos = 0.0;
+    for (Index j = 0; j < n; ++j) {
+        if (rng() % 2 != 0) continue;
+        const f64 a = 1.0 + static_cast<f64>(rng() % 3);
+        r.push_back(m); c.push_back(j); v.push_back(a);
+        pos += a;
+    }
+    LpProblem out = lp;
+    out.A = from_triplets(m + 1, n, r, c, v);
+    out.row_lo.push_back(-kInf);
+    out.row_hi.push_back(std::floor(pos * 0.4));
+    return out;
+}
+
+void test_child_extends_carry() {
+    std::mt19937 rng(19);
+    int checked = 0, extra_cliques = 0;
+    for (int trial = 0; trial < 400; ++trial) {
+        const Index n = 6 + static_cast<Index>(rng() % 4);
+        const auto parent = random_binary_model(rng, n, 2 + static_cast<Index>(rng() % 3));
+        ProbingOptions po;
+        po.give_up_unproductive = false;
+        po.probe_time_limit_s = 0.0;
+        ProbingCarry carry;
+        auto lo = parent.col_lo, hi = parent.col_hi;
+        if (sor::search::build_conflict_graph(parent, lo, hi, carry.graph, po, &carry.state).infeasible)
+            continue;
+        carry.lo = lo;
+        carry.hi = hi;
+        carry.describe(parent);
+        CHECK(carry.state.rows_covered == parent.n_rows());
+
+        // The child: the parent's rows, one of its own, a narrower box.
+        auto child = with_extra_row(parent, rng);
+        child.col_lo = lo;
+        child.col_hi = hi;
+        for (Index j = 0; j < n; ++j)
+            if (child.col_lo[static_cast<std::size_t>(j)] < child.col_hi[static_cast<std::size_t>(j)] &&
+                rng() % 4 == 0)
+                child.col_hi[static_cast<std::size_t>(j)] = child.col_lo[static_cast<std::size_t>(j)];
+        CHECK(carry.usable_for(child));
+        // A child that changed a probed row is a different model.
+        auto changed = child;
+        if (parent.nnz() > 0) {   // vals[0] lies in a probed row
+            changed.A.vals[0] += 1.0;
+            CHECK(!carry.usable_for(changed));
+        }
+
+        ConflictGraph g = carry.graph;
+        ProbingState st = carry.state;
+        st.gave_up = true;   // a child does not continue the parent's probing
+        auto clo = child.col_lo, chi = child.col_hi;
+        const std::size_t before = g.cliques().size();
+        const auto d = sor::search::build_conflict_graph(child, clo, chi, g, po, &st);
+        CHECK(d.probes == 0);
+        CHECK(st.rows_covered == child.n_rows());
+        extra_cliques += static_cast<int>(g.cliques().size() - before);
+        const auto pts = feasible_points(child);
+        if (d.infeasible) { CHECK(pts.empty()); continue; }
+        CHECK(facts_valid(g, pts));
+        ++checked;
+    }
+    std::cout << "PROBING_CHILD checked=" << checked << " extra_cliques=" << extra_cliques << '\n';
+    CHECK(checked > 200);
+    CHECK(extra_cliques > 50);
 }
 
 }  // namespace
@@ -263,5 +357,6 @@ int main() {
     test_resume_covers_each_binary_once();
     test_remap_valid_on_reduced_model();
     test_carry_validity();
+    test_child_extends_carry();
     return sor::test::finish("test_probing_carry");
 }

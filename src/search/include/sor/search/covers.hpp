@@ -119,11 +119,16 @@ struct CoverDiagnostics {
 // Returns cuts in the same CutRow form the pool and apply_cuts() consume. Every
 // returned inequality is valid for every integer-feasible point of `lp`; it is
 // the caller's choice whether it is worth adding.
+//
+// With the root box given, each cut's used_local_bound reports whether its
+// knapsack rests on a bound of [col_lo, col_hi] the root box does not imply.
 std::vector<CutRow> separate_lifted_covers(const model::LpProblem& lp,
                                            const std::vector<f64>& x,
                                            const std::vector<f64>& col_lo,
                                            const std::vector<f64>& col_hi,
                                            const CoverOptions& opts,
-                                           CoverDiagnostics& diag);
+                                           CoverDiagnostics& diag,
+                                           const std::vector<f64>* root_lo = nullptr,
+                                           const std::vector<f64>* root_hi = nullptr);
 
 }  // namespace sor::search

@@ -480,15 +480,9 @@ PlanBbModel fit_planbb_paper(const std::vector<PlanBbDynSample>& samples,
             dy[1] = opts.dynamics_w * (tu - y_dyn[1]);
             const f64 pr = sigmoid(y_dyn[2]);
             dy[2] = opts.dynamics_w * (tp - pr) * pr * (1.0 - pr);
-            // Next latent consistency: pull toward scaled action features.
-            for (int i = 0; i < kPlanBbLatentDim; ++i) {
-                const f64 tgt =
-                    s.feats[static_cast<std::size_t>(i % kBranchFeatureDim)] *
-                    (1.0 - 0.5 * tp);
-                dy[static_cast<std::size_t>(3 + i)] =
-                    0.1 * opts.dynamics_w *
-                    (tgt - y_dyn[static_cast<std::size_t>(3 + i)]);
-            }
+            // The next-latent outputs get no gradient: a sample holds no
+            // child state, and pulling them toward a copy of the action's
+            // own features taught the planner an invented transition.
             m.dynamics.sgd_step(x_zf.data(), h, dy.data(), lr);
 
             // Policy: imitate normalized SB product
@@ -823,7 +817,11 @@ Index pick_planbb_mcts_paper(const PlanBbModel& model,
         for (f64& p : priors) p /= psum;
     }
 
-    const int depth_cap = std::max(1, opts.mcts_depth);
+    // Without a learned transition only the root's actions are planned: a
+    // predicted next latent is no state, so neither expansion from it nor its
+    // value means anything.
+    const bool deep = model_ok && model.transition_learned;
+    const int depth_cap = deep ? std::max(1, opts.mcts_depth) : 1;
     const int sims = std::max(1, opts.mcts_sims);
     const f64 c_puct = std::max(1e-6, opts.mcts_c_puct);
     const f64 eps = opts.eps;
@@ -942,7 +940,7 @@ Index pick_planbb_mcts_paper(const PlanBbModel& model,
                                 pruned || next_avail == 0);
                 // Immediate dual-progress reward proxy + value backup.
                 f64 leaf = sb_product_score(tr.down_gain, tr.up_gain, eps);
-                if (model_ok && !pruned)
+                if (deep && !pruned)
                     leaf = 0.5 * leaf + 0.5 * model.value_of(tr.next);
                 // Paper R=-1 per step; we maximize dual progress, so use
                 // progress - depth_penalty as the backed-up return.
@@ -968,7 +966,9 @@ Index pick_planbb_mcts_paper(const PlanBbModel& model,
         // Simulation from existing leaf: evaluate value head / heuristic.
         {
             const PaperMctsNode& leaf_n = pool[static_cast<std::size_t>(nid)];
-            f64 G = model_ok ? model.value_of(leaf_n.latent) : 0.0;
+            // The root's latent is an encoded state; a deeper one is a
+            // prediction, valued only with a learned transition.
+            f64 G = model_ok && (deep || nid == root_id) ? model.value_of(leaf_n.latent) : 0.0;
             G -= 0.05 * static_cast<f64>(depth_from_root);
             for (int pi = static_cast<int>(path.size()) - 1; pi >= 0; --pi) {
                 const int pn = path[static_cast<std::size_t>(pi)].first;

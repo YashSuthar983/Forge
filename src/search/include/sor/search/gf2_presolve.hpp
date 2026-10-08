@@ -26,6 +26,12 @@ struct Gf2PresolveOptions {
     Index max_equations = 1024;
     int max_rounds = 8;
     f64 tol = 1e-9;
+    // Columns integral at EVERY feasible point (the caller's integers). A
+    // parity deduction is a feasibility fact, so it may rest only on those:
+    // an implied-integer mark that only guarantees an integral optimum does
+    // not make x + y - 2k = 1 a parity relation at every point. Null: the
+    // model's is_integer.
+    const std::vector<char>* integer_mask = nullptr;
 };
 
 struct Gf2PresolveDiagnostics {

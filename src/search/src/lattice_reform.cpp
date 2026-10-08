@@ -1,7 +1,11 @@
 // SOR - lattice reformulation implementation (AHL / Aardal-Wolsey).
 #include "sor/search/lattice_reform.hpp"
 
+#include "sor/certify/finalize.hpp"
+#include "sor/model/dyadic.hpp"
 #include "sor/sparse/csr.hpp"
+
+#include <boost/multiprecision/cpp_int.hpp>
 
 #include <functional>
 #include <algorithm>
@@ -42,6 +46,49 @@ bool near_integer(f64 v, f64 tol = 1e-9) {
 
 i64 round_exact(f64 v) {
     return static_cast<i64>(std::llround(v));
+}
+
+// The reformulation is an equivalence only on the data actually stored, so
+// its integer premises are exact: an integer, not a value near one (a
+// coefficient 2 + 1e-12 is not 2), and small enough for the int64 lattice
+// arithmetic below.
+bool exact_int(f64 v) {
+    return std::isfinite(v) && std::fabs(v) <= 0x1p52 && v == std::trunc(v);
+}
+
+// Exact rank of an m x n integer matrix (row-major), by fraction-free
+// (Bareiss) elimination in arbitrary precision. The kernel extracted below
+// has dimension n - rank; assuming rank = m (duplicate rows x+y+z = 1 and
+// 2x+2y+2z = 2 have rank 1) asks for too few kernel vectors, and the map
+// then misses feasible points while claiming a bijection.
+int exact_rank(const std::vector<i64>& A_flat, int m, int n) {
+    using big = boost::multiprecision::cpp_int;
+    std::vector<std::vector<big>> M(static_cast<std::size_t>(m), std::vector<big>(static_cast<std::size_t>(n)));
+    for (int i = 0; i < m; ++i)
+        for (int j = 0; j < n; ++j)
+            M[static_cast<std::size_t>(i)][static_cast<std::size_t>(j)] =
+                A_flat[static_cast<std::size_t>(i * n + j)];
+    big prev = 1;
+    int rank = 0;
+    for (int col = 0; col < n && rank < m; ++col) {
+        int piv = -1;
+        for (int i = rank; i < m; ++i)
+            if (M[static_cast<std::size_t>(i)][static_cast<std::size_t>(col)] != 0) { piv = i; break; }
+        if (piv < 0) continue;
+        std::swap(M[static_cast<std::size_t>(piv)], M[static_cast<std::size_t>(rank)]);
+        const auto& pr = M[static_cast<std::size_t>(rank)];
+        for (int i = rank + 1; i < m; ++i) {
+            auto& r = M[static_cast<std::size_t>(i)];
+            for (int j = col + 1; j < n; ++j)
+                r[static_cast<std::size_t>(j)] =
+                    (pr[static_cast<std::size_t>(col)] * r[static_cast<std::size_t>(j)] -
+                     r[static_cast<std::size_t>(col)] * pr[static_cast<std::size_t>(j)]) / prev;
+            r[static_cast<std::size_t>(col)] = 0;
+        }
+        prev = pr[static_cast<std::size_t>(col)];
+        ++rank;
+    }
+    return rank;
 }
 
 // Dense integer matrix stored column-major: cols[j][i] = entry (i,j).
@@ -334,7 +381,7 @@ try_lattice_reform(const model::LpProblem& lp, const LatticeReformOptions& opts)
               lp.row_hi[static_cast<std::size_t>(i)])) {
             return std::nullopt;
         }
-        if (!near_integer(lp.row_lo[static_cast<std::size_t>(i)])) return std::nullopt;
+        if (!exact_int(lp.row_lo[static_cast<std::size_t>(i)])) return std::nullopt;
     }
 
     LatticeReformMap map;
@@ -346,7 +393,7 @@ try_lattice_reform(const model::LpProblem& lp, const LatticeReformOptions& opts)
         const f64 lo = lp.col_lo[static_cast<std::size_t>(j)];
         const f64 hi = lp.col_hi[static_cast<std::size_t>(j)];
         if (lo == hi) {
-            if (!near_integer(lo)) return std::nullopt;
+            if (!exact_int(lo)) return std::nullopt;
             is_fixed[static_cast<std::size_t>(j)] = true;
             fixed_val[static_cast<std::size_t>(j)] = lo;
             map.fixed_cols.push_back(j);
@@ -354,28 +401,26 @@ try_lattice_reform(const model::LpProblem& lp, const LatticeReformOptions& opts)
         }
     }
 
-    // RHS after eliminating fixed columns: b' = b - A_fixed x_fixed
-    std::vector<f64> b_work(static_cast<std::size_t>(m_all));
-    for (Index i = 0; i < m_all; ++i)
-        b_work[static_cast<std::size_t>(i)] = lp.row_lo[static_cast<std::size_t>(i)];
-
+    // RHS after eliminating fixed columns, b' = b - A_fixed x_fixed, in
+    // exact integer arithmetic (every term is an exact integer here).
     const auto& rp = lp.A.pattern.row_ptr();
     const auto& ci = lp.A.pattern.col_idx();
     const auto& av = lp.A.vals;
+    std::vector<i64> b_exact(static_cast<std::size_t>(m_all));
     for (Index i = 0; i < m_all; ++i) {
+        i128 acc = static_cast<i128>(round_exact(lp.row_lo[static_cast<std::size_t>(i)]));
         for (core::Offset p = rp[static_cast<std::size_t>(i)];
              p < rp[static_cast<std::size_t>(i) + 1]; ++p) {
             const Index j = ci[static_cast<std::size_t>(p)];
-            if (is_fixed[static_cast<std::size_t>(j)]) {
-                b_work[static_cast<std::size_t>(i)] -=
-                    av[static_cast<std::size_t>(p)] *
-                    fixed_val[static_cast<std::size_t>(j)];
-            }
+            if (!is_fixed[static_cast<std::size_t>(j)]) continue;
+            const f64 a = av[static_cast<std::size_t>(p)];
+            if (!exact_int(a)) return std::nullopt;
+            acc -= static_cast<i128>(round_exact(a)) *
+                   static_cast<i128>(round_exact(fixed_val[static_cast<std::size_t>(j)]));
         }
-    }
-    for (f64& v : b_work) {
-        if (!near_integer(v)) return std::nullopt;
-        v = std::round(v);
+        if (acc > (static_cast<i128>(1) << 52) || acc < -(static_cast<i128>(1) << 52))
+            return std::nullopt;
+        b_exact[static_cast<std::size_t>(i)] = static_cast<i64>(acc);
     }
 
     // Partition free columns.
@@ -427,8 +472,7 @@ try_lattice_reform(const model::LpProblem& lp, const LatticeReformOptions& opts)
     std::vector<i64> A_flat(static_cast<std::size_t>(m * n), 0);
     std::vector<i64> b_int(static_cast<std::size_t>(m));
     for (int i = 0; i < m; ++i)
-        b_int[static_cast<std::size_t>(i)] =
-            round_exact(b_work[static_cast<std::size_t>(i)]);
+        b_int[static_cast<std::size_t>(i)] = b_exact[static_cast<std::size_t>(i)];
 
     for (Index i = 0; i < m_all; ++i) {
         for (core::Offset p = rp[static_cast<std::size_t>(i)];
@@ -441,7 +485,7 @@ try_lattice_reform(const model::LpProblem& lp, const LatticeReformOptions& opts)
                 // value is 0; verify coeff is finite and we'll set x=0.
                 continue;
             }
-            if (!near_integer(av[static_cast<std::size_t>(p)])) return std::nullopt;
+            if (!exact_int(av[static_cast<std::size_t>(p)])) return std::nullopt;
             // Find local index.
             const auto it = std::find(free_int.begin(), free_int.end(), j);
             if (it == free_int.end()) return std::nullopt;
@@ -450,6 +494,9 @@ try_lattice_reform(const model::LpProblem& lp, const LatticeReformOptions& opts)
                 round_exact(av[static_cast<std::size_t>(p)]);
         }
     }
+
+    // Full row rank is the premise of the kernel extraction (Aardal-Wolsey).
+    if (exact_rank(A_flat, m, n) != m) return std::nullopt;
 
     map.free_int_cols = free_int;
     map.kernel_dim = n - m;
@@ -558,23 +605,20 @@ try_lattice_reform(const model::LpProblem& lp, const LatticeReformOptions& opts)
     tp.row_lo = std::move(row_lo);
     tp.row_hi = std::move(row_hi);
 
-    // Exact per-coordinate mu bounds: LP-project the polytope
-    // {row_lo <= Q*mu <= row_hi} onto each mu_t. Every INTEGER solution of
-    // the (equality-eliminated) restricted system satisfies these real-
-    // valued constraints, so the resulting box provably contains every
-    // integer point of the restricted system -- this is the exact
-    // projection, not a heuristic guess (replaces a fixed +-64 starter box,
-    // which on markshare's ~10^80-point box was nowhere near tight enough
-    // for B&B to find anything). Full-column-rank Q + the finite original
-    // bounds enforced above guarantee this polytope is bounded, so a
-    // generous finite dummy box for the projection LPs cannot silently
-    // truncate it; hitting the dummy is treated as that guarantee having
-    // failed somehow, and refuses the reform rather than risk a truncated
-    // box reaching B&B.
-    constexpr f64 kDummyBox = 1.0e7;
+    // Per-coordinate mu bounds: LP-project the polytope
+    // {row_lo <= Q*mu <= row_hi} onto each mu_t. Every integer solution of
+    // the restricted system satisfies these real constraints, so the box
+    // contains every integer point -- provided each projection is a proved
+    // result over the polytope itself. mu is therefore left unboxed: a
+    // temporary box [-1e7, 1e7] turned "empty inside this box" into an
+    // Infeasible marker for the original (x + y = 0, K <= x <= K + 1,
+    // -K - 1 <= y <= -K with K = 2e7 is feasible at (K, -K), but its mu
+    // range [-K - 1, -K] lies outside the box). Full column rank and finite
+    // original bounds make the polytope bounded; a projection that is not
+    // certified Optimal (or certified Infeasible) refuses the reform.
     model::LpProblem proj = tp;
-    proj.col_lo.assign(static_cast<std::size_t>(k), -kDummyBox);
-    proj.col_hi.assign(static_cast<std::size_t>(k), kDummyBox);
+    proj.col_lo.assign(static_cast<std::size_t>(k), -model::kInf);
+    proj.col_hi.assign(static_cast<std::size_t>(k), model::kInf);
     proj.is_integer.assign(static_cast<std::size_t>(k), false);
     proj.c.assign(static_cast<std::size_t>(k), 0.0);
     proj.row_names.assign(static_cast<std::size_t>(row_id), "");
@@ -592,47 +636,56 @@ try_lattice_reform(const model::LpProblem& lp, const LatticeReformOptions& opts)
             proj.maximize = (dir == 1);
             engines::SimplexDiagnostics sdiag;
             auto r = engines::solve_simplex(proj, sopts, sdiag);
-            if (r.proposed_status == core::Status::Infeasible) {
+            const auto ev = certify::check_lp_result(proj, r, engines::simplex_evidence(sdiag, sopts));
+            const auto res = certify::finalize_result(std::move(r), ev);
+            if (res.status == core::Status::Infeasible && res.ray_certified) {
                 lp_infeasible = true;
                 break;
             }
-            if (r.proposed_status != core::Status::Optimal ||
-                !std::isfinite(r.objective) ||
-                std::fabs(r.objective) >= 0.5 * kDummyBox) {
-                return std::nullopt;  // boundedness guarantee failed -- refuse
+            if (res.status != core::Status::Optimal || !std::isfinite(res.objective) ||
+                !std::isfinite(res.dual_bound))
+                return std::nullopt;   // not proved: refuse
+            // The valid endpoint is the dual bound (the primal objective is
+            // a point's value): the smaller for a minimum, the larger for a
+            // maximum, widened by a relative pad before integer rounding.
+            if (dir == 0) {
+                const f64 v = std::min(res.objective, res.dual_bound);
+                lo_v = v - 1e-9 * (1.0 + std::fabs(v));
+            } else {
+                const f64 v = std::max(res.objective, res.dual_bound);
+                hi_v = v + 1e-9 * (1.0 + std::fabs(v));
             }
-            (dir == 0 ? lo_v : hi_v) = r.objective;
         }
         if (!lp_infeasible) {
-            tp.col_lo[static_cast<std::size_t>(t)] = std::ceil(lo_v - 1e-7);
-            tp.col_hi[static_cast<std::size_t>(t)] = std::floor(hi_v + 1e-7);
+            tp.col_lo[static_cast<std::size_t>(t)] = std::ceil(lo_v);
+            tp.col_hi[static_cast<std::size_t>(t)] = std::floor(hi_v);
         }
     }
 
     if (lp_infeasible) {
-        // The restricted system has no real point at all (proven directly,
-        // independent of integrality) -- same marker-problem construction as
-        // the AHL-level infeasibility signal above.
+        // The restricted system has no real point at all (certified Farkas
+        // ray over the unboxed polytope) -- same marker-problem construction
+        // as the AHL-level infeasibility signal above.
         return build_infeasible_marker(
             "; restricted LP relaxation infeasible (no real point)");
     }
 
-    // A few rounds of row-wise bound propagation as a cheap, sound extra
-    // tightening on top of the exact per-coordinate LP projection (a joint
-    // polytope constraint can still imply more than any single coordinate's
-    // own projection alone). Can only tighten further, never invalidate the
-    // LP-derived box.
+    // A few rounds of row-wise bound propagation as a cheap extra tightening
+    // on top of the per-coordinate projection (a joint row can imply more
+    // than any single coordinate's projection). The residual activities are
+    // exact and each implied bound is rounded outward before the integer
+    // rounding, so a tightening is always implied by the rows.
     for (int pass = 0; pass < 3; ++pass) {
+        const auto& trp = tp.A.pattern.row_ptr();
+        const auto& tci = tp.A.pattern.col_idx();
+        const auto& tav = tp.A.vals;
         for (Index i = 0; i < row_id; ++i) {
-            const auto& trp = tp.A.pattern.row_ptr();
-            const auto& tci = tp.A.pattern.col_idx();
-            const auto& tav = tp.A.vals;
             for (core::Offset p = trp[static_cast<std::size_t>(i)];
                  p < trp[static_cast<std::size_t>(i) + 1]; ++p) {
                 const Index t = tci[static_cast<std::size_t>(p)];
                 const f64 q = tav[static_cast<std::size_t>(p)];
                 if (q == 0.0) continue;
-                f64 others_max = 0.0, others_min = 0.0;
+                model::DyadicSum others_max, others_min;
                 for (core::Offset p2 = trp[static_cast<std::size_t>(i)];
                      p2 < trp[static_cast<std::size_t>(i) + 1]; ++p2) {
                     const Index j = tci[static_cast<std::size_t>(p2)];
@@ -640,59 +693,77 @@ try_lattice_reform(const model::LpProblem& lp, const LatticeReformOptions& opts)
                     const f64 qj = tav[static_cast<std::size_t>(p2)];
                     const f64 loj = tp.col_lo[static_cast<std::size_t>(j)];
                     const f64 hij = tp.col_hi[static_cast<std::size_t>(j)];
-                    others_max += std::max(qj * loj, qj * hij);
-                    others_min += std::min(qj * loj, qj * hij);
+                    others_max.add_product(qj, qj > 0.0 ? hij : loj);
+                    others_min.add_product(qj, qj > 0.0 ? loj : hij);
                 }
-                const f64 L = tp.row_lo[static_cast<std::size_t>(i)] - others_max;
-                const f64 U = tp.row_hi[static_cast<std::size_t>(i)] - others_min;
-                f64 a = L / q, b = U / q;
-                if (a > b) std::swap(a, b);
+                // row_lo - others_max <= q mu_t <= row_hi - others_min.
+                model::DyadicSum L = others_max, U = others_min;
+                L.negate();
+                L.add(tp.row_lo[static_cast<std::size_t>(i)]);
+                U.negate();
+                U.add(tp.row_hi[static_cast<std::size_t>(i)]);
+                f64 lo_t, hi_t;
+                if (q > 0.0) { lo_t = L.quotient_down(q); hi_t = U.quotient_up(q); }
+                else { lo_t = U.quotient_down(q); hi_t = L.quotient_up(q); }
                 tp.col_lo[static_cast<std::size_t>(t)] =
-                    std::max(tp.col_lo[static_cast<std::size_t>(t)], a);
+                    std::max(tp.col_lo[static_cast<std::size_t>(t)], std::ceil(lo_t));
                 tp.col_hi[static_cast<std::size_t>(t)] =
-                    std::min(tp.col_hi[static_cast<std::size_t>(t)], b);
+                    std::min(tp.col_hi[static_cast<std::size_t>(t)], std::floor(hi_t));
             }
         }
     }
     for (int t = 0; t < k; ++t) {
         if (!(tp.col_lo[static_cast<std::size_t>(t)] <=
               tp.col_hi[static_cast<std::size_t>(t)])) {
-            // The LP projection proved this coordinate's range nonempty;
-            // integer-only row-propagation tightening it to empty here would
-            // mean either a genuine integer infeasibility the propagation
-            // found (which the LP box alone would not show) or a numerical
-            // inconsistency -- either way, not safe to paper over with a
-            // silently-widened box. Refuse the reform; the plain B&B path
-            // handles the instance instead.
+            // Propagation emptied a coordinate the projection kept: a genuine
+            // integer infeasibility or a numerical inconsistency. Either way
+            // not safe to paper over; the plain B&B path handles the model.
             return std::nullopt;
         }
-        // Integer bounds: floor/ceil (idempotent -- already exact integers
-        // from the LP projection step, this only guards the propagation
-        // pass's own floating-point tightenings).
-        tp.col_lo[static_cast<std::size_t>(t)] =
-            std::ceil(tp.col_lo[static_cast<std::size_t>(t)] - 1e-9);
-        tp.col_hi[static_cast<std::size_t>(t)] =
-            std::floor(tp.col_hi[static_cast<std::size_t>(t)] + 1e-9);
     }
     tp.is_integer.assign(static_cast<std::size_t>(k), true);
     tp.c.assign(static_cast<std::size_t>(k), 0.0);
-    // c_μ = Q^T c_free ; offset += c_free · x0 (+ fixed contrib already in lp)
-    f64 offset = lp.obj_offset;
-    for (std::size_t fi = 0; fi < map.fixed_cols.size(); ++fi) {
-        const Index j = map.fixed_cols[fi];
-        offset += lp.c[static_cast<std::size_t>(j)] * map.fixed_vals[fi];
-    }
+    // c_mu = Q^T c_free; offset += c_free . x0 + c_fixed . x_fixed, each
+    // summed exactly. A coefficient or offset that is not a double makes the
+    // transformed objective an approximation: points still transfer (they
+    // are re-priced in x-space), statuses and bounds do not.
+    model::DyadicSum off;
+    off.add(lp.obj_offset);
+    for (std::size_t fi = 0; fi < map.fixed_cols.size(); ++fi)
+        off.add_product(lp.c[static_cast<std::size_t>(map.fixed_cols[fi])], map.fixed_vals[fi]);
+    std::vector<model::DyadicSum> cmu(static_cast<std::size_t>(k));
     for (std::size_t ii = 0; ii < free_int.size(); ++ii) {
-        const Index oj = free_int[ii];
-        const f64 cj = lp.c[static_cast<std::size_t>(oj)];
-        offset += cj * static_cast<f64>(map.x0[ii]);
-        for (int t = 0; t < k; ++t) {
-            tp.c[static_cast<std::size_t>(t)] +=
-                cj * static_cast<f64>(map.Q[ii][static_cast<std::size_t>(t)]);
-        }
+        const f64 cj = lp.c[static_cast<std::size_t>(free_int[ii])];
+        if (cj == 0.0) continue;
+        off.add_product(cj, static_cast<f64>(map.x0[ii]));
+        for (int t = 0; t < k; ++t)
+            cmu[static_cast<std::size_t>(t)].add_product(
+                cj, static_cast<f64>(map.Q[ii][static_cast<std::size_t>(t)]));
     }
-    // Forced-zero continuous contribute 0.
-    tp.obj_offset = offset;
+    bool objective_exact = true;
+    for (const i64 v : map.x0) objective_exact &= std::llabs(v) <= (i64{1} << 53);
+    for (const auto& row : map.Q)
+        for (const i64 v : row) objective_exact &= std::llabs(v) <= (i64{1} << 53);
+    for (int t = 0; t < k; ++t) {
+        f64 v = 0.0;
+        if (!cmu[static_cast<std::size_t>(t)].representable(v)) {
+            objective_exact = false;
+            v = cmu[static_cast<std::size_t>(t)].nearest();
+        }
+        tp.c[static_cast<std::size_t>(t)] = v;
+    }
+    {
+        f64 v = 0.0;
+        if (!off.representable(v)) {
+            objective_exact = false;
+            v = off.nearest();
+        }
+        tp.obj_offset = v;
+    }
+    if (!objective_exact) {
+        map.exact_equivalence = false;
+        map.note += "; transformed objective not exact: points only";
+    }
     tp.col_names.resize(static_cast<std::size_t>(k));
     for (int t = 0; t < k; ++t)
         tp.col_names[static_cast<std::size_t>(t)] = "mu" + std::to_string(t);

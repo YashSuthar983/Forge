@@ -281,6 +281,16 @@ struct RawResult {
     std::vector<Index> certificate_basis;
     std::vector<std::string> exact_dual;
 
+    // Rigorous enclosure of the minimization reduced costs d = c - A'y of
+    // the exported multipliers (sense applied), componentwise in
+    // [rc_lo, rc_hi], and the Lagrangian bound they give over the box the
+    // engine solved: every point of it has minimization objective >=
+    // rc_bound. Empty when not computed. The engine's residual check
+    // already sums A'y once; consumers (reduced-cost fixing) reuse it
+    // instead of a second O(nnz) pass.
+    std::vector<f64> rc_lo, rc_hi;
+    f64 rc_bound = kNaN;
+
     std::uint64_t iterations = 0;
     std::string engine;
     std::string backend;

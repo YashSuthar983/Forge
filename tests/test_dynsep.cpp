@@ -291,7 +291,38 @@ void test_auto_falls_back_without_model() {
 
 }  // namespace
 
+// Scheduler feedback is measured progress, shared by violation (audit 8):
+// a family is credited its share of the round's realised progress, a family
+// that ran and contributed nothing is a zero-reward play.
+void test_observe_round_shares_measured_progress() {
+    sor::search::DynSepOptions o;
+    o.enabled = true;
+    sor::search::DynSepController c(o);
+    sor::search::DynSepDecision ran;
+    ran.run_mir = true;
+    ran.run_zerohalf = true;
+    ran.run_gmi = true;
+    std::array<int, sor::search::kSepFamilyCount> sel{};
+    std::array<double, sor::search::kSepFamilyCount> viol{};
+    const auto mir = static_cast<std::size_t>(sor::search::SepFamily::Mir);
+    const auto gmi = static_cast<std::size_t>(sor::search::SepFamily::Gmi);
+    const auto zh = static_cast<std::size_t>(sor::search::SepFamily::ZeroHalf);
+    sel[mir] = 3; viol[mir] = 3.0;
+    sel[gmi] = 1; viol[gmi] = 1.0;
+    c.observe_round(ran, sel, viol, 0.2);
+    const auto& d = c.diagnostics();
+    CHECK(std::fabs(d.reward_sum[mir] - 0.15) < 1e-12);
+    CHECK(std::fabs(d.reward_sum[gmi] - 0.05) < 1e-12);
+    CHECK(d.plays[zh] == 1);                 // ran, contributed nothing
+    CHECK(d.reward_sum[zh] == 0.0);
+    // A round that lost bound is no reward, never a negative one.
+    c.observe_round(ran, sel, viol, -0.5);
+    CHECK(std::fabs(d.reward_sum[mir] - 0.15) < 1e-12);
+    CHECK(d.plays[mir] == 2);
+}
+
 int main() {
+    test_observe_round_shares_measured_progress();
     test_policy_gates();
     test_bandit_schedules_baseline_and_optional();
     test_classical_static_path();

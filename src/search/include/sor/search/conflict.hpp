@@ -34,6 +34,7 @@
 #include "sor/core/result.hpp"
 #include "sor/model/lp.hpp"
 #include "sor/search/cuts.hpp"
+#include "sor/search/prop_trail.hpp"
 #include "sor/search/row_support_probe.hpp"
 
 #include <cstddef>
@@ -253,7 +254,13 @@ struct ProbingState {
     Index n_cols = 0;
     std::vector<char> probed;
     bool complete = false;   // every binary probed
-    bool gave_up = false;    // stopped as slow-and-unproductive: do not resume
+    // Stopped as slow-and-unproductive, or handed to a stage that must not
+    // continue it (a heuristic child): a resume probes nothing.
+    bool gave_up = false;
+    // Leading rows a resume does not scan for row cliques: their cliques (or
+    // those of the rows they were derived from) are in the graph already.
+    // Rows after them -- a child's neighbourhood or objective row -- are new.
+    Index rows_covered = 0;
     std::size_t probed_count() const {
         std::size_t c = 0;
         for (const char p : probed) c += p != 0;
@@ -264,19 +271,34 @@ struct ProbingState {
     ProbingState remapped(const std::vector<Index>& new_of_old, Index new_n) const;
 };
 
-// Probing facts handed from one stage to the next (presolve -> search) together
-// with what they are valid for: the matrix (fingerprint) and a box that the
-// consumer's own box must lie inside.
+// Probing facts handed from one solve stage to another, together with what
+// they are valid for. The facts hold at every point of the probed model that
+// is integral on its integer columns and lies in the box [lo, hi]. A consumer
+// may adopt them when all of its own such points are among those: the same
+// columns, the probed rows as its LEADING rows with the same coefficients and
+// sides no wider (rows after them only cut further), every probed integer
+// column still integer, and a box inside [lo, hi]. That covers presolve ->
+// search (the very model) and parent -> heuristic child (the parent's rows
+// plus neighbourhood, objective and cut rows, over a narrower box).
 struct ProbingCarry {
-    std::uint64_t fingerprint = 0;
+    std::uint64_t fingerprint = 0;    // row_prefix_fingerprint(probed model, rows)
+    Index rows = 0;
+    std::vector<f64> row_lo, row_hi;  // the probed rows' sides
+    std::vector<char> integer;        // the probed model's integer columns
     std::vector<f64> lo, hi;
     ConflictGraph graph;
     ProbingState state;
+    // Declares the first `rows` rows of `lp` (all of them when negative), their
+    // sides and `lp`'s integrality as the model the facts describe.
+    void describe(const model::LpProblem& lp, Index rows = -1);
     bool usable_for(const model::LpProblem& lp) const;
 };
 
 // Hash of the constraint matrix and integrality (not bounds, costs or row sides).
 std::uint64_t matrix_fingerprint(const model::LpProblem& lp);
+// Hash of the column count and the first `rows` rows' pattern and values (not
+// integrality, bounds, costs or sides).
+std::uint64_t row_prefix_fingerprint(const model::LpProblem& lp, Index rows);
 
 // Builds `out` from `lp` and tightens `col_lo`/`col_hi` IN PLACE with the
 // globally valid consequences probing found (fixings and hull bounds). Both
@@ -299,6 +321,24 @@ std::vector<CutRow> separate_clique_cuts(const ConflictGraph& cg,
                                          const std::vector<f64>& x,
                                          const ProbingOptions& opts);
 
+// Violated odd-cycle cuts at `x`. Literals l_1..l_k (k odd, k >= 5) that
+// conflict pairwise around a cycle admit at most (k-1)/2 true, an inequality
+// no set of pairwise conflicts gives the LP. With w(u,v) = 1 - x_u - x_v on
+// the conflict edges among fractional literals, the cycle inequality is
+// violated exactly when the cycle weighs less than 1; the lightest odd closed
+// walk through a literal is a shortest path between its two copies in the
+// bipartite double cover, and dropping even sub-walks from it (weights are
+// >= 0) leaves a simple odd cycle no heavier. Edges are the graph's explicit
+// conflicts and the pairs of every stored clique. Triangles are cliques and
+// are left to separate_clique_cuts. At most `max_cuts` rows, from up to
+// `max_starts` start literals (the most fractional first). Rows:
+//   sum_{v=1} x_j - sum_{v=0} x_j  <=  (k-1)/2 - |{v=0 literals}|
+// (a variable whose two literals both lie on the cycle cancels exactly).
+std::vector<CutRow> separate_odd_cycle_cuts(const ConflictGraph& cg,
+                                            const std::vector<f64>& x,
+                                            int max_cuts, int max_starts,
+                                            f64 violation_min);
+
 // Violated implied-bound cuts at `x`, strongest violation first. Each returned
 // row is one entry of cg.implied_bounds() written out as
 //   col - (b1 - b0) * bin  <=  b0   (or >= b0 for a lower bound).
@@ -315,10 +355,26 @@ std::vector<CutRow> separate_implied_bound_cuts(const ConflictGraph& cg,
 // one row at a time, while a probing implication is the compressed result of a
 // whole propagation cascade, and a clique carries cardinality reasoning that no
 // single row bound can express.
+// `trail` (optional) receives every bound it moves, with the true literal
+// that implied it as an Implication reason; `conflict_var` (optional) the
+// column whose box it emptied.
 bool propagate_conflicts(const ConflictGraph& cg,
                          std::vector<f64>& col_lo,
                          std::vector<f64>& col_hi,
                          std::uint64_t& tightened,
-                         int max_rounds = 4);
+                         int max_rounds = 4,
+                         PropTrail* trail = nullptr, int depth = 0,
+                         Index* conflict_var = nullptr);
+
+// The same deductions, event-driven: only the binaries in `seeds` that are
+// fixed (their literal newly true) and the columns their consequences fix in
+// turn are expanded, to a fixpoint -- equivalent to propagate_conflicts when
+// the box outside `seeds` was already a fixpoint of the graph. `changed`
+// (optional) receives every column moved.
+bool propagate_conflicts_from(const ConflictGraph& cg, std::vector<f64>& col_lo,
+                              std::vector<f64>& col_hi, const std::vector<Index>& seeds,
+                              std::uint64_t& tightened, PropTrail* trail = nullptr,
+                              int depth = 0, Index* conflict_var = nullptr,
+                              std::vector<Index>* changed = nullptr);
 
 }  // namespace sor::search

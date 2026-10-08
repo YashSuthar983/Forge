@@ -33,11 +33,15 @@ inline bool is_binary(const model::LpProblem& lp, const std::vector<f64>& lo,
 
 // `mag` returns |bound| + the magnitudes of the terms folded into `cap`: the
 // scale of the capacity's rounding error, and of a derived row's own error.
+// `local` is set when the knapsack rests on a bound of [lo, hi] that the
+// root box [root_lo, root_hi] does not imply: an item read as binary, or a
+// non-item at the bound that minimizes it.
 bool build_knapsack(const model::LpProblem& lp, Index row, f64 sign,
                     const std::vector<f64>& x, const std::vector<f64>& lo,
                     const std::vector<f64>& hi, const CoverOptions& opts,
                     std::vector<Item>& items, f64& cap, f64& mag,
-                    CoverDiagnostics& diag) {
+                    CoverDiagnostics& diag, const std::vector<f64>* root_lo,
+                    const std::vector<f64>* root_hi, bool& local) {
     core::work_add(4 + static_cast<std::uint64_t>(lp.A.pattern.row_ptr()[sz(row) + 1] -
                                                   lp.A.pattern.row_ptr()[sz(row)]), ::sor::core::WorkTag::Cover);
     const f64 bound = sign > 0.0 ? lp.row_hi[sz(row)] : -lp.row_lo[sz(row)];
@@ -50,6 +54,7 @@ bool build_knapsack(const model::LpProblem& lp, Index row, f64 sign,
     items.clear();
     cap = bound;
     mag = std::fabs(bound);
+    local = root_lo == nullptr || root_hi == nullptr;
     for (core::Offset k = rp[sz(row)]; k < rp[sz(row) + 1]; ++k) {
         const Index j = ci[sz(k)];
         const f64 a = sign * av[sz(k)];
@@ -59,6 +64,10 @@ bool build_knapsack(const model::LpProblem& lp, Index row, f64 sign,
         // goes to the capacity at its minimizing bound like a continuous
         // term. Dropping a negative one would tighten the row.
         if (std::fabs(a) > opts.tol && is_binary(lp, lo, hi, j)) {
+            // An item is a 0/1 column: both of its bounds are assumed.
+            if (!root_implies_bound(root_lo, root_hi, j, false, lo[sz(j)]) ||
+                !root_implies_bound(root_lo, root_hi, j, true, hi[sz(j)]))
+                local = true;
             mag += std::fabs(a);
             Item it;
             it.col = j;
@@ -88,6 +97,7 @@ bool build_knapsack(const model::LpProblem& lp, Index row, f64 sign,
         }
         cap -= a * at_min;
         mag += std::fabs(a * at_min);
+        if (!root_implies_bound(root_lo, root_hi, j, a < 0.0, at_min)) local = true;
     }
 
     if (items.size() < 2) return false;
@@ -401,7 +411,9 @@ std::vector<CutRow> separate_lifted_covers(const model::LpProblem& lp,
                                            const std::vector<f64>& col_lo,
                                            const std::vector<f64>& col_hi,
                                            const CoverOptions& opts,
-                                           CoverDiagnostics& diag) {
+                                           CoverDiagnostics& diag,
+                                           const std::vector<f64>* root_lo,
+                                           const std::vector<f64>* root_hi) {
     core::WorkScope work_scope_(core::WorkCat::Separation);
     std::vector<CutRow> cuts;
     const Index n = lp.n_cols();
@@ -422,8 +434,9 @@ std::vector<CutRow> separate_lifted_covers(const model::LpProblem& lp,
         for (const f64 sign : {1.0, -1.0}) {
             if (static_cast<int>(cuts.size()) >= opts.max_cuts) break;
             f64 cap = 0.0, mag = 0.0;
+            bool local = true;
             if (!build_knapsack(lp, i, sign, x, col_lo, col_hi, opts, items, cap,
-                                mag, diag))
+                                mag, diag, root_lo, root_hi, local))
                 continue;
             // The capacity's uncertainty. Every test against `cap` below reads
             // it in the safe direction: a cover must exceed cap + cap_tol, and
@@ -529,6 +542,7 @@ std::vector<CutRow> separate_lifted_covers(const model::LpProblem& lp,
             }
             cut.row_lo = -kInf;
             cut.row_hi = rhs;
+            cut.used_local_bound = local;
             if (used == SiLiftKind::Pc)
                 cut.name = "COVPC_" + std::to_string(cuts.size());
             else if (used == SiLiftKind::Gns)

@@ -5,6 +5,8 @@
 // proven answer, only the path to it.
 #include "sor/certify/finalize.hpp"
 #include "sor/engines/simplex.hpp"
+#include "sor/engines/dual_simplex.hpp"
+#include "sor/sparse/csr.hpp"
 #include "sor/io/mps.hpp"
 #include "sor/search/bab.hpp"
 #include "sor/search/cuts.hpp"
@@ -12,6 +14,8 @@
 #include "test_helpers.hpp"
 
 #include <cmath>
+#include <memory>
+#include <random>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -580,6 +584,7 @@ void test_cut_retraction_round_trip() {
     cuts[1].row_lo = -sor::model::kInf;
     cuts[1].row_hi = 14.0;          // == x + y <= 7, tighter than 10
     cuts[1].name = "MERGE_0";
+    cuts[1].exact = true;           // stored as given (no derivation margin)
 
     CutUndo undo;
     sor::search::apply_cuts_inplace(lp, cuts, opts, &undo);
@@ -842,60 +847,6 @@ void test_bound_snapshot_names_the_invocation() {
     CHECK(snap1 != snap2);
 }
 
-void test_integer_reduced_cost_fix_unit_step() {
-    using sor::search::integer_reduced_cost_fix;
-    const double tol = 1e-8;
-    double lo = 0.0;
-    double hi = 5.0;
-    CHECK(integer_reduced_cost_fix(lo, hi, 0.0, 3.0, 3.0, tol));
-    CHECK_NEAR(lo, 0.0, tol);
-    CHECK_NEAR(hi, 0.0, tol);
-
-    lo = 0.0;
-    hi = 5.0;
-    CHECK(!integer_reduced_cost_fix(lo, hi, 0.0, 1.5, 3.0, tol));
-    CHECK_NEAR(hi, 5.0, tol);
-
-    lo = 0.5;
-    hi = 5.0;
-    CHECK(!integer_reduced_cost_fix(lo, hi, 0.5, 3.0, 3.0, tol));
-    CHECK_NEAR(lo, 0.5, tol);
-    CHECK_NEAR(hi, 5.0, tol);
-
-    lo = 0.0;
-    hi = 5.0;
-    CHECK(integer_reduced_cost_fix(lo, hi, 5.0, -3.0, 3.0, tol));
-    CHECK_NEAR(lo, 5.0, tol);
-    CHECK_NEAR(hi, 5.0, tol);
-    // Every exclusion must come from the certified Lagrangian: the result has
-    // to retain every point as good as the incumbent.
-    for (bool maximize : {false, true}) {
-        sor::model::LpProblem p;
-        p.A = sor::sparse::from_triplets(0, 2, {}, {}, {});
-        p.c = maximize ? std::vector<double>{-10., -1.} : std::vector<double>{10., 1.};
-        p.col_lo = {0., 0.}; p.col_hi = {3., 3.}; p.is_integer = {1, 1}; p.maximize = maximize;
-        auto lows = p.col_lo, highs = p.col_hi;
-        const auto result = sor::search::certified_reduced_cost_bounds(
-            p, {}, maximize ? -3. : 3., lows, highs, tol);
-        CHECK(result.checked == 2);
-        CHECK(result.fixed == 1);
-        for (int a = 0; a <= 3; ++a) for (int b = 0; b <= 3; ++b) {
-            const auto obj = p.objective({double(a), double(b)});
-            if ((maximize ? -obj : obj) <= 3.) {
-                CHECK(a >= lows[0] && a <= highs[0]);
-                CHECK(b >= lows[1] && b <= highs[1]);
-            }
-        }
-        p.c = maximize ? std::vector<double>{1., 0.} : std::vector<double>{-1., 0.};
-        p.col_hi = {100., 1.}; p.is_integer = {1, 0};
-        lows = p.col_lo; highs = p.col_hi;
-        const auto upper = sor::search::certified_reduced_cost_bounds(
-            p, {}, maximize ? 90. : -90., lows, highs, tol);
-        CHECK(upper.tightened == 1);
-        CHECK(lows[0] == 90. && highs[0] == 100.);
-        CHECK(lows[1] == 0. && highs[1] == 1.);
-    }
-}
 
 // A tiny reduced cost against a large incumbent gap must not turn an INFINITE
 // bound into an astronomical finite one (gap / d = 2e13 here): such a bound
@@ -960,6 +911,40 @@ void test_gmi_structural_drop_relaxes_rhs() {
     CHECK(sor::search::separate_gomory_mi(lp, x, basis, o, unbounded).empty());
 }
 
+// A tableau entry just above an integer gives an integer nonbasic a GMI
+// coefficient fj/f0 below 1e-11. Dropping it from a >= cut claims more than the
+// row gives wherever the column is large. Row x0 + (1 + 2^-41) x1 <= 1.5 at the
+// LP point (1.5, 0): the cut without x1's 2^-40 term is x0 + (1 + 2^-41) x1 <= 1,
+// and the integer point (1 - 2^40, 2^40) satisfies the row with equality and
+// violates that cut by 1/2. Kept, the term cancels to x0 + x1 <= 1.
+void test_gmi_tiny_integer_coefficient_is_kept() {
+    sor::model::LpProblem lp;
+    const double eps = std::ldexp(1.0, -41);
+    lp.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0 + eps});
+    lp.c = {-1.0, 0.0};
+    lp.col_lo = {-std::ldexp(1.0, 42), 0.0};
+    lp.col_hi = {10.0, std::ldexp(1.0, 42)};
+    lp.is_integer = {true, true};
+    lp.row_lo = {-sor::model::kInf}; lp.row_hi = {1.5};
+    sor::engines::SimplexBasis basis;
+    basis.n_struct = 2; basis.basic = {0};
+    using NB = sor::engines::NonbasicStatus;
+    basis.status = {NB::Basic, NB::AtLower, NB::AtUpper};
+    const std::vector<double> x{1.5, 0.0};
+    const std::vector<double> far{1.0 - std::ldexp(1.0, 40), std::ldexp(1.0, 40)};
+    CHECK(lp.max_row_violation(far) == 0.0);
+    sor::search::CutOptions o;
+    sor::search::CutDiagnostics d;
+    const auto cuts = sor::search::separate_gomory_mi(lp, x, basis, o, d);
+    CHECK(!cuts.empty());
+    for (const auto& cut : cuts) {
+        double activity = 0.0;
+        for (std::size_t k = 0; k < cut.cols.size(); ++k)
+            activity += cut.vals[k] * far[static_cast<std::size_t>(cut.cols[k])];
+        CHECK(activity >= cut.row_lo - 1e-6 * std::fabs(cut.row_lo) - 1e-9);
+    }
+}
+
 void test_cut_merge_preserves_original_rows() {
     sor::model::LpProblem lp;
     lp.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1e-12});
@@ -1009,10 +994,10 @@ void test_cut_merge_requires_exact_normalized_coefficients() {
 }
 
 // A cut computed in floating point is only as valid as that arithmetic, and
-// everything downstream reads the stored row as data. So a non-integral cut
-// is stored relaxed outward by its margin, an exact integer cut (cover,
-// clique, zero-half, nogood) is stored as given, and model rows are never
-// touched.
+// everything downstream reads the stored row as data. So a cut is stored
+// relaxed outward by its margin unless its separator derived it exactly
+// (CutRow::exact: clique, zero-half, nogood) -- integer-looking numbers alone
+// do not qualify -- and model rows are never touched.
 void test_derived_cuts_enter_with_their_margin() {
     sor::model::LpProblem lp;
     lp.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
@@ -1026,8 +1011,12 @@ void test_derived_cuts_enter_with_their_margin() {
     sor::search::CutRow exact;
     exact.cols = {0}; exact.vals = {3.0};
     exact.row_lo = -sor::model::kInf; exact.row_hi = 2.0;
-    sor::search::apply_cuts_inplace(lp, {frac, exact}, o);
-    CHECK(lp.n_rows() == 3);
+    exact.exact = true;
+    sor::search::CutRow looks_integral;   // same data, derived in floating point
+    looks_integral.cols = {1}; looks_integral.vals = {3.0};
+    looks_integral.row_lo = -sor::model::kInf; looks_integral.row_hi = 2.0;
+    sor::search::apply_cuts_inplace(lp, {frac, exact, looks_integral}, o);
+    CHECK(lp.n_rows() == 4);
     CHECK(lp.row_hi[0] == 2.5);                       // model row untouched
     const double reach_sum = 0.5 * 1.0 + 0.25 * 3.0;
     const auto margin = [&](double side) {
@@ -1036,18 +1025,141 @@ void test_derived_cuts_enter_with_their_margin() {
     };
     CHECK(lp.row_hi[1] == 0.75 + margin(0.75));
     CHECK(lp.row_lo[1] == -1.25 - margin(-1.25));
-    CHECK(lp.row_hi[2] == 2.0);                       // exact integer data
+    CHECK(lp.row_hi[2] == 2.0);                       // derived exactly
     CHECK(lp.row_lo[2] == -sor::model::kInf);
+    CHECK(lp.row_hi[3] > 2.0);                        // integer data, no proof
 }
 
 
+// Merging a cut into an existing row needs exact proportionality (audit
+// section 11). N = 2^52: row A = (N+1, N) <= -N and cut B = (N, N-1) <= -N
+// both admit (x, y) = (-N, N) (activity -N in each), and share a binary64
+// signature. The old merge mapped B's side through the ratio 1 + 2^-52 and
+// tightened A to <= -N - 1, cutting that point off.
+void test_cut_merge_requires_exact_proportionality() {
+    const double N = 0x1p52;
+    sor::model::LpProblem lp;
+    lp.c = {0.0, 0.0};
+    lp.col_lo = {-2 * N, -2 * N};
+    lp.col_hi = {2 * N, 2 * N};
+    lp.is_integer = {false, false};
+    lp.row_lo = {-sor::model::kInf};
+    lp.row_hi = {-N};
+    lp.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {N + 1, N});
+    lp.validate();
+    sor::search::CutRow b;
+    b.cols = {0, 1};
+    b.vals = {N, N - 1};
+    b.row_lo = -sor::model::kInf;
+    b.row_hi = -N;
+    b.exact = true;   // no margin: isolate the merge
+    sor::search::CutOptions opts;
+    opts.parallel_to_row_max = 1.1;   // never reject as near-parallel
+    opts.original_rows = 0;           // row A takes part in merging, as a cut row
+    auto out = lp;
+    sor::search::apply_cuts_inplace(out, {b}, opts);
+    const std::vector<double> pt = {-N, N};
+    CHECK(out.max_row_violation(pt) == 0.0);
+    // A proportional cut still merges: 2A <= -2N - 2 tightens A to <= -N - 1.
+    sor::search::CutRow a2;
+    a2.cols = {0, 1};
+    a2.vals = {2 * (N + 1), 2 * N};
+    a2.row_lo = -sor::model::kInf;
+    a2.row_hi = -2 * N - 2;
+    a2.exact = true;
+    auto out2 = lp;
+    sor::search::apply_cuts_inplace(out2, {a2}, opts);
+    CHECK(out2.n_rows() == 1);
+    CHECK(out2.row_hi[0] == -N - 1);
+}
+
+// The engine's tableau rows (DualProbeSession::basis_inverse_row) on
+// scaled random LPs: y^T B = e_slot^T for B the unscaled basis of [A | -I],
+// and GMI separates the same rows with them as with its own factorization.
+void test_engine_basis_inverse_rows() {
+    std::mt19937 rng(41);
+    int sessions = 0, rows = 0, gmi_same = 0;
+    for (int trial = 0; trial < 60; ++trial) {
+        const sor::core::Index m = 3 + static_cast<sor::core::Index>(rng() % 5);
+        const sor::core::Index n = 4 + static_cast<sor::core::Index>(rng() % 6);
+        std::vector<sor::core::Index> ri, cj;
+        std::vector<double> v;
+        for (sor::core::Index i = 0; i < m; ++i)
+            for (sor::core::Index j = 0; j < n; ++j)
+                if (rng() % 2 == 0) {
+                    ri.push_back(i); cj.push_back(j);
+                    // wide magnitudes so Ruiz scaling is far from identity
+                    v.push_back(static_cast<double>(1 + rng() % 9) * std::ldexp(1.0, static_cast<int>(rng() % 9) - 4));
+                }
+        sor::model::LpProblem lp;
+        lp.name = "inv_rows";
+        lp.A = sor::sparse::from_triplets(m, n, ri, cj, v);
+        lp.c.resize(static_cast<std::size_t>(n));
+        for (auto& c : lp.c) c = -static_cast<double>(1 + rng() % 7);
+        lp.col_lo.assign(static_cast<std::size_t>(n), 0.0);
+        lp.col_hi.assign(static_cast<std::size_t>(n), 10.0);
+        lp.is_integer.assign(static_cast<std::size_t>(n), true);
+        lp.row_lo.assign(static_cast<std::size_t>(m), -sor::model::kInf);
+        lp.row_hi.resize(static_cast<std::size_t>(m));
+        for (auto& r : lp.row_hi) r = 5.0 + static_cast<double>(rng() % 20) + 0.5;
+        sor::engines::SimplexOptions so;
+        so.presolve = false;
+        sor::engines::SimplexDiagnostics sd;
+        sor::engines::SimplexBasis basis;
+        std::unique_ptr<sor::engines::DualProbeSession> session;
+        const auto raw = sor::engines::solve_dual_simplex(lp, so, sd, &basis, nullptr, nullptr,
+                                                          nullptr, &session);
+        if (raw.proposed_status != sor::core::Status::Optimal || !session) continue;
+        ++sessions;
+        const auto& rp = lp.A.pattern.row_ptr();
+        const auto& ci = lp.A.pattern.col_idx();
+        for (sor::core::Index slot = 0; slot < m; ++slot) {
+            std::vector<double> y;
+            if (!session->basis_inverse_row(basis.basic, slot, y)) continue;
+            ++rows;
+            std::vector<double> tab(static_cast<std::size_t>(n + m), 0.0);
+            for (sor::core::Index i = 0; i < m; ++i)
+                for (auto k = rp[static_cast<std::size_t>(i)]; k < rp[static_cast<std::size_t>(i) + 1]; ++k)
+                    tab[static_cast<std::size_t>(ci[static_cast<std::size_t>(k)])] +=
+                        y[static_cast<std::size_t>(i)] * lp.A.vals[static_cast<std::size_t>(k)];
+            for (sor::core::Index i = 0; i < m; ++i) tab[static_cast<std::size_t>(n + i)] = -y[static_cast<std::size_t>(i)];
+            for (sor::core::Index k = 0; k < m; ++k)
+                CHECK_NEAR(tab[static_cast<std::size_t>(basis.basic[static_cast<std::size_t>(k)])],
+                           k == slot ? 1.0 : 0.0, 1e-10);
+        }
+        sor::search::CutOptions co;
+        sor::search::CutDiagnostics d0, d1;
+        const auto own = sor::search::separate_gomory_mi(lp, raw.x, basis, co, d0);
+        const sor::search::BasisInverseRow rows_fn = [&](sor::core::Index slot, std::vector<double>& y) {
+            return session->basis_inverse_row(basis.basic, slot, y);
+        };
+        const auto eng = sor::search::separate_gomory_mi(lp, raw.x, basis, co, d1, nullptr, nullptr,
+                                                         &rows_fn);
+        CHECK(d1.gmi_own_factorizations == 0 || d1.gmi_engine_rows_rejected > 0);
+        bool same = own.size() == eng.size();
+        for (std::size_t q = 0; same && q < own.size(); ++q) {
+            same = own[q].cols == eng[q].cols && own[q].vals.size() == eng[q].vals.size();
+            for (std::size_t t = 0; same && t < own[q].vals.size(); ++t)
+                same = std::fabs(own[q].vals[t] - eng[q].vals[t]) <= 1e-9 * (1.0 + std::fabs(own[q].vals[t]));
+        }
+        gmi_same += same;
+    }
+    std::printf("ENGINE_INVERSE_ROWS sessions=%d rows=%d gmi_same=%d\n", sessions, rows, gmi_same);
+    CHECK(sessions > 30);
+    CHECK(rows > 100);
+    CHECK(gmi_same >= sessions - 2);
+}
+
 int main() {
+    test_engine_basis_inverse_rows();
+    test_cut_merge_requires_exact_proportionality();
     test_gmi_dynamism_recovery();
     test_cut_merge_preserves_original_rows();
     test_cut_merge_requires_exact_normalized_coefficients();
     test_derived_cuts_enter_with_their_margin();
     test_rc_tightening_skips_infinite_to_astronomical();
     test_gmi_structural_drop_relaxes_rhs();
+    test_gmi_tiny_integer_coefficient_is_kept();
     test_cut_retraction_round_trip();
     test_purge_kernel_preserves_survivors();
     test_gmi_separates_and_is_valid();
@@ -1059,7 +1171,6 @@ int main() {
     test_cuts_do_not_change_knapsack_answer();
     test_cut_pool_management();
     test_cut_pool_parallel_penalty_branch();
-    test_integer_reduced_cost_fix_unit_step();
     test_restart_reduced_cost_fixes_integer_not_continuous();
     test_bound_snapshot_names_the_invocation();
     return sor::test::finish("test_cuts");

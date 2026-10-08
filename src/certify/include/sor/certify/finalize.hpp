@@ -126,6 +126,62 @@ std::vector<RcBoundChange> safe_reduced_cost_tightenings(
     f64 cutoff_min, SafeLpBound* bound_out = nullptr,
     std::uint64_t* candidates_out = nullptr);
 
+// The same tightening at interval cost, for every node LP. Each reduced
+// cost d_j = (sense c - A'y)_j is enclosed in [d_lo_j, d_hi_j] (long double
+// accumulation, Higham's bound gamma_{k+2} * sum |terms| per column), the
+// Lagrangian's minimum over the box is bounded below by L, every term taken
+// at its worst corner, and a column charged to its finite lower bound l
+// (d_lo > 0) keeps x_j <= l + floor(up((cutoff_min - L) / d_lo)): a point
+// t units above l costs at least L + d_lo t, and the floor of an upward
+// quotient keeps every t the exact arithmetic would keep. Symmetrically at
+// the upper bound. Not finite (no changes) when a column whose sign the
+// enclosure cannot decide, or that needs an infinite bound, would enter L:
+// the exact routine above is the fallback, not this one. `sides` (optional)
+// receives, per column, which of its bounds L rests on: bit 0 the lower,
+// bit 1 the upper (both when the sign is undecided).
+struct IntervalRcFixing {
+    bool finite = false;
+    f64 bound = 0.0;   // L, minimization sense, rounded down
+    std::vector<RcBoundChange> changes;
+};
+IntervalRcFixing interval_reduced_cost_tightenings(
+    const model::LpProblem& problem, const std::vector<f64>& y_min,
+    const std::vector<f64>& col_lo, const std::vector<f64>& col_hi,
+    f64 cutoff_min, const std::vector<char>* integer_mask,
+    std::vector<unsigned char>* sides = nullptr);
+
+// The enclosure both of the above rest on: d_j in [lo_j, hi_j] (f64,
+// rounded outward) for d = sense c - A'y, and the Lagrangian L over
+// [col_lo, col_hi] rounded down. finite = false when a multiplier sits on a
+// side its row does not have, or a column needs an infinite bound.
+struct RcEnclosure {
+    bool finite = false;
+    f64 bound = 0.0;
+    std::vector<f64> lo, hi;
+};
+RcEnclosure enclose_reduced_costs(const model::LpProblem& problem,
+                                  const std::vector<f64>& y_min,
+                                  const std::vector<f64>& col_lo,
+                                  const std::vector<f64>& col_hi);
+// Same from sums a caller already accumulated in long double, row by row:
+// aty_j = sum_i y_i a_ij over cnt_j products and ab_j = sum_i |y_i a_ij|.
+RcEnclosure enclose_reduced_costs_from_sums(const model::LpProblem& problem,
+                                            const std::vector<f64>& y_min,
+                                            const std::vector<long double>& aty,
+                                            const std::vector<long double>& ab,
+                                            const std::vector<std::uint32_t>& cnt,
+                                            const std::vector<f64>& col_lo,
+                                            const std::vector<f64>& col_hi);
+// The tightenings of interval_reduced_cost_tightenings from an enclosure of
+// the same box (rc_lo / rc_hi / bound as in RawResult or RcEnclosure).
+IntervalRcFixing reduced_cost_tightenings_from(const std::vector<f64>& rc_lo,
+                                               const std::vector<f64>& rc_hi, f64 bound,
+                                               const std::vector<f64>& col_lo,
+                                               const std::vector<f64>& col_hi,
+                                               f64 cutoff_min,
+                                               const std::vector<char>& integer_mask,
+                                               std::vector<unsigned char>* sides = nullptr);
+
 // LP-based conflict analysis (plan 3H; Witzig, Berthold & Heinz): from a
 // Farkas ray y proving {row sides, box [col_lo, col_hi]} infeasible, the
 // bounds the proof actually uses that are tighter than the root box

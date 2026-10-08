@@ -1,3 +1,4 @@
+#include "sor/model/dyadic.hpp"
 #include "sor/search/cuts.hpp"
 #include "sor/core/work_clock.hpp"
 #include "sor/search/mir.hpp"
@@ -441,7 +442,8 @@ std::vector<CutRow> CutPool::select_violated(const std::vector<f64>& x,
 bool relax_small_terms(std::vector<Index>& cols, std::vector<f64>& vals, f64& rhs,
                        bool geq, const std::vector<f64>& lo,
                        const std::vector<f64>& hi, f64 dynamism_max,
-                       std::vector<std::pair<Index, f64>>* used_bounds) {
+                       const std::vector<f64>* root_lo,
+                       const std::vector<f64>* root_hi, bool* used_local) {
     if (cols.size() != vals.size() || cols.empty() || !(dynamism_max > 1.0))
         return false;
     f64 max_abs = 0.0;
@@ -450,7 +452,7 @@ bool relax_small_terms(std::vector<Index>& cols, std::vector<f64>& vals, f64& rh
     const f64 thr = max_abs / dynamism_max;
     std::vector<Index> kept_cols;
     std::vector<f64> kept_vals;
-    std::vector<std::pair<Index, f64>> used;
+    bool local = false;
     f64 new_rhs = rhs;
     for (std::size_t k = 0; k < cols.size(); ++k) {
         const f64 v = vals[k];
@@ -467,14 +469,14 @@ bool relax_small_terms(std::vector<Index>& cols, std::vector<f64>& vals, f64& rh
         const f64 bound = use_lower ? lo[sz(cols[k])] : hi[sz(cols[k])];
         if (!std::isfinite(bound)) return false;
         new_rhs -= v * bound;
-        used.emplace_back(cols[k], bound);
+        if (!root_implies_bound(root_lo, root_hi, cols[k], !use_lower, bound))
+            local = true;
     }
     if (kept_cols.empty() || !std::isfinite(new_rhs)) return false;
     cols = std::move(kept_cols);
     vals = std::move(kept_vals);
     rhs = new_rhs;
-    if (used_bounds != nullptr)
-        used_bounds->insert(used_bounds->end(), used.begin(), used.end());
+    if (used_local != nullptr && local) *used_local = true;
     return true;
 }
 
@@ -577,7 +579,10 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
                                        const std::vector<f64>& x,
                                        const engines::SimplexBasis& basis,
                                        const CutOptions& opts,
-                                       CutDiagnostics& diag) {
+                                       CutDiagnostics& diag,
+                                       const std::vector<f64>* root_lo,
+                                       const std::vector<f64>* root_hi,
+                                       const BasisInverseRow* inverse_row) {
     core::WorkScope work_scope_(core::WorkCat::Separation);
     SOR_FN();
     const Index m = lp.n_rows();
@@ -596,38 +601,47 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
     const auto& ari = Acsc.pattern.row_idx();
     const auto& acv = Acsc.vals;
 
-    std::vector<core::Offset> bcol_ptr(sz(m) + 1, 0);
-    std::vector<Index> brow_idx;
-    std::vector<f64> bvals;
-    brow_idx.reserve(sz(lp.nnz()));
-    bvals.reserve(sz(lp.nnz()));
     for (Index slot = 0; slot < m; ++slot) {
         const Index bj = basis.basic[sz(slot)];
-        if (bj >= 0 && bj < ns) {
-            for (core::Offset k = acp[sz(bj)]; k < acp[sz(bj) + 1]; ++k) {
-                brow_idx.push_back(ari[sz(k)]);
-                bvals.push_back(acv[sz(k)]);
-            }
-        } else if (bj >= ns && bj < nt) {
-            brow_idx.push_back(bj - ns);
-            bvals.push_back(-1.0);
-        } else {
-            return {};  // malformed basis
-        }
-        bcol_ptr[sz(slot) + 1] = static_cast<core::Offset>(brow_idx.size());
+        if (bj < 0 || bj >= nt) return {};  // malformed basis
     }
-
+    // GMI's own factorization of the basis, built only when the engine's
+    // rows are unavailable or fail their check.
     la::BasisFactor factor;
-    la::LuOptions lu_opts;
-    std::vector<Index> singular_slots, vacant_rows;
-    const bool factored = factor.factorize(m, bcol_ptr, brow_idx, bvals, lu_opts,
-                                           &singular_slots, &vacant_rows);
-    // A partially-repaired factorization does not represent the true B^-1;
-    // skip this round rather than derive a cut from the wrong inverse.
-    if (!factored || !factor.is_valid()) {
-        ++diag.gmi_invalid_factor;
-        return {};
-    }
+    bool own_factor_tried = false, own_factor_ok = false;
+    const auto own_factor = [&]() -> bool {
+        if (own_factor_tried) return own_factor_ok;
+        own_factor_tried = true;
+        std::vector<core::Offset> bcol_ptr(sz(m) + 1, 0);
+        std::vector<Index> brow_idx;
+        std::vector<f64> bvals;
+        brow_idx.reserve(sz(lp.nnz()));
+        bvals.reserve(sz(lp.nnz()));
+        for (Index slot = 0; slot < m; ++slot) {
+            const Index bj = basis.basic[sz(slot)];
+            if (bj < ns) {
+                for (core::Offset k = acp[sz(bj)]; k < acp[sz(bj) + 1]; ++k) {
+                    brow_idx.push_back(ari[sz(k)]);
+                    bvals.push_back(acv[sz(k)]);
+                }
+            } else {
+                brow_idx.push_back(bj - ns);
+                bvals.push_back(-1.0);
+            }
+            bcol_ptr[sz(slot) + 1] = static_cast<core::Offset>(brow_idx.size());
+        }
+        la::LuOptions lu_opts;
+        std::vector<Index> singular_slots, vacant_rows;
+        const bool factored = factor.factorize(m, bcol_ptr, brow_idx, bvals, lu_opts,
+                                               &singular_slots, &vacant_rows);
+        ++diag.gmi_own_factorizations;
+        // A partially-repaired factorization does not represent the true B^-1;
+        // no cut is derived from the wrong inverse.
+        own_factor_ok = factored && factor.is_valid();
+        if (!own_factor_ok) ++diag.gmi_invalid_factor;
+        return own_factor_ok;
+    };
+    if (inverse_row == nullptr && !own_factor()) return {};
 
     // ---- per-column bookkeeping over the augmented [A | -I] space --------
     std::vector<char> is_basic(sz(nt), 0);
@@ -669,6 +683,13 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
     std::vector<CutRow> cuts;
     constexpr f64 kZeroTol = 1e-11;
     int cmir_attempts = 0;
+    // Provenance: a structural column's bound the derivation consumed is a
+    // global fact only when the root box implies it. A logical's bounds are
+    // its row's sides, which belong to the rows of `lp`.
+    const bool root_known = root_lo != nullptr && root_hi != nullptr;
+    const auto global_bound = [&](Index z, bool upper, f64 b) {
+        return z >= ns || root_implies_bound(root_lo, root_hi, z, upper, b);
+    };
 
     struct TableauCandidate {
         Index slot;
@@ -737,33 +758,61 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
         if (basic_activity) ++diag.integer_activity_candidates;
 
         // y = B^-T e_slot: row `slot` of the tableau is y' A (structural)
-        // and -y (slack), computed with one CSR sweep below.
-        std::vector<f64> y(sz(m), 0.0);
-        y[sz(slot)] = 1.0;
-        factor.btran(y);
-
-        // Rows with y_i = 0 add exact zeros: skipping them leaves tab
-        // bit-identical and makes the sweep cost y's support, not nnz(A).
+        // and -y (slack), computed with one CSR sweep below. From the
+        // engine's factor when it supplies the row and the row passes its
+        // check (the tableau's basic columns form the unit vector e_slot),
+        // else from GMI's own factorization.
+        std::vector<f64> y;
         std::vector<f64> tab(sz(nt), 0.0);
-        std::uint64_t swept = static_cast<std::uint64_t>(nt);
-        for (Index i = 0; i < m; ++i) {
-            if (y[sz(i)] == 0.0) continue;
-            swept += static_cast<std::uint64_t>(rp[sz(i) + 1] - rp[sz(i)]);
-            for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
-                tab[sz(ci[sz(k)])] += y[sz(i)] * av[sz(k)];
+        const auto sweep = [&]() {
+            // Rows with y_i = 0 add exact zeros: skipping them leaves tab
+            // bit-identical and makes the sweep cost y's support, not nnz(A).
+            std::fill(tab.begin(), tab.end(), 0.0);
+            std::uint64_t swept = static_cast<std::uint64_t>(nt);
+            for (Index i = 0; i < m; ++i) {
+                if (y[sz(i)] == 0.0) continue;
+                swept += static_cast<std::uint64_t>(rp[sz(i) + 1] - rp[sz(i)]);
+                for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
+                    tab[sz(ci[sz(k)])] += y[sz(i)] * av[sz(k)];
+            }
+            for (Index i = 0; i < m; ++i) tab[sz(ns + i)] = -y[sz(i)];
+            core::work_add(swept, ::sor::core::WorkTag::Gmi);
+        };
+        bool have_row = false;
+        if (inverse_row != nullptr && (*inverse_row)(slot, y) && y.size() == sz(m)) {
+            sweep();
+            bool unit = true;
+            for (Index k = 0; k < m && unit; ++k) {
+                const f64 want = k == slot ? 1.0 : 0.0;
+                const f64 got = tab[sz(basis.basic[sz(k)])];
+                if (!(std::fabs(got - want) <= 1e-9)) unit = false;
+            }
+            if (unit) {
+                have_row = true;
+                ++diag.gmi_engine_rows;
+            } else {
+                ++diag.gmi_engine_rows_rejected;
+            }
         }
-        for (Index i = 0; i < m; ++i) tab[sz(ns + i)] = -y[sz(i)];
-        core::work_add(swept, ::sor::core::WorkTag::Gmi);
+        if (!have_row) {
+            if (!own_factor()) break;
+            y.assign(sz(m), 0.0);
+            y[sz(slot)] = 1.0;
+            factor.btran(y);
+            sweep();
+        }
 
         CutRow gmi_cut;
         bool have_gmi = false;
         f64 gmi_eff = -1.0;
         // Outer-level `continue` below leaves this block (the condition is
         // false), so a refused GMI still falls through to the c-MIR attempt.
+        bool gmi_local = !root_known;
         do {
         std::vector<f64> struct_coef(sz(ns), 0.0);
         f64 rhs = 1.0;
         bool reject_free = false;
+        gmi_local = !root_known;
         for (Index j = 0; j < nt; ++j) {
             if (is_basic[sz(j)]) continue;
             const f64 alpha = tab[sz(j)];
@@ -777,6 +826,9 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
             const bool at_lower = (st == engines::NonbasicStatus::AtLower);
             const f64 gamma = at_lower ? alpha : -alpha;
             const f64 active_bound = at_lower ? lo[sz(j)] : hi[sz(j)];
+            // The term is z_j shifted onto active_bound (t >= 0): that bound
+            // is what the cut assumes about z_j.
+            if (!global_bound(j, !at_lower, active_bound)) gmi_local = true;
             // Complementing an integer variable about a fractional bound
             // makes the transformed variable nonintegral. Such a term must
             // use the continuous MIR coefficient, including for structural
@@ -801,23 +853,12 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
             } else {
                 coeff = (gamma >= 0.0) ? (gamma / f0) : (-gamma / (1.0 - f0));
             }
-            if (coeff <= kZeroTol) {
-                // A5: dropping this term silently is exact only when the
-                // coeff*bound contribution it would have added to rhs
-                // (lines below, for a kept term) is itself exactly 0. A
-                // rounded-to-~0 coefficient times a large or infinite bound
-                // is not negligible, and omitting it can produce a cut that
-                // excludes a feasible point. Refuse the candidate rather
-                // than risk that -- cheaper and safer than deriving the
-                // exact relaxation for every case here.
-                const f64 bound = at_lower ? lo[sz(j)] : hi[sz(j)];
-                if (bound != 0.0) {
-                    reject_free = true;
-                    ++diag.rejected_dropped_term_bound;
-                    break;
-                }
-                continue;
-            }
+            // coeff >= 0 multiplies t >= 0 in a >= cut, so no positive
+            // coefficient may be dropped here however small: the cut would
+            // claim more than the row gives wherever t is large. A tiny one
+            // is kept and leaves below, through the structural bound step,
+            // which moves its largest contribution into the right-hand side.
+            if (coeff == 0.0) continue;
 
             const f64 local = at_lower ? coeff : -coeff;
             if (at_lower) rhs += coeff * lo[sz(j)];
@@ -849,6 +890,7 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
                     break;
                 }
                 rhs -= v * bound;
+                if (!global_bound(k, v > 0.0, bound)) gmi_local = true;
                 continue;
             }
             cols.push_back(k);
@@ -864,7 +906,7 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
         if (max_abs / std::max(min_abs, 1e-300) > opts.dynamism_max &&
             opts.relax_small_terms &&
             relax_small_terms(cols, vals_out, rhs, true, lp.col_lo, lp.col_hi,
-                              opts.dynamism_max)) {
+                              opts.dynamism_max, root_lo, root_hi, &gmi_local)) {
             ++diag.dynamism_repaired;
             max_abs = 0.0;
             min_abs = std::numeric_limits<f64>::infinity();
@@ -897,6 +939,9 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
                     vals_out = std::move(new_vals);
                     rhs = new_rhs;
                     ++diag.cmir_recovered;
+                    // The re-rounding substitutes onto lp's box and reports
+                    // no provenance: the cut stays where it was derived.
+                    gmi_local = true;
                 }
             }
             if (!recovered) {
@@ -920,6 +965,7 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
         gmi_cut.vals = std::move(vals_out);
         gmi_cut.row_lo = rhs;
         gmi_cut.row_hi = model::kInf;
+        gmi_cut.used_local_bound = gmi_local;
         gmi_eff = violation / std::sqrt(gnorm2);
         have_gmi = true;
         } while (false);
@@ -971,6 +1017,15 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
                 v.integral = integral_z(j) && is_integral_bound(v.bound);
                 tv.push_back(v);
             }
+            // Every shifted term assumes its bound; a fixed one is a
+            // constant, which assumes both.
+            bool tc_local = !root_known;
+            for (const TabVar& v : tv) {
+                if (!global_bound(v.z, v.at_upper, v.bound)) tc_local = true;
+                if (v.fixed && !global_bound(v.z, !v.at_upper, v.at_upper ? lo[sz(v.z)]
+                                                                          : hi[sz(v.z)]))
+                    tc_local = true;
+            }
             std::vector<std::pair<Index, f64>> wz;
             f64 rz = 0.0;
             if (ok && tv.size() >= 2 &&
@@ -997,7 +1052,8 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
                     if (mx / mn > opts.dynamism_max)
                         good = opts.relax_small_terms &&
                                relax_small_terms(cc, vv, crhs, true, lp.col_lo,
-                                                 lp.col_hi, opts.dynamism_max);
+                                                 lp.col_hi, opts.dynamism_max,
+                                                 root_lo, root_hi, &tc_local);
                 }
                 if (good) {
                     f64 act = 0.0, n2 = 0.0;
@@ -1015,6 +1071,7 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
                         gmi_cut.vals = std::move(vv);
                         gmi_cut.row_lo = crhs;
                         gmi_cut.row_hi = model::kInf;
+                        gmi_cut.used_local_bound = tc_local;
                         gmi_eff = eff;
                         have_gmi = true;
                     }
@@ -1169,16 +1226,11 @@ void apply_cuts_inplace(model::LpProblem& lp,
     };
     // The stored row is the one every consumer reads as data, so a cut
     // derived in floating point enters with its outward margin
-    // (CutOptions::derived_cut_*_margin); exact integer rows enter unchanged.
-    const auto exact_integer_data = [](f64 v) {
-        return !std::isfinite(v) ||
-               (std::fabs(v) < 9007199254740992.0 && v == std::round(v));
-    };
+    // (CutOptions::derived_cut_*_margin). Only a row its separator derived
+    // exactly (CutRow::exact) enters unchanged: integer-looking final data
+    // does not show how it was derived.
     const auto with_margin = [&](const CutRow& in) -> CutRow {
-        bool exact = exact_integer_data(in.row_lo) && exact_integer_data(in.row_hi);
-        for (std::size_t k = 0; k < in.vals.size() && exact; ++k)
-            exact = std::isfinite(in.vals[k]) && exact_integer_data(in.vals[k]);
-        if (exact) return in;
+        if (in.exact) return in;
         CutRow out = in;
         f64 reach_sum = 0.0;
         for (std::size_t k = 0; k < in.cols.size(); ++k) {
@@ -1224,9 +1276,47 @@ void apply_cuts_inplace(model::LpProblem& lp,
                 row_signature(pending[q].cols, pending[q].vals, rsc);
             }
             if (rsc == 0.0) continue;
-            const f64 ratio = rsc / cs;
-            f64 lo = cut.row_lo * ratio, hi = cut.row_hi * ratio;
-            if (ratio < 0.0) std::swap(lo, hi);
+            // The signature compares rounded ratios, which is a candidate
+            // index, not a proof of proportionality: with N = 2^52 the rows
+            // (N+1, N) and (N, N-1) share a signature. Tightening a row with
+            // a non-proportional cut's side can cut off points both admit,
+            // so proportionality is checked exactly (r_k cs == c_k rsc), and
+            // the side is mapped exactly (s rsc / cs) and rounded outward.
+            {
+                const std::vector<f64>* rv = &rvals;
+                if (i >= m0) rv = &pending[static_cast<std::size_t>(i - m0)].vals;
+                bool proportional = rv->size() == cut.vals.size();
+                for (std::size_t k = 0; k < cut.vals.size() && proportional; ++k) {
+                    model::DyadicSum d;
+                    d.add_product((*rv)[k], cs);
+                    d.add_product(-cut.vals[k], rsc);
+                    proportional = d.is_zero();
+                }
+                if (!proportional) {
+                    if (max_row_parallelism(lp, col_rows, cut) > opts.parallel_to_row_max)
+                        continue;
+                    pending.push_back(cut);
+                    continue;
+                }
+            }
+            const bool flip = (rsc < 0.0) != (cs < 0.0);
+            // Image of a cut side in the row's scale, rounded outward for
+            // the row side it bounds (upper: up, lower: down).
+            const auto image = [&](f64 side, bool bounds_upper) {
+                if (!std::isfinite(side))
+                    return bounds_upper ? model::kInf : -model::kInf;
+                model::DyadicSum v;
+                v.add_product(side, rsc);
+                return bounds_upper ? v.quotient_up(cs) : v.quotient_down(cs);
+            };
+            f64 lo, hi;
+            if (!flip) {
+                lo = image(cut.row_lo, false);
+                hi = image(cut.row_hi, true);
+            } else {
+                lo = image(cut.row_hi, false);
+                hi = image(cut.row_lo, true);
+            }
             if (i < m0) {
                 if (undo != nullptr) {
                     // First touch of this row in this round: save the bounds

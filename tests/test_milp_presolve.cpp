@@ -16,6 +16,8 @@
 #include <string>
 
 using sor::core::Status;
+using sor::core::Index;
+using sor::core::f64;
 using sor::search::MilpPresolveOptions;
 using sor::search::MilpPresolveStats;
 using sor::search::run_structural_presolve;
@@ -40,6 +42,7 @@ void test_short_binary_row_support_fixes_and_postsolves() {
     lp.row_lo = lp.row_hi = {4.};
     MilpPresolveOptions opts;
     opts.probing_presolve = false;   // these tests isolate one reduction at a time
+    opts.aggregation = false;
     MilpPresolveStats stats;
     const auto pre = run_structural_presolve(lp, opts, stats);
     CHECK(!pre.infeasible);
@@ -65,6 +68,7 @@ void test_global_propagation_prepares_structural_support() {
     lp.row_lo = {4.,-sor::model::kInf}; lp.row_hi = {4.,0.};
     MilpPresolveOptions opts;
     opts.probing_presolve = false;   // these tests isolate one reduction at a time
+    opts.aggregation = false;
     MilpPresolveStats stats;
     const auto pre = run_structural_presolve(lp, opts, stats);
     CHECK(!pre.infeasible);
@@ -94,6 +98,7 @@ void test_structural_joint_assignments_detect_integer_infeasibility() {
     lp.is_integer.assign(3,1); lp.row_lo=lp.row_hi={1.,1.,1.};
     MilpPresolveOptions opts;
     opts.probing_presolve = false;   // these tests isolate one reduction at a time
+    opts.aggregation = false;
     MilpPresolveStats stats;
     const auto pre=run_structural_presolve(lp,opts,stats);
     CHECK(pre.infeasible);
@@ -107,6 +112,7 @@ void test_structural_binary_relations_postsolve() {
     lp.is_integer.assign(3,1);lp.row_lo=lp.row_hi={1.,1.};
     MilpPresolveOptions opts;
     opts.probing_presolve = false;   // these tests isolate one reduction at a time
+    opts.aggregation = false;
     MilpPresolveStats stats;
     const auto pre=run_structural_presolve(lp,opts,stats);
     CHECK(!pre.infeasible);
@@ -129,6 +135,7 @@ void test_conflict_components_become_reversible_relations() {
     lp.row_lo = lp.row_hi = {0.,1.};
     MilpPresolveOptions opts;
     opts.probing_presolve = false;   // these tests isolate one reduction at a time
+    opts.aggregation = false;
     opts.structural_fbbt = false;
     opts.binary_row_support = false;
     opts.row_probe.enabled = false;
@@ -156,6 +163,7 @@ void test_structural_relation_budgets_and_fixed_representative() {
     lp.row_lo={0.,1.};lp.row_hi={0.,sor::model::kInf};
     MilpPresolveOptions opts;
     opts.probing_presolve = false;   // these tests isolate one reduction at a time
+    opts.aggregation = false;
     opts.row_probe.max_row_visits_per_branch=2;
     MilpPresolveStats stats;
     auto pre=run_structural_presolve(lp,opts,stats);
@@ -181,6 +189,7 @@ void test_structural_relations_reject_rounded_rewrites() {
     lp.row_lo={0.,-sor::model::kInf};lp.row_hi={0.,2e16};
     MilpPresolveOptions opts;
     opts.probing_presolve = false;   // these tests isolate one reduction at a time
+    opts.aggregation = false;
     // Isolates the substitution's numerical guard: coefficient strengthening
     // would drop the 1e16 row as activity-redundant before it is reached.
     opts.coefficient_strengthening=false;
@@ -261,6 +270,7 @@ void test_joint_support_mixed_domain_retention() {
         MilpPresolveOptions opts;
         opts.monotone_binary_pairs = false;  // this oracle requires EVERY feasible point
         opts.probing_presolve = false;   // these tests isolate one reduction at a time
+    opts.aggregation = false;
         opts.row_probe.max_row_visits_per_branch=example%2?2:10000;
         opts.row_probe.max_row_overlap=example%3?1.0:0.5;
         opts.graph_relation_probe = example % 2 == 0;
@@ -409,6 +419,7 @@ void test_short_binary_rows_retain_every_feasible_assignment() {
         MilpPresolveOptions opts;
         opts.monotone_binary_pairs = false;  // isolate primal support retention
         opts.probing_presolve = false;   // these tests isolate one reduction at a time
+    opts.aggregation = false;
         MilpPresolveStats stats;
         const auto pre = run_structural_presolve(lp, opts, stats);
         CHECK(!pre.infeasible);
@@ -435,6 +446,7 @@ void test_binary_row_support_budget_and_continuous_guard() {
     lp.is_integer = {1, 0}; lp.row_lo = lp.row_hi = {1.};
     MilpPresolveOptions opts;
     opts.probing_presolve = false;   // these tests isolate one reduction at a time
+    opts.aggregation = false;
     opts.structural_fbbt = false;  // isolate the binary support budget/guard
     opts.row_probe.enabled = false;
     MilpPresolveStats stats;
@@ -476,10 +488,113 @@ BOUNDS
 ENDATA
 )";
 
+// Exactness of structural presolve (audit section 2). Each model is the
+// audit's hand-derived counterexample; every number in it is a double.
+sor::model::LpProblem exact_model(std::vector<double> c, std::vector<double> lo,
+                                  std::vector<double> hi, std::vector<char> integer,
+                                  std::vector<double> row_lo, std::vector<double> row_hi,
+                                  std::vector<sor::core::Index> ri,
+                                  std::vector<sor::core::Index> rj,
+                                  std::vector<double> rv) {
+    sor::model::LpProblem lp;
+    lp.c = std::move(c);
+    lp.col_lo = std::move(lo);
+    lp.col_hi = std::move(hi);
+    lp.is_integer.assign(integer.begin(), integer.end());
+    lp.row_lo = std::move(row_lo);
+    lp.row_hi = std::move(row_hi);
+    lp.A = sor::sparse::from_triplets(static_cast<sor::core::Index>(lp.row_lo.size()),
+                                      static_cast<sor::core::Index>(lp.c.size()), ri, rj, rv);
+    lp.validate();
+    return lp;
+}
+
+// The optimum of the reduced model when it has no rows: every column at its
+// cheaper bound; postsolved and priced in the original model.
+double box_optimum_after_presolve(const sor::model::LpProblem& lp) {
+    MilpPresolveOptions opts;
+    opts.probing_presolve = false;
+    MilpPresolveStats stats;
+    auto pre = run_structural_presolve(lp, opts, stats);
+    CHECK(!pre.infeasible);
+    CHECK(pre.reduced.n_rows() == 0);
+    std::vector<double> xr(static_cast<std::size_t>(pre.reduced.n_cols()));
+    for (std::size_t k = 0; k < xr.size(); ++k)
+        xr[k] = pre.reduced.c[k] >= 0.0 ? pre.reduced.col_lo[k] : pre.reduced.col_hi[k];
+    const auto x = postsolve_point(pre, xr);
+    CHECK(lp.max_bound_violation(x) == 0.0);
+    return lp.objective(x);
+}
+
+void test_narrow_continuous_column_keeps_its_optimum() {
+    // x in [0, 2^-40] with cost -2^40: optimum -1 at the upper bound. Fixing
+    // the narrow column at its midpoint gave -1/2.
+    const auto lp = exact_model({-0x1p40, 0.0}, {0.0, 0.0}, {0x1p-40, 0.0}, {0, 1},
+                                {}, {}, {}, {}, {});
+    CHECK(box_optimum_after_presolve(lp) == -1.0);
+}
+
+void test_fixed_column_substitution_is_exact() {
+    // p, r, q fixed to 1, M = 2^54: M p - M r + q = 1 holds exactly. A
+    // rounded running subtraction of the sides left 0 = -1 (infeasible).
+    const double M = 0x1p54;
+    const auto lp = exact_model({0.0, 0.0, 0.0, 1.0}, {1.0, 1.0, 1.0, 0.0},
+                                {1.0, 1.0, 1.0, 5.0}, {1, 1, 1, 0},
+                                {1.0, 0.0}, {1.0, sor::model::kInf},
+                                {0, 0, 0, 1}, {0, 1, 2, 3}, {M, -M, 1.0, 1.0});
+    MilpPresolveOptions opts;
+    opts.probing_presolve = false;
+    MilpPresolveStats stats;
+    auto pre = run_structural_presolve(lp, opts, stats);
+    CHECK(!pre.infeasible);
+}
+
+void test_duplicate_column_merge_needs_an_exact_domain() {
+    // Integer x in [0, 2^53], y in [0, 1], identical columns and costs: the
+    // merged domain [0, 2^53 + 1] is not a double. Merging into [0, 2^53]
+    // loses (2^53, 1), the optimum (-2^53 - 1).
+    // x + y - z = 0 with z continuous in [0, 2^54] keeps the columns
+    // nonempty and the row from being redundant.
+    const auto lp = exact_model({-1.0, -1.0, 0.0}, {0.0, 0.0, 0.0}, {0x1p53, 1.0, 0x1p54},
+                                {1, 1, 0}, {0.0}, {0.0}, {0, 0, 0}, {0, 1, 2},
+                                {1.0, 1.0, -1.0});
+    MilpPresolveOptions opts;
+    opts.probing_presolve = false;
+    MilpPresolveStats stats;
+    auto pre = run_structural_presolve(lp, opts, stats);
+    CHECK(!pre.infeasible);
+    CHECK(stats.merged_cols == 0);
+    CHECK(stats.merge_inexact_skipped >= 1);
+    // A pair whose domain sum is exact still merges.
+    const auto lp2 = exact_model({-1.0, -1.0, 0.0}, {0.0, 0.0, 0.0}, {4.0, 1.0, 16.0},
+                                 {1, 1, 0}, {0.0}, {0.0}, {0, 0, 0}, {0, 1, 2},
+                                 {1.0, 1.0, -1.0});
+    MilpPresolveStats stats2;
+    auto pre2 = run_structural_presolve(lp2, opts, stats2);
+    CHECK(stats2.merged_cols == 1);
+}
+
+void test_singleton_row_bound_is_rounded_outward() {
+    // 3 x <= 1 on continuous x: the bound is 1/3, whose nearest double lies
+    // below it. Rounded to nearest the new bound excluded x = 1/3's
+    // neighbourhood exactly at the side; it must round up.
+    const auto lp = exact_model({-1.0, 1.0}, {0.0, 0.0}, {10.0, 1.0}, {0, 1},
+                                {-sor::model::kInf}, {1.0}, {0}, {0}, {3.0});
+    MilpPresolveOptions opts;
+    opts.probing_presolve = false;
+    MilpPresolveStats stats;
+    auto pre = run_structural_presolve(lp, opts, stats);
+    CHECK(!pre.infeasible);
+    const auto k = pre.reduced_col[0];
+    CHECK(k >= 0);
+    if (k >= 0) CHECK(pre.reduced.col_hi[static_cast<std::size_t>(k)] > 1.0 / 3.0);
+}
+
 void test_fixed_column_eliminated_and_folded_into_row() {
     auto lp = read_text(kFixedColumn);
     MilpPresolveOptions opts;
     opts.probing_presolve = false;   // these tests isolate one reduction at a time
+    opts.aggregation = false;
     MilpPresolveStats stats;
     auto pre = run_structural_presolve(lp, opts, stats);
     CHECK(!pre.infeasible);
@@ -546,6 +661,7 @@ void test_asymptotic_bounds_are_not_fixed() {
     lp.validate();
     MilpPresolveOptions opts;
     opts.probing_presolve = false;   // these tests isolate one reduction at a time
+    opts.aggregation = false;
     MilpPresolveStats stats;
     auto pre = run_structural_presolve(lp, opts, stats);
     CHECK(!pre.infeasible);
@@ -561,6 +677,7 @@ void test_singleton_row_tightens_bound_and_is_dropped() {
     auto lp = read_text(kSingletonRow);
     MilpPresolveOptions opts;
     opts.probing_presolve = false;   // these tests isolate one reduction at a time
+    opts.aggregation = false;
     // R2 (x1 + x2 >= 0, columns >= 0) is activity-redundant too; isolate the
     // singleton-row behaviour under test.
     opts.coefficient_strengthening = false;
@@ -602,6 +719,7 @@ void test_conflicting_singleton_rows_detected_infeasible() {
     auto lp = read_text(kSingletonInfeasible);
     MilpPresolveOptions opts;
     opts.probing_presolve = false;   // these tests isolate one reduction at a time
+    opts.aggregation = false;
     MilpPresolveStats stats;
     auto pre = run_structural_presolve(lp, opts, stats);
     CHECK(pre.infeasible);
@@ -640,6 +758,7 @@ void test_chained_elimination_reaches_fixed_point() {
     auto lp = read_text(kChainedElimination);
     MilpPresolveOptions opts;
     opts.probing_presolve = false;   // these tests isolate one reduction at a time
+    opts.aggregation = false;
     MilpPresolveStats stats;
     auto pre = run_structural_presolve(lp, opts, stats);
     CHECK(!pre.infeasible);
@@ -971,7 +1090,252 @@ void test_side_rounding_moves_sides_to_the_gcd_lattice() {
     }
 }
 
+// Aggregation (aggregate_presolve.hpp). x0, x1 integer in [0,5], y
+// continuous in [ylo, yhi]; r0: x0 + x1 - y = 0, r1: 2 x0 + y <= 8,
+// objective -x0 - 2 x1 + y/2. y is substituted out (y = x0 + x1): r1 becomes
+// 3 x0 + x1 <= 8 and the costs -1/2, -3/2. With y in [0,10] the row implies
+// y's bounds and leaves with it; with y in [0,3] it stays as 0 <= x0+x1 <= 3.
+// Every integer (x0, x1) must be feasible in the reduced model exactly when
+// (x0, x1, x0 + x1) is in the original, with the same objective, and
+// postsolve must give back y exactly.
+void test_aggregation_substitutes_exactly() {
+    for (const double yhi : {10.0, 3.0}) {
+        sor::model::LpProblem lp;
+        lp.A = sor::sparse::from_triplets(2, 3, {0, 0, 0, 1, 1}, {0, 1, 2, 0, 2},
+                                          {1., 1., -1., 2., 1.});
+        lp.c = {-1., -2., .5};
+        lp.col_lo = {0., 0., 0.};
+        lp.col_hi = {5., 5., yhi};
+        lp.is_integer = {1, 1, 0};
+        lp.row_lo = {0., -sor::model::kInf};
+        lp.row_hi = {0., 8.};
+        MilpPresolveOptions opts;
+        opts.probing_presolve = false;
+        opts.structural_fbbt = false;
+        opts.coefficient_strengthening = false;
+        opts.row_probe.enabled = false;
+        MilpPresolveStats stats;
+        auto pre = run_structural_presolve(lp, opts, stats);
+        CHECK(!pre.infeasible);
+        CHECK(stats.aggregated_cols == 1);
+        CHECK(stats.aggregation_rows_removed == (yhi == 10.0 ? 1 : 0));
+        CHECK(pre.reduced.n_cols() == 2);
+        CHECK(pre.eliminated[2] == 1);
+        if (pre.reduced.n_cols() != 2) continue;
+        for (int x0 = 0; x0 <= 5; ++x0)
+            for (int x1 = 0; x1 <= 5; ++x1) {
+                const std::vector<double> x{double(x0), double(x1), double(x0 + x1)};
+                std::vector<double> red(2);
+                for (int j = 0; j < 2; ++j)
+                    if (pre.reduced_col[j] >= 0) red[pre.reduced_col[j]] = x[j];
+                const bool orig_ok = lp.max_row_violation(x) == 0.0 &&
+                                     lp.max_bound_violation(x) == 0.0;
+                const bool red_ok = pre.reduced.max_row_violation(red) == 0.0 &&
+                                    pre.reduced.max_bound_violation(red) == 0.0;
+                CHECK(orig_ok == red_ok);
+                if (!red_ok) continue;
+                CHECK(postsolve_point(pre, red) == x);
+                CHECK(pre.reduced.objective(red) == lp.objective(x));
+            }
+    }
+}
+
+// Integrality survives exactly or nothing happens: an integer column leaves
+// only through a unit coefficient on an all-integer row (2 x0 + 3 x1 = 7 has
+// none), and a rewrite that is not exactly representable is declined
+// (x0 + x1 - 3 y = 0 would give y's cost 1 as 1/3 on x0 and x1).
+void test_aggregation_declines_what_it_cannot_keep_exact() {
+    MilpPresolveOptions opts;
+    opts.probing_presolve = false;
+    opts.structural_fbbt = false;
+    opts.coefficient_strengthening = false;
+    opts.side_rounding = false;
+    opts.row_probe.enabled = false;
+    opts.binary_row_support = false;
+    opts.merge_duplicate_columns = false;   // x0, x1 below are duplicates
+    {
+        sor::model::LpProblem lp;
+        lp.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {2., 3.});
+        lp.c = {1., 1.};
+        lp.col_lo = {0., 0.};
+        lp.col_hi = {10., 10.};
+        lp.is_integer = {1, 1};
+        lp.row_lo = lp.row_hi = {7.};
+        MilpPresolveStats stats;
+        const auto pre = run_structural_presolve(lp, opts, stats);
+        CHECK(stats.aggregated_cols == 0);
+        CHECK(pre.reduced.n_cols() == 2);
+    }
+    {
+        sor::model::LpProblem lp;
+        lp.A = sor::sparse::from_triplets(2, 3, {0, 0, 0, 1, 1}, {0, 1, 2, 0, 1},
+                                          {1., 1., -3., 1., 1.});
+        lp.c = {0., 0., 1.};
+        lp.col_lo = {0., 0., 0.};
+        lp.col_hi = {4., 4., 10.};
+        lp.is_integer = {1, 1, 0};
+        lp.row_lo = {0., -sor::model::kInf};
+        lp.row_hi = {0., 6.};
+        MilpPresolveStats stats;
+        const auto pre = run_structural_presolve(lp, opts, stats);
+        CHECK(stats.aggregated_cols == 0);
+        CHECK(stats.aggregation_inexact_skipped >= 1);
+        CHECK(pre.reduced.n_cols() == 3);
+    }
+}
+
+// Presolve is an EXACT equivalence (the search runs optimality reductions such
+// as dual fixing on the reduced model), never a relaxation of the original:
+// four hand-traced compositions from the 2026-10-08 follow-up audit, each
+// solved through the presolve wrapper. M = 2^54.
+sor::model::LpProblem exactness_model(Index n, const std::vector<f64>& c,
+                                      const std::vector<f64>& lo, const std::vector<f64>& hi,
+                                      const std::vector<Index>& ri, const std::vector<Index>& cj,
+                                      const std::vector<f64>& v, const std::vector<f64>& rlo,
+                                      const std::vector<f64>& rhi, f64 offset = 0.0) {
+    sor::model::LpProblem lp;
+    lp.name = "exactness";
+    lp.A = sor::sparse::from_triplets(static_cast<Index>(rlo.size()), n, ri, cj, v);
+    lp.c = c;
+    lp.col_lo = lo;
+    lp.col_hi = hi;
+    lp.is_integer.assign(static_cast<std::size_t>(n), true);
+    lp.row_lo = rlo;
+    lp.row_hi = rhi;
+    lp.obj_offset = offset;
+    return lp;
+}
+
+f64 solve_presolved(const sor::model::LpProblem& lp, Status& st) {
+    sor::search::BabOptions opts;
+    opts.structural_presolve.enabled = true;
+    opts.para_bab.threads = 1;
+    opts.gap_tol = opts.abs_gap_tol = 0.0;
+    sor::search::BabDiagnostics diag;
+    auto raw = sor::search::solve_milp(lp, opts, diag);
+    const auto res = sor::certify::finalize_result(std::move(raw), sor::search::milp_evidence(diag, opts));
+    st = res.status;
+    return res.objective;
+}
+
+void test_presolve_keeps_rows_cancellation_makes_look_redundant() {
+    // M x + y - M z <= 0, min M (z - x) - 2 y, x, y binary, z in [1, 2].
+    // The maximizing corner (1, 1, 1) sums to 0 in binary64 (exactly 1).
+    const f64 M = 0x1p54;
+    const auto lp = exactness_model(3, {-M, -2.0, M}, {0, 0, 1}, {1, 1, 2}, {0, 0, 0},
+                                    {0, 1, 2}, {M, 1.0, -M}, {-sor::model::kInf}, {0.0});
+    // The reduced model excludes the corner and keeps the optimum (1, 0, 1).
+    MilpPresolveOptions popts;
+    popts.probing_presolve = false;
+    MilpPresolveStats stats;
+    const auto pre = run_structural_presolve(lp, popts, stats);
+    CHECK(!pre.infeasible);
+    CHECK(stats.redundant_by_activity == 0);
+    if (!pre.infeasible) {
+        const auto image = [&](const std::vector<f64>& xo) {
+            std::vector<f64> xr(static_cast<std::size_t>(pre.reduced.n_cols()), 0.0);
+            for (Index j = 0; j < 3; ++j) {
+                const Index k = pre.reduced_col[static_cast<std::size_t>(j)];
+                if (k >= 0) xr[static_cast<std::size_t>(k)] = xo[static_cast<std::size_t>(j)];
+            }
+            return xr;
+        };
+        CHECK(pre.reduced.max_row_violation(image({1.0, 1.0, 1.0})) +
+                  pre.reduced.max_bound_violation(image({1.0, 1.0, 1.0})) > 0.5);
+        CHECK(pre.reduced.max_row_violation(image({1.0, 0.0, 1.0})) == 0.0);
+    }
+    // Solved at the default gap (at gap 0 the LP optimum z = 1 + 2^-54 is
+    // beyond binary64 and the node LP cannot be certified: an LP precision
+    // limit, not a presolve one), the optimum 0 is found and proved.
+    sor::search::BabOptions opts;
+    opts.structural_presolve.enabled = true;
+    opts.para_bab.threads = 1;
+    sor::search::BabDiagnostics diag;
+    auto raw = sor::search::solve_milp(lp, opts, diag);
+    const auto res = sor::certify::finalize_result(std::move(raw), sor::search::milp_evidence(diag, opts));
+    CHECK(res.status == Status::Optimal);
+    CHECK(res.objective == 0.0);   // (1, 0, 1)
+}
+
+void test_presolve_keeps_singleton_rows_no_exact_bound_states() {
+    // M x <= M - 2, min -x, x binary: x = 1 violates by 2, optimum 0.
+    const f64 M = 0x1p54;
+    const auto lp = exactness_model(1, {-1.0}, {0}, {1}, {0}, {0}, {M},
+                                    {-sor::model::kInf}, {M - 2.0});
+    Status st;
+    const f64 obj = solve_presolved(lp, st);
+    CHECK(st == Status::Optimal);
+    CHECK(obj == 0.0);
+}
+
+void test_presolve_keeps_fixed_terms_an_inexact_side_needs() {
+    // M x + r <= M with r fixed at 1, min -x: the residual side M - 1 is no
+    // double; rounded to M it admitted x = 1. Optimum 0.
+    const f64 M = 0x1p54;
+    const auto lp = exactness_model(2, {-1.0, 0.0}, {0, 1}, {1, 1}, {0, 0}, {0, 1},
+                                    {M, 1.0}, {-sor::model::kInf}, {M});
+    Status st;
+    const f64 obj = solve_presolved(lp, st);
+    CHECK(st == Status::Optimal);
+    CHECK(obj == 0.0);
+    // The reduced model itself must exclude x = 1.
+    MilpPresolveOptions popts;
+    popts.probing_presolve = false;
+    MilpPresolveStats stats;
+    const auto pre = run_structural_presolve(lp, popts, stats);
+    CHECK(!pre.infeasible);
+    if (!pre.infeasible) {
+        const Index k = pre.reduced_col[0];
+        if (k >= 0) {
+            std::vector<f64> x(static_cast<std::size_t>(pre.reduced.n_cols()), 0.0);
+            for (Index j = 0; j < pre.reduced.n_cols(); ++j)
+                x[static_cast<std::size_t>(j)] = pre.reduced.col_lo[static_cast<std::size_t>(j)];
+            x[static_cast<std::size_t>(k)] = 1.0;
+            CHECK(pre.reduced.col_hi[static_cast<std::size_t>(k)] < 1.0 ||
+                  pre.reduced.max_row_violation(x) > 0.5);
+        }
+    }
+}
+
+void test_presolve_objective_constant_is_exact() {
+    // q = M and r = 1 fixed, x binary; objective q - r - M x; row
+    // q / M - r + x >= 0 (x >= 0). The constant M - 1 is no double: rounded
+    // to M, the reduced optimum read 0 against the true -1.
+    const f64 M = 0x1p54;
+    const auto lp = exactness_model(3, {1.0, -1.0, -M}, {M, 1, 0}, {M, 1, 1}, {0, 0, 0},
+                                    {0, 1, 2}, {1.0 / M, -1.0, 1.0}, {0.0}, {sor::model::kInf});
+    Status st;
+    const f64 obj = solve_presolved(lp, st);
+    CHECK(st == Status::Optimal);
+    CHECK(obj == -1.0);
+    MilpPresolveOptions popts;
+    popts.probing_presolve = false;
+    MilpPresolveStats stats;
+    const auto pre = run_structural_presolve(lp, popts, stats);
+    CHECK(!pre.infeasible);
+    if (!pre.infeasible) {
+        // Reduced and original objectives agree exactly at the optimum.
+        std::vector<f64> xo{M, 1.0, 1.0};
+        std::vector<f64> xr(static_cast<std::size_t>(pre.reduced.n_cols()), 0.0);
+        for (Index j = 0; j < 3; ++j) {
+            const Index k = pre.reduced_col[static_cast<std::size_t>(j)];
+            if (k >= 0) xr[static_cast<std::size_t>(k)] = xo[static_cast<std::size_t>(j)];
+        }
+        CHECK(pre.reduced.objective(xr) == lp.objective(xo));
+    }
+}
+
 int main() {
+    test_presolve_keeps_rows_cancellation_makes_look_redundant();
+    test_presolve_keeps_singleton_rows_no_exact_bound_states();
+    test_presolve_keeps_fixed_terms_an_inexact_side_needs();
+    test_presolve_objective_constant_is_exact();
+    test_aggregation_substitutes_exactly();
+    test_aggregation_declines_what_it_cannot_keep_exact();
+    test_narrow_continuous_column_keeps_its_optimum();
+    test_fixed_column_substitution_is_exact();
+    test_duplicate_column_merge_needs_an_exact_domain();
+    test_singleton_row_bound_is_rounded_outward();
     test_monotone_pairs_preserve_optimum_and_postsolve();
     test_probing_fixes_and_shrinks();
     test_joint_support_mixed_domain_retention();

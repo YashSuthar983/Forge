@@ -147,7 +147,12 @@ void BalansScheduler::reward(int arm, LnsOutcome outcome, double seconds) {
 
     const bool success = outcome == LnsOutcome::NewBest ||
                          outcome == LnsOutcome::Feasible;
-    if (success) a.fixing_rate -= opts_.fixing_rate_step_down;
+    // A settled neighbourhood (Exhausted: searched to the end, nothing
+    // better) is evidence about a region, not about its size being too large:
+    // with nested neighbourhoods every stricter one is empty too, so it widens
+    // like a success. Only a budget-limited miss (Nothing) asks for a smaller
+    // region.
+    if (success || outcome == LnsOutcome::Exhausted) a.fixing_rate -= opts_.fixing_rate_step_down;
     else a.fixing_rate += opts_.fixing_rate_step_up;
     a.fixing_rate = std::min(std::max(a.fixing_rate, opts_.fixing_rate_min),
                              opts_.fixing_rate_max);

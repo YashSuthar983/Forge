@@ -964,7 +964,34 @@ void test_markshare1_latest_not_false_optimal() {
 
 }  // namespace
 
+// The bounded checkers decide violation on the exact cut activity (audit
+// section 11). Five binaries fixed to 1 and the cut
+// M p + M q + r - M s - M t <= 0 with M = 2^52: its activity at the only
+// feasible point is 1, but the f64 sum in column order reads 0, and both
+// enumerators labeled the invalid cut Verified.
+void test_checkers_use_exact_cut_activity() {
+    const double M = 0x1p52;
+    sor::model::LpProblem lp;
+    lp.c.assign(5, 0.0);
+    lp.col_lo.assign(5, 1.0);
+    lp.col_hi.assign(5, 1.0);
+    lp.is_integer.assign(5, true);
+    lp.A = sor::sparse::from_triplets(0, 5, {}, {}, {});
+    lp.validate();
+    sor::search::CutRow cut;
+    cut.cols = {0, 1, 2, 3, 4};
+    cut.vals = {M, M, 1.0, -M, -M};
+    cut.row_lo = -sor::model::kInf;
+    cut.row_hi = 0.0;
+    CHECK(sor::search::conflict_cut_check_binary(lp, cut) != CutValidity::Verified);
+    CHECK(sor::search::conflict_cut_check_general(lp, cut) != CutValidity::Verified);
+    cut.row_hi = 1.0;   // the valid version
+    CHECK(sor::search::conflict_cut_check_binary(lp, cut) == CutValidity::Verified);
+    CHECK(sor::search::conflict_cut_check_general(lp, cut) == CutValidity::Verified);
+}
+
 int main() {
+    test_checkers_use_exact_cut_activity();
     test_paper_mode_default();
     test_analyze_learns_valid_cut();
     test_latest_bab_learns_global_conflict_cut();

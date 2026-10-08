@@ -3,7 +3,10 @@
 // Two kinds of evidence are kept apart on purpose.
 //   * Objective pseudocosts: LP-bound gain per unit of integer movement, from
 //     PROVED optimal relaxations only. A proved zero gain is a real sample (the
-//     bound really does not move); an incomplete LP contributes nothing.
+//     bound really does not move). An unfinished LP whose multipliers certify
+//     a lower bound gives a CENSORED sample ("the gain is at least g"): kept
+//     apart, never counted toward reliability and never averaged with
+//     completed gains, used only as a floor where no completed sample exists.
 //   * Feasibility usefulness, per direction: how often a branch was certified
 //     closed (infeasible, or cut off by the incumbent) and how many bound
 //     deductions propagation derived in it. Rates, not counts, so a variable
@@ -15,6 +18,7 @@
 
 #include "sor/core/result.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -27,6 +31,7 @@ enum class BranchOutcome {
     CertifiedInfeasible,  // branch proved empty (propagation or verified ray)
     CertifiedCutoff,      // branch proved no better than the incumbent
     DomainOnly,           // survived propagation: feasibility evidence only, no LP
+    Censored,             // unfinished, but a certified LOWER bound on the gain
     Incomplete,           // no certified result: not evidence
 };
 
@@ -42,6 +47,10 @@ struct BranchStats {
     std::vector<std::uint32_t> observed[2];   // certified outcomes (closed or optimal)
     std::vector<f64> inference_sum[2];        // bound deductions in the branch
     std::vector<std::uint32_t> inference_n[2];
+    // Censored objective samples (lower bounds on the unit gain).
+    std::vector<f64> cens_sum[2];
+    std::vector<std::uint32_t> cens_count[2];
+    std::uint64_t censored_samples = 0;
 
     std::uint64_t objective_samples = 0;
     std::uint64_t closure_samples = 0;
@@ -57,6 +66,8 @@ struct BranchStats {
             observed[d].assign(static_cast<std::size_t>(n), 0);
             inference_sum[d].assign(static_cast<std::size_t>(n), 0.0);
             inference_n[d].assign(static_cast<std::size_t>(n), 0);
+            cens_sum[d].assign(static_cast<std::size_t>(n), 0.0);
+            cens_count[d].assign(static_cast<std::size_t>(n), 0);
         }
     }
     Index size() const { return static_cast<Index>(pc_sum[0].size()); }
@@ -75,6 +86,14 @@ struct BranchStats {
         case BranchOutcome::Incomplete:
             ++ignored_incomplete;
             return false;
+        case BranchOutcome::Censored:
+            // Not an outcome of the branch (it was not finished): no closure
+            // or inference evidence, and no completed-sample count.
+            if (!(dist > int_tol) || !(gain == gain)) return false;
+            cens_sum[d][j] += (gain > 0.0 ? gain : 0.0) / dist;
+            ++cens_count[d][j];
+            ++censored_samples;
+            return true;
         case BranchOutcome::ProvedOptimal:
             if (!(dist > int_tol) || !(gain == gain)) return false;
             pc_sum[d][j] += (gain > 0.0 ? gain : 0.0) / dist;
@@ -141,6 +160,18 @@ struct BranchStats {
                 recorded_unit = (gain > 0.0 ? gain : 0.0) / dist;
         }
         return ok;
+    }
+
+    // Unit-gain estimate of (var, dir): the mean of completed samples when
+    // there are any; otherwise `fallback` (the model-wide mean), raised to
+    // the mean of the censored lower bounds when that is larger -- a floor
+    // the true gain is known to exceed, not an estimate of it.
+    f64 pc_estimate(Index var, int dir, f64 fallback) const {
+        const auto j = static_cast<std::size_t>(var);
+        const int d = dir < 0 ? 0 : 1;
+        if (pc_count[d][j]) return pc_sum[d][j] / pc_count[d][j];
+        if (cens_count[d][j]) return std::max(fallback, cens_sum[d][j] / cens_count[d][j]);
+        return fallback;
     }
 
     // Observed rate at which branches of (var, dir) were certified closed,

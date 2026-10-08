@@ -131,7 +131,12 @@ void AlnsScheduler::reward(int arm, LnsOutcome outcome, double seconds) {
     // more), success makes it larger (fix less).
     const bool success = outcome == LnsOutcome::NewBest ||
                          outcome == LnsOutcome::Feasible;
-    if (success) a.fixing_rate -= opts_.fixing_rate_step_down;
+    // A settled neighbourhood (Exhausted: searched to the end, nothing
+    // better) is evidence about a region, not about its size being too large:
+    // with nested neighbourhoods every stricter one is empty too, so it widens
+    // like a success. Only a budget-limited miss (Nothing) asks for a smaller
+    // region.
+    if (success || outcome == LnsOutcome::Exhausted) a.fixing_rate -= opts_.fixing_rate_step_down;
     else a.fixing_rate += opts_.fixing_rate_step_up;
     a.fixing_rate = std::min(std::max(a.fixing_rate, opts_.fixing_rate_min),
                              opts_.fixing_rate_max);
@@ -154,13 +159,25 @@ void AlnsScheduler::reward(int arm, LnsOutcome outcome, double seconds) {
 
 void SolutionPool::add(const std::vector<f64>& x, f64 objective, bool maximize) {
     if (x.empty()) return;
-    for (const auto& e : entries_) {
+    const bool masked = mask_.size() == x.size();
+    for (auto& e : entries_) {
         if (e.x.size() != x.size()) continue;
         bool same = true;
         for (std::size_t k = 0; k < x.size() && same; ++k)
-            if (std::fabs(e.x[k] - x[k]) > 1e-9) same = false;
-        if (same) return;
+            if ((!masked || mask_[k]) && std::fabs(e.x[k] - x[k]) > 1e-9) same = false;
+        if (!same) continue;
+        // One point per pattern: keep the better completion.
+        const bool better = maximize ? objective > e.obj : objective < e.obj;
+        if (!better) return;
+        e = {x, objective};
+        std::sort(entries_.begin(), entries_.end(),
+                  [maximize](const Entry& a, const Entry& b) {
+                      return maximize ? a.obj > b.obj : a.obj < b.obj;
+                  });
+        ++version_;
+        return;
     }
+    ++version_;
     entries_.push_back({x, objective});
     std::sort(entries_.begin(), entries_.end(),
               [maximize](const Entry& a, const Entry& b) {
@@ -427,11 +444,13 @@ bool build_neighborhood(Neighborhood kind,
             }
             if (bins < 4) return false;
             out.replace_objective = true;
-            const f64 inc_obj = mip.objective(x_inc);
-            if (!std::isfinite(inc_obj)) return false;
-            const f64 delta = 1e-4 * (1.0 + std::fabs(inc_obj));
-            out.objective_cutoff = mip.maximize ? inc_obj + delta : inc_obj - delta;
-            out.has_objective_cutoff = true;
+            // The improvement target is the caller's strictly-better cutoff.
+            // Set here as 1e-4 (1 + |f(x_inc)|), it scaled with the objective
+            // constant: shifting the objective by 2^20 demanded an
+            // improvement of ~105 units and emptied a neighbourhood whose
+            // decisions and available gain were unchanged.
+            if (!std::isfinite(mip.objective(x_inc))) return false;
+            out.requires_objective_cutoff = true;
             out.fixed = bins;  // the cutoff row is the restriction here
             break;
         }
