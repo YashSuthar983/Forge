@@ -1,0 +1,19 @@
+# Allow-list: the repo root holds GBs of benchmarks, build trees and backups
+# that must never enter the build context.
+*
+!CMakeLists.txt
+!src
+!apps
+!tests
+!scripts
+!bindings
+!examples
+!web
+!benchmarks/netlib/mps
+!benchmarks/miplib-easy/mps
+!benchmarks/miplib2017/benchmark-v2.test
+
+**/__pycache__
+**/.venv
+**/*.pyc
+web/.venv

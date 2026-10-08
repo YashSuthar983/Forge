@@ -1,0 +1,9 @@
+services:
+  forge:
+    build: .
+    image: forge:latest
+    ports:
+      - "8765:8765"
+    environment:
+      FORGE_WEB_TIMEOUT: "90"
+    restart: unless-stopped
