@@ -30,6 +30,7 @@ forge::search::CutRow le_cut(std::vector<Index> cols, std::vector<double> vals,
     c.row_hi = rhs;
     c.row_lo = -forge::model::kInf;
     c.name = name;
+    c.exact = true;
     return c;
 }
 

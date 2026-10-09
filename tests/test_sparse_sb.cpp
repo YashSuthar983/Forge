@@ -138,6 +138,7 @@ void test_save_load_roundtrip() {
 void test_fallback_without_model() {
     auto lp = read_text(kKnap);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.sparse_sb.enabled = true;
@@ -178,6 +179,7 @@ void test_model_pick_fires() {
 
     auto lp = read_text(kFracBranch);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.branch_strategy = forge::search::BranchStrategy::SparseSb;
@@ -231,6 +233,7 @@ void test_classical_ignores_model() {
 
     auto lp = read_text(kKnap);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Classical;
     opts.sparse_sb.enabled = true;
@@ -251,6 +254,7 @@ void test_collect_out_fit_and_warm_starts() {
     forge::search::SparseSbCollector pool;
     pool.max_samples = 10000;
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.max_nodes = 200;

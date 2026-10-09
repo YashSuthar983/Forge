@@ -26,7 +26,8 @@ using forge::test::oracle::make_branching_ip;
 
 void test_probing_everywhere_matches_oracle() {
     std::uint64_t probes = 0, deductions = 0, closed = 0, session_nodes = 0,
-                  optimal = 0, infeasible = 0, inference_probes = 0, probe_clauses = 0;
+                  optimal = 0, infeasible = 0, inference_probes = 0, probe_clauses = 0,
+                  projected = 0;
     for (std::uint32_t seed = 1; seed <= 3000; ++seed) {
         // Alternate the two families: mixed models (continuous columns,
         // equalities) and pure-integer branching models.
@@ -36,6 +37,8 @@ void test_probing_everywhere_matches_oracle() {
         BabOptions o;
         o.para_bab.threads = 1;
         o.structural_presolve.enabled = false;
+        o.structural_presolve.binary_row_max_work = 0;  // isolate probe learning
+        o.component_solve = false;
         o.gap_tol = o.abs_gap_tol = 1e-9;
         o.max_nodes = 5000;
         o.time_limit_s = 0.0;
@@ -69,6 +72,7 @@ void test_probing_everywhere_matches_oracle() {
         session_nodes += d.rb_reliable_nodes;
         inference_probes += d.domain_probe_runs;
         probe_clauses += d.farkas_probe_clauses;
+        projected += d.farkas_projected;
         const double sense = lp.maximize ? -1.0 : 1.0;
         if (res.status == Status::Optimal) {
             ++optimal;
@@ -99,7 +103,8 @@ void test_probing_everywhere_matches_oracle() {
               << " nodes_closed=" << closed << " session_selected_nodes=" << session_nodes
               << " optimal=" << optimal << " infeasible=" << infeasible << '\n';
     std::cout << "INFERENCE_PROBES runs=" << inference_probes
-              << " farkas_clauses=" << probe_clauses << '\n';
+              << " farkas_clauses=" << probe_clauses
+              << " farkas_projected=" << projected << '\n';
     CHECK(probes > 500);
     CHECK(deductions > 20);
     CHECK(closed > 5);

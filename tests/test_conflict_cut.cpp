@@ -92,7 +92,9 @@ void test_analyze_learns_valid_cut() {
 void test_latest_bab_learns_global_conflict_cut() {
     auto lp = read_text(kPairInfeas);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
+    opts.component_solve = false;  // exercise the original conflict tree
     opts.policy = MilpPolicy::Latest;
     opts.conflict_cut.enabled = true;
     opts.conflict_cut.mode = ConflictCutMode::Paper;
@@ -335,14 +337,22 @@ void test_p0033_latest_learns_mexi_cut() {
     forge::io::MpsReadReport rep;
     auto lp = forge::io::read_mps_file(path, rep);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
+    opts.component_solve = false;  // retain the tree this learning fixture tests
     opts.policy = MilpPolicy::Latest;
     opts.time_limit_s = 15.0;
     opts.feasibility_jump = false;
-    // This regression exercises the conflict trajectory reached with the
-    // light root-cut policy. The default cut selector can close p0033 before
-    // any conflict is generated, making the accounting assertion vacuous.
+    // This regression exercises Mexi on a real conflict tree. Root/tree cut
+    // families can close p0033 before any conflict is generated; keep them
+    // off so the accounting assertion is about conflict learning, not about
+    // whether the cut selector happened to leave a fractional tree.
     opts.auto_cuts = false;
+    opts.cuts_enabled = false;
+    opts.structural_presolve.binary_row_max_work = 0;
+    opts.face_vertices = false;
+    opts.strong_branch_time_s = 0.0;
+    opts.mip_presolve = opts.probing = opts.symmetry = false;
     BabDiagnostics diag;
     forge::search::solve_milp(lp, opts, diag);
     CHECK(diag.conflict_cut_diag.attempts >= 1);
@@ -639,6 +649,7 @@ ENDATA
 
 BabOptions nogood_test_options() {
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.max_nodes = 50;
     opts.feasibility_jump = false;
@@ -652,6 +663,16 @@ BabOptions nogood_test_options() {
     opts.integer_dive = false;
     opts.integer_neighborhood = false;
     opts.conflict_propagation = false;
+    // Latest root services must not replace the branch-trail learning this
+    // fixture exists to hit. strong_branch_time_s=0 disables certified
+    // integer-row splits that close 2(x1+x2+x3)=3 at the root with Split
+    // reasons build_nogood_from_branch_trail cannot read.
+    opts.face_vertices = false;
+    opts.structural_presolve.binary_row_max_work = 0;
+    opts.strong_branch_time_s = 0.0;
+    opts.balans.enabled = false;
+    opts.kernel_pump.enabled = false;
+    opts.mrens.enabled = false;
     return opts;
 }
 
@@ -659,6 +680,7 @@ void test_latest_bab_learns_nogood() {
     auto lp = read_text(kNogoodModel);
     BabOptions opts = nogood_test_options();
     opts.policy = MilpPolicy::Latest;
+    opts.structural_presolve.binary_row_max_work = 0;  // isolate branch nogoods
     opts.conflict_cut.enabled = true;
     opts.conflict_cut.nogood_cuts = true;
     // The LP-row path (kept as the fallback) ...
@@ -753,6 +775,7 @@ void test_flugpl_latest_dual_not_above_opt() {
     forge::io::MpsReadReport rep;
     auto lp = forge::io::read_mps_file(path, rep);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.time_limit_s = 15.0;
@@ -811,6 +834,8 @@ void test_misc03_dense_binary_mexi_auto_off() {
     forge::io::MpsReadReport rep;
     auto lp = forge::io::read_mps_file(path, rep);
     BabOptions opts;
+    opts.component_solve = false;  // Exercise original-space conflict learning.
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.time_limit_s = 8.0;
@@ -858,6 +883,7 @@ void test_enigma_latest_not_false_infeasible() {
     forge::io::MpsReadReport rep;
     auto lp = forge::io::read_mps_file(path, rep);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.time_limit_s = 20.0;
@@ -898,6 +924,7 @@ void test_gen_ip002_latest_not_false_optimal() {
     forge::io::MpsReadReport rep;
     auto lp = forge::io::read_mps_file(path, rep);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.time_limit_s = 25.0;
@@ -946,6 +973,7 @@ void test_markshare1_latest_not_false_optimal() {
     forge::io::MpsReadReport rep;
     auto lp = forge::io::read_mps_file(path, rep);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.time_limit_s = 20.0;

@@ -46,6 +46,7 @@ MilpPresolveResult aggregate_equalities(const model::LpProblem& lp,
     const Index m = lp.n_rows();
     MilpPresolveResult out;
     out.reduced_col.assign(sz(n), -1);
+    out.reduced_row.assign(sz(m), -1);
     out.eliminated.assign(sz(n), 0);
     out.fixed_value.assign(sz(n), 0.0);
 
@@ -103,6 +104,7 @@ MilpPresolveResult aggregate_equalities(const model::LpProblem& lp,
     for (int pass = 0; pass < 3; ++pass) {
         bool changed = false;
         for (Index r = 0; r < m; ++r) {
+            if (core::cancel_requested(opts.cancel)) break;
             if (row_dead[sz(r)]) continue;
             const f64 b = row_lo[sz(r)];
             if (!(b == row_hi[sz(r)]) || !std::isfinite(b)) continue;
@@ -290,7 +292,7 @@ MilpPresolveResult aggregate_equalities(const model::LpProblem& lp,
             ++stats.aggregated_cols;
             changed = true;
         }
-        if (!changed) break;
+        if (!changed || core::cancel_requested(opts.cancel)) break;
     }
     core::work_add(work + static_cast<std::uint64_t>(lp.nnz()), core::WorkTag::MilpPresolve);
 
@@ -316,6 +318,7 @@ MilpPresolveResult aggregate_equalities(const model::LpProblem& lp,
     Index mm = 0;
     for (Index i = 0; i < m; ++i) {
         if (row_dead[sz(i)]) continue;
+        out.reduced_row[sz(i)] = mm;
         for (const auto& [k, v] : rows[sz(i)]) {
             if (new_col[sz(k)] < 0 || v == 0.0) continue;
             ti.push_back(mm);

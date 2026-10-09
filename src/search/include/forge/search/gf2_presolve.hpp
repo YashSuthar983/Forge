@@ -7,6 +7,8 @@
 // does. Pairing with zero-half: tighter binary boxes improve ZH bases later.
 #pragma once
 
+#include "forge/core/cancel.hpp"
+
 #include "forge/core/result.hpp"
 #include "forge/model/lp.hpp"
 
@@ -19,6 +21,7 @@ using core::f64;
 using core::Index;
 
 struct Gf2PresolveOptions {
+    const core::CancelToken* cancel = nullptr;
     bool enabled = true;
     // Max free binaries participating in the GF(2) system (cost ~ O(e^2)).
     Index max_vars = 512;

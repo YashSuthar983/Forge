@@ -75,10 +75,23 @@ int test_session_rejects_foreign_factor_and_invalid_bounds() {
     }
     const FactorCarrier own = second.final_factor();
     const auto again = second.solve(opts, reuse, nullptr, &second_basis, nullptr, &own);
-    if (!reuse.factor_reused || !valid_point(b, again)) {
+    if (!reuse.factor_reused || !valid_point(b, again) ||
+        reuse.bound_delta_prices != 1 || reuse.bound_delta_xB == 0) {
         std::fprintf(stderr, "session test: valid same-session factor was rejected\n");
         ++failures;
     }
+    auto changed_sides = b.row_lo;
+    changed_sides[0] = 1.5;
+    second.set_row_bounds(changed_sides, b.row_hi);
+    const auto moved = second.solve(opts, reuse, nullptr, &second_basis);
+    if (reuse.bound_delta_prices != 1 || reuse.bound_delta_xB == 0 ||
+        std::fabs(moved.objective - .75) > 1e-9) {
+        std::fprintf(stderr, "row-side continuation: objective=%.17g prices=%llu xB=%llu factor=%d\n",
+            moved.objective, static_cast<unsigned long long>(reuse.bound_delta_prices),
+            static_cast<unsigned long long>(reuse.bound_delta_xB), reuse.factor_reused);
+        ++failures;
+    }
+    second.set_row_bounds(b.row_lo, b.row_hi);
     for (Index bad : {Index(-1), b.n_cols()}) {
         bool threw = false;
         try { second.probe(bad, 0.0, 1.0, opts, db, second_basis); }
@@ -667,8 +680,112 @@ int test_exact_support_recovery() {
     return 0;
 }
 
+// Bound/side edits preserve B and c edits preserve its equality point. A
+// session must re-enter feasibility search when the continued point leaves
+// the new box, and must not reuse another basis's point.
+int test_primal_session_continuation() {
+    using namespace forge::engines;
+    auto lp = make_lp(1, 1, 12);
+    lp.A = forge::sparse::from_triplets(1, 1, {0}, {0}, {1.0});
+    lp.c = {1}; lp.row_lo = {1}; lp.row_hi = {forge::model::kInf};
+    lp.col_lo = {0}; lp.col_hi = {10};
+    SimplexOptions opts; opts.presolve = false; opts.ruiz_iterations = 0;
+    PrimalCostSession session(lp, opts);
+    SimplexBasis basis, original_basis;
+    SimplexDiagnostics d;
+    auto raw = session.solve(opts, d, &basis, nullptr);
+    original_basis = basis;
+    if (!valid_point(lp, raw) || std::fabs(raw.objective - 1) > 1e-9) return 1;
+    lp.c = {2}; session.set_costs(lp.c);
+    raw = session.solve(opts, d, &basis, &basis);
+    if (d.factor_adoptions != 1 || d.bound_delta_xB != 1 ||
+        !valid_point(lp, raw) || std::fabs(raw.objective - 2) > 1e-9) return 1;
+    lp.row_lo = {2}; session.set_row_bounds(lp.row_lo, lp.row_hi);
+    raw = session.solve(opts, d, &basis, &basis);
+    if (d.factor_adoptions != 1 || d.bound_delta_xB != 1 ||
+        !valid_point(lp, raw) || std::fabs(raw.objective - 4) > 1e-9) return 1;
+    lp.col_lo = {3}; session.set_column_bounds(lp.col_lo, lp.col_hi);
+    raw = session.solve(opts, d, &basis, &basis);
+    if (d.bound_delta_xB != 1 || d.phase1_iterations == 0 ||
+        !valid_point(lp, raw) || std::fabs(raw.objective - 6) > 1e-9) return 1;
+    raw = session.solve(opts, d, &basis, &original_basis);
+    if (d.bound_delta_xB != 0 || !valid_point(lp, raw) ||
+        std::fabs(raw.objective - 6) > 1e-9) return 1;
+    raw = session.solve(opts, d, &basis, nullptr);
+    if (d.bound_delta_xB != 0 || !valid_point(lp, raw)) return 1;
+    return 0;
+}
+
+int test_cross_session_operator_identity() {
+    auto lp = make_lp(2,3,133);
+    forge::engines::SimplexOptions options; options.presolve = false; options.ruiz_iterations = 0;
+    forge::engines::DualProbeSession source(lp,options);
+    forge::engines::SimplexBasis basis;
+    forge::engines::SimplexDiagnostics diagnostics;
+    auto answer = source.solve(options,diagnostics,&basis,nullptr);
+    int failures = !valid_point(lp,answer);
+    auto factor = source.final_factor();
+    auto weights = source.final_weights();
+    forge::engines::DualProbeSession destination(lp,options);
+    answer = destination.solve(options,diagnostics,nullptr,&basis,&weights,&factor);
+    if (!diagnostics.factor_reused || !valid_point(lp,answer)) ++failures;
+    // Slot identity and shape alone cannot authorize another operator.
+    auto other = lp; other.A.vals[0] = std::nextafter(other.A.vals[0], forge::model::kInf);
+    forge::engines::DualProbeSession foreign(other,options);
+    answer = foreign.solve(options,diagnostics,nullptr,&basis,&weights,&factor);
+    if (diagnostics.factor_reused || !valid_point(other,answer)) ++failures;
+    return failures;
+}
+
+int test_session_fork_private_state() {
+    using namespace forge::engines;
+    auto lp = make_lp(8, 13, 118u);
+    SimplexOptions options; options.presolve = false;
+    DualProbeSession parent(lp,options); SimplexBasis basis; SimplexDiagnostics d;
+    const auto initial = parent.solve(options,d,&basis,nullptr);
+    if (!valid_point(lp,initial)) return 1;
+    auto sibling = parent.fork();
+    auto lo = lp.col_lo; lo[0] = std::min(lp.col_hi[0],lo[0]+.25);
+    sibling->set_column_bounds(lo,lp.col_hi);
+    auto tightened = lp; tightened.col_lo = lo;
+    const auto child = sibling->solve(options,d,nullptr,&basis);
+    int failures = !d.factor_reused || !valid_point(tightened,child);
+    const auto restored = parent.solve(options,d,nullptr,&basis);
+    if (!d.bound_delta_prices || !d.bound_delta_xB || !valid_point(lp,restored) ||
+        std::fabs(initial.objective-restored.objective) > 1e-8) ++failures;
+    return failures;
+}
+
+int test_structural_session_continuation() {
+    using namespace forge::engines;
+    auto lp = make_lp(2, 3, 92u);
+    SimplexOptions options; options.presolve = false;
+    DualProbeSession session(lp, options);
+    SimplexBasis basis; SimplexDiagnostics diag;
+    auto raw = session.solve(options, diag, &basis, nullptr);
+    int failures = !valid_point(lp, raw);
+    auto extended = lp;
+    extended.A.append_row({0,1,2}, {0x1p-30, 0x1p30, 1});
+    extended.row_lo.push_back(-forge::model::kInf); extended.row_hi.push_back(0x1p40);
+    if (!session.extend_rows(extended, options, basis)) return failures + 1;
+    const auto warm = basis;
+    raw = session.solve(options, diag, &basis, &warm);
+    if (!diag.factor_reused || !valid_point(extended, raw)) ++failures;
+    const auto current = basis;
+    raw = session.solve(options, diag, &basis, &current);
+    if (!diag.bound_delta_prices || !diag.bound_delta_xB || !valid_point(extended,raw)) ++failures;
+    if (!session.remove_rows(lp, {0,1,-1}, options)) return failures + 1;
+    const auto& retained = session.final_factor();
+    auto reduced_basis = basis; reduced_basis.basic = retained.basis; reduced_basis.status.resize(lp.n_cols()+lp.n_rows());
+    raw = session.solve(options, diag, nullptr, &reduced_basis);
+    if (!diag.factor_reused || !valid_point(lp, raw)) ++failures;
+    return failures;
+}
+
 int main() {
-    int failures = 0;
+    const int structural_failures = test_structural_session_continuation();
+    int failures = structural_failures + test_cross_session_operator_identity() + test_session_fork_private_state();
+    failures += test_primal_session_continuation();
     failures += test_exact_support_recovery();
     failures += test_session_rejects_foreign_factor_and_invalid_bounds();
     failures += test_rescaling_same_matrix_rejects_factor();

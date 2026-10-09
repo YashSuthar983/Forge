@@ -27,6 +27,7 @@ namespace {
 
 BabOptions tree_options(bool resolve) {
     BabOptions o;
+    o.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     o.para_bab.threads = 1;
     o.policy = MilpPolicy::Latest;
     o.tree_cut.enabled = true;
@@ -40,7 +41,8 @@ BabOptions tree_options(bool resolve) {
     o.cut.tableau_cmir = true;
     o.cut.relax_small_terms = true;
     o.mir.relax_small_terms = true;
-    o.cuts_enabled = false;   // fractional root, so the tree branches
+    o.cuts_enabled = true;    // authorize tree cuts
+    o.cut.max_rounds = 0;     // keep the root cut loop out of this component test
     o.structural_presolve.enabled = false;
     o.mip_presolve = o.probing = o.symmetry = false;
     o.integer_row_rounding = false;
@@ -88,7 +90,8 @@ void run(const char* label, Make make, std::uint32_t first, std::uint32_t last,
                 tot.basis_kept += d.node_local_cut_basis_kept;
             } else {
                 CHECK(d.node_cut_resolves == 0);
-                CHECK(d.node_cuts_inherited == 0 && d.node_local_cut_nodes == 0);
+                CHECK(d.node_cuts_inherited == 0);
+                // Certified probe geometry may be scoped even without a cut re-solve.
             }
             if (res.status == Status::Optimal) {
                 if (resolve) ++tot.optimal;

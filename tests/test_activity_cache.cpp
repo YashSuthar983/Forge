@@ -86,6 +86,67 @@ bool within(const RowActivityCache::Side& s, const forge::model::DyadicSum& exac
     return exact.compare(lo_out) >= 0 && exact.compare(hi_out) <= 0;
 }
 
+void test_checkpoint_sync_restores_siblings() {
+    std::mt19937 rng(87);
+    auto lp = random_model(rng, 540, 9, true);
+    auto lo = lp.col_lo, hi = lp.col_hi;
+    const auto root = forge::search::DomainCheckpoint::capture(lo, hi, {});
+    auto left = root, right = root;
+    left.set_lower(7, 1); right.set_upper(270, 2);
+    RowActivityCache cache; cache.build(lp, lo, hi);
+    for (const auto* box : std::initializer_list<const forge::search::DomainCheckpoint*>{&root, &left, &right, &root, &right}) {
+        cache.sync_checkpoint(*box);
+        box->materialize(lo, hi);
+        for (Index i = 0; i < lp.n_rows(); ++i) {
+            forge::model::DyadicSum mn, mx; int ni, xi; long long nc, xc;
+            exact_row(lp,i,lo,hi,mn,ni,nc,mx,xi,xc);
+            CHECK(within(cache.min_side(i),mn)); CHECK(within(cache.max_side(i),mx));
+        }
+        // A consumer moves a bound without modifying the immutable anchor.
+        // The next sibling must restore it, including an unchanged root page.
+        cache.set_bounds(515, 2, 3);
+    }
+}
+
+void test_structural_remap() {
+    std::mt19937 rng(61);
+    auto lp = random_model(rng, 5, 4, true);
+    auto lo = lp.col_lo, hi = lp.col_hi;
+    RowActivityCache cache;
+    cache.build(lp, lo, hi);
+    lo[1] = 1; hi[3] = 2;
+    cache.sync(lo, hi);
+    const auto saved = cache.min_side(3);
+    const auto rebuilds = cache.rebuilds();
+    auto edited = lp;
+    std::vector<Index> rr, cc;
+    std::vector<f64> vv;
+    const std::vector<Index> map{3, -1, 0};
+    const auto& rp = lp.A.pattern.row_ptr();
+    for (Index i = 0; i < 3; ++i) {
+        if (map[z(i)] < 0) { rr.push_back(i); cc.push_back(2); vv.push_back(-7); continue; }
+        const Index old = map[z(i)];
+        for (auto k = rp[z(old)]; k < rp[z(old)+1]; ++k) {
+            rr.push_back(i); cc.push_back(lp.A.pattern.col_idx()[z(k)]); vv.push_back(lp.A.vals[z(k)]);
+        }
+    }
+    edited.A = forge::sparse::from_triplets(3,5,rr,cc,vv);
+    edited.row_lo = {-kInf,-kInf,-kInf}; edited.row_hi = {100,100,100};
+    CHECK(cache.remap(edited,map));
+    CHECK(cache.min_side(0).sum == saved.sum);
+    CHECK(cache.min_side(0).err == saved.err);
+    CHECK(cache.rebuilds() == rebuilds+1);
+    hi[2] = 1;
+    cache.sync(lo,hi);
+    for (Index i = 0; i < 3; ++i) {
+        forge::model::DyadicSum mn,mx; int ni,xi; long long nc,xc;
+        exact_row(edited,i,lo,hi,mn,ni,nc,mx,xi,xc);
+        CHECK(within(cache.min_side(i),mn)); CHECK(within(cache.max_side(i),mx));
+    }
+    auto foreign = edited; foreign.A.vals[0] = std::nextafter(foreign.A.vals[0], kInf);
+    CHECK(!cache.remap(foreign,{0,1,2}));
+}
+
 void test_consistency() {
     std::mt19937 rng(5);
     int checked = 0;
@@ -290,6 +351,8 @@ void test_local_rows_keep_their_scope() {
 }  // namespace
 
 int main() {
+    test_checkpoint_sync_restores_siblings();
+    test_structural_remap();
     test_consistency();
     test_sound_and_strong();
     test_local_rows_keep_their_scope();

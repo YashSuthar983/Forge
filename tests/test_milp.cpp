@@ -469,6 +469,8 @@ void test_knapsack() {
     auto lp = read_text(kKnapsack);
     CHECK(lp.n_integer() == 3);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise native LP/tree closure.
+    opts.component_solve = false;
     opts.max_nodes = 1000;
     opts.verbose = false;
     // This test is about the branch-and-bound tree; the root primal pass
@@ -823,6 +825,8 @@ void test_node_cutoff_values() {
         // Lattice rule wins: no point better than 5 has a bound above 4.
         {5.0, 1.0, 0.0, 1e-4, 4.0 + 5e-6},
         {100.0, 1.0, 0.0, 1e-4, 99.0 + 1e-4},
+        // A near-lattice incumbent below 5 must retain the improving value 4.
+        {4.9999999, 1.0, 0.0, 0.0, 4.0 + 4.9999999e-6},
         // Gap rule wins: a gap of 0.5 already allows pruning at 2.5.
         {5.0, 1.0, 0.0, 0.5, 2.5},
         {5.0000001, 1.0, 0.0, 0.5, 5.0000001 * 0.5},
@@ -842,7 +846,7 @@ void test_node_cutoff_values() {
         // Never weaker than the gap rule alone.
         const double gap_rule =
             t.inc - std::max(1e-6, t.gap * std::fabs(t.inc));
-        CHECK(c <= gap_rule);
+        CHECK(c <= std::nextafter(gap_rule, std::numeric_limits<double>::infinity()));
         if (t.g > 0.0) {
             // A prune at c either loses no better lattice point, or loses
             // only points the gap rule already allows to be lost.
@@ -913,6 +917,7 @@ double gap_knapsack_optimum(const forge::model::LpProblem& lp) {
 
 BabOptions gap_knapsack_options(double gap, int threads) {
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise gap closure in the tree.
     opts.cuts_enabled = false;
     opts.mip_presolve = false;
     opts.probing = false;
@@ -995,6 +1000,8 @@ void test_integral_lp_points_reach_incumbent_validation_before_gap_pruning() {
     forge::io::MpsReadReport report;
     const auto lp = forge::io::read_mps_file(path, report);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise native LP/tree closure.
+    opts.component_solve = false;
     opts.time_limit_s = 20.0;
     opts.para_bab.threads = 1;
     BabDiagnostics diag;
@@ -1015,6 +1022,8 @@ void test_enigma_stops_when_the_global_gap_closes() {
     forge::io::MpsReadReport report;
     const auto lp = forge::io::read_mps_file(path, report);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise native LP/tree closure.
+    opts.component_solve = false;
     // Root phases take fractions of the limit: at 20 s they ended on wall
     // clock and the tree varied (4.6k-6k nodes, 16-20 s, failing under ctest
     // load); at 60 s the path is deterministic (800 nodes, ~14 s alone).
@@ -1195,6 +1204,7 @@ void test_node_infeasibility_needs_a_checked_ray() {
 void test_proved_cut_loop_root_is_reused_only_at_identical_bounds(bool trace = false) {
     auto lp = read_text(kRootReuse);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Isolate LP handoff from the exact integer oracle.
     opts.time_limit_s = 5.0;
     opts.verbose = trace;
     opts.trace_branching = trace ? 4 : 0;
@@ -1252,6 +1262,10 @@ void test_proved_cut_loop_root_is_reused_only_at_identical_bounds(bool trace = f
     opts.conflict_cut.enabled = false;
     opts.conflict_cut.nogood_cuts = false;
     opts.reduced_cost_strengthening = false;
+    // This fixture measures factor handoff to probes, so admit no root cuts.
+    opts.cut.max_cuts_per_round = 0;
+    opts.structural_presolve.binary_row_max_work = 0;
+    opts.face_vertices = false;  // face rounding can close the lattice gap before probes
     BabDiagnostics probes;
     const auto branched = forge::search::solve_milp(fractional, opts, probes);
     CHECK(branched.proposed_status == Status::Optimal);

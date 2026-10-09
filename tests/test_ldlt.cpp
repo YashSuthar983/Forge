@@ -16,6 +16,7 @@
 #include <cstring>
 #include <map>
 #include <numeric>
+#include <stdexcept>
 #include <vector>
 
 using namespace forge;
@@ -108,6 +109,29 @@ SymCsc grid_laplacian(Index k) {
 }  // namespace
 
 int main() {
+    // Every task must have stopped before run propagates an error. A worker
+    // waiting at the collective barrier must not outlive its failed peer.
+    {
+        core::ThreadPool pool(3);
+        for (int failing : {0,1}) {
+            bool caught = false;
+            try {
+                pool.run(3,[&](int worker) {
+                    if (worker == failing) throw std::runtime_error("job failure");
+                    pool.barrier();
+                });
+            } catch (const std::runtime_error&) { caught = true; }
+            CHECK(caught); CHECK(!core::ThreadPool::in_job());
+            std::atomic<int> completed{0};
+            pool.run(3,[&](int) { pool.barrier(); ++completed; pool.barrier(); });
+            CHECK(completed == 3);
+        }
+        bool caught = false;
+        try { pool.run(1,[](int) { throw std::runtime_error("serial job failure"); }); }
+        catch (const std::runtime_error&) { caught = true; }
+        CHECK(caught); CHECK(!core::ThreadPool::in_job());
+    }
+
     // ---- grid Laplacian: correct, and AMD beats natural order on fill ----
     {
         const auto a = grid_laplacian(60);   // n = 3600

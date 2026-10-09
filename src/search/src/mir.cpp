@@ -1,4 +1,5 @@
 #include "forge/search/mir.hpp"
+#include "forge/search/certificate_rows.hpp"
 #include "forge/core/work_clock.hpp"
 #include "forge/search/conflict.hpp"
 
@@ -1070,6 +1071,7 @@ std::vector<CutRow> generate_mir(const model::LpProblem& lp,
                      [](const auto& a, const auto& b) { return a.first < b.first; });
 
     std::vector<f64> dense(sz(n), 0.0);
+    std::vector<model::DyadicSum> exact_dense(sz(n));
     // Explicit membership, NOT `dense[j] == 0.0`. A cancelled column is set to
     // exactly zero on purpose, and two contributions can cancel to zero by
     // arithmetic, so the value cannot double as the membership test: it lets a
@@ -1101,9 +1103,10 @@ std::vector<CutRow> generate_mir(const model::LpProblem& lp,
             for (std::size_t q = 0; q < base.cols.size(); ++q) {
                 const Index j = base.cols[q];
                 if (!in_support[sz(j)]) { in_support[sz(j)] = 1; support.push_back(j); }
-                dense[sz(j)] += base.vals[q];
+                exact_dense[sz(j)].add(base.vals[q]);
+                dense[sz(j)] = exact_dense[sz(j)].nearest();
             }
-            f64 agg_rhs = base.rhs;
+            model::DyadicSum exact_rhs; exact_rhs.add(base.rhs);
             std::vector<char> used(sz(lp.n_rows()), 0);
             used[sz(i0)] = 1;
             // A term leaves the aggregate (a <= row) only by moving its
@@ -1114,7 +1117,8 @@ std::vector<CutRow> generate_mir(const model::LpProblem& lp,
             const auto relax_out = [&](Index j, f64 v) {
                 const f64 b = v > 0.0 ? agg_lo[sz(j)] : agg_hi[sz(j)];
                 if (!std::isfinite(b)) return false;
-                agg_rhs -= v * b;
+                exact_rhs.add_sum_product(exact_dense[sz(j)], -b);
+                exact_dense[sz(j)] = {};
                 return true;
             };
 
@@ -1169,33 +1173,32 @@ std::vector<CutRow> generate_mir(const model::LpProblem& lp,
                     for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
                         const Index j = ci[sz(k)];
                         if (!in_support[sz(j)]) { in_support[sz(j)] = 1; support.push_back(j); }
-                        dense[sz(j)] += lambda * sign * av[sz(k)];
+                        exact_dense[sz(j)].add_product(lambda * sign, av[sz(k)]);
+                        dense[sz(j)] = exact_dense[sz(j)].nearest();
                     }
-                    agg_rhs += lambda * bound;
+                    exact_rhs.add_product(lambda, bound);
                     used[sz(i)] = 1;
                     // lambda = -alpha/a_ij is rounded, so the target keeps a
                     // residual of rounding size; it is not zero by
                     // construction, and deleting it needs its bound.
-                    const f64 residual = dense[sz(target)];
-                    if (residual != 0.0 && !relax_out(target, residual)) break;
+                    if (!exact_dense[sz(target)].is_zero() && !relax_out(target,
+                        exact_dense[sz(target)].sign() > 0 ? 1.0 : -1.0)) break;
                     dense[sz(target)] = 0.0;
                     cancelled = true;
                 }
                 if (!cancelled) break;
 
-                // Separate on the aggregate as it now stands.
-                BaseRow agg;
-                for (const Index j : support) {
-                    const f64 v = dense[sz(j)];
-                    if (v == 0.0) continue;
-                    if (std::fabs(v) <= opts.tol && relax_out(j, v)) {
-                        dense[sz(j)] = 0.0;
-                        continue;
-                    }
-                    agg.cols.push_back(j);
-                    agg.vals.push_back(v);
-                }
-                agg.rhs = agg_rhs;
+                // Reconstruct the exact aggregate before MIR. Greedy weight
+                // selection is guidance; it must not erase multiply-add
+                // residuals or silently round an aggregate into a restriction.
+                auto geq = exact_dense;
+                for (auto& coefficient : geq) coefficient.negate();
+                auto side = exact_rhs; side.negate();
+                CutRow compiled;
+                if (!compile_geq_exact(geq, side, agg_lo, agg_hi, compiled)) break;
+                BaseRow agg; agg.cols = std::move(compiled.cols); agg.vals = std::move(compiled.vals);
+                for (auto& coefficient : agg.vals) coefficient = -coefficient;
+                agg.rhs = -compiled.row_lo;
                 if (agg.cols.size() >= 2 && agg.cols.size() <= opts.max_row_len) {
                     ++diag.aggregations;
                     try_mir_on_base(lp, agg, x, col_lo, col_hi, opts, true, diag,
@@ -1203,7 +1206,7 @@ std::vector<CutRow> generate_mir(const model::LpProblem& lp,
                 }
             }
 
-            for (const Index j : support) { dense[sz(j)] = 0.0; in_support[sz(j)] = 0; }
+            for (const Index j : support) { dense[sz(j)] = 0.0; exact_dense[sz(j)] = {}; in_support[sz(j)] = 0; }
         }
     }
     return cuts;

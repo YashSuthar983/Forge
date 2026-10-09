@@ -33,12 +33,17 @@ bool load(const std::string& name, forge::model::LpProblem& out) {
 // and the heuristics whose outcome depends on a wall-clock budget are off.
 BabOptions deterministic_options(std::uint64_t nodes) {
     BabOptions o;
+    o.structural_presolve.binary_row_max_work = 0;  // Isolate the LP/tree service from the exact root oracle.
+    o.component_solve = false;  // Exercise this model's LP/tree diagnostics.
     o.max_nodes = nodes;
     o.time_limit_s = 1000.0;
     o.strong_branch_time_s = 0.0;
     o.rb_startup_ms = 1e12; // The deterministic test uses pivot/node budgets.
     o.para_bab.threads = 1;
     o.feasibility_jump = false;
+    o.feasibility_pump_root = false;
+    o.face_vertices = false;
+    o.rapid_learning.enabled = false;
     o.fixprop = false;
     o.sub_mip_lns = false;
     o.balans.enabled = false;
@@ -182,7 +187,7 @@ void test_capability_inventory() {
     CHECK(status_of("independent component solving") !=
           CapabilityStatus::Unavailable);
     CHECK(status_of("reliability branching") == CapabilityStatus::Implemented);
-    CHECK(status_of("tree / local cuts") != CapabilityStatus::Implemented);
+    CHECK(status_of("tree / local cuts") == CapabilityStatus::Implemented);
 }
 
 }  // namespace

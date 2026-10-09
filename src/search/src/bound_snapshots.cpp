@@ -1,6 +1,9 @@
 #include "bound_snapshots.hpp"
 
 #include <atomic>
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -233,15 +236,15 @@ void append_milp_invocation(const model::LpProblem& model,
     const char* base = milp_dump_base_path();
     if (!base) return;
     const std::string path = std::string(base) + ".invocations.jsonl";
-    std::FILE* f = std::fopen(path.c_str(), "a");
-    if (!f) return;
-    std::fprintf(
-        f,
-        "{\"run\":\"%s\",\"invocation\":%llu,\"parent\":%llu,\"sub_mip_depth\":%d,"
+    // Assemble the complete record before touching the log. Buffered stdio
+    // can report success and then leave a partial JSON record on close.
+    const auto format = "{\"run\":\"%s\",\"invocation\":%llu,\"parent\":%llu,\"sub_mip_depth\":%d,"
         "\"phase\":\"%s\",\"wrote_bounds\":%s,\"snapshot\":\"%s\","
         "\"snapshot_sha256\":\"%s\",\"snapshot_error\":\"%s\",\"content_fp\":\"%016llx\","
         "\"col_order_fp\":\"%016llx\",\"rows\":%d,\"cols\":%d,\"nnz\":%lld,"
-        "\"maximize\":%s,\"name\":\"",
+        "\"maximize\":%s,\"name\":\"%s\",\"column_map\":\"identity\"}\n";
+    const auto render = [&](char* buffer, std::size_t size) {
+        return std::snprintf(buffer, size, format,
         milp_run_id().c_str(),
         static_cast<unsigned long long>(invocation),
         static_cast<unsigned long long>(parent),
@@ -252,12 +255,37 @@ void append_milp_invocation(const model::LpProblem& model,
         static_cast<unsigned long long>(milp_column_order_fingerprint(model)),
         static_cast<int>(model.n_rows()), static_cast<int>(model.n_cols()),
         static_cast<long long>(model.nnz()),
-        model.maximize ? "true" : "false");
-    std::fputs(milp_json_escape(model.name).c_str(), f);
-    // Snapshot row j is column j of col_order_fp. Submodels that drop or
-    // reorder columns get a different content and column fingerprint.
-    std::fprintf(f, "\",\"column_map\":\"identity\"}\n");
-    std::fclose(f);
+        model.maximize ? "true" : "false", milp_json_escape(model.name).c_str());
+    };
+    const int length = render(nullptr, 0);
+    if (length < 0) return;
+    std::string body(static_cast<std::size_t>(length) + 1, '\0');
+    render(body.data(), body.size());
+    body.resize(static_cast<std::size_t>(length));
+    const int fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0666);
+    if (fd < 0) return;
+    // The process mutex protects threads; the file lock also serializes
+    // independent solver processes writing to the same requested log.
+    if (::flock(fd, LOCK_EX) != 0) { ::close(fd); return; }
+    const off_t start = ::lseek(fd, 0, SEEK_END);
+    if (start >= 0) {
+        std::size_t done = 0;
+        while (done < body.size()) {
+            const ssize_t count = ::write(fd, body.data() + done, body.size() - done);
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) break;
+            done += static_cast<std::size_t>(count);
+        }
+        // A failed diagnostic transaction must preserve all earlier records.
+        if (done != body.size()) {
+            int truncated;
+            do { truncated = ::ftruncate(fd, start); } while (truncated != 0 && errno == EINTR);
+            if (truncated != 0)
+                std::fprintf(stderr, "MILP invocation log rollback failed: %s\n", path.c_str());
+        }
+    }
+    ::flock(fd, LOCK_UN);
+    ::close(fd);
 }
 
 }  // namespace

@@ -54,6 +54,7 @@ void test_node_lp_carriers_reuse_weights_and_match_brute_force() {
     auto lp = read_text(build_knapsack_mps(value, weight, capacity));
 
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.time_limit_s = 20.0;
     opts.max_nodes = 2000000;
     // This test is about carrying factors and weights between node LPs, which

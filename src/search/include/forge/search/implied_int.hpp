@@ -5,6 +5,8 @@
 // continuous components (§7.1). Full TU recognition (Truemper) not implemented.
 #pragma once
 
+#include "forge/core/cancel.hpp"
+
 #include "forge/core/result.hpp"
 #include "forge/model/lp.hpp"
 
@@ -18,6 +20,7 @@ using core::f64;
 using core::Index;
 
 struct ImpliedIntOptions {
+    const core::CancelToken* cancel = nullptr;
     bool enabled = true;
     bool equality_pm1 = true;     // classic ±1 equality cascade
     // Network (each column at most one +1 and one -1) and interval (each

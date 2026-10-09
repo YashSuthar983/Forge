@@ -1,5 +1,8 @@
+#include "forge/search/domain_writer.hpp"
 #include "forge/search/mip_presolve.hpp"
 #include "forge/certify/finalize.hpp"
+#include "forge/model/dyadic.hpp"
+#include "forge/search/certificate_rows.hpp"
 #include "forge/core/work_clock.hpp"
 
 #include "forge/search/component_presolve.hpp"
@@ -40,6 +43,24 @@ inline f64 min_sense_c(const model::LpProblem& lp, Index j) {
 
 }  // namespace
 
+// Any correctly sided row multipliers imply g'x >= beta, g = A'y.
+// Store a binary64 row with its coefficient-rounding error compensated over
+// the exact root box. Its coefficients, RHS and scope are then reusable,
+// even when the auxiliary LP never reached optimality.
+static std::optional<RetiredRow> auxiliary_relation(
+    const model::LpProblem& lp, const std::vector<f64>& y,
+    const std::vector<f64>& lo, const std::vector<f64>& hi) {
+    std::vector<model::DyadicSum> g;
+    model::DyadicSum beta;
+    CutRow compiled;
+    if (!aggregate_geq_exact(lp, y, g, beta) ||
+        !compile_geq_exact(g, beta, lo, hi, compiled) || compiled.cols.empty()) return std::nullopt;
+    RetiredRow row;
+    row.cols = std::move(compiled.cols); row.vals = std::move(compiled.vals);
+    row.lo = compiled.row_lo; row.hi = compiled.row_hi;
+    return row;
+}
+
 DualFixDiagnostics apply_dual_fixing(const model::LpProblem& lp,
                                       std::vector<f64>& col_lo,
                                       std::vector<f64>& col_hi,
@@ -47,16 +68,17 @@ DualFixDiagnostics apply_dual_fixing(const model::LpProblem& lp,
                                       int max_rounds,
                                       bool zero_cost_ok,
                                       double time_limit_s,
-                                      const std::vector<Index>* candidate_cols) {
+                                      const std::vector<Index>* candidate_cols,
+                                      const core::CancelToken* cancel) {
     DualFixDiagnostics diag;
     // Dual fixing is the non-optional core of root MIP presolve and, on large
     // models, its dominant cost: 5.6 s on atlanta-ip (48738 cols) with every
     // optional phase disabled, against a 5 s SOLVER budget. Bounded per round.
     const auto dfx_t0 = Clock::now();
     const auto dfx_over = [&]() {
-        return time_limit_s > 0.0 &&
+        return core::cancel_requested(cancel) || (time_limit_s > 0.0 &&
                std::chrono::duration<double>(Clock::now() - dfx_t0).count() >
-                   time_limit_s;
+                   time_limit_s);
     };
     const Index n = lp.n_cols();
     const Index m = lp.n_rows();
@@ -161,9 +183,9 @@ CliqueProbeDiagnostics apply_clique_probing(const model::LpProblem& lp,
     // where the loop is.
     const auto cp_t0 = Clock::now();
     const auto cp_over = [&]() {
-        return opts.time_limit_s > 0.0 &&
+        return core::cancel_requested(opts.cancel) || (opts.time_limit_s > 0.0 &&
                std::chrono::duration<double>(Clock::now() - cp_t0).count() >
-                   opts.time_limit_s;
+                   opts.time_limit_s);
     };
 
     const Index n = lp.n_cols();
@@ -206,7 +228,7 @@ CliqueProbeDiagnostics apply_clique_probing(const model::LpProblem& lp,
     {
         const auto fr = propagate_bounds_cached(lp, act, col_lo, col_hi, nullptr, nullptr,
                                                 scratch, nullptr, 0, tol, visit_cap,
-                                                /*sync_box=*/false);
+                                                /*sync_box=*/false, opts.cancel);
         if (!fr.feasible) {
             diag.infeasible = true;
             return diag;
@@ -256,21 +278,19 @@ CliqueProbeDiagnostics apply_clique_probing(const model::LpProblem& lp,
             for (const Index j : bins) {
                 const f64 v = j == on ? 1.0 : 0.0;
                 if (col_lo[sz(j)] != v) {
-                    trail.push(j, BoundDir::Lower, v, col_lo[sz(j)],
-                               ReasonKind::Branch, -1, 1);
-                    col_lo[sz(j)] = v;
+                    write_domain_bound(col_lo, col_hi, j, BoundDir::Lower, v,
+                                       &trail, {ReasonKind::Branch, -1, 1});
                 }
                 if (col_hi[sz(j)] != v) {
-                    trail.push(j, BoundDir::Upper, v, col_hi[sz(j)],
-                               ReasonKind::Branch, -1, 1);
-                    col_hi[sz(j)] = v;
+                    write_domain_bound(col_lo, col_hi, j, BoundDir::Upper, v,
+                                       &trail, {ReasonKind::Branch, -1, 1});
                 }
                 act.set_bounds(j, col_lo[sz(j)], col_hi[sz(j)]);
                 seeds.push_back(j);
             }
             const auto pr = propagate_bounds_cached(lp, act, col_lo, col_hi, &seeds, nullptr,
                                                     scratch, &trail, 1, tol, visit_cap,
-                                                    /*sync_box=*/false);
+                                                    /*sync_box=*/false, opts.cancel);
             if (pr.feasible) {
                 ++case_id;
                 const auto& es = trail.entries();
@@ -450,6 +470,7 @@ ObbtDiagnostics apply_obbt_lite(const model::LpProblem& lp,
         aux.col_lo = col_lo;
         aux.col_hi = col_hi;
         engines::SimplexOptions so = *lp_opts;
+        so.cancel = opts.cancel;
         so.presolve = false;
         so.time_limit_s = opts.obbt_lp_time_s;
         so.max_iterations = opts.obbt_lp_max_iterations;
@@ -477,6 +498,8 @@ ObbtDiagnostics apply_obbt_lite(const model::LpProblem& lp,
                 certify::SafeLpBound safe;
                 if (raw.y.size() == sz(m))
                     safe = certify::safe_lagrangian_lower_bound(aux, raw.y, col_lo, col_hi);
+                if (auto relation = auxiliary_relation(aux, raw.y, col_lo, col_hi))
+                    diag.relations.push_back(std::move(*relation));
                 aux.c[sz(j)] = 0.0;
                 if (!safe.finite || !std::isfinite(safe.value)) continue;
                 const f64 L = safe.value;   // min (+-) x_j >= L
@@ -509,7 +532,7 @@ ObbtDiagnostics apply_obbt_lite(const model::LpProblem& lp,
     // before, on an unchanged box when nothing had).
     if (changed || lp_opts == nullptr) {
         diag.used_fbbt_fallback = lp_opts == nullptr;
-        auto pr = propagate_bounds(lp, col_lo, col_hi, tol, opts.fbbt_deepen_rounds);
+        auto pr = propagate_bounds(lp, col_lo, col_hi, tol, opts.fbbt_deepen_rounds, opts.cancel);
         diag.fbbt_tightenings += pr.tightened;
     }
     return diag;
@@ -531,9 +554,9 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
     // Root presolve must live inside the solver's budget. Checked at the
     // coarse restart boundary, which is where the multi-second costs sit.
     const auto out_of_time = [&]() {
-        return opts.time_limit_s > 0.0 &&
+        return core::cancel_requested(opts.cancel) || (opts.time_limit_s > 0.0 &&
                std::chrono::duration<double>(Clock::now() - t0).count() >
-                   opts.time_limit_s;
+                   opts.time_limit_s);
     };
     if (!opts.enabled) {
         diag.ms = ms_since(t0);
@@ -609,7 +632,7 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
             PhaseTimer _t(diag.ms_dual_fix);
             const auto d = apply_dual_fixing(lp, col_lo, col_hi, opts.tol,
                                               opts.dual_fix_max_rounds, true,
-                                             remaining_budget());
+                                             remaining_budget(), nullptr, opts.cancel);
             diag.dual_fix.fixings += d.fixings;
             diag.dual_fix.rounds += d.rounds;
             if (d.infeasible) {
@@ -619,6 +642,7 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
         }
 
         ProbingOptions po = probe_opts;
+        po.cancel = opts.cancel;
         po.dual_fix_in_probing = opts.dual_fix_in_probing;
         if (out_of_time()) { ++diag.aborted_on_time; return true; }
         // The probing allowance is for the whole presolve, not per cycle: two
@@ -669,6 +693,7 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
         if (opts.gf2) {
             PhaseTimer _t(diag.ms_gf2);
             Gf2PresolveOptions go = opts.gf2_opts;
+            go.cancel = opts.cancel;
             go.tol = opts.tol;
             const auto g = apply_gf2_presolve(lp, col_lo, col_hi, go);
             diag.gf2.equations = std::max(diag.gf2.equations, g.equations);
@@ -687,6 +712,7 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
         if (opts.components) {
             PhaseTimer _t(diag.ms_components);
             ComponentPresolveOptions co = opts.component_opts;
+            co.cancel = opts.cancel;
             co.time_limit_s = remaining_budget();
             co.tol = opts.tol;
             const auto c = apply_component_presolve(lp, col_lo, col_hi, co);
@@ -712,6 +738,7 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
         if (opts.implied_integers) {
             PhaseTimer _t(diag.ms_implied_int);
             ImpliedIntOptions io = opts.implied_int_opts;
+            io.cancel = opts.cancel;
             io.tol = opts.tol;
             // ImpliedIntOptions::time_limit_s defaults to 0.0, which means
             // UNLIMITED -- so leaving it unset silently disabled the whole
@@ -737,6 +764,7 @@ MipPresolveDiagnostics run_mip_presolve(model::LpProblem& lp,
         if (opts.obbt_lite) {
             const auto od =
                 apply_obbt_lite(lp, col_lo, col_hi, opts, lp_opts, nullptr);
+            diag.obbt.relations.insert(diag.obbt.relations.end(), od.relations.begin(), od.relations.end());
             diag.obbt.vars_tried += od.vars_tried;
             diag.obbt.lp_solves += od.lp_solves;
             diag.obbt.lp_tightenings += od.lp_tightenings;

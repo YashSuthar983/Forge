@@ -306,6 +306,20 @@ void test_tree_row_working_set() {
         o.gap_tol = o.abs_gap_tol = 1e-9;
         o.heuristic_proof_gap = 0.0;   // keep separating once an incumbent is in
         o.cut_reference_point = &oracle.x;
+        // Keep a real tree: root services and primal heuristics otherwise close
+        // these tiny models before purge/remap/reinject can run.
+        o.mip_presolve = o.probing = o.symmetry = false;
+        o.integer_row_rounding = false;
+        o.feasibility_jump = false;
+        o.fixprop = false;
+        o.sub_mip_lns = false;
+        o.balans.enabled = false;
+        o.kernel_pump.enabled = false;
+        o.mrens.enabled = false;
+        o.integer_dive = false;
+        o.rounding_heuristic = false;
+        o.face_vertices = false;
+        o.structural_presolve.binary_row_max_work = 0;
         o.tree_cut.always_depth = 1000;
         o.tree_cut.row_age_limit = 1;
         o.tree_cut.purge_every_nodes = 1;
@@ -332,6 +346,7 @@ void test_tree_row_working_set() {
         reasons += diag.tree_row_reasons_checked;
         fitted += diag.tree_row_bases_fitted;
         CHECK(diag.tree_row_bases_fit_failed == 0);
+        CHECK(diag.tree_row_remap_rejected == 0);
     }
     std::cout << "WORKING_SET promoted=" << promoted << " purged=" << purged
               << " bases_remapped=" << remapped << " reinjected=" << reentered
@@ -354,6 +369,8 @@ void test_parallel_workers_match_oracle() {
         const OracleResult oracle = solve_oracle(lp);
         if (!oracle.feasible) continue;
         forge::search::BabOptions o;
+        o.structural_presolve.binary_row_max_work = 0;  // Exercise persistent workers.
+        o.component_solve = false;
         o.para_bab.threads = 4;
         o.para_bab_cost.adaptive = false;
         o.plunge_max_depth = 0;

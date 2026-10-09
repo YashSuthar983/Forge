@@ -1,3 +1,4 @@
+#include "forge/search/domain_writer.hpp"
 #include "forge/search/clique_rows.hpp"
 
 #include "forge/core/work_clock.hpp"
@@ -201,8 +202,8 @@ PropagateResult propagate_clique_rows(const CliqueRowIndex& index,
                                 std::fabs(std::isfinite(rhi) ? rhi : 0.0));
         // Antecedents of this row's deductions, built on first use.
         Index reason_max = -1, reason_min = -1;
+        ConflictAntecedents refs_max, refs_min;
         const auto antecedents = [&](bool use_min) -> Index {
-            if (reasons == nullptr) return -1;
             std::vector<BoundRef> set;
             for (std::size_t q = 0; q < L; ++q) {
                 const Index j = cr.cols[q];
@@ -213,6 +214,8 @@ PropagateResult propagate_clique_rows(const CliqueRowIndex& index,
                 if (want_lower && lo[sz(j)] > root_lo[sz(j)]) set.push_back({j, false});
                 if (want_upper && hi[sz(j)] < root_hi[sz(j)]) set.push_back({j, true});
             }
+            (use_min ? refs_min : refs_max) = std::make_shared<const std::vector<BoundRef>>(set);
+            if (!reasons) return -1;
             reasons->antecedents.push_back(std::move(set));
             return static_cast<Index>(reasons->antecedents.size() - 1);
         };
@@ -220,7 +223,9 @@ PropagateResult propagate_clique_rows(const CliqueRowIndex& index,
             (max_inf == 0 && std::isfinite(rlo) && maxact < rlo - eps)) {
             res.feasible = false;
             res.conflict_row = cr.row;
-            res.conflict_var = cr.cols.empty() ? -1 : cr.cols[0];
+            const bool use_min = min_inf == 0 && std::isfinite(rhi) && minact > rhi + eps;
+            (void)antecedents(use_min);
+            res.conflict_antecedents = use_min ? refs_min : refs_max;
             core::work_add(work, core::WorkTag::Propagate);
             return res;
         }
@@ -280,39 +285,38 @@ PropagateResult propagate_clique_rows(const CliqueRowIndex& index,
                 new_lo -= slack;
                 if (integral) new_lo = std::ceil(new_lo - tol);
             }
-            const auto push = [&](BoundDir dir, f64 nb, f64 ob, bool use_min) {
-                if (trail != nullptr) {
-                    Index& rid = use_min ? reason_min : reason_max;
-                    if (rid < 0) rid = antecedents(use_min);
-                    trail->push(j, dir, nb, ob, rid >= 0 ? ReasonKind::Antecedents : ReasonKind::Unknown,
-                                rid, depth);
-                }
+            const auto push = [&](BoundDir dir, f64 nb, bool use_min) {
+                Index& rid = use_min ? reason_min : reason_max;
+                auto& refs = use_min ? refs_min : refs_max;
+                if (!refs) rid = antecedents(use_min);
+                write_domain_bound(lo, hi, j, dir, nb, trail,
+                                   {ReasonKind::Antecedents, rid, depth, {}, refs});
                 ++res.tightened;
                 if (changed) changed->push_back(j);
             };
             if (new_hi < h - tol) {
                 if (new_hi < l - tol) {
                     res.feasible = false;
-                    res.conflict_var = j;
+                    (void)antecedents(hi_from_min);
+                    res.conflict_antecedents = hi_from_min ? refs_min : refs_max;
                     res.conflict_row = cr.row;
                     core::work_add(work, core::WorkTag::Propagate);
                     return res;
                 }
                 new_hi = std::max(new_hi, l);
-                push(BoundDir::Upper, new_hi, h, hi_from_min);
-                hi[sz(j)] = new_hi;
+                push(BoundDir::Upper, new_hi, hi_from_min);
             }
             if (new_lo > lo[sz(j)] + tol) {
                 if (new_lo > hi[sz(j)] + tol) {
                     res.feasible = false;
-                    res.conflict_var = j;
+                    (void)antecedents(lo_from_min);
+                    res.conflict_antecedents = lo_from_min ? refs_min : refs_max;
                     res.conflict_row = cr.row;
                     core::work_add(work, core::WorkTag::Propagate);
                     return res;
                 }
                 new_lo = std::min(new_lo, hi[sz(j)]);
-                push(BoundDir::Lower, new_lo, lo[sz(j)], lo_from_min);
-                lo[sz(j)] = new_lo;
+                push(BoundDir::Lower, new_lo, lo_from_min);
             }
         }
     }

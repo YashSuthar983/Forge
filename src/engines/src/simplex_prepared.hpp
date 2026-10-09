@@ -5,6 +5,7 @@
 #include "forge/engines/simplex.hpp"
 #include "forge/sparse/csc.hpp"
 #include "forge/sparse/spmv_plan.hpp"
+#include "forge/core/parallel.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -30,6 +31,7 @@ struct SimplexPrepared {
     model::LpProblem scaled;
     RuizScaling scaling;
     std::shared_ptr<const FactorScalingIdentity> factor_scaling_identity;
+    std::shared_ptr<const FactorOperatorIdentity> factor_operator_identity;
     sparse::CscMatrix csc;
     sparse::SpmvPlan pricing_plan;
     std::vector<f64> lo;
@@ -45,7 +47,8 @@ struct SimplexPrepared {
 };
 
 SimplexPrepared prepare_simplex_model(const model::LpProblem& problem,
-                                      const SimplexOptions& opts);
+                                      const SimplexOptions& opts,
+                                      const SimplexPrepared* row_prefix = nullptr);
 
 // Tolerances belong to the current solve policy, not the constructor that
 // happened to prepare the numeric matrix for a repeated-LP session.
@@ -80,6 +83,33 @@ inline SimplexOptions simplex_options_after_elapsed(const SimplexOptions& opts,
     return remaining;
 }
 
+// A prepared primal session owns its working storage and a continuation point.
+// Scratch arrays are initialized on each call. Only the separately named last
+// snapshot survives semantically, and is consumed with an adopted factor and
+// identical basis/status membership on this exact preparation.
+struct PrimalPassWorkspace {
+    const SimplexPrepared* prepared = nullptr;
+    bool last_point_valid = false;
+    bool last_prices_valid = false;
+    std::vector<Index> last_basis;
+    std::vector<NonbasicStatus> last_status;
+    std::vector<f64> last_value, last_xB, last_cost, last_y, last_redcost;
+    std::vector<Index> basis, slot_of, nonbasic, nonbasic_pos, crash_basis_save,
+        crash_slot_save, bri, bad_slots, vacant_rows, alpha_support, alpha_input_rows,
+        rho_seed, rho_support, phase_delta_seed, phase_delta_support, prow_idx;
+    std::vector<NonbasicStatus> st, crash_st_save;
+    std::vector<char> seen, alpha_support_mark, prow_used;
+    std::vector<Offset> bcp;
+    std::vector<f64> value, xB, crash_value_save, perturbed_lo, perturbed_hi,
+        bvals, rhs, y, alpha, cB, rho, phase_delta, composite_check,
+        col_w, redcost, prow, yout;
+    std::vector<long double> equation_residual, equation_scale, aty, aty_abs, ax;
+    std::vector<std::uint32_t> aty_count;
+    // Storage of the indexed pricing heap, cleared and repriced per solve.
+    std::vector<Index> heap, heap_position, heap_tie;
+    std::vector<f64> heap_score;
+};
+
 struct PrimalCleanupState {
     std::vector<f64> basic_values;
     std::vector<f64> nonbasic_values;
@@ -90,7 +120,8 @@ core::RawResult solve_primal_simplex_prepared(
     SimplexDiagnostics& diag, SimplexBasis* out_basis,
     const SimplexBasis* warm = nullptr,
     FactorCarrier* out_factor = nullptr,
-    const PrimalCleanupState* cleanup_state = nullptr);
+    const PrimalCleanupState* cleanup_state = nullptr,
+    PrimalPassWorkspace* workspace = nullptr);
 
 // `factor_carrier` (optional, EXPERIMENTAL -- repeated-LP reuse
 // measurement): see FactorCarrier's own doc comment in dual_simplex.hpp. Read
@@ -108,11 +139,11 @@ core::RawResult solve_primal_simplex_prepared(
 // arrays and repartitioning every row. Owned by the caller (a session);
 // `prepared` names the preparation it belongs to.
 // The dual pass's per-solve arrays (sized by the rows and columns of the
-// preparation), kept between solves so a solve reuses their storage instead
-// of allocating some sixty vectors: every pass re-initializes each one before
-// use, so no value carries over. On a node-throughput tree (mas76) the
-// allocator was ~10% of the profile, most of it these.
+// preparation), kept between solves. Terminal basis membership and its
+// nonbasic index set continue only under the independently validated phase-2
+// snapshot; transient pricing and ratio-test buffers are reinitialized.
 struct DualPassWorkspace {
+    std::shared_ptr<core::ThreadPool> pricing_pool;
     std::vector<core::Index> carried_basis;
     std::vector<core::f64> carried_weights;
     std::vector<core::Index> carried_factor_basis;
@@ -188,8 +219,22 @@ struct DualPartitionState {
     std::vector<core::f64> pr_val;
     std::vector<core::Offset> pr_slot, pr_at, pr_cstart, pr_centry;
     std::vector<std::uint8_t> active;
-    // Storage for the pass itself (no state: see DualPassWorkspace).
+    // Pass state and private pricing workers are owned by this session.
     DualPassWorkspace work;
+    // Last phase-2 primal point of a session solve: when the next solve keeps
+    // the same basis membership and only nonbasic bound values move, xB is
+    // updated by Delta x_B = -B^-1 A_j Delta x_j instead of a full RHS FTRAN
+    // (audit rank 4). Invalidated whenever membership or the factor changes.
+    bool last_primal_ok = false;
+    std::vector<core::Index> last_basis;
+    std::vector<NonbasicStatus> last_st;
+    std::vector<core::f64> last_value;
+    std::vector<core::f64> last_xB;
+    // Prices are invariant under bound/side edits when the matrix, basis,
+    // true objective and adopted factor remain the same. Capture from the
+    // independently re-derived terminal multipliers, never a perturbed cost.
+    bool last_dual_ok = false;
+    std::vector<core::f64> last_cost, last_pi, last_redcost;
 };
 
 core::RawResult solve_dual_simplex_prepared(

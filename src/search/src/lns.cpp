@@ -1,4 +1,6 @@
+#include "forge/search/domain_writer.hpp"
 #include "forge/search/lns.hpp"
+#include "forge/model/dyadic.hpp"
 
 #include "forge/search/propagate.hpp"
 #include "forge/sparse/csr.hpp"
@@ -265,11 +267,9 @@ bool build_neighborhood(Neighborhood kind,
                 trail.truncate(mark);
             };
             const auto set_bound = [&](Index j, bool lower, f64 v) {
-                auto& b = lower ? out.col_lo[sz(j)] : out.col_hi[sz(j)];
-                if (b == v) return;
-                trail.push(j, lower ? BoundDir::Lower : BoundDir::Upper, v, b,
-                           ReasonKind::Branch, -1, 1);
-                b = v;
+                write_domain_bound(out.col_lo, out.col_hi, j,
+                    lower ? BoundDir::Lower : BoundDir::Upper, v, &trail,
+                    {ReasonKind::Branch, -1, 1});
             };
 
             Index n_int = 0;
@@ -522,12 +522,18 @@ model::LpProblem apply_neighborhood(const model::LpProblem& mip,
             any = true;
         }
         if (any) {
+            f64 side = np.objective_cutoff;
+            if (std::isfinite(side)) {
+                model::DyadicSum translated;
+                translated.add(side); translated.add(-mip.obj_offset);
+                side = mip.maximize ? translated.down() : translated.up();
+            }
             if (mip.maximize) {
-                sub.row_lo.push_back(np.objective_cutoff - mip.obj_offset);
+                sub.row_lo.push_back(side);
                 sub.row_hi.push_back(kInf);
             } else {
                 sub.row_lo.push_back(-kInf);
-                sub.row_hi.push_back(np.objective_cutoff - mip.obj_offset);
+                sub.row_hi.push_back(side);
             }
             sub.row_names.push_back("LNS_CUTOFF");
             ++next;

@@ -20,6 +20,7 @@
 #pragma once
 
 #include "forge/core/result.hpp"
+#include "forge/core/cancel.hpp"
 #include "forge/model/lp.hpp"
 #include "forge/search/conflict.hpp"
 #include "forge/search/conflict_store.hpp"
@@ -38,11 +39,13 @@ struct RapidLearningOptions {
     std::uint64_t restart_base = 64;
     f64 activity_decay = 0.95;
     f64 tol = 1e-9;
+    const core::CancelToken* cancel = nullptr;
 };
 
 struct RapidLearningResult {
     bool ran = false;
     bool infeasible = false;        // level-0 conflict: the root box is empty
+    bool interrupted = false;      // allowance expired with unfinished work
     bool leaf = false;              // every binary assigned without a conflict
     std::uint64_t decisions = 0, conflicts = 0, learned = 0, units = 0, restarts = 0;
     std::uint64_t level0_tightenings = 0;

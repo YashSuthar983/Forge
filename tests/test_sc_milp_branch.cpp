@@ -138,6 +138,7 @@ void test_load_rejects_nan_poisoned_model() {
 void test_bab_sc_milp_fires() {
     auto lp = read_text(kFracBranch);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.branch_strategy = BranchStrategy::ScMilp;
@@ -175,6 +176,7 @@ void test_bab_sc_milp_fires() {
 void test_classical_ignores_sc_milp() {
     auto lp = read_text(kFracBranch);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Classical;
     opts.branch_strategy = BranchStrategy::ScMilp;
@@ -190,6 +192,7 @@ void test_classical_ignores_sc_milp() {
 void test_auto_prefers_sc_without_sparse_model() {
     auto lp = read_text(kFracBranch);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.branch_strategy = BranchStrategy::Auto;
@@ -231,6 +234,7 @@ void test_explicit_reliability_bypasses_untrained_sc_heuristic() {
     CHECK(parsed == BranchStrategy::Reliability);
     auto lp = read_text(kFracBranch);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.branch_strategy = BranchStrategy::Reliability;
@@ -263,6 +267,7 @@ void test_explicit_reliability_bypasses_untrained_sc_heuristic() {
 void test_auto_defaults_to_paper_reliability() {
     auto lp = read_text(kFracBranch);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.branch_strategy = BranchStrategy::Auto;

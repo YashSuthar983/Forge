@@ -1,5 +1,7 @@
 #pragma once
 
+#include "forge/core/cancel.hpp"
+
 #include "forge/model/lp.hpp"
 #include <cstdint>
 #include <vector>
@@ -16,6 +18,7 @@ struct BinaryRelation {
 };
 
 struct RowSupportProbeOptions {
+    const core::CancelToken* cancel = nullptr;
     bool enabled = true;
     int max_row_binaries = 8;
     int min_row_binaries = 2;

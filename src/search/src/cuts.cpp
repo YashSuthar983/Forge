@@ -34,13 +34,15 @@ bool canonicalize(CutRow& cut) {
               [](const auto& a, const auto& b) { FORGE_FN(); return a.first < b.first; });
     cut.cols.clear();
     cut.vals.clear();
-    for (const auto& [col, val] : terms) {
-        if (!cut.cols.empty() && cut.cols.back() == col) {
-            cut.vals.back() += val;
-        } else {
-            cut.cols.push_back(col);
-            cut.vals.push_back(val);
-        }
+    for (std::size_t k = 0; k < terms.size();) {
+        const Index col = terms[k].first;
+        model::DyadicSum sum;
+        do { sum.add(terms[k++].second); }
+        while (k < terms.size() && terms[k].first == col);
+        f64 val = 0.0;
+        if (!sum.representable(val)) return false;
+        cut.cols.push_back(col);
+        cut.vals.push_back(val);
     }
     std::size_t write = 0;
     for (std::size_t read = 0; read < cut.vals.size(); ++read) {
@@ -98,10 +100,132 @@ f64 sparse_dot(const CutRow& a, const std::vector<f64>& av,
 
 }  // namespace
 
+bool compile_cut(CutRow& cut, const model::LpProblem& lp, const CutOptions& opts) {
+    if (!canonicalize(cut) || std::isnan(cut.row_lo) || std::isnan(cut.row_hi) ||
+        cut.row_lo > cut.row_hi) return false;
+    for (const Index j : cut.cols) if (j >= lp.n_cols()) return false;
+    if (cut.compiled) return true;
+    if (!cut.exact) {
+        long double reach_sum = 0.0L;
+        for (std::size_t k = 0; k < cut.cols.size(); ++k) {
+            const auto j = sz(cut.cols[k]);
+            const f64 lo = lp.col_lo[j], hi = lp.col_hi[j];
+            long double reach = std::max(std::isfinite(lo) ? std::fabs(lo) : 1.0,
+                                         std::isfinite(hi) ? std::fabs(hi) : 1.0);
+            reach_sum += std::fabs(static_cast<long double>(cut.vals[k])) * reach;
+        }
+        const auto side = [&](f64 rhs, bool upper) {
+            if (!std::isfinite(rhs)) return rhs;
+            const long double margin = opts.derived_cut_rel_margin *
+                (std::fabs(static_cast<long double>(rhs)) + reach_sum) + opts.derived_cut_abs_margin;
+            const long double v = rhs + (upper ? margin : -margin);
+            f64 result = static_cast<f64>(v);
+            if (upper ? static_cast<long double>(result) < v : static_cast<long double>(result) > v)
+                result = std::nextafter(result, upper ? model::kInf : -model::kInf);
+            return result;
+        };
+        cut.row_lo = side(cut.row_lo, false);
+        cut.row_hi = side(cut.row_hi, true);
+    }
+    cut.compiled = true;
+    return true;
+}
+
+std::optional<int> compare_cut_rhs(const CutRow& a, const CutRow& b) {
+    if (a.cols.empty() || a.cols != b.cols || a.vals.size() != b.vals.size()) return std::nullopt;
+    const bool au = std::isfinite(a.row_hi), bu = std::isfinite(b.row_hi);
+    if (au == std::isfinite(a.row_lo) || bu == std::isfinite(b.row_lo)) return std::nullopt;
+    const f64 as = au ? 1.0 : -1.0, bs = bu ? 1.0 : -1.0;
+    const f64 a0 = as * a.vals.front(), b0 = bs * b.vals.front();
+    if (a0 == 0.0 || b0 == 0.0 || (a0 < 0.0) != (b0 < 0.0)) return std::nullopt;
+    for (std::size_t k = 0; k < a.vals.size(); ++k) {
+        model::DyadicSum d;
+        d.add_product(as * a.vals[k], b0);
+        d.add_product(-bs * b.vals[k], a0);
+        if (!d.is_zero()) return std::nullopt;
+    }
+    model::DyadicSum d;
+    d.add_product(as * (au ? a.row_hi : a.row_lo), std::fabs(b0));
+    d.add_product(-bs * (bu ? b.row_hi : b.row_lo), std::fabs(a0));
+    return d.sign();
+}
+
 std::size_t CutPool::active_size() const {
     FORGE_FN();
     return static_cast<std::size_t>(std::count_if(
         entries_.begin(), entries_.end(), [](const Entry& e) { FORGE_FN(); return e.active; }));
+}
+
+std::uint64_t CutPool::sync_active_with_model(const model::LpProblem& lp,
+                                              Index first_cut_row,
+                                              CutDiagnostics* diag) {
+    FORGE_FN();
+    if (first_cut_row < 0 || first_cut_row > lp.n_rows()) return 0;
+    struct Present {
+        std::vector<Index> cols;
+        std::vector<f64> unit_vals;
+        f64 rhs_unit = 0.0;
+    };
+    std::vector<Present> present;
+    present.reserve(sz(lp.n_rows() - first_cut_row));
+    const auto& rp = lp.A.pattern.row_ptr();
+    const auto& ci = lp.A.pattern.col_idx();
+    const auto& av = lp.A.vals;
+    for (Index i = first_cut_row; i < lp.n_rows(); ++i) {
+        CutRow cr;
+        const bool has_hi = std::isfinite(lp.row_hi[sz(i)]);
+        const bool has_lo = std::isfinite(lp.row_lo[sz(i)]);
+        if (!has_hi && !has_lo) continue;
+        // Match the pool's <= unit form: prefer a finite upper side, else
+        // negate a finite lower side. Two-sided rows contribute their upper.
+        const bool as_le = has_hi;
+        for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+            const f64 a = av[sz(k)];
+            if (a == 0.0) continue;
+            cr.cols.push_back(ci[sz(k)]);
+            cr.vals.push_back(as_le ? a : -a);
+        }
+        cr.row_lo = -model::kInf;
+        cr.row_hi = as_le ? lp.row_hi[sz(i)] : -lp.row_lo[sz(i)];
+        Present p;
+        if (!normalized_le(cr, p.unit_vals, p.rhs_unit)) continue;
+        p.cols = std::move(cr.cols);
+        present.push_back(std::move(p));
+    }
+    const auto same = [](const Entry& e, const Present& p) {
+        if (e.cut.cols != p.cols || e.unit_vals.size() != p.unit_vals.size())
+            return false;
+        constexpr f64 kTol = 1e-9;
+        if (std::fabs(e.rhs_unit - p.rhs_unit) > kTol) return false;
+        for (std::size_t k = 0; k < e.unit_vals.size(); ++k)
+            if (std::fabs(e.unit_vals[k] - p.unit_vals[k]) > kTol) return false;
+        return true;
+    };
+    std::uint64_t released = 0;
+    for (Entry& e : entries_) {
+        if (!e.active) continue;
+        bool found = false;
+        for (const Present& p : present) {
+            if (same(e, p)) {
+                found = true;
+                break;
+            }
+        }
+        if (found) continue;
+        e.active = false;
+        e.age = 0;  // freshly released: do not age out before a reactivation chance
+        ++released;
+    }
+    if (diag != nullptr) diag->pool_released += released;
+    return released;
+}
+
+std::vector<CutRow> CutPool::retained_inactive() const {
+    FORGE_FN();
+    std::vector<CutRow> out;
+    for (const Entry& e : entries_)
+        if (e.ever_selected && !e.active) out.push_back(e.cut);
+    return out;
 }
 
 void CutPool::start_round(CutDiagnostics& diag) {
@@ -121,11 +245,10 @@ void CutPool::start_round(CutDiagnostics& diag) {
 void CutPool::add(const std::vector<CutRow>& candidates,
                   CutDiagnostics& diag) {
     FORGE_FN();
-    constexpr f64 kCosRoundoff = 1e-12;
     for (const auto& cut : candidates) {
         Entry incoming;
         incoming.cut = cut;
-        if (!canonicalize(incoming.cut) ||
+        if (!(lp_ctx_ ? compile_cut(incoming.cut, *lp_ctx_, opts_) : canonicalize(incoming.cut)) ||
             !normalized_le(incoming.cut, incoming.unit_vals, incoming.rhs_unit))
             continue;
         // Reject cuts whose support is outside the scoring context (stale
@@ -144,21 +267,11 @@ void CutPool::add(const std::vector<CutRow>& candidates,
                 ++it;
                 continue;
             }
-            const f64 cosine = sparse_dot(it->cut, it->unit_vals,
-                                          incoming.cut, incoming.unit_vals);
-            if (cosine < 1.0 - opts_.pool_duplicate_tol - kCosRoundoff) {
-                ++it;
-                continue;
-            }
-            const f64 rhs_delta = incoming.rhs_unit - it->rhs_unit;
-            if (std::fabs(rhs_delta) <= opts_.pool_duplicate_tol) {
-                ++diag.pool_duplicates;
-                reject = true;
-                break;
-            }
-            // In normalized <= form, the smaller rhs is the stronger cut.
-            if (rhs_delta > 0.0) {
-                ++diag.pool_dominated;
+            const auto comparison = compare_cut_rhs(incoming.cut, it->cut);
+            if (!comparison) { ++it; continue; }
+            if (*comparison >= 0) {
+                if (*comparison == 0) ++diag.pool_duplicates;
+                else ++diag.pool_dominated;
                 reject = true;
                 break;
             }
@@ -264,6 +377,13 @@ std::vector<CutRow> CutPool::select_violated(const std::vector<f64>& x,
             activity += entry.unit_vals[k] * x[sz(j)];
         }
         entry.last_efficacy = valid_point ? activity - entry.rhs_unit : 0.0;
+        for (const auto& point : references_) {
+            if (point.size() != x.size()) continue;
+            f64 a = 0.0;
+            for (std::size_t k = 0; k < entry.cut.cols.size(); ++k)
+                a += entry.unit_vals[k] * point[sz(entry.cut.cols[k])];
+            entry.last_efficacy = std::max(entry.last_efficacy, a - entry.rhs_unit);
+        }
         if (entry.last_efficacy < opts_.pool_efficacy_min) continue;
         max_eff = std::max(max_eff, entry.last_efficacy);
         order.push_back(i);
@@ -399,7 +519,10 @@ std::vector<CutRow> CutPool::select_violated(const std::vector<f64>& x,
         if (best == entries_.size()) break;
 
         alive[best] = 0;
+        if (entries_[best].ever_selected && !entries_[best].active)
+            ++diag.pool_reactivated;
         entries_[best].active = true;
+        entries_[best].ever_selected = true;
         entries_[best].age = 0;
         chosen.push_back(best);
         nnz_used += static_cast<f64>(entries_[best].cut.cols.size());
@@ -1177,15 +1300,6 @@ void apply_cuts_inplace(model::LpProblem& lp,
     }
     if (cuts.empty()) return;
 
-    std::vector<std::vector<Index>> col_rows(sz(lp.n_cols()));
-    {
-        const auto& rp0 = lp.A.pattern.row_ptr();
-        const auto& ci0 = lp.A.pattern.col_idx();
-        for (Index i = 0; i < lp.n_rows(); ++i)
-            for (core::Offset k = rp0[sz(i)]; k < rp0[sz(i) + 1]; ++k)
-                col_rows[sz(ci0[sz(k)])].push_back(i);
-    }
-
     const Index m0 = lp.n_rows();
     const Index n = lp.n_cols();
     const auto& rp = lp.A.pattern.row_ptr();
@@ -1224,35 +1338,10 @@ void apply_cuts_inplace(model::LpProblem& lp,
             if (j < 0 || j >= n) return false;
         return true;
     };
-    // The stored row is the one every consumer reads as data, so a cut
-    // derived in floating point enters with its outward margin
-    // (CutOptions::derived_cut_*_margin). Only a row its separator derived
-    // exactly (CutRow::exact) enters unchanged: integer-looking final data
-    // does not show how it was derived.
-    const auto with_margin = [&](const CutRow& in) -> CutRow {
-        if (in.exact) return in;
-        CutRow out = in;
-        f64 reach_sum = 0.0;
-        for (std::size_t k = 0; k < in.cols.size(); ++k) {
-            const Index j = in.cols[k];
-            const f64 lo = lp.col_lo[sz(j)], hi = lp.col_hi[sz(j)];
-            f64 reach = 0.0;
-            if (std::isfinite(lo)) reach = std::max(reach, std::fabs(lo));
-            if (std::isfinite(hi)) reach = std::max(reach, std::fabs(hi));
-            if (!std::isfinite(lo) || !std::isfinite(hi)) reach = std::max(reach, 1.0);
-            reach_sum += std::fabs(in.vals[k]) * reach;
-        }
-        const auto margin = [&](f64 side) {
-            return opts.derived_cut_rel_margin * (std::fabs(side) + reach_sum) +
-                   opts.derived_cut_abs_margin;
-        };
-        if (std::isfinite(out.row_lo)) out.row_lo -= margin(out.row_lo);
-        if (std::isfinite(out.row_hi)) out.row_hi += margin(out.row_hi);
-        return out;
-    };
     for (const auto& raw_cut : cuts) {
         if (!cut_cols_in_range(raw_cut)) continue;
-        const CutRow cut = with_margin(raw_cut);
+        CutRow cut = raw_cut;
+        if (!compile_cut(cut, lp, opts)) continue;
         f64 cs = 0.0;
         const std::string key = row_signature(cut.cols, cut.vals, cs);
         const auto it = key.empty() ? shape_of.end() : shape_of.find(key);
@@ -1293,8 +1382,6 @@ void apply_cuts_inplace(model::LpProblem& lp,
                     proportional = d.is_zero();
                 }
                 if (!proportional) {
-                    if (max_row_parallelism(lp, col_rows, cut) > opts.parallel_to_row_max)
-                        continue;
                     pending.push_back(cut);
                     continue;
                 }
@@ -1345,11 +1432,7 @@ void apply_cuts_inplace(model::LpProblem& lp,
             }
             continue;
         }
-        // Near-parallel to an existing row: not exactly proportional, so the
-        // exact merge above cannot fold it in, but close enough that adding it
-        // buys almost no new direction while contributing near-dependence.
-        if (max_row_parallelism(lp, col_rows, cut) > opts.parallel_to_row_max)
-            continue;
+        // Similar normals are a selection cost, never proof of dominance.
         pending.push_back(cut);
         if (!key.empty())
             shape_of.emplace(key, m0 + static_cast<Index>(pending.size()) - 1);

@@ -126,6 +126,7 @@ Gf2PresolveDiagnostics apply_gf2_presolve(const model::LpProblem& lp,
         eqs.reserve(sz(std::min(m, opts.max_equations)));
 
         for (Index i = 0; i < m; ++i) {
+            if (core::cancel_requested(opts.cancel)) { diag.truncated = true; return diag; }
             if (static_cast<Index>(eqs.size()) >= opts.max_equations) {
                 diag.truncated = true;
                 break;
@@ -217,6 +218,7 @@ Gf2PresolveDiagnostics apply_gf2_presolve(const model::LpProblem& lp,
         std::vector<Index> pivot_of_var(sz(nv), -1);
         Index rank = 0;
         for (Index col = 0; col < nv && rank < ne; ++col) {
+            if (core::cancel_requested(opts.cancel)) { diag.truncated = true; return diag; }
             Index piv = -1;
             for (Index r = rank; r < ne; ++r) {
                 if (bit_get(mat[sz(r)], col)) {
@@ -244,6 +246,7 @@ Gf2PresolveDiagnostics apply_gf2_presolve(const model::LpProblem& lp,
         // Check inconsistency / extract singleton fixings.
         bool any_fix = false;
         for (Index r = 0; r < ne; ++r) {
+            if (core::cancel_requested(opts.cancel)) { diag.truncated = true; return diag; }
             if (row_empty(mat[sz(r)])) {
                 if (rhs[sz(r)] != 0) {
                     diag.infeasible = true;

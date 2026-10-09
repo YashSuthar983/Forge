@@ -102,7 +102,7 @@ public:
     explicit BalansScheduler(const BalansOptions& opts);
 
     int select(const std::vector<bool>& usable);
-    void reward(int arm, LnsOutcome outcome, double seconds);
+    void reward(int arm, LnsOutcome outcome, double seconds, f64 gap_closed = -1.0);
 
     f64 fixing_rate(int arm) const {
         return arms_[static_cast<std::size_t>(arm)].fixing_rate;

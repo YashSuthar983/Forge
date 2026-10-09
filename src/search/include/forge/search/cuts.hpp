@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <functional>
+#include <optional>
 #include <utility>
 #include <vector>
 #include "forge/core/route_debug.hpp"
@@ -372,6 +373,10 @@ struct CutDiagnostics {
     std::uint64_t pool_aged_out = 0;
     std::uint64_t pool_evicted = 0;
     std::uint64_t pool_selected = 0;
+    // Entries whose `active` flag was cleared because the working LP no longer
+    // carries their row (purge / retract). They may be reselected when violated.
+    std::uint64_t pool_released = 0;
+    std::uint64_t pool_reactivated = 0;
     f64 root_bound_before = core::kNaN;
     f64 root_bound_after = core::kNaN;
 };
@@ -451,14 +456,29 @@ struct CutRow {
     // like: integer-looking data says nothing about how it was derived.
     // Set by zero-half, clique and assignment-nogood cuts.
     bool exact = false;
+    // The coefficients and sides are already the row to be delivered to the
+    // LP. Independent of exact: compiling a floating derivation does not
+    // turn it into an exact derivation. Never pad a compiled row again.
+    bool compiled = false;
 };
 
-// A bounded global pool for generated, not-yet-active cuts. Cuts are stored in
-// a scale-invariant <= representation so positive rescalings are recognized as
+// Canonicalize without coefficient loss and apply the storage margin once,
+// before efficacy/duplicate/selection decisions. False means the row has no
+// representable canonical coefficients or valid support.
+bool compile_cut(CutRow& cut, const model::LpProblem& lp, const CutOptions& opts);
+// -1/0/+1 compares RHS in a common <= scale; nullopt for distinct normals.
+std::optional<int> compare_cut_rhs(const CutRow& a, const CutRow& b);
+
+// A bounded global pool for generated cuts. Cuts are stored in a
+// scale-invariant <= representation so positive rescalings are recognized as
 // duplicates. Selection ranks normalized violation (efficacy), rejects nearly
-// parallel rows within a batch, and ages unused candidates. Once selected, a
-// cut remains fingerprinted as active so a later separator round cannot append
-// the same LP row again.
+// parallel rows within a batch, and ages unused candidates.
+//
+// `active` means the inequality is currently present in the working LP, not
+// that it was ever selected. After a purge removes nonbinding cut rows,
+// sync_active_with_model clears that flag so a later violated round can
+// reselect the retained pool entry (reactivation). Fingerprints alone must
+// not permanently exile a valid cut from the LP working set.
 class CutPool {
 public:
     explicit CutPool(const CutOptions& opts) : opts_(opts) { FORGE_FN();}
@@ -468,6 +488,9 @@ public:
     // measured against, and which columns are integral. Without it the pool
     // falls back to ranking on efficacy alone.
     void set_scoring_context(const model::LpProblem& lp);
+    void set_reference_points(std::vector<std::vector<f64>> points) {
+        references_ = std::move(points);
+    }
     // Optional external score for sequence selection (HGTSM under Latest).
     // When set, select_violated ranks by scorer(cut, x) instead of the efficacy
     // composite. Violation / density / parallelism filters are unchanged.
@@ -485,6 +508,15 @@ public:
     void add(const std::vector<CutRow>& candidates, CutDiagnostics& diag);
     std::vector<CutRow> select_violated(const std::vector<f64>& x,
                                         CutDiagnostics& diag);
+    // Clear `active` on every pool entry whose normalized form is absent from
+    // LP rows [first_cut_row, n_rows). Purged inequalities become selectable
+    // again; survivors stay marked so selection does not re-append them.
+    std::uint64_t sync_active_with_model(const model::LpProblem& lp,
+                                         Index first_cut_row,
+                                         CutDiagnostics* diag = nullptr);
+    // Inequalities previously selected into the LP but no longer present
+    // after sync (candidates for GCS reinjection / later reactivation).
+    std::vector<CutRow> retained_inactive() const;
     std::size_t size() const { FORGE_FN(); return entries_.size(); }
     std::size_t active_size() const;
 
@@ -496,7 +528,8 @@ private:
         f64 last_efficacy = 0.0;
         f64 last_score = 0.0;
         int age = 0;
-        bool active = false;
+        bool active = false;       // currently in the working LP
+        bool ever_selected = false;  // was in the LP at least once (reactivation)
     };
 
     CutOptions opts_;
@@ -507,6 +540,7 @@ private:
     f64 max_locks_ = 0.0;
     Index n_cols_ = 0;
     const model::LpProblem* lp_ctx_ = nullptr;
+    std::vector<std::vector<f64>> references_;
     ExternalScoreFn external_score_;
     ExternalBatchScoreFn external_batch_score_;
 };

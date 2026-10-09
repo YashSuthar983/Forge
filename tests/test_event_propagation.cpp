@@ -43,6 +43,8 @@ BabOptions tree_options(bool event) {
     o.mip_presolve = o.probing = o.symmetry = false;
     o.integer_row_rounding = false;
     o.tree_cut.enabled = false;
+    o.structural_presolve.binary_row_max_work = 0;  // isolate row-event coverage
+    o.component_solve = false;
     o.event_propagation = event;
     return o;
 }

@@ -178,21 +178,25 @@ bool BasisFactor::factorize(Index m,
         !std::isfinite(opts.dense_nucleus_density) || opts.dense_nucleus_density < 0 || opts.dense_nucleus_density > 1 ||
         opts.dense_nucleus_limit < 0)
         throw std::invalid_argument("BasisFactor: invalid numerical policy");
+    border_parent_.reset();
+    border_ptr_.clear(); border_slot_.clear(); border_value_.clear();
+    projected_ = false; retained_rows_.clear(); retained_slots_.clear();
+    if (!base_.unique()) base_ = std::make_shared<BaseStorage>();
     m_ = m;
     valid_ = false;
     stats_ = LuStats{};
     stats_.dimension = m;
     stats_.input_nnz = static_cast<Offset>(row_idx.size());
 
-    piv_row_.clear();  piv_slot_.clear();  piv_val_.clear();
-    u_off_.clear();    u_len_.clear();     u_cap_.clear();
-    u_idx_.clear();    u_val_.clear();     u_dead_nnz_ = 0;
-    l_start_.clear();  l_idx_.clear();     l_val_.clear();
-    u_cstart_.clear(); u_clen_.clear();    u_ccap_.clear();
-    u_crow_.clear();   u_cval_.clear();    u_cdead_nnz_ = 0;
-    l_col_start_.clear(); l_col_row_.clear(); l_row_val_.clear();
+    base_->piv_row_.clear();  base_->piv_slot_.clear();  base_->piv_val_.clear();
+    base_->u_off_.clear();    base_->u_len_.clear();     base_->u_cap_.clear();
+    base_->u_idx_.clear();    base_->u_val_.clear();     u_dead_nnz_ = 0;
+    base_->l_start_.clear();  base_->l_idx_.clear();     base_->l_val_.clear();
+    base_->u_cstart_.clear(); base_->u_clen_.clear();    base_->u_ccap_.clear();
+    base_->u_crow_.clear();   base_->u_cval_.clear();    u_cdead_nnz_ = 0;
+    base_->l_col_start_.clear(); base_->l_col_row_.clear(); base_->l_row_val_.clear();
     // A fresh factorization eliminates in index order and owes no row etas.
-    uord_.clear();     upos_.clear();      u_reordered_ = false;
+    base_->uord_.clear();     base_->upos_.clear();      u_reordered_ = false;
     r_pos_.clear();    r_start_.assign(1, 0);
     r_idx_.clear();    r_val_.clear();
     eta_p_.clear();    eta_start_.assign(1, 0);
@@ -220,9 +224,9 @@ bool BasisFactor::factorize(Index m,
     if (singular_slots) singular_slots->clear();
     if (vacant_rows)    vacant_rows->clear();
 
-    piv_row_.reserve(sz(m));  piv_slot_.reserve(sz(m));  piv_val_.reserve(sz(m));
-    u_off_.reserve(sz(m));    u_len_.reserve(sz(m));
-    l_start_.assign(1, 0);
+    base_->piv_row_.reserve(sz(m));  base_->piv_slot_.reserve(sz(m));  base_->piv_val_.reserve(sz(m));
+    base_->u_off_.reserve(sz(m));    base_->u_len_.reserve(sz(m));
+    base_->l_start_.assign(1, 0);
 
     if (m == 0) { valid_ = true; return true; }
 
@@ -312,16 +316,16 @@ bool BasisFactor::factorize(Index m,
                     if (i != r && e.row_live[sz(i)] && find_at(i, c) >= 0) return false;
                 }
             }
-            piv_row_.push_back(r);
-            piv_slot_.push_back(c);
-            piv_val_.push_back(piv);
+            base_->piv_row_.push_back(r);
+            base_->piv_slot_.push_back(c);
+            base_->piv_val_.push_back(piv);
             for (Offset k = rb; k < re; ++k) {
                 if (rcol[sz(k)] == c) continue;
-                u_idx_.push_back(rcol[sz(k)]);
-                u_val_.push_back(rval[sz(k)]);
+                base_->u_idx_.push_back(rcol[sz(k)]);
+                base_->u_val_.push_back(rval[sz(k)]);
             }
-            u_off_.push_back(u_alloc_nnz_);
-            u_len_.push_back(pr);
+            base_->u_off_.push_back(u_alloc_nnz_);
+            base_->u_len_.push_back(pr);
             u_alloc_nnz_ += static_cast<Offset>(pr);
             for (Offset k = cs[sz(c)]; k < cs[sz(c)] + cl[sz(c)]; ++k) {
                 const Index i = crow[sz(k)];
@@ -330,8 +334,8 @@ bool BasisFactor::factorize(Index m,
                 if (at < 0) continue;
                 const f64 mult = rval[sz(at)] / piv;
                 stats_.largest_multiplier = std::max(stats_.largest_multiplier, std::fabs(mult));
-                l_idx_.push_back(i);
-                l_val_.push_back(mult);
+                base_->l_idx_.push_back(i);
+                base_->l_val_.push_back(mult);
                 const Offset last = rs[sz(i)] + rl[sz(i)];
                 std::copy(rcol.begin() + at + 1, rcol.begin() + last, rcol.begin() + at);
                 std::copy(rval.begin() + at + 1, rval.begin() + last, rval.begin() + at);
@@ -339,7 +343,7 @@ bool BasisFactor::factorize(Index m,
                 --e.col_cnt[sz(c)];
                 if (rl[sz(i)] == 1) e.q_row1.push_back(i);
             }
-            l_start_.push_back(static_cast<Offset>(l_idx_.size()));
+            base_->l_start_.push_back(static_cast<Offset>(base_->l_idx_.size()));
             for (Offset k = rb; k < re; ++k) {
                 const Index j = rcol[sz(k)];
                 --e.col_cnt[sz(j)];
@@ -396,10 +400,10 @@ bool BasisFactor::factorize(Index m,
     const bool peeled_flat = flat_load_and_peel();
     if (!peeled_flat) {
         // Start over on the vector path, exactly as without the flat peel.
-        piv_row_.clear(); piv_slot_.clear(); piv_val_.clear();
-        u_off_.clear(); u_len_.clear(); u_idx_.clear(); u_val_.clear();
+        base_->piv_row_.clear(); base_->piv_slot_.clear(); base_->piv_val_.clear();
+        base_->u_off_.clear(); base_->u_len_.clear(); base_->u_idx_.clear(); base_->u_val_.clear();
         u_alloc_nnz_ = 0;
-        l_start_.assign(1, 0); l_idx_.clear(); l_val_.clear();
+        base_->l_start_.assign(1, 0); base_->l_idx_.clear(); base_->l_val_.clear();
         stats_.triangular_pivots = 0;
         stats_.largest_multiplier = 0.0;
         e.reset(m);
@@ -437,19 +441,19 @@ bool BasisFactor::factorize(Index m,
             }
         }
 
-        piv_row_.push_back(r);
-        piv_slot_.push_back(c);
-        piv_val_.push_back(piv);
+        base_->piv_row_.push_back(r);
+        base_->piv_slot_.push_back(c);
+        base_->piv_val_.push_back(piv);
 
         // U row: the pivot row's off-diagonals, in ORIGINAL column indices.
         // Translated to pivot coordinates after the whole factorization, when
         // every column's pivot position is known.
         for (std::size_t k = 0; k < e.pr_cols.size(); ++k) {
-            u_idx_.push_back(e.pr_cols[k]);
-            u_val_.push_back(e.pr_vals[k]);
+            base_->u_idx_.push_back(e.pr_cols[k]);
+            base_->u_val_.push_back(e.pr_vals[k]);
         }
-        u_off_.push_back(u_alloc_nnz_);
-        u_len_.push_back(static_cast<Index>(e.pr_cols.size()));
+        base_->u_off_.push_back(u_alloc_nnz_);
+        base_->u_len_.push_back(static_cast<Index>(e.pr_cols.size()));
         u_alloc_nnz_ += static_cast<Offset>(e.pr_cols.size());
 
         // Eliminate column c from every other live row that holds it. The
@@ -468,8 +472,8 @@ bool BasisFactor::factorize(Index m,
             const f64 mult = *aic / piv;
             stats_.largest_multiplier =
                 std::max(stats_.largest_multiplier, std::fabs(mult));
-            l_idx_.push_back(i);
-            l_val_.push_back(mult);
+            base_->l_idx_.push_back(i);
+            base_->l_val_.push_back(mult);
 
             // row_i <- (row_i minus column c) - mult * pivot_row
             // Merge of two ascending lists, so the result stays sorted and the
@@ -534,7 +538,7 @@ bool BasisFactor::factorize(Index m,
             riv.swap(e.tmp_vals);
             e.note_row(i);
         }
-        l_start_.push_back(static_cast<Offset>(l_idx_.size()));
+        base_->l_start_.push_back(static_cast<Offset>(base_->l_idx_.size()));
 
         // Retire the pivot row and column.
         for (const Index j : e.row_cols[sz(r)]) {
@@ -695,21 +699,21 @@ bool BasisFactor::factorize(Index m,
         for (const Index j : columns) col_position[sz(j)] = -1;
         if (!factored) return false;
         for (Index k = 0; k < n; ++k) {
-            piv_row_.push_back(rows[sz(k)]); piv_slot_.push_back(columns[sz(k)]);
-            piv_val_.push_back(dense[sz(k)*sz(n)+sz(k)]);
-            u_off_.push_back(u_alloc_nnz_);
+            base_->piv_row_.push_back(rows[sz(k)]); base_->piv_slot_.push_back(columns[sz(k)]);
+            base_->piv_val_.push_back(dense[sz(k)*sz(n)+sz(k)]);
+            base_->u_off_.push_back(u_alloc_nnz_);
             Index length = 0;
             for (Index j = k+1; j < n; ++j) {
                 const f64 a = dense[sz(k)*sz(n)+sz(j)];
-                if (a != 0) { u_idx_.push_back(columns[sz(j)]); u_val_.push_back(a); ++length; }
+                if (a != 0) { base_->u_idx_.push_back(columns[sz(j)]); base_->u_val_.push_back(a); ++length; }
             }
-            u_len_.push_back(length); u_alloc_nnz_ += length;
+            base_->u_len_.push_back(length); u_alloc_nnz_ += length;
             for (Index i = k+1; i < n; ++i) {
                 const f64 a = dense[sz(i)*sz(n)+sz(k)];
-                if (a != 0) { l_idx_.push_back(rows[sz(i)]); l_val_.push_back(a);
+                if (a != 0) { base_->l_idx_.push_back(rows[sz(i)]); base_->l_val_.push_back(a);
                     stats_.largest_multiplier = std::max(stats_.largest_multiplier, std::fabs(a)); }
             }
-            l_start_.push_back(static_cast<Offset>(l_idx_.size()));
+            base_->l_start_.push_back(static_cast<Offset>(base_->l_idx_.size()));
             e.row_live[sz(rows[sz(k)])] = 0; e.col_live[sz(columns[sz(k)])] = 0;
         }
         stats_.nucleus_pivots += n; stats_.blocked_nucleus_pivots += n;
@@ -767,7 +771,7 @@ bool BasisFactor::factorize(Index m,
     std::vector<Index> tail_rows;
     bool tail_tried = !opts.blocked_nucleus;
     for (; !dense_done;) {
-        const Index live = m - static_cast<Index>(piv_row_.size());
+        const Index live = m - static_cast<Index>(base_->piv_row_.size());
         if (!tail_tried && live <= opts.dense_nucleus_limit) {
             if (live < 32) {
                 tail_tried = true;
@@ -800,7 +804,7 @@ bool BasisFactor::factorize(Index m,
     }
 
     // ---- report and repair singularity ------------------------------------
-    const auto n_piv = static_cast<Index>(piv_row_.size());
+    const auto n_piv = static_cast<Index>(base_->piv_row_.size());
     if (n_piv < m) {
         // Pair the unpivotable columns with the uncovered rows and give each a
         // unit pivot. The factorization returned is therefore of B with those
@@ -816,24 +820,24 @@ bool BasisFactor::factorize(Index m,
 
         const std::size_t n = std::min(free_rows.size(), free_cols.size());
         for (std::size_t t = 0; t < n; ++t) {
-            piv_row_.push_back(free_rows[t]);
-            piv_slot_.push_back(free_cols[t]);
-            piv_val_.push_back(1.0);
-            u_off_.push_back(u_alloc_nnz_);
-            u_len_.push_back(0);
-            l_start_.push_back(static_cast<Offset>(l_idx_.size()));
+            base_->piv_row_.push_back(free_rows[t]);
+            base_->piv_slot_.push_back(free_cols[t]);
+            base_->piv_val_.push_back(1.0);
+            base_->u_off_.push_back(u_alloc_nnz_);
+            base_->u_len_.push_back(0);
+            base_->l_start_.push_back(static_cast<Offset>(base_->l_idx_.size()));
         }
     }
 
     // ---- translate original row/column indices to pivot coordinates -------
-    rpos_.assign(sz(m), -1);
-    cpos_.assign(sz(m), -1);
-    for (std::size_t k = 0; k < piv_row_.size(); ++k) {
-        rpos_[sz(piv_row_[k])] = static_cast<Index>(k);
-        cpos_[sz(piv_slot_[k])] = static_cast<Index>(k);
+    base_->rpos_.assign(sz(m), -1);
+    base_->cpos_.assign(sz(m), -1);
+    for (std::size_t k = 0; k < base_->piv_row_.size(); ++k) {
+        base_->rpos_[sz(base_->piv_row_[k])] = static_cast<Index>(k);
+        base_->cpos_[sz(base_->piv_slot_[k])] = static_cast<Index>(k);
     }
-    for (auto& j : u_idx_) j = cpos_[sz(j)];
-    for (auto& i : l_idx_) i = rpos_[sz(i)];
+    for (auto& j : base_->u_idx_) j = base_->cpos_[sz(j)];
+    for (auto& i : base_->l_idx_) i = base_->rpos_[sz(i)];
 
     // NOTE: rows stay in ORIGINAL column order (the pivot permutation does
     // not sort them). No consumer requires sorted rows; a sort here changes
@@ -843,14 +847,14 @@ bool BasisFactor::factorize(Index m,
 
     build_col_patterns();
     u_live_nnz_ = u_alloc_nnz_;
-    scratch_.mark_.assign(piv_val_.size(), 0);
+    scratch_.mark_.assign(base_->piv_val_.size(), 0);
     scratch_.dfs_stack_.clear();
     scratch_.reach_.clear();
     scratch_.order_.clear();
-    dense_below_ = static_cast<Index>(piv_val_.size() / 2);
+    dense_below_ = static_cast<Index>(base_->piv_val_.size() / 2);
 
-    stats_.factor_nnz = static_cast<Offset>(u_idx_.size() + l_idx_.size()) +
-                        static_cast<Offset>(piv_val_.size());
+    stats_.factor_nnz = static_cast<Offset>(base_->u_idx_.size() + base_->l_idx_.size()) +
+                        static_cast<Offset>(base_->piv_val_.size());
     // Deterministic work: loading, elimination and the produced factor.
     stats_.factor_work = 16 * static_cast<Offset>(m) + 6 * static_cast<Offset>(row_idx.size()) +
                          4 * stats_.factor_nnz;
@@ -882,71 +886,198 @@ void BasisFactor::reset_scratch(SolveScratch& sc) const {
     sc.work_.assign(sz(m_), 0.0);
     sc.pair_work_.assign(sz(m_), 0.0);
     sc.work_all_dirty_ = false;   // freshly zeroed, as after factorize()
-    sc.mark_.assign(piv_val_.size(), 0);
+    sc.mark_.assign(base_->piv_val_.size(), 0);
     sc.support_stamp_.assign(sz(m_), 0);
     sc.factor_gen = factor_gen_;
 }
 
+void BasisFactor::extend_logical_rows(Index added,
+                                     const std::vector<Offset>& row_ptr,
+                                     const std::vector<Index>& slots,
+                                     const std::vector<f64>& values) {
+    if (!valid_ || added < 0 || added > std::numeric_limits<Index>::max() - m_ ||
+        row_ptr.size() != sz(added) + 1 || row_ptr.front() != 0 ||
+        row_ptr.back() != static_cast<Offset>(slots.size()) || slots.size() != values.size())
+        throw std::invalid_argument("BasisFactor: malformed logical border");
+    for (Index i = 0; i < added; ++i)
+        if (row_ptr[sz(i)] < 0 || row_ptr[sz(i)] > row_ptr[sz(i) + 1])
+            throw std::invalid_argument("BasisFactor: malformed border offsets");
+    for (std::size_t k = 0; k < slots.size(); ++k)
+        if (slots[k] < 0 || slots[k] >= m_ || !std::isfinite(values[k]))
+            throw std::invalid_argument("BasisFactor: malformed border entry");
+    if (added == 0) return;
+    BasisFactor next;
+    next.border_parent_ = std::make_shared<const BasisFactor>(*this);
+    next.border_ptr_ = row_ptr; next.border_slot_ = slots; next.border_value_ = values;
+    next.m_ = m_ + added;
+    next.valid_ = true;
+    next.stats_ = stats_;
+    next.stats_.dimension = next.m_;
+    next.stats_.input_nnz += static_cast<Offset>(values.size()) + added;
+    next.stats_.factor_nnz += static_cast<Offset>(values.size()) + added;
+    next.eta_start_.assign(1, 0); next.r_start_.assign(1, 0);
+    next.rev_.resize(sz(next.m_));
+    next.factor_gen_ = factor_gen_ + 1;
+    core::work_add(values.size() + sz(added), core::WorkTag::LuFactor);
+    *this = std::move(next);
+}
+
+void BasisFactor::retain_logical_rows(const std::vector<Index>& rows,
+                                     const std::vector<Index>& slots) {
+    if (!valid_ || rows.size() != slots.size() || rows.size() > sz(m_))
+        throw std::invalid_argument("BasisFactor: malformed logical projection");
+    const auto validate = [&](const auto& map) {
+        std::vector<char> seen(sz(m_), false);
+        for (Index j : map) {
+            if (j < 0 || j >= m_ || seen[sz(j)])
+                throw std::invalid_argument("BasisFactor: malformed projection map");
+            seen[sz(j)] = true;
+        }
+    };
+    validate(rows); validate(slots);
+    BasisFactor next;
+    next.border_parent_ = std::make_shared<const BasisFactor>(*this);
+    next.projected_ = true;
+    next.retained_rows_ = rows; next.retained_slots_ = slots;
+    next.m_ = static_cast<Index>(rows.size()); next.valid_ = true;
+    next.stats_ = stats_; next.stats_.dimension = next.m_;
+    next.eta_start_.assign(1, 0); next.r_start_.assign(1, 0); next.rev_.resize(rows.size());
+    next.factor_gen_ = factor_gen_ + 1;
+    core::work_add(rows.size() * 2, core::WorkTag::LuFactor);
+    *this = std::move(next);
+}
+
+bool BasisFactor::solve_border(SolveScratch& sc, std::vector<f64>& b,
+                              std::vector<Index>* support, bool transpose) const {
+    if (b.size() != sz(m_))
+        throw std::invalid_argument("BasisFactor: bordered RHS size");
+    if (sc.factor_gen != factor_gen_) reset_scratch(sc);
+    if (!sc.border_scratch) sc.border_scratch = std::make_unique<SolveScratch>();
+    const Offset parent_work_before = sc.border_scratch->work_since_factor_;
+    const Offset parent_eta_before = sc.border_scratch->eta_work_since_factor_;
+    const Index old = border_parent_->dimension();
+    auto& rhs = sc.border_rhs;
+    if (!projected_) rhs.assign(b.begin(), b.begin() + old);
+    if (transpose) {
+        // E^-T newest first, then [[B^-T,B^-T D^T],[0,-I]].
+        for (std::size_t t = eta_p_.size(); t-- > 0;) {
+            f64 value = b[sz(eta_p_[t])];
+            for (Offset k = eta_start_[t]; k < eta_start_[t + 1]; ++k)
+                value -= eta_val_[sz(k)] * b[sz(eta_idx_[sz(k)])];
+            b[sz(eta_p_[t])] = value / eta_pivot_[t];
+        }
+        if (projected_) {
+            rhs.assign(sz(old), 0);
+            for (Index i = 0; i < m_; ++i) rhs[sz(retained_slots_[sz(i)])] = b[sz(i)];
+        } else {
+            std::copy_n(b.begin(), old, rhs.begin());
+            for (Index i = old; i < m_; ++i)
+                for (Offset k = border_ptr_[sz(i - old)]; k < border_ptr_[sz(i - old) + 1]; ++k)
+                    rhs[sz(border_slot_[sz(k)])] += border_value_[sz(k)] * b[sz(i)];
+        }
+        border_parent_->btran_impl(*sc.border_scratch, rhs, nullptr, nullptr);
+        if (projected_)
+            for (Index i = 0; i < m_; ++i) b[sz(i)] = rhs[sz(retained_rows_[sz(i)])];
+        else {
+            std::copy(rhs.begin(), rhs.end(), b.begin());
+            for (Index i = old; i < m_; ++i) b[sz(i)] = -b[sz(i)];
+        }
+    } else {
+        if (projected_) {
+            rhs.assign(sz(old), 0);
+            for (Index i = 0; i < m_; ++i) rhs[sz(retained_rows_[sz(i)])] = b[sz(i)];
+        }
+        border_parent_->ftran_impl(*sc.border_scratch, rhs, nullptr, nullptr);
+        if (projected_)
+            for (Index i = 0; i < m_; ++i) b[sz(i)] = rhs[sz(retained_slots_[sz(i)])];
+        else {
+            std::copy(rhs.begin(), rhs.end(), b.begin());
+            for (Index i = old; i < m_; ++i) {
+                f64 value = -b[sz(i)];
+                for (Offset k = border_ptr_[sz(i - old)]; k < border_ptr_[sz(i - old) + 1]; ++k)
+                    value += border_value_[sz(k)] * rhs[sz(border_slot_[sz(k)])];
+                b[sz(i)] = value;
+            }
+        }
+        for (std::size_t t = 0; t < eta_p_.size(); ++t) {
+            const f64 value = b[sz(eta_p_[t])] / eta_pivot_[t];
+            for (Offset k = eta_start_[t]; k < eta_start_[t + 1]; ++k)
+                b[sz(eta_idx_[sz(k)])] -= eta_val_[sz(k)] * value;
+            b[sz(eta_p_[t])] = value;
+        }
+    }
+    if (support) {
+        support->clear();
+        for (Index i = 0; i < m_; ++i) if (b[sz(i)] != 0) support->push_back(i);
+    }
+    const Offset own_etas = static_cast<Offset>(eta_val_.size());
+    const Offset work = static_cast<Offset>(border_value_.size()) + m_ + own_etas;
+    sc.work_since_factor_ += work + sc.border_scratch->work_since_factor_ - parent_work_before;
+    sc.eta_work_since_factor_ += own_etas + sc.border_scratch->eta_work_since_factor_ - parent_eta_before;
+    core::work_add(static_cast<std::uint64_t>(work), core::WorkTag::LuSolve);
+    return true;
+}
+
 void BasisFactor::build_col_patterns() {
-    const auto n = piv_val_.size();
+    const auto n = base_->piv_val_.size();
 
     // U's elimination order starts as the index order; update_ft() is the only
     // thing that ever changes it.
-    uord_.resize(n);
-    upos_.resize(n);
+    base_->uord_.resize(n);
+    base_->upos_.resize(n);
     for (std::size_t k = 0; k < n; ++k) {
-        uord_[k] = static_cast<Index>(k);
-        upos_[k] = static_cast<Index>(k);
+        base_->uord_[k] = static_cast<Index>(k);
+        base_->upos_[k] = static_cast<Index>(k);
     }
     u_reordered_ = false;
 
     // The row store owns exactly its entries after a factorization: give every
     // row zero slack now and let update_ft() relocate the few rows it grows.
-    u_cap_.resize(n);
-    for (std::size_t k = 0; k < n; ++k) u_cap_[k] = u_len_[k];
+    base_->u_cap_.resize(n);
+    for (std::size_t k = 0; k < n; ++k) base_->u_cap_[k] = base_->u_len_[k];
     u_dead_nnz_ = 0;
 
     // U by column, WITH values, laid out by counting sort.
-    u_cstart_.assign(n + 1, 0);
-    u_clen_.assign(n, 0);
-    u_ccap_.assign(n, 0);
-    u_crow_.assign(u_idx_.size(), 0);
-    u_cval_.assign(u_idx_.size(), 0.0);
+    base_->u_cstart_.assign(n + 1, 0);
+    base_->u_clen_.assign(n, 0);
+    base_->u_ccap_.assign(n, 0);
+    base_->u_crow_.assign(base_->u_idx_.size(), 0);
+    base_->u_cval_.assign(base_->u_idx_.size(), 0.0);
     u_cdead_nnz_ = 0;
-    l_col_start_.assign(n + 1, 0);
-    l_col_row_.clear();
-    l_col_row_.resize(l_idx_.size());
-    l_row_val_.resize(l_idx_.size());
+    base_->l_col_start_.assign(n + 1, 0);
+    base_->l_col_row_.clear();
+    base_->l_col_row_.resize(base_->l_idx_.size());
+    base_->l_row_val_.resize(base_->l_idx_.size());
 
     for (std::size_t k = 0; k < n; ++k) {
-        const Offset beg = u_off_[k], end = beg + u_len_[k];
-        for (Offset t = beg; t < end; ++t) ++u_cstart_[sz(u_idx_[sz(t)]) + 1];
+        const Offset beg = base_->u_off_[k], end = beg + base_->u_len_[k];
+        for (Offset t = beg; t < end; ++t) ++base_->u_cstart_[sz(base_->u_idx_[sz(t)]) + 1];
     }
-    for (std::size_t t = 0; t < l_idx_.size(); ++t) ++l_col_start_[sz(l_idx_[t]) + 1];
+    for (std::size_t t = 0; t < base_->l_idx_.size(); ++t) ++base_->l_col_start_[sz(base_->l_idx_[t]) + 1];
     for (std::size_t j = 0; j < n; ++j) {
-        u_cstart_[j + 1] += u_cstart_[j];
-        l_col_start_[j + 1] += l_col_start_[j];
+        base_->u_cstart_[j + 1] += base_->u_cstart_[j];
+        base_->l_col_start_[j + 1] += base_->l_col_start_[j];
     }
-    std::vector<Offset> l_cursor(l_col_start_.begin(), l_col_start_.end() - 1);
+    std::vector<Offset> l_cursor(base_->l_col_start_.begin(), base_->l_col_start_.end() - 1);
     for (std::size_t k = 0; k < n; ++k) {
-        const Offset beg = u_off_[k], end = beg + u_len_[k];
+        const Offset beg = base_->u_off_[k], end = beg + base_->u_len_[k];
         for (Offset t = beg; t < end; ++t) {
-            const auto j = sz(u_idx_[sz(t)]);
-            const auto at = sz(u_cstart_[j]) + sz(u_clen_[j]);
-            u_crow_[at] = static_cast<Index>(k);
-            u_cval_[at] = u_val_[sz(t)];
-            ++u_clen_[j];
+            const auto j = sz(base_->u_idx_[sz(t)]);
+            const auto at = sz(base_->u_cstart_[j]) + sz(base_->u_clen_[j]);
+            base_->u_crow_[at] = static_cast<Index>(k);
+            base_->u_cval_[at] = base_->u_val_[sz(t)];
+            ++base_->u_clen_[j];
         }
-        for (Offset t = l_start_[k]; t < l_start_[k + 1]; ++t) {
-            const auto at = sz(l_cursor[sz(l_idx_[sz(t)])]++);
-            l_col_row_[at] = static_cast<Index>(k);
-            l_row_val_[at] = l_val_[sz(t)];
+        for (Offset t = base_->l_start_[k]; t < base_->l_start_[k + 1]; ++t) {
+            const auto at = sz(l_cursor[sz(base_->l_idx_[sz(t)])]++);
+            base_->l_col_row_[at] = static_cast<Index>(k);
+            base_->l_row_val_[at] = base_->l_val_[sz(t)];
         }
     }
-    for (std::size_t j = 0; j < n; ++j) u_ccap_[j] = u_clen_[j];
+    for (std::size_t j = 0; j < n; ++j) base_->u_ccap_[j] = base_->u_clen_[j];
     u_live_nnz_ = 0;
-    for (std::size_t k = 0; k < n; ++k) u_live_nnz_ += static_cast<Offset>(u_len_[k]);
-    u_alloc_nnz_ = static_cast<Offset>(u_idx_.size());
+    for (std::size_t k = 0; k < n; ++k) u_live_nnz_ += static_cast<Offset>(base_->u_len_[k]);
+    u_alloc_nnz_ = static_cast<Offset>(base_->u_idx_.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -962,66 +1093,66 @@ void BasisFactor::build_col_patterns() {
 
 void BasisFactor::u_row_append(Index row, Index col, f64 val) {
     const auto r = sz(row);
-    if (u_len_[r] >= u_cap_[r]) {
+    if (base_->u_len_[r] >= base_->u_cap_[r]) {
         // Relocate to the end with fresh slack. The copy goes VIA A BUFFER: an
         // insert() reading iterators into the same vector is undefined once the
         // append reallocates, and it does.
-        const Index len = u_len_[r];
+        const Index len = base_->u_len_[r];
         const Index cap = std::max<Index>(2 * len + 4, len + 1);
-        const auto old = sz(u_off_[r]);
-        ft_move_idx_.assign(u_idx_.begin() + static_cast<std::ptrdiff_t>(old),
-                            u_idx_.begin() + static_cast<std::ptrdiff_t>(old) + len);
-        ft_move_val_.assign(u_val_.begin() + static_cast<std::ptrdiff_t>(old),
-                            u_val_.begin() + static_cast<std::ptrdiff_t>(old) + len);
-        u_off_[r] = static_cast<Offset>(u_idx_.size());
-        u_idx_.insert(u_idx_.end(), ft_move_idx_.begin(), ft_move_idx_.end());
-        u_val_.insert(u_val_.end(), ft_move_val_.begin(), ft_move_val_.end());
-        u_idx_.resize(u_idx_.size() + sz(cap - len));
-        u_val_.resize(u_val_.size() + sz(cap - len));
-        u_dead_nnz_ += static_cast<Offset>(u_cap_[r]);
-        u_cap_[r] = cap;
+        const auto old = sz(base_->u_off_[r]);
+        ft_move_idx_.assign(base_->u_idx_.begin() + static_cast<std::ptrdiff_t>(old),
+                            base_->u_idx_.begin() + static_cast<std::ptrdiff_t>(old) + len);
+        ft_move_val_.assign(base_->u_val_.begin() + static_cast<std::ptrdiff_t>(old),
+                            base_->u_val_.begin() + static_cast<std::ptrdiff_t>(old) + len);
+        base_->u_off_[r] = static_cast<Offset>(base_->u_idx_.size());
+        base_->u_idx_.insert(base_->u_idx_.end(), ft_move_idx_.begin(), ft_move_idx_.end());
+        base_->u_val_.insert(base_->u_val_.end(), ft_move_val_.begin(), ft_move_val_.end());
+        base_->u_idx_.resize(base_->u_idx_.size() + sz(cap - len));
+        base_->u_val_.resize(base_->u_val_.size() + sz(cap - len));
+        u_dead_nnz_ += static_cast<Offset>(base_->u_cap_[r]);
+        base_->u_cap_[r] = cap;
     }
-    const auto at = sz(u_off_[r]) + sz(u_len_[r]);
-    u_idx_[at] = col;
-    u_val_[at] = val;
-    ++u_len_[r];
+    const auto at = sz(base_->u_off_[r]) + sz(base_->u_len_[r]);
+    base_->u_idx_[at] = col;
+    base_->u_val_[at] = val;
+    ++base_->u_len_[r];
     ++u_live_nnz_;
 }
 
 void BasisFactor::u_col_append(Index col, Index row, f64 val) {
     const auto c = sz(col);
-    if (u_clen_[c] >= u_ccap_[c]) {
+    if (base_->u_clen_[c] >= base_->u_ccap_[c]) {
         // Same buffered relocation as u_row_append; see the note there.
-        const Index len = u_clen_[c];
+        const Index len = base_->u_clen_[c];
         const Index cap = std::max<Index>(2 * len + 4, len + 1);
-        const auto old = sz(u_cstart_[c]);
-        ft_move_idx_.assign(u_crow_.begin() + static_cast<std::ptrdiff_t>(old),
-                            u_crow_.begin() + static_cast<std::ptrdiff_t>(old) + len);
-        ft_move_val_.assign(u_cval_.begin() + static_cast<std::ptrdiff_t>(old),
-                            u_cval_.begin() + static_cast<std::ptrdiff_t>(old) + len);
-        u_cstart_[c] = static_cast<Offset>(u_crow_.size());
-        u_crow_.insert(u_crow_.end(), ft_move_idx_.begin(), ft_move_idx_.end());
-        u_cval_.insert(u_cval_.end(), ft_move_val_.begin(), ft_move_val_.end());
-        u_crow_.resize(u_crow_.size() + sz(cap - len));
-        u_cval_.resize(u_cval_.size() + sz(cap - len));
-        u_cdead_nnz_ += static_cast<Offset>(u_ccap_[c]);
-        u_ccap_[c] = cap;
+        const auto old = sz(base_->u_cstart_[c]);
+        ft_move_idx_.assign(base_->u_crow_.begin() + static_cast<std::ptrdiff_t>(old),
+                            base_->u_crow_.begin() + static_cast<std::ptrdiff_t>(old) + len);
+        ft_move_val_.assign(base_->u_cval_.begin() + static_cast<std::ptrdiff_t>(old),
+                            base_->u_cval_.begin() + static_cast<std::ptrdiff_t>(old) + len);
+        base_->u_cstart_[c] = static_cast<Offset>(base_->u_crow_.size());
+        base_->u_crow_.insert(base_->u_crow_.end(), ft_move_idx_.begin(), ft_move_idx_.end());
+        base_->u_cval_.insert(base_->u_cval_.end(), ft_move_val_.begin(), ft_move_val_.end());
+        base_->u_crow_.resize(base_->u_crow_.size() + sz(cap - len));
+        base_->u_cval_.resize(base_->u_cval_.size() + sz(cap - len));
+        u_cdead_nnz_ += static_cast<Offset>(base_->u_ccap_[c]);
+        base_->u_ccap_[c] = cap;
     }
-    const auto at = sz(u_cstart_[c]) + sz(u_clen_[c]);
-    u_crow_[at] = row;
-    u_cval_[at] = val;
-    ++u_clen_[c];
+    const auto at = sz(base_->u_cstart_[c]) + sz(base_->u_clen_[c]);
+    base_->u_crow_[at] = row;
+    base_->u_cval_[at] = val;
+    ++base_->u_clen_[c];
 }
 
 void BasisFactor::u_row_erase(Index row, Index col) {
     const auto r = sz(row);
-    const auto beg = sz(u_off_[r]);
-    for (Index t = 0; t < u_len_[r]; ++t) {
-        if (u_idx_[beg + sz(t)] != col) continue;
-        const auto last = beg + sz(u_len_[r] - 1);
-        u_idx_[beg + sz(t)] = u_idx_[last];
-        u_val_[beg + sz(t)] = u_val_[last];
-        --u_len_[r];
+    const auto beg = sz(base_->u_off_[r]);
+    for (Index t = 0; t < base_->u_len_[r]; ++t) {
+        if (base_->u_idx_[beg + sz(t)] != col) continue;
+        const auto last = beg + sz(base_->u_len_[r] - 1);
+        base_->u_idx_[beg + sz(t)] = base_->u_idx_[last];
+        base_->u_val_[beg + sz(t)] = base_->u_val_[last];
+        --base_->u_len_[r];
         --u_live_nnz_;
         return;
     }
@@ -1029,27 +1160,27 @@ void BasisFactor::u_row_erase(Index row, Index col) {
 
 void BasisFactor::u_col_erase(Index col, Index row) {
     const auto c = sz(col);
-    const auto beg = sz(u_cstart_[c]);
-    for (Index t = 0; t < u_clen_[c]; ++t) {
-        if (u_crow_[beg + sz(t)] != row) continue;
-        const auto last = beg + sz(u_clen_[c] - 1);
-        u_crow_[beg + sz(t)] = u_crow_[last];
-        u_cval_[beg + sz(t)] = u_cval_[last];
-        --u_clen_[c];
+    const auto beg = sz(base_->u_cstart_[c]);
+    for (Index t = 0; t < base_->u_clen_[c]; ++t) {
+        if (base_->u_crow_[beg + sz(t)] != row) continue;
+        const auto last = beg + sz(base_->u_clen_[c] - 1);
+        base_->u_crow_[beg + sz(t)] = base_->u_crow_[last];
+        base_->u_cval_[beg + sz(t)] = base_->u_cval_[last];
+        --base_->u_clen_[c];
         return;
     }
 }
 
 void BasisFactor::u_order_move_to_back(Index p) {
-    const auto n = static_cast<Index>(uord_.size());
-    const Index t0 = upos_[sz(p)];
+    const auto n = static_cast<Index>(base_->uord_.size());
+    const Index t0 = base_->upos_[sz(p)];
     for (Index t = t0; t + 1 < n; ++t) {
-        const Index q = uord_[sz(t + 1)];
-        uord_[sz(t)] = q;
-        upos_[sz(q)] = t;
+        const Index q = base_->uord_[sz(t + 1)];
+        base_->uord_[sz(t)] = q;
+        base_->upos_[sz(q)] = t;
     }
-    uord_[sz(n - 1)] = p;
-    upos_[sz(p)] = n - 1;
+    base_->uord_[sz(n - 1)] = p;
+    base_->upos_[sz(p)] = n - 1;
     u_reordered_ = true;
 }
 
@@ -1058,27 +1189,27 @@ void BasisFactor::u_order_move_to_back(Index p) {
 // ---------------------------------------------------------------------------
 
 void BasisFactor::solve_lower(std::vector<f64>& v) const {
-    const auto n = piv_val_.size();
+    const auto n = base_->piv_val_.size();
     for (std::size_t k = 0; k < n; ++k) {
         const f64 zk = v[k];
         if (zk == 0.0) continue;
-        const Offset beg = l_start_[k], end = l_start_[k + 1];
+        const Offset beg = base_->l_start_[k], end = base_->l_start_[k + 1];
         for (Offset t = beg; t < end; ++t)
-            v[sz(l_idx_[sz(t)])] -= l_val_[sz(t)] * zk;
+            v[sz(base_->l_idx_[sz(t)])] -= base_->l_val_[sz(t)] * zk;
     }
 }
 
 void BasisFactor::solve_lower_pair(std::vector<f64>& a,
                                    std::vector<f64>& b) const {
-    const auto n = piv_val_.size();
+    const auto n = base_->piv_val_.size();
     for (std::size_t k = 0; k < n; ++k) {
         const f64 ak = a[k];
         const f64 bk = b[k];
         if (ak == 0.0 && bk == 0.0) continue;
-        const Offset beg = l_start_[k], end = l_start_[k + 1];
+        const Offset beg = base_->l_start_[k], end = base_->l_start_[k + 1];
         for (Offset t = beg; t < end; ++t) {
-            const auto i = sz(l_idx_[sz(t)]);
-            const f64 multiplier = l_val_[sz(t)];
+            const auto i = sz(base_->l_idx_[sz(t)]);
+            const f64 multiplier = base_->l_val_[sz(t)];
             a[i] -= multiplier * ak;
             b[i] -= multiplier * bk;
         }
@@ -1090,18 +1221,18 @@ void BasisFactor::solve_lower_pair(std::vector<f64>& a,
 // test. The row gather it replaces read every entry of U on every call, which
 // is what kept the hypersparse path running up to half of n.
 void BasisFactor::solve_upper(std::vector<f64>& v) const {
-    const auto n = piv_val_.size();
+    const auto n = base_->piv_val_.size();
     const auto step = [&](const std::size_t k) {
         f64 wk = v[k];
         if (wk == 0.0) return;
-        wk /= piv_val_[k];
+        wk /= base_->piv_val_[k];
         v[k] = wk;
-        const Offset beg = u_cstart_[k], end = beg + u_clen_[k];
+        const Offset beg = base_->u_cstart_[k], end = beg + base_->u_clen_[k];
         for (Offset q = beg; q < end; ++q)
-            v[sz(u_crow_[sz(q)])] -= u_cval_[sz(q)] * wk;
+            v[sz(base_->u_crow_[sz(q)])] -= base_->u_cval_[sz(q)] * wk;
     };
     if (u_reordered_) {
-        for (std::size_t t = n; t-- > 0;) step(sz(uord_[t]));
+        for (std::size_t t = n; t-- > 0;) step(sz(base_->uord_[t]));
     } else {
         for (std::size_t k = n; k-- > 0;) step(k);
     }
@@ -1109,62 +1240,62 @@ void BasisFactor::solve_upper(std::vector<f64>& v) const {
 
 void BasisFactor::solve_upper_pair(std::vector<f64>& a,
                                    std::vector<f64>& b) const {
-    const auto n = piv_val_.size();
+    const auto n = base_->piv_val_.size();
     const auto step = [&](const std::size_t k) {
         f64 ak = a[k], bk = b[k];
         if (ak == 0.0 && bk == 0.0) return;
-        ak /= piv_val_[k];
-        bk /= piv_val_[k];
+        ak /= base_->piv_val_[k];
+        bk /= base_->piv_val_[k];
         a[k] = ak;
         b[k] = bk;
-        const Offset beg = u_cstart_[k], end = beg + u_clen_[k];
+        const Offset beg = base_->u_cstart_[k], end = beg + base_->u_clen_[k];
         for (Offset q = beg; q < end; ++q) {
-            const auto r = sz(u_crow_[sz(q)]);
-            const f64 value = u_cval_[sz(q)];
+            const auto r = sz(base_->u_crow_[sz(q)]);
+            const f64 value = base_->u_cval_[sz(q)];
             a[r] -= value * ak;
             b[r] -= value * bk;
         }
     };
     if (u_reordered_) {
-        for (std::size_t t = n; t-- > 0;) step(sz(uord_[t]));
+        for (std::size_t t = n; t-- > 0;) step(sz(base_->uord_[t]));
     } else {
         for (std::size_t k = n; k-- > 0;) step(k);
     }
 }
 
 void BasisFactor::solve_upper_t(std::vector<f64>& v) const {
-    const auto n = piv_val_.size();
+    const auto n = base_->piv_val_.size();
     if (u_reordered_) {
         for (std::size_t t = 0; t < n; ++t) {
-            const auto k = sz(uord_[t]);
-            const f64 zk = v[k] / piv_val_[k];
+            const auto k = sz(base_->uord_[t]);
+            const f64 zk = v[k] / base_->piv_val_[k];
             v[k] = zk;
             if (zk == 0.0) continue;
-            const Offset beg = u_off_[k], end = beg + u_len_[k];
+            const Offset beg = base_->u_off_[k], end = beg + base_->u_len_[k];
             for (Offset q = beg; q < end; ++q)
-                v[sz(u_idx_[sz(q)])] -= u_val_[sz(q)] * zk;
+                v[sz(base_->u_idx_[sz(q)])] -= base_->u_val_[sz(q)] * zk;
         }
         return;
     }
     for (std::size_t k = 0; k < n; ++k) {
-        const f64 zk = v[k] / piv_val_[k];
+        const f64 zk = v[k] / base_->piv_val_[k];
         v[k] = zk;
         if (zk == 0.0) continue;
-        const Offset beg = u_off_[k], end = beg + u_len_[k];
+        const Offset beg = base_->u_off_[k], end = beg + base_->u_len_[k];
         for (Offset t = beg; t < end; ++t)
-            v[sz(u_idx_[sz(t)])] -= u_val_[sz(t)] * zk;
+            v[sz(base_->u_idx_[sz(t)])] -= base_->u_val_[sz(t)] * zk;
     }
 }
 
 // L' w = v as a ROW scatter in reverse order (L has a unit diagonal): w_i is
 // final when reached, and row i of L is subtracted from the columns before it.
 void BasisFactor::solve_lower_t(std::vector<f64>& v) const {
-    for (std::size_t i = piv_val_.size(); i-- > 0;) {
+    for (std::size_t i = base_->piv_val_.size(); i-- > 0;) {
         const f64 wi = v[i];
         if (wi == 0.0) continue;
-        const Offset beg = l_col_start_[i], end = l_col_start_[i + 1];
+        const Offset beg = base_->l_col_start_[i], end = base_->l_col_start_[i + 1];
         for (Offset t = beg; t < end; ++t)
-            v[sz(l_col_row_[sz(t)])] -= l_row_val_[sz(t)] * wi;
+            v[sz(base_->l_col_row_[sz(t)])] -= base_->l_row_val_[sz(t)] * wi;
     }
 }
 
@@ -1180,25 +1311,45 @@ void BasisFactor::solve_lower_t(std::vector<f64>& v) const {
 // BTRAN eta with v[p] == 0 writes zero everywhere it touches.
 void BasisFactor::apply_row_etas_ftran(std::vector<f64>& v,
                                        std::vector<Index>* touched) const {
+    if (touched == nullptr) {
+        // Dense RHS: skip the s == 0 branch so the write stays predictable /
+        // SIMD-friendly. Multiplying through a zero s is cheaper than a
+        // mispredicted continue on mid-dense vectors.
+        for (std::size_t t = 0; t < r_pos_.size(); ++t) {
+            f64 s = 0.0;
+            for (Offset q = r_start_[t]; q < r_start_[t + 1]; ++q)
+                s += r_val_[sz(q)] * v[sz(r_idx_[sz(q)])];
+            v[sz(r_pos_[t])] -= s;
+        }
+        return;
+    }
     for (std::size_t t = 0; t < r_pos_.size(); ++t) {
         f64 s = 0.0;
         for (Offset q = r_start_[t]; q < r_start_[t + 1]; ++q)
             s += r_val_[sz(q)] * v[sz(r_idx_[sz(q)])];
         if (s == 0.0) continue;
         const auto p = sz(r_pos_[t]);
-        if (v[p] == 0.0 && touched) touched->push_back(r_pos_[t]);
+        if (v[p] == 0.0) touched->push_back(r_pos_[t]);
         v[p] -= s;
     }
 }
 
 void BasisFactor::apply_row_etas_btran(std::vector<f64>& v,
                                        std::vector<Index>* touched) const {
+    if (touched == nullptr) {
+        for (std::size_t t = r_pos_.size(); t-- > 0;) {
+            const f64 vp = v[sz(r_pos_[t])];
+            for (Offset q = r_start_[t]; q < r_start_[t + 1]; ++q)
+                v[sz(r_idx_[sz(q)])] -= r_val_[sz(q)] * vp;
+        }
+        return;
+    }
     for (std::size_t t = r_pos_.size(); t-- > 0;) {
         const f64 vp = v[sz(r_pos_[t])];
         if (vp == 0.0) continue;
         for (Offset q = r_start_[t]; q < r_start_[t + 1]; ++q) {
             const auto j = sz(r_idx_[sz(q)]);
-            if (v[j] == 0.0 && touched) touched->push_back(r_idx_[sz(q)]);
+            if (v[j] == 0.0) touched->push_back(r_idx_[sz(q)]);
             v[j] -= r_val_[sz(q)] * vp;
         }
     }
@@ -1374,12 +1525,12 @@ inline void order_by_index(SolveScratch& sc, std::size_t n) {
 
 // Reach in ascending U elimination order, written to sc.order_.
 void BasisFactor::order_by_elimination(SolveScratch& sc) const {
-    const auto n = piv_val_.size();
+    const auto n = base_->piv_val_.size();
     if (!u_reordered_) { order_by_index(sc, n); return; }
     sc.order_.clear();
-    for (const Index k : sc.reach_) sc.order_.push_back(upos_[sz(k)]);
+    for (const Index k : sc.reach_) sc.order_.push_back(base_->upos_[sz(k)]);
     sort_support(sc.order_, static_cast<Index>(n), sc.sort_tmp_, sc.sort_bits_);
-    for (Index& t : sc.order_) t = uord_[sz(t)];
+    for (Index& t : sc.order_) t = base_->uord_[sz(t)];
 }
 
 // L z = v, ascending. Edge k -> i for each entry l_ik of L's column k.
@@ -1388,19 +1539,19 @@ bool BasisFactor::sparse_lower(SolveScratch& sc, const std::vector<Index>& seed,
     if (!reach_postorder(
             seed,
             [&](Index k) {
-                const Index* col = l_idx_.data() + l_start_[sz(k)];
+                const Index* col = base_->l_idx_.data() + base_->l_start_[sz(k)];
                 return std::pair<const Index*, const Index*>(
-                    col, l_idx_.data() + l_start_[sz(k) + 1]);
+                    col, base_->l_idx_.data() + base_->l_start_[sz(k) + 1]);
             },
             sc.mark_, sc.dfs_frames_, sc.reach_, dense_below_))
         return false;
-    order_by_index(sc, piv_val_.size());
+    order_by_index(sc, base_->piv_val_.size());
     for (const Index kk : sc.order_) {
         const auto k = sz(kk);
         const f64 zk = v[k];
         if (zk == 0.0) continue;
-        for (Offset t = l_start_[k]; t < l_start_[k + 1]; ++t)
-            v[sz(l_idx_[sz(t)])] -= l_val_[sz(t)] * zk;
+        for (Offset t = base_->l_start_[k]; t < base_->l_start_[k + 1]; ++t)
+            v[sz(base_->l_idx_[sz(t)])] -= base_->l_val_[sz(t)] * zk;
     }
     return true;
 }
@@ -1411,8 +1562,8 @@ bool BasisFactor::sparse_upper(SolveScratch& sc, const std::vector<Index>& seed,
     if (!reach_postorder(
             seed,
             [&](Index k) {
-                const Index* col = u_crow_.data() + u_cstart_[sz(k)];
-                return std::pair<const Index*, const Index*>(col, col + u_clen_[sz(k)]);
+                const Index* col = base_->u_crow_.data() + base_->u_cstart_[sz(k)];
+                return std::pair<const Index*, const Index*>(col, col + base_->u_clen_[sz(k)]);
             },
             sc.mark_, sc.dfs_frames_, sc.reach_, dense_below_))
         return false;
@@ -1421,11 +1572,11 @@ bool BasisFactor::sparse_upper(SolveScratch& sc, const std::vector<Index>& seed,
         const auto k = sz(*it);
         f64 wk = v[k];
         if (wk == 0.0) continue;
-        wk /= piv_val_[k];
+        wk /= base_->piv_val_[k];
         v[k] = wk;
-        const Offset beg = u_cstart_[k], end = beg + u_clen_[k];
+        const Offset beg = base_->u_cstart_[k], end = beg + base_->u_clen_[k];
         for (Offset q = beg; q < end; ++q)
-            v[sz(u_crow_[sz(q)])] -= u_cval_[sz(q)] * wk;
+            v[sz(base_->u_crow_[sz(q)])] -= base_->u_cval_[sz(q)] * wk;
     }
     return true;
 }
@@ -1436,8 +1587,8 @@ bool BasisFactor::sparse_upper_t(SolveScratch& sc, const std::vector<Index>& see
     if (!reach_postorder(
             seed,
             [&](Index k) {
-                const Index* row = u_idx_.data() + u_off_[sz(k)];
-                return std::pair<const Index*, const Index*>(row, row + u_len_[sz(k)]);
+                const Index* row = base_->u_idx_.data() + base_->u_off_[sz(k)];
+                return std::pair<const Index*, const Index*>(row, row + base_->u_len_[sz(k)]);
             },
             sc.mark_, sc.dfs_frames_, sc.reach_, dense_below_))
         return false;
@@ -1446,11 +1597,11 @@ bool BasisFactor::sparse_upper_t(SolveScratch& sc, const std::vector<Index>& see
         const auto k = sz(kk);
         f64 zk = v[k];
         if (zk == 0.0) continue;
-        zk /= piv_val_[k];
+        zk /= base_->piv_val_[k];
         v[k] = zk;
-        const Offset beg = u_off_[k], end = beg + u_len_[k];
+        const Offset beg = base_->u_off_[k], end = beg + base_->u_len_[k];
         for (Offset t = beg; t < end; ++t)
-            v[sz(u_idx_[sz(t)])] -= u_val_[sz(t)] * zk;
+            v[sz(base_->u_idx_[sz(t)])] -= base_->u_val_[sz(t)] * zk;
     }
     return true;
 }
@@ -1461,20 +1612,20 @@ bool BasisFactor::sparse_lower_t(SolveScratch& sc, const std::vector<Index>& see
     if (!reach_postorder(
             seed,
             [&](Index k) {
-                const Index* row = l_col_row_.data() + l_col_start_[sz(k)];
+                const Index* row = base_->l_col_row_.data() + base_->l_col_start_[sz(k)];
                 return std::pair<const Index*, const Index*>(
-                    row, l_col_row_.data() + l_col_start_[sz(k) + 1]);
+                    row, base_->l_col_row_.data() + base_->l_col_start_[sz(k) + 1]);
             },
             sc.mark_, sc.dfs_frames_, sc.reach_, dense_below_))
         return false;
-    order_by_index(sc, piv_val_.size());
+    order_by_index(sc, base_->piv_val_.size());
     for (auto it = sc.order_.rbegin(); it != sc.order_.rend(); ++it) {
         const auto i = sz(*it);
         const f64 wi = v[i];
         if (wi == 0.0) continue;
-        const Offset beg = l_col_start_[i], end = l_col_start_[i + 1];
+        const Offset beg = base_->l_col_start_[i], end = base_->l_col_start_[i + 1];
         for (Offset t = beg; t < end; ++t)
-            v[sz(l_col_row_[sz(t)])] -= l_row_val_[sz(t)] * wi;
+            v[sz(base_->l_col_row_[sz(t)])] -= base_->l_row_val_[sz(t)] * wi;
     }
     return true;
 }
@@ -1495,7 +1646,7 @@ void BasisFactor::ftran(std::vector<f64>& b, SpikeCapture* spike) const {
 void BasisFactor::capture_spike(SolveScratch& sc, SpikeCapture& out, bool have_seed) const {
     out.pos.clear();
     out.val.clear();
-    const auto n = piv_val_.size();
+    const auto n = base_->piv_val_.size();
     if (have_seed) {
         if (sc.spike_stamp_.size() != n) sc.spike_stamp_.assign(n, 0);
         if (++sc.spike_gen_ == 0) {
@@ -1524,21 +1675,28 @@ void BasisFactor::ftran_pair(std::vector<f64>& a,
                              std::vector<f64>& b,
                              SpikeCapture* spike_a) const {
     const core::ScopedFlushSubnormals fp_scope;
+    if (border_parent_) {
+        if (spike_a) spike_a->clear();
+        solve_border(scratch_, a, nullptr, false);
+        if (&a != &b) solve_border(scratch_, b, nullptr, false);
+        return;
+    }
     if (&a == &b) {
         ftran(a, spike_a);
         return;
     }
     if (spike_a) spike_a->clear();
     if (m_ == 0) return;
-    const auto n = piv_val_.size();
+    const auto n = base_->piv_val_.size();
     if (a.size() != n || b.size() != n) return;
+    if (scratch_.factor_gen != factor_gen_) reset_scratch(scratch_);
     scratch_.eta_work_since_factor_ += 2 * eta_nnz();
 
     // Dense permutation. scratch_.work_ is the ordinary FTRAN scratch, so record that
     // every entry was overwritten before a later seeded solve tries to reuse
     // it. scratch_.pair_work_ is private to this dense primitive.
     for (std::size_t k = 0; k < n; ++k) {
-        const auto row = sz(piv_row_[k]);
+        const auto row = sz(base_->piv_row_[k]);
         scratch_.work_[k] = a[row];
         scratch_.pair_work_[k] = b[row];
     }
@@ -1570,7 +1728,7 @@ void BasisFactor::ftran_pair(std::vector<f64>& a,
 
     solve_upper_pair(scratch_.work_, scratch_.pair_work_);
     for (std::size_t k = 0; k < n; ++k) {
-        const auto slot = sz(piv_slot_[k]);
+        const auto slot = sz(base_->piv_slot_[k]);
         a[slot] = scratch_.work_[k];
         b[slot] = scratch_.pair_work_[k];
     }
@@ -1618,9 +1776,11 @@ bool BasisFactor::ftran_impl(SolveScratch& sc, std::vector<f64>& b,
                              SpikeCapture* spike) const {
     if (support) support->clear();
     if (spike) spike->clear();
+    if (border_parent_) return solve_border(sc, b, support, false);
     if (m_ == 0) return true;
+    if (sc.factor_gen != factor_gen_) reset_scratch(sc);
     sc.eta_work_since_factor_ += eta_nnz();
-    const auto n = piv_val_.size();
+    const auto n = base_->piv_val_.size();
     bool seed_is_sparse = n >= 64;
     sc.seed_.clear();
 
@@ -1634,7 +1794,7 @@ bool BasisFactor::ftran_impl(SolveScratch& sc, std::vector<f64>& b,
     // therefore always safe to reach from a half-finished seeded permute.
     bool seeded = false;
     if (seed_rows != nullptr && seed_is_sparse && !seed_rows->empty() &&
-        4 * seed_rows->size() <= n && rpos_.size() >= sz(m_)) {
+        4 * seed_rows->size() <= n && base_->rpos_.size() >= sz(m_)) {
         if (sc.work_all_dirty_) {
             std::fill(sc.work_.begin(), sc.work_.end(), 0.0);
             sc.work_all_dirty_ = false;
@@ -1644,8 +1804,8 @@ bool BasisFactor::ftran_impl(SolveScratch& sc, std::vector<f64>& b,
         sc.work_dirty_.clear();
         seeded = true;
         for (const Index i : *seed_rows) {
-            if (i < 0 || sz(i) >= rpos_.size()) { seeded = false; break; }
-            const Index k = rpos_[sz(i)];
+            if (i < 0 || sz(i) >= base_->rpos_.size()) { seeded = false; break; }
+            const Index k = base_->rpos_[sz(i)];
             if (k < 0 || sz(k) >= n) { seeded = false; break; }
             const f64 value = b[sz(i)];
             if (value == 0.0) continue;
@@ -1669,7 +1829,7 @@ bool BasisFactor::ftran_impl(SolveScratch& sc, std::vector<f64>& b,
     // mandatory permutation.
     if (!seeded) {
         for (std::size_t k = 0; k < n; ++k) {
-            const f64 value = b[sz(piv_row_[k])];
+            const f64 value = b[sz(base_->piv_row_[k])];
             sc.work_[k] = value;
             if (seed_is_sparse && value != 0.0) {
                 sc.seed_.push_back(static_cast<Index>(k));
@@ -1742,13 +1902,17 @@ bool BasisFactor::ftran_impl(SolveScratch& sc, std::vector<f64>& b,
     // trust it to be zero and read a stale value. collect_seed() below rescans
     // sc.work_ in full, so the U seed needs no separate bookkeeping.
     if (!r_pos_.empty()) {
-        sc.row_eta_touched_.clear();
-        apply_row_etas_ftran(sc.work_, &sc.row_eta_touched_);
-        sc.work_dirty_.insert(sc.work_dirty_.end(),
-                           sc.row_eta_touched_.begin(), sc.row_eta_touched_.end());
-        if (lower_sparse)
+        if (lower_sparse) {
+            sc.row_eta_touched_.clear();
+            apply_row_etas_ftran(sc.work_, &sc.row_eta_touched_);
+            sc.work_dirty_.insert(sc.work_dirty_.end(),
+                               sc.row_eta_touched_.begin(), sc.row_eta_touched_.end());
             sc.seed_.insert(sc.seed_.end(), sc.row_eta_touched_.begin(),
                          sc.row_eta_touched_.end());
+        } else {
+            // Dense after L: no support bookkeeping; branchless eta apply.
+            apply_row_etas_ftran(sc.work_, nullptr);
+        }
         { const auto w_ = (static_cast<Offset>(r_start_.back())); sc.work_since_factor_ += w_; core::work_add(static_cast<std::uint64_t>(w_), ::forge::core::WorkTag::LuSolve); }
     }
 
@@ -1787,14 +1951,14 @@ bool BasisFactor::ftran_impl(SolveScratch& sc, std::vector<f64>& b,
         if (support) {
             support->reserve(sc.reach_.size() + eta_p_.size());
             for (const Index k : sc.reach_) {
-                const auto slot = sz(piv_slot_[sz(k)]);
+                const auto slot = sz(base_->piv_slot_[sz(k)]);
                 b[slot] = sc.work_[sz(k)];
                 support->push_back(slot);
                 sc.support_stamp_[slot] = sgen;
             }
         } else {
             for (std::size_t k = 0; k < n; ++k)
-                b[sz(piv_slot_[k])] = sc.mark_[k] ? sc.work_[k] : 0.0;
+                b[sz(base_->piv_slot_[k])] = sc.mark_[k] ? sc.work_[k] : 0.0;
         }
         for (const Index k : sc.reach_) sc.mark_[sz(k)] = 0;
     } else {
@@ -1809,7 +1973,7 @@ bool BasisFactor::ftran_impl(SolveScratch& sc, std::vector<f64>& b,
             support->resize(n);
             Index* out = support->data();
             for (std::size_t slot = 0; slot < n; ++slot) {
-                const f64 value = sc.work_[sz(cpos_[slot])];
+                const f64 value = sc.work_[sz(base_->cpos_[slot])];
                 b[slot] = value;
                 out[nonzeros] = static_cast<Index>(slot);
                 nonzeros += value != 0.0;
@@ -1820,7 +1984,7 @@ bool BasisFactor::ftran_impl(SolveScratch& sc, std::vector<f64>& b,
         } else {
             for (std::size_t k = 0; k < n; ++k) {
                 const f64 value = sc.work_[k];
-                const auto slot = sz(piv_slot_[k]);
+                const auto slot = sz(base_->piv_slot_[k]);
                 b[slot] = value;
                 if (value == 0.0) continue;
                 ++nonzeros;
@@ -1913,7 +2077,9 @@ bool BasisFactor::btran_impl(SolveScratch& sc, std::vector<f64>& d,
                              std::vector<Index>* support,
                              const std::vector<Index>* seed_slots) const {
     if (support) support->clear();
+    if (border_parent_) return solve_border(sc, d, support, true);
     if (m_ == 0) return true;
+    if (sc.factor_gen != factor_gen_) reset_scratch(sc);
     sc.eta_work_since_factor_ += eta_nnz();
 
     // B_k^-T = B_0^-T E_1^-T ... E_k^-T, so the etas apply newest first.
@@ -2024,14 +2190,14 @@ bool BasisFactor::btran_impl(SolveScratch& sc, std::vector<f64>& d,
         { const auto w_ = (static_cast<Offset>(eta_nnz())); sc.work_since_factor_ += w_; core::work_add(static_cast<std::uint64_t>(w_), ::forge::core::WorkTag::LuSolve); }
     }
 
-    const auto n = piv_val_.size();
+    const auto n = base_->piv_val_.size();
     // Fuse the basis-slot permutation with sparse-seed construction, exactly
     // as in ftran(). Etas have already been applied above, so this observes
     // the true input pattern to the base U' solve.
     bool seed_is_sparse = n >= 64;
     sc.seed_.clear();
 
-    // SEEDED permute (slot space, via cpos_). Same contract and same fallback
+    // SEEDED permute (slot space, via base_->cpos_). Same contract and same fallback
     // discipline as ftran_impl's. Note the eta loops above may have written
     // slots OUTSIDE the declared input seed, so the seed used here is the
     // caller's slots PLUS every eta pivot that fired -- collected during the
@@ -2039,7 +2205,7 @@ bool BasisFactor::btran_impl(SolveScratch& sc, std::vector<f64>& d,
     // an empty or short eta file still avoids the O(m) permutation scan.
     bool seeded = false;
     if (seed_slots != nullptr && seed_is_sparse &&
-        cpos_.size() >= sz(m_)) {
+        base_->cpos_.size() >= sz(m_)) {
         const std::size_t declared = seed_slots->size() + sc.fire_touched_.size();
         if (declared > 0 && 4 * declared <= n) {
             if (sc.work_all_dirty_) {
@@ -2051,8 +2217,8 @@ bool BasisFactor::btran_impl(SolveScratch& sc, std::vector<f64>& d,
             sc.work_dirty_.clear();
             seeded = true;
             const auto take = [&](Index i) {
-                if (i < 0 || sz(i) >= cpos_.size()) { seeded = false; return; }
-                const Index k = cpos_[sz(i)];
+                if (i < 0 || sz(i) >= base_->cpos_.size()) { seeded = false; return; }
+                const Index k = base_->cpos_[sz(i)];
                 if (k < 0 || sz(k) >= n) { seeded = false; return; }
                 const f64 value = d[sz(i)];
                 if (value == 0.0) return;
@@ -2071,7 +2237,7 @@ bool BasisFactor::btran_impl(SolveScratch& sc, std::vector<f64>& d,
 
     if (!seeded) {
         for (std::size_t k = 0; k < n; ++k) {
-            const f64 value = d[sz(piv_slot_[k])];
+            const f64 value = d[sz(base_->piv_slot_[k])];
             sc.work_[k] = value;
             if (seed_is_sparse && value != 0.0) {
                 sc.seed_.push_back(static_cast<Index>(k));
@@ -2131,13 +2297,16 @@ bool BasisFactor::btran_impl(SolveScratch& sc, std::vector<f64>& d,
     // Row etas transposed, between U' and L': B^-T = L^-T M_1^T ... M_k^T U^-T.
     // Newest first, mirroring ftran's oldest-first order.
     if (!r_pos_.empty()) {
-        sc.row_eta_touched_.clear();
-        apply_row_etas_btran(sc.work_, &sc.row_eta_touched_);
-        sc.work_dirty_.insert(sc.work_dirty_.end(),
-                           sc.row_eta_touched_.begin(), sc.row_eta_touched_.end());
-        if (upper_t_sparse)
+        if (upper_t_sparse) {
+            sc.row_eta_touched_.clear();
+            apply_row_etas_btran(sc.work_, &sc.row_eta_touched_);
+            sc.work_dirty_.insert(sc.work_dirty_.end(),
+                               sc.row_eta_touched_.begin(), sc.row_eta_touched_.end());
             sc.seed_.insert(sc.seed_.end(), sc.row_eta_touched_.begin(),
                          sc.row_eta_touched_.end());
+        } else {
+            apply_row_etas_btran(sc.work_, nullptr);
+        }
         { const auto w_ = (static_cast<Offset>(r_start_.back())); sc.work_since_factor_ += w_; core::work_add(static_cast<std::uint64_t>(w_), ::forge::core::WorkTag::LuSolve); }
     }
 
@@ -2167,7 +2336,7 @@ bool BasisFactor::btran_impl(SolveScratch& sc, std::vector<f64>& d,
             support->reserve(sc.reach_.size());
             for (const Index k : sc.reach_) {
                 if (sc.work_[sz(k)] == 0.0) continue;
-                const Index row = piv_row_[sz(k)];
+                const Index row = base_->piv_row_[sz(k)];
                 d[sz(row)] = sc.work_[sz(k)];
                 support->push_back(row);
             }
@@ -2179,12 +2348,12 @@ bool BasisFactor::btran_impl(SolveScratch& sc, std::vector<f64>& d,
             support->reserve(sc.reach_.size());
             for (const Index k : sc.reach_)
                 if (sc.work_[sz(k)] != 0.0)
-                    support->push_back(piv_row_[sz(k)]);
+                    support->push_back(base_->piv_row_[sz(k)]);
             sort_support(*support, m_, sc.sort_tmp_, sc.sort_bits_);
         }
         if (!partial_seeded_scatter) {
             for (std::size_t k = 0; k < n; ++k)
-                d[sz(piv_row_[k])] = sc.mark_[k] ? sc.work_[k] : 0.0;
+                d[sz(base_->piv_row_[k])] = sc.mark_[k] ? sc.work_[k] : 0.0;
         }
         for (const Index k : sc.reach_) sc.mark_[sz(k)] = 0;
     } else {
@@ -2196,7 +2365,7 @@ bool BasisFactor::btran_impl(SolveScratch& sc, std::vector<f64>& d,
             support->resize(n);
             Index* out = support->data();
             for (std::size_t row = 0; row < n; ++row) {
-                const f64 value = sc.work_[sz(rpos_[row])];
+                const f64 value = sc.work_[sz(base_->rpos_[row])];
                 d[row] = value;
                 out[nonzeros] = static_cast<Index>(row);
                 nonzeros += value != 0.0;
@@ -2205,10 +2374,10 @@ bool BasisFactor::btran_impl(SolveScratch& sc, std::vector<f64>& d,
         } else {
             for (std::size_t k = 0; k < n; ++k) {
                 const f64 value = sc.work_[k];
-                d[sz(piv_row_[k])] = value;
+                d[sz(base_->piv_row_[k])] = value;
                 if (value == 0.0) continue;
                 ++nonzeros;
-                if (support) support->push_back(piv_row_[k]);   // see ftran_impl
+                if (support) support->push_back(base_->piv_row_[k]);   // see ftran_impl
             }
             if (support) sort_support(*support, m_, sc.sort_tmp_, sc.sort_bits_);
         }
@@ -2240,30 +2409,63 @@ bool BasisFactor::check_invariants(std::string* why) const {
         if (why) *why = msg;
         return false;
     };
-    const auto n = piv_val_.size();
-    if (n != sz(m_)) return fail("piv_val_ size != m");
+    const auto n = base_->piv_val_.size();
+    if (border_parent_) {
+        const Index old = border_parent_->dimension();
+        if (projected_) {
+            if (!valid_ || retained_rows_.size() != sz(m_) || retained_slots_.size() != sz(m_) || old < m_)
+                return fail("invalid projection shape");
+            std::vector<char> rows(sz(old), false), slots(sz(old), false);
+            for (Index i = 0; i < m_; ++i) {
+                const Index r = retained_rows_[sz(i)], s = retained_slots_[sz(i)];
+                if (r < 0 || r >= old || s < 0 || s >= old || rows[sz(r)] || slots[sz(s)])
+                    return fail("invalid projection maps");
+                rows[sz(r)] = slots[sz(s)] = true;
+            }
+        } else {
+        if (!valid_ || old >= m_ || border_ptr_.size() != sz(m_ - old) + 1 ||
+            border_ptr_.front() != 0 || border_ptr_.back() != static_cast<Offset>(border_value_.size()) ||
+            border_slot_.size() != border_value_.size()) return fail("invalid border shape");
+        for (Index i = 0; i < m_ - old; ++i)
+            if (border_ptr_[sz(i)] > border_ptr_[sz(i) + 1]) return fail("invalid border offsets");
+        for (std::size_t k = 0; k < border_slot_.size(); ++k)
+            if (border_slot_[k] < 0 || border_slot_[k] >= old || !std::isfinite(border_value_[k]))
+                return fail("invalid border entry");
+        }
+        if (eta_start_.empty() || eta_start_.front() != 0 || eta_start_.size() != eta_p_.size() + 1 || eta_pivot_.size() != eta_p_.size() ||
+            eta_start_.back() != static_cast<Offset>(eta_val_.size()) ||
+            eta_idx_.size() != eta_val_.size()) return fail("invalid border eta shape");
+        for (std::size_t t = 0; t < eta_p_.size(); ++t)
+            if (eta_start_[t] > eta_start_[t + 1] || eta_p_[t] < 0 || eta_p_[t] >= m_ || !std::isfinite(eta_pivot_[t]) || eta_pivot_[t] == 0)
+                return fail("invalid border eta pivot");
+        for (std::size_t k = 0; k < eta_idx_.size(); ++k)
+            if (eta_idx_[k] < 0 || eta_idx_[k] >= m_ || !std::isfinite(eta_val_[k]))
+                return fail("invalid border eta entry");
+        return border_parent_->check_invariants(why);
+    }
+    if (n != sz(m_)) return fail("base_->piv_val_ size != m");
 
-    // Pivot maps are permutations, and rpos_/cpos_ invert them.
+    // Pivot maps are permutations, and base_->rpos_/base_->cpos_ invert them.
     {
         std::vector<char> seen_row(n, 0), seen_slot(n, 0);
         for (std::size_t k = 0; k < n; ++k) {
-            const auto r = piv_row_[k], c = piv_slot_[k];
-            if (r < 0 || sz(r) >= n || seen_row[sz(r)]) return fail("piv_row_ not a permutation");
-            if (c < 0 || sz(c) >= n || seen_slot[sz(c)]) return fail("piv_slot_ not a permutation");
+            const auto r = base_->piv_row_[k], c = base_->piv_slot_[k];
+            if (r < 0 || sz(r) >= n || seen_row[sz(r)]) return fail("base_->piv_row_ not a permutation");
+            if (c < 0 || sz(c) >= n || seen_slot[sz(c)]) return fail("base_->piv_slot_ not a permutation");
             seen_row[sz(r)] = seen_slot[sz(c)] = 1;
-            if (rpos_.size() >= n && rpos_[sz(r)] != static_cast<Index>(k))
-                return fail("rpos_ does not invert piv_row_");
-            if (cpos_.size() >= n && cpos_[sz(c)] != static_cast<Index>(k))
-                return fail("cpos_ does not invert piv_slot_");
+            if (base_->rpos_.size() >= n && base_->rpos_[sz(r)] != static_cast<Index>(k))
+                return fail("base_->rpos_ does not invert base_->piv_row_");
+            if (base_->cpos_.size() >= n && base_->cpos_[sz(c)] != static_cast<Index>(k))
+                return fail("base_->cpos_ does not invert base_->piv_slot_");
         }
     }
 
     // Elimination order and its inverse.
-    if (uord_.size() != n || upos_.size() != n) return fail("uord_/upos_ size");
+    if (base_->uord_.size() != n || base_->upos_.size() != n) return fail("base_->uord_/base_->upos_ size");
     for (std::size_t t = 0; t < n; ++t) {
-        const auto k = uord_[t];
-        if (k < 0 || sz(k) >= n) return fail("uord_ out of range");
-        if (upos_[sz(k)] != static_cast<Index>(t)) return fail("upos_ does not invert uord_");
+        const auto k = base_->uord_[t];
+        if (k < 0 || sz(k) >= n) return fail("base_->uord_ out of range");
+        if (base_->upos_[sz(k)] != static_cast<Index>(t)) return fail("base_->upos_ does not invert base_->uord_");
     }
 
     // U row store: in-range, no duplicate columns, no self-entry, triangular
@@ -2271,73 +2473,73 @@ bool BasisFactor::check_invariants(std::string* why) const {
     std::vector<char> hit(n, 0);
     Offset live = 0;
     for (std::size_t k = 0; k < n; ++k) {
-        if (u_len_[k] > u_cap_[k]) return fail("u_len_ exceeds u_cap_");
-        const auto beg = sz(u_off_[k]);
-        if (beg + sz(u_cap_[k]) > u_idx_.size() || beg + sz(u_cap_[k]) > u_val_.size())
+        if (base_->u_len_[k] > base_->u_cap_[k]) return fail("base_->u_len_ exceeds base_->u_cap_");
+        const auto beg = sz(base_->u_off_[k]);
+        if (beg + sz(base_->u_cap_[k]) > base_->u_idx_.size() || beg + sz(base_->u_cap_[k]) > base_->u_val_.size())
             return fail("U row segment runs past the arrays");
-        for (Index t = 0; t < u_len_[k]; ++t) {
-            const auto j = u_idx_[beg + sz(t)];
+        for (Index t = 0; t < base_->u_len_[k]; ++t) {
+            const auto j = base_->u_idx_[beg + sz(t)];
             if (j < 0 || sz(j) >= n) return fail("U row column out of range");
             if (sz(j) == k) return fail("U row carries its own diagonal");
             if (hit[sz(j)]) return fail("U row repeats a column");
             hit[sz(j)] = 1;
-            if (upos_[sz(j)] <= upos_[k])
+            if (base_->upos_[sz(j)] <= base_->upos_[k])
                 return fail("U is not triangular for the elimination order");
         }
-        for (Index t = 0; t < u_len_[k]; ++t) hit[sz(u_idx_[beg + sz(t)])] = 0;
-        live += static_cast<Offset>(u_len_[k]);
+        for (Index t = 0; t < base_->u_len_[k]; ++t) hit[sz(base_->u_idx_[beg + sz(t)])] = 0;
+        live += static_cast<Offset>(base_->u_len_[k]);
     }
 
     // U column store holds exactly the same entries with the same values.
     {
         Offset clive = 0;
         for (std::size_t j = 0; j < n; ++j) {
-            if (u_clen_[j] > u_ccap_[j]) return fail("u_clen_ exceeds u_ccap_");
-            const auto beg = sz(u_cstart_[j]);
-            if (beg + sz(u_ccap_[j]) > u_crow_.size() || beg + sz(u_ccap_[j]) > u_cval_.size())
+            if (base_->u_clen_[j] > base_->u_ccap_[j]) return fail("base_->u_clen_ exceeds base_->u_ccap_");
+            const auto beg = sz(base_->u_cstart_[j]);
+            if (beg + sz(base_->u_ccap_[j]) > base_->u_crow_.size() || beg + sz(base_->u_ccap_[j]) > base_->u_cval_.size())
                 return fail("U column segment runs past the arrays");
-            for (Index t = 0; t < u_clen_[j]; ++t) {
-                const auto r = u_crow_[beg + sz(t)];
+            for (Index t = 0; t < base_->u_clen_[j]; ++t) {
+                const auto r = base_->u_crow_[beg + sz(t)];
                 if (r < 0 || sz(r) >= n) return fail("U column row out of range");
                 if (hit[sz(r)]) return fail("U column repeats a row");
                 hit[sz(r)] = 1;
                 // The same entry must be present, with the same value, in the
                 // row store. This is the check that catches a mirror drifting.
                 bool found = false;
-                const auto rbeg = sz(u_off_[sz(r)]);
-                for (Index q = 0; q < u_len_[sz(r)]; ++q) {
-                    if (u_idx_[rbeg + sz(q)] != static_cast<Index>(j)) continue;
-                    if (u_val_[rbeg + sz(q)] != u_cval_[beg + sz(t)])
+                const auto rbeg = sz(base_->u_off_[sz(r)]);
+                for (Index q = 0; q < base_->u_len_[sz(r)]; ++q) {
+                    if (base_->u_idx_[rbeg + sz(q)] != static_cast<Index>(j)) continue;
+                    if (base_->u_val_[rbeg + sz(q)] != base_->u_cval_[beg + sz(t)])
                         return fail("U mirrors disagree on a value");
                     found = true;
                     break;
                 }
                 if (!found) return fail("U column entry missing from the row store");
             }
-            for (Index t = 0; t < u_clen_[j]; ++t) hit[sz(u_crow_[beg + sz(t)])] = 0;
-            clive += static_cast<Offset>(u_clen_[j]);
+            for (Index t = 0; t < base_->u_clen_[j]; ++t) hit[sz(base_->u_crow_[beg + sz(t)])] = 0;
+            clive += static_cast<Offset>(base_->u_clen_[j]);
         }
         if (clive != live) return fail("U mirrors hold different entry counts");
     }
 
     // Diagonal must be usable: a zero would make U singular.
     for (std::size_t k = 0; k < n; ++k)
-        if (!std::isfinite(piv_val_[k]) || piv_val_[k] == 0.0)
+        if (!std::isfinite(base_->piv_val_[k]) || base_->piv_val_[k] == 0.0)
             return fail("U has a zero or non-finite diagonal");
 
     // L: strictly lower triangular in its OWN (index) order, which no update
     // is allowed to disturb.
-    if (l_start_.size() != n + 1) return fail("l_start_ size");
+    if (base_->l_start_.size() != n + 1) return fail("base_->l_start_ size");
     for (std::size_t k = 0; k < n; ++k) {
-        if (l_start_[k] > l_start_[k + 1]) return fail("l_start_ not monotone");
-        for (Offset t = l_start_[k]; t < l_start_[k + 1]; ++t) {
-            const auto i = l_idx_[sz(t)];
+        if (base_->l_start_[k] > base_->l_start_[k + 1]) return fail("base_->l_start_ not monotone");
+        for (Offset t = base_->l_start_[k]; t < base_->l_start_[k + 1]; ++t) {
+            const auto i = base_->l_idx_[sz(t)];
             if (i < 0 || sz(i) >= n) return fail("L row index out of range");
             if (sz(i) <= k) return fail("L is not strictly lower triangular");
         }
     }
-    if (l_start_.back() != static_cast<Offset>(l_idx_.size()) ||
-        l_idx_.size() != l_val_.size())
+    if (base_->l_start_.back() != static_cast<Offset>(base_->l_idx_.size()) ||
+        base_->l_idx_.size() != base_->l_val_.size())
         return fail("L arrays inconsistent");
 
     // Row etas: in range, and never carrying their own pivot position (which
@@ -2367,7 +2569,8 @@ Offset BasisFactor::eta_nnz() const {
     // at all, so without the row etas here every refactorization trigger in
     // needs_refactor() would key off a permanently empty structure and NONE of
     // them would ever fire -- see the note there.
-    return static_cast<Offset>(eta_val_.size() + r_val_.size());
+    return static_cast<Offset>(eta_val_.size() + r_val_.size()) +
+           (border_parent_ ? border_parent_->eta_nnz() : 0);
 }
 
 // A Forrest-Tomlin factorization MUST be refactorized on a schedule, and more
@@ -2449,6 +2652,8 @@ constexpr std::FILE* lu_update_log() { return nullptr; }
 }  // namespace
 
 bool BasisFactor::update(Index p, const std::vector<f64>& alpha, f64 min_pivot) {
+    if (p < 0 || p >= m_ || alpha.size() != sz(m_) ||
+        !std::all_of(alpha.begin(), alpha.end(), [](f64 v) { return std::isfinite(v); })) return false;
     const f64 ap = (sz(p) < alpha.size()) ? alpha[sz(p)] : 0.0;
     if (!(std::fabs(ap) > min_pivot)) return false;
     eta_p_.push_back(p);
@@ -2496,6 +2701,10 @@ bool BasisFactor::update(Index p, const std::vector<f64>& alpha, f64 min_pivot) 
 // ---------------------------------------------------------------------------
 
 bool BasisFactor::collapse_pending_into_ft(const LuOptions& opts, f64 min_pivot) {
+    // The border has no U bump representation. Its product-form journal
+    // remains live until the normal full basis refactorization.
+    if (border_parent_) return eta_p_.empty();
+    detach_base();
     if (eta_p_.empty()) return true;
 
     // Snapshot every pending eta's ORIGINAL (p, alpha) as recorded by
@@ -2555,7 +2764,7 @@ bool BasisFactor::collapse_pending_into_ft(const LuOptions& opts, f64 min_pivot)
 // & Hall, COAP 60:587-608 (2015) §2.1.
 //
 // THE ALGEBRA. Work in position coordinates, where position k means pivot row
-// piv_row_[k] and basis slot piv_slot_[k]; both maps are fixed by factorize()
+// base_->piv_row_[k] and basis slot base_->piv_slot_[k]; both maps are fixed by factorize()
 // and no update touches them. In those coordinates A = L U, and replacing the
 // column at position ps gives
 //
@@ -2603,19 +2812,23 @@ bool BasisFactor::update_ft(Index p, const std::vector<f64>& alpha,
                             const LuOptions& opts, f64 min_pivot,
                             const std::vector<Index>* alpha_support,
                             const SpikeCapture* spike) {
+    if (border_parent_)
+        throw std::logic_error("BasisFactor: FT requires an unbordered LU base");
+    detach_base();
     (void)opts;
     if (m_ == 0 || sz(p) >= sz(m_) || alpha.size() < sz(m_)) return false;
-    const auto n = piv_val_.size();
-    if (n != sz(m_) || cpos_.size() < sz(m_)) return false;
+    const auto n = base_->piv_val_.size();
+    if (n != sz(m_) || base_->cpos_.size() < sz(m_)) return false;
 
-    const Index ps = cpos_[sz(p)];
+    if (scratch_.factor_gen != factor_gen_) reset_scratch(scratch_);
+    const Index ps = base_->cpos_[sz(p)];
     if (ps < 0 || sz(ps) >= n) return false;
 
     // alpha[p] is the pivot element in position coordinates; it is what the new
     // diagonal is built from, so reject a tiny one before touching anything.
     const f64 ap = alpha[sz(p)];
     if (!(std::fabs(ap) > min_pivot)) return false;
-    const f64 u_pp = piv_val_[sz(ps)];
+    const f64 u_pp = base_->piv_val_[sz(ps)];
     const f64 new_diag = u_pp * ap;
     if (!(std::fabs(new_diag) > min_pivot) || !std::isfinite(new_diag)) return false;
 
@@ -2645,16 +2858,16 @@ bool BasisFactor::update_ft(Index p, const std::vector<f64>& alpha,
         ft_support_.push_back(k);
     };
     // Iterate alpha's SUPPORT when the caller declared one. Scanning all m
-    // slots is a random gather through piv_slot_ and was, on a hypersparse
+    // slots is a random gather through base_->piv_slot_ and was, on a hypersparse
     // basis, most of the update's cost.
     const auto add_alpha_column = [&](std::size_t k, f64 xk) {
         touch(static_cast<Index>(k));
-        ft_atilde_[k] += piv_val_[k] * xk;             // the diagonal
-        const auto cbeg = sz(u_cstart_[k]);
-        const auto cend = cbeg + sz(u_clen_[k]);
+        ft_atilde_[k] += base_->piv_val_[k] * xk;             // the diagonal
+        const auto cbeg = sz(base_->u_cstart_[k]);
+        const auto cend = cbeg + sz(base_->u_clen_[k]);
         for (auto t = cbeg; t < cend; ++t) {
-            touch(u_crow_[t]);
-            ft_atilde_[sz(u_crow_[t])] += u_cval_[t] * xk;
+            touch(base_->u_crow_[t]);
+            ft_atilde_[sz(base_->u_crow_[t])] += base_->u_cval_[t] * xk;
         }
     };
     if (spike != nullptr && spike->valid) {
@@ -2677,14 +2890,14 @@ bool BasisFactor::update_ft(Index p, const std::vector<f64>& alpha,
             if (slot < 0 || sz(slot) >= n) continue;
             const f64 xk = alpha[sz(slot)];
             if (xk == 0.0) continue;
-            const Index k = cpos_[sz(slot)];
+            const Index k = base_->cpos_[sz(slot)];
             if (k < 0 || sz(k) >= n) continue;
             if (ft_stamp_[sz(k)] == ft_gen_) continue;   // duplicate slot
             add_alpha_column(sz(k), xk);
         }
     } else {
         for (std::size_t k = 0; k < n; ++k) {
-            const f64 xk = alpha[sz(piv_slot_[k])];
+            const f64 xk = alpha[sz(base_->piv_slot_[k])];
             if (xk == 0.0) continue;
             add_alpha_column(k, xk);
         }
@@ -2718,15 +2931,15 @@ bool BasisFactor::update_ft(Index p, const std::vector<f64>& alpha,
     // entering column replaces all of them. Row ps's entries are the ones the
     // row eta is about to absorb.
     {
-        const auto cbeg = sz(u_cstart_[sz(ps)]);
-        for (Index t = 0; t < u_clen_[sz(ps)]; ++t)
-            u_row_erase(u_crow_[cbeg + sz(t)], ps);
-        u_clen_[sz(ps)] = 0;
+        const auto cbeg = sz(base_->u_cstart_[sz(ps)]);
+        for (Index t = 0; t < base_->u_clen_[sz(ps)]; ++t)
+            u_row_erase(base_->u_crow_[cbeg + sz(t)], ps);
+        base_->u_clen_[sz(ps)] = 0;
 
-        const auto rbeg = sz(u_off_[sz(ps)]);
-        for (Index t = 0; t < u_len_[sz(ps)]; ++t)
-            u_col_erase(u_idx_[rbeg + sz(t)], ps);
-        u_len_[sz(ps)] = 0;
+        const auto rbeg = sz(base_->u_off_[sz(ps)]);
+        for (Index t = 0; t < base_->u_len_[sz(ps)]; ++t)
+            u_col_erase(base_->u_idx_[rbeg + sz(t)], ps);
+        base_->u_len_[sz(ps)] = 0;
     }
 
     // ---- U: install the entering column at position ps ------------------
@@ -2739,7 +2952,7 @@ bool BasisFactor::update_ft(Index p, const std::vector<f64>& alpha,
         u_row_append(k, ps, val);
         u_col_append(ps, k, val);
     }
-    piv_val_[sz(ps)] = new_diag;
+    base_->piv_val_[sz(ps)] = new_diag;
 
     // ---- the row eta ----------------------------------------------------
     for (const Index k : ft_vsupport_) {
@@ -2758,7 +2971,7 @@ bool BasisFactor::update_ft(Index p, const std::vector<f64>& alpha,
     // quantity the old implementation's bump width measured (how much of the
     // trailing order this update disturbed), so the bump_width_max trigger
     // keeps its meaning. Only the order array pays it, at one memmove.
-    const Index shift = m_ - upos_[sz(ps)];
+    const Index shift = m_ - base_->upos_[sz(ps)];
     u_order_move_to_back(ps);
     bump_width_ = shift;
     if (std::FILE* fp = lu_update_log()) {
@@ -2796,7 +3009,7 @@ bool BasisFactor::update_ft(Index p, const std::vector<f64>& alpha,
     // carrying them. This is bounded amortized work, not a per-update cost.
     // u_live_nnz_ is maintained incrementally by the four store helpers -- an
     // O(m) recount here would undo the point of the sparse edits above.
-    u_alloc_nnz_ = static_cast<Offset>(u_idx_.size());
+    u_alloc_nnz_ = static_cast<Offset>(base_->u_idx_.size());
     if (u_dead_nnz_ > u_live_nnz_ + 64 || u_cdead_nnz_ > u_live_nnz_ + 64)
         compact_u_storage();
     return true;
@@ -2805,7 +3018,7 @@ bool BasisFactor::update_ft(Index p, const std::vector<f64>& alpha,
 // Rebuild both U mirrors packed, preserving contents exactly. Only the storage
 // layout changes, so no solve can observe this beyond running faster.
 void BasisFactor::compact_u_storage() {
-    const auto n = piv_val_.size();
+    const auto n = base_->piv_val_.size();
     std::vector<Offset> off(n);
     std::vector<Index>  len(n), cap(n);
     std::vector<Index>  idx;
@@ -2814,42 +3027,42 @@ void BasisFactor::compact_u_storage() {
     val.reserve(u_live_nnz_ ? sz(u_live_nnz_) : 1);
     for (std::size_t k = 0; k < n; ++k) {
         off[k] = static_cast<Offset>(idx.size());
-        len[k] = u_len_[k];
-        cap[k] = u_len_[k];
-        const auto beg = sz(u_off_[k]);
-        for (Index t = 0; t < u_len_[k]; ++t) {
-            idx.push_back(u_idx_[beg + sz(t)]);
-            val.push_back(u_val_[beg + sz(t)]);
+        len[k] = base_->u_len_[k];
+        cap[k] = base_->u_len_[k];
+        const auto beg = sz(base_->u_off_[k]);
+        for (Index t = 0; t < base_->u_len_[k]; ++t) {
+            idx.push_back(base_->u_idx_[beg + sz(t)]);
+            val.push_back(base_->u_val_[beg + sz(t)]);
         }
     }
-    u_off_ = std::move(off);
-    u_len_ = std::move(len);
-    u_cap_ = std::move(cap);
-    u_idx_ = std::move(idx);
-    u_val_ = std::move(val);
+    base_->u_off_ = std::move(off);
+    base_->u_len_ = std::move(len);
+    base_->u_cap_ = std::move(cap);
+    base_->u_idx_ = std::move(idx);
+    base_->u_val_ = std::move(val);
     u_dead_nnz_ = 0;
 
-    u_cstart_.assign(n + 1, 0);
-    u_clen_.assign(n, 0);
-    u_ccap_.assign(n, 0);
+    base_->u_cstart_.assign(n + 1, 0);
+    base_->u_clen_.assign(n, 0);
+    base_->u_ccap_.assign(n, 0);
     for (std::size_t k = 0; k < n; ++k) {
-        const auto beg = sz(u_off_[k]);
-        for (Index t = 0; t < u_len_[k]; ++t) ++u_cstart_[sz(u_idx_[beg + sz(t)]) + 1];
+        const auto beg = sz(base_->u_off_[k]);
+        for (Index t = 0; t < base_->u_len_[k]; ++t) ++base_->u_cstart_[sz(base_->u_idx_[beg + sz(t)]) + 1];
     }
-    for (std::size_t j = 0; j < n; ++j) u_cstart_[j + 1] += u_cstart_[j];
-    u_crow_.assign(sz(u_cstart_[n]) ? sz(u_cstart_[n]) : 1, 0);
-    u_cval_.assign(u_crow_.size(), 0.0);
+    for (std::size_t j = 0; j < n; ++j) base_->u_cstart_[j + 1] += base_->u_cstart_[j];
+    base_->u_crow_.assign(sz(base_->u_cstart_[n]) ? sz(base_->u_cstart_[n]) : 1, 0);
+    base_->u_cval_.assign(base_->u_crow_.size(), 0.0);
     for (std::size_t k = 0; k < n; ++k) {
-        const auto beg = sz(u_off_[k]);
-        for (Index t = 0; t < u_len_[k]; ++t) {
-            const auto j = sz(u_idx_[beg + sz(t)]);
-            const auto at = sz(u_cstart_[j]) + sz(u_clen_[j]);
-            u_crow_[at] = static_cast<Index>(k);
-            u_cval_[at] = u_val_[beg + sz(t)];
-            ++u_clen_[j];
+        const auto beg = sz(base_->u_off_[k]);
+        for (Index t = 0; t < base_->u_len_[k]; ++t) {
+            const auto j = sz(base_->u_idx_[beg + sz(t)]);
+            const auto at = sz(base_->u_cstart_[j]) + sz(base_->u_clen_[j]);
+            base_->u_crow_[at] = static_cast<Index>(k);
+            base_->u_cval_[at] = base_->u_val_[beg + sz(t)];
+            ++base_->u_clen_[j];
         }
     }
-    for (std::size_t j = 0; j < n; ++j) u_ccap_[j] = u_clen_[j];
+    for (std::size_t j = 0; j < n; ++j) base_->u_ccap_[j] = base_->u_clen_[j];
     u_cdead_nnz_ = 0;
 }
 

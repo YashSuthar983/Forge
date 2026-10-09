@@ -1,3 +1,4 @@
+#include "forge/search/domain_writer.hpp"
 #include "forge/search/rapid_learning.hpp"
 
 #include "forge/core/work_clock.hpp"
@@ -7,11 +8,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
+#include <numeric>
+#include <stdexcept>
 
 namespace forge::search {
 namespace {
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
-using Clock = std::chrono::steady_clock;
+using Clock = core::SolverClock;
 }  // namespace
 
 RapidLearningResult rapid_learning(
@@ -28,11 +32,23 @@ RapidLearningResult rapid_learning(
     if (!opts.enabled || static_cast<Index>(root_lo.size()) != n ||
         static_cast<Index>(root_hi.size()) != n || sz(n) != is_int.size())
         return res;
+    if (core::cancel_requested(opts.cancel)) { res.interrupted = true; return res; }
     std::vector<Index> binaries;
     for (Index j = 0; j < n; ++j)
         if (is_int[sz(j)] && root_lo[sz(j)] == 0.0 && root_hi[sz(j)] == 1.0) binaries.push_back(j);
     if (binaries.size() < 2) return res;
     res.ran = true;
+    // This run owns its asserting theory. Export policy controls what the
+    // tree retains; it cannot discard a clause the active CDCL search needs.
+    // A bounded run creates at most one local clause per paid conflict.
+    ConflictStore active_store(n, std::numeric_limits<std::size_t>::max(), 2 * sz(n));
+    std::vector<ConflictLiteral> pending_units;
+    for (auto clause : store.export_clauses()) {
+        std::vector<ConflictLiteral> normalized;
+        const auto verdict = active_store.add_typed(std::move(clause), root_lo, root_hi, &normalized);
+        if (verdict == ClauseResult::Contradiction) { res.infeasible = true; res.ms = ms_since(); return res; }
+        if (verdict == ClauseResult::Unit) pending_units.push_back(normalized.front());
+    }
 
     std::vector<f64> lo = root_lo, hi = root_hi;
     RowActivityCache cache;
@@ -45,33 +61,42 @@ RapidLearningResult rapid_learning(
 
     // Restore the box to the trail mark and drop what came after.
     const auto undo_to = [&](std::size_t mark) {
-        const auto& es = trail.entries();
-        for (std::size_t t = es.size(); t-- > mark;) {
-            const auto& e = es[t];
-            (e.dir == BoundDir::Lower ? lo : hi)[sz(e.var)] = e.old_bound;
-        }
-        for (std::size_t t = mark; t < es.size(); ++t)
-            cache.set_bounds(es[t].var, lo[sz(es[t].var)], hi[sz(es[t].var)]);
-        trail.truncate(mark);
+        std::vector<Index> moved;
+        for (const auto& e : trail.since(mark)) moved.push_back(e.var);
+        undo_domain(lo, hi, trail, mark);
+        for (const Index j : moved) cache.set_bounds(j, lo[sz(j)], hi[sz(j)]);
     };
-    // Rows, clauses and the graph to a fixpoint from the columns moved since
-    // `from` plus `extra` (a new clause's columns). False on an empty domain
-    // or a violated clause; `cv` the emptied column (-1 for a clause).
-    std::vector<Index> seeds, moved;
+    const auto time_expired = [&] {
+        return core::cancel_requested(opts.cancel) ||
+               (opts.time_limit_s > 0 && ms_since() >= 1000 * opts.time_limit_s);
+    };
+    enum class PropagationStatus { Stable, Conflict, Pending };
+    // A scan allowance is not a fixpoint certificate. Unvisited row/clause
+    // work is re-seeded and retained as pending until it finishes or this
+    // run's enclosing allowance expires; it never authorizes a leaf.
+    std::vector<Index> seeds;
+    ConflictAntecedents conflict_seed;
     const auto propagate = [&](int level, std::size_t from, const std::vector<Index>* extra,
-                               Index& cv) -> bool {
+                               Index& cv, bool full_rows = false) -> PropagationStatus {
         cv = -1;
+        conflict_seed.reset();
         std::size_t rows_from = from, other_from = from;
-        bool first = true;
-        for (int round = 0; round < 256; ++round) {
+        bool first = true, rows_pending = full_rows, clauses_pending = false;
+        for (;;) {
+            if (time_expired()) return PropagationStatus::Pending;
             seeds.clear();
             for (const auto& e : trail.since(rows_from)) seeds.push_back(e.var);
             if (first && extra != nullptr) seeds.insert(seeds.end(), extra->begin(), extra->end());
-            if (!seeds.empty()) {
-                const auto pr = propagate_bounds_cached(lp, cache, lo, hi, &seeds, nullptr,
-                                                        scratch, &trail, level, opts.tol,
-                                                        visit_cap, /*sync_box=*/false);
-                if (!pr.feasible) { cv = pr.conflict_var; return false; }
+            if (rows_pending || !seeds.empty()) {
+                const auto pr = propagate_bounds_cached(lp, cache, lo, hi,
+                    rows_pending ? nullptr : &seeds, nullptr, scratch, &trail, level,
+                    opts.tol, visit_cap, /*sync_box=*/false, opts.cancel);
+                if (!pr.feasible) {
+                    cv = pr.conflict_var;
+                    conflict_seed = pr.conflict_antecedents;
+                    return PropagationStatus::Conflict;
+                }
+                rows_pending = !pr.converged;
             }
             // Clauses and the graph see every column moved since they last ran.
             const std::size_t before = trail.size();
@@ -79,14 +104,19 @@ RapidLearningResult rapid_learning(
             for (const auto& e : trail.since(other_from)) seeds.push_back(e.var);
             if (first && extra != nullptr) seeds.insert(seeds.end(), extra->begin(), extra->end());
             first = false;
-            if (!store.empty() && !seeds.empty()) {
-                Index c = -1;
-                if (!store.propagate_from(lo, hi, seeds, nullptr, &trail, level, &c)) {
+            if (!active_store.empty() && (clauses_pending || !seeds.empty())) {
+                Index c = -1; bool converged = true;
+                if (clauses_pending) {
+                    seeds.resize(sz(n)); std::iota(seeds.begin(), seeds.end(), 0);
+                }
+                if (!active_store.propagate_from(lo, hi, seeds, &converged, &trail, level, &c,
+                                                 &conflict_seed, opts.cancel)) {
                     for (const auto& e : trail.since(before))
                         cache.set_bounds(e.var, lo[sz(e.var)], hi[sz(e.var)]);
                     cv = c;
-                    return false;
+                    return PropagationStatus::Conflict;
                 }
+                clauses_pending = !converged;
             }
             if (use_graph && !seeds.empty()) {
                 std::uint64_t forced = 0;
@@ -99,16 +129,16 @@ RapidLearningResult rapid_learning(
                     for (const auto& e : trail.since(before))
                         cache.set_bounds(e.var, lo[sz(e.var)], hi[sz(e.var)]);
                     cv = c;
-                    return false;
+                    return PropagationStatus::Conflict;
                 }
             }
             for (const auto& e : trail.since(before))
                 cache.set_bounds(e.var, lo[sz(e.var)], hi[sz(e.var)]);
             other_from = trail.size();
-            if (trail.size() == before) return true;   // store and graph moved nothing new
+            if (trail.size() == before && !rows_pending && !clauses_pending)
+                return PropagationStatus::Stable;
             rows_from = before;
         }
-        return true;
     };
     // Level 0: the facts hold for the whole root box; commit them to it.
     const auto commit_level0 = [&]() {
@@ -121,40 +151,60 @@ RapidLearningResult rapid_learning(
     };
     // Back to level 0 with the caller's root box (a unit clause may have
     // tightened it), propagated and committed.
-    const auto restart_at_root = [&]() -> bool {
+    const auto restart_at_root = [&]() -> PropagationStatus {
         undo_to(0);
         std::vector<Index> moved_cols;
+        for (const auto& unit : pending_units) {
+            f64& bound = unit.upper ? hi[sz(unit.var)] : lo[sz(unit.var)];
+            const f64 next = unit.upper ? std::min(bound, unit.bound) : std::max(bound, unit.bound);
+            if (next != bound) {
+                write_domain_bound(lo, hi, unit.var,
+                    unit.upper ? BoundDir::Upper : BoundDir::Lower, next,
+                    &trail, {ReasonKind::Unknown, -1, 0});
+                cache.set_bounds(unit.var, lo[sz(unit.var)], hi[sz(unit.var)]);
+                moved_cols.push_back(unit.var);
+            }
+        }
+        pending_units.clear();
         for (Index j = 0; j < n; ++j) {
             const f64 nl = std::max(lo[sz(j)], root_lo[sz(j)]);
             const f64 nh = std::min(hi[sz(j)], root_hi[sz(j)]);
             if (nl != lo[sz(j)] || nh != hi[sz(j)]) {
-                if (nl != lo[sz(j)]) trail.push(j, BoundDir::Lower, nl, lo[sz(j)], ReasonKind::Unknown, -1, 0);
-                if (nh != hi[sz(j)]) trail.push(j, BoundDir::Upper, nh, hi[sz(j)], ReasonKind::Unknown, -1, 0);
-                lo[sz(j)] = nl;
-                hi[sz(j)] = nh;
+                write_domain_bound(lo, hi, j, BoundDir::Lower, nl, &trail, {ReasonKind::Unknown, -1, 0});
+                write_domain_bound(lo, hi, j, BoundDir::Upper, nh, &trail, {ReasonKind::Unknown, -1, 0});
                 cache.set_bounds(j, nl, nh);
                 moved_cols.push_back(j);
             }
-            if (lo[sz(j)] > hi[sz(j)] + opts.tol) return false;
+            if (lo[sz(j)] > hi[sz(j)] + opts.tol) return PropagationStatus::Conflict;
         }
         Index cv = -1;
-        if (!propagate(0, 0, &moved_cols, cv)) return false;
-        commit_level0();
-        return true;
+        const auto state = propagate(0, 0, &moved_cols, cv);
+        if (state != PropagationStatus::Conflict) commit_level0();
+        return state;
     };
 
+    if (!pending_units.empty()) {
+        const auto state = restart_at_root();
+        if (state != PropagationStatus::Stable) {
+            res.infeasible = state == PropagationStatus::Conflict;
+            res.interrupted = state == PropagationStatus::Pending;
+            res.ms = ms_since(); return res;
+        }
+    }
     // Initial level-0 fixpoint over every row.
     {
         const auto pr = propagate_bounds_cached(lp, cache, lo, hi, nullptr, nullptr, scratch,
-                                                &trail, 0, opts.tol, visit_cap, false);
+                                                &trail, 0, opts.tol, visit_cap, false, opts.cancel);
         Index cv = -1;
         std::vector<Index> all(binaries.begin(), binaries.end());
-        if (!pr.feasible || !propagate(0, 0, &all, cv)) {
-            res.infeasible = true;
-            res.ms = ms_since();
-            return res;
+        const auto state = pr.feasible ? propagate(0, 0, &all, cv,
+            !pr.converged) : PropagationStatus::Conflict;
+        if (state != PropagationStatus::Conflict) commit_level0();
+        if (state != PropagationStatus::Stable) {
+            res.infeasible = state == PropagationStatus::Conflict;
+            res.interrupted = state == PropagationStatus::Pending;
+            res.ms = ms_since(); return res;
         }
-        commit_level0();
     }
 
     std::vector<f64> activity(sz(n), 0.0);
@@ -169,7 +219,7 @@ RapidLearningResult rapid_learning(
 
     const auto out_of_budget = [&]() {
         return res.conflicts >= opts.max_conflicts || res.decisions >= opts.max_decisions ||
-               (opts.time_limit_s > 0.0 && ms_since() > opts.time_limit_s * 1000.0);
+               time_expired();
     };
     // The level at which a clause literal became false (0 if at the root).
     const auto false_level = [&](const ConflictLiteral& l) {
@@ -184,6 +234,7 @@ RapidLearningResult rapid_learning(
     };
 
     while (!out_of_budget()) {
+        core::work_add(binaries.size(), core::WorkTag::ClauseScan);
         // Decide: the most active open binary.
         Index pick = -1;
         f64 best = -1.0;
@@ -199,22 +250,25 @@ RapidLearningResult rapid_learning(
         ++res.decisions;
         level_mark.push_back(trail.size());
         const f64 v = phase[sz(pick)];
-        trail.push(pick, BoundDir::Lower, v, lo[sz(pick)], ReasonKind::Branch, -1, level);
-        trail.push(pick, BoundDir::Upper, v, hi[sz(pick)], ReasonKind::Branch, -1, level);
-        lo[sz(pick)] = hi[sz(pick)] = v;
+        write_domain_bound(lo, hi, pick, BoundDir::Lower, v, &trail, {ReasonKind::Branch, -1, level});
+        write_domain_bound(lo, hi, pick, BoundDir::Upper, v, &trail, {ReasonKind::Branch, -1, level});
         cache.set_bounds(pick, v, v);
 
         std::vector<Index> extra;
         std::size_t from = level_mark.back();
         for (;;) {
             Index cv = -1;
-            if (propagate(level, from, extra.empty() ? nullptr : &extra, cv)) break;
+            const auto state = propagate(level, from, extra.empty() ? nullptr : &extra, cv);
+            if (state == PropagationStatus::Stable) break;
+            if (state == PropagationStatus::Pending) {
+                res.interrupted = true; res.ms = ms_since(); return res;
+            }
             ++res.conflicts;
             ++since_restart;
             if (level == 0) { res.infeasible = true; break; }
             std::vector<ConflictLiteral> lits = explain_conflict_clause(
                 trail, lp, lp.n_rows(), is_int, root_lo, root_hi, lo, hi, cv,
-                /*first_uip=*/true, &store, nullptr);
+                /*first_uip=*/true, &active_store, nullptr, conflict_seed.get());
             if (lits.empty()) lits = negated_branch_decisions(trail, is_int, root_lo, root_hi);
             if (lits.empty()) { res.ms = ms_since(); return res; }   // nothing sound to learn
             // Activity and phase: the conflict's columns, and the value each
@@ -236,10 +290,18 @@ RapidLearningResult rapid_learning(
             int back = lv.size() >= 2 ? lv[lv.size() - 2] : 0;
             std::vector<Index> clause_cols;
             for (const auto& l : lits) clause_cols.push_back(l.var);
-            const ClauseResult cr = store_clause(std::move(lits));
-            if (cr == ClauseResult::Contradiction) { res.infeasible = true; break; }
-            if (clause_retained(cr)) ++res.learned;
-            if (cr == ClauseResult::Unit) { ++res.units; back = 0; }
+            std::vector<ConflictLiteral> normalized;
+            const auto local = active_store.add_typed(lits, root_lo, root_hi, &normalized);
+            const ClauseResult exported = store_clause(std::move(lits));
+            if (local == ClauseResult::Contradiction || exported == ClauseResult::Contradiction) {
+                res.infeasible = true; break;
+            }
+            if (local == ClauseResult::Rejected)
+                throw std::logic_error("rapid learning rejected its own checked asserting clause");
+            if (clause_retained(exported)) ++res.learned;
+            if (local == ClauseResult::Unit) {
+                pending_units.push_back(normalized.front()); ++res.units; back = 0;
+            }
             back = std::min(back, level - 1);
             if (since_restart >= static_cast<std::uint64_t>(restart_limit)) {
                 back = 0;
@@ -250,7 +312,11 @@ RapidLearningResult rapid_learning(
             if (back == 0) {
                 level_mark.clear();
                 level = 0;
-                if (!restart_at_root()) { res.infeasible = true; break; }
+                const auto root_state = restart_at_root();
+                if (root_state == PropagationStatus::Conflict) { res.infeasible = true; break; }
+                if (root_state == PropagationStatus::Pending) {
+                    res.interrupted = true; res.ms = ms_since(); return res;
+                }
                 // The new clause asserts at the root through its columns.
                 from = trail.size();
                 extra = clause_cols;
@@ -266,6 +332,7 @@ RapidLearningResult rapid_learning(
         // A fixpoint reached at level 0 (after a backjump there) is a root fact.
         if (level == 0) commit_level0();
     }
+    res.interrupted = !res.infeasible && !res.leaf && out_of_budget();
     res.ms = ms_since();
     return res;
 }

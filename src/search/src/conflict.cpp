@@ -1,3 +1,4 @@
+#include "forge/search/domain_writer.hpp"
 #include "forge/search/conflict.hpp"
 #include "forge/model/dyadic.hpp"
 #include "forge/core/work_clock.hpp"
@@ -655,12 +656,18 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
         const auto& rp = lp.A.pattern.row_ptr();
         const Index first = resume ? std::min(state->rows_covered, lp.n_rows()) : 0;
         for (Index i = first; i < lp.n_rows(); ++i) {
+            if (core::cancel_requested(opts.cancel)) { diag.probing_truncated = true; break; }
             if (out.cliques().size() >= opts.max_cliques) break;
-            if (sz(rp[sz(i) + 1] - rp[sz(i)]) > opts.max_row_len) continue;
+            if (sz(rp[sz(i) + 1] - rp[sz(i)]) > opts.max_row_len) {
+                if (state) state->rows_covered = i+1;
+                continue;
+            }
             extract_row_cliques(lp, i, 1.0, col_lo, col_hi, opts, out, diag);
             extract_row_cliques(lp, i, -1.0, col_lo, col_hi, opts, out, diag);
+            if (state) state->rows_covered = i+1;
         }
-        if (state != nullptr) state->rows_covered = lp.n_rows();
+        // Coverage is advanced after each completed row, including skipped
+        // rows; interruption must leave the unfinished suffix discoverable.
     }
 
     if (opts.enabled && lp.nnz() <= opts.max_nnz) {
@@ -794,16 +801,14 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
                 if (std::isfinite(nh)) nh = std::floor(nh + opts.tol);
             }
             if (nl != l) {
-                if (log) log->push(k, BoundDir::Lower, nl, l, ReasonKind::Unknown, -1, 1);
-                lo[sz(k)] = nl;
-                changed = true;
+                changed = write_domain_bound(lo, hi, k, BoundDir::Lower, nl,
+                    log, {ReasonKind::Unknown, -1, 1}) || changed;
             }
             if (nh != h) {
-                if (log) log->push(k, BoundDir::Upper, nh, h, ReasonKind::Unknown, -1, 1);
-                hi[sz(k)] = nh;
-                changed = true;
+                changed = write_domain_bound(lo, hi, k, BoundDir::Upper, nh,
+                    log, {ReasonKind::Unknown, -1, 1}) || changed;
             }
-            return !(nl > nh + opts.tol);
+            return !(lo[sz(k)] > hi[sz(k)] + opts.tol);
         };
         std::vector<Index> dirty;
         std::vector<char> is_dirty(sz(n), 0);
@@ -838,7 +843,7 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
             for (Index k = 0; k < n; ++k) all[sz(k)] = k;
             const auto fr = propagate_bounds_events(lp, index, col_lo, col_hi, all,
                                                     scratch, &trail, 0, opts.tol,
-                                                    visit_cap);
+                                                    visit_cap, opts.cancel);
             if (!fr.feasible) {
                 diag.infeasible = true;
                 diag.probe_ms = ms_since(t0);
@@ -852,6 +857,7 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
         act.build(lp, col_lo, col_hi);
         act_pending.clear();
         std::vector<Index> seeds(1);
+        bool side_complete = true;
 
         // x_j = v on the global box. Fills `rec`; undoes unless `keep`.
         const auto run_side = [&](Index j, f64 v, std::vector<SideCol>& rec,
@@ -861,17 +867,16 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
                 act_pending.clear();
             }
             const std::size_t mark = trail.size();
-            trail.push(j, BoundDir::Lower, v, col_lo[sz(j)], ReasonKind::Branch, -1, 1);
-            trail.push(j, BoundDir::Upper, v, col_hi[sz(j)], ReasonKind::Branch, -1, 1);
-            col_lo[sz(j)] = v;
-            col_hi[sz(j)] = v;
+            write_domain_bound(col_lo, col_hi, j, BoundDir::Lower, v, &trail, {ReasonKind::Branch, -1, 1});
+            write_domain_bound(col_lo, col_hi, j, BoundDir::Upper, v, &trail, {ReasonKind::Branch, -1, 1});
             act.set_bounds(j, v, v);
             seeds[0] = j;
             scratch.record_redundancy = opts.dual_fix_in_probing;
             scratch.redundant.clear();
             const auto pr = propagate_bounds_cached(lp, act, col_lo, col_hi, &seeds, nullptr,
                                                     scratch, &trail, 1, opts.tol, visit_cap,
-                                                    /*sync_box=*/false);
+                                                    /*sync_box=*/false, opts.cancel);
+            side_complete = side_complete && (pr.converged || !pr.feasible);
             scratch.record_redundancy = false;
             bool feasible = pr.feasible;
             rec.clear();
@@ -1004,16 +1009,10 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
         if (budget < bins.size()) diag.probing_truncated = true;
 
         for (std::size_t idx = 0; idx < budget; ++idx) {
-            // Every 16 binaries, and that granularity is part of the budget:
-            // probe_time_limit_s was tuned with it. Checking every binary held
-            // probing to its nominal 0.3 s on ex10 (134 binaries probed over
-            // presolve and root, against 255), clique probing then fixed 99
-            // columns instead of 160, fixprop found no incumbent and the root
-            // LP ran out the clock: Optimal in 20 s became Interrupted. The
-            // cost is an overrun of up to 15 binaries, which a small child
-            // allowance feels most (neos-860300: 0.06-0.2 s ran 0.32-0.42 s).
-            if ((idx & 0xF) == 0 && opts.probe_time_limit_s > 0.0 &&
-                ms_since(t0) > opts.probe_time_limit_s * 1000.0) {
+            // Stop between completed side transactions. A numerical budget
+            // is a resource contract, independent of benchmark trajectories.
+            if (core::cancel_requested(opts.cancel) || (opts.probe_time_limit_s > 0.0 &&
+                ms_since(t0) > opts.probe_time_limit_s * 1000.0)) {
                 diag.probing_truncated = true;
                 break;
             }
@@ -1033,12 +1032,16 @@ ConflictDiagnostics build_conflict_graph(const model::LpProblem& lp,
             const Index j = bins[idx];
             if (state != nullptr) {
                 if (state->probed[sz(j)]) continue;   // an earlier pass covered it
-                state->probed[sz(j)] = 1;
             }
-            if (col_hi[sz(j)] - col_lo[sz(j)] < 0.5) continue;  // already fixed
+            if (col_hi[sz(j)] - col_lo[sz(j)] < 0.5) {
+                if (state) state->probed[sz(j)] = 1;
+                continue;
+            }
 
+            side_complete = true;
             const bool f0 = run_side(j, 0.0, side[0], false);
             const bool f1 = run_side(j, 1.0, side[1], false);
+            if (state && side_complete) state->probed[sz(j)] = 1;
             diag.probes += 2;
 
             if (!f0 && !f1) {
@@ -1370,50 +1373,14 @@ bool propagate_conflicts(const ConflictGraph& cg,
         return true;
     if (cg.empty()) return true;
 
-    // Forcing literal (k,w) false pins x_k to 1-w; `why` is the true literal.
-    // Only the side that falsifies the literal is the deduction (x_k <= 0
-    // for (k,1), x_k >= 1 for (k,0)); it is what the trail records.
-    Index why = -1;
-    auto force_false = [&](Index l) -> bool {
-        const Index k = lit_var(l);
-        const f64 v = lit_val(l) == 1 ? 0.0 : 1.0;
-        bool changed = false;
-        if (lit_val(l) == 0 && col_lo[sz(k)] < v - 0.5) {
-            if (trail) trail->push(k, BoundDir::Lower, v, col_lo[sz(k)], ReasonKind::Implication, why, depth);
-            col_lo[sz(k)] = v;
-            changed = true;
-        }
-        if (lit_val(l) == 1 && col_hi[sz(k)] > v + 0.5) {
-            if (trail) trail->push(k, BoundDir::Upper, v, col_hi[sz(k)], ReasonKind::Implication, why, depth);
-            col_hi[sz(k)] = v;
-            changed = true;
-        }
-        if (changed) ++tightened;
-        if (col_lo[sz(k)] > col_hi[sz(k)] + 0.5) {
-            if (conflict_var) *conflict_var = k;
-            return false;
-        }
-        return true;
-    };
+    // A round count cannot certify a graph fixpoint. Seed the event-driven
+    // closure with all graph binaries; it processes every newly forced literal
+    // exactly once, including chains longer than the former round allowance.
+    (void)max_rounds;
+    return propagate_conflicts_from(cg, col_lo, col_hi, cg.binaries(), tightened,
+                                    trail, depth, conflict_var);
 
-    for (int round = 0; round < max_rounds; ++round) {
-        const std::uint64_t before = tightened;
-        for (const Index j : cg.binaries()) {
-            if (col_hi[sz(j)] - col_lo[sz(j)] > 0.5) continue;  // not fixed
-            const int v = col_lo[sz(j)] > 0.5 ? 1 : 0;
-            const Index tru = lit_of(j, v);
-            why = tru;
-            // Everything this literal conflicts with is now false.
-            for (const Index nb : cg.neighbors(tru))
-                if (!force_false(nb)) return false;
-            // A clique containing a true literal has all its others false.
-            for (const Index cid : cg.cliques_of(tru))
-                for (const Index l : cg.cliques()[sz(cid)].lits)
-                    if (l != tru && !force_false(l)) return false;
-        }
-        if (tightened == before) break;
-    }
-    return true;
+
 }
 
 bool propagate_conflicts_from(const ConflictGraph& cg, std::vector<f64>& col_lo,
@@ -1434,13 +1401,13 @@ bool propagate_conflicts_from(const ConflictGraph& cg, std::vector<f64>& col_lo,
         const f64 v = lit_val(l) == 1 ? 0.0 : 1.0;
         bool moved = false;
         if (lit_val(l) == 0 && col_lo[sz(k)] < v - 0.5) {
-            if (trail) trail->push(k, BoundDir::Lower, v, col_lo[sz(k)], ReasonKind::Implication, why, depth);
-            col_lo[sz(k)] = v;
+            write_domain_bound(col_lo, col_hi, k, BoundDir::Lower, v,
+                               trail, {ReasonKind::Implication, why, depth});
             moved = true;
         }
         if (lit_val(l) == 1 && col_hi[sz(k)] > v + 0.5) {
-            if (trail) trail->push(k, BoundDir::Upper, v, col_hi[sz(k)], ReasonKind::Implication, why, depth);
-            col_hi[sz(k)] = v;
+            write_domain_bound(col_lo, col_hi, k, BoundDir::Upper, v,
+                               trail, {ReasonKind::Implication, why, depth});
             moved = true;
         }
         if (col_lo[sz(k)] > col_hi[sz(k)] + 0.5) {

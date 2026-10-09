@@ -413,18 +413,27 @@ void test_gmi_fixture_via_solve_milp() {
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.max_nodes = 1000;
     opts.cuts_enabled = true;
-    // Isolate the cut loop from newer root reductions that already prove
-    // this one-row fixture before GMI runs (integral-row rounding / MIP
-    // presolve / symmetry).
+    // Isolate the cut loop from newer root reductions and from DynSep optional
+    // arms. Unauthorized ZH previously still ran (DynSep allow_zerohalf default)
+    // and stole the pool slot from the GMI that this fixture exists to exercise.
     opts.integer_row_rounding = false;
     opts.mip_presolve = false;
     opts.symmetry = false;
+    opts.structural_presolve.binary_row_max_work = 0;  // isolate GMI from block pricing
+    opts.domain_propagation = false;
+    opts.probing = false;
+    opts.auto_cuts = false;
+    opts.mir_cuts = opts.lifted_cover_cuts = opts.zerohalf_cuts = false;
+    opts.flow_cover_cuts = false;
     BabDiagnostics diag;
     auto raw = forge::search::solve_milp(lp, opts, diag);
     const auto ev = forge::search::milp_evidence(diag, opts);
     const auto r = forge::certify::finalize_result(std::move(raw), ev);
     CHECK(r.status == Status::Optimal || r.status == Status::Feasible);
     CHECK_NEAR(r.objective, -1.0, 1e-6);
+    // Competing families are off: DynSep must not schedule unauthorized ZH/FC
+    // (or attribute non-GMI rows to gmi_cuts_added) and steal this path.
+    CHECK(diag.zerohalf_cuts_added == 0);
     CHECK(diag.gmi_cuts_added >= 1);
     CHECK(diag.cut_rounds >= 1);
     CHECK(diag.cut_pool_inserted >= 1);
@@ -848,12 +857,10 @@ void test_bound_snapshot_names_the_invocation() {
 }
 
 
-// A tiny reduced cost against a large incumbent gap must not turn an INFINITE
-// bound into an astronomical finite one (gap / d = 2e13 here): such a bound
-// tightens nothing, and it makes later Lagrangian dual objectives charge
-// roundoff-sized reduced costs 2e13 each, which failed the primal-dual gap
-// test on every nu25-pr12 node LP. A finite old bound is still tightened.
-void test_rc_tightening_skips_infinite_to_astronomical() {
+// A certified improving-domain bound is useful even at a large magnitude.
+// Its proof scope is the cutoff, and its derivation cannot depend on whether
+// the original upper endpoint happened to be finite.
+void test_rc_tightening_large_certified_domain() {
     forge::model::LpProblem p;
     p.A = forge::sparse::from_triplets(1, 1, {0}, {0}, {1.0});
     p.c = {1e-6};                       // reduced cost 1e-6 with y = 0
@@ -867,14 +874,17 @@ void test_rc_tightening_skips_infinite_to_astronomical() {
     // incumbent 2e7 above the LP value 0: gap / d = 2e13
     const auto r = forge::search::certified_reduced_cost_bounds(
         p, {0.0}, 2e7, lows, highs, 1e-7);
-    CHECK(highs[0] == forge::model::kInf);
-    CHECK(r.tightened == 0);
+    CHECK(std::isfinite(highs[0]));
+    CHECK(highs[0] >= 2e13);
+    CHECK(r.tightened == 1);
+    const double from_infinite = highs[0];
     // Same reduced cost, finite old bound: tightened as before.
     highs = {1e15};
     const auto r2 = forge::search::certified_reduced_cost_bounds(
         p, {0.0}, 2e7, lows, highs, 1e-7);
     CHECK(highs[0] < 1e15);
     CHECK(r2.tightened == 1);
+    CHECK(highs[0] == from_infinite);
 }
 
 void test_gmi_structural_drop_relaxes_rhs() {
@@ -1157,7 +1167,7 @@ int main() {
     test_cut_merge_preserves_original_rows();
     test_cut_merge_requires_exact_normalized_coefficients();
     test_derived_cuts_enter_with_their_margin();
-    test_rc_tightening_skips_infinite_to_astronomical();
+    test_rc_tightening_large_certified_domain();
     test_gmi_structural_drop_relaxes_rhs();
     test_gmi_tiny_integer_coefficient_is_kept();
     test_cut_retraction_round_trip();

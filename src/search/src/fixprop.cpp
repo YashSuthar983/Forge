@@ -1,3 +1,4 @@
+#include "forge/search/domain_writer.hpp"
 // Fix-Propagate-Repair - see forge/search/fixprop.hpp for why this exists and
 // what it is implementing (Salvagnin, MPC 2024).
 
@@ -317,14 +318,12 @@ bool Dive::tighten_row(Index i) {
         if (new_lo > l + 1e-12 || new_hi < h - 1e-12) {
             const f64 old_l = l, old_h = h;
             if (new_lo > l + 1e-12) {
-                trail_.push(j, BoundDir::Lower, new_lo, l, ReasonKind::Row, i,
-                            cur_depth_);
-                lo_[sz(j)] = new_lo;
+                write_domain_bound(lo_, hi_, j, BoundDir::Lower, new_lo, &trail_,
+                                   {ReasonKind::Row, i, cur_depth_});
             }
             if (new_hi < h - 1e-12) {
-                trail_.push(j, BoundDir::Upper, new_hi, h, ReasonKind::Row, i,
-                            cur_depth_);
-                hi_[sz(j)] = new_hi;
+                write_domain_bound(lo_, hi_, j, BoundDir::Upper, new_hi, &trail_,
+                                   {ReasonKind::Row, i, cur_depth_});
             }
             bump_activities(j, old_l, old_h);
             if (aborted_) return false;

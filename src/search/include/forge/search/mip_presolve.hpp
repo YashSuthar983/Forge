@@ -10,6 +10,8 @@
 // implications (paper §2.3 inconsistency).
 #pragma once
 
+#include "forge/core/cancel.hpp"
+
 #include "forge/core/result.hpp"
 #include "forge/engines/simplex.hpp"
 #include "forge/model/lp.hpp"
@@ -27,6 +29,7 @@ using core::f64;
 using core::Index;
 
 struct MipPresolveOptions {
+    const core::CancelToken* cancel = nullptr;
     bool enabled = true;
     // Classic dual fixing + lock recount after FBBT on each probe side
     // (Wang-Chen-Dai Algorithm 1 spirit). Wired into build_conflict_graph via
@@ -101,6 +104,9 @@ struct CliqueProbeDiagnostics {
 };
 
 struct ObbtDiagnostics {
+    // Certified auxiliary-LP aggregates, retained for node propagation.
+    // Unlike scalar OBBT endpoints, these react to later domain changes.
+    std::vector<RetiredRow> relations;
     std::uint64_t vars_tried = 0;
     std::uint64_t lp_solves = 0;
     std::uint64_t lp_tightenings = 0;
@@ -151,7 +157,8 @@ DualFixDiagnostics apply_dual_fixing(const model::LpProblem& lp,
                                       int max_rounds = 4,
                                       bool zero_cost_ok = true,
                                      double time_limit_s = 0.0,
-                                     const std::vector<Index>* candidate_cols = nullptr);
+                                     const std::vector<Index>* candidate_cols = nullptr,
+                                     const core::CancelToken* cancel = nullptr);
 
 // Clique probing over `cg.cliques()`: for each AMO clique, propagate the
 // all-zero assignment and each single-1 assignment; take the hull of feasible

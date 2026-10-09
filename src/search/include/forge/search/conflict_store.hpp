@@ -25,7 +25,9 @@
 #pragma once
 
 #include "forge/core/result.hpp"
+#include "forge/core/cancel.hpp"
 #include "forge/model/lp.hpp"
+#include "forge/search/prop_trail.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -56,15 +58,6 @@ inline bool clause_retained(ClauseResult r) {
     return r == ClauseResult::Inserted || r == ClauseResult::Unit ||
            r == ClauseResult::AlreadyPresent;
 }
-
-struct ConflictLiteral {
-    Index var = -1;
-    bool upper = false;   // true: x_var <= bound; false: x_var >= bound
-    f64 bound = 0.0;      // integral
-    bool operator==(const ConflictLiteral& o) const {
-        return var == o.var && upper == o.upper && bound == o.bound;
-    }
-};
 
 struct ConflictStoreStats {
     std::uint64_t added = 0;
@@ -108,7 +101,9 @@ public:
     bool propagate(std::vector<f64>& lo, std::vector<f64>& hi,
                    const std::vector<f64>& root_lo, const std::vector<f64>& root_hi,
                    bool* converged = nullptr, PropTrail* trail = nullptr,
-                   int depth = 0, Index* conflict_var = nullptr);
+                   int depth = 0, Index* conflict_var = nullptr,
+                   ConflictAntecedents* conflict = nullptr,
+                   const core::CancelToken* cancel = nullptr);
 
     // The same propagation started from the columns in `seeds` alone (those
     // whose bounds moved since the box was last at a fixpoint of the store,
@@ -118,7 +113,8 @@ public:
     bool propagate_from(std::vector<f64>& lo, std::vector<f64>& hi,
                         const std::vector<Index>& seeds, bool* converged = nullptr,
                         PropTrail* trail = nullptr, int depth = 0,
-                        Index* conflict_var = nullptr);
+                        Index* conflict_var = nullptr, ConflictAntecedents* conflict = nullptr,
+                        const core::CancelToken* cancel = nullptr);
 
     // The literals of the live clause with stable id `id` (a Clause reason),
     // or nullptr once it has been evicted.
@@ -136,7 +132,8 @@ public:
 
 private:
     struct Clause {
-        std::vector<ConflictLiteral> lits;
+        std::shared_ptr<const std::vector<ConflictLiteral>> data;
+        const std::vector<ConflictLiteral>& lits() const { return *data; }
         std::uint64_t hash = 0;
         std::uint64_t activity = 0;   // times it forced a bound or conflicted
         std::uint64_t born = 0;
@@ -150,7 +147,8 @@ private:
     void index_clause(std::size_t c);
     void finish_scan(const std::vector<Index>& queue, std::size_t head);
     bool run_queue(std::vector<f64>& lo, std::vector<f64>& hi, bool* converged,
-                   PropTrail* trail, int depth, Index* conflict_var);
+                   PropTrail* trail, int depth, Index* conflict_var,
+                   ConflictAntecedents* conflict, const core::CancelToken* cancel);
 
     Index n_ = 0;
     std::size_t budget_ = 0;
@@ -207,7 +205,8 @@ std::vector<ConflictLiteral> explain_conflict_clause(
     const std::vector<char>& is_int, const std::vector<f64>& root_lo,
     const std::vector<f64>& root_hi, const std::vector<f64>& cur_lo,
     const std::vector<f64>& cur_hi, Index conflict_var, bool first_uip = false,
-    const ConflictStore* store = nullptr, const ReasonStore* reasons = nullptr);
+    const ConflictStore* store = nullptr, const ReasonStore* reasons = nullptr,
+    const std::vector<BoundRef>* conflict = nullptr);
 
 // Explanation of an LP-infeasible node from its Farkas ray. `lp` is the node's
 // LP (its columns' bounds ARE the node box); the ray is checked by

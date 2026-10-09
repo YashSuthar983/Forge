@@ -31,6 +31,8 @@
 // relaxation itself is allowed to get strictly tighter.
 #pragma once
 
+#include "forge/core/cancel.hpp"
+
 #include "forge/core/result.hpp"
 #include "forge/model/lp.hpp"
 #include "forge/search/cuts.hpp"
@@ -86,6 +88,7 @@ struct ImpliedBound {
 };
 
 struct ProbingOptions {
+    const core::CancelToken* cancel = nullptr;
     bool enabled = true;
     // Wang-Chen-Dai dual-fix-in-probing combo (WP-F / mip_presolve.hpp):
     // after FBBT on each probe side, re-count locks on non-redundant rows and

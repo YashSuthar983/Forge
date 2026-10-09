@@ -9,9 +9,13 @@
 // and less degenerate).
 #pragma once
 
+#include "forge/search/domain_writer.hpp"
+#include "forge/core/cancel.hpp"
+
 #include "forge/core/result.hpp"
 #include "forge/model/lp.hpp"
 #include "forge/search/prop_trail.hpp"
+#include "forge/search/domain_checkpoint.hpp"
 
 #include <cstdint>
 #include <utility>
@@ -22,6 +26,7 @@ namespace forge::search {
 
 using core::f64;
 using core::Index;
+using core::Offset;
 
 struct PropagateResult {
     bool feasible = true;      // false: some variable's [lo,hi] went empty
@@ -29,6 +34,8 @@ struct PropagateResult {
     int rounds = 0;
     Index conflict_var = -1;
     Index conflict_row = -1;
+    bool converged = true;
+    ConflictAntecedents conflict_antecedents;
 };
 
 // Tightens col_lo/col_hi IN PLACE (both size lp.n_cols()) using lp's rows and
@@ -45,7 +52,8 @@ PropagateResult propagate_bounds(const model::LpProblem& lp,
                                  std::vector<f64>& col_lo,
                                  std::vector<f64>& col_hi,
                                  f64 tol = 1e-9,
-                                 int max_rounds = 10);
+                                 int max_rounds = 10,
+                                 const core::CancelToken* cancel = nullptr);
 
 // Same as propagate_bounds; when `trail` is non-null, records reasons: Row for
 // rows below n_global_rows (all rows when negative), Cut with the position in
@@ -57,7 +65,8 @@ PropagateResult propagate_bounds_trail(const model::LpProblem& lp,
                                        int depth,
                                        f64 tol = 1e-9,
                                        int max_rounds = 10,
-                                       Index n_global_rows = -1);
+                                       Index n_global_rows = -1,
+                                       const core::CancelToken* cancel = nullptr);
 
 // Objective-cutoff propagation: the objective as one more (virtual) row.
 // Every point worth keeping satisfies  sense*(c'x) <= rhs  (rhs is the
@@ -89,7 +98,9 @@ PropagateResult propagate_objective_cutoff(const model::LpProblem& lp,
                                            std::vector<f64>& col_hi,
                                            f64 tol,
                                            std::vector<Index>* changed,
-                                           const ObjectiveCliques* amo = nullptr);
+                                           const ObjectiveCliques* amo = nullptr,
+                                           PropTrail* trail = nullptr,
+                                           DomainReason reason = {});
 
 // Column -> rows incidence for event-driven propagation (built once per
 // matrix revision).
@@ -126,7 +137,8 @@ PropagateResult propagate_bounds_events(const model::LpProblem& lp,
                                         PropagationScratch& scratch,
                                         PropTrail* trail, int depth,
                                         f64 tol,
-                                        std::uint64_t max_row_visits);
+                                        std::uint64_t max_row_visits,
+                                        const core::CancelToken* cancel = nullptr);
 
 // Row activities of one model over a box, kept current under bound changes
 // instead of being re-summed on every row visit (audit rank 3).
@@ -153,11 +165,18 @@ public:
     // Over `lp`'s rows and the box [lo, hi].
     void build(const model::LpProblem& lp, const std::vector<f64>& lo,
                const std::vector<f64>& hi);
+    // Preserve activities for exact retained rows across append/purge edits.
+    // Matrix identity is checked against pinned incidence and owned values;
+    // an unrelated matrix returns false without changing the cache.
+    bool remap(const model::LpProblem& lp, const std::vector<Index>& old_row);
     bool built() const noexcept { return n_rows_ >= 0; }
     Index n_rows() const noexcept { return n_rows_; }
     Index n_cols() const noexcept { return n_cols_; }
     // Brings the cache to the box [lo, hi] (columns that differ are updated).
     void sync(const std::vector<f64>& lo, const std::vector<f64>& hi);
+    // Compare immutable page identities, then only changed pages and the
+    // columns the cache itself moved since its last anchor. Includes widening.
+    void sync_checkpoint(const DomainCheckpoint& box);
     // Column j's bounds are now [lo, hi].
     void set_bounds(Index j, f64 lo, f64 hi);
     // set_bounds for the listed columns only (a caller that knows what moved).
@@ -191,7 +210,13 @@ private:
     std::vector<core::Offset> col_ptr_;
     std::vector<Index> col_row_;
     std::vector<f64> col_val_;
+    sparse::SparsePattern pattern_;
+    std::vector<core::Offset> entry_slot_;
     std::vector<f64> lo_, hi_;
+    DomainCheckpoint checkpoint_anchor_;
+    bool checkpoint_known_ = false;
+    std::vector<Index> checkpoint_dirty_;
+    std::vector<char> checkpoint_dirty_mark_;
     std::vector<Side> min_, max_;
     std::vector<f64> range_ub_;
     std::uint64_t rebuilds_ = 0;
@@ -205,6 +230,8 @@ struct LocalRowView {
     const std::vector<Index>* cols = nullptr;
     const std::vector<f64>* vals = nullptr;
     f64 lo = -model::kInf, hi = model::kInf;
+    ReasonKind reason = ReasonKind::Cut;
+    Index reason_id = -1;   // default: position in this local block
 };
 
 // propagate_bounds_events over `lp`'s rows -- the model `cache` describes,
@@ -226,6 +253,7 @@ PropagateResult propagate_bounds_cached(const model::LpProblem& lp,
                                         PropagationScratch& scratch,
                                         PropTrail* trail, int depth, f64 tol,
                                         std::uint64_t max_row_visits,
-                                        bool sync_box = true);
+                                        bool sync_box = true,
+                                        const core::CancelToken* cancel = nullptr);
 
 }  // namespace forge::search

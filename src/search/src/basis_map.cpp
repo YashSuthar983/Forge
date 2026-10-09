@@ -1,6 +1,7 @@
 #include "forge/search/basis_map.hpp"
 
 #include "forge/la/lu.hpp"
+#include "forge/search/milp_presolve.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -10,6 +11,79 @@ namespace forge::search {
 using core::f64;
 using core::Index;
 using engines::NonbasicStatus;
+
+std::optional<engines::SimplexBasis> map_basis_through_presolve(
+    const engines::SimplexBasis& parent, const MilpPresolveResult& pre) {
+    const auto sz = [](Index v) { return static_cast<std::size_t>(v); };
+    const Index old_n = static_cast<Index>(pre.reduced_col.size());
+    const Index old_m = static_cast<Index>(pre.reduced_row.size());
+    const auto& lp = pre.reduced;
+    const Index n = lp.n_cols(), m = lp.n_rows();
+    if (parent.n_struct != old_n || parent.status.size() != sz(old_n + old_m) ||
+        parent.basic.size() != sz(old_m)) return std::nullopt;
+
+    // Binary substitution and column sums have a surviving representative.
+    // An equality elimination has no single-column image; its other images
+    // and surviving logicals recover rank on the transformed matrix.
+    std::vector<Index> image = pre.reduced_col;
+    for (auto it = pre.journal.rbegin(); it != pre.journal.rend(); ++it) {
+        if (it->kind == PostsolveKind::Binary) {
+            const auto& s = pre.binary_substitution_steps.at(it->index);
+            image.at(sz(s.first)) = image.at(sz(s.second));
+        } else if (it->kind == PostsolveKind::Merge) {
+            const auto& s = pre.column_merges.at(it->index);
+            for (const Index j : s.members) image.at(sz(j)) = image.at(sz(s.members.front()));
+        }
+    }
+    engines::SimplexBasis out;
+    out.n_struct = n;
+    out.status.resize(sz(n + m));
+    for (Index v = 0; v < n + m; ++v) {
+        const f64 lo = v < n ? lp.col_lo[sz(v)] : lp.row_lo[sz(v - n)];
+        const f64 hi = v < n ? lp.col_hi[sz(v)] : lp.row_hi[sz(v - n)];
+        out.status[sz(v)] = std::isfinite(lo) ? NonbasicStatus::AtLower
+            : std::isfinite(hi) ? NonbasicStatus::AtUpper : NonbasicStatus::AtZeroFree;
+    }
+    std::vector<char> seen(sz(n + m), 0);
+    const auto add = [&](Index v) {
+        if (v >= 0 && v < n + m && !seen[sz(v)]) {
+            seen[sz(v)] = 1;
+            out.basic.push_back(v);
+        }
+    };
+    for (const Index v : parent.basic) {
+        if (v < 0 || v >= old_n + old_m) return std::nullopt;
+        if (v < old_n) add(image[sz(v)]);
+        else {
+            const Index r = pre.reduced_row[sz(v - old_n)];
+            if (r >= 0) add(n + r);
+        }
+    }
+    for (Index j = 0; j < old_n; ++j) {
+        const Index k = pre.reduced_col[sz(j)];
+        if (k < 0) continue;
+        const auto s = parent.status[sz(j)];
+        if ((s == NonbasicStatus::AtLower && std::isfinite(lp.col_lo[sz(k)])) ||
+            (s == NonbasicStatus::AtUpper && std::isfinite(lp.col_hi[sz(k)])) ||
+            (s == NonbasicStatus::AtZeroFree && !std::isfinite(lp.col_lo[sz(k)]) &&
+             !std::isfinite(lp.col_hi[sz(k)]))) out.status[sz(k)] = s;
+    }
+    // Every row logical is available for completion. Select rank only once,
+    // including when the number of parent images happens to equal m: equal
+    // counts say nothing about rank after aggregation or coefficient edits.
+    for (Index r = 0; r < m; ++r) add(n + r);
+    std::vector<Index> leaving, vacant;
+    basis_rank_selection(lp, m, out.basic, leaving, vacant);
+    std::vector<char> drop(out.basic.size(), 0);
+    for (const Index q : leaving) drop.at(sz(q)) = 1;
+    std::vector<Index> kept;
+    for (std::size_t q = 0; q < out.basic.size(); ++q)
+        if (!drop[q]) kept.push_back(out.basic[q]);
+    if (kept.size() != sz(m)) return std::nullopt;
+    out.basic = std::move(kept);
+    for (const Index v : out.basic) out.status[sz(v)] = NonbasicStatus::Basic;
+    return out;
+}
 
 std::optional<engines::SimplexBasis> map_basis_to_child(
     const engines::SimplexBasis& parent, Index n, Index parent_rows, Index base_rows,

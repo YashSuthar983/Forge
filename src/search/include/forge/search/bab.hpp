@@ -10,6 +10,7 @@
 #include "forge/core/result.hpp"
 #include "forge/engines/simplex.hpp"
 #include "forge/model/lp.hpp"
+#include "forge/model/dyadic.hpp"
 #include "forge/search/milp_presolve.hpp"
 #include "forge/search/conflict.hpp"
 #include "forge/search/conflict_store.hpp"
@@ -599,8 +600,8 @@ struct BabOptions {
     // MILP root entry before B&C.
     bool mip_presolve = true;
     MipPresolveOptions mip_pre;
-    // WP-G: color-refinement orbits + AMO orbital fixing + Reflection-complete
-    // + Folding-complete (disable via sym.reflection / sym.folding).
+    // WP-G: color-refinement orbits + AMO orbital fixing + Verified reflection
+    // + Exact folding (disable via sym.reflection / sym.folding).
     bool symmetry = true;
     // Verified block symmetry with orbitopal fixing (orbitope.hpp).
     OrbitopeOptions orbitope;
@@ -645,9 +646,9 @@ struct BabOptions {
     int face_vertex_count = 3;
     // Lifted knapsack cover cuts, separated from the LP point in every cut
     // round (forge/search/covers.hpp). Distinct from the blind, unlifted
-    // add_binary_cover_cuts() pass that still runs once before the tree: this
-    // one looks at the relaxation, accepts mixed-sign rows by complementing,
-    // and lifts.
+    // add_binary_cover_cuts() pass that runs once before the tree when
+    // cuts_enabled is set: this one looks at the relaxation, accepts
+    // mixed-sign rows by complementing, and lifts.
     // MEASURED OFF by default, and this is the whole story for the cut work.
     //
     // On instances that PROVE, the new families are a large win: on
@@ -1107,6 +1108,8 @@ struct BabDiagnostics {
     std::uint64_t mir_deep_rounds = 0;   // root rounds that used deep MIR aggregation
     std::uint64_t node_lp_deferred = 0;   // nodes set aside after an unusable LP
     std::uint64_t node_lp_retries = 0;    // ... put back for a second try
+    std::uint64_t conditional_contexts = 0;
+    std::uint64_t conditional_cache_hits = 0;
     std::uint64_t component_count = 0;        // components with rows
     std::uint64_t component_isolated = 0;     // columns in no row, fixed directly
     std::uint64_t components_solved = 0;      // sub-MILPs run to a proved optimum
@@ -1314,6 +1317,11 @@ struct BabDiagnostics {
     std::uint64_t farkas_probe_clauses = 0;    // subset explained at strong-branch directions
     std::uint64_t farkas_literals = 0;         // ...with this many literals in total
     std::uint64_t farkas_relaxed_bounds = 0;   // tightened bounds relaxed back to the root
+    // Global learning from a node LP that also carries scoped rows: the ray
+    // was silent on every local row, so the certificate projects onto the
+    // global subsystem. Nonzero local multipliers remain a hard refusal.
+    std::uint64_t farkas_projected = 0;
+    std::uint64_t farkas_local_blocked = 0;
     std::uint64_t session_cache_hits = 0;        // prepared LP reused from the bounded cache (matrix only)
     std::uint64_t session_cache_evictions = 0;
     std::uint64_t session_key_collisions = 0;    // hash equal, row sets different
@@ -1367,6 +1375,8 @@ struct BabDiagnostics {
     std::uint64_t tree_row_purges = 0;
     std::uint64_t tree_rows_purged = 0;
     std::uint64_t tree_row_bases_remapped = 0;   // stored warm starts carried across a purge
+    std::uint64_t tree_row_remap_no_basis = 0;   // stored nodes with no warm start at purge
+    std::uint64_t tree_row_remap_rejected = 0;   // warm starts dropped as layout-incompatible
     std::uint64_t tree_row_bases_deferred = 0;   // of those, left with surplus basics (a binding row left)
     std::uint64_t tree_row_bases_fitted = 0;     // warm starts fitted by LU when their node was solved
     std::uint64_t tree_row_bases_fit_repaired = 0;  // of those, completed with logicals (numerically singular)
@@ -1386,6 +1396,7 @@ struct BabDiagnostics {
     std::uint64_t mixing_families = 0, mixing_cut_candidates = 0;
     // Rapid learning: whether it ran, its search, and what it filed.
     bool rapid_learning_ran = false, rapid_learning_infeasible = false, rapid_learning_leaf = false;
+    bool rapid_learning_interrupted = false;
     std::uint64_t rapid_learning_conflicts = 0, rapid_learning_decisions = 0;
     std::uint64_t rapid_learning_learned = 0, rapid_learning_units = 0;
     std::uint64_t rapid_learning_fixings = 0, rapid_learning_restarts = 0;
@@ -1427,6 +1438,15 @@ struct BabDiagnostics {
     SymmetryDiagnostics symmetry_diag;
     OrbitopeDiagnostics orbitope_diag;
     std::uint64_t orbitopal_fixings = 0;   // node bounds the lexicographic rule fixed
+    // AMO orbital fixing from retained root permutation orbits (dynamic
+    // node stabilizers for clique orbits): binaries fixed to 0 when an
+    // orbit mate is fixed to 1.
+    std::uint64_t orbital_fixings = 0;
+    std::uint64_t dual_cutoff_certs = 0;
+    std::uint64_t dual_cutoff_tightenings = 0;
+    std::uint64_t dual_cutoff_empties = 0;
+    std::uint64_t cut_pool_released = 0;
+    std::uint64_t cut_pool_reactivated = 0;
     std::uint64_t orbitope_prunes = 0;     // nodes it emptied
     bool mip_restart_recommended = false;
     std::uint64_t clique_cut_candidates = 0;
@@ -1541,6 +1561,26 @@ struct MilpCapability {
 };
 const std::vector<MilpCapability>& milp_capability_inventory();
 
+// An owning, cooperatively scheduled native MILP search. A slice preserves
+// the complete tree and solver services, and reports the covering frontier
+// bound. Suspension occurs only between node transactions after root setup.
+// The session stays on its creating thread; external option callbacks/tokens
+// must outlive it. Its initial point and model are copied into owned storage.
+class MilpSearchSession {
+public:
+    MilpSearchSession(const model::LpProblem&, const BabOptions&);
+    ~MilpSearchSession();
+    MilpSearchSession(const MilpSearchSession&) = delete;
+    MilpSearchSession& operator=(const MilpSearchSession&) = delete;
+    core::RawResult advance(double time_allowance_s = core::kPosInf,
+        std::uint64_t node_allowance = std::numeric_limits<std::uint64_t>::max());
+    bool finished() const;
+    const BabDiagnostics& diagnostics() const;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 core::RawResult solve_milp(const model::LpProblem& problem,
                            const BabOptions& opts,
                            BabDiagnostics& diag);
@@ -1587,6 +1627,7 @@ struct BoundCertificate {
         LpOptimal,    // min(primal, dual) of an LP that passed every check
         Lagrangian,   // safe Lagrangian of an unproved LP's multipliers
         Frontier,     // min over the open frontier (tree restart)
+        IntegerOracle, // complete exact finite-domain state coverage
     };
     enum class Scope : std::uint8_t {
         Subtree = 0,  // valid for one node's box (and its local rows)
@@ -1706,24 +1747,39 @@ inline f64 cut_round_progress(f64 bound_before, f64 bound_now, f64 incumbent_min
 // exceeded g the cutoff rose above the incumbent itself.
 inline f64 node_cutoff(f64 inc_min, f64 g, f64 offset_min,
                        f64 gap_tol, f64 abs_gap_tol) {
-    f64 c = inc_min - std::max(abs_gap_tol, gap_tol * std::fabs(inc_min));
-    if (g > 0.0 && std::isfinite(inc_min)) {
-        const f64 t = (inc_min - offset_min) / g;
-        const f64 kr = std::round(t);
-        const f64 k = (std::fabs(t - kr) <= 1e-6) ? kr - 1.0 : std::floor(t);
+    if (!std::isfinite(inc_min)) return inc_min;
+    model::DyadicSum threshold;
+    threshold.add(inc_min);
+    threshold.add(-std::max(abs_gap_tol, gap_tol * std::fabs(inc_min)));
+    f64 c = threshold.up();
+    if (g > 0.0 && std::isfinite(g) && std::isfinite(offset_min)) {
+        model::DyadicSum difference;
+        difference.add(inc_min); difference.add(-offset_min);
+        const f64 q = difference.quotient_down(g);
+        // Consecutive integer indices must be representable. An unresolvable
+        // lattice index supplies no additional prune beyond the gap rule.
+        if (!(std::fabs(q) < 0x1p52)) return c;
+        f64 k = std::floor(q);
+        auto remainder = difference; remainder.add_product(-k, g);
+        if (remainder.sign() == 0) k -= 1;
+        // The predecessor is exact. Treating a near-integer quotient as an
+        // integer skipped a genuinely improving lattice point below inc_min.
         // The margin: a tolerance on the offset-free value plus the round-
         // off of values that carry the constant. 1e-6 * |inc| made a large
         // objective constant (1e7: a margin of 10 against g = 1) switch the
         // rule off, so adding a constant changed the search.
-        c = std::min(c, offset_min + k * g +
-                           1e-6 * std::max(1.0, std::fabs(inc_min - offset_min)) +
-                           8.0 * std::numeric_limits<f64>::epsilon() *
-                               (std::fabs(inc_min) + std::fabs(offset_min)));
+        model::DyadicSum lattice;
+        lattice.add(offset_min); lattice.add_product(k, g);
+        lattice.add(1e-6 * std::max(1.0, std::fabs(inc_min - offset_min)));
+        lattice.add(8.0 * std::numeric_limits<f64>::epsilon() *
+                    (std::fabs(inc_min) + std::fabs(offset_min)));
+        c = std::min(c, lattice.up());
     }
     return c;
 }
 
 struct CertifiedRcStats {
+    core::f64 cutoff_min = core::kNaN;
     std::uint64_t checked = 0, tightened = 0, fixed = 0;
     double ms = 0.0;
 };

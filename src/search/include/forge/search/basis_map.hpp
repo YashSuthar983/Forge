@@ -26,6 +26,13 @@
 
 namespace forge::search {
 
+struct MilpPresolveResult;
+// Transfer candidate basis columns through the transformation journal and
+// select independent images on the actual reduced matrix. No parent factor
+// or point is reused after a structural transformation.
+std::optional<engines::SimplexBasis> map_basis_through_presolve(
+    const engines::SimplexBasis& parent, const MilpPresolveResult& pre);
+
 std::optional<engines::SimplexBasis> map_basis_to_child(
     const engines::SimplexBasis& parent, core::Index n_struct, core::Index parent_rows,
     core::Index base_rows, core::Index fresh_rows,

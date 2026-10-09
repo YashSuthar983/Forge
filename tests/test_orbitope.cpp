@@ -114,6 +114,8 @@ void test_optimum_survives() {
         bool ok = true;
         for (int on = 0; on < 2; ++on) {
             BabOptions o;
+            o.structural_presolve.binary_row_max_work = 0;  // Exercise symmetry in the tree.
+            o.component_solve = false;  // Keep the orbitopal tree in its original column space.
             o.para_bab.threads = 1;
             o.gap_tol = o.abs_gap_tol = 1e-9;
             o.orbitope.enabled = on == 1;
