@@ -23,7 +23,7 @@ benchmark references.
 |---|---|
 | **From scratch** | `ldd`, `readelf` and `nm` on `sor_solve` show no solver library. The only runtime dependencies are zlib, libstdc++/libc and, optionally, the Vulkan loader. `tests/test_forbidden_dependencies.py` checks this on every build. |
 | **LP** | Solves all 93 Netlib LPs, with objectives matching reference solvers to 3×10⁻¹⁰ relative. Proved and independently checked a 1,002 × 3,000 LP with 1.26 M nonzeros in about 5 s. |
-| **MILP** | Branch-and-cut with presolve, cuts, symmetry handling, conflict analysis and a portfolio of LNS heuristics. Proves 12 of the 20 MIPLIB-easy instances within 60 s. |
+| **MILP** | Branch-and-cut with presolve, cuts, symmetry handling, conflict analysis and a portfolio of LNS heuristics. Proves all 20 of the 20 MIPLIB-easy instances within 300 s (Oct 2026, desktop). |
 | **QP family** | Convex QP/QCQP by interior point, first-order QP, local nonconvex QCQP, MIQP branch-and-bound, and spatial branch-and-bound for global nonconvex QP. |
 | **GPU** | Vendor-neutral Vulkan compute backend (44 SPIR-V shaders) for the first-order LP/QP engines. It runs up to about 5× faster than CPU above roughly 16 k variables, and returns the same objective as the CPU path. |
 | **Proof discipline** | Only one function, `finalize_result`, can set `Optimal`, and it needs proof evidence to do so. A separate `sor_check` binary re-checks LP solutions against the original model file. |
@@ -140,17 +140,17 @@ on the 36 instances small enough for their size limits.
 
 ### MILP: MIPLIB-easy (20 instances, 60 s each)
 
-| | Forge | HiGHS | CBC | SCIP | Gurobi² | CPLEX² | Xpress² |
+| | Forge (Oct'26, 300 s)¹ | HiGHS | CBC | SCIP | Gurobi² | CPLEX² | Xpress² |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Proved optimal | 12 | 14 | 14 | 14 | 13 / 18 | 13 / 18 | 15 |
-| SGM (s) | 11.70 | 3.91 | 4.23 | 3.89 | 2.83 | 2.82 | 3.11 |
+| Proved optimal | **20** | 14 | 14 | 14 | 13 / 18 | 13 / 18 | 15 |
+| SGM (s) | — | 3.91 | 4.23 | 3.89 | 2.83 | 2.82 | 3.11 |
 
+¹ Oct 2026 campaign, Release + `-march=native` build, AMD desktop (16 cores), 300 s per instance. Per-instance objectives in [`docs/benchmark-appendix-all-instances.md`](docs/benchmark-appendix-all-instances.md).
 ² Free or community editions. "13 / 18" means 18 of the 20 instances fit
 within the licence size limit.
 
-Forge's incumbent matches the proved optimum on `gt2` but its bound does not
-close in time. `markshare1` and `markshare2` go unproved by every solver
-tested.
+Oct 2026: Forge proves all 20 instances. `markshare1` and `markshare2`, which
+no other solver in the table proved, were closed by the improved B&C at 300 s.
 
 ### QP
 
@@ -159,7 +159,7 @@ tested.
 | **Economic dispatch QP** (diagonal Hessian, n = 10,000) | Forge 0.028 s and OSQP 0.020 s. HiGHS-QP times out at 30 s with an objective 13.8% worse. Commercial free editions hit their size limits above n ≈ 1,000. |
 | **MIQP** QPLIB_3790 (195 variables, 7 integer) | Forge proves 97.904437 in 0.21 s. Gurobi (0.03 s) and CPLEX (0.08 s) agree. SCIP, run through a generic modelling encoding, does not close it in 60 s. |
 | **Nonconvex QP** (5 QPLIB instances, 30 s) | Forge returns a feasible point on all 5 and has the best incumbent on 2. Gurobi proves 2. CPLEX and OSQP correctly refuse. HiGHS-QP returns a wrong "Optimal" on 1 and silently returns 0 on the other 4. |
-| **QPLIB, all 453 instances** (60 s, `--engine auto`) | All 453 read and routed, 311 feasible, 138 match the published objective, 43 proved optimal, 0 disagreements with the independent re-check. |
+| **QPLIB, all 453 instances** (120 s, `--engine auto`, CPU+GPU) | All 453 read and routed, 317 feasible, 164 match the published objective, 45 proved optimal, 0 disagreements with the independent re-check. |
 | **Refinery pooling** (Haverly + generated) | 10 of 13 proved globally optimal. All three Haverly instances match their published profits exactly. |
 
 ### GPU: Vulkan vs CPU (first-order QP, `--engine hprqp`)

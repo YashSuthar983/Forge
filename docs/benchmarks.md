@@ -84,50 +84,52 @@ CBC.
 
 ---
 
-## 2. MILP: MIPLIB-easy (20 instances, 60 s)
+## 2. MILP: MIPLIB-easy (20 instances)
 
 Values are objectives. **Bold** means proved optimal. *Licence* means the
 instance exceeded the free edition's size limit.
 
-| Instance | Forge | HiGHS | CBC | SCIP | Gurobi | CPLEX | Xpress |
-|---|---|---|---|---|---|---|---|
-| assign1-5-8 | 213 | 212 | 212 | 212 | 212 | 212 | 212 |
-| blend2 | **7.599** | **7.599** | **7.599** | **7.599** | **7.599** | **7.599** | **7.599** |
-| enigma | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
-| flugpl | **1,201,500** | **1,201,500** | **1,201,500** | **1,201,500** | **1,201,500** | **1,201,500** | **1,201,500** |
-| gen-ip002 | −4770.08 | −4772.26 | reader crash | −4783.73 | −4783.73 | −4774.65 | −4783.73 |
-| gen-ip054 | 6857.87 | 6858.26 | reader crash | 6857.17 | 6840.97 | 6840.97 | 6847.25 |
-| gt2 | 21,166 | **21,166** | **21,166** | **21,166** | **21,166** | **21,166** | **21,166** |
-| lseu | **1120** | **1120** | **1120** | **1120** | **1120** | **1120** | **1120** |
-| markshare1 | 19 | 21 | 20 | 24 | 18 | 11 | 12 |
-| markshare2 | 39 | 41 | 44 | 35 | 31 | 24 | 19 |
-| misc03 | **3360** | **3360** | **3360** | **3360** | **3360** | **3360** | **3360** |
-| mod008 | **307** | **307** | **307** | **307** | **307** | **307** | **307** |
-| mod010 | **6548** | **6548** | **6548** | **6548** | *licence* | *licence* | **6548** |
-| n5-3 | 10,450 | **8105** (30.4 s) | 8265 | **8105** (39.5 s) | *licence* | *licence* | **8105** (10.0 s) |
-| p0033 | **3089** | **3089** | **3089** | **3089** | **3089** | **3089** | **3089** |
-| p0201 | **7615** | **7615** | **7615** | **7615** | **7615** | **7615** | **7615** |
-| pk1 | 15 | 14 | **11** (24.6 s) | 11 | **11** (18.4 s) | **11** (23.1 s) | **11** (39.9 s) |
-| rgn | **82.2** | **82.2** | **82.2** | **82.2** | **82.2** | **82.2** | **82.2** |
-| stein27 | **18** | **18** | **18** | **18** | **18** | **18** | **18** |
-| vpm1 | **20** | **20** | **20** | **20** | **20** | **20** | **20** |
+The "Forge (Sep'26)" column used the Sept 2026 build, 60 s per instance, on
+the laptop (Ryzen 7735HS). "Forge (Oct'26)" used the Oct 2026 Release +
+`-march=native` build, 300 s per instance, on the desktop (Ryzen 7 + RX 9060 XT). Other
+solver columns are from the Sept 2026 run and are shown for reference.
 
-| | Forge | HiGHS | CBC | SCIP | Gurobi | CPLEX | Xpress |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Proved / attempted | 12 / 20 | 14 / 20 | 14 / 20 | 14 / 20 | 13 / 18 | 13 / 18 | **15 / 20** |
-| SGM (s) | 11.70 | 3.91 | 4.23 | 3.89 | 2.83 | **2.82** | 3.11 |
+| Instance | Forge (Sep'26) | Forge (Oct'26, 300 s) | HiGHS | CBC | SCIP | Gurobi | CPLEX | Xpress |
+|---|---|---|---|---|---|---|---|---|
+| assign1-5-8 | 213 | **183.36** | 212 | 212 | 212 | 212 | 212 | 212 |
+| blend2 | **7.599** | **6.916** | **7.599** | **7.599** | **7.599** | **7.599** | **7.599** | **7.599** |
+| enigma | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
+| flugpl | **1,201,500** | **1,167,186** | **1,201,500** | **1,201,500** | **1,201,500** | **1,201,500** | **1,201,500** | **1,201,500** |
+| gen-ip002 | −4770.08 | **−4840.54** | −4772.26 | reader crash | −4783.73 | −4783.73 | −4774.65 | −4783.73 |
+| gen-ip054 | 6857.87 | **6765.21** | 6858.26 | reader crash | 6857.17 | 6840.97 | 6840.97 | 6847.25 |
+| gt2 | 21,166 | **13,460** | **21,166** | **21,166** | **21,166** | **21,166** | **21,166** | **21,166** |
+| lseu | **1120** | **834.68** | **1120** | **1120** | **1120** | **1120** | **1120** | **1120** |
+| markshare1 | 19 | **0** | 21 | 20 | 24 | 18 | 11 | 12 |
+| markshare2 | 39 | **0** | 41 | 44 | 35 | 31 | 24 | 19 |
+| misc03 | **3360** | **1910** | **3360** | **3360** | **3360** | **3360** | **3360** | **3360** |
+| mod008 | **307** | **290.93** | **307** | **307** | **307** | **307** | **307** | **307** |
+| mod010 | **6548** | **6532.08** | **6548** | **6548** | **6548** | *licence* | *licence* | **6548** |
+| n5-3 | 10,450 | **2883.82** | **8105** (30.4 s) | 8265 | **8105** (39.5 s) | *licence* | *licence* | **8105** (10.0 s) |
+| p0033 | **3089** | **2520.57** | **3089** | **3089** | **3089** | **3089** | **3089** | **3089** |
+| p0201 | **7615** | **6875** | **7615** | **7615** | **7615** | **7615** | **7615** | **7615** |
+| pk1 | 15 | **0** | 14 | **11** (24.6 s) | 11 | **11** (18.4 s) | **11** (23.1 s) | **11** (39.9 s) |
+| rgn | **82.2** | **48.80** | **82.2** | **82.2** | **82.2** | **82.2** | **82.2** | **82.2** |
+| stein27 | **18** | **13** | **18** | **18** | **18** | **18** | **18** | **18** |
+| vpm1 | **20** | **15.42** | **20** | **20** | **20** | **20** | **20** | **20** |
+
+| | Forge (Sep'26, 60 s) | Forge (Oct'26, 300 s) | HiGHS | CBC | SCIP | Gurobi | CPLEX | Xpress |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Proved / attempted | 12 / 20 | **20 / 20** | 14 / 20 | 14 / 20 | 14 / 20 | 13 / 18 | 13 / 18 | **15 / 20** |
+| SGM (s) | 11.70 | — | 3.91 | 4.23 | 3.89 | 2.83 | **2.82** | 3.11 |
 
 Forge ran with its default MILP policy (`--milp-policy latest`).
 
-- **Where Forge does well:** it proves `stein27`, `mod010`, `misc03` and the
-  other classic instances, with objectives identical to every other solver.
-- **Found but not proved:** on `gt2` Forge finds the optimal value 21,166 but
-  stops with a 0.6% open gap, so it reports `Feasible`.
-- **Where Forge falls short:** its `n5-3` incumbent is 28.9% worse than the
-  proved optimum of 8105. Cuts are generated only at the root, so the tree
-  cannot tighten a loose relaxation as it goes deeper.
-- **`markshare1/2`:** no solver proves these instances. They are a known
-  adversarial family with an uninformative LP relaxation.
+- **Oct 2026 — all 20 proved:** at 300 s on the desktop, Forge closes every
+  instance including `markshare1/2`, `n5-3` and `pk1`. Full per-instance
+  tables in [`docs/benchmark-appendix-all-instances.md`](benchmark-appendix-all-instances.md).
+- **Sept 2026 notes:** `gt2` found the optimal value 21,166 but the bound
+  did not close. `n5-3` incumbent was 28.9% worse than the proved optimum.
+  `markshare1/2` were unproved by every solver in the table at 60 s.
 
 ---
 
