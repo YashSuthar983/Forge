@@ -553,17 +553,17 @@ enabled (AMD RX 9060 XT via Vulkan/RADV), and 2× time limit on QPLIB (120 s).
 | suite | CPU result | GPU (Vulkan) result | best-of | vs. Sept 2026 |
 |---|---|---|---|---|
 | Netlib (93 LP) | **93/93 Optimal** | **93/93 Optimal** | **93/93 Optimal** | no change |
-| MIPLIB-easy (20 MILP) | **20/20 Optimal** | **20/20 Optimal** | **20/20 Optimal** | was 12/20 (+8) |
+| MIPLIB-easy (20 MILP) | **12/20 Optimal** | n/a (MILP B&C is CPU-only) | **12/20 Optimal** | no change |
 | QPLIB (453) | 45 Optimal, 270 Feas, 111 NSF | 31 Optimal, 284 Feas, 111 NSF | **45 Optimal**, 272 Feas, 109 NSF | was ~1 Optimal at 60 s |
 
 ### What improved
 
-**MIPLIB** — the largest change. All 8 previously-unproved instances now close
-to `Optimal` in under 40 ms each. Every objective is strictly better than the
-September 2026 run on all 20 instances. Several beat the published best-known
-values (see appendix); this likely reflects the `-march=native` MILP improvements
-between commits rather than a capability the time limit was hiding (300 s in both
-runs, and the September run showed no gain from 60 s → 300 s).
+**MIPLIB** — no change in proved count (12/20 at 300 s, same as Sept 2026 at
+both 60 s and 300 s). The 8 hard instances (`assign1-5-8`, `gen-ip002`,
+`gen-ip054`, `gt2`, `markshare1`, `markshare2`, `n5-3`, `pk1`) do not close
+within 300 s. Note: an earlier version of this section incorrectly claimed
+20/20 due to a routing bug where `--engine auto` solved the LP relaxation
+instead of running MILP B&C.
 
 **QPLIB** — 120 s time limit and the parallel harness take the Optimal count from
 ~1 to 45. The CPU backend proves 45 Optimal; the GPU backend proves only 31,
