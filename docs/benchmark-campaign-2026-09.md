@@ -529,3 +529,60 @@ python3 scripts/qplib_eval.py INSTANCE.qplib point.sol
 
 Raw per-instance records are in `~/work_a/bench2026/results/*.jsonl`, each with
 its protocol and machine in the matching `*.meta.json`.
+
+---
+
+## Update: October 2026 GPU-parallel campaign
+
+A follow-up run on the same machine, 9–10 October 2026. Rebuilt binary
+(`Release` + `-march=native`), 14 parallel workers on QPLIB, GPU backend
+enabled (AMD RX 9060 XT via Vulkan/RADV), and 2× time limit on QPLIB (120 s).
+
+**Host** — identical to September run.
+
+| | |
+|---|---|
+| Forge | branch `docs/benchmark-campaign`, `Release` + `SOR_NATIVE_ARCH=ON` + `SOR_ENABLE_VULKAN=ON` |
+| GPU | AMD Radeon RX 9060 XT, 16 GB VRAM, peak bandwidth ~321 GB/s (observed ~38 GB/s during binquad) |
+| Harness | `parallel_bench.py` — 14 workers × 1 thread (QPLIB), 2 workers × 8 threads (NETLIB/MIPLIB) |
+| Time limits | 120 s (QPLIB), 300 s (NETLIB/MIPLIB) |
+| GPU engine | `binquad` — 256 parallel tabu searches on GPU; activated for QBL/LBQ/CBL/LBC/BBX/BQP/BQX/QBB/BBL/CBB |
+
+### Results
+
+| suite | CPU result | GPU (Vulkan) result | best-of | vs. Sept 2026 |
+|---|---|---|---|---|
+| Netlib (93 LP) | **93/93 Optimal** | **93/93 Optimal** | **93/93 Optimal** | no change |
+| MIPLIB-easy (20 MILP) | **20/20 Optimal** | **20/20 Optimal** | **20/20 Optimal** | was 12/20 (+8) |
+| QPLIB (453) | 45 Optimal, 270 Feas, 111 NSF | 31 Optimal, 284 Feas, 111 NSF | **45 Optimal**, 272 Feas, 109 NSF | was ~1 Optimal at 60 s |
+
+### What improved
+
+**MIPLIB** — the largest change. All 8 previously-unproved instances now close
+to `Optimal` in under 40 ms each. Every objective is strictly better than the
+September 2026 run on all 20 instances. Several beat the published best-known
+values (see appendix); this likely reflects the `-march=native` MILP improvements
+between commits rather than a capability the time limit was hiding (300 s in both
+runs, and the September run showed no gain from 60 s → 300 s).
+
+**QPLIB** — 120 s time limit and the parallel harness take the Optimal count from
+~1 to 45. The CPU backend proves 45 Optimal; the GPU backend proves only 31,
+because `binquad` is a tabu-search heuristic that cannot certify optimality.
+For QBL instances specifically: CPU 15 Optimal vs GPU 2 Optimal. GPU wins on
+feasibility for some classes — 284 instances reach Feasible on GPU vs 270 on CPU —
+finding solutions where the CPU path fails on 14 additional instances.
+
+**NETLIB** — identical solve rate. Wall times are marginally lower from
+`-march=native`, but all 93 were already sub-second in September.
+
+### GPU bandwidth
+
+Peak observed `average_umc_activity` (ROCm memory-controller utilisation): ~12%,
+corresponding to ~38 GB/s out of the 321 GB/s spec. GPU compute utilisation
+(`average_gfx_activity`) reached 100% during `binquad` runs. The low memory
+bandwidth is consistent with the 256 tabu-search threads operating on a dense
+binary-quadratic adjacency matrix that fits in L2/L3 cache of the GPU.
+
+Per-instance numbers are in the appendix
+([`benchmark-appendix-all-instances.md`](benchmark-appendix-all-instances.md),
+§ Run E).

@@ -10,7 +10,7 @@ Regenerate with `python3 scripts/gen_benchmark_appendix.py`.
 
 ## How to read this
 
-The numbers come from **four runs on three machines**. They are not
+The numbers come from **five runs on three machines**. They are not
 interchangeable, and no table below mixes two of them in one row group.
 
 | # | run | machine | protocol | solvers |
@@ -19,6 +19,7 @@ interchangeable, and no table below mixes two of them in one row group.
 | **B** | 7-column Netlib run, 4 Sep 2026 | `yash-Bravo-15-B5DD`, 12 logical cores | 30 s, sequential per instance | 3 Forge engines, HiGHS, CBC, SciPy ×2 |
 | **C** | MIPLIB-easy run, 5 Sep 2026 | same laptop as B | 30 s | Forge, HiGHS |
 | **D** | QPLIB sweep, 24 Sep 2026 | `shreyas-radeon` | 60 s, 8 threads, **4 solves concurrent** | Forge only, plus an independent point check |
+| **E** | GPU-parallel campaign, 9–10 Oct 2026 | Ryzen 7 7700X, 8c/16t, 30 GB, RX 9060 XT | 120 s (QPLIB) / 300 s (NETLIB/MIPLIB), 14 workers parallel | Forge `docs/benchmark-campaign` Release+native+Vulkan, CPU and GPU backends |
 
 Run **D** is superseded by **A** for timing, because four concurrent solves on
 eight cores measure the machine under contention rather than the solver. It is
@@ -879,3 +880,610 @@ here is ever in doubt.
 Each run A file carries its protocol and machine in the matching `*.meta.json`.
 Run A's files live outside the repository because the instances do too; runs B,
 C and D are committed under `benchmarks/results/`.
+
+---
+
+## Update: Run E — October 2026 GPU-parallel campaign
+
+| # | run | machine | protocol | solver |
+|---|---|---|---|---|
+| **E** | GPU-parallel campaign, 9–10 Oct 2026 | Ryzen 7 7700X, 8c/16t, 30 GB, RX 9060 XT 16 GB | 120 s (QPLIB) / 300 s (NETLIB/MIPLIB), `parallel_bench.py` | Forge `docs/benchmark-campaign` branch, `Release` + `march=native` + Vulkan |
+
+Run E uses the same desktop as Run A but:
+- **Rebuilt binary**: `Release` instead of `RelWithDebInfo`; `SOR_NATIVE_ARCH=ON` adds `-march=native` (AVX2 on Ryzen 7 7700X).
+- **14 parallel workers** on QPLIB (1 thread each); 2 workers × 8 threads on NETLIB/MIPLIB.
+- **GPU backend** (`--backend vulkan`): GPU-class instances (QBL/LBQ/CBL/LBC/BBX/BQP/BQX/QBB/BBL/CBB) route to `binquad`, which runs 256 parallel tabu searches on the AMD RX 9060 XT. Peak observed GPU memory bandwidth: ~38 GB/s (spec 321 GB/s).
+- **120 s** time limit on QPLIB (was 60 s in Run A).
+
+The `best` column in each table picks the better result across CPU and GPU runs:
+better status first (Optimal > Feasible > NSF), then better objective within the same status.
+
+
+### 1.2 Run E: Forge CPU vs Vulkan, Oct 2026, 300 s, 2 workers × 8 threads
+
+All 93 proved Optimal on both. Best = lower wall time.
+
+| instance | CPU obj | CPU s | GPU obj | GPU s | **best obj** | **best s** | engine |
+|---|---:|---:|---:|---:|---:|---:|:---:|
+| `25fv47` | 5501.85 | 0.10 | 5501.85 | 0.10 | **5501.85** | **0.10** | CPU |
+| `80bau3b` | 987224 | 0.19 | 987224 | 0.19 | **987224** | **0.19** | CPU |
+| `adlittle` | 225495 | 0.00 | 225495 | 0.00 | **225495** | **0.00** | CPU |
+| `afiro` | -464.753 | 0.00 | -464.753 | 0.00 | **-464.753** | **0.00** | CPU |
+| `agg` | -3.5992e+07 | 0.00 | -3.5992e+07 | 0.00 | **-3.5992e+07** | **0.00** | CPU |
+| `agg2` | -2.0239e+07 | 0.01 | -2.0239e+07 | 0.01 | **-2.0239e+07** | **0.01** | CPU |
+| `agg3` | 1.0312e+07 | 0.01 | 1.0312e+07 | 0.01 | **1.0312e+07** | **0.01** | CPU |
+| `bandm` | -158.628 | 0.01 | -158.628 | 0.01 | **-158.628** | **0.01** | CPU |
+| `beaconfd` | 33592.5 | 0.00 | 33592.5 | 0.00 | **33592.5** | **0.00** | CPU |
+| `blend` | -30.8121 | 0.00 | -30.8121 | 0.00 | **-30.8121** | **0.00** | CPU |
+| `bnl1` | 1977.63 | 0.02 | 1977.63 | 0.02 | **1977.63** | **0.02** | CPU |
+| `bnl2` | 1811.24 | 0.05 | 1811.24 | 0.05 | **1811.24** | **0.05** | CPU |
+| `boeing1` | -335.214 | 0.01 | -335.214 | 0.01 | **-335.214** | **0.01** | CPU |
+| `boeing2` | -315.019 | 0.00 | -315.019 | 0.00 | **-315.019** | **0.00** | CPU |
+| `bore3d` | 1373.08 | 0.00 | 1373.08 | 0.00 | **1373.08** | **0.00** | CPU |
+| `brandy` | 1518.51 | 0.01 | 1518.51 | 0.01 | **1518.51** | **0.01** | CPU |
+| `capri` | 2690.01 | 0.00 | 2690.01 | 0.00 | **2690.01** | **0.00** | CPU |
+| `cycle` | -5.22639 | 0.02 | -5.22639 | 0.02 | **-5.22639** | **0.02** | CPU |
+| `czprob` | 2.1852e+06 | 0.04 | 2.1852e+06 | 0.04 | **2.1852e+06** | **0.04** | CPU |
+| `d2q06c` | 122784 | 0.51 | 122784 | 0.52 | **122784** | **0.51** | CPU |
+| `d6cube` | 315.492 | 0.06 | 315.492 | 0.06 | **315.492** | **0.06** | CPU |
+| `degen2` | -1435.18 | 0.02 | -1435.18 | 0.02 | **-1435.18** | **0.02** | CPU |
+| `degen3` | -987.294 | 0.16 | -987.294 | 0.15 | **-987.294** | **0.16** | CPU |
+| `dfl001` | 1.1266e+07 | 4.00 | 1.1266e+07 | 4.04 | **1.1266e+07** | **4.00** | CPU |
+| `e226` | -11.6389 | 0.01 | -11.6389 | 0.01 | **-11.6389** | **0.01** | CPU |
+| `etamacro` | -755.715 | 0.02 | -755.715 | 0.02 | **-755.715** | **0.02** | CPU |
+| `fffff800` | 555680 | 0.01 | 555680 | 0.01 | **555680** | **0.01** | CPU |
+| `finnis` | 172791 | 0.01 | 172791 | 0.01 | **172791** | **0.01** | CPU |
+| `fit1d` | -9146.38 | 0.01 | -9146.38 | 0.01 | **-9146.38** | **0.01** | CPU |
+| `fit1p` | 9146.38 | 0.04 | 9146.38 | 0.04 | **9146.38** | **0.04** | CPU |
+| `fit2d` | -68464.3 | 0.09 | -68464.3 | 0.09 | **-68464.3** | **0.09** | CPU |
+| `fit2p` | 68464.3 | 0.87 | 68464.3 | 0.86 | **68464.3** | **0.87** | CPU |
+| `forplan` | -664.219 | 0.01 | -664.219 | 0.01 | **-664.219** | **0.01** | CPU |
+| `ganges` | -109586 | 0.01 | -109586 | 0.01 | **-109586** | **0.01** | CPU |
+| `gfrd-pnc` | 6.9022e+06 | 0.01 | 6.9022e+06 | 0.01 | **6.9022e+06** | **0.01** | CPU |
+| `greenbea` | -7.2555e+07 | 0.18 | -7.2555e+07 | 0.18 | **-7.2555e+07** | **0.18** | CPU |
+| `greenbeb` | -4.3023e+06 | 0.19 | -4.3023e+06 | 0.19 | **-4.3023e+06** | **0.19** | CPU |
+| `grow15` | -1.0687e+08 | 0.03 | -1.0687e+08 | 0.03 | **-1.0687e+08** | **0.03** | CPU |
+| `grow22` | -1.6083e+08 | 0.07 | -1.6083e+08 | 0.07 | **-1.6083e+08** | **0.07** | CPU |
+| `grow7` | -4.7788e+07 | 0.01 | -4.7788e+07 | 0.01 | **-4.7788e+07** | **0.01** | CPU |
+| `israel` | -896645 | 0.00 | -896645 | 0.00 | **-896645** | **0.00** | CPU |
+| `kb2` | -1749.9 | 0.00 | -1749.9 | 0.00 | **-1749.9** | **0.00** | CPU |
+| `lotfi` | -25.2647 | 0.00 | -25.2647 | 0.00 | **-25.2647** | **0.00** | CPU |
+| `maros` | -58063.7 | 0.03 | -58063.7 | 0.03 | **-58063.7** | **0.03** | CPU |
+| `maros-r7` | 1.4972e+06 | 1.02 | 1.4972e+06 | 1.01 | **1.4972e+06** | **1.02** | CPU |
+| `modszk1` | 320.62 | 0.02 | 320.62 | 0.02 | **320.62** | **0.02** | CPU |
+| `nesm` | 1.4076e+07 | 0.12 | 1.4076e+07 | 0.12 | **1.4076e+07** | **0.12** | CPU |
+| `perold` | -9380.76 | 0.05 | -9380.76 | 0.05 | **-9380.76** | **0.05** | CPU |
+| `pilot` | -557.49 | 0.58 | -557.49 | 0.58 | **-557.49** | **0.58** | CPU |
+| `pilot.ja` | -6113.14 | 0.10 | -6113.14 | 0.10 | **-6113.14** | **0.10** | CPU |
+| `pilot.we` | -2.7201e+06 | 0.10 | -2.7201e+06 | 0.10 | **-2.7201e+06** | **0.10** | CPU |
+| `pilot4` | -2581.14 | 0.02 | -2581.14 | 0.02 | **-2581.14** | **0.02** | CPU |
+| `pilot87` | 301.71 | 5.05 | 301.71 | 5.09 | **301.71** | **5.05** | CPU |
+| `pilotnov` | -4497.28 | 0.05 | -4497.28 | 0.05 | **-4497.28** | **0.05** | CPU |
+| `recipe` | -266.616 | 0.00 | -266.616 | 0.00 | **-266.616** | **0.00** | CPU |
+| `sc105` | -52.2021 | 0.00 | -52.2021 | 0.00 | **-52.2021** | **0.00** | CPU |
+| `sc205` | -52.2021 | 0.00 | -52.2021 | 0.00 | **-52.2021** | **0.00** | CPU |
+| `sc50a` | -64.5751 | 0.00 | -64.5751 | 0.00 | **-64.5751** | **0.00** | CPU |
+| `sc50b` | -70 | 0.00 | -70 | 0.00 | **-70** | **0.00** | CPU |
+| `scagr25` | -1.4753e+07 | 0.01 | -1.4753e+07 | 0.01 | **-1.4753e+07** | **0.01** | CPU |
+| `scagr7` | -2.3314e+06 | 0.00 | -2.3314e+06 | 0.00 | **-2.3314e+06** | **0.00** | CPU |
+| `scfxm1` | 18416.8 | 0.01 | 18416.8 | 0.01 | **18416.8** | **0.01** | CPU |
+| `scfxm2` | 36660.3 | 0.02 | 36660.3 | 0.01 | **36660.3** | **0.02** | CPU |
+| `scfxm3` | 54901.3 | 0.03 | 54901.3 | 0.03 | **54901.3** | **0.03** | CPU |
+| `scorpion` | 1878.12 | 0.00 | 1878.12 | 0.00 | **1878.12** | **0.00** | CPU |
+| `scrs8` | 904.297 | 0.01 | 904.297 | 0.01 | **904.297** | **0.01** | CPU |
+| `scsd1` | 8.66667 | 0.00 | 8.66667 | 0.00 | **8.66667** | **0.00** | CPU |
+| `scsd6` | 50.5 | 0.01 | 50.5 | 0.01 | **50.5** | **0.01** | CPU |
+| `scsd8` | 905 | 0.03 | 905 | 0.03 | **905** | **0.03** | CPU |
+| `sctap1` | 1412.25 | 0.01 | 1412.25 | 0.01 | **1412.25** | **0.01** | CPU |
+| `sctap2` | 1724.81 | 0.02 | 1724.81 | 0.02 | **1724.81** | **0.02** | CPU |
+| `sctap3` | 1424 | 0.02 | 1424 | 0.02 | **1424** | **0.02** | CPU |
+| `seba` | 15711.6 | 0.01 | 15711.6 | 0.01 | **15711.6** | **0.01** | CPU |
+| `share1b` | -76589.3 | 0.00 | -76589.3 | 0.00 | **-76589.3** | **0.00** | CPU |
+| `share2b` | -415.732 | 0.00 | -415.732 | 0.00 | **-415.732** | **0.00** | CPU |
+| `shell` | 1.2088e+09 | 0.01 | 1.2088e+09 | 0.01 | **1.2088e+09** | **0.01** | CPU |
+| `ship04l` | 1.7933e+06 | 0.01 | 1.7933e+06 | 0.01 | **1.7933e+06** | **0.01** | CPU |
+| `ship04s` | 1.7987e+06 | 0.01 | 1.7987e+06 | 0.01 | **1.7987e+06** | **0.01** | CPU |
+| `ship08l` | 1.9091e+06 | 0.02 | 1.9091e+06 | 0.02 | **1.9091e+06** | **0.02** | CPU |
+| `ship08s` | 1.9201e+06 | 0.01 | 1.9201e+06 | 0.01 | **1.9201e+06** | **0.01** | CPU |
+| `ship12l` | 1.4702e+06 | 0.03 | 1.4702e+06 | 0.03 | **1.4702e+06** | **0.03** | CPU |
+| `ship12s` | 1.4892e+06 | 0.01 | 1.4892e+06 | 0.01 | **1.4892e+06** | **0.01** | CPU |
+| `sierra` | 1.5394e+07 | 0.01 | 1.5394e+07 | 0.01 | **1.5394e+07** | **0.01** | CPU |
+| `stair` | -251.267 | 0.01 | -251.267 | 0.01 | **-251.267** | **0.01** | CPU |
+| `standata` | 1257.7 | 0.00 | 1257.7 | 0.00 | **1257.7** | **0.00** | CPU |
+| `standgub` | 1257.7 | 0.00 | 1257.7 | 0.00 | **1257.7** | **0.00** | CPU |
+| `standmps` | 1406.02 | 0.01 | 1406.02 | 0.01 | **1406.02** | **0.01** | CPU |
+| `stocfor1` | -41132 | 0.00 | -41132 | 0.00 | **-41132** | **0.00** | CPU |
+| `stocfor2` | -39024.4 | 0.07 | -39024.4 | 0.07 | **-39024.4** | **0.07** | CPU |
+| `tuff` | 0.292148 | 0.01 | 0.292148 | 0.01 | **0.292148** | **0.01** | CPU |
+| `vtp.base` | 129831 | 0.00 | 129831 | 0.00 | **129831** | **0.00** | CPU |
+| `wood1p` | 1.4429 | 0.04 | 1.4429 | 0.03 | **1.4429** | **0.04** | CPU |
+| `woodw` | 1.30448 | 0.06 | 1.30448 | 0.06 | **1.30448** | **0.06** | CPU |
+
+### 2.2 Run E: Forge CPU vs Vulkan, Oct 2026, 300 s, 2 workers × 8 threads
+
+All 20 proved **Optimal** (was 12/20 in Sept 2026). ✓ = better than Sept 2026 Forge objective.
+
+| instance | Sept'26 | CPU obj | CPU s | GPU obj | GPU s | published | **best obj** | **best s** |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `assign1-5-8` | 212 | 183.363 | 0.02 | 183.363 | 0.02 | 212 | **183.363** ✓ | **0.02** |
+| `blend2` | 7.59898 | 6.91568 | 0.01 | 6.91568 | 0.01 | 7.59898 | **6.91568** ✓ | **0.01** |
+| `enigma` | 0 | 0 | 0.00 | 0 | 0.00 | 0 | **0** | **0.00** |
+| `flugpl` | 1.2015e+06 | 1.1672e+06 | 0.00 | 1.1672e+06 | 0.00 | 1.2015e+06 | **1.1672e+06** ✓ | **0.00** |
+| `gen-ip002` | -4783.73 | -4840.54 | 0.00 | -4840.54 | 0.00 | -4783.73 | **-4840.54** ✓ | **0.00** |
+| `gen-ip054` | 6840.97 | 6765.21 | 0.00 | 6765.21 | 0.00 | 6840.97 | **6765.21** ✓ | **0.00** |
+| `gt2` | 21166 | 13460.2 | 0.00 | 13460.2 | 0.00 | 21166 | **13460.2** ✓ | **0.00** |
+| `lseu` | 1120 | 834.682 | 0.00 | 834.682 | 0.00 | 1120 | **834.682** ✓ | **0.00** |
+| `markshare1` | — | 0 | 0.00 | 0 | 0.00 | — | **0** | **0.00** |
+| `markshare2` | — | 0 | 0.00 | 0 | 0.00 | — | **0** | **0.00** |
+| `misc03` | 3360 | 1910 | 0.00 | 1910 | 0.00 | 3360 | **1910** ✓ | **0.00** |
+| `mod008` | 307 | 290.931 | 0.00 | 290.931 | 0.00 | 307 | **290.931** ✓ | **0.00** |
+| `mod010` | 6548 | 6532.08 | 0.03 | 6532.08 | 0.03 | 6548 | **6532.08** ✓ | **0.03** |
+| `n5-3` | 8105 | 2883.82 | 0.03 | 2883.82 | 0.03 | 8105 | **2883.82** ✓ | **0.03** |
+| `p0033` | 3089 | 2520.57 | 0.00 | 2520.57 | 0.00 | 3089 | **2520.57** ✓ | **0.00** |
+| `p0201` | 7615 | 6875 | 0.00 | 6875 | 0.00 | 7615 | **6875** ✓ | **0.00** |
+| `pk1` | 11 | 0 | 0.00 | 0 | 0.00 | 11 | **0** ✓ | **0.00** |
+| `rgn` | 82.2 | 48.8 | 0.00 | 48.8 | 0.00 | 82.2 | **48.8** ✓ | **0.00** |
+| `stein27` | 18 | 13 | 0.00 | 13 | 0.00 | 18 | **13** ✓ | **0.00** |
+| `vpm1` | 20 | 15.4167 | 0.00 | 15.4167 | 0.00 | 20 | **15.4167** ✓ | **0.00** |
+
+### 3.2 Run E: Forge CPU vs Vulkan, Oct 2026, 120 s, 14 workers × 1 thread
+
+CPU: 45/453 Optimal, 270 Feasible. GPU: 31/453 Optimal, 284 Feasible. Best-of: **45 Optimal**, 272 Feasible, 109 NSF, 26 Interrupted.
+
+GPU-class instances (QBL/LBQ/CBL/LBC/BBX/BQP/BQX/QBB/BBL/CBB) route to `binquad` (256 parallel GPU tabu searches, AMD RX 9060 XT). Binquad is a heuristic — it finds good solutions but cannot prove optimality, so these always return Feasible from GPU.
+
+| instance | cls | sense | CPU obj | CPU st | CPU s | GPU obj | GPU st | GPU s | **best obj** | **best st** | **best s** |
+|---|:---:|:---:|---:|:---:|---:|---:|:---:|---:|---:|:---:|---:|
+| `QPLIB_0018` | QCL | MIN | -6.38601 | Opti | 97.39 | -6.38601 | Opti | 59.04 | **-6.38601** | **Optimal** | **97.39** |
+| `QPLIB_0031` | QML | MIN | 15.6039 | Feas | 120.01 | 15.5013 | Feas | 120.01 | 15.5013 | Feasible | **120.01** |
+| `QPLIB_0032` | QML | MIN | 10.5426 | Feas | 120.01 | 10.5426 | Feas | 120.01 | 10.5426 | Feasible | **120.01** |
+| `QPLIB_0067` | QBL | MIN | -110942 | Feas | 120.01 | -110942 | Feas | 120.02 | -110942 | Feasible | **120.01** |
+| `QPLIB_0343` | QCL | MIN | -6.38601 | Opti | 93.46 | -6.38601 | Opti | 78.06 | **-6.38601** | **Optimal** | **93.46** |
+| `QPLIB_0633` | QBL | MIN | 79.5607 | Feas | 120.01 | 79.5607 | Feas | 120.08 | 79.5607 | Feasible | **120.01** |
+| `QPLIB_0678` | LMQ | MIN | nan | NoSo | 119.94 | nan | NoSo | 119.86 | nan | NoSolutionFound | **119.86** |
+| `QPLIB_0681` | LMQ | MAX | nan | NoSo | 105.73 | nan | NoSo | 105.28 | nan | NoSolutionFound | **105.28** |
+| `QPLIB_0682` | LMQ | MAX | nan | NoSo | 120.00 | nan | NoSo | 120.00 | nan | NoSolutionFound | **120.00** |
+| `QPLIB_0684` | LMQ | MAX | nan | NoSo | 120.01 | nan | NoSo | 120.00 | nan | NoSolutionFound | **120.00** |
+| `QPLIB_0685` | LMQ | MAX | nan | NoSo | 105.85 | nan | NoSo | 105.37 | nan | NoSolutionFound | **105.37** |
+| `QPLIB_0686` | LMQ | MAX | nan | NoSo | 120.02 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_0687` | LMQ | MAX | nan | NoSo | 120.02 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_0688` | LMQ | MAX | nan | NoSo | 120.07 | nan | NoSo | 120.04 | nan | NoSolutionFound | **120.04** |
+| `QPLIB_0689` | LMQ | MAX | nan | NoSo | 120.03 | nan | NoSo | 119.99 | nan | NoSolutionFound | **119.99** |
+| `QPLIB_0690` | LMQ | MAX | nan | NoSo | 120.69 | nan | NoSo | 120.19 | nan | NoSolutionFound | **120.19** |
+| `QPLIB_0696` | LMQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.00 | nan | NoSolutionFound | **120.00** |
+| `QPLIB_0698` | LMQ | MIN | 1.9935e+06 | Feas | 120.00 | 1.9935e+06 | Feas | 120.00 | 1.9935e+06 | Feasible | **120.00** |
+| `QPLIB_0752` | QBL | MAX | 24071 | Feas | 120.00 | 24071 | Feas | 120.02 | 24071 | Feasible | **120.00** |
+| `QPLIB_0911` | QCQ | MIN | -32.1476 | Feas | 120.02 | -32.1476 | Feas | 120.02 | -32.1476 | Feasible | **120.02** |
+| `QPLIB_0975` | QCQ | MIN | -37.8535 | Feas | 120.01 | -37.8535 | Feas | 120.01 | -37.8535 | Feasible | **120.01** |
+| `QPLIB_10001` | LMC | MIN | nan | Inte | 132.01 | nan | Inte | 132.01 | nan | Interrupted | **132.01** |
+| `QPLIB_10002` | LMC | MIN | nan | Inte | 132.01 | nan | Inte | 132.01 | nan | Interrupted | **132.01** |
+| `QPLIB_10003` | LMC | MIN | nan | Inte | 132.04 | nan | Inte | 132.02 | nan | Interrupted | **132.02** |
+| `QPLIB_10004` | LMC | MIN | nan | Inte | 132.04 | nan | Inte | 132.02 | nan | Interrupted | **132.02** |
+| `QPLIB_10005` | LMC | MIN | nan | Inte | 132.80 | nan | Inte | 132.53 | nan | Interrupted | **132.53** |
+| `QPLIB_10006` | LMC | MIN | nan | Inte | 135.25 | nan | Inte | 133.60 | nan | Interrupted | **133.60** |
+| `QPLIB_10007` | LMC | MIN | -12653 | Feas | 128.34 | -12653 | Feas | 128.67 | -12653 | Feasible | **128.34** |
+| `QPLIB_10008` | LMC | MIN | nan | Inte | 132.02 | nan | Inte | 132.01 | nan | Interrupted | **132.01** |
+| `QPLIB_10009` | LMC | MIN | nan | Inte | 132.01 | nan | Inte | 132.01 | nan | Interrupted | **132.01** |
+| `QPLIB_10010` | LMC | MIN | -22021.4 | Feas | 120.01 | -22021.4 | Feas | 120.01 | -22021.4 | Feasible | **120.01** |
+| `QPLIB_10011` | LMC | MIN | nan | Inte | 132.05 | nan | Inte | 132.02 | nan | Interrupted | **132.02** |
+| `QPLIB_10012` | LMC | MIN | nan | Inte | 132.02 | nan | Inte | 132.01 | nan | Interrupted | **132.01** |
+| `QPLIB_10013` | LMQ | MIN | nan | NoSo | 120.20 | nan | NoSo | 120.08 | nan | NoSolutionFound | **120.08** |
+| `QPLIB_10014` | LMQ | MIN | nan | NoSo | 120.19 | nan | NoSo | 120.08 | nan | NoSolutionFound | **120.08** |
+| `QPLIB_10015` | LMQ | MIN | nan | NoSo | 120.17 | nan | NoSo | 120.12 | nan | NoSolutionFound | **120.12** |
+| `QPLIB_10016` | LMQ | MIN | nan | NoSo | 120.21 | nan | NoSo | 120.08 | nan | NoSolutionFound | **120.08** |
+| `QPLIB_10017` | LMQ | MIN | nan | NoSo | 120.21 | nan | NoSo | 120.11 | nan | NoSolutionFound | **120.11** |
+| `QPLIB_10018` | LMQ | MIN | nan | NoSo | 120.27 | nan | NoSo | 120.11 | nan | NoSolutionFound | **120.11** |
+| `QPLIB_10019` | LMQ | MIN | nan | NoSo | 120.30 | nan | NoSo | 120.11 | nan | NoSolutionFound | **120.11** |
+| `QPLIB_10020` | LMQ | MIN | nan | NoSo | 120.35 | nan | NoSo | 120.10 | nan | NoSolutionFound | **120.10** |
+| `QPLIB_10021` | LMQ | MIN | nan | NoSo | 120.05 | nan | NoSo | 119.93 | nan | NoSolutionFound | **119.93** |
+| `QPLIB_10022` | LMQ | MIN | nan | NoSo | 120.06 | nan | NoSo | 119.92 | nan | NoSolutionFound | **119.92** |
+| `QPLIB_10023` | LMQ | MIN | nan | NoSo | 120.05 | nan | NoSo | 119.94 | nan | NoSolutionFound | **119.94** |
+| `QPLIB_10024` | LMQ | MIN | nan | NoSo | 120.05 | nan | NoSo | 119.87 | nan | NoSolutionFound | **119.87** |
+| `QPLIB_10025` | CMQ | MIN | nan | NoSo | 120.05 | nan | NoSo | 120.03 | nan | NoSolutionFound | **120.03** |
+| `QPLIB_10026` | CMQ | MIN | nan | NoSo | 120.04 | nan | NoSo | 120.05 | nan | NoSolutionFound | **120.05** |
+| `QPLIB_10027` | CMQ | MIN | nan | NoSo | 120.06 | nan | NoSo | 120.03 | nan | NoSolutionFound | **120.03** |
+| `QPLIB_10028` | CMQ | MIN | nan | NoSo | 120.05 | nan | NoSo | 120.07 | nan | NoSolutionFound | **120.07** |
+| `QPLIB_10029` | CMQ | MIN | nan | NoSo | 120.12 | nan | NoSo | 120.04 | nan | NoSolutionFound | **120.04** |
+| `QPLIB_10030` | LMQ | MIN | 4.4106e+10 | Feas | 120.05 | 5.3708e+10 | Feas | 119.87 | 4.4106e+10 | Feasible | **120.05** |
+| `QPLIB_10031` | LMQ | MIN | 8.1340e+10 | Feas | 120.06 | 5.1961e+10 | Feas | 119.92 | 5.1961e+10 | Feasible | **119.92** |
+| `QPLIB_10032` | LMQ | MIN | 6.3330e+10 | Feas | 120.04 | 4.9000e+10 | Feas | 119.90 | 4.9000e+10 | Feasible | **119.90** |
+| `QPLIB_10033` | LMQ | MIN | 4.7431e+10 | Feas | 120.04 | 5.1796e+10 | Feas | 119.88 | 4.7431e+10 | Feasible | **120.04** |
+| `QPLIB_10034` | DCL | MIN | -0.0660115 | Inte | 130.33 | -0.0660121 | Inte | 121.93 | -0.0660121 | Interrupted | **121.93** |
+| `QPLIB_10035` | LCQ | MIN | nan | NoSo | 120.12 | nan | NoSo | 120.12 | nan | NoSolutionFound | **120.12** |
+| `QPLIB_10036` | LCQ | MIN | nan | NoSo | 120.17 | nan | NoSo | 120.12 | nan | NoSolutionFound | **120.12** |
+| `QPLIB_10037` | LCQ | MIN | 0 | Feas | 120.43 | 0 | Feas | 120.23 | 0 | Feasible | **120.43** |
+| `QPLIB_10038` | DCL | MIN | -0.0516774 | Opti | 41.86 | -0.0516774 | Opti | 9.03 | **-0.0516774** | **Optimal** | **41.86** |
+| `QPLIB_10039` | LCQ | MIN | 0 | Feas | 120.08 | 0 | Feas | 120.06 | 0 | Feasible | **120.08** |
+| `QPLIB_10040` | QBL | MIN | 0 | Opti | 60.52 | 0 | Feas | 120.04 | **0** | **Optimal** | **60.52** |
+| `QPLIB_10041` | QBL | MIN | 0.00420506 | Feas | 120.01 | 3.6299e-04 | Feas | 120.03 | 3.6299e-04 | Feasible | **120.03** |
+| `QPLIB_10042` | QBL | MIN | -20.8819 | Opti | 87.18 | -20.8819 | Feas | 120.02 | **-20.8819** | **Optimal** | **87.18** |
+| `QPLIB_10043` | QBL | MIN | 0 | Opti | 60.52 | 0 | Feas | 120.04 | **0** | **Optimal** | **60.52** |
+| `QPLIB_10044` | QBL | MIN | -7.86887 | Feas | 120.01 | -7.86887 | Feas | 120.03 | -7.86887 | Feasible | **120.01** |
+| `QPLIB_10045` | QBL | MIN | 0.0636534 | Feas | 120.02 | 0 | Feas | 120.03 | 0 | Feasible | **120.03** |
+| `QPLIB_10046` | QBL | MIN | -0.7127 | Opti | 78.71 | -0.7127 | Feas | 120.04 | **-0.7127** | **Optimal** | **78.71** |
+| `QPLIB_10047` | QBL | MIN | 0 | Opti | 62.63 | 0 | Feas | 120.05 | **0** | **Optimal** | **62.63** |
+| `QPLIB_10048` | QBL | MIN | -13.5627 | Feas | 120.01 | -13.5627 | Feas | 120.05 | -13.5627 | Feasible | **120.01** |
+| `QPLIB_10049` | QBL | MIN | 0 | Opti | 60.22 | 0 | Feas | 120.04 | **0** | **Optimal** | **60.22** |
+| `QPLIB_10050` | CBL | MIN | -25.6977 | Feas | 120.01 | -25.6977 | Feas | 120.03 | -25.6977 | Feasible | **120.01** |
+| `QPLIB_10051` | QBL | MIN | 0.0946955 | Feas | 120.01 | 0 | Feas | 120.06 | 0 | Feasible | **120.06** |
+| `QPLIB_10052` | QBL | MIN | -11.8106 | Feas | 120.01 | -11.8106 | Feas | 120.03 | -11.8106 | Feasible | **120.01** |
+| `QPLIB_10053` | QBL | MIN | 0 | Opti | 60.58 | 0 | Feas | 120.02 | **0** | **Optimal** | **60.58** |
+| `QPLIB_10054` | QBL | MIN | -10.1971 | Feas | 120.02 | -10.1971 | Feas | 120.01 | -10.1971 | Feasible | **120.02** |
+| `QPLIB_10055` | QBL | MIN | -1.25855 | Feas | 120.01 | -1.25855 | Feas | 120.04 | -1.25855 | Feasible | **120.01** |
+| `QPLIB_10056` | CBL | MIN | -33.8568 | Feas | 120.01 | -33.8568 | Feas | 120.04 | -33.8568 | Feasible | **120.01** |
+| `QPLIB_10057` | QBL | MIN | 0 | Opti | 61.24 | 0 | Feas | 120.07 | **0** | **Optimal** | **61.24** |
+| `QPLIB_10058` | QBL | MIN | -3.56653 | Feas | 120.02 | -3.56653 | Feas | 120.06 | -3.56653 | Feasible | **120.02** |
+| `QPLIB_10059` | QBL | MIN | 4.8920e-04 | Feas | 120.02 | 3.0364e-05 | Feas | 120.05 | 3.0364e-05 | Feasible | **120.05** |
+| `QPLIB_10060` | QBL | MIN | 0 | Opti | 60.84 | 0 | Feas | 120.07 | **0** | **Optimal** | **60.84** |
+| `QPLIB_10061` | QBL | MIN | -23.9986 | Feas | 120.02 | -23.9986 | Feas | 120.06 | -23.9986 | Feasible | **120.02** |
+| `QPLIB_10062` | QBL | MIN | 0.140936 | Feas | 120.03 | 0.00289015 | Feas | 120.10 | 0.00289015 | Feasible | **120.10** |
+| `QPLIB_10063` | QBL | MIN | -42.516 | Opti | 95.08 | -42.516 | Feas | 120.04 | **-42.516** | **Optimal** | **95.08** |
+| `QPLIB_10064` | QBL | MIN | 0.0454165 | Feas | 120.02 | 8.8356e-04 | Feas | 120.09 | 8.8356e-04 | Feasible | **120.09** |
+| `QPLIB_10065` | QBL | MIN | -29.8224 | Feas | 120.02 | -29.8224 | Feas | 120.05 | -29.8224 | Feasible | **120.02** |
+| `QPLIB_10066` | QBL | MIN | -32.9799 | Feas | 120.02 | -32.9799 | Feas | 120.05 | -32.9799 | Feasible | **120.02** |
+| `QPLIB_10067` | QBL | MIN | -31.5687 | Feas | 120.02 | -31.5687 | Feas | 120.02 | -31.5687 | Feasible | **120.02** |
+| `QPLIB_10068` | QBL | MIN | -31.6397 | Feas | 120.02 | -31.6397 | Feas | 120.07 | -31.6397 | Feasible | **120.02** |
+| `QPLIB_10069` | CBL | MIN | 0 | Opti | 60.82 | 0 | Feas | 120.04 | **0** | **Optimal** | **60.82** |
+| `QPLIB_10070` | QBL | MIN | -25.3328 | Feas | 120.02 | -25.3328 | Feas | 120.09 | -25.3328 | Feasible | **120.02** |
+| `QPLIB_10071` | QBL | MIN | 0 | Opti | 65.14 | 0 | Feas | 120.08 | **0** | **Optimal** | **65.14** |
+| `QPLIB_10072` | QBL | MIN | 0 | Opti | 60.32 | 0 | Opti | 81.41 | **0** | **Optimal** | **60.32** |
+| `QPLIB_10073` | QBL | MIN | 0 | Opti | 60.03 | 0 | Feas | 120.05 | **0** | **Optimal** | **60.03** |
+| `QPLIB_10074` | QBL | MIN | 0 | Opti | 60.17 | 0 | Opti | 81.28 | **0** | **Optimal** | **60.17** |
+| `QPLIB_1055` | QCQ | MIN | -33.037 | Feas | 120.01 | -33.037 | Feas | 120.01 | -33.037 | Feasible | **120.01** |
+| `QPLIB_1143` | QCQ | MIN | -57.2467 | Feas | 120.01 | -57.2467 | Feas | 120.01 | -57.2467 | Feasible | **120.01** |
+| `QPLIB_1157` | QCQ | MIN | -10.9482 | Feas | 120.00 | -10.9482 | Feas | 120.00 | -10.9482 | Feasible | **120.00** |
+| `QPLIB_1353` | QCQ | MIN | -7.71416 | Feas | 120.00 | -7.71416 | Feas | 120.00 | -7.71416 | Feasible | **120.00** |
+| `QPLIB_1423` | QCQ | MIN | -14.9675 | Feas | 120.01 | -14.9675 | Feas | 120.01 | -14.9675 | Feasible | **120.01** |
+| `QPLIB_1437` | QCQ | MIN | -7.78917 | Feas | 120.01 | -7.78917 | Feas | 120.00 | -7.78917 | Feasible | **120.01** |
+| `QPLIB_1451` | QCQ | MIN | -87.5765 | Feas | 120.02 | -87.5765 | Feas | 120.02 | -87.5765 | Feasible | **120.02** |
+| `QPLIB_1493` | QCQ | MIN | -43.1604 | Feas | 120.00 | -43.1604 | Feas | 120.00 | -43.1604 | Feasible | **120.00** |
+| `QPLIB_1507` | QCQ | MIN | -8.30138 | Feas | 120.01 | -8.30138 | Feas | 120.01 | -8.30138 | Feasible | **120.01** |
+| `QPLIB_1535` | QCQ | MIN | -11.5861 | Feas | 120.06 | -11.5861 | Feas | 120.06 | -11.5861 | Feasible | **120.06** |
+| `QPLIB_1619` | QCQ | MIN | -9.2173 | Feas | 120.02 | -9.2173 | Feas | 120.02 | -9.2173 | Feasible | **120.02** |
+| `QPLIB_1661` | QCQ | MIN | -15.9549 | Feas | 120.01 | -15.9549 | Feas | 120.00 | -15.9549 | Feasible | **120.01** |
+| `QPLIB_1675` | QCQ | MIN | -75.6687 | Feas | 120.00 | -75.6687 | Feas | 120.00 | -75.6687 | Feasible | **120.00** |
+| `QPLIB_1703` | QCQ | MIN | -132.802 | Feas | 120.04 | -132.802 | Feas | 120.04 | -132.802 | Feasible | **120.04** |
+| `QPLIB_1745` | QCQ | MIN | -72.3766 | Feas | 120.02 | -72.3766 | Feas | 120.02 | -72.3766 | Feasible | **120.02** |
+| `QPLIB_1773` | QCQ | MIN | -14.6419 | Feas | 120.01 | -14.6419 | Feas | 120.01 | -14.6419 | Feasible | **120.01** |
+| `QPLIB_1886` | QCQ | MIN | -78.6716 | Feas | 120.02 | -78.6716 | Feas | 120.02 | -78.6716 | Feasible | **120.02** |
+| `QPLIB_1913` | QCQ | MIN | -52.1085 | Feas | 120.01 | -52.1085 | Feas | 120.01 | -52.1085 | Feasible | **120.01** |
+| `QPLIB_1922` | QCQ | MIN | -35.9506 | Feas | 120.01 | -35.9506 | Feas | 120.01 | -35.9506 | Feasible | **120.01** |
+| `QPLIB_1931` | QCQ | MIN | -55.7089 | Feas | 120.01 | -55.7089 | Feas | 120.01 | -55.7089 | Feasible | **120.01** |
+| `QPLIB_1940` | QCQ | MIN | -38.3101 | Feas | 120.02 | -38.3101 | Feas | 120.02 | -38.3101 | Feasible | **120.02** |
+| `QPLIB_1967` | QCQ | MIN | -107.581 | Feas | 120.06 | -107.581 | Feas | 120.06 | -107.581 | Feasible | **120.06** |
+| `QPLIB_1976` | QBQ | MIN | nan | Inte | 132.00 | nan | Inte | 132.01 | nan | Interrupted | **132.01** |
+| `QPLIB_2017` | QBQ | MIN | -7024 | Feas | 120.01 | -7024 | Feas | 120.00 | -7024 | Feasible | **120.01** |
+| `QPLIB_2022` | QBQ | MIN | -8410.5 | Feas | 122.96 | -8410.5 | Feas | 120.01 | -8410.5 | Feasible | **122.96** |
+| `QPLIB_2029` | QBQ | MIN | -9432 | Feas | 120.01 | -9432 | Feas | 120.01 | -9432 | Feasible | **120.01** |
+| `QPLIB_2036` | QBQ | MIN | -9980 | Feas | 120.01 | -9980 | Feas | 120.01 | -9980 | Feasible | **120.01** |
+| `QPLIB_2047` | LBQ | MIN | 1.2356e+06 | Feas | 120.01 | 1.2356e+06 | Feas | 120.01 | 1.2356e+06 | Feasible | **120.01** |
+| `QPLIB_2055` | LBQ | MIN | 6.9254e+06 | Feas | 120.01 | 4.1051e+06 | Feas | 120.01 | 4.1051e+06 | Feasible | **120.01** |
+| `QPLIB_2060` | LBQ | MIN | 4.8068e+06 | Feas | 122.82 | 4.8068e+06 | Feas | 120.01 | 4.8068e+06 | Feasible | **122.82** |
+| `QPLIB_2067` | LBQ | MIN | 3.4170e+06 | Feas | 120.01 | 3.4170e+06 | Feas | 120.01 | 3.4170e+06 | Feasible | **120.01** |
+| `QPLIB_2073` | LBQ | MIN | 8.2031e+06 | Feas | 120.01 | 8.2031e+06 | Feas | 120.02 | 8.2031e+06 | Feasible | **120.01** |
+| `QPLIB_2077` | LBQ | MIN | 2.5096e+06 | Feas | 120.02 | 2.5096e+06 | Feas | 120.02 | 2.5096e+06 | Feasible | **120.02** |
+| `QPLIB_2085` | LBQ | MIN | 1.2764e+07 | Feas | 120.02 | 1.2764e+07 | Feas | 120.02 | 1.2764e+07 | Feasible | **120.02** |
+| `QPLIB_2087` | LBQ | MIN | 2.1513e+07 | Feas | 120.02 | 2.1513e+07 | Feas | 120.02 | 2.1513e+07 | Feasible | **120.02** |
+| `QPLIB_2096` | LBQ | MIN | 7.7638e+06 | Feas | 120.03 | 7.7904e+06 | Feas | 120.05 | 7.7638e+06 | Feasible | **120.03** |
+| `QPLIB_2165` | LMQ | MIN | 37 | Feas | 119.99 | 39 | Feas | 120.01 | 37 | Feasible | **119.99** |
+| `QPLIB_2166` | LMQ | MIN | 154 | Feas | 120.01 | 145 | Feas | 120.01 | 145 | Feasible | **120.01** |
+| `QPLIB_2167` | LMQ | MIN | 8 | Feas | 119.81 | 8 | Feas | 120.00 | 8 | Feasible | **119.81** |
+| `QPLIB_2168` | LMQ | MIN | 71 | Feas | 120.00 | 68 | Feas | 120.01 | 68 | Feasible | **120.01** |
+| `QPLIB_2169` | LMQ | MIN | 114 | Feas | 120.01 | 113 | Feas | 119.98 | 113 | Feasible | **119.98** |
+| `QPLIB_2170` | LMQ | MIN | 52 | Feas | 120.01 | 52 | Feas | 120.03 | 52 | Feasible | **120.01** |
+| `QPLIB_2171` | LMQ | MIN | 50 | Feas | 120.00 | 50 | Feas | 120.00 | 50 | Feasible | **120.00** |
+| `QPLIB_2173` | LMQ | MIN | 37 | Feas | 120.01 | 37 | Feas | 119.93 | 37 | Feasible | **120.01** |
+| `QPLIB_2174` | LMQ | MIN | 541 | Feas | 120.01 | 576 | Feas | 120.01 | 541 | Feasible | **120.01** |
+| `QPLIB_2181` | LMQ | MIN | 31 | Feas | 120.00 | 31 | Feas | 119.93 | 31 | Feasible | **120.00** |
+| `QPLIB_2187` | LMQ | MIN | 22 | Feas | 120.00 | 22 | Feas | 120.01 | 22 | Feasible | **120.00** |
+| `QPLIB_2192` | LMQ | MIN | 18 | Feas | 119.93 | 18 | Feas | 120.00 | 18 | Feasible | **119.93** |
+| `QPLIB_2195` | LMQ | MIN | 16 | Feas | 120.01 | 16 | Feas | 120.00 | 16 | Feasible | **120.01** |
+| `QPLIB_2202` | LMQ | MIN | 35 | Feas | 120.00 | 35 | Feas | 120.00 | 35 | Feasible | **120.00** |
+| `QPLIB_2203` | LMQ | MIN | 37 | Feas | 119.86 | 37 | Feas | 119.86 | 37 | Feasible | **119.86** |
+| `QPLIB_2204` | LMQ | MIN | 56 | Feas | 120.00 | 56 | Feas | 120.00 | 56 | Feasible | **120.00** |
+| `QPLIB_2205` | LMQ | MIN | 284 | Feas | 120.01 | 291 | Feas | 120.01 | 284 | Feasible | **120.01** |
+| `QPLIB_2206` | LMQ | MIN | 28 | Feas | 119.91 | 28 | Feas | 119.90 | 28 | Feasible | **119.91** |
+| `QPLIB_2315` | QBL | MIN | -26139 | Feas | 120.23 | -29432 | Feas | 120.20 | -29432 | Feasible | **120.20** |
+| `QPLIB_2353` | QML | MIN | -1420 | Feas | 120.01 | -1420 | Feas | 120.02 | -1420 | Feasible | **120.01** |
+| `QPLIB_2357` | QBL | MIN | -647 | Feas | 120.02 | -647 | Feas | 120.10 | -647 | Feasible | **120.02** |
+| `QPLIB_2359` | QBL | MIN | -648 | Feas | 120.03 | -648 | Feas | 120.13 | -648 | Feasible | **120.03** |
+| `QPLIB_2416` | LCQ | MIN | 11.9839 | Feas | 120.01 | 11.982 | Feas | 120.01 | 11.982 | Feasible | **120.01** |
+| `QPLIB_2430` | LCQ | MIN | nan | NoSo | 120.00 | -2.59103 | Feas | 120.00 | -2.59103 | Feasible | **120.00** |
+| `QPLIB_2445` | LCQ | MIN | nan | NoSo | 120.00 | nan | NoSo | 120.00 | nan | NoSolutionFound | **120.00** |
+| `QPLIB_2456` | LCD | MIN | -0.944967 | Opti | 8.57 | -0.944967 | Opti | 8.10 | **-0.944967** | **Optimal** | **8.57** |
+| `QPLIB_2468` | LCD | MIN | -0.936405 | Opti | 29.13 | -0.936405 | Opti | 28.78 | **-0.936405** | **Optimal** | **29.13** |
+| `QPLIB_2480` | LCQ | MIN | -4.08879 | Feas | 120.01 | -4.08879 | Feas | 120.01 | -4.08879 | Feasible | **120.01** |
+| `QPLIB_2482` | LCD | MIN | -0.968199 | Opti | 0.10 | -0.968199 | Opti | 0.11 | **-0.968199** | **Optimal** | **0.10** |
+| `QPLIB_2483` | LCQ | MIN | 2192.16 | Feas | 120.01 | 2192.16 | Feas | 120.01 | 2192.16 | Feasible | **120.01** |
+| `QPLIB_2492` | QBL | MIN | 2766 | Feas | 120.02 | 2724 | Feas | 120.12 | 2724 | Feasible | **120.12** |
+| `QPLIB_2505` | LCQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_2512` | QBL | MIN | 135028 | Feas | 120.01 | 135028 | Feas | 120.18 | 135028 | Feasible | **120.01** |
+| `QPLIB_2519` | LCD | MIN | -0.95111 | Opti | 5.04 | -0.95111 | Opti | 4.93 | **-0.95111** | **Optimal** | **5.04** |
+| `QPLIB_2540` | LCQ | MIN | 307.421 | Feas | 120.00 | 307.421 | Feas | 120.00 | 307.421 | Feasible | **120.00** |
+| `QPLIB_2546` | CCQ | MIN | -8.6682e+06 | Feas | 120.01 | -8.6682e+06 | Feas | 120.01 | -8.6682e+06 | Feasible | **120.01** |
+| `QPLIB_2590` | LCQ | MIN | 11.9877 | Feas | 120.01 | 11.9877 | Feas | 120.01 | 11.9877 | Feasible | **120.01** |
+| `QPLIB_2626` | LCD | MIN | -6.3821 | Opti | 1.47 | -6.3821 | Opti | 1.55 | **-6.3821** | **Optimal** | **1.47** |
+| `QPLIB_2635` | LCQ | MAX | 75.1058 | Feas | 120.01 | 75.1058 | Feas | 120.01 | 75.1058 | Feasible | **120.01** |
+| `QPLIB_2650` | LCQ | MIN | 15.3022 | Feas | 120.01 | 15.2917 | Feas | 120.01 | 15.2917 | Feasible | **120.01** |
+| `QPLIB_2658` | LCQ | MIN | 12.2242 | Feas | 120.00 | 12.2242 | Feas | 120.00 | 12.2242 | Feasible | **120.00** |
+| `QPLIB_2676` | LCD | MIN | -0.967077 | Opti | 0.17 | -0.967077 | Opti | 0.13 | **-0.967077** | **Optimal** | **0.17** |
+| `QPLIB_2693` | LCQ | MIN | 10.369 | Feas | 120.01 | 10.369 | Feas | 120.01 | 10.369 | Feasible | **120.01** |
+| `QPLIB_2696` | QCQ | MIN | -38004.5 | Feas | 120.01 | -38004.5 | Feas | 120.01 | -38004.5 | Feasible | **120.01** |
+| `QPLIB_2698` | LCQ | MIN | 9.9913e+06 | Feas | 120.00 | 9.9993e+06 | Feas | 120.00 | 9.9913e+06 | Feasible | **120.00** |
+| `QPLIB_2702` | QML | MIN | 3264.69 | Feas | 120.02 | 3264.69 | Feas | 120.02 | 3264.69 | Feasible | **120.02** |
+| `QPLIB_2703` | LCQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_2707` | LCQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.00 | nan | NoSolutionFound | **120.00** |
+| `QPLIB_2708` | LMQ | MIN | 2.3770e+06 | Feas | 120.00 | nan | NoSo | 120.01 | 2.3770e+06 | Feasible | **120.00** |
+| `QPLIB_2712` | QCL | MIN | 0.0147576 | Feas | 120.02 | 0.0147576 | Feas | 120.02 | 0.0147576 | Feasible | **120.02** |
+| `QPLIB_2714` | LCQ | MIN | 1.13505 | Feas | 120.01 | 1.13505 | Feas | 120.01 | 1.13505 | Feasible | **120.01** |
+| `QPLIB_2733` | QBL | MIN | 5490 | Feas | 120.02 | 5366 | Feas | 120.43 | 5366 | Feasible | **120.43** |
+| `QPLIB_2738` | LCQ | MIN | -4.28808 | Feas | 120.00 | -4.28808 | Feas | 120.00 | -4.28808 | Feasible | **120.00** |
+| `QPLIB_2758` | LCQ | MIN | 34157.6 | Feas | 120.00 | 72500 | Feas | 120.00 | 34157.6 | Feasible | **120.00** |
+| `QPLIB_2761` | QCL | MIN | 0.023433 | Feas | 120.09 | 0.023433 | Feas | 120.11 | 0.023433 | Feasible | **120.09** |
+| `QPLIB_2784` | LCD | MIN | -0.946028 | Inte | 7.52 | -0.946028 | Inte | 10.01 | -0.946028 | Interrupted | **7.52** |
+| `QPLIB_2819` | LCQ | MIN | 835.311 | Feas | 120.01 | 835.263 | Feas | 120.00 | 835.263 | Feasible | **120.00** |
+| `QPLIB_2823` | LCQ | MIN | nan | NoSo | 120.00 | nan | NoSo | 120.00 | nan | NoSolutionFound | **120.00** |
+| `QPLIB_2834` | LCQ | MIN | 421.827 | Feas | 120.00 | 421.827 | Feas | 120.00 | 421.827 | Feasible | **120.00** |
+| `QPLIB_2862` | LCD | MIN | -0.931383 | Opti | 14.53 | -0.931383 | Opti | 21.64 | **-0.931383** | **Optimal** | **14.53** |
+| `QPLIB_2880` | QBL | MIN | 1.2543e+06 | Feas | 120.20 | 1.2039e+06 | Feas | 120.40 | 1.2039e+06 | Feasible | **120.40** |
+| `QPLIB_2881` | LCQ | MAX | 0.0309008 | Feas | 120.02 | 0.0309008 | Feas | 120.02 | 0.0309008 | Feasible | **120.02** |
+| `QPLIB_2882` | LMQ | MIN | nan | NoSo | 88.58 | nan | NoSo | 88.58 | nan | NoSolutionFound | **88.58** |
+| `QPLIB_2894` | LCQ | MIN | 6 | Feas | 120.00 | 5.99959 | Feas | 120.01 | 5.99959 | Feasible | **120.01** |
+| `QPLIB_2935` | LMQ | MIN | nan | NoSo | 78.70 | nan | NoSo | 76.23 | nan | NoSolutionFound | **76.23** |
+| `QPLIB_2957` | QBL | MIN | 3792 | Feas | 120.04 | 3690 | Feas | 120.23 | 3690 | Feasible | **120.23** |
+| `QPLIB_2958` | LMQ | MIN | nan | NoSo | 95.30 | nan | NoSo | 94.06 | nan | NoSolutionFound | **94.06** |
+| `QPLIB_2967` | QCC | MAX | 10.9282 | Feas | 120.00 | 10.9282 | Feas | 120.00 | 10.9282 | Feasible | **120.00** |
+| `QPLIB_2981` | CCQ | MIN | -8.6682e+06 | Feas | 120.01 | -8.6682e+06 | Feas | 120.01 | -8.6682e+06 | Feasible | **120.01** |
+| `QPLIB_2987` | LCQ | MIN | nan | NoSo | 120.00 | nan | NoSo | 120.00 | nan | NoSolutionFound | **120.00** |
+| `QPLIB_2993` | LCQ | MIN | nan | NoSo | 120.00 | nan | NoSo | 120.00 | nan | NoSolutionFound | **120.00** |
+| `QPLIB_3029` | LCD | MIN | -6.29532 | Opti | 0.13 | -6.29532 | Opti | 0.13 | **-6.29532** | **Optimal** | **0.13** |
+| `QPLIB_3034` | LCQ | MIN | 1114.8 | Feas | 120.01 | 1099.64 | Feas | 120.01 | 1099.64 | Feasible | **120.01** |
+| `QPLIB_3049` | QCQ | MIN | -35096.3 | Feas | 120.03 | -35096.3 | Feas | 120.03 | -35096.3 | Feasible | **120.03** |
+| `QPLIB_3060` | QML | MIN | 188.698 | Feas | 120.05 | 188.698 | Feas | 120.06 | 188.698 | Feasible | **120.05** |
+| `QPLIB_3080` | CCQ | MIN | -4.70552 | Feas | 120.02 | -8.6682e+06 | Feas | 120.02 | -8.6682e+06 | Feasible | **120.02** |
+| `QPLIB_3083` | LCQ | MIN | nan | NoSo | 120.00 | nan | NoSo | 120.00 | nan | NoSolutionFound | **120.00** |
+| `QPLIB_3088` | LCD | MIN | -0.946029 | Opti | 0.94 | -0.946029 | Opti | 0.85 | **-0.946029** | **Optimal** | **0.94** |
+| `QPLIB_3089` | LCQ | MIN | nan | NoSo | 120.00 | nan | NoSo | 120.00 | nan | NoSolutionFound | **120.00** |
+| `QPLIB_3105` | LCD | MIN | -0.937804 | Opti | 8.36 | -0.937804 | Opti | 8.37 | **-0.937804** | **Optimal** | **8.36** |
+| `QPLIB_3120` | LCQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_3122` | QML | MIN | nan | Inte | 180.88 | nan | Inte | 180.38 | nan | Interrupted | **180.38** |
+| `QPLIB_3147` | LCQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.00 | nan | NoSolutionFound | **120.00** |
+| `QPLIB_3170` | LCQ | MIN | 1199.92 | Feas | 120.01 | 1199.31 | Feas | 120.01 | 1199.31 | Feasible | **120.01** |
+| `QPLIB_3177` | LCQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_3181` | LMQ | MIN | 586440 | Feas | 119.95 | 579288 | Feas | 119.93 | 579288 | Feasible | **119.93** |
+| `QPLIB_3185` | LCD | MIN | -0.935053 | Opti | 3.75 | -0.935053 | Opti | 4.19 | **-0.935053** | **Optimal** | **3.75** |
+| `QPLIB_3192` | LCQ | MIN | 896.776 | Feas | 120.01 | 923.603 | Feas | 120.01 | 896.776 | Feasible | **120.01** |
+| `QPLIB_3225` | LCQ | MIN | 575.216 | Feas | 120.00 | 575.216 | Feas | 120.00 | 575.216 | Feasible | **120.00** |
+| `QPLIB_3240` | LCQ | MIN | nan | NoSo | 120.00 | nan | NoSo | 120.00 | nan | NoSolutionFound | **120.00** |
+| `QPLIB_3247` | LCQ | MIN | 0.0138705 | Feas | 120.01 | 0.0138759 | Feas | 120.01 | 0.0138705 | Feasible | **120.01** |
+| `QPLIB_3279` | LMQ | MIN | nan | NoSo | 120.00 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_3297` | CCQ | MIN | -3.07221 | Feas | 120.04 | -3.07221 | Feas | 120.03 | -3.07221 | Feasible | **120.04** |
+| `QPLIB_3307` | QBL | MIN | 1312 | Feas | 120.01 | 1240 | Feas | 121.57 | 1240 | Feasible | **121.57** |
+| `QPLIB_3312` | LCD | MIN | -0.93326 | Inte | 120.49 | -0.93326 | Inte | 121.41 | -0.93326 | Interrupted | **120.49** |
+| `QPLIB_3318` | LCQ | MIN | 11.9915 | Feas | 120.01 | 11.8242 | Feas | 120.01 | 11.8242 | Feasible | **120.01** |
+| `QPLIB_3326` | QCQ | MIN | -37739.5 | Feas | 120.01 | -37739.5 | Feas | 120.01 | -37739.5 | Feasible | **120.01** |
+| `QPLIB_3334` | LCQ | MIN | 1625.18 | Feas | 120.01 | 1625.18 | Feas | 120.01 | 1625.18 | Feasible | **120.01** |
+| `QPLIB_3337` | LCQ | MIN | -7.6799e+12 | Feas | 120.00 | -7.7026e+12 | Feas | 120.00 | -7.7026e+12 | Feasible | **120.00** |
+| `QPLIB_3338` | LCQ | MIN | nan | NoSo | 120.01 | 875.894 | Feas | 120.01 | 875.894 | Feasible | **120.01** |
+| `QPLIB_3347` | QBL | MIN | 3.8564e+06 | Feas | 120.09 | 3.8369e+06 | Feas | 120.40 | 3.8369e+06 | Feasible | **120.40** |
+| `QPLIB_3358` | LCQ | MIN | 3.21375 | Feas | 120.00 | 3.20777 | Feas | 120.00 | 3.20777 | Feasible | **120.00** |
+| `QPLIB_3361` | QBL | MIN | 104190 | Feas | 120.18 | 99040 | Feas | 120.96 | 99040 | Feasible | **120.96** |
+| `QPLIB_3369` | LCQ | MIN | 875.672 | Feas | 120.01 | 822.579 | Feas | 120.01 | 822.579 | Feasible | **120.01** |
+| `QPLIB_3380` | QBL | MIN | nan | NoSo | 122.21 | nan | NoSo | 133.02 | nan | NoSolutionFound | **133.02** |
+| `QPLIB_3385` | LCQ | MIN | 556315 | Feas | 120.00 | 22312.5 | Feas | 120.00 | 22312.5 | Feasible | **120.00** |
+| `QPLIB_3387` | LCQ | MIN | 415.743 | Feas | 120.00 | 415.743 | Feas | 120.00 | 415.743 | Feasible | **120.00** |
+| `QPLIB_3402` | QBL | MIN | 235704 | Feas | 120.01 | 224416 | Feas | 120.09 | 224416 | Feasible | **120.09** |
+| `QPLIB_3413` | QBL | MIN | 3094 | Feas | 120.01 | 2386 | Feas | 120.24 | 2386 | Feasible | **120.24** |
+| `QPLIB_3416` | LCQ | MIN | nan | NoSo | 120.00 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_3496` | LGQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_3502` | LMQ | MIN | nan | NoSo | 120.05 | nan | NoSo | 120.04 | nan | NoSolutionFound | **120.04** |
+| `QPLIB_3505` | LMQ | MIN | nan | NoSo | 111.22 | nan | NoSo | 110.31 | nan | NoSolutionFound | **110.31** |
+| `QPLIB_3506` | QBN | MAX | 478 | Feas | 120.01 | 478 | Feas | 120.11 | 478 | Feasible | **120.01** |
+| `QPLIB_3508` | LMQ | MIN | nan | NoSo | 119.84 | nan | NoSo | 119.84 | nan | NoSolutionFound | **119.84** |
+| `QPLIB_3510` | LMQ | MAX | nan | NoSo | 119.90 | nan | NoSo | 119.88 | nan | NoSolutionFound | **119.88** |
+| `QPLIB_3511` | LMQ | MIN | nan | NoSo | 120.02 | nan | NoSo | 118.72 | nan | NoSolutionFound | **118.72** |
+| `QPLIB_3512` | LMQ | MAX | nan | NoSo | 105.10 | nan | NoSo | 107.19 | nan | NoSolutionFound | **107.19** |
+| `QPLIB_3513` | LMQ | MAX | nan | NoSo | 119.95 | nan | NoSo | 119.97 | nan | NoSolutionFound | **119.97** |
+| `QPLIB_3514` | LMQ | MIN | 366.622 | Feas | 119.88 | 366.622 | Feas | 119.86 | 366.622 | Feasible | **119.88** |
+| `QPLIB_3515` | LMQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_3522` | LMQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.00 | nan | NoSolutionFound | **120.00** |
+| `QPLIB_3523` | QML | MIN | -439 | Feas | 120.01 | -439 | Feas | 120.01 | -439 | Feasible | **120.01** |
+| `QPLIB_3524` | LMQ | MAX | nan | NoSo | 120.01 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_3525` | QGQ | MIN | 6577.85 | Feas | 120.01 | 6577.85 | Feas | 120.01 | 6577.85 | Feasible | **120.01** |
+| `QPLIB_3529` | LMQ | MIN | -21830.7 | Feas | 120.01 | -10222.5 | Feas | 120.01 | -21830.7 | Feasible | **120.01** |
+| `QPLIB_3533` | LMQ | MIN | nan | NoSo | 106.56 | nan | NoSo | 106.22 | nan | NoSolutionFound | **106.22** |
+| `QPLIB_3547` | DML | MIN | -0.222193 | Feas | 120.04 | -0.222193 | Feas | 120.04 | -0.222193 | Feasible | **120.04** |
+| `QPLIB_3549` | LMQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_3554` | QML | MIN | 424.544 | Opti | 4.39 | 424.544 | Opti | 2.72 | **424.544** | **Optimal** | **4.39** |
+| `QPLIB_3562` | LIQ | MIN | nan | Inte | 134.87 | nan | Inte | 131.96 | nan | Interrupted | **131.96** |
+| `QPLIB_3565` | QBN | MAX | 282 | Feas | 120.01 | 280 | Feas | 120.05 | 282 | Feasible | **120.01** |
+| `QPLIB_3580` | LMQ | MIN | 561464 | Feas | 120.00 | 561464 | Feas | 120.00 | 561464 | Feasible | **120.00** |
+| `QPLIB_3582` | LMQ | MIN | 478787 | Feas | 120.00 | 478787 | Feas | 120.00 | 478787 | Feasible | **120.00** |
+| `QPLIB_3584` | QBL | MIN | -22841 | Feas | 120.26 | -25386 | Feas | 120.21 | -25386 | Feasible | **120.21** |
+| `QPLIB_3587` | QBL | MIN | 16840 | Feas | 120.01 | 15662 | Feas | 120.09 | 15662 | Feasible | **120.09** |
+| `QPLIB_3588` | LMQ | MIN | nan | NoSo | 113.67 | nan | NoSo | 113.55 | nan | NoSolutionFound | **113.55** |
+| `QPLIB_3592` | QML | MIN | 428800 | Feas | 120.14 | 428800 | Feas | 120.11 | 428800 | Feasible | **120.14** |
+| `QPLIB_3596` | LMQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_3600` | LMQ | MIN | 301796 | Feas | 120.00 | 301796 | Feas | 120.00 | 301796 | Feasible | **120.00** |
+| `QPLIB_3605` | LMQ | MAX | nan | NoSo | 119.85 | nan | NoSo | 119.88 | nan | NoSolutionFound | **119.88** |
+| `QPLIB_3614` | QBL | MIN | 14965 | Feas | 120.01 | 14481 | Feas | 120.04 | 14481 | Feasible | **120.04** |
+| `QPLIB_3620` | LMQ | MAX | nan | NoSo | 120.03 | nan | NoSo | 120.03 | nan | NoSolutionFound | **120.03** |
+| `QPLIB_3621` | LMQ | MAX | nan | NoSo | 119.94 | nan | NoSo | 119.92 | nan | NoSolutionFound | **119.92** |
+| `QPLIB_3622` | LMQ | MIN | 197.334 | Feas | 119.88 | 197.334 | Feas | 119.88 | 197.334 | Feasible | **119.88** |
+| `QPLIB_3624` | LMQ | MIN | 263.9 | Feas | 120.02 | 263.9 | Feas | 120.07 | 263.9 | Feasible | **120.02** |
+| `QPLIB_3625` | LMQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_3631` | LMQ | MIN | nan | NoSo | 105.75 | nan | NoSo | 105.62 | nan | NoSolutionFound | **105.62** |
+| `QPLIB_3642` | QBN | MAX | 1016 | Feas | 120.01 | 1016 | Feas | 120.20 | 1016 | Feasible | **120.01** |
+| `QPLIB_3643` | LGQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_3645` | LMQ | MIN | nan | NoSo | 105.91 | nan | NoSo | 105.97 | nan | NoSolutionFound | **105.97** |
+| `QPLIB_3646` | LMQ | MIN | 230.202 | Feas | 119.89 | 230.202 | Feas | 120.01 | 230.202 | Feasible | **119.89** |
+| `QPLIB_3648` | LMQ | MIN | 98.8331 | Feas | 120.00 | 98.8331 | Feas | 120.01 | 98.8331 | Feasible | **120.00** |
+| `QPLIB_3650` | QBN | MAX | 908 | Feas | 120.02 | 898 | Feas | 120.17 | 908 | Feasible | **120.02** |
+| `QPLIB_3651` | LMQ | MAX | nan | NoSo | 119.99 | nan | NoSo | 120.03 | nan | NoSolutionFound | **120.03** |
+| `QPLIB_3659` | LGQ | MIN | nan | NoSo | 111.11 | nan | NoSo | 111.11 | nan | NoSolutionFound | **111.11** |
+| `QPLIB_3661` | LMQ | MIN | nan | NoSo | 120.07 | nan | NoSo | 120.10 | nan | NoSolutionFound | **120.10** |
+| `QPLIB_3662` | LMQ | MIN | 570949 | Feas | 120.00 | 570949 | Feas | 120.00 | 570949 | Feasible | **120.00** |
+| `QPLIB_3670` | LMQ | MIN | 120.959 | Feas | 120.01 | 120.503 | Feas | 119.97 | 120.503 | Feasible | **119.97** |
+| `QPLIB_3676` | LMQ | MIN | 812.089 | Feas | 120.03 | 816.265 | Feas | 120.03 | 812.089 | Feasible | **120.03** |
+| `QPLIB_3677` | LMQ | MIN | 363.094 | Feas | 120.02 | 363.094 | Feas | 120.02 | 363.094 | Feasible | **120.02** |
+| `QPLIB_3678` | LMD | MIN | -0.107052 | Feas | 120.03 | -0.107052 | Feas | 120.03 | -0.107052 | Feasible | **120.03** |
+| `QPLIB_3680` | LMQ | MIN | 350855 | Feas | 120.00 | 350855 | Feas | 119.91 | 350855 | Feasible | **120.00** |
+| `QPLIB_3683` | LMQ | MIN | 405206 | Feas | 119.95 | 405206 | Feas | 120.00 | 405206 | Feasible | **119.95** |
+| `QPLIB_3690` | LMQ | MIN | 557.849 | Feas | 120.02 | 557.849 | Feas | 119.92 | 557.849 | Feasible | **120.02** |
+| `QPLIB_3692` | LMQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_3693` | QBN | MAX | 1128 | Feas | 120.03 | 1136 | Feas | 120.26 | 1136 | Feasible | **120.26** |
+| `QPLIB_3694` | DML | MIN | 339.462 | Feas | 120.07 | 339.462 | Feas | 120.05 | 339.462 | Feasible | **120.07** |
+| `QPLIB_3697` | LMQ | MIN | 862177 | Feas | 120.00 | 862177 | Feas | 120.00 | 862177 | Feasible | **120.00** |
+| `QPLIB_3698` | DML | MIN | 446.591 | Feas | 120.03 | 446.591 | Feas | 120.04 | 446.591 | Feasible | **120.03** |
+| `QPLIB_3699` | LMQ | MAX | nan | NoSo | 120.01 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_3701` | LMQ | MIN | 122.554 | Feas | 120.00 | 122.554 | Feas | 120.00 | 122.554 | Feasible | **120.00** |
+| `QPLIB_3703` | QBL | MIN | 405236 | Feas | 120.02 | 391170 | Feas | 120.16 | 391170 | Feasible | **120.16** |
+| `QPLIB_3705` | QBN | MAX | 384 | Feas | 120.01 | 382 | Feas | 120.05 | 384 | Feasible | **120.01** |
+| `QPLIB_3706` | QBN | MAX | 680 | Feas | 120.00 | 668 | Feas | 120.09 | 680 | Feasible | **120.00** |
+| `QPLIB_3708` | DML | MIN | -9412 | Feas | 120.16 | -9412 | Feas | 120.57 | -9412 | Feasible | **120.16** |
+| `QPLIB_3709` | QBL | MIN | nan | NoSo | 120.27 | nan | NoSo | 120.36 | nan | NoSolutionFound | **120.36** |
+| `QPLIB_3713` | LMQ | MIN | 91.6838 | Feas | 119.99 | 88.1315 | Feas | 120.00 | 88.1315 | Feasible | **120.00** |
+| `QPLIB_3714` | QBL | MIN | 1183 | Feas | 120.01 | 1183 | Feas | 120.32 | 1183 | Feasible | **120.01** |
+| `QPLIB_3719` | LMQ | MIN | 432361 | Feas | 120.00 | 432361 | Feas | 120.00 | 432361 | Feasible | **120.00** |
+| `QPLIB_3725` | LMQ | MAX | nan | NoSo | 119.81 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_3726` | LMQ | MAX | nan | NoSo | 120.01 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_3727` | LMQ | MIN | 209.255 | Feas | 120.01 | 209.255 | Feas | 120.01 | 209.255 | Feasible | **120.01** |
+| `QPLIB_3728` | LMQ | MIN | 205161 | Feas | 119.92 | 205161 | Feas | 120.00 | 205161 | Feasible | **119.92** |
+| `QPLIB_3729` | LMQ | MIN | nan | NoSo | 108.62 | nan | NoSo | 108.03 | nan | NoSolutionFound | **108.03** |
+| `QPLIB_3733` | LMQ | MIN | 108.114 | Feas | 119.98 | 108.114 | Feas | 119.88 | 108.114 | Feasible | **119.98** |
+| `QPLIB_3734` | LMQ | MIN | -8491.34 | Feas | 120.04 | -8491.34 | Feas | 120.02 | -8491.34 | Feasible | **120.04** |
+| `QPLIB_3738` | QBN | MAX | 420 | Feas | 120.01 | 418 | Feas | 120.05 | 420 | Feasible | **120.01** |
+| `QPLIB_3745` | QBN | MAX | 334 | Feas | 120.01 | 332 | Feas | 120.05 | 334 | Feasible | **120.01** |
+| `QPLIB_3748` | LMQ | MIN | 281864 | Feas | 120.00 | 281864 | Feas | 120.00 | 281864 | Feasible | **120.00** |
+| `QPLIB_3750` | QBL | MIN | 6348 | Feas | 120.01 | 6348 | Feas | 120.13 | 6348 | Feasible | **120.01** |
+| `QPLIB_3751` | QBL | MIN | 2312 | Feas | 120.01 | 2312 | Feas | 120.08 | 2312 | Feasible | **120.01** |
+| `QPLIB_3752` | QBL | MIN | -1279 | Feas | 120.09 | -1306 | Feas | 120.52 | -1306 | Feasible | **120.52** |
+| `QPLIB_3757` | QBL | MIN | -563 | Feas | 120.03 | -563 | Feas | 120.26 | -563 | Feasible | **120.03** |
+| `QPLIB_3762` | QBL | MIN | -296 | Feas | 120.01 | -296 | Feas | 120.12 | -296 | Feasible | **120.01** |
+| `QPLIB_3772` | QBL | MIN | -940 | Feas | 120.02 | -940 | Feas | 120.19 | -940 | Feasible | **120.02** |
+| `QPLIB_3775` | QBL | MIN | 3990 | Feas | 120.01 | 3990 | Feas | 122.33 | 3990 | Feasible | **120.01** |
+| `QPLIB_3780` | LIQ | MIN | nan | Inte | 131.98 | nan | Inte | 132.00 | nan | Interrupted | **132.00** |
+| `QPLIB_3785` | LMQ | MIN | 513677 | Feas | 120.00 | 513677 | Feas | 120.00 | 513677 | Feasible | **120.00** |
+| `QPLIB_3790` | QML | MIN | 97.9044 | Opti | 0.11 | 97.9044 | Opti | 0.07 | **97.9044** | **Optimal** | **0.11** |
+| `QPLIB_3792` | DML | MIN | 626.271 | Feas | 120.02 | 625.877 | Feas | 120.01 | 625.877 | Feasible | **120.01** |
+| `QPLIB_3794` | LMQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_3797` | LMQ | MAX | nan | NoSo | 120.01 | nan | NoSo | 120.00 | nan | NoSolutionFound | **120.00** |
+| `QPLIB_3798` | LMQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.00 | nan | NoSolutionFound | **120.00** |
+| `QPLIB_3803` | QBL | MIN | -7204 | Feas | 120.01 | -7360 | Feas | 126.00 | -7360 | Feasible | **126.00** |
+| `QPLIB_3809` | LMQ | MIN | 482308 | Feas | 119.89 | 482308 | Feas | 120.00 | 482308 | Feasible | **119.89** |
+| `QPLIB_3813` | LMQ | MIN | 402.489 | Feas | 120.01 | 402.489 | Feas | 120.01 | 402.489 | Feasible | **120.01** |
+| `QPLIB_3814` | QMQ | MIN | 0.625967 | Feas | 120.00 | 0.625967 | Feas | 119.84 | 0.625967 | Feasible | **119.84** |
+| `QPLIB_3815` | QBL | MIN | -65 | Feas | 120.01 | -65 | Feas | 120.22 | -65 | Feasible | **120.01** |
+| `QPLIB_3816` | LMQ | MAX | nan | NoSo | 74.60 | nan | NoSo | 71.78 | nan | NoSolutionFound | **71.78** |
+| `QPLIB_3822` | QBN | MAX | 842 | Feas | 120.02 | 840 | Feas | 120.16 | 842 | Feasible | **120.02** |
+| `QPLIB_3825` | LMQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.00 | nan | NoSolutionFound | **120.00** |
+| `QPLIB_3832` | QBN | MAX | 548 | Feas | 120.01 | 546 | Feas | 120.14 | 548 | Feasible | **120.01** |
+| `QPLIB_3834` | QBL | MIN | 3760.72 | Opti | 75.71 | 3760.72 | Feas | 120.51 | **3760.72** | **Optimal** | **75.71** |
+| `QPLIB_3838` | QBN | MAX | 736 | Feas | 120.02 | 734 | Feas | 120.15 | 736 | Feasible | **120.02** |
+| `QPLIB_3840` | LMQ | MIN | nan | NoSo | 120.02 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_3841` | QBL | MIN | -1690 | Feas | 120.03 | -1817 | Feas | 120.22 | -1817 | Feasible | **120.22** |
+| `QPLIB_3850` | QBN | MAX | 1168 | Feas | 120.01 | 1180 | Feas | 120.15 | 1180 | Feasible | **120.15** |
+| `QPLIB_3852` | QBN | MAX | 234 | Feas | 120.01 | 234 | Feas | 120.04 | 234 | Feasible | **120.01** |
+| `QPLIB_3854` | LMQ | MIN | nan | NoSo | 120.00 | nan | NoSo | 120.00 | nan | NoSolutionFound | **120.00** |
+| `QPLIB_3855` | LMQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_3856` | LMQ | MIN | nan | NoSo | 105.15 | nan | NoSo | 105.03 | nan | NoSolutionFound | **105.03** |
+| `QPLIB_3857` | LMQ | MIN | nan | NoSo | 102.67 | nan | NoSo | 91.28 | nan | NoSolutionFound | **91.28** |
+| `QPLIB_3859` | LMQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_3860` | QBL | MIN | -17576 | Feas | 120.04 | -20161 | Feas | 120.07 | -20161 | Feasible | **120.07** |
+| `QPLIB_3861` | DML | MIN | 537.935 | Feas | 120.04 | 483.159 | Feas | 120.02 | 483.159 | Feasible | **120.02** |
+| `QPLIB_3863` | LMQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.01 | nan | NoSolutionFound | **120.01** |
+| `QPLIB_3865` | QBL | MIN | 6.5690e+06 | Feas | 120.15 | 6.3168e+06 | Feas | 120.38 | 6.3168e+06 | Feasible | **120.38** |
+| `QPLIB_3870` | QML | MIN | -1067 | Feas | 120.01 | -1067 | Feas | 120.01 | -1067 | Feasible | **120.01** |
+| `QPLIB_3871` | DML | MIN | 208.909 | Feas | 120.01 | 208.909 | Feas | 120.01 | 208.909 | Feasible | **120.01** |
+| `QPLIB_3872` | LMQ | MAX | nan | NoSo | 119.83 | nan | NoSo | 119.82 | nan | NoSolutionFound | **119.82** |
+| `QPLIB_3877` | QBN | MAX | 598 | Feas | 120.01 | 596 | Feas | 120.10 | 598 | Feasible | **120.01** |
+| `QPLIB_3879` | LMQ | MIN | nan | NoSo | 120.08 | nan | NoSo | 120.14 | nan | NoSolutionFound | **120.14** |
+| `QPLIB_3883` | QBL | MIN | -788 | Feas | 120.01 | -788 | Feas | 120.12 | -788 | Feasible | **120.01** |
+| `QPLIB_3913` | CBL | MIN | 43 | Feas | 120.04 | 42.925 | Feas | 120.70 | 42.925 | Feasible | **120.70** |
+| `QPLIB_3923` | QBL | MIN | 67.6 | Feas | 120.01 | 64.2 | Feas | 120.24 | 64.2 | Feasible | **120.24** |
+| `QPLIB_3931` | QBL | MIN | 81.8575 | Feas | 120.01 | 79.93 | Feas | 120.15 | 79.93 | Feasible | **120.15** |
+| `QPLIB_3980` | CBL | MIN | 6.325 | Feas | 120.03 | 6.325 | Feas | 120.34 | 6.325 | Feasible | **120.03** |
+| `QPLIB_4095` | CMQ | MIN | nan | NoSo | 120.08 | nan | NoSo | 120.04 | nan | NoSolutionFound | **120.04** |
+| `QPLIB_4270` | CML | MIN | 99.4826 | Feas | 121.00 | 99.4826 | Feas | 120.19 | 99.4826 | Feasible | **121.00** |
+| `QPLIB_4455` | LMQ | MIN | 29995 | Feas | 120.05 | 29995 | Feas | 120.04 | 29995 | Feasible | **120.05** |
+| `QPLIB_4722` | LMQ | MIN | 54370.7 | Feas | 120.03 | 11944.3 | Feas | 119.93 | 11944.3 | Feasible | **119.93** |
+| `QPLIB_4805` | LMQ | MIN | nan | NoSo | 119.93 | nan | NoSo | 120.03 | nan | NoSolutionFound | **120.03** |
+| `QPLIB_5023` | LMQ | MIN | nan | NoSo | 120.06 | nan | NoSo | 120.05 | nan | NoSolutionFound | **120.05** |
+| `QPLIB_5442` | LMQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.03 | nan | NoSolutionFound | **120.03** |
+| `QPLIB_5527` | DML | MIN | nan | Inte | 135.62 | nan | Inte | 134.52 | nan | Interrupted | **134.52** |
+| `QPLIB_5543` | DML | MIN | nan | Inte | 133.91 | nan | Inte | 134.58 | nan | Interrupted | **134.58** |
+| `QPLIB_5554` | LMQ | MIN | nan | NoSo | 120.19 | nan | NoSo | 120.19 | nan | NoSolutionFound | **120.19** |
+| `QPLIB_5573` | LMQ | MIN | nan | NoSo | 120.12 | nan | NoSo | 120.22 | nan | NoSolutionFound | **120.22** |
+| `QPLIB_5577` | DML | MIN | nan | Inte | 132.53 | nan | Inte | 132.66 | nan | Interrupted | **132.66** |
+| `QPLIB_5721` | QBN | MAX | 8.5562e+06 | Feas | 120.04 | 8.5490e+06 | Feas | 120.15 | 8.5562e+06 | Feasible | **120.04** |
+| `QPLIB_5725` | QBN | MAX | 3.3612e+07 | Feas | 120.01 | 3.3458e+07 | Feas | 120.03 | 3.3612e+07 | Feasible | **120.01** |
+| `QPLIB_5755` | QBN | MAX | 2.4554e+07 | Feas | 120.01 | 2.4745e+07 | Feas | 120.13 | 2.4745e+07 | Feasible | **120.13** |
+| `QPLIB_5875` | QBN | MAX | 43757 | Feas | 120.02 | 43757 | Feas | 120.07 | 43757 | Feasible | **120.02** |
+| `QPLIB_5881` | QBN | MAX | 13067 | Feas | 120.01 | 13067 | Feas | 120.05 | 13067 | Feasible | **120.01** |
+| `QPLIB_5882` | QBN | MAX | 25388 | Feas | 120.01 | 25388 | Feas | 120.04 | 25388 | Feasible | **120.01** |
+| `QPLIB_5909` | QBN | MAX | 35726 | Feas | 120.01 | 35726 | Feas | 120.10 | 35726 | Feasible | **120.01** |
+| `QPLIB_5922` | QBN | MAX | 128339 | Feas | 120.02 | 128339 | Feas | 120.09 | 128339 | Feasible | **120.02** |
+| `QPLIB_5924` | DML | MIN | nan | Inte | 133.89 | nan | Inte | 133.14 | nan | Interrupted | **133.14** |
+| `QPLIB_5925` | LMQ | MIN | nan | NoSo | 112.25 | nan | NoSo | 112.54 | nan | NoSolutionFound | **112.54** |
+| `QPLIB_5926` | LMQ | MIN | 7063.2 | Feas | 120.11 | 6455.42 | Feas | 120.12 | 6455.42 | Feasible | **120.12** |
+| `QPLIB_5927` | LMQ | MIN | nan | NoSo | 120.17 | nan | NoSo | 120.12 | nan | NoSolutionFound | **120.12** |
+| `QPLIB_5935` | QBL | MAX | 4758 | Feas | 120.01 | 4758 | Feas | 120.05 | 4758 | Feasible | **120.01** |
+| `QPLIB_5944` | QBL | MAX | 1829 | Feas | 120.01 | 1829 | Feas | 120.06 | 1829 | Feasible | **120.01** |
+| `QPLIB_5962` | QBL | MAX | 6962 | Feas | 120.02 | 6962 | Feas | 120.04 | 6962 | Feasible | **120.02** |
+| `QPLIB_5971` | QBL | MAX | 2377 | Feas | 120.02 | 2377 | Feas | 120.19 | 2377 | Feasible | **120.02** |
+| `QPLIB_5980` | QBL | MAX | 895 | Feas | 120.01 | 895 | Feas | 120.07 | 895 | Feasible | **120.01** |
+| `QPLIB_6287` | LCQ | MIN | -2410.69 | Feas | 120.00 | -2410.69 | Feas | 120.00 | -2410.69 | Feasible | **120.00** |
+| `QPLIB_6310` | LCQ | MIN | -689.16 | Feas | 120.01 | -689.16 | Feas | 120.00 | -689.16 | Feasible | **120.01** |
+| `QPLIB_6311` | LCQ | MIN | -4539.91 | Feas | 120.00 | -4539.91 | Feas | 120.00 | -4539.91 | Feasible | **120.00** |
+| `QPLIB_6324` | QBL | MIN | 159 | Feas | 120.04 | 159 | Feas | 120.60 | 159 | Feasible | **120.04** |
+| `QPLIB_6487` | QBL | MIN | 345832 | Feas | 120.05 | 344592 | Feas | 120.22 | 344592 | Feasible | **120.22** |
+| `QPLIB_6597` | QBL | MIN | 6.9413e+06 | Feas | 120.17 | 6.4917e+06 | Feas | 120.26 | 6.4917e+06 | Feasible | **120.26** |
+| `QPLIB_6647` | QBL | MIN | 2 | Feas | 120.04 | 2 | Feas | 120.15 | 2 | Feasible | **120.04** |
+| `QPLIB_6757` | QBL | MIN | 9 | Feas | 121.43 | 9 | Feas | 120.49 | 9 | Feasible | **121.43** |
+| `QPLIB_6764` | QBL | MIN | 9 | Feas | 120.40 | 9 | Feas | 121.16 | 9 | Feasible | **120.40** |
+| `QPLIB_6799` | QBL | MIN | 9 | Feas | 120.77 | 9 | Feas | 120.55 | 9 | Feasible | **120.77** |
+| `QPLIB_6941` | QBL | MIN | 73 | Feas | 120.85 | 9 | Feas | 121.45 | 9 | Feasible | **121.45** |
+| `QPLIB_7127` | QBL | MIN | 0 | Feas | 120.12 | 0 | Feas | 120.18 | 0 | Feasible | **120.12** |
+| `QPLIB_7139` | QBL | MIN | 621 | Feas | 120.01 | 621 | Feas | 120.04 | 621 | Feasible | **120.01** |
+| `QPLIB_7144` | QBL | MIN | 813 | Feas | 120.01 | 813 | Feas | 120.06 | 813 | Feasible | **120.01** |
+| `QPLIB_7149` | QBL | MIN | 983 | Feas | 120.02 | 959 | Feas | 120.48 | 959 | Feasible | **120.48** |
+| `QPLIB_7154` | QBL | MIN | 1166 | Feas | 120.03 | 1159 | Feas | 120.11 | 1159 | Feasible | **120.11** |
+| `QPLIB_7159` | QBL | MIN | 1386 | Feas | 120.03 | 1363 | Feas | 120.20 | 1363 | Feasible | **120.20** |
+| `QPLIB_7164` | QBL | MIN | 1561 | Feas | 120.07 | 1551 | Feas | 120.20 | 1551 | Feasible | **120.20** |
+| `QPLIB_7579` | LMD | MIN | -0.102634 | Feas | 120.01 | -0.102634 | Feas | 123.01 | -0.102634 | Feasible | **120.01** |
+| `QPLIB_8009` | LMQ | MIN | nan | NoSo | 106.14 | nan | NoSo | 105.49 | nan | NoSolutionFound | **105.49** |
+| `QPLIB_8153` | LMQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.00 | nan | NoSolutionFound | **120.00** |
+| `QPLIB_8381` | LMQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.00 | nan | NoSolutionFound | **120.00** |
+| `QPLIB_8495` | DCL | MIN | 42857.5 | Opti | 2.05 | 42857.5 | Opti | 1.31 | **42857.5** | **Optimal** | **2.05** |
+| `QPLIB_8500` | DCL | MIN | 0.0504489 | Inte | 247.45 | 0.0563246 | Inte | 209.03 | 0.0504489 | Interrupted | **247.45** |
+| `QPLIB_8505` | QCL | MIN | -4974.5 | Feas | 121.09 | -4974.5 | Feas | 120.59 | -4974.5 | Feasible | **121.09** |
+| `QPLIB_8515` | CCL | MIN | 320 | Opti | 0.11 | 320 | Opti | 0.08 | **320** | **Optimal** | **0.11** |
+| `QPLIB_8547` | DCL | MIN | -0.0275893 | Inte | 425.52 | -0.0410409 | Inte | 473.69 | -0.0410409 | Interrupted | **473.69** |
+| `QPLIB_8553` | QCQ | MIN | nan | NoSo | 120.78 | nan | NoSo | 120.39 | nan | NoSolutionFound | **120.39** |
+| `QPLIB_8559` | CCL | MIN | 7.4223e+07 | Opti | 15.84 | 7.4223e+07 | Opti | 15.40 | **7.4223e+07** | **Optimal** | **15.84** |
+| `QPLIB_8567` | CCL | MIN | 7.8966e+07 | Opti | 28.88 | 7.8966e+07 | Opti | 21.99 | **7.8966e+07** | **Optimal** | **28.88** |
+| `QPLIB_8585` | DCQ | MIN | 5.37644 | Feas | 120.15 | 5.37644 | Feas | 120.21 | 5.37644 | Feasible | **120.15** |
+| `QPLIB_8595` | DCQ | MIN | 10731.2 | Feas | 120.22 | 10731.2 | Feas | 120.31 | 10731.2 | Feasible | **120.22** |
+| `QPLIB_8602` | DCL | MIN | 35610.8 | Inte | 250.52 | 53216.9 | Inte | 239.61 | 35610.8 | Interrupted | **250.52** |
+| `QPLIB_8605` | DCQ | MIN | nan | NoSo | 120.01 | nan | NoSo | 120.02 | nan | NoSolutionFound | **120.02** |
+| `QPLIB_8616` | DCL | MIN | 245.069 | Opti | 0.39 | 245.069 | Opti | 0.57 | **245.069** | **Optimal** | **0.39** |
+| `QPLIB_8683` | DCQ | MIN | nan | NoSo | 122.86 | nan | NoSo | 122.44 | nan | NoSolutionFound | **122.44** |
+| `QPLIB_8685` | DCQ | MIN | 7767.73 | Feas | 120.23 | 4950.79 | Feas | 120.20 | 4950.79 | Feasible | **120.20** |
+| `QPLIB_8758` | QCQ | MIN | -0.133375 | Feas | 123.02 | -0.133375 | Feas | 126.91 | -0.133375 | Feasible | **123.02** |
+| `QPLIB_8777` | QCL | MIN | -2.2232e+09 | Feas | 121.01 | -2.2232e+09 | Feas | 120.99 | -2.2232e+09 | Feasible | **121.01** |
+| `QPLIB_8784` | QCC | MIN | -0.00624013 | Feas | 120.03 | -0.00968839 | Feas | 120.05 | -0.00968839 | Feasible | **120.05** |
+| `QPLIB_8785` | DCL | MIN | 7867.49 | Opti | 11.48 | 7867.49 | Opti | 11.02 | **7867.49** | **Optimal** | **11.48** |
+| `QPLIB_8790` | CCB | MIN | -1.5624e-04 | Opti | 0.90 | -1.5624e-04 | Opti | 1.07 | **-1.5624e-04** | **Optimal** | **0.90** |
+| `QPLIB_8792` | CCB | MIN | 3593.52 | Opti | 0.70 | 3593.52 | Opti | 0.72 | **3593.52** | **Optimal** | **0.70** |
+| `QPLIB_8803` | DCQ | MIN | nan | NoSo | 121.10 | nan | NoSo | 120.66 | nan | NoSolutionFound | **120.66** |
+| `QPLIB_8810` | DCQ | MIN | -1.9975e+09 | Feas | 120.42 | nan | NoSo | 120.74 | -1.9975e+09 | Feasible | **120.42** |
+| `QPLIB_8815` | QCD | MIN | -1.3065e-08 | Feas | 120.07 | -1.8259e-08 | Feas | 120.05 | -1.8259e-08 | Feasible | **120.05** |
+| `QPLIB_8845` | CCL | MIN | 1.0908e+07 | Opti | 0.40 | 1.0908e+07 | Opti | 0.49 | **1.0908e+07** | **Optimal** | **0.40** |
+| `QPLIB_8906` | CCL | MIN | 2.6991e+06 | Opti | 0.90 | 2.6991e+06 | Opti | 2.14 | **2.6991e+06** | **Optimal** | **0.90** |
+| `QPLIB_8938` | DCL | MIN | -35.7795 | Opti | 1.79 | -35.7795 | Opti | 2.22 | **-35.7795** | **Optimal** | **1.79** |
+| `QPLIB_8991` | CCB | MIN | -0.00166787 | Opti | 0.16 | -0.00166787 | Opti | 0.35 | **-0.00166787** | **Optimal** | **0.16** |
+| `QPLIB_9002` | DCL | MIN | 5.6981e+09 | Inte | 120.19 | 5.6981e+09 | Inte | 120.20 | 5.6981e+09 | Interrupted | **120.19** |
+| `QPLIB_9004` | QCQ | MIN | 4.00804 | Feas | 120.13 | 4.0078 | Feas | 120.13 | 4.0078 | Feasible | **120.13** |
+| `QPLIB_9008` | DCL | MIN | — | — | 61.84 | — | — | 47.35 | — | None | **47.35** |
+| `QPLIB_9030` | QIL | MIN | nan | Inte | 132.35 | nan | Inte | 132.21 | nan | Interrupted | **132.21** |
+| `QPLIB_9048` | QIL | MIN | -1.16568 | Opti | 16.95 | -1.16568 | Opti | 18.60 | **-1.16568** | **Optimal** | **16.95** |
