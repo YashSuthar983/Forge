@@ -100,6 +100,12 @@ void test_invalid_or_incomplete_reasons_rejected() {
     PropTrail frac;
     frac.push(0, BoundDir::Upper, 2.5, 10.0, ReasonKind::Branch, -1, 1);
     CHECK(negated_branch_decisions(frac, is_int, kRootLo, kRootHi).empty());
+    for (ReasonKind kind : {ReasonKind::Symmetry, ReasonKind::Cut, ReasonKind::Split}) {
+        PropTrail restricted;
+        restricted.push(0, BoundDir::Upper, 2, 10, ReasonKind::Branch, -1, 1);
+        restricted.push(2, BoundDir::Upper, 0, 10, kind, -1, 1);
+        CHECK(negated_branch_decisions(restricted, is_int, kRootLo, kRootHi).empty());
+    }
     // A vacuous clause (a literal the root box always satisfies) and an
     // over-long one are refused; a fractional literal is refused.
     ConflictStore st(4, 1 << 20, 2);
@@ -135,7 +141,7 @@ void test_eviction_under_budget() {
     CHECK(!clause_retained(result) && tiny.empty());
 }
 
-void test_deferred_scan_reports_pending() {
+void test_cancelled_scan_retains_pending_watches() {
     ConflictStore st(4, 1 << 20, 16);
     CHECK(st.add({{0, true, 0.0}, {1, false, 1.0}}, kRootLo, kRootHi));
     for (int i = 0; i < 2000; ++i) {
@@ -145,9 +151,10 @@ void test_deferred_scan_reports_pending() {
     auto lo = kRootLo, hi = kRootHi;
     lo[0] = 1.0;
     bool converged = true;
-    CHECK(st.propagate(lo, hi, kRootLo, kRootHi, &converged));
+    sor::core::CancelToken cancel; cancel.request_stop();
+    CHECK(st.propagate(lo, hi, kRootLo, kRootHi, &converged, nullptr, 0, nullptr, nullptr, &cancel));
     CHECK(!converged && lo[1] == 0.0);
-    // The scheduled complete scan must still enforce the clause.
+    // A fresh scheduling slice must still enforce the unvisited watch.
     for (int i = 0; i < 16 && !converged; ++i)
         CHECK(st.propagate(lo, hi, kRootLo, kRootHi, &converged));
     CHECK(converged && lo[1] == 1.0);
@@ -301,6 +308,7 @@ void test_explanation_through_graph_and_clause_reasons() {
 
 BabOptions store_options(bool store) {
     BabOptions o;
+    o.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     o.para_bab.threads = 1;
     o.policy = MilpPolicy::Latest;
     o.conflict_cut.conflict_store = store;
@@ -529,7 +537,7 @@ int main() {
     test_exact_integer_complements_from_decisions();
     test_invalid_or_incomplete_reasons_rejected();
     test_eviction_under_budget();
-    test_deferred_scan_reports_pending();
+    test_cancelled_scan_retains_pending_watches();
     test_analysis_keeps_only_relevant_decisions();
     oracle_stress();
     return sor::test::finish("test_conflict_store");

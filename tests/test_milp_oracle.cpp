@@ -190,6 +190,7 @@ void test_fractional_root_branches_and_proves() {
     opts.probing = false;
     opts.symmetry = false;
     opts.cuts_enabled = false;
+    opts.structural_presolve.binary_row_max_work = 0;  // This fixture exercises branching.
     // The tree cuts re-solved at the root would close this instance without
     // branching; the test is about branching.
     opts.tree_cut.resolve_with_local = false;

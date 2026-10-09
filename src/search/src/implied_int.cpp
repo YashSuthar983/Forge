@@ -21,10 +21,11 @@ namespace {
 struct IiDeadline {
     sor::core::SolverClock::time_point t0{};
     double limit = 0.0;
+    const core::CancelToken* cancel = nullptr;
     bool over() const {
-        return limit > 0.0 &&
+        return core::cancel_requested(cancel) || (limit > 0.0 &&
                std::chrono::duration<double>(
-                   sor::core::SolverClock::now() - t0).count() > limit;
+                   sor::core::SolverClock::now() - t0).count() > limit);
     }
 };
 // Poll every 256 columns: frequent enough to bound a quadratic rule, rare
@@ -786,12 +787,12 @@ ImpliedIntDiagnostics infer_implied_integers_ex(
     if (!opts.enabled) return diag;
     // Deadline between rules and inside each rule's loop.
     const auto ii_t0 = sor::core::SolverClock::now();
-    const IiDeadline dl{ii_t0, opts.time_limit_s};
+    const IiDeadline dl{ii_t0, opts.time_limit_s, opts.cancel};
     const auto ii_over = [&]() {
-        return opts.time_limit_s > 0.0 &&
+        return core::cancel_requested(opts.cancel) || (opts.time_limit_s > 0.0 &&
                std::chrono::duration<double>(
                    sor::core::SolverClock::now() - ii_t0).count() >
-                   opts.time_limit_s;
+                   opts.time_limit_s);
     };
     if (ii_over()) { diag.aborted_on_time = 1; return diag; }
     const Index n = lp.n_cols(), m = lp.n_rows();

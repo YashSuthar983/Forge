@@ -178,6 +178,7 @@ std::vector<CutRow> filter_cut_candidates_for_round(
     for (auto& cut : candidates) {
         CandUnit c;
         c.cut = std::move(cut);
+        if (!compile_cut(c.cut, lp, opts)) { ++st.rejected_malformed; continue; }
         if (!normalized_le(c.cut, c.unit_vals, c.rhs_unit)) {
             ++st.rejected_malformed;
             continue;
@@ -241,14 +242,6 @@ std::vector<CutRow> filter_cut_candidates_for_round(
     // normalised coefficients and are never duplicates, and neither are
     // near-parallel independent rows: how much a pick should discourage
     // similar candidates is the pool's soft score, not a rejection here.
-    const auto same_lhs = [&](const CandUnit& a, const CandUnit& b) {
-        if (a.cut.cols.size() != b.cut.cols.size()) return false;
-        for (std::size_t k = 0; k < a.cut.cols.size(); ++k) {
-            if (a.cut.cols[k] != b.cut.cols[k]) return false;
-            if (std::fabs(a.unit_vals[k] - b.unit_vals[k]) > 1e-9) return false;
-        }
-        return true;
-    };
     std::unordered_map<std::uint64_t, std::vector<std::size_t>> by_support;   // hash -> slots in `accepted`
     const auto support_hash = [&](const CandUnit& c) {
         std::uint64_t h = 1469598103934665603ull;
@@ -262,12 +255,13 @@ std::vector<CutRow> filter_cut_candidates_for_round(
         bool handled = false;
         for (const std::size_t slot : slots) {
             const std::size_t a = accepted[slot];
-            if (!same_lhs(pool[i], pool[a])) continue;
+            const auto cmp = compare_cut_rhs(pool[i].cut, pool[a].cut);
+            if (!cmp) continue;
             handled = true;
-            if (pool[i].rhs_unit < pool[a].rhs_unit - 1e-12) {
+            if (*cmp < 0) {
                 accepted[slot] = i;   // strictly stronger: replaces the kept one
                 ++dominated;
-            } else if (pool[i].rhs_unit > pool[a].rhs_unit + 1e-12) {
+            } else if (*cmp > 0) {
                 ++dominated;
             } else {
                 ++duplicates;

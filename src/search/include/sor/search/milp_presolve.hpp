@@ -18,6 +18,7 @@
 #pragma once
 
 #include "sor/model/lp.hpp"
+#include "sor/core/cancel.hpp"
 #include "sor/search/row_support_probe.hpp"
 #include "sor/search/conflict.hpp"
 
@@ -30,6 +31,7 @@ using core::f64;
 using core::Index;
 
 struct MilpPresolveOptions {
+    const core::CancelToken* cancel = nullptr;
     bool enabled = false;
     // Bounded, like every other root-setup phase (see bab.cpp's root_budget):
     // a presolve pass that never terminates is worse than no presolve.
@@ -96,6 +98,10 @@ struct MilpPresolveOptions {
     bool aggregation = true;
     int aggregation_max_row = 8;
     int aggregation_max_col_rows = 8;
+    // MIP-valid binary column dominance (column_dominance.hpp): fix dominated
+    // binaries to 0 by an exchange argument. Off by default only when the
+    // caller disables it; structural Latest keeps it on.
+    bool column_dominance = true;
     // Two bounds compare equal (a fixed column, or a tightened bound closing
     // to a point) within this absolute tolerance.
     f64 tol = 1e-9;
@@ -134,6 +140,7 @@ struct MilpPresolveStats {
     int aggregated_cols = 0;              // columns substituted out through equalities
     int aggregation_rows_removed = 0;     // pivot rows that left with their column
     int aggregation_inexact_skipped = 0;  // candidates declined: a rewrite was not exact
+    int dominated_cols = 0;               // binaries fixed to 0 by column dominance
     int probing_fixings = 0;      // columns fixed / bounds moved by presolve probing
     double probing_ms = 0.0;
     int merge_groups = 0;
@@ -201,6 +208,9 @@ struct MilpPresolveResult {
     // fixed_value[j] holds the value every feasible point of the original
     // model was proved to need there.
     std::vector<Index> reduced_col;
+    // Original row -> reduced row, -1 when deleted. Row identity survives
+    // coefficient/side rewrites; the reduced matrix decides basis rank.
+    std::vector<Index> reduced_row;
     std::vector<f64> fixed_value;
     std::vector<char> eliminated;
     // Stored in elimination order. Replay backwards after filling the

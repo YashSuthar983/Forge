@@ -38,6 +38,9 @@ enum class ReasonKind : std::uint8_t {
     Conflict = 2,
     Branch = 3,
     Unknown = 4,
+    // The path includes a linear integer disjunction, which a clause over
+    // single-coordinate bound literals cannot negate completely.
+    Split = 10,
     // A conflict-graph implication: reason_id is the literal (2j + v) whose
     // truth made this bound's literal false (a global pair conflict).
     Implication = 5,
@@ -49,6 +52,9 @@ enum class ReasonKind : std::uint8_t {
     // A symmetry-handling restriction (orbitopal fixing): valid only for
     // the representatives the search keeps, so no explanation resolves it.
     Symmetry = 9,
+    // Necessary only for objective values below an incumbent cutoff. It is
+    // never a premise of an unconditional feasibility clause.
+    Cutoff = 11,
 };
 
 // Content of a retired global row (see ReasonKind::Retired): lo <= a'x <= hi.
@@ -62,6 +68,15 @@ struct RetiredRow {
 struct BoundRef {
     Index var = -1;
     bool upper = false;
+};
+using ConflictAntecedents = std::shared_ptr<const std::vector<BoundRef>>;
+struct ConflictLiteral {
+    Index var = -1;
+    bool upper = false;
+    f64 bound = 0.0;
+    bool operator==(const ConflictLiteral& o) const {
+        return var == o.var && upper == o.upper && bound == o.bound;
+    }
 };
 // What Retired and Antecedents reasons name. Owned by the solve; entries are
 // shared by every trail that copied the reason, and only grow between
@@ -85,6 +100,10 @@ struct PropTrailEntry {
     Index reason_id = -1;  // row / cut / conflict index when applicable
     int depth = 0;
     std::uint32_t trail_index = 0;
+    // Stable proof ownership, independent of a store's evictable working
+    // set or another worker's numeric clause IDs.
+    std::shared_ptr<const std::vector<ConflictLiteral>> clause;
+    std::shared_ptr<const std::vector<BoundRef>> antecedents;
 };
 
 // A node's trail is its ancestors' entries followed by its own. Children
@@ -120,12 +139,13 @@ public:
     // The whole history, oldest first.
     const std::vector<PropTrailEntry>& entries() const {
         if (!prefix_) return own_;
-        if (!flat_valid_) {
+        if (!flat_valid_ || flat_epoch_ != prefix_->epoch) {
             flat_.clear();
             flat_.reserve(size());
             append_segment(prefix_.get(), flat_);
             flat_.insert(flat_.end(), own_.begin(), own_.end());
             flat_valid_ = true;
+            flat_epoch_ = prefix_->epoch;
         }
         return flat_;
     }
@@ -135,10 +155,11 @@ public:
         const PropTrailEntry* last = nullptr;
         const PropTrailEntry* begin() const { return first; }
         const PropTrailEntry* end() const { return last; }
-        std::size_t size() const { return static_cast<std::size_t>(last - first); }
+        std::size_t size() const { return first == last ? 0 : static_cast<std::size_t>(last - first); }
     };
     Range since(std::size_t mark) const {
         if (mark >= prefix_size_) {
+            if (own_.empty()) return {};
             const std::size_t off = std::min(mark - prefix_size_, own_.size());
             return {own_.data() + off, own_.data() + own_.size()};
         }
@@ -164,7 +185,9 @@ public:
     }
 
     void push(Index var, BoundDir dir, f64 new_bound, f64 old_bound,
-              ReasonKind kind, Index reason_id, int depth);
+              ReasonKind kind, Index reason_id, int depth,
+              std::shared_ptr<const std::vector<ConflictLiteral>> clause = {},
+              std::shared_ptr<const std::vector<BoundRef>> antecedents = {});
 
     // Reverse chronological order (newest first).
     const PropTrailEntry& at_reverse(std::size_t k) const {
@@ -270,6 +293,7 @@ private:
     mutable std::vector<PropTrailEntry> own_;
     mutable std::vector<PropTrailEntry> flat_;
     mutable bool flat_valid_ = false;
+    mutable std::uint64_t flat_epoch_ = 0;
     std::uint32_t next_index_ = 0;
 };
 

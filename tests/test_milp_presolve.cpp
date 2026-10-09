@@ -168,7 +168,9 @@ void test_structural_relation_budgets_and_fixed_representative() {
     MilpPresolveStats stats;
     auto pre=run_structural_presolve(lp,opts,stats);
     CHECK(!pre.infeasible);CHECK(pre.reduced.n_cols()==0);
-    CHECK(stats.binary_substitutions>=1);
+    // Full row propagation now fixes the representative before a relation
+    // substitution is necessary. The exact lifted point is the invariant.
+    CHECK(stats.binary_substitutions>=1 || stats.fixed_cols>=2);
     if(pre.reduced.n_cols()==0) {
         CHECK(postsolve_point(pre,{})==std::vector<double>({1.,1.}));
         CHECK_NEAR(pre.reduced.objective({}),2.,1e-12);
@@ -190,6 +192,7 @@ void test_structural_relations_reject_rounded_rewrites() {
     MilpPresolveOptions opts;
     opts.probing_presolve = false;   // these tests isolate one reduction at a time
     opts.aggregation = false;
+    opts.column_dominance = false; // isolate exact substitution, retaining both binaries
     // Isolates the substitution's numerical guard: coefficient strengthening
     // would drop the 1e16 row as activity-redundant before it is reached.
     opts.coefficient_strengthening=false;
@@ -349,6 +352,7 @@ void test_monotone_pairs_preserve_optimum_and_postsolve() {
         opts.row_probe.enabled = false; opts.probing_presolve = false;
         opts.binary_row_support = false; opts.structural_fbbt = false;
         opts.coefficient_strengthening = false; opts.merge_duplicate_columns = false;
+        opts.column_dominance = false; // this suite measures pair saturation
         MilpPresolveStats stats;
         const auto pre = run_structural_presolve(lp, opts, stats);
         saturated += stats.monotone_pairs_saturated;
@@ -387,6 +391,7 @@ void test_monotone_pairs_preserve_optimum_and_postsolve() {
     CHECK(lp.max_bound_violation(original_zero) == 0.);
     CHECK_NEAR(lp.objective(original_zero), 0., 0.);
     opts.monotone_binary_pairs = false; lp.c = {0., 0.};
+    opts.column_dominance = false; // explicit saturation opt-out fixture
     opts.merge_duplicate_columns = false;
     pre = run_structural_presolve(lp, opts, stats);
     CHECK(stats.monotone_pairs_saturated == 0);
@@ -464,7 +469,7 @@ void test_binary_row_support_budget_and_continuous_guard() {
     opts.binary_row_max_work = 1000;
     lp.row_lo = lp.row_hi = {1. + 5e-10};
     pre = run_structural_presolve(lp, opts, stats);
-    CHECK(!pre.infeasible);  // outward numerical relaxation admits (1,0)
+    CHECK(pre.infeasible);  // no integer point satisfies this exact equality
     lp.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {6., 4.});
     lp.row_lo = lp.row_hi = {3.};
     pre = run_structural_presolve(lp, opts, stats);
@@ -869,6 +874,7 @@ void test_wrapper_projects_cut_reference_point() {
     // projected reference. Binary support would force X2=1 before any cuts;
     // support/postsolve correctness is tested independently above.
     opts.structural_presolve.binary_row_support = false;
+    opts.structural_presolve.column_dominance = false; // retain the fractional reference consumer
     opts.structural_presolve.structural_fbbt = false;
     opts.structural_presolve.row_probe.enabled = false;
     // Strengthening 2x1+3x2>=2.5 to 2x1+2.5x2>=2.5 makes the root LP
@@ -933,6 +939,7 @@ void test_wrapper_keeps_portfolio_points_in_original_space() {
         }
     lp.A = sor::sparse::from_triplets(5, 17, rows, cols, vals);
     sor::search::BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Retain a tree for original-space pool publication.
     opts.structural_presolve.enabled = true;
     opts.time_limit_s = 10.0;
     opts.para_bab.threads = 1;

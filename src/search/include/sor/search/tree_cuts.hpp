@@ -30,6 +30,12 @@ namespace sor::search {
 using core::f64;
 using core::Index;
 
+// The workspace is [global prefix][scoped suffix], with one logical per row.
+// Refresh sides without changing either the matrix or the logical-slot count.
+void refresh_scoped_row_bounds(model::LpProblem& workspace,
+                               const model::LpProblem& global,
+                               const std::vector<CutRow>& scoped);
+
 inline constexpr int kGcsNodeFeatDim = 6;
 inline constexpr int kGcsCutFeatDim = 8;
 inline constexpr int kGcsEmbDim = 8;
@@ -53,17 +59,13 @@ struct TreeCutOptions {
     // this node's box, so the re-solved objective is a valid bound for the
     // whole subtree: it is folded into node.bound, which both children
     // inherit, and a node whose new bound reaches the cutoff is pruned. The
-    // rows themselves are not carried into the children's LPs.
+    // retained rows enter the children's scoped working set and age there.
     bool resolve_with_local = true;
     // Iteration cap for that re-solve, as a multiple of the node LP's rows.
     f64 resolve_iter_per_row = 2.0;
-    // A node lineage carries at most this many inherited local rows. Zero (the
-    // default) keeps them out of descendants: measured on exp-1-500-5-5 and
-    // beasleyC3, a subtree solved with inherited rows cannot use the prepared
-    // LP session or the checkpoint cache (their rows differ from global_lp),
-    // and throughput fell 4x (7923 -> 1834 nodes, worse bound in 20 s). The
-    // machinery is complete and oracle-tested; it needs sessions keyed on the
-    // local row set before it can pay.
+    // Optional explicit lineage allowance; zero uses the aged working set.
+    // Prepared sessions are keyed on the scoped row set, and inactive rows
+    // retire with a rank-repaired basis. Split rows always define coverage.
     int max_local_rows = 0;
     // --- GCS ---------------------------------------------------------------
     bool gcs_enabled = true;
@@ -155,7 +157,9 @@ inline bool cut_family_derivation_trusted(const std::string& name) {
            name.rfind("COVGNS_", 0) == 0 || name.rfind("MIR_", 0) == 0 ||
            name.rfind("GMI_", 0) == 0 || name.rfind("ZH_", 0) == 0 ||
            name.rfind("CLQ_", 0) == 0 || name.rfind("OCY_", 0) == 0 ||
-           name.rfind("VUB_", 0) == 0 || name.rfind("MIX_", 0) == 0;
+           name.rfind("VUB_", 0) == 0 || name.rfind("MIX_", 0) == 0 || name.rfind("BLK_", 0) == 0 ||
+           name.rfind("LCM_", 0) == 0 || name.rfind("SKP_", 0) == 0 ||
+           name.rfind("BD", 0) == 0 || name.rfind("FC_", 0) == 0;
 }
 
 struct ManagedCut {
@@ -165,6 +169,7 @@ struct ManagedCut {
     std::uint64_t created_node = 0;
     // Fingerprint for sibling / pool identity checks in tests.
     std::string id;
+    int inactive_age = 0;
 };
 
 inline void apply_policy_tree_cuts(MilpPolicy policy, TreeCutOptions& tc) {
@@ -189,13 +194,8 @@ bool local_cut_present(const std::vector<ManagedCut>& active,
 // Extract CutRows for apply_cuts().
 std::vector<CutRow> managed_to_rows(const std::vector<ManagedCut>& cuts);
 
-// Content key so the same inequality accumulates multi-node stats.
-// Printed with six significant digits, so it is not an exact identity.
-// GcsPool treats a disagreement on this key as "keep the weaker scope".
-// That is a conservative policy: a later local sighting does not
-// mathematically invalidate an earlier global derivation of a truly
-// identical inequality. Relaxing the policy needs an exact comparison
-// and retained provenance.
+// Exact binary64 content identity of the compiled inequality. Scope and
+// selection features belong to its derivations, never its numeric encoding.
 std::string cut_content_id(const CutRow& row);
 
 // --- GCS (global selection over tree-collected candidates) -----------------

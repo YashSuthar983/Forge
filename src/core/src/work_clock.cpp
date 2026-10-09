@@ -125,7 +125,11 @@ WorkScope::~WorkScope() {
 std::uint64_t work_floor_binds() noexcept { return g_floor_binds.load(std::memory_order_relaxed); }
 std::int64_t work_floor_max_lead_ns() noexcept { return g_floor_max_lead.load(std::memory_order_relaxed); }
 
-SolverClock::time_point SolverClock::now() noexcept {
+namespace { thread_local SolverClock::duration solver_clock_offset{}; }
+SolverClock::duration SolverClock::offset() noexcept { return solver_clock_offset; }
+void SolverClock::set_offset(duration value) noexcept { solver_clock_offset = value; }
+SolverClock::time_point SolverClock::now() noexcept { return raw_now() + solver_clock_offset; }
+SolverClock::time_point SolverClock::raw_now() noexcept {
     const std::int64_t wall = wall_ns();
     if (!deterministic_time()) return time_point(duration(wall));
     const auto work = static_cast<std::int64_t>(static_cast<double>(t_work_units) * kNsPerUnit);

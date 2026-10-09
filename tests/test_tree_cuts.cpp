@@ -6,6 +6,7 @@
 #include "test_helpers.hpp"
 
 #include <cstdio>
+#include <cmath>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -85,6 +86,24 @@ void test_local_no_sibling_leak() {
     CHECK(sor::search::local_cut_present(left_active, "L"));
     CHECK(sor::search::local_cut_present(right_active, "P"));
     CHECK(!sor::search::local_cut_present(right_active, "L"));
+}
+
+void test_exact_cut_identity_and_provenance() {
+    sor::search::CutRow a; a.cols = {0}; a.vals = {1}; a.row_hi = 1;
+    auto b = a; b.row_hi = std::nextafter(1.0, 2.0);
+    const auto ia = sor::search::cut_content_id(a), ib = sor::search::cut_content_id(b);
+    CHECK(ia != ib);
+    sor::search::GcsPool pool;
+    sor::search::CutFeatureVec f{};
+    pool.observe(a,f,1,true,true,ia,0);
+    pool.observe(a,f,1,true,false,ia,1);
+    pool.observe(b,f,1,true,false,ib,1);
+    CHECK(pool.cands.size() == 2);
+    CHECK(pool.cands[0].globally_valid);
+    CHECK(!pool.cands[1].globally_valid);
+    // A supplied selection ID cannot merge different inequalities either.
+    pool.observe(b,f,1,true,false,ia,2);
+    CHECK(pool.cands.size() == 3);
 }
 
 void test_gcs_prefers_multi_node() {
@@ -207,6 +226,7 @@ void test_gcs_fit_save_load_policy() {
 void test_latest_tree_sep_can_fire() {
     auto lp = read_text(kFrac);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.tree_cut.enabled = true;
@@ -221,7 +241,9 @@ void test_latest_tree_sep_can_fire() {
     opts.feasibility_jump = false;
     opts.sub_mip_lns = false;
     opts.probing = false;
-    opts.cuts_enabled = false;  // force fractional root → tree branching
+    opts.cuts_enabled = true;   // authorize the tree separator
+    opts.cut.max_rounds = 0;    // retain the fractional root without root rounds
+    opts.integer_row_rounding = false;
     opts.rounding_heuristic = false;
     opts.lp_rounding_repair = false;
     opts.integer_dive = false;
@@ -244,6 +266,7 @@ void test_latest_tree_sep_can_fire() {
 void test_classical_root_only() {
     auto lp = read_text(kFrac);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Classical;
     opts.tree_cut.enabled = true;  // ignored / forced off
@@ -273,6 +296,7 @@ void test_classical_root_only() {
 int main() {
     test_schedule_and_classical_off();
     test_local_no_sibling_leak();
+    test_exact_cut_identity_and_provenance();
     test_gcs_prefers_multi_node();
     test_gcs_never_promotes_local();
     test_gcs_skip_promoted();

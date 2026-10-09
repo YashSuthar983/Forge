@@ -145,7 +145,24 @@ void test_against_brute_force() {
 
 }  // namespace
 
+void test_asserting_theory_survives_export_rejection() {
+    LpProblem lp;
+    lp.A = sor::sparse::from_triplets(1, 3, {0,0,0}, {0,1,2}, {2,2,2});
+    lp.row_lo = lp.row_hi = {3}; lp.c = {0,0,0};
+    lp.col_lo = {0,0,0}; lp.col_hi = {1,1,1}; lp.is_integer.assign(3,true);
+    auto lo = lp.col_lo, hi = lp.col_hi;
+    ConflictStore rejected(3, 1, 1);
+    RapidLearningOptions options; options.time_limit_s = 0; options.max_conflicts = 100;
+    const auto result = rapid_learning(lp, lo, hi, nullptr, rejected, {1,1,1},
+        [](std::vector<ConflictLiteral>) { return ClauseResult::Rejected; }, nullptr, options);
+    CHECK(result.infeasible);
+    CHECK(result.conflicts < options.max_conflicts);
+    CHECK(result.learned == 0);
+    CHECK(rejected.empty());
+}
+
 int main() {
+    test_asserting_theory_survives_export_rejection();
     test_against_brute_force();
     return sor::test::finish("test_rapid_learning");
 }

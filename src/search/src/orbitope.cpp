@@ -1,3 +1,4 @@
+#include "sor/search/domain_writer.hpp"
 #include "sor/search/orbitope.hpp"
 
 #include "sor/core/work_clock.hpp"
@@ -13,7 +14,7 @@ namespace sor::search {
 namespace {
 
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
-using Clock = std::chrono::steady_clock;
+using Clock = core::SolverClock;
 
 std::uint64_t mix(std::uint64_t h, std::uint64_t v) {
     h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
@@ -160,6 +161,7 @@ std::vector<Orbitope> detect_orbitopes(const model::LpProblem& lp,
                 if (first < 0) first = e.first;
             }
             work += r.entries.size();
+            core::work_add(r.entries.size(), core::WorkTag::Symmetry);
             if (!block_row || members < 1) continue;
             // Every column of such a row travels with that block (a bin's
             // capacity row carries its bin-used indicator too). A row with a
@@ -217,6 +219,11 @@ std::vector<Orbitope> detect_orbitopes(const model::LpProblem& lp,
             for (std::size_t q = 0; q < extra[b].size(); ++q)
                 extras_match = extras_match && color[sz(extra[b][q])] == color[sz(extra[0][q])];
         }
+        // Existing canonical orders may only be combined for disjoint action
+        // supports. Marked extras travel with earlier blocks too, even when
+        // they do not appear in an orbitope's displayed packing rows.
+        for (const auto& e : extra) for (Index j : e)
+            if (used[sz(j)]) extras_match = false;
         if (!extras_match) { ++diag.blocks_rejected; continue; }
         // Verify every adjacent block transposition as an automorphism.
         bool verified = true;
@@ -254,6 +261,7 @@ std::vector<Orbitope> detect_orbitopes(const model::LpProblem& lp,
                     img.entries.emplace_back(image[sz(c)] >= 0 ? image[sz(c)] : c, v);
                 std::sort(img.entries.begin(), img.entries.end());
                 work += 2 * img.entries.size();
+                core::work_add(2 * img.entries.size(), core::WorkTag::Symmetry);
                 bool found = false;
                 const auto range = by_hash.equal_range(hash_row(img));
                 for (auto it = range.first; it != range.second && !found; ++it)
@@ -283,7 +291,7 @@ std::vector<Orbitope> detect_orbitopes(const model::LpProblem& lp,
         diag.orbitope_blocks += k;
         out.push_back(std::move(orb));
     }
-    core::work_add(work, core::WorkTag::Symmetry);
+
     diag.ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     return out;
 }
@@ -302,9 +310,8 @@ bool orbitopal_fixing(const Orbitope& orb, std::vector<f64>& lo, std::vector<f64
             if (c > bound) {
                 if (lo[sz(j)] > 0.5) return false;   // its one sits past the bound
                 if (hi[sz(j)] > 0.5) {
-                    if (trail) trail->push(j, BoundDir::Upper, 0.0, hi[sz(j)],
-                                           ReasonKind::Symmetry, -1, depth);
-                    hi[sz(j)] = 0.0;
+                    write_domain_bound(lo, hi, j, BoundDir::Upper, 0.0,
+                                       trail, {ReasonKind::Symmetry, -1, depth});
                     ++fixed;
                     if (changed) changed->push_back(j);
                 }

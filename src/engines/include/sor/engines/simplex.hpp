@@ -649,6 +649,10 @@ struct SimplexDiagnostics {
     // (exit_refactor_by_economy) instead of a rebuild.
     std::uint64_t exit_rederives = 0;
     std::uint64_t partition_moved_columns = 0;
+    // Session warm starts where xB was continued from the previous solve by
+    // a sparse bound-delta FTRAN rather than a full nonbasic RHS rebuild.
+    std::uint64_t bound_delta_xB = 0;
+    std::uint64_t bound_delta_prices = 0;
     // 1 if this solve adopted a carried factorization (skipped the initial
     // do_factorize()), 0 otherwise. Distinguishes "carrier supplied but
     // rejected" (basis/dims/token mismatch -> fell back to a full factorize,
@@ -807,10 +811,11 @@ void install_simplex_work_totals(SimplexDiagnostics& chosen,
                                  const SimplexDiagnostics& total);
 
 // One prepared LP (scaling, column-wise matrix, tolerances) re-solved for a
-// sequence of OBJECTIVES over the same rows and bounds -- what a feasibility
-// pump does every round. A cost change leaves the basis primal feasible, so
-// each solve is a warm PRIMAL simplex from the previous basis; nothing is
-// rebuilt or re-scaled between rounds.
+// sequence of objectives and bound/row-side edits over a fixed matrix.
+// Retains preparation, work arrays, the equality point, pricing history and
+// the numerical basis factorization. Cost-only edits
+// preserve primal feasibility; side/bound edits enter primal phase I whenever
+// the continued equality solution is outside the new box.
 class PrimalCostSession {
 public:
     PrimalCostSession(const model::LpProblem& problem, const SimplexOptions& opts);
@@ -825,6 +830,10 @@ public:
     // Replace all column bounds (O(n), the transform prepare applies).
     void set_column_bounds(const std::vector<core::f64>& lo,
                            const std::vector<core::f64>& hi);
+
+    // Replace row sides without rebuilding the matrix or its factorization.
+    void set_row_bounds(const std::vector<core::f64>& lo,
+                        const std::vector<core::f64>& hi);
 
     // Solve from `warm` (empty / null: cold). The basis reached is returned in
     // `out_basis` for the next round.

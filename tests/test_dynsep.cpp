@@ -27,6 +27,7 @@ using sor::search::DynSepRoundInput;
 using sor::search::MilpPolicy;
 using sor::search::SepFamily;
 using sor::search::apply_dynsep_policy;
+using sor::search::clamp_dynsep_to_cut_flags;
 using sor::search::dynsep_forward;
 using sor::search::dynsep_prefer_gnn;
 using sor::search::fit_dynsep_imitation;
@@ -41,8 +42,9 @@ void test_policy_gates() {
     DynSepOptions latest;
     apply_dynsep_policy(MilpPolicy::Latest, latest);
     CHECK(latest.enabled);
-    CHECK(latest.allow_zerohalf);
-    CHECK(latest.allow_flowcover);
+    // ZH/flow are opt-in via BabOptions (or auto_cuts), not DynSep defaults.
+    CHECK(!latest.allow_zerohalf);
+    CHECK(!latest.allow_flowcover);
     CHECK(latest.backend == DynSepBackend::Auto);
 
     DynSepOptions classical = latest;
@@ -51,6 +53,18 @@ void test_policy_gates() {
     CHECK(!classical.allow_zerohalf);
     CHECK(!classical.allow_flowcover);
     CHECK(classical.backend == DynSepBackend::Ucb);
+
+    DynSepOptions unauthorized = latest;
+    unauthorized.allow_zerohalf = true;
+    unauthorized.allow_flowcover = true;
+    unauthorized.allow_mir = true;
+    clamp_dynsep_to_cut_flags(unauthorized, /*mir=*/false, /*cover=*/false,
+                              /*clique=*/false, /*implied_bound=*/true,
+                              /*zerohalf=*/false, /*flowcover=*/false);
+    CHECK(!unauthorized.allow_zerohalf);
+    CHECK(!unauthorized.allow_flowcover);
+    CHECK(!unauthorized.allow_mir);
+    CHECK(unauthorized.allow_ib);
 }
 
 void test_bandit_schedules_baseline_and_optional() {

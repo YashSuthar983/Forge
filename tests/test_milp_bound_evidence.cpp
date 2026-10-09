@@ -74,6 +74,8 @@ void test_strong_branch_child_certificates_close_gap() {
     const auto oracle = solve_oracle(lp);
     CHECK(oracle.feasible);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Isolate the LP/tree service from the exact root oracle.
+    opts.component_solve = false;  // Exercise this model's LP/tree diagnostics.
     opts.para_bab.threads = 1;
     opts.structural_presolve.enabled = false;
     opts.time_limit_s = 0.0;
@@ -140,6 +142,8 @@ void test_interrupted_node_lps_stay_sound() {
         lp.obj_offset = static_cast<double>(static_cast<int>(seed % 7) - 3);
         const auto oracle = solve_oracle(lp);
         BabOptions o;
+        o.structural_presolve.binary_row_max_work = 0;  // Isolate the LP/tree service from the exact root oracle.
+        o.component_solve = false;  // Exercise this model's LP/tree diagnostics.
         o.para_bab.threads = 1;
         o.structural_presolve.enabled = false;
         o.time_limit_s = 0.0;           // node LPs end on pivots, not on time
@@ -220,6 +224,8 @@ void test_root_certificate_floors_final_bound() {
     const auto lp = sor::io::read_mps(in, rep);
     for (const std::uint64_t nodes : {1ull, 2ull, 25ull}) {
         BabOptions o;
+        o.structural_presolve.binary_row_max_work = 0;  // Isolate the LP/tree service from the exact root oracle.
+        o.component_solve = false;  // Exercise this model's LP/tree diagnostics.
         o.para_bab.threads = 1;
         o.max_nodes = nodes;
         o.time_limit_s = 1000.0;

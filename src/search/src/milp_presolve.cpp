@@ -1,7 +1,9 @@
 #include "sor/search/milp_presolve.hpp"
 #include "aggregate_presolve.hpp"
+#include "sor/search/column_dominance.hpp"
 #include "sor/core/work_clock.hpp"
 #include "sor/search/propagate.hpp"
+#include "sor/search/domain_writer.hpp"
 #include "binary_substitution.hpp"
 #include "column_merge.hpp"
 
@@ -30,9 +32,6 @@ inline bool two_sum_exact(f64 a, f64 b, f64& sum) {
     return (a - av) + (b - bv) == 0.0;
 }
 
-inline bool nearly_eq(f64 a, f64 b, f64 tol) {
-    return std::isfinite(a) && std::isfinite(b) && std::fabs(a - b) <= tol;
-}
 
 }  // namespace
 
@@ -49,6 +48,17 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
     const Index m0 = lp.n_rows();
 
     std::vector<f64> col_lo = lp.col_lo, col_hi = lp.col_hi;
+    // Dominance tightens the working box before the fixed-column sweep so a
+    // newly dominated binary (hi -> 0 with lo already 0) is eliminated as a
+    // fixed column on the first round, through the same journal path.
+    if (opts.column_dominance) {
+        ColumnDominanceOptions dopts;
+        dopts.tol = opts.tol;
+        ColumnDominanceDiagnostics ddiag;
+        const auto nfix =
+            apply_binary_column_dominance(lp, col_lo, col_hi, dopts, &ddiag);
+        stats.dominated_cols += static_cast<int>(nfix);
+    }
     std::vector<f64> row_lo = lp.row_lo, row_hi = lp.row_hi;
     std::vector<char> col_dead(sz(n0), 0);
     std::vector<char> row_dead(sz(m0), 0);
@@ -370,13 +380,25 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
             std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     };
 
+    // Integrality defines the exact domain hull, irrespective of row/LP
+    // feasibility tolerances. All later fixings are inside this hull.
+    for (Index j = 0; j < n0; ++j) {
+        if (have_int && lp.is_integer[sz(j)]) {
+            col_lo[sz(j)] = std::ceil(col_lo[sz(j)]);
+            col_hi[sz(j)] = std::floor(col_hi[sz(j)]);
+        }
+        if (col_lo[sz(j)] > col_hi[sz(j)]) { mark_infeasible(); return out; }
+    }
+    for (Index i = 0; i < m0; ++i)
+        if (row_lo[sz(i)] > row_hi[sz(i)]) { mark_infeasible(); return out; }
+
     bool changed = true;
     const auto out_of_time = [&]() {
-        return opts.time_limit_s > 0.0 &&
-               std::chrono::duration<double>(Clock::now() - t0).count() > opts.time_limit_s;
+        return core::cancel_requested(opts.cancel) || (opts.time_limit_s > 0.0 &&
+               std::chrono::duration<double>(Clock::now() - t0).count() > opts.time_limit_s);
     };
     while (changed && stats.rounds < opts.max_rounds) {
-        if (stats.rounds > 0 && out_of_time()) {
+        if (out_of_time()) {
             ++stats.rounds_stopped_on_time;
             break;
         }
@@ -407,145 +429,77 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
             const int cap = live_nnz == 0 ? 0
                 : static_cast<int>(std::min<std::uint64_t>(
                       static_cast<std::uint64_t>(rounds_left), work_left / live_nnz));
-            const f64 kHuge = 1e9;   // a derived bound beyond this is noise, not information
             for (int sweep = 0; sweep < cap; ++sweep) {
                 std::uint64_t tightened_now = 0;
-                std::uint64_t rescan_work = 0;
                 for (Index i = 0; i < m0; ++i) {
                     if (row_dead[sz(i)]) continue;
                     const auto& row = rows[sz(i)];
                     if (row.empty()) continue;
                     const f64 rl = row_lo[sz(i)], rh = row_hi[sz(i)];
-                    // The row's activity range: finite parts, count of
-                    // infinite contributions (and the column behind a lone
-                    // one), and the magnitude every rounding error in the
-                    // sums is bounded by. `ops` counts the terms that went
-                    // into the sums: the row once, plus two per incremental
-                    // update below.
-                    f64 min_fin = 0.0, max_fin = 0.0;
-                    int min_inf = 0, max_inf = 0;
-                    Index min_culprit = -1, max_culprit = -1;
-                    f64 row_min_abs = 0.0, row_max_abs = 0.0;
-                    std::size_t ops = 0;
-                    const auto scan_row = [&]() {
-                        min_fin = max_fin = 0.0;
-                        min_inf = max_inf = 0;
-                        row_min_abs = row_max_abs = 0.0;
-                        for (const auto& [j, a] : row) {
-                            const f64 lo = col_lo[sz(j)], hi = col_hi[sz(j)];
-                            const f64 lo_side = a > 0.0 ? lo : hi;     // minimises a*x
-                            const f64 hi_side = a > 0.0 ? hi : lo;     // maximises a*x
-                            if (std::isfinite(lo_side)) { min_fin += a * lo_side; row_min_abs += std::fabs(a * lo_side); }
-                            else { ++min_inf; min_culprit = j; }
-                            if (std::isfinite(hi_side)) { max_fin += a * hi_side; row_max_abs += std::fabs(a * hi_side); }
-                            else { ++max_inf; max_culprit = j; }
-                        }
-                        ops = row.size();
-                    };
-                    scan_row();
+                    // Exact dyadic activities survive cancellation and large
+                    // domains. Finite parts update in O(1) exact products; the
+                    // counts and sums identify a lone infinite contributor.
+                    model::DyadicSum minimum, maximum;
+                    std::uint64_t min_columns = 0, max_columns = 0;
+                    Index min_inf = 0, max_inf = 0;
                     for (const auto& [j, a] : row) {
-                        if (a == 0.0 || !std::isfinite(a)) continue;
+                        if (a == 0) continue;
+                        const f64 l = a > 0 ? col_lo[sz(j)] : col_hi[sz(j)];
+                        const f64 h = a > 0 ? col_hi[sz(j)] : col_lo[sz(j)];
+                        if (std::isfinite(l)) minimum.add_product(a, l);
+                        else { ++min_inf; min_columns += static_cast<std::uint64_t>(j); }
+                        if (std::isfinite(h)) maximum.add_product(a, h);
+                        else { ++max_inf; max_columns += static_cast<std::uint64_t>(j); }
+                    }
+                    for (const auto& [j, a] : row) {
+                        if (core::cancel_requested(opts.cancel)) break;
+                        if (a == 0) continue;
                         const f64 lo = col_lo[sz(j)], hi = col_hi[sz(j)];
-                        const f64 lo_side = a > 0.0 ? lo : hi;
-                        const f64 hi_side = a > 0.0 ? hi : lo;
-                        // Residual activities: everything but column j's own term.
-                        bool have_rmin = false, have_rmax = false;
-                        f64 rmin = 0.0, rmax = 0.0;
-                        if (min_inf == 0) { rmin = min_fin - a * lo_side; have_rmin = true; }
-                        else if (min_inf == 1 && min_culprit == j) { rmin = min_fin; have_rmin = true; }
-                        if (max_inf == 0) { rmax = max_fin - a * hi_side; have_rmax = true; }
-                        else if (max_inf == 1 && max_culprit == j) { rmax = max_fin; have_rmax = true; }
-                        f64 new_lo = -std::numeric_limits<f64>::infinity();
-                        f64 new_hi = std::numeric_limits<f64>::infinity();
-                        // Each implied value is widened by the binary64 error
-                        // budget of the sums it came from (not a fixed
-                        // tolerance: a coarse one keeps a bound from ever
-                        // landing exactly on a point, so nothing gets fixed).
-                        const f64 fac = (4.0 * static_cast<f64>(ops) + 8.0) *
-                                        std::numeric_limits<f64>::epsilon();
-                        const f64 inf = std::numeric_limits<f64>::infinity();
-                        // a x + rmin <= ... <= rh  ->  a x <= rh - rmin
-                        if (std::isfinite(rh) && have_rmin) {
-                            const f64 v = (rh - rmin) / a;
-                            const f64 e = fac * ((row_min_abs + std::fabs(rh)) / std::fabs(a) + std::fabs(v));
-                            if (a > 0.0) new_hi = std::nextafter(v + e, inf);
-                            else new_lo = std::nextafter(v - e, -inf);
+                        const f64 l = a > 0 ? lo : hi, h = a > 0 ? hi : lo;
+                        f64 new_lo = -model::kInf, new_hi = model::kInf;
+                        const bool have_min = min_inf == 0 ||
+                            (min_inf == 1 && min_columns == static_cast<std::uint64_t>(j));
+                        const bool have_max = max_inf == 0 ||
+                            (max_inf == 1 && max_columns == static_cast<std::uint64_t>(j));
+                        if (std::isfinite(rh) && have_min) {
+                            auto residual = minimum;
+                            if (std::isfinite(l)) residual.add_product(-a, l);
+                            residual.negate(); residual.add(rh); residual.add(std::max(0.0, opts.tol));
+                            if (a > 0) new_hi = residual.quotient_up(a);
+                            else new_lo = residual.quotient_down(a);
                         }
-                        // rl <= a x + rest <= a x + rmax  ->  a x >= rl - rmax
-                        if (std::isfinite(rl) && have_rmax) {
-                            const f64 v = (rl - rmax) / a;
-                            const f64 e = fac * ((row_max_abs + std::fabs(rl)) / std::fabs(a) + std::fabs(v));
-                            if (a > 0.0) new_lo = std::max(new_lo, std::nextafter(v - e, -inf));
-                            else new_hi = std::min(new_hi, std::nextafter(v + e, inf));
+                        if (std::isfinite(rl) && have_max) {
+                            auto residual = maximum;
+                            if (std::isfinite(h)) residual.add_product(-a, h);
+                            residual.negate(); residual.add(rl); residual.add(-std::max(0.0, opts.tol));
+                            if (a > 0) new_lo = residual.quotient_down(a);
+                            else new_hi = residual.quotient_up(a);
                         }
-                        const bool is_int = lp.is_integer[sz(j)];
-                        if (is_int) {
-                            if (std::isfinite(new_lo)) new_lo = std::ceil(new_lo - opts.tol);
-                            if (std::isfinite(new_hi)) new_hi = std::floor(new_hi + opts.tol);
+                        if (lp.is_integer[sz(j)]) {
+                            new_lo = std::ceil(new_lo); new_hi = std::floor(new_hi);
                         }
-                        if (std::fabs(new_lo) > kHuge) new_lo = -std::numeric_limits<f64>::infinity();
-                        if (std::fabs(new_hi) > kHuge) new_hi = std::numeric_limits<f64>::infinity();
-                        // A move is worth taking when it is a real fraction of the
-                        // column's range (or the first finite bound): sub-percent
-                        // creep on a continuous column can run for thousands of
-                        // sweeps without changing anything that matters.
-                        const auto meaningful = [&](f64 old_b, f64 nb, bool lower) {
-                            if (!std::isfinite(nb)) return false;
-                            if (lower ? nb <= old_b : nb >= old_b) return false;
-                            if (!std::isfinite(old_b)) return true;
-                            if (is_int) return true;
-                            const f64 range = std::isfinite(col_hi[sz(j)]) && std::isfinite(col_lo[sz(j)])
-                                ? col_hi[sz(j)] - col_lo[sz(j)] : 1.0 + std::fabs(old_b);
-                            return std::fabs(nb - old_b) > 1e-3 * range;
+                        const bool lower = write_domain_bound(col_lo, col_hi, j, BoundDir::Lower,
+                            new_lo, nullptr, {});
+                        const bool upper = write_domain_bound(col_lo, col_hi, j, BoundDir::Upper,
+                            new_hi, nullptr, {});
+                        if (!(lower || upper)) continue;
+                        ++tightened_now;
+                        if (col_lo[sz(j)] > col_hi[sz(j)]) { mark_infeasible(); return out; }
+                        const auto shift = [&](f64 old_side, f64 new_side, model::DyadicSum& sum,
+                                               Index& infinite, std::uint64_t& columns) {
+                            if (old_side == new_side) return;
+                            if (std::isfinite(old_side)) sum.add_product(-a, old_side);
+                            else { --infinite; columns -= static_cast<std::uint64_t>(j); }
+                            if (std::isfinite(new_side)) sum.add_product(a, new_side);
+                            else { ++infinite; columns += static_cast<std::uint64_t>(j); }
                         };
-                        bool moved = false;
-                        if (meaningful(lo, new_lo, true)) { col_lo[sz(j)] = new_lo; moved = true; }
-                        if (meaningful(hi, new_hi, false)) { col_hi[sz(j)] = new_hi; moved = true; }
-                        if (moved) {
-                            ++tightened_now;
-                            if (col_lo[sz(j)] > col_hi[sz(j)] + opts.tol * (1.0 + std::fabs(col_hi[sz(j)]))) {
-                                mark_infeasible();
-                                return out;
-                            }
-                            // The row's activity changed with this bound: move
-                            // column j's term for the columns still to come in
-                            // this row. Rescanning the row after every move was
-                            // quadratic in the row length and left the
-                            // magnitudes (the error budget) stale. An update
-                            // adds both terms' magnitudes and two terms to
-                            // `ops`, so the budget still bounds every rounding
-                            // in the sums. A rescan is needed only when a
-                            // second infinite contribution goes and the one
-                            // left is unknown, or when the updates outgrow the
-                            // row (keeps the budget near the fresh one).
-                            const f64 nlo_side = a > 0.0 ? col_lo[sz(j)] : col_hi[sz(j)];
-                            const f64 nhi_side = a > 0.0 ? col_hi[sz(j)] : col_lo[sz(j)];
-                            bool rescan = false;
-                            const auto shift = [&](f64 old_s, f64 new_s, f64& fin, int& n_inf,
-                                                   f64& abs_sum) {
-                                if (old_s == new_s) return;
-                                if (std::isfinite(old_s)) {
-                                    fin -= a * old_s;
-                                    abs_sum += std::fabs(a * old_s);
-                                } else if (--n_inf == 1) {
-                                    rescan = true;
-                                }
-                                fin += a * new_s;
-                                abs_sum += std::fabs(a * new_s);
-                            };
-                            shift(lo_side, nlo_side, min_fin, min_inf, row_min_abs);
-                            shift(hi_side, nhi_side, max_fin, max_inf, row_max_abs);
-                            ops += 2;
-                            if (rescan || ops > 2 * row.size() + 8) {
-                                scan_row();
-                                rescan_work += row.size();
-                            }
-                        }
+                        shift(l, a > 0 ? col_lo[sz(j)] : col_hi[sz(j)], minimum, min_inf, min_columns);
+                        shift(h, a > 0 ? col_hi[sz(j)] : col_lo[sz(j)], maximum, max_inf, max_columns);
                     }
                 }
                 stats.structural_fbbt_rounds += 1;
                 stats.structural_fbbt_work += live_nnz;
-                core::work_add(static_cast<std::uint64_t>(live_nnz) + rescan_work,
+                core::work_add(static_cast<std::uint64_t>(live_nnz),
                                ::sor::core::WorkTag::MilpPresolve);
                 stats.structural_fbbt_tightenings += tightened_now;
                 if (tightened_now > 0) changed = true;
@@ -582,12 +536,6 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
                 note_fixed(j, lo, hi, lo);
                 fix_column(j, lo);
                 changed = true;
-            } else if (have_int && lp.is_integer[sz(j)] &&
-                       nearly_eq(lo, hi, opts.tol) &&
-                       std::fabs(lo - std::round(lo)) <= opts.tol) {
-                note_fixed(j, lo, hi, std::round(lo));
-                fix_column(j, std::round(lo));
-                changed = true;
             } else if (!(have_int && lp.is_integer[sz(j)]) && std::isfinite(lo) &&
                        std::isfinite(hi) && hi - lo <= 1e-12 * (1.0 + std::fabs(lo))) {
                 f64 v = 0.0;
@@ -608,8 +556,8 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
         for (Index i = 0; i < m0; ++i) {
             if (row_dead[sz(i)] || !rows[sz(i)].empty()) continue;
             const f64 lo = row_lo[sz(i)], hi = row_hi[sz(i)];
-            if ((std::isfinite(lo) && lo > opts.tol) ||
-                (std::isfinite(hi) && hi < -opts.tol)) {
+            if ((std::isfinite(lo) && lo > 0.0) ||
+                (std::isfinite(hi) && hi < 0.0)) {
                 mark_infeasible();
                 return out;
             }
@@ -680,10 +628,10 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
             if (have_int && lp.is_integer[sz(j)]) {
                 // Outward bounds of a row that stays: the integer hull of what
                 // the row admits within the tolerance.
-                if (std::isfinite(new_lo) && !ex_lo) new_lo = std::ceil(new_lo - opts.tol);
-                if (std::isfinite(new_hi) && !ex_hi) new_hi = std::floor(new_hi + opts.tol);
+                if (std::isfinite(new_lo) && !ex_lo) new_lo = std::ceil(new_lo);
+                if (std::isfinite(new_hi) && !ex_hi) new_hi = std::floor(new_hi);
             }
-            if (new_lo > new_hi + opts.tol) {
+            if (new_lo > new_hi) {
                 mark_infeasible();
                 return out;
             }
@@ -995,31 +943,17 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
         clean_rows();
     }
 
-    // Bounds and row sides that crossed by less than the tolerance (the
-    // per-step checks only reject a crossing beyond it) would make the
-    // reduced model fail LpProblem::validate() and hide a point the
-    // original admits. Collapse them to one value; beyond the tolerance the
-    // model really is infeasible.
-    for (Index j = 0; j < n0; ++j) {
-        if (col_dead[sz(j)] || !(col_lo[sz(j)] > col_hi[sz(j)])) continue;
-        const f64 gap = col_lo[sz(j)] - col_hi[sz(j)];
-        if (gap > opts.tol * (1.0 + std::fabs(col_hi[sz(j)]))) {
-            mark_infeasible();
-            return out;
+    // Sound outward deductions cannot cross on a nonempty domain. A
+    // crossing is an infeasibility proof; replacing it by a midpoint would
+    // invent a domain the original model never had.
+    for (Index j = 0; j < n0; ++j)
+        if (!col_dead[sz(j)] && col_lo[sz(j)] > col_hi[sz(j)]) {
+            mark_infeasible(); return out;
         }
-        f64 v = 0.5 * (col_lo[sz(j)] + col_hi[sz(j)]);
-        if (have_int && lp.is_integer[sz(j)]) v = std::round(v);
-        col_lo[sz(j)] = col_hi[sz(j)] = v;
-    }
-    for (Index i = 0; i < m0; ++i) {
-        if (row_dead[sz(i)] || !(row_lo[sz(i)] > row_hi[sz(i)])) continue;
-        const f64 gap = row_lo[sz(i)] - row_hi[sz(i)];
-        if (gap > opts.tol * (1.0 + std::fabs(row_hi[sz(i)]))) {
-            mark_infeasible();
-            return out;
+    for (Index i = 0; i < m0; ++i)
+        if (!row_dead[sz(i)] && row_lo[sz(i)] > row_hi[sz(i)]) {
+            mark_infeasible(); return out;
         }
-        row_lo[sz(i)] = row_hi[sz(i)] = 0.5 * (row_lo[sz(i)] + row_hi[sz(i)]);
-    }
 
     // Assemble the reduced problem: surviving columns/rows, remapped to a
     // compact index space, plus the postsolve map for eliminated columns.
@@ -1044,6 +978,7 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
         new_row_of[sz(i)] = m1;
         ++m1;
     }
+    out.reduced_row = new_row_of;
 
     model::LpProblem& red = out.reduced;
     red.name = lp.name;
@@ -1132,6 +1067,8 @@ static MilpPresolveResult structural_core(const model::LpProblem& lp,
 }
 
 void compose_presolve(MilpPresolveResult& outer, MilpPresolveResult inner) {
+    for (auto& r : outer.reduced_row)
+        if (r >= 0) r = inner.reduced_row.at(sz(r));
     std::vector<Index> original_of_reduced(sz(outer.reduced.n_cols()), -1);
     for (Index j = 0; j < static_cast<Index>(outer.reduced_col.size()); ++j)
         if (outer.reduced_col[sz(j)] >= 0)
@@ -1189,6 +1126,7 @@ void add_core_stats(MilpPresolveStats& total, const MilpPresolveStats& part) {
     total.binary_assignments_checked += part.binary_assignments_checked;
     total.binary_row_work += part.binary_row_work;
     total.binary_row_fixings += part.binary_row_fixings;
+    total.dominated_cols += part.dominated_cols;
 }
 
 // Independent monotonicity proof, not a probing inference: the only row that
@@ -1246,7 +1184,7 @@ MilpPresolveResult run_structural_presolve(const model::LpProblem& lp,
     core::WorkScope work_scope_(core::WorkCat::Presolve);
     const auto start = Clock::now();
     auto out = structural_core(lp, opts, stats);
-    if (!out.infeasible && opts.monotone_binary_pairs && opts.max_rounds > 0) {
+    if (!out.infeasible && !core::cancel_requested(opts.cancel) && opts.monotone_binary_pairs && opts.max_rounds > 0) {
         const auto relations = saturate_monotone_binary_pairs(out.reduced, stats);
         if (!relations.empty()) {
             auto substituted = detail::substitute_binary_relations(out.reduced, relations, stats);
@@ -1269,12 +1207,13 @@ MilpPresolveResult run_structural_presolve(const model::LpProblem& lp,
     }
     ConflictGraph guide_graph;
     bool guide_changed_box = false;
-    if (!out.infeasible && opts.graph_support_propagation &&
+    if (!out.infeasible && !core::cancel_requested(opts.cancel) && opts.graph_support_propagation &&
         opts.row_probe.enabled && out.reduced.n_cols() > 0) {
         const auto tguide = Clock::now();
         auto& p = out.reduced;
         auto lo = p.col_lo, hi = p.col_hi;
         ProbingOptions po = opts.graph_probe;
+        po.cancel = opts.cancel;
         po.dual_fix_in_probing = false;
         const auto gd = build_conflict_graph(p, lo, hi, guide_graph, po);
         stats.row_probe_graph_edges = guide_graph.n_edges();
@@ -1288,9 +1227,10 @@ MilpPresolveResult run_structural_presolve(const model::LpProblem& lp,
         }
     }
     const auto probe_start = Clock::now();
-    for (int pass = 0; !out.infeasible && opts.max_rounds > 0 && opts.row_probe.enabled &&
+    for (int pass = 0; !out.infeasible && !core::cancel_requested(opts.cancel) && opts.max_rounds > 0 && opts.row_probe.enabled &&
          pass < opts.row_probe_max_passes && out.reduced.n_cols() > 0; ++pass) {
         RowSupportProbeOptions po = opts.row_probe;
+        po.cancel = opts.cancel;
         po.tol = opts.tol;
         po.max_total_row_visits -= std::min(po.max_total_row_visits, stats.row_probe_visits);
         if (po.max_total_row_visits == 0) { stats.row_probe_truncated = true; break; }
@@ -1350,12 +1290,13 @@ MilpPresolveResult run_structural_presolve(const model::LpProblem& lp,
         if (core.infeasible) out.infeasible = stats.infeasible = true;
         else compose_presolve(out, std::move(core));
     }
-    if (!out.infeasible && opts.graph_relation_probe && out.reduced.n_cols() > 0) {
+    if (!out.infeasible && !core::cancel_requested(opts.cancel) && opts.graph_relation_probe && out.reduced.n_cols() > 0) {
         const auto graph_start = Clock::now();
         auto& p = out.reduced;
         auto lo = p.col_lo, hi = p.col_hi;
         ConflictGraph graph;
         ProbingOptions po = opts.graph_probe;
+        po.cancel = opts.cancel;
         po.dual_fix_in_probing = false;  // equivalence must hold for all feasible points
         const auto gd = build_conflict_graph(p, lo, hi, graph, po);
         stats.graph_probe_edges = graph.n_edges();
@@ -1405,7 +1346,7 @@ MilpPresolveResult run_structural_presolve(const model::LpProblem& lp,
     std::vector<Index> carried_snapshot;   // original column -> probed-model column
     std::size_t carried_merges = 0;
     bool have_carry = false;
-    if (!out.infeasible && opts.probing_presolve && opts.max_rounds > 0 &&
+    if (!out.infeasible && !core::cancel_requested(opts.cancel) && opts.probing_presolve && opts.max_rounds > 0 &&
         opts.probing_presolve_time_s > 0.0 && out.reduced.n_cols() > 1 &&
         !out.reduced.is_integer.empty()) {
         const auto tprobe = Clock::now();
@@ -1414,6 +1355,7 @@ MilpPresolveResult run_structural_presolve(const model::LpProblem& lp,
         ConflictGraph graph;
         ProbingState pstate;
         ProbingOptions po = opts.graph_probe;
+        po.cancel = opts.cancel;
         po.dual_fix_in_probing = false;   // every feasible point must survive
         po.probe_time_limit_s = opts.probing_presolve_time_s;
         const auto pd = build_conflict_graph(p, lo, hi, graph, po, &pstate);
@@ -1443,7 +1385,7 @@ MilpPresolveResult run_structural_presolve(const model::LpProblem& lp,
             else compose_presolve(out, std::move(core));
         }
     }
-    if (!out.infeasible && opts.merge_duplicate_columns && opts.max_rounds > 0 &&
+    if (!out.infeasible && !core::cancel_requested(opts.cancel) && opts.merge_duplicate_columns && opts.max_rounds > 0 &&
         out.reduced.n_cols() > 1) {
         MilpPresolveStats ms;
         auto merged = detail::merge_duplicate_columns(out.reduced, ms);
@@ -1464,7 +1406,7 @@ MilpPresolveResult run_structural_presolve(const model::LpProblem& lp,
             else compose_presolve(out, std::move(core));
         }
     }
-    if (!out.infeasible && opts.aggregation && opts.max_rounds > 0 && out.reduced.n_cols() > 1) {
+    if (!out.infeasible && !core::cancel_requested(opts.cancel) && opts.aggregation && opts.max_rounds > 0 && out.reduced.n_cols() > 1) {
         MilpPresolveStats as;
         auto agg = detail::aggregate_equalities(out.reduced, opts, as);
         stats.aggregated_cols += as.aggregated_cols;

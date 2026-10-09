@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <exception>
 #if defined(__linux__)
 #include <sched.h>
 #endif
@@ -54,12 +55,22 @@ struct ThreadPool::Impl {
     // sense-reversing barrier
     std::atomic<int> bar_count{0};
     std::atomic<int> bar_sense{0};
+    std::atomic<bool> failed{false};
+    std::exception_ptr error;       // guarded by mu; published by failed
 };
 
 ThreadPool::ThreadPool(int n_threads) : impl_(new Impl) {
     n_ = n_threads <= 0 ? default_thread_count() : n_threads;
-    impl_->threads.reserve(static_cast<std::size_t>(n_ - 1));
-    for (int i = 1; i < n_; ++i) impl_->threads.emplace_back([this, i] { worker_loop(i); });
+    try {
+        impl_->threads.reserve(static_cast<std::size_t>(n_ - 1));
+        for (int i = 1; i < n_; ++i) impl_->threads.emplace_back([this, i] { worker_loop(i); });
+    } catch (...) {
+        { std::lock_guard<std::mutex> lock(impl_->mu); impl_->stop = true; }
+        impl_->cv.notify_all();
+        for (auto& thread : impl_->threads) thread.join();
+        delete impl_;
+        throw;
+    }
 }
 
 ThreadPool::~ThreadPool() {
@@ -73,6 +84,18 @@ ThreadPool::~ThreadPool() {
 }
 
 bool ThreadPool::in_job() noexcept { return t_in_job; }
+
+void ThreadPool::invoke_job(const std::function<void(int)>& job, int id) {
+    const bool previous = t_in_job;
+    t_in_job = true;
+    try { job(id); }
+    catch (...) {
+        std::lock_guard<std::mutex> lock(impl_->mu);
+        if (!impl_->error) impl_->error = std::current_exception();
+        impl_->failed.store(true, std::memory_order_release);
+    }
+    t_in_job = previous;
+}
 
 void ThreadPool::worker_loop(int id) {
     std::uint64_t seen = 0;
@@ -88,9 +111,7 @@ void ThreadPool::worker_loop(int id) {
             workers = impl_->job_workers;
         }
         if (id < workers) {
-            t_in_job = true;
-            (*job)(id);
-            t_in_job = false;
+            invoke_job(*job, id);
             impl_->remaining.fetch_sub(1, std::memory_order_acq_rel);
         }
     }
@@ -100,32 +121,31 @@ void ThreadPool::run(int workers, const std::function<void(int)>& f) {
     workers = std::clamp(workers, 1, n_);
     if (workers == 1 || t_in_job) {
         // Serial: a nested job, or one worker.  barrier() is a no-op then.
-        const bool was = t_in_job;
-        t_in_job = true;
-        ++t_serial;
+        struct SerialScope {
+            bool previous = t_in_job;
+            SerialScope() { t_in_job = true; ++t_serial; }
+            ~SerialScope() { --t_serial; t_in_job = previous; }
+        } scope;
         f(0);
-        --t_serial;
-        t_in_job = was;
         return;
     }
-    // Jobs must not throw: an exception escaping f on a helper thread would
-    // terminate the process (the LDL' kernels never throw inside a job).
     std::lock_guard<std::mutex> run_lock(impl_->run_mu);
     impl_->remaining.store(workers - 1, std::memory_order_relaxed);
     impl_->bar_count.store(0, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lk(impl_->mu);
+        impl_->error = {};
+        impl_->failed.store(false, std::memory_order_relaxed);
         impl_->job = &f;
         impl_->job_workers = workers;
         ++impl_->generation;
     }
     impl_->cv.notify_all();
-    t_in_job = true;
-    f(0);
-    t_in_job = false;
+    invoke_job(f, 0);
     Backoff b;
     while (impl_->remaining.load(std::memory_order_acquire) != 0) b.pause();
-    impl_->job_workers = 1;
+    { std::lock_guard<std::mutex> lock(impl_->mu); impl_->job_workers = 1; }
+    if (impl_->error) std::rethrow_exception(impl_->error);
 }
 
 void ThreadPool::barrier() {
@@ -137,7 +157,13 @@ void ThreadPool::barrier() {
         impl_->bar_sense.store(sense ^ 1, std::memory_order_release);
     } else {
         Backoff b;
-        while (impl_->bar_sense.load(std::memory_order_acquire) == sense) b.pause();
+        while (impl_->bar_sense.load(std::memory_order_acquire) == sense &&
+               !impl_->failed.load(std::memory_order_acquire)) b.pause();
+    }
+    if (impl_->failed.load(std::memory_order_acquire)) {
+        std::exception_ptr error;
+        { std::lock_guard<std::mutex> lock(impl_->mu); error = impl_->error; }
+        std::rethrow_exception(error);
     }
 }
 

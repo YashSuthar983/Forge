@@ -4,9 +4,29 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <locale>
 #include <sstream>
+#include <stdexcept>
 
 namespace sor::search {
+
+void refresh_scoped_row_bounds(model::LpProblem& workspace,
+                               const model::LpProblem& global,
+                               const std::vector<CutRow>& scoped) {
+    const auto prefix = static_cast<std::size_t>(global.n_rows());
+    const auto rows = prefix + scoped.size();
+    if (workspace.n_cols() != global.n_cols() ||
+        static_cast<std::size_t>(workspace.n_rows()) != rows ||
+        workspace.row_lo.size() != rows || workspace.row_hi.size() != rows ||
+        global.row_lo.size() != prefix || global.row_hi.size() != prefix)
+        throw std::logic_error("scoped LP row layout changed without matrix invalidation");
+    std::copy(global.row_lo.begin(), global.row_lo.end(), workspace.row_lo.begin());
+    std::copy(global.row_hi.begin(), global.row_hi.end(), workspace.row_hi.begin());
+    for (std::size_t q = 0; q < scoped.size(); ++q) {
+        workspace.row_lo[prefix + q] = scoped[q].row_lo;
+        workspace.row_hi[prefix + q] = scoped[q].row_hi;
+    }
+}
 namespace {
 
 std::uint64_t splitmix64(std::uint64_t& s) {
@@ -97,19 +117,18 @@ std::vector<CutRow> managed_to_rows(const std::vector<ManagedCut>& cuts) {
     return rows;
 }
 
-// Six significant digits, not an exact encoding of the inequality. Callers
-// must not treat an id match as proof that two cuts are the same cut.
+// An identity is an exact encoding of the compiled binary64 inequality.
+// Feature quantization and formatting must never merge mathematical objects.
 std::string cut_content_id(const CutRow& row) {
+    if (row.cols.size() != row.vals.size())
+        throw std::invalid_argument("cut identity: coefficient shape mismatch");
     std::ostringstream os;
-    os << "c";
-    char buf[64];
-    for (std::size_t k = 0; k < row.cols.size() && k < row.vals.size(); ++k) {
-        std::snprintf(buf, sizeof buf, "|%d:%.6g",
-                      static_cast<int>(row.cols[k]), row.vals[k]);
-        os << buf;
-    }
-    std::snprintf(buf, sizeof buf, "#%.6g:%.6g", row.row_lo, row.row_hi);
-    os << buf;
+    os.imbue(std::locale::classic());
+    os << std::hexfloat << "c";
+    for (std::size_t k = 0; k < row.cols.size(); ++k)
+        os << '|' << row.cols[k] << ':' << (row.vals[k] == 0 ? 0.0 : row.vals[k]);
+    os << '#' << (row.row_lo == 0 ? 0.0 : row.row_lo) << ':'
+       << (row.row_hi == 0 ? 0.0 : row.row_hi);
     return os.str();
 }
 
@@ -503,7 +522,8 @@ void GcsPool::observe(const CutRow& row,
     ob.dual_bound = dual_bound;
 
     for (GcsCandidate& c : cands) {
-        if (c.id == id) {
+        if (c.id == id && c.row.cols == row.cols && c.row.vals == row.vals &&
+            c.row.row_lo == row.row_lo && c.row.row_hi == row.row_hi) {
             c.feats = feats;
             c.efficacy_sum += efficacy;
             ++c.seen_nodes;
@@ -511,14 +531,10 @@ void GcsPool::observe(const CutRow& row,
                 ++c.violation_nodes;
                 c.last_violated_point = point;
             }
-            // Conservative policy, not a theorem. One exact global derivation
-            // of an identical inequality is enough to keep it global; a later
-            // local derivation does not cancel that. cut_content_id uses only
-            // six significant digits, so an id match is not exact identity.
-            // Until provenance is stored against an exact comparison, a
-            // disagreement keeps the weaker scope.
-            c.globally_valid = c.globally_valid && globally_valid;
-            if (c.row.cols.empty()) c.row = row;
+            // A verified global derivation remains valid when another node
+            // derives exactly this same inequality from stronger local facts.
+            if (globally_valid && !c.globally_valid) c.row = row;
+            c.globally_valid = c.globally_valid || globally_valid;
             c.depth_sum += static_cast<f64>(std::max(0, depth));
             if (c.first_depth < 0) c.first_depth = depth;
             c.best_violation = std::max(c.best_violation, ob.violation);

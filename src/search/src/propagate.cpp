@@ -1,3 +1,4 @@
+#include "sor/search/domain_writer.hpp"
 #include "sor/search/propagate.hpp"
 #include "sor/model/dyadic.hpp"
 #include "sor/core/work_clock.hpp"
@@ -183,20 +184,14 @@ bool process_span(const Index* ci, const f64* av, core::Offset beg, core::Offset
         if (new_hi < col_lo[sz(j)] && new_hi >= col_lo[sz(j)] - tol) new_hi = col_lo[sz(j)];
         if (new_lo > col_hi[sz(j)] && new_lo <= col_hi[sz(j)] + tol) new_lo = col_hi[sz(j)];
         if (new_lo > col_lo[sz(j)] + tol) {
-            if (trail) {
-                trail->push(j, BoundDir::Lower, new_lo, col_lo[sz(j)],
-                            rkind, rid, depth);
-            }
-            col_lo[sz(j)] = new_lo;
+            write_domain_bound(col_lo, col_hi, j, BoundDir::Lower, new_lo,
+                               trail, {rkind, rid, depth});
             ++res.tightened;
             if (changed) changed->push_back(j);
         }
         if (new_hi < col_hi[sz(j)] - tol) {
-            if (trail) {
-                trail->push(j, BoundDir::Upper, new_hi, col_hi[sz(j)],
-                            rkind, rid, depth);
-            }
-            col_hi[sz(j)] = new_hi;
+            write_domain_bound(col_lo, col_hi, j, BoundDir::Upper, new_hi,
+                               trail, {rkind, rid, depth});
             ++res.tightened;
             if (changed) changed->push_back(j);
         }
@@ -234,7 +229,8 @@ PropagateResult propagate_bounds_impl(const model::LpProblem& lp,
                                       int depth,
                                       f64 tol,
                                       int max_rounds,
-                                      Index local_from) {
+                                      Index local_from,
+                                      const core::CancelToken* cancel) {
     PropagateResult res;
     const Index m = lp.n_rows();
     const Index n = lp.n_cols();
@@ -243,12 +239,15 @@ PropagateResult propagate_bounds_impl(const model::LpProblem& lp,
         return res;
     for (res.rounds = 0; res.rounds < max_rounds; ++res.rounds) {
         const std::uint64_t before = res.tightened;
-        for (Index i = 0; i < m; ++i)
+        for (Index i = 0; i < m; ++i) {
+            if (core::cancel_requested(cancel)) { res.converged = false; return res; }
             if (!process_row(lp, i, col_lo, col_hi, trail, depth, tol, res, nullptr, nullptr,
                              local_from))
                 return res;
+        }
         if (res.tightened == before) break;
     }
+    if (res.rounds == max_rounds) res.converged = false;
     return res;
 }
 
@@ -257,9 +256,9 @@ PropagateResult propagate_bounds_impl(const model::LpProblem& lp,
 PropagateResult propagate_bounds(const model::LpProblem& lp,
                                  std::vector<f64>& col_lo,
                                  std::vector<f64>& col_hi,
-                                 f64 tol, int max_rounds) {
+                                 f64 tol, int max_rounds, const core::CancelToken* cancel) {
     return propagate_bounds_impl(lp, col_lo, col_hi, nullptr, 0, tol, max_rounds,
-                                 std::numeric_limits<Index>::max());
+                                 std::numeric_limits<Index>::max(), cancel);
 }
 
 PropagateResult propagate_bounds_trail(const model::LpProblem& lp,
@@ -269,10 +268,10 @@ PropagateResult propagate_bounds_trail(const model::LpProblem& lp,
                                        int depth,
                                        f64 tol,
                                        int max_rounds,
-                                       Index n_global_rows) {
+                                       Index n_global_rows, const core::CancelToken* cancel) {
     return propagate_bounds_impl(lp, col_lo, col_hi, trail, depth, tol, max_rounds,
                                  n_global_rows >= 0 ? n_global_rows
-                                                    : std::numeric_limits<Index>::max());
+                                                    : std::numeric_limits<Index>::max(), cancel);
 }
 
 }  // namespace sor::search
@@ -283,7 +282,8 @@ PropagateResult propagate_objective_cutoff(const model::LpProblem& lp, f64 rhs,
                                            std::vector<f64>& col_lo,
                                            std::vector<f64>& col_hi, f64 tol,
                                            std::vector<Index>* changed,
-                                           const ObjectiveCliques* amo) {
+                                           const ObjectiveCliques* amo,
+                                           PropTrail* trail, DomainReason reason) {
     PropagateResult res;
     const Index n = lp.n_cols();
     if (!std::isfinite(rhs) || static_cast<Index>(col_lo.size()) != n ||
@@ -379,8 +379,9 @@ PropagateResult propagate_objective_cutoff(const model::LpProblem& lp, f64 rhs,
                 const long double with_true = min_fin - group_min[g] + cst;
                 if (!(with_true > static_cast<long double>(rhs) + pad)) continue;
                 // The literal cannot be true: x_j = 1 - v.
-                if ((l & 1) != 0) col_hi[sz(j)] = 0.0;
-                else col_lo[sz(j)] = 1.0;
+                write_domain_bound(col_lo, col_hi, j,
+                    (l & 1) != 0 ? BoundDir::Upper : BoundDir::Lower,
+                    (l & 1) != 0 ? 0.0 : 1.0, trail, reason);
                 ++res.tightened;
                 if (changed) changed->push_back(j);
             }
@@ -410,7 +411,7 @@ PropagateResult propagate_objective_cutoff(const model::LpProblem& lp, f64 rhs,
                     if (nh < col_lo[sz(j)] - tol) { res.feasible = false; res.conflict_var = j; return res; }
                     nh = col_lo[sz(j)];
                 }
-                col_hi[sz(j)] = nh;
+                write_domain_bound(col_lo, col_hi, j, BoundDir::Upper, nh, trail, reason);
                 ++res.tightened;
                 if (changed) changed->push_back(j);
             }
@@ -425,7 +426,7 @@ PropagateResult propagate_objective_cutoff(const model::LpProblem& lp, f64 rhs,
                     if (nl > col_hi[sz(j)] + tol) { res.feasible = false; res.conflict_var = j; return res; }
                     nl = col_hi[sz(j)];
                 }
-                col_lo[sz(j)] = nl;
+                write_domain_bound(col_lo, col_hi, j, BoundDir::Lower, nl, trail, reason);
                 ++res.tightened;
                 if (changed) changed->push_back(j);
             }
@@ -564,9 +565,15 @@ void RowActivityCache::build(const model::LpProblem& lp, const std::vector<f64>&
     n_cols_ = lp.n_cols();
     lo_ = lo;
     hi_ = hi;
+    checkpoint_known_ = false;
+    checkpoint_anchor_ = {};
+    checkpoint_dirty_.clear();
+    checkpoint_dirty_mark_.assign(sz(n_cols_), false);
     const auto& rp = lp.A.pattern.row_ptr();
     const auto& ci = lp.A.pattern.col_idx();
     const auto& av = lp.A.vals;
+    pattern_ = lp.A.pattern;
+    entry_slot_.resize(av.size());
     col_ptr_.assign(sz(n_cols_) + 1, 0);
     for (const Index j : ci) ++col_ptr_[sz(j) + 1];
     for (Index j = 0; j < n_cols_; ++j) col_ptr_[sz(j) + 1] += col_ptr_[sz(j)];
@@ -578,6 +585,7 @@ void RowActivityCache::build(const model::LpProblem& lp, const std::vector<f64>&
             const auto q = fill[sz(ci[sz(k)])]++;
             col_row_[sz(q)] = i;
             col_val_[sz(q)] = av[sz(k)];
+            entry_slot_[sz(k)] = q;
         }
     min_.assign(sz(n_rows_), Side{});
     max_.assign(sz(n_rows_), Side{});
@@ -585,9 +593,54 @@ void RowActivityCache::build(const model::LpProblem& lp, const std::vector<f64>&
     for (Index i = 0; i < n_rows_; ++i) resum(i);
 }
 
+bool RowActivityCache::remap(const model::LpProblem& lp,
+                            const std::vector<Index>& old_row) {
+    if (!built() || lp.n_cols() != n_cols_ || old_row.size() != sz(lp.n_rows())) return false;
+    const auto& rp = lp.A.pattern.row_ptr();
+    const auto& ci = lp.A.pattern.col_idx();
+    const auto& op = pattern_.row_ptr();
+    const auto& oc = pattern_.col_idx();
+    std::vector<char> seen(sz(n_rows_), false);
+    for (Index i = 0; i < lp.n_rows(); ++i) {
+        const Index old = old_row[sz(i)];
+        if (old == -1) continue; // a newly inserted row
+        if (old < -1) return false;
+        if (old >= n_rows_ || seen[sz(old)] ||
+            op[sz(old) + 1] - op[sz(old)] != rp[sz(i) + 1] - rp[sz(i)]) return false;
+        seen[sz(old)] = true;
+        for (Offset k = rp[sz(i)], q = op[sz(old)]; k < rp[sz(i) + 1]; ++k, ++q)
+            if (ci[sz(k)] != oc[sz(q)] || lp.A.vals[sz(k)] != col_val_[sz(entry_slot_[sz(q)])])
+                return false;
+    }
+    auto old_min = std::move(min_), old_max = std::move(max_);
+    auto old_range = std::move(range_ub_);
+    lp_ = &lp; n_rows_ = lp.n_rows(); pattern_ = lp.A.pattern;
+    col_ptr_.assign(sz(n_cols_) + 1, 0);
+    for (Index j : ci) ++col_ptr_[sz(j) + 1];
+    for (Index j = 0; j < n_cols_; ++j) col_ptr_[sz(j) + 1] += col_ptr_[sz(j)];
+    col_row_.resize(ci.size()); col_val_.resize(ci.size()); entry_slot_.resize(ci.size());
+    std::vector<Offset> fill(col_ptr_.begin(), col_ptr_.end() - 1);
+    min_.resize(sz(n_rows_)); max_.resize(sz(n_rows_)); range_ub_.resize(sz(n_rows_));
+    for (Index i = 0; i < n_rows_; ++i) {
+        for (Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+            const auto q = fill[sz(ci[sz(k)])]++;
+            col_row_[sz(q)] = i; col_val_[sz(q)] = lp.A.vals[sz(k)]; entry_slot_[sz(k)] = q;
+        }
+        const Index old = old_row[sz(i)];
+        if (old >= 0) { min_[sz(i)] = old_min[sz(old)]; max_[sz(i)] = old_max[sz(old)]; range_ub_[sz(i)] = old_range[sz(old)]; }
+        else resum(i);
+    }
+    core::work_add(ci.size() + sz(n_cols_) + sz(n_rows_), core::WorkTag::Propagate);
+    return true;
+}
+
 void RowActivityCache::set_bounds(Index j, f64 lo, f64 hi) {
     const f64 olo = lo_[sz(j)], ohi = hi_[sz(j)];
     if (olo == lo && ohi == hi) return;
+    if (checkpoint_known_ && !checkpoint_dirty_mark_[sz(j)]) {
+        checkpoint_dirty_.push_back(j);
+        checkpoint_dirty_mark_[sz(j)] = true;
+    }
     const f64 old_w = ohi - olo, new_w = hi - lo;
     const bool wider = !(new_w <= old_w);
     lo_[sz(j)] = lo;
@@ -628,6 +681,29 @@ void RowActivityCache::sync(const std::vector<f64>& lo, const std::vector<f64>& 
     for (Index j = 0; j < n_cols_; ++j)
         if (lo[sz(j)] != lo_[sz(j)] || hi[sz(j)] != hi_[sz(j)])
             set_bounds(j, lo[sz(j)], hi[sz(j)]);
+}
+
+void RowActivityCache::sync_checkpoint(const DomainCheckpoint& box) {
+    if (box.size() != sz(n_cols_)) throw std::logic_error("activity checkpoint shape");
+    // The anchor describes the last incoming domain, not the current cache:
+    // propagation may have moved cache bounds in the meantime. Restore those
+    // columns even if a sibling shares every page with the anchor.
+    const bool known = checkpoint_known_;
+    checkpoint_known_ = false;
+    for (const Index j : checkpoint_dirty_) {
+        set_bounds(j, box.lower(sz(j)), box.upper(sz(j)));
+        checkpoint_dirty_mark_[sz(j)] = false;
+    }
+    checkpoint_dirty_.clear();
+    core::work_add((box.size() + DomainCheckpoint::page_size - 1) /
+                   DomainCheckpoint::page_size, core::WorkTag::Propagate);
+    box.for_each_changed_column(known ? checkpoint_anchor_ : DomainCheckpoint{},
+        [&](std::size_t j) {
+            core::work_add(1, core::WorkTag::Propagate);
+            set_bounds(static_cast<Index>(j), box.lower(j), box.upper(j));
+        });
+    checkpoint_anchor_ = box;
+    checkpoint_known_ = true;
 }
 
 namespace {
@@ -772,14 +848,14 @@ bool process_row_cached(const model::LpProblem& lp, RowActivityCache& cache, Ind
         if (new_lo > col_hi[sz(j)] && new_lo <= col_hi[sz(j)] + tol) new_lo = col_hi[sz(j)];
         bool moved = false;
         if (new_lo > col_lo[sz(j)] + tol) {
-            if (trail) trail->push(j, BoundDir::Lower, new_lo, col_lo[sz(j)], ReasonKind::Row, i, depth);
-            col_lo[sz(j)] = new_lo;
+            write_domain_bound(col_lo, col_hi, j, BoundDir::Lower, new_lo,
+                               trail, {ReasonKind::Row, i, depth});
             ++res.tightened;
             moved = true;
         }
         if (new_hi < col_hi[sz(j)] - tol) {
-            if (trail) trail->push(j, BoundDir::Upper, new_hi, col_hi[sz(j)], ReasonKind::Row, i, depth);
-            col_hi[sz(j)] = new_hi;
+            write_domain_bound(col_lo, col_hi, j, BoundDir::Upper, new_hi,
+                               trail, {ReasonKind::Row, i, depth});
             ++res.tightened;
             moved = true;
         }
@@ -809,7 +885,8 @@ PropagateResult propagate_bounds_cached(const model::LpProblem& lp,
                                         const std::vector<LocalRowView>* local,
                                         PropagationScratch& scratch,
                                         PropTrail* trail, int depth, f64 tol,
-                                        std::uint64_t max_row_visits, bool sync_box) {
+                                        std::uint64_t max_row_visits, bool sync_box,
+                                        const core::CancelToken* cancel) {
     core::WorkScope work_scope_(core::WorkCat::Propagation);
     PropagateResult res;
     const Index m = lp.n_rows();
@@ -841,10 +918,13 @@ PropagateResult propagate_bounds_cached(const model::LpProblem& lp,
     bool stopped = false;
     for (;;) {
         while (!scratch.queue.empty()) {
+            if (core::cancel_requested(cancel) || visits == max_row_visits) {
+                stopped = true; res.converged = false; break;
+            }
             const Index i = scratch.queue.front();
             scratch.queue.pop_front();
             scratch.queued[sz(i)] = 0;
-            if (++visits > max_row_visits) { stopped = true; break; }
+            ++visits;
             scratch.changed.clear();
             unsigned char red = 0;
             if (!process_row_cached(lp, cache, i, col_lo, col_hi, trail, depth, tol, res,
@@ -860,15 +940,19 @@ PropagateResult propagate_bounds_cached(const model::LpProblem& lp,
         // The local rows: one sweep, whose moves queue model rows again.
         bool moved = false;
         for (std::size_t q = 0; q < n_local; ++q) {
-            if (++visits > max_row_visits) { stopped = true; break; }
+            if (core::cancel_requested(cancel) || visits == max_row_visits) {
+                stopped = true; res.converged = false; break;
+            }
+            ++visits;
             const LocalRowView& r = (*local)[q];
             if (r.cols == nullptr || r.vals == nullptr || r.cols->size() != r.vals->size()) continue;
             scratch.changed.clear();
             if (!process_span(r.cols->data(), r.vals->data(), 0,
                               static_cast<core::Offset>(r.cols->size()), r.lo, r.hi,
                               lp.is_integer, col_lo, col_hi, trail, depth, tol, res,
-                              &scratch.changed, nullptr, ReasonKind::Cut,
-                              static_cast<Index>(q), m + static_cast<Index>(q))) {
+                              &scratch.changed, nullptr, r.reason,
+                              r.reason_id >= 0 ? r.reason_id : static_cast<Index>(q),
+                              m + static_cast<Index>(q))) {
                 stopped = true;
                 break;
             }
@@ -893,7 +977,7 @@ PropagateResult propagate_bounds_events(const model::LpProblem& lp,
                                         const std::vector<Index>& seed_cols,
                                         PropagationScratch& scratch,
                                         PropTrail* trail, int depth, f64 tol,
-                                        std::uint64_t max_row_visits) {
+                                        std::uint64_t max_row_visits, const core::CancelToken* cancel) {
     core::WorkScope work_scope_(core::WorkCat::Propagation);
     PropagateResult res;
     const Index m = lp.n_rows();
@@ -918,10 +1002,14 @@ PropagateResult propagate_bounds_events(const model::LpProblem& lp,
     std::uint64_t visits = 0;
     bool ok = true;
     while (!scratch.queue.empty()) {
+        if (core::cancel_requested(cancel) || visits == max_row_visits) {
+            res.converged = false;
+            break;
+        }
         const Index i = scratch.queue.front();
         scratch.queue.pop_front();
         scratch.queued[sz(i)] = 0;
-        if (++visits > max_row_visits) break;
+        ++visits;
         scratch.changed.clear();
         unsigned char red = 0;
         if (!process_row(lp, i, col_lo, col_hi, trail, depth, tol, res, &scratch.changed,

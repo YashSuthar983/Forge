@@ -10,7 +10,7 @@
 //     min  (1 - alpha) * Delta(x, x~)  +  alpha * scale * c'x
 // over the model's rows and the given box, where Delta is the L1 distance to
 // x~ on the integer columns (linear on columns whose target sits at a bound;
-// an auxiliary variable per column whose target is strictly inside) and alpha
+// permanent epigraph columns for domains admitting interior targets) and alpha
 // decays geometrically, so the search starts objective-driven and ends
 // feasibility-driven. A distance of ~0 means the LP point is integral on
 // every integer column, hence feasible for the whole model, continuous

@@ -468,15 +468,26 @@ static core::RawResult dual_prepared_pass(
 
     // ---- 4. state --------------------------------------------------------
     auto& basis = pass_ws.basis;
-    basis.assign(sz(m), {});
     auto& slot_of = pass_ws.slot_of;
-    slot_of.assign(sz(nt), -1);
     auto& st = pass_ws.st;
-    st.assign(sz(nt), NonbasicStatus::AtLower);
     auto& value = pass_ws.value;
-    value.assign(sz(nt), 0.0);
     auto& xB = pass_ws.xB;
-    xB.assign(sz(m), 0.0);
+    // Only an owned terminal snapshot authorizes continuation of membership.
+    // A foreign warm basis still takes the normal validation/initialization path.
+    const bool continue_membership = partition != nullptr &&
+        partition->prepared == &prepared && partition->last_primal_ok && warm != nullptr &&
+        warm->basic == partition->last_basis && warm->status == partition->last_st &&
+        basis == partition->last_basis && st == partition->last_st &&
+        basis.size() == sz(m) && slot_of.size() == sz(nt) &&
+        value.size() == sz(nt) && xB.size() == sz(m) &&
+        pass_ws.nonbasic_pos.size() == sz(nt);
+    if (!continue_membership) {
+        basis.assign(sz(m), {});
+        slot_of.assign(sz(nt), -1);
+        st.assign(sz(nt), NonbasicStatus::AtLower);
+        value.assign(sz(nt), 0.0);
+        xB.assign(sz(m), 0.0);
+    }
 
     // Park a nonbasic on a bound that is dual-feasible for its (unreduced)
     // cost when both ends exist. At the all-logical start π = 0, so d_j = c_j.
@@ -496,6 +507,7 @@ static core::RawResult dual_prepared_pass(
         else                  { st[sz(j)] = NonbasicStatus::AtZeroFree; value[sz(j)] = 0.0; }
     };
 
+    if (!continue_membership) {
     for (Index j = 0; j < ns; ++j) park(j);
     for (Index i = 0; i < m; ++i) {
         basis[sz(i)] = ns + i;
@@ -512,7 +524,7 @@ static core::RawResult dual_prepared_pass(
         warm != nullptr &&
         static_cast<Index>(warm->basic.size()) == m &&
         static_cast<Index>(warm->status.size()) == nt;
-    if (warm_ok) {
+    if (warm_ok && !continue_membership) {
         std::vector<char> seen(sz(nt), 0);
         bool sane = true;
         for (Index s = 0; s < m && sane; ++s) {
@@ -550,6 +562,23 @@ static core::RawResult dual_prepared_pass(
         }
     }
 
+    } else {
+        // Endpoint values change with domains; membership does not. Delta-RHS
+        // continuation below compares these values against the owned snapshot.
+        for (const Index j : pass_ws.nonbasic) {
+            switch (st[sz(j)]) {
+                case NonbasicStatus::AtLower:
+                    value[sz(j)] = lo[sz(j)] > -kInf ? lo[sz(j)] : 0.0;
+                    break;
+                case NonbasicStatus::AtUpper:
+                    value[sz(j)] = hi[sz(j)] < kInf ? hi[sz(j)] : 0.0;
+                    break;
+                default: value[sz(j)] = 0.0; break;
+            }
+        }
+        ++diag.warm_starts;
+    }
+
     // Zero-cost structural crash columns preserve c_B=0 and thus the logical
     // cold start's dual multipliers. Warm bases keep their caller-owned state.
     if (diag.warm_starts == 0 && opts.dual_crash && m > 0 && ns > 0) {
@@ -562,14 +591,16 @@ static core::RawResult dual_prepared_pass(
     // swap-with-last; score ties are already resolved only by strict `>` so
     // this does not change the mathematical eligibility set.
     auto& nonbasic = pass_ws.nonbasic;
-    nonbasic.clear();
     auto& nonbasic_pos = pass_ws.nonbasic_pos;
-    nonbasic_pos.assign(sz(nt), -1);
-    nonbasic.reserve(sz(nt));
-    for (Index j = 0; j < nt; ++j) {
-        if (st[sz(j)] == NonbasicStatus::Basic) continue;
-        nonbasic_pos[sz(j)] = static_cast<Index>(nonbasic.size());
-        nonbasic.push_back(j);
+    if (!continue_membership) {
+        nonbasic.clear();
+        nonbasic_pos.assign(sz(nt), -1);
+        nonbasic.reserve(sz(nt));
+        for (Index j = 0; j < nt; ++j) {
+            if (st[sz(j)] == NonbasicStatus::Basic) continue;
+            nonbasic_pos[sz(j)] = static_cast<Index>(nonbasic.size());
+            nonbasic.push_back(j);
+        }
     }
     // Exact membership of the production pivotal-row support. Only basis
     // exchanges change it, so the hot assembly loop can replace two status /
@@ -600,12 +631,14 @@ static core::RawResult dual_prepared_pass(
     // ---- 5. factorization ------------------------------------------------
     BasisFactor factor;
     std::uint64_t drift_solve_base = 0;   // solve work of earlier factors
-    std::unique_ptr<core::ThreadPool> pricing_pool;
+    auto& pricing_pool = pass_ws.pricing_pool;
     // Every use below is gated on m >= 2048. A pool for a smaller basis only
     // started and joined its threads once per solve: about 5% of awhea's
     // tree search, one pool per node LP.
-    if (opts.pricing_threads > 1 && m >= 2048)
-        pricing_pool = std::make_unique<core::ThreadPool>(opts.pricing_threads);
+    if (opts.pricing_threads > 1 && m >= 2048) {
+        if (!pricing_pool || pricing_pool->size() != opts.pricing_threads)
+            pricing_pool = std::make_unique<core::ThreadPool>(opts.pricing_threads);
+    } else pricing_pool.reset();
     // The entering column's exact Forrest-Tomlin spike, captured by whichever
     // FTRAN produced alpha and handed to update_ft(). Only filled when the FT
     // representation is live; the product-form path never asks for it.
@@ -1044,6 +1077,8 @@ static core::RawResult dual_prepared_pass(
     auto& pr_cstart = ps.pr_cstart;
     auto& pr_centry = ps.pr_centry;
     if (!partition_static_ok) {
+        ps.last_primal_ok = false;
+        ps.last_dual_ok = false;
         ps.prepared = &prepared;
         pr_act.assign(sz(m), 0);
         pr_col.assign(aci.size(), 0);
@@ -1456,6 +1491,50 @@ static core::RawResult dual_prepared_pass(
             diag.refinement_corrections += static_cast<std::uint64_t>(refinement.corrections);
         }
         invalidate_leave_heap();
+    };
+
+    // Same basis membership as the previous session solve, with only nonbasic
+    // parked values moved by set_column_bounds: continue xB by the sparse
+    // bound-delta formula instead of rebuilding the whole nonbasic RHS.
+    const auto recompute_xB_bound_delta = [&]() {
+        SOR_FN();
+        if (partition == nullptr || artificial_bounds_active || !factor.is_valid() ||
+            !ps.last_primal_ok || ps.last_basis.size() != sz(m) ||
+            ps.last_st.size() != sz(nt) || ps.last_value.size() != sz(nt) ||
+            ps.last_xB.size() != sz(m)) {
+            recompute_xB();
+            return;
+        }
+        for (Index i = 0; i < m; ++i)
+            if (ps.last_basis[sz(i)] != basis[sz(i)]) {
+                recompute_xB();
+                return;
+            }
+        for (Index j = 0; j < nt; ++j)
+            if (ps.last_st[sz(j)] != st[sz(j)]) {
+                recompute_xB();
+                return;
+            }
+        std::fill(rhs.begin(), rhs.end(), 0.0);
+        bool any = false;
+        for (Index j = 0; j < nt; ++j) {
+            if (st[sz(j)] == NonbasicStatus::Basic) continue;
+            const f64 delta = value[sz(j)] - ps.last_value[sz(j)];
+            if (delta == 0.0) continue;
+            any = true;
+            for_col(j, [&](Index i, f64 v) { SOR_FN(); rhs[sz(i)] -= v * delta; });
+        }
+        if (!any) {
+            xB = ps.last_xB;
+            invalidate_leave_heap();
+            ++diag.bound_delta_xB;
+            return;
+        }
+        do_ftran(rhs);
+        xB = ps.last_xB;
+        for (Index i = 0; i < m; ++i) xB[sz(i)] += rhs[sz(i)];
+        invalidate_leave_heap();
+        ++diag.bound_delta_xB;
     };
 
     // Incremental xB after nonbasic bound flips (Koberstein 2008,
@@ -2108,7 +2187,18 @@ static core::RawResult dual_prepared_pass(
         // away -- 4.3 ms of every 15 ms rebuild on supportcase12's LP
         // relaxation. The final xB comes from the same values on the same
         // factor either way.
-        recompute_pi();
+        const bool prices_carried = !at_exit && diag.factor_adoptions == 1 &&
+            diag.refactorizations == 0 && partition != nullptr && ps.last_dual_ok &&
+            ps.last_basis == basis && ps.last_cost == work_cost &&
+            ps.last_pi.size() == sz(m) && ps.last_redcost.size() == sz(nt);
+        if (prices_carried) {
+            y = ps.last_pi;
+            redcost = ps.last_redcost;
+            d_valid = true;
+            ++diag.bound_delta_prices;
+        } else {
+            recompute_pi();
+        }
         // Preserve Devex history across a numerical refactorization. The
         // basis is unchanged, so throwing away edge weights every eta recycle
         // creates avoidable extra pivots. Only initialize on the first factor
@@ -2144,7 +2234,7 @@ static core::RawResult dual_prepared_pass(
                 enter_phase1();             // derives xB for the subproblem
                 ++diag.phase_restarts;
             } else {
-                recompute_xB();
+                recompute_xB_bound_delta();
             }
         } else {
             // Every later rebuild stays in phase 2. recompute_pi() re-derived
@@ -2174,11 +2264,11 @@ static core::RawResult dual_prepared_pass(
             // same test as primal_infeasibility() on this xB (the leave heap
             // was invalidated by recompute_xB), so it finds no row again.
             if (correct_dual_infeasibilities(!at_exit)) set_values_from_status();
-            recompute_xB();
+            recompute_xB_bound_delta();
             if (at_exit && primal_infeasibility() > 0.0 &&
                 flip_boxed_to_dual_feasible()) {
                 set_values_from_status();
-                recompute_xB();
+                recompute_xB_bound_delta();
             }
             if (!opts.allow_cost_shifts && true_dual_infeasibility() > 0) {
                 // Preserve the mature basis and the model's bounds. A primal
@@ -2580,7 +2670,7 @@ static core::RawResult dual_prepared_pass(
                                                     opts.ft_update_limit);
         const auto update_t0 = tick();
         const bool updated =
-            opts.update_method == la::UpdateMethod::ForrestTomlin
+            opts.update_method == la::UpdateMethod::ForrestTomlin && !factor.is_bordered()
                 ? factor.update_ft(leave, alpha, lu_opts, opts.pivot_tol,
                                    alpha_is_sparse ? &alpha_support : nullptr,
                                    entering_spike.valid ? &entering_spike
@@ -2597,7 +2687,7 @@ static core::RawResult dual_prepared_pass(
         // refactorize. Never attempted after an unstable/failed update: those
         // need the safety of a genuinely fresh factorization, not a
         // representation shuffle of a basis that may itself be suspect.
-        if (opts.collective_ft && !unstable && updated &&
+        if (opts.collective_ft && !factor.is_bordered() && !unstable && updated &&
             opts.update_method == la::UpdateMethod::ProductForm) {
             // The exact collective implementation replays single FT bumps.
             // Bound that superlinear work; large sparse bases take the
@@ -3976,6 +4066,8 @@ static core::RawResult dual_prepared_pass(
         : 0.0;
     if (needs_primal_cleanup && iter < max_iter &&
         (opts.time_limit_s <= 0.0 || cleanup_time_left > 0.0)) {
+        ps.last_primal_ok = false;
+        ps.last_dual_ok = false;
         SOR_ROUTE(1, "simplex_dual", "cleanup_to_primal",
                   "\"phase\":\"handoff\"");
         SimplexBasis current;
@@ -4180,6 +4272,41 @@ static core::RawResult dual_prepared_pass(
         carrier->weights.assign(row_w.begin(), row_w.end());
     }
 
+    // Carry the phase-2 primal point for the next session solve's bound-delta
+    // xB update. Membership must match exactly; phase-1 / repaired states are
+    // not reusable under that contract.
+    if (partition != nullptr && !artificial_bounds_active && phase == 2 &&
+        factor.is_valid() && xB.size() == sz(m) && value.size() == sz(nt) &&
+        st.size() == sz(nt) && basis.size() == sz(m) &&
+        std::all_of(xB.begin(), xB.end(), [](f64 v) { return std::isfinite(v); }) &&
+        std::all_of(value.begin(), value.end(), [](f64 v) { return std::isfinite(v); })) {
+        ps.last_basis.assign(basis.begin(), basis.end());
+        ps.last_st.assign(st.begin(), st.end());
+        ps.last_value.assign(value.begin(), value.end());
+        ps.last_xB.assign(xB.begin(), xB.end());
+        ps.last_primal_ok = true;
+        ps.last_dual_ok = !costs_perturbed && !costs_shifted;
+        if (ps.last_dual_ok) {
+            ps.last_cost.assign(cost.begin(), cost.end());
+            ps.last_pi.assign(y.begin(), y.end());
+            ps.last_redcost.assign(sz(nt), 0);
+            for (Index j = 0; j < ns; ++j)
+                ps.last_redcost[sz(j)] = (pmin.c[sz(j)] - static_cast<f64>(aty[sz(j)])) *
+                                         scaling.col_scale[sz(j)];
+            for (Index i = 0; i < m; ++i) ps.last_redcost[sz(ns+i)] = y[sz(i)];
+            // A factor/basis match permits algebraic continuation, but does
+            // not make a non-finite terminal price a reusable numeric state.
+            ps.last_dual_ok =
+                std::all_of(ps.last_pi.begin(), ps.last_pi.end(),
+                            [](f64 v) { return std::isfinite(v); }) &&
+                std::all_of(ps.last_redcost.begin(), ps.last_redcost.end(),
+                            [](f64 v) { return std::isfinite(v); });
+        }
+    } else if (partition != nullptr) {
+        ps.last_primal_ok = false;
+        ps.last_dual_ok = false;
+    }
+
     // EXPERIMENTAL: hand this run's factorization to the next solve on the
     // same matrix. Unlike DSE weights this does not depend on which pricing
     // ran -- `factor` describes B alone. Identity fields are echoed back
@@ -4195,6 +4322,7 @@ static core::RawResult dual_prepared_pass(
         factor_carrier->basis.assign(basis.begin(), basis.end());
         factor_carrier->factor = std::move(factor);
         factor_carrier->scaling_identity = prepared.factor_scaling_identity;
+        factor_carrier->operator_identity = prepared.factor_operator_identity;
         factor_carrier->has_factor = true;
     }
 
@@ -4456,7 +4584,7 @@ struct DualProbeSession::Impl {
     // The row store's permutation, carried from solve to solve (probes too:
     // their bound edits are a few columns' activity, like a child's).
     DualPartitionState partition;
-    const std::shared_ptr<const void> identity = std::make_shared<const char>(0);
+    std::shared_ptr<const void> identity = std::make_shared<const char>(0);
 };
 
 DualProbeSession::DualProbeSession(const model::LpProblem& problem,
@@ -4499,6 +4627,23 @@ DualProbeSession::DualProbeSession(SimplexPrepared&& prepared,
 
 DualProbeSession::~DualProbeSession() = default;
 
+DualProbeSession::DualProbeSession(std::unique_ptr<Impl> state) : impl_(std::move(state)) {}
+
+std::unique_ptr<DualProbeSession> DualProbeSession::fork() const {
+    auto state = std::make_unique<Impl>(*impl_);
+    state->identity = std::make_shared<const char>(0);
+    state->prep_reported = true;
+    auto result = std::unique_ptr<DualProbeSession>(new DualProbeSession(std::move(state)));
+    auto& im = *result->impl_;
+    im.factor.matrix = result.get();
+    im.factor.session_identity = im.identity;
+    im.weights.matrix = result.get();
+    im.partition.prepared = &im.prepared;
+    core::work_add(im.prepared.scaled.A.vals.size() + im.prepared.csc.vals.size() +
+                   im.partition.work.value.size() + im.partition.work.xB.size(), core::WorkTag::BabNode);
+    return result;
+}
+
 void DualProbeSession::set_column_bounds(const std::vector<f64>& lo,
                                          const std::vector<f64>& hi) {
     auto& pr = impl_->prepared;
@@ -4525,6 +4670,185 @@ void DualProbeSession::set_column_bounds(const std::vector<f64>& lo,
 
 const FactorCarrier& DualProbeSession::final_factor() const {
     return impl_->factor;
+}
+
+void DualProbeSession::set_row_bounds(const std::vector<f64>& lo,
+                                     const std::vector<f64>& hi) {
+    auto& pr = impl_->prepared;
+    const Index m = pr.scaled.n_rows(), n = pr.scaled.n_cols();
+    if (lo.size() != sz(m) || hi.size() != sz(m))
+        throw std::invalid_argument("DualProbeSession::set_row_bounds: size");
+    for (Index i = 0; i < m; ++i)
+        if (std::isnan(lo[sz(i)]) || std::isnan(hi[sz(i)]))
+            throw std::invalid_argument("DualProbeSession::set_row_bounds: NaN bound");
+    for (Index i = 0; i < m; ++i) {
+        const auto q = sz(i);
+        const f64 scale = pr.scaling.row_scale[q];
+        pr.pmin.row_lo[q] = lo[q]; pr.pmin.row_hi[q] = hi[q];
+        pr.scaled.row_lo[q] = std::isfinite(lo[q]) ? lo[q] * scale : lo[q];
+        pr.scaled.row_hi[q] = std::isfinite(hi[q]) ? hi[q] * scale : hi[q];
+        pr.lo[sz(n + i)] = pr.scaled.row_lo[q];
+        pr.hi[sz(n + i)] = pr.scaled.row_hi[q];
+    }
+}
+
+bool DualProbeSession::extend_rows(const model::LpProblem& problem,
+                                   const SimplexOptions& opts,
+                                   SimplexBasis& basis) {
+    problem.validate(true);
+    auto& im = *impl_;
+    const auto& old = im.prepared;
+    const auto& p = old.pmin;
+    const Index m = p.n_rows(), n = p.n_cols();
+    auto start_basis = basis;
+    if (start_basis.basic.size() == sz(problem.n_rows()) && problem.n_rows() > m &&
+        start_basis.status.size() == sz(n + problem.n_rows())) {
+        for (Index i = m; i < problem.n_rows(); ++i)
+            if (start_basis.basic[sz(i)] != n + i ||
+                start_basis.status[sz(n + i)] != NonbasicStatus::Basic) return false;
+        start_basis.basic.resize(sz(m));
+        start_basis.status.resize(sz(n + m));
+    }
+    if (problem.n_cols() != n || problem.n_rows() < m || start_basis.n_struct != n ||
+        start_basis.basic.size() != sz(m) || start_basis.status.size() != sz(n + m) ||
+        (problem.maximize ? -1.0 : 1.0) != old.sense ||
+        old.factor_scaling_identity->ruiz_iterations != opts.ruiz_iterations ||
+        old.factor_scaling_identity->ruiz_power_of_two != opts.ruiz_power_of_two ||
+        problem.is_integer != p.is_integer)
+        return false;
+    for (Index j = 0; j < n; ++j)
+        if (old.sense * problem.c[sz(j)] != p.c[sz(j)]) return false;
+    if (old.sense * problem.obj_offset != p.obj_offset) return false;
+    const auto& rp = problem.A.pattern.row_ptr();
+    const auto& ci = problem.A.pattern.col_idx();
+    const auto& op = p.A.pattern.row_ptr();
+    const auto& oc = p.A.pattern.col_idx();
+    if (!std::equal(op.begin(), op.end(), rp.begin()) ||
+        !std::equal(oc.begin(), oc.end(), ci.begin()) ||
+        !std::equal(p.A.vals.begin(), p.A.vals.end(), problem.A.vals.begin())) return false;
+    if (problem.n_rows() == m) {
+        set_column_bounds(problem.col_lo, problem.col_hi);
+        set_row_bounds(problem.row_lo, problem.row_hi);
+        return true;
+    }
+    std::vector<Index> slot(sz(n + m), -1);
+    for (Index k = 0; k < m; ++k) {
+        const Index j = start_basis.basic[sz(k)];
+        if (j < 0 || j >= n + m || slot[sz(j)] != -1 ||
+            start_basis.status[sz(j)] != NonbasicStatus::Basic) return false;
+        slot[sz(j)] = k;
+    }
+    SimplexPrepared next;
+    try {
+        next = prepare_simplex_model(problem, opts, &old);
+    } catch (const std::invalid_argument& error) {
+        if (std::string_view(error.what()) == "simplex row extension: unrepresentable scaling") return false;
+        throw;
+    }
+    auto extended = start_basis;
+    extended.status.resize(sz(n + problem.n_rows()), NonbasicStatus::Basic);
+    for (Index i = m; i < problem.n_rows(); ++i) extended.basic.push_back(n + i);
+    FactorCarrier factor;
+    if (im.factor.has_factor && im.factor.basis == start_basis.basic &&
+        im.factor.scaling_identity == old.factor_scaling_identity &&
+        im.factor.factor.is_valid() && im.factor.factor.dimension() == m) {
+        std::vector<Offset> ptr(1, 0);
+        std::vector<Index> slots;
+        std::vector<f64> values;
+        for (Index i = m; i < problem.n_rows(); ++i) {
+            for (Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+                const Index b = slot[sz(ci[sz(k)])];
+                if (b >= 0) { slots.push_back(b); values.push_back(next.scaled.A.vals[sz(k)]); }
+            }
+            ptr.push_back(static_cast<Offset>(slots.size()));
+        }
+        factor = im.factor;
+        factor.factor.extend_logical_rows(problem.n_rows() - m, ptr, slots, values);
+        factor.basis = extended.basic;
+        factor.scaling_identity = next.factor_scaling_identity;
+        factor.operator_identity = next.factor_operator_identity;
+        factor.rows = problem.n_rows(); factor.nnz = problem.nnz();
+    }
+    im.prepared = std::move(next);
+    im.identity = std::make_shared<const char>(0);
+    factor.matrix = this; factor.session_identity = im.identity;
+    im.factor = std::move(factor);
+    im.weights.clear(); // Bordered inverse rows have changed norms.
+    im.partition = DualPartitionState{};
+    im.prep_reported = false;
+    basis = std::move(extended);
+    return true;
+}
+
+bool DualProbeSession::remove_rows(const model::LpProblem& problem,
+                                   const std::vector<Index>& old_to_new,
+                                   const SimplexOptions& opts) {
+    problem.validate(true);
+    auto& im = *impl_;
+    const auto& old = im.prepared;
+    const Index m = old.pmin.n_rows(), n = old.pmin.n_cols(), next_m = problem.n_rows();
+    if (problem.n_cols() != n || next_m > m || old_to_new.size() != sz(m) ||
+        !im.factor.has_factor || !im.factor.factor.is_valid() ||
+        im.factor.scaling_identity != old.factor_scaling_identity ||
+        im.factor.factor.dimension() != m ||
+        im.factor.basis.size() != sz(m) || old.sense != (problem.maximize ? -1.0 : 1.0) ||
+        problem.is_integer != old.pmin.is_integer ||
+        old.factor_scaling_identity->ruiz_iterations != opts.ruiz_iterations ||
+        old.factor_scaling_identity->ruiz_power_of_two != opts.ruiz_power_of_two)
+        return false;
+    for (Index j = 0; j < n; ++j)
+        if (old.sense * problem.c[sz(j)] != old.pmin.c[sz(j)]) return false;
+    if (old.sense * problem.obj_offset != old.pmin.obj_offset) return false;
+    std::vector<Index> rows(sz(next_m), -1), slots, basic;
+    for (Index r = 0; r < m; ++r) {
+        const Index next = old_to_new[sz(r)];
+        if (next < -1 || next >= next_m || (next >= 0 && rows[sz(next)] != -1)) return false;
+        if (next >= 0) rows[sz(next)] = r;
+    }
+    if (std::find(rows.begin(), rows.end(), -1) != rows.end()) return false;
+    std::vector<char> dropped_logical(sz(m), false);
+    for (Index k = 0; k < m; ++k) {
+        const Index j = im.factor.basis[sz(k)];
+        if (j < 0 || j >= n + m) return false;
+        if (j >= n && old_to_new[sz(j - n)] < 0) dropped_logical[sz(j - n)] = true;
+        else { slots.push_back(k); basic.push_back(j < n ? j : n + old_to_new[sz(j - n)]); }
+    }
+    for (Index r = 0; r < m; ++r)
+        if (old_to_new[sz(r)] < 0 && !dropped_logical[sz(r)]) return false;
+    if (slots.size() != sz(next_m)) return false;
+    const auto& rp = problem.A.pattern.row_ptr(); const auto& ci = problem.A.pattern.col_idx();
+    const auto& op = old.pmin.A.pattern.row_ptr(); const auto& oc = old.pmin.A.pattern.col_idx();
+    SimplexPrepared prefix;
+    prefix.scaled = problem;
+    prefix.scaled.c = old.scaled.c;
+    prefix.scaling.col_scale = old.scaling.col_scale;
+    for (Index r = 0; r < next_m; ++r) {
+        const Index old_r = rows[sz(r)];
+        if (rp[sz(r) + 1] - rp[sz(r)] != op[sz(old_r) + 1] - op[sz(old_r)]) return false;
+        prefix.scaling.row_scale.push_back(old.scaling.row_scale[sz(old_r)]);
+        for (Offset k = rp[sz(r)], q = op[sz(old_r)]; k < rp[sz(r) + 1]; ++k, ++q) {
+            if (ci[sz(k)] != oc[sz(q)] || problem.A.vals[sz(k)] != old.pmin.A.vals[sz(q)]) return false;
+            prefix.scaled.A.vals[sz(k)] = old.scaled.A.vals[sz(q)];
+        }
+    }
+    SimplexPrepared next;
+    try {
+        next = prepare_simplex_model(problem, opts, &prefix);
+    } catch (const std::invalid_argument& error) {
+        if (std::string_view(error.what()) == "simplex row extension: unrepresentable scaling") return false;
+        throw;
+    }
+    auto factor = im.factor;
+    factor.factor.retain_logical_rows(rows, slots);
+    factor.basis = std::move(basic); factor.rows = next_m; factor.nnz = problem.nnz();
+    factor.scaling_identity = next.factor_scaling_identity;
+    factor.operator_identity = next.factor_operator_identity;
+    im.prepared = std::move(next);
+    im.identity = std::make_shared<const char>(0);
+    factor.session_identity = im.identity;
+    im.factor = std::move(factor);
+    im.weights.clear(); im.partition = DualPartitionState{}; im.prep_reported = false;
+    return true;
 }
 
 bool DualProbeSession::basis_inverse_row(const std::vector<Index>& basic, Index slot,
@@ -4572,8 +4896,11 @@ core::RawResult DualProbeSession::solve(const SimplexOptions& opts,
     // the basis they describe. Clearing first would destroy what it asked to
     // reuse, and copying it onto itself would be wasted work, so an aliased
     // input is kept in place (or dropped if it does not match `warm`).
-    const bool weights_alias =
-        warm_weights != nullptr && warm_weights == &im.weights.weights;
+    const bool foreign_operator_matches = !warm_factor || warm_factor == &im.factor ||
+        (warm_factor->matrix == this && warm_factor->session_identity == im.identity) ||
+        same_factor_operator(warm_factor->operator_identity, im.prepared.factor_operator_identity);
+    const bool weights_alias = warm_weights == nullptr ||
+        warm_weights == &im.weights.weights;
     if (weights_alias) {
         if (warm == nullptr || im.weights.basis != warm->basic ||
             im.weights.weights.size() != warm->basic.size()) {
@@ -4583,7 +4910,7 @@ core::RawResult DualProbeSession::solve(const SimplexOptions& opts,
     } else {
         im.weights.basis.clear();
         im.weights.weights.clear();
-        if (warm != nullptr && warm_weights != nullptr &&
+        if (foreign_operator_matches && warm != nullptr && warm_weights != nullptr &&
             warm_weights->size() == warm->basic.size()) {
             im.weights.basis = warm->basic;
             im.weights.weights = *warm_weights;
@@ -4593,14 +4920,14 @@ core::RawResult DualProbeSession::solve(const SimplexOptions& opts,
     im.weights.rows = 0;
     im.weights.cols = 0;
     im.weights.nnz = 0;
-    if (warm_factor != nullptr && warm_factor == &im.factor) {
+    if (warm_factor == nullptr || warm_factor == &im.factor) {
         if (warm == nullptr || !im.factor.has_factor ||
             im.factor.basis != warm->basic)
             im.factor.has_factor = false;
     } else {
         im.factor.clear();
         if (warm != nullptr && warm_factor != nullptr && warm_factor->has_factor &&
-            warm_factor->matrix == this && warm_factor->session_identity == im.identity &&
+            foreign_operator_matches &&
             warm_factor->rows == p.n_rows() &&
             warm_factor->cols == p.n_cols() &&
             warm_factor->nnz == static_cast<Offset>(p.A.vals.size()) &&

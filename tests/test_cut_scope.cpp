@@ -137,7 +137,7 @@ void test_family_derivation_whitelist() {
     CHECK(cut_family_derivation_trusted("VUB_5"));
     CHECK(cut_family_derivation_trusted("MIX_1"));
 
-    CHECK(!cut_family_derivation_trusted("FC_0"));
+    CHECK(cut_family_derivation_trusted("FC_0"));
 
     // A trusted family is still not promotable on its own.
     CutScopeConditions s;
@@ -177,9 +177,8 @@ void test_default_scope_is_local() {
     CHECK(!cut_may_leave_subtree(s));
 }
 
-// The pool, not a hand-ANDed struct, must refuse a cut once any observation
-// of the same content failed the global gate. select_global is the insertion
-// path into the global model.
+// A verified global proof of exactly the same inequality survives a local
+// observation. Promotion carries the global derivation's own metadata.
 void test_gcs_pool_keeps_weaker_scope_and_selects_global() {
     sor::search::CutRow row;
     row.cols = {0};
@@ -193,18 +192,28 @@ void test_gcs_pool_keeps_weaker_scope_and_selects_global() {
 
     auto observe = [&](sor::search::GcsPool& pool, bool global_flag) {
         pool.prefer_heuristic = true;
-        pool.observe(row, feats, 1.0, true, global_flag, id);
+        auto proved_row = row;
+        proved_row.used_local_bound = !global_flag;
+        pool.observe(proved_row, feats, 1.0, true, global_flag, id);
     };
 
     sor::search::GcsPool local_then_global;
     observe(local_then_global, false);
     observe(local_then_global, true);
-    CHECK(local_then_global.select_global(10, -1.0, false).empty());
+    const auto local_first = local_then_global.select_global(10, -1.0, false);
+    CHECK(local_first.size() == 1);
+    if (!local_first.empty()) CHECK(!local_first[0].used_local_bound);
 
     sor::search::GcsPool global_then_local;
     observe(global_then_local, true);
     observe(global_then_local, false);
-    CHECK(global_then_local.select_global(10, -1.0, false).empty());
+    const auto global_first = global_then_local.select_global(10, -1.0, false);
+    CHECK(global_first.size() == 1);
+    if (!global_first.empty()) CHECK(!global_first[0].used_local_bound);
+
+    sor::search::GcsPool only_local;
+    observe(only_local, false);
+    CHECK(only_local.select_global(10, -1.0, false).empty());
 
     sor::search::GcsPool only_global;
     observe(only_global, true);

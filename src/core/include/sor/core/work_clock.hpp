@@ -159,6 +159,36 @@ struct SolverClock {
     using time_point = std::chrono::time_point<SolverClock, duration>;
     static constexpr bool is_steady = true;
     static time_point now() noexcept;
+    static time_point raw_now() noexcept;
+    static duration offset() noexcept;
+    static void set_offset(duration) noexcept;
+};
+
+// A cooperatively scheduled solve keeps its logical clock while inactive.
+// Run only at quiescent boundaries, on its owning thread. Nested contexts
+// restore the enclosing clock; work counters and ledgers remain cumulative.
+class SolverClockContext {
+public:
+    template<class Fn> void run(Fn&& fn) {
+        const auto before = SolverClock::offset();
+        const auto raw = SolverClock::raw_now();
+        if (!started_) { offset_ = before; started_ = true; }
+        else offset_ -= raw - paused_;
+        SolverClock::set_offset(offset_);
+        struct Restore {
+            SolverClockContext& context;
+            SolverClock::duration before;
+            ~Restore() {
+                context.paused_ = SolverClock::raw_now();
+                SolverClock::set_offset(before);
+            }
+        } restore{*this, before};
+        fn();
+    }
+private:
+    SolverClock::duration offset_{};
+    SolverClock::time_point paused_{};
+    bool started_ = false;
 };
 
 }  // namespace sor::core

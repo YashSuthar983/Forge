@@ -4,6 +4,7 @@
 // must find points on a solid share of small feasible models.
 #include "sor/engines/simplex.hpp"
 #include "sor/search/fpump.hpp"
+#include "sor/search/l1_projection.hpp"
 
 #include "milp_oracle.hpp"
 #include "test_helpers.hpp"
@@ -174,7 +175,43 @@ void test_invalid_cost_update_is_atomic() {
     }
 }
 
+// Moving an interior target changes logical bounds and can make the old basis
+// primal infeasible. The same factor must repair that basis, not keep stale xB.
+void test_projection_moves_targets_and_reuses_factor() {
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1., 1.});
+    lp.c = {1., 2.};
+    lp.col_lo = {0., 0.}; lp.col_hi = {4., 4.};
+    lp.row_lo = {3.5}; lp.row_hi = {3.5};
+    lp.is_integer = {true, true};
+    sor::engines::SimplexOptions opts;
+    opts.presolve = false;
+    opts.certify_terminal = false;
+    sor::search::L1ProjectionSession session(lp, lp.col_lo, lp.col_hi, {0, 1}, opts);
+    const std::vector<std::vector<double>> targets{{1., 2.}, {3., 0.}, {0., 4.}, {2., 1.}};
+    for (std::size_t round = 0; round < targets.size(); ++round) {
+        sor::engines::SimplexDiagnostics diag;
+        const auto raw = session.solve(targets[round], 0., 1., opts, diag);
+        CHECK(raw.proposed_status == sor::core::Status::Optimal);
+        CHECK_NEAR(raw.objective, .5, 1e-8);
+        CHECK_NEAR(raw.x[0] + raw.x[1], 3.5, 1e-8);
+        CHECK_NEAR(std::fabs(raw.x[0]-targets[round][0]) +
+                   std::fabs(raw.x[1]-targets[round][1]), .5, 1e-8);
+        CHECK(diag.preprocessing_builds == (round == 0 ? 1u : 0u));
+        if (round != 0) CHECK(diag.factor_adoptions == 1);
+    }
+    // A rounded target must remain integral when the real box has fractional
+    // endpoints; every legal target here is interior and uses the epigraph.
+    lp.col_lo = {.1, .1}; lp.col_hi = {3.9, 3.9};
+    sor::search::L1ProjectionSession fractional_box(lp, lp.col_lo, lp.col_hi, {0, 1}, opts);
+    sor::engines::SimplexDiagnostics diag;
+    const auto raw = fractional_box.solve({1., 2.}, 0., 1., opts, diag);
+    CHECK_NEAR(raw.objective, .5, 1e-8);
+    CHECK_THROWS(fractional_box.solve({.1, 2.}, 0., 1., opts, diag));
+}
+
 int main() {
+    test_projection_moves_targets_and_reuses_factor();
     test_invalid_cost_update_is_atomic();
     test_cost_session_matches_fresh_solves();
     test_improvement_mode_respects_cutoff();

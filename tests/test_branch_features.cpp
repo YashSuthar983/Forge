@@ -282,6 +282,8 @@ void test_default_branching_builds_no_features() {
     sor::io::MpsReadReport rep;
     const auto lp = sor::io::read_mps(in, rep);
     sor::search::BabOptions o;
+    o.structural_presolve.binary_row_max_work = 0;  // Isolate the LP/tree service from the exact root oracle.
+    o.component_solve = false;  // Exercise this model's LP/tree diagnostics.
     o.para_bab.threads = 1;
     o.max_nodes = 60;
     o.time_limit_s = 1000.0;

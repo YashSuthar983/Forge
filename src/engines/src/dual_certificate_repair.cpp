@@ -275,6 +275,10 @@ bool repair_simplex_dual(const model::LpProblem& p, core::RawResult& raw,
     const double gap = std::fabs(raw.objective - bound.value) / (1 + std::fabs(raw.objective));
     if (gap > opts.gap_tol) return false;
     raw.y = std::move(candidate);
+    const auto enclosure = certify::enclose_reduced_costs(p, raw.y, p.col_lo, p.col_hi);
+    raw.rc_lo = enclosure.finite ? enclosure.lo : std::vector<double>{};
+    raw.rc_hi = enclosure.finite ? enclosure.hi : std::vector<double>{};
+    raw.rc_bound = enclosure.finite ? enclosure.bound : core::kNaN;
     raw.exact_dual.clear();
     raw.dual_bound = diag.dual_objective = bound.value;
     diag.dual_bound_finite = true;
@@ -444,6 +448,10 @@ bool repair_simplex_support(const model::LpProblem& p, core::RawResult& raw,
         !std::isfinite(checked.gap_rel) || checked.gap_rel > opts.gap_tol) return false;
     // The auxiliary basis is not a basis of p. Retain the original basis only.
     raw.y = std::move(candidate.y);
+    const auto enclosure = certify::enclose_reduced_costs(p, raw.y, p.col_lo, p.col_hi);
+    raw.rc_lo = enclosure.finite ? enclosure.lo : std::vector<double>{};
+    raw.rc_hi = enclosure.finite ? enclosure.hi : std::vector<double>{};
+    raw.rc_bound = enclosure.finite ? enclosure.bound : core::kNaN;
     raw.exact_dual = std::move(candidate.exact_dual);
     raw.dual_bound = diag.dual_objective = bound.value;
     diag.dual_residual = checked.max_dual_violation;

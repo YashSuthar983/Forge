@@ -20,7 +20,9 @@ namespace sor::core {
 
 class CancelToken {
 public:
-    explicit CancelToken(const CancelToken* parent = nullptr) : parent_(parent) {}
+    explicit CancelToken(const CancelToken* parent = nullptr,
+                         const CancelToken* other_parent = nullptr)
+        : parent_(parent), other_parent_(other_parent) {}
     CancelToken(const CancelToken&) = delete;
     CancelToken& operator=(const CancelToken&) = delete;
 
@@ -29,11 +31,14 @@ public:
     }
 
     bool stop_requested() const noexcept {
-        return stop_.load(std::memory_order_relaxed) || (parent_ && parent_->stop_requested());
+        return stop_.load(std::memory_order_relaxed) ||
+               (parent_ && parent_->stop_requested()) ||
+               (other_parent_ && other_parent_->stop_requested());
     }
 
 private:
     const CancelToken* parent_ = nullptr;
+    const CancelToken* other_parent_ = nullptr;
     std::atomic<bool> stop_{false};
 };
 

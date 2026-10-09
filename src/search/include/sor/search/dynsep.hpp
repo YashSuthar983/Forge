@@ -96,16 +96,19 @@ struct DynSepOptions {
     // Always schedule these when allowed (cheap / historically useful baseline).
     bool always_gmi = true;
     bool always_ib = true;
-    // Arms the bandit / GNN may enable. MIR/cover/clique stay opt-in:
-    // enabling MIR+cover by default stalled dual proofs on gt2 (Latest
-    // Feasible @1.4% gap; --no-dynsep Optimal in 15s). ZH/flow remain on.
+    // Arms the bandit / GNN may enable. Optional families start off: BabOptions
+    // (explicit flags or auto_cuts policy) authorizes them, then
+    // clamp_dynsep_to_cut_flags retracts any prior that enabled an unauthorized
+    // arm. Enabling MIR+cover by default stalled dual proofs on gt2; ZH/flow
+    // used to default on here and silently ignored BabOptions::zerohalf_cuts /
+    // flow_cover_cuts (same failure class as the old un-gated FC path).
     bool allow_gmi = true;
     bool allow_mir = false;
     bool allow_cover = false;
     bool allow_clique = false;
     bool allow_ib = true;
-    bool allow_zerohalf = true;
-    bool allow_flowcover = true;
+    bool allow_zerohalf = false;
+    bool allow_flowcover = false;
     // Soft cap on how many optional arms run in one round (excl. always_*).
     int max_optional_arms = 2;
     // Per-family cut budgets when selected.
@@ -266,6 +269,21 @@ inline void apply_dynsep_policy(MilpPolicy policy, DynSepOptions& o) {
         o.backend = DynSepBackend::Ucb;
         o.collect_labels = false;
     }
+}
+
+// BabOptions family flags are the authority for which DynSep arms may run.
+// Call after any prior (L2Sep, auto enable-OR, mid-tree reconfigure) that might
+// have set allow_* = true for a family the caller did not authorize. Forced
+// scheduling still uses DynSepRoundInput::force_*; this only retracts allow_*.
+inline void clamp_dynsep_to_cut_flags(DynSepOptions& o, bool mir, bool cover,
+                                      bool clique, bool implied_bound,
+                                      bool zerohalf, bool flowcover) {
+    if (!mir) o.allow_mir = false;
+    if (!cover) o.allow_cover = false;
+    if (!clique) o.allow_clique = false;
+    if (!implied_bound) o.allow_ib = false;
+    if (!zerohalf) o.allow_zerohalf = false;
+    if (!flowcover) o.allow_flowcover = false;
 }
 
 void fill_dynsep_state_feats(const DynSepRoundInput& in,

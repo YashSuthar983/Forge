@@ -1329,6 +1329,12 @@ std::optional<CutRow> build_nogood_from_branch_trail(const PropTrail& trail,
                                                     const model::LpProblem& lp,
                                                     f64 tol) {
     const Index n = lp.n_cols();
+    // The original box may still be feasible when a local row, a general
+    // split or a canonical representative restriction emptied this search.
+    // Negating only coordinate branches would omit a necessary premise.
+    for (const auto& e : trail.entries())
+        if (e.kind == ReasonKind::Symmetry || e.kind == ReasonKind::Cut ||
+            e.kind == ReasonKind::Split || e.kind == ReasonKind::Cutoff) return std::nullopt;
     // Last Branch assignment wins per variable (deeper decisions override).
     std::vector<int> assign(static_cast<std::size_t>(n), -1);  // -1 unset, 0/1
     for (const auto& e : trail.entries()) {

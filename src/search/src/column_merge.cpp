@@ -33,6 +33,8 @@ MilpPresolveResult merge_duplicate_columns(const model::LpProblem& lp,
     const auto identity = [&]() {
         MilpPresolveResult out;
         out.reduced = lp;
+        out.reduced_row.resize(sz(lp.n_rows()));
+        std::iota(out.reduced_row.begin(), out.reduced_row.end(), 0);
         out.reduced_col.resize(sz(n));
         std::iota(out.reduced_col.begin(), out.reduced_col.end(), 0);
         out.eliminated.assign(sz(n), 0);
@@ -143,6 +145,8 @@ MilpPresolveResult merge_duplicate_columns(const model::LpProblem& lp,
 
     // Reduced column space: every non-representative member disappears.
     MilpPresolveResult out;
+    out.reduced_row.resize(sz(lp.n_rows()));
+    std::iota(out.reduced_row.begin(), out.reduced_row.end(), 0);
     out.reduced_col.assign(sz(n), -1);
     out.eliminated.assign(sz(n), 0);
     out.fixed_value.assign(sz(n), 0.0);

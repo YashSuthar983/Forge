@@ -116,6 +116,57 @@ void test_portfolio_single_worker() {
     CHECK_NEAR(r.objective, -7.0, 1e-9);
 }
 
+void test_cancellation_is_inherited_without_a_proof() {
+    auto lp = read_text(kKnapsack);
+    sor::core::CancelToken parent, lp_parent;
+    sor::core::CancelToken joined(&parent, &lp_parent);
+    CHECK(!joined.stop_requested());
+    lp_parent.request_stop();
+    CHECK(joined.stop_requested());
+    parent.request_stop();
+    for (int workers : {1, 2}) {
+        BabOptions base;
+        base.cancel = &parent;
+        PortfolioOptions options;
+        options.workers = workers;
+        options.ramp_seconds = 0;
+        BabDiagnostics diag;
+        PortfolioDiagnostics pdiag;
+        const auto result = sor::search::solve_milp_portfolio(lp, base, options, diag, pdiag);
+        CHECK(result.proposed_status == Status::Interrupted);
+        CHECK(!diag.globally_proved);
+        CHECK(!diag.proved_no_better_than_cutoff);
+        CHECK(diag.nodes == 0 && diag.lp_solves == 0);
+    }
+    BabOptions base;
+    base.lp.cancel = &lp_parent;
+    BabDiagnostics diag;
+    const auto result = sor::search::solve_milp(lp, base, diag);
+    CHECK(result.proposed_status == Status::Interrupted);
+    CHECK(diag.nodes == 0 && !diag.globally_proved);
+}
+
+void test_checked_unbounded_arm_is_terminal() {
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(0, 2, {}, {}, {});
+    lp.c = {0, -1}; lp.col_lo = {0, 0};
+    lp.col_hi = {0, sor::model::kInf}; lp.is_integer = {true, false};
+    const std::vector<double> base_point{0, 0};
+    BabOptions base;
+    base.structural_presolve.enabled = false;
+    base.initial_solution = &base_point;
+    base.time_limit_s = 5;
+    PortfolioOptions options;
+    options.workers = 2; options.ramp_seconds = 0;
+    BabDiagnostics diag;
+    PortfolioDiagnostics pdiag;
+    auto raw = sor::search::solve_milp_portfolio(lp, base, options, diag, pdiag);
+    const auto result = sor::certify::finalize_result(raw, sor::search::milp_evidence(diag, base));
+    CHECK(result.status == Status::Unbounded);
+    CHECK(diag.unbounded_certified);
+    CHECK(raw.primal_ray.direction.size() == 2);
+}
+
 }  // namespace
 
 // The cross-arm gate and the cut net decide on exact activities (audit
@@ -141,6 +192,8 @@ void test_portfolio_gate_is_exact() {
 }
 
 int main() {
+    test_cancellation_is_inherited_without_a_proof();
+    test_checked_unbounded_arm_is_terminal();
     test_portfolio_gate_is_exact();
     test_portfolio_matches_single_arm_on_knapsack();
     test_portfolio_without_sharing_still_correct();

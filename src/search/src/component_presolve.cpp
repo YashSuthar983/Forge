@@ -118,10 +118,10 @@ ComponentPresolveDiagnostics apply_component_presolve(
     const auto t0 = sor::core::SolverClock::now();
     // Unbounded before 2026-09-20; see the comment on the component loop.
     const auto out_of_time = [&]() {
-        return opts.time_limit_s > 0.0 &&
+        return core::cancel_requested(opts.cancel) || (opts.time_limit_s > 0.0 &&
                std::chrono::duration<double>(
                    sor::core::SolverClock::now() - t0).count() >
-                   opts.time_limit_s;
+                   opts.time_limit_s);
     };
 
     ComponentPresolveDiagnostics diag;
@@ -145,6 +145,7 @@ ComponentPresolveDiagnostics apply_component_presolve(
     DSU dsu(n);
     std::vector<std::vector<Index>> row_cols(sz(m));
     for (Index i = 0; i < m; ++i) {
+        if (out_of_time()) { diag.aborted_on_time = true; return diag; }
         Index first = -1;
         for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
             if (av[sz(k)] == 0.0) continue;
@@ -238,7 +239,7 @@ ComponentPresolveDiagnostics apply_component_presolve(
         // rows are currently active. This previously produced false root
         // Infeasible claims on seymour1 and supportcase12.
         auto dfix = apply_dual_fixing(sub, col_lo, col_hi, opts.tol,
-                                      opts.dual_fix_rounds, true, 0.0, &cols);
+                                      opts.dual_fix_rounds, true, 0.0, &cols, opts.cancel);
         diag.dual_fixings += dfix.fixings;
         if (dfix.infeasible) {
             diag.infeasible = true;
@@ -246,7 +247,7 @@ ComponentPresolveDiagnostics apply_component_presolve(
         }
 
         auto pr = propagate_bounds(sub, col_lo, col_hi, opts.tol,
-                                   opts.fbbt_rounds);
+                                   opts.fbbt_rounds, opts.cancel);
         diag.fbbt_tightenings += pr.tightened;
         if (!pr.feasible) {
             diag.infeasible = true;
@@ -280,6 +281,8 @@ ComponentPresolveDiagnostics apply_component_presolve(
         std::vector<f64> hull_lo(sz(nb), 1.0), hull_hi(sz(nb), 0.0);
         std::uint64_t feas = 0;
         for (std::uint64_t mask = 0; mask < nass; ++mask) {
+            // Partial enumeration cannot prove a hull or exhaustion.
+            if (out_of_time()) { diag.aborted_on_time = true; return diag; }
             for (Index t = 0; t < nb; ++t) {
                 const f64 v = ((mask >> static_cast<unsigned>(t)) & 1ULL) ? 1.0 : 0.0;
                 x_lo[sz(free_bins[sz(t)])] = v;
