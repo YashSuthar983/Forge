@@ -74,7 +74,9 @@ int main() {
         tall.c.assign(n, 1); tall.col_lo.assign(n, 0); tall.col_hi.assign(n, 50);
         forge::engines::SimplexOptions policy; policy.exact_proof = false;
         forge::core::LpOptions race; race.concurrent_solves = 3; race.time_limit_s = 30;
-        forge::core::LpOptions single; single.time_limit_s = 30;
+        forge::core::LpOptions single;
+        single.concurrent_solves = 1;
+        single.time_limit_s = 30;
         policy.dualize = forge::engines::DualizePolicy::Always;
         double objectives[2];
         int k = 0;

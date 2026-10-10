@@ -31,6 +31,9 @@ struct Tok {
     f64 num = 0.0;
     int line = 0;
     bool first_on_line = false;
+    // True when the literal underflows to 0 in double. Matrix/objective
+    // coefficients still reject that loss; bounds accept it as an explicit 0.
+    bool underflown = false;
 };
 
 std::string lower(std::string s) {
@@ -63,13 +66,14 @@ std::vector<Tok> tokenize(const std::string& text, std::size_t& lines) {
     bool line_start = true;
     std::size_t i = 0;
     const std::size_t n = text.size();
-    auto push = [&](TokKind k, std::string t, f64 v) {
+    auto push = [&](TokKind k, std::string t, f64 v, bool underflown = false) {
         Tok tok;
         tok.kind = k;
         tok.text = std::move(t);
         tok.num = v;
         tok.line = line;
         tok.first_on_line = line_start;
+        tok.underflown = underflown;
         line_start = false;
         out.push_back(std::move(tok));
     };
@@ -104,13 +108,14 @@ std::vector<Tok> tokenize(const std::string& text, std::size_t& lines) {
             const std::string lex = text.substr(i, j - i);
             const f64 number = std::strtod(lex.c_str(), nullptr);
             if (!std::isfinite(number)) fail(line, "numeric literal overflows: " + lex);
+            bool underflown = false;
             if (number == 0.0) {
                 const auto exp = lex.find_first_of("eE");
                 const auto mantissa = lex.substr(0, exp);
                 if (mantissa.find_first_of("123456789") != std::string::npos)
-                    fail(line, "numeric literal underflows to zero: " + lex);
+                    underflown = true;  // accepted only when used as a bound
             }
-            push(TokKind::Num, lex, number);
+            push(TokKind::Num, lex, number, underflown);
             i = j;
             continue;
         }
@@ -261,6 +266,8 @@ int Parser::var(const std::string& name) {
 void Parser::add_term(Expr& e, f64 sign, bool same_line_only) {
     const Tok tk = cur();
     if (tk.kind == TokKind::Num) {
+        if (tk.underflown)
+            fail(tk.line, "numeric literal underflows to zero: " + tk.text);
         advance();
         f64 coef = tk.num;
         if (is_op(cur(), "*") && cur().line == tk.line) {
@@ -341,7 +348,14 @@ void Parser::parse_objective(bool is_max) {
 
 void Parser::parse_constraint() {
     std::string name;
-    if (cur().kind == TokKind::Name && is_op(peek(), ":")) {
+    // "name:" or a decorative leading number before it ("3 c2:") — exporters
+    // sometimes prefix a row id; that must not become the term 3*c2.
+    if (cur().kind == TokKind::Num && peek().kind == TokKind::Name && is_op(peek(2), ":")) {
+        advance();
+        name = cur().text;
+        advance();
+        advance();
+    } else if (cur().kind == TokKind::Name && is_op(peek(), ":")) {
         name = cur().text;
         advance();
         advance();
@@ -366,7 +380,7 @@ void Parser::parse_constraint() {
             fail(line, "a ranged constraint must use the same direction twice (a <= expr <= b)");
         for (const auto& [j, c] : e2.terms) lin[j] += c;
         if (!std::isfinite(e2.constant)) fail(line, "ranged expression constant must be finite");
-        if (s1 == "<=") { lo = e1.constant - 0.0; hi = e3.constant; }
+        if (s1 == "<=") { lo = e1.constant; hi = e3.constant; }
         else            { hi = e1.constant;       lo = e3.constant; }
         if (std::isfinite(lo)) {
             lo -= e2.constant;
@@ -417,9 +431,15 @@ f64 Parser::read_value() {
     }
     (void)signed_;
     f64 v;
-    if (cur().kind == TokKind::Num) v = cur().num;
-    else if (is_infinity_name(cur())) v = kInf;
-    else fail(cur().line, "expected a number or inf in a bound");
+    if (cur().kind == TokKind::Num) {
+        // Bounds may underflow to an explicit 0; matrix/objective literals
+        // still hard-error in add_term.
+        v = cur().num;
+    } else if (is_infinity_name(cur())) {
+        v = kInf;
+    } else {
+        fail(cur().line, "expected a number or inf in a bound");
+    }
     advance();
     v *= sign;
     return v;

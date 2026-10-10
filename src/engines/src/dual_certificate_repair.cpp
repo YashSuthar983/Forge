@@ -459,4 +459,74 @@ bool repair_simplex_support(const model::LpProblem& p, core::RawResult& raw,
     diag.gap_rel = checked.gap_rel;
     return true;
 }
+
+bool continue_certificate_from_basis(const model::LpProblem& problem,
+                                     const SimplexOptions& opts,
+                                     const SimplexBasis& basis,
+                                     std::uint64_t pivot_cap,
+                                     core::RawResult& raw,
+                                     SimplexDiagnostics& diag,
+                                     SimplexBasis* out_basis) {
+    if (raw.proposed_status != core::Status::Optimal ||
+        basis.status.empty() ||
+        (diag.dual_bound_finite && diag.gap_rel <= opts.gap_tol) ||
+        diag.certificate_iterations >= simplex_certificate_pivot_allowance)
+        return false;
+    if (opts.max_iterations != 0 && diag.iterations >= opts.max_iterations)
+        return false;
+
+    SimplexOptions continuation = opts;
+    continuation.presolve = false;
+    continuation.method = SimplexMethod::Primal;
+    continuation.certificate_pricing = true;
+    continuation.primal_bound_perturbation = false;
+    const auto certificate_available =
+        simplex_certificate_pivot_allowance - diag.certificate_iterations;
+    continuation.max_iterations = opts.max_iterations == 0
+        ? certificate_available
+        : std::min(certificate_available, opts.max_iterations - diag.iterations);
+    if (pivot_cap != 0)
+        continuation.max_iterations =
+            std::min(continuation.max_iterations, pivot_cap);
+    if (continuation.max_iterations == 0) return false;
+
+    SimplexDiagnostics work;
+    SimplexBasis repaired;
+    auto candidate =
+        solve_primal_simplex(problem, continuation, work, &repaired, &basis);
+    auto checked = certify::check_lp_result(
+        problem, candidate, simplex_evidence(work, continuation));
+    if (!checked.checker_passed &&
+        candidate.proposed_status == core::Status::Optimal &&
+        std::isfinite(candidate.dual_bound) && !raw.x.empty()) {
+        candidate.x = raw.x;
+        candidate.objective = problem.objective(candidate.x);
+        checked = certify::check_lp_result(
+            problem, candidate, simplex_evidence(work, continuation));
+    }
+    work.certificate_stages = std::max<std::uint64_t>(1, work.stages);
+    work.certificate_iterations = work.iterations;
+    work.certificate_preprocessing_builds = work.preprocessing_builds;
+    accumulate_simplex_work(diag, work);
+    if (!(checked.checker_passed && checked.reported_values_consistent &&
+          checked.max_dual_violation <= opts.dual_feas_tol &&
+          std::isfinite(checked.gap_rel) && checked.gap_rel <= opts.gap_tol &&
+          candidate.proposed_status == core::Status::Optimal))
+        return false;
+
+    const auto totals = diag;
+    diag = work;
+    install_simplex_work_totals(diag, totals);
+    diag.primal_residual = checked.max_primal_violation;
+    diag.dual_residual = checked.max_dual_violation;
+    diag.primal_objective = candidate.objective;
+    diag.dual_objective = checked.checked_dual_bound;
+    diag.dual_bound_finite = std::isfinite(checked.checked_dual_bound);
+    diag.gap_rel = checked.gap_rel;
+    raw = std::move(candidate);
+    raw.engine = "simplex+certificate-continuation";
+    if (out_basis) *out_basis = std::move(repaired);
+    return true;
+}
+
 }  // namespace forge::engines

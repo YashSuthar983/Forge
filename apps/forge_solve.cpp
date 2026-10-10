@@ -95,6 +95,8 @@ void usage() {
         "  --refactor-eta-ratio R refactor when eta nnz exceeds R*factor nnz\n"
         "  --refactor-work-ratio R refactor when solve work exceeds R*factor nnz\n"
         "  --refactor-u-nnz-ratio R  FT: refactor when nnz(U) exceeds R*factor nnz\n"
+        "  --refactor-hypersparse-hit-floor R  refactor when hypersparse hit rate\n"
+        "                   drops below R (0 disables; armed at factor nnz>=4096)\n"
         "  --ft-update-limit N       FT: refactor after N row etas\n"
         "  --dual-resync-interval N rebuild dual/reduced costs every N pivots (0=off)\n"
         "  --dual-cost-perturbation M deterministic dual perturbation multiplier\n"
@@ -125,6 +127,8 @@ void usage() {
         "  --[no-]fo-polish     enable/disable HPR feasibility polishing\n"
         "  --[no-]fo-certificates enable/disable HPR certificate detection\n"
         "  --[no-]fo-crossover  enable/disable Auto FO-to-simplex crossover\n"
+        "  --enable-sifting     column-generation sifting stub for wide LPs (off)\n"
+        "  --enable-network-simplex  network incidence detect + stub path (off)\n"
         "  --auto-budget-split S  one of 60/25/15, 70/20/10, 80/15/5\n"
         "  --hpr-restart-off | --hpr-reflection-off | --hpr-weight-off\n"
         "  --hpr-weight-pid | --hpr-weight-smoothed  primal-weight controller (default smoothed)\n"
@@ -290,7 +294,9 @@ void usage() {
         "  --lp-exit-refactor always|economy  rebuild the dual simplex factor at every would-be\n"
         "                      optimum carrying updates, or only once its update file has cost a\n"
         "                      factorization (default always)\n"
-        "  --lp-concurrent N  race N independently checked simplex arms (auto route)\n"
+        "  --lp-concurrent N  race N independently checked arms (dual/primal/alt/barrier)\n"
+        "  --lp-concurrent-deterministic  Method=4-style: fixed budgets, lowest-index winner\n"
+        "  --lp-preset verified|speed  verified=1e-7/1e-9 (default); speed=1e-6 commercial\n"
         "  --lp-parallel-basis  evaluate paired basis solves with private worker factors\n"
         "  --lp-dualize off|on|auto  solve the LP through its dual LP (simplex, no\n"
         "                   exact proof; default off; auto: rows >= 4000 and\n"
@@ -315,6 +321,21 @@ void usage() {
         "  checked point without an optimality proof); 7 Infeasible;\n"
         "  8 Unbounded or InfeasibleOrUnbounded\n",
         stderr);
+    namespace num = forge::engines::numerics;
+    std::fprintf(stderr,
+        "simplex numerics defaults (engines::numerics):\n"
+        "  primal/dual feas tol  %.0e / %.0e\n"
+        "  gap tol               %.0e\n"
+        "  pivot tol             %.0e  (eligibility; LU absolute floor %.0e)\n"
+        "  harris slack          %.0e\n"
+        "  scale-adjusted floor  %.0e\n"
+        "  expand delta/max      %.0e / %.0e\n"
+        "  FT hard update floor  %d row etas\n",
+        num::kDefaultPrimalFeasTol, num::kDefaultDualFeasTol,
+        num::kDefaultGapTol, num::kDefaultPivotTol,
+        num::kDefaultLuPivotTol, num::kDefaultHarrisSlack,
+        num::kScaleAdjustedTolFloor, num::kDefaultExpandDelta,
+        num::kDefaultExpandMax, num::kForrestTomlinHardUpdateFloor);
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,7 +1037,7 @@ bool refuse_if_no_columns(const std::string& path, int n_cols) {
 int main(int argc, char** argv) {
     if (argc < 2) { usage(); return 2; }
 
-    std::string path, backend_name = "cpu", engine_name = "simplex";
+    std::string path, backend_name = "cpu", engine_name = "auto";
     std::string q_diag_arg;
     std::uint32_t bq_searches = 256;   // --engine binquad on a device
     std::uint32_t bq_batch = 8;        // --engine binquad: B&B nodes per pass
@@ -1031,7 +1052,10 @@ int main(int argc, char** argv) {
     // each engine's options are built, AFTER that branch's own defaults, so an
     // explicitly given option always wins over a built-in choice.
     std::vector<std::string> qp_opt_args, qcqp_opt_args, miqp_opt_args;
-    int lp_concurrent = 1;
+    int lp_concurrent = 0;
+    bool lp_concurrent_given = false;
+    bool lp_concurrent_deterministic = false;
+    std::string lp_preset;
     int n_threads = 0;                 // --threads: 0 = forge::core's default
     forge::engines::PdhgOptions pdhg_opts;
     forge::engines::HprOptions hpr_opts;
@@ -1061,6 +1085,8 @@ int main(int argc, char** argv) {
     bool fo_polish = true;
     bool fo_certificates = true;
     bool fo_crossover = true;
+    bool lp_enable_sifting = false;
+    bool lp_enable_network_simplex = false;
     forge::core::LpAutoBudgetSplit auto_budget_split =
         forge::core::LpAutoBudgetSplit::Fo60Crossover25Simplex15;
     // MILP conflict-graph switches. Three independent consumers of one root
@@ -1455,6 +1481,10 @@ int main(int argc, char** argv) {
             sx_opts.ft_update_limit = static_cast<int>(parse_uint(
                 next("--ft-update-limit"), "--ft-update-limit", 0,
                 static_cast<unsigned long long>(std::numeric_limits<int>::max())));
+        else if (a == "--refactor-hypersparse-hit-floor")
+            sx_opts.refactor_hypersparse_hit_floor = parse_real(
+                next("--refactor-hypersparse-hit-floor"),
+                "--refactor-hypersparse-hit-floor", 0.0, 1.0);
         else if (a == "--dual-resync-interval")
             sx_opts.dual_resync_interval = static_cast<int>(parse_uint(
                 next("--dual-resync-interval"), "--dual-resync-interval", 0,
@@ -1527,6 +1557,8 @@ int main(int argc, char** argv) {
         }
         else if (a == "--fo-crossover") fo_crossover = true;
         else if (a == "--no-fo-crossover") fo_crossover = false;
+        else if (a == "--enable-sifting") lp_enable_sifting = true;
+        else if (a == "--enable-network-simplex") lp_enable_network_simplex = true;
         else if (a == "--auto-budget-split") {
             const std::string split = next("--auto-budget-split");
             if (split == "60/25/15")
@@ -1900,8 +1932,15 @@ int main(int argc, char** argv) {
             hpr_opts.weight_policy = forge::engines::HprOptions::WeightPolicy::Pid;
         else if (a == "--hpr-weight-smoothed")
             hpr_opts.weight_policy = forge::engines::HprOptions::WeightPolicy::Smoothed;
-        else if (a == "--lp-concurrent")
-            lp_concurrent = static_cast<int>(parse_uint(next("--lp-concurrent"), "--lp-concurrent", 1, 16));
+        else if (a == "--lp-concurrent") {
+            lp_concurrent_given = true;
+            lp_concurrent = static_cast<int>(
+                parse_uint(next("--lp-concurrent"), "--lp-concurrent", 1, 16));
+        }
+        else if (a == "--lp-concurrent-deterministic")
+            lp_concurrent_deterministic = true;
+        else if (a == "--lp-preset")
+            lp_preset = next("--lp-preset");
         else if (a == "--threads")
             n_threads = static_cast<int>(parse_uint(next("--threads"), "--threads", 1, 256));
         else if (a == "--solution-out") solution_out = next("--solution-out");
@@ -1990,6 +2029,8 @@ int main(int argc, char** argv) {
     if (lp_gap_given) {
         sx_opts.gap_tol = pdhg_opts.gap_tol = hpr_opts.gap_tol = lp_gap_tolerance;
     }
+    sx_opts.enable_sifting = lp_enable_sifting;
+    sx_opts.enable_network_simplex = lp_enable_network_simplex;
 
     // The pool is process-wide and sized once, before any solve: sizing it
     // mid-solve would change how a reduction is chunked.  Printed with every
@@ -4472,12 +4513,30 @@ int main(int argc, char** argv) {
             }
             forge::core::LpOptions lp_opts;
             lp_opts.strategy = forge::core::LpStrategy::Auto;
-            lp_opts.concurrent_solves = lp_concurrent;
+            if (lp_concurrent_given)
+                lp_opts.concurrent_solves = lp_concurrent;
+            lp_opts.concurrent_deterministic = lp_concurrent_deterministic;
+            if (lp_preset == "speed")
+                forge::core::apply_lp_tolerance_preset(
+                    lp_opts, forge::core::LpTolerancePreset::Speed);
+            else if (lp_preset == "verified" || lp_preset.empty())
+                forge::core::apply_lp_tolerance_preset(
+                    lp_opts, forge::core::LpTolerancePreset::Verified);
+            else {
+                std::fprintf(stderr, "error: --lp-preset must be verified|speed\n");
+                return 2;
+            }
             lp_opts.max_iterations = max_iter_given ? sx_opts.max_iterations : 0;
             lp_opts.time_limit_s = sx_opts.time_limit_s;
-            lp_opts.primal_feas_tol = sx_opts.primal_feas_tol;
-            lp_opts.dual_feas_tol = sx_opts.dual_feas_tol;
-            lp_opts.gap_tol = sx_opts.gap_tol;
+            if (lp_preset.empty()) {
+                lp_opts.primal_feas_tol = sx_opts.primal_feas_tol;
+                lp_opts.dual_feas_tol = sx_opts.dual_feas_tol;
+                lp_opts.gap_tol = sx_opts.gap_tol;
+            } else {
+                sx_opts.primal_feas_tol = lp_opts.primal_feas_tol;
+                sx_opts.dual_feas_tol = lp_opts.dual_feas_tol;
+                sx_opts.gap_tol = lp_opts.gap_tol;
+            }
             lp_opts.presolve = sx_opts.presolve;
             lp_opts.presolve_implied_slack = sx_opts.presolve_implied_slack;
             lp_opts.fo_polish = fo_polish;
@@ -4485,6 +4544,8 @@ int main(int argc, char** argv) {
             lp_opts.fo_crossover = fo_crossover;
             lp_opts.auto_budget_split = auto_budget_split;
             lp_opts.backend = backend_name;
+            lp_opts.enable_sifting = lp_enable_sifting;
+            lp_opts.enable_network_simplex = lp_enable_network_simplex;
             forge::core::LpDiagnostics diag;
             forge::core::ProofEvidence ev;
             // As in the simplex route: the exact dual-bound proof only when
@@ -4674,22 +4735,38 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(
                             diag.wrong_sign_backward_steps));
             std::printf("  primal cleanup   %10llu  (%llu pivots, handed dual "
-                        "infeas %.3e / primal infeas %.3e)\n",
+                        "infeas %.3e / primal infeas %.3e, cause %u phase %d "
+                        "working %.3e model-costs %s, reeval %llu dropped %llu)\n",
                         static_cast<unsigned long long>(diag.primal_cleanups),
                         static_cast<unsigned long long>(
                             diag.primal_cleanup_iterations),
                         diag.cleanup_dual_infeasibility,
-                        diag.cleanup_primal_infeasibility);
-            std::printf("  trouble refactor %10llu  (%llu shifts refused)\n",
+                        diag.cleanup_primal_infeasibility,
+                        static_cast<unsigned>(diag.cleanup_request_cause),
+                        diag.cleanup_request_phase,
+                        diag.cleanup_working_dual_infeasibility,
+                        diag.cleanup_restored_model_costs ? "yes" : "no",
+                        static_cast<unsigned long long>(diag.cleanup_reevaluations),
+                        static_cast<unsigned long long>(
+                            diag.cleanup_requests_dropped));
+            std::printf("  trouble refactor %10llu  (%llu shifts refused, "
+                        "%llu harmful fresh-factor blocks)\n",
                         static_cast<unsigned long long>(
                             diag.numerical_trouble_refactors),
                         static_cast<unsigned long long>(
-                            diag.refused_cost_shifts));
+                            diag.refused_cost_shifts),
+                        static_cast<unsigned long long>(
+                            diag.harmful_shift_fresh_factor_blocks));
             std::printf("  residual refactors %8llu  (%llu refinement corrections)\n",
                         static_cast<unsigned long long>(diag.residual_refactors),
                         static_cast<unsigned long long>(diag.refinement_corrections));
-            std::printf("  zero dual steps  %10llu\n",
-                        static_cast<unsigned long long>(diag.numerical_zero_dual_steps));
+            std::printf("  zero dual steps  %10llu  (max stationarity approx %.3e)\n",
+                        static_cast<unsigned long long>(diag.numerical_zero_dual_steps),
+                        diag.numerical_zero_stationarity_max);
+            std::printf("  price refreshes  %10llu  (%llu beyond-tol repairs)\n",
+                        static_cast<unsigned long long>(diag.working_price_refreshes),
+                        static_cast<unsigned long long>(
+                            diag.working_price_refresh_repairs));
             std::printf("  rho density      %llu sparse / %llu dense, avg support %llu\n",
                         static_cast<unsigned long long>(diag.rho_sparse_iters),
                         static_cast<unsigned long long>(diag.rho_dense_iters),
@@ -4751,6 +4828,7 @@ int main(int argc, char** argv) {
                     ? forge::core::LpStrategy::Hpr
                     : engine_name == "barrier" ? forge::core::LpStrategy::Barrier
                     : forge::core::LpStrategy::Pdhg;
+                lp_opts.concurrent_solves = 1;
                 lp_opts.max_iterations = max_iter_given
                     ? (engine_name == "hpr" ? hpr_opts.max_iterations
                                             : pdhg_opts.max_iterations)
@@ -4769,6 +4847,8 @@ int main(int argc, char** argv) {
                 lp_opts.fo_certificates = fo_certificates;
                 lp_opts.fo_crossover = fo_crossover;
                 lp_opts.backend = backend_name;
+                lp_opts.enable_sifting = lp_enable_sifting;
+                lp_opts.enable_network_simplex = lp_enable_network_simplex;
                 forge::core::LpDiagnostics diag;
                 forge::core::ProofEvidence ev;
                 // As in the simplex route: the exact dual-bound proof only when

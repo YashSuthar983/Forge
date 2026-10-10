@@ -214,9 +214,11 @@ bool LiveMatrix::fix_column(Index j, f64 value, DualRecoveryKind kind, Index row
         if (!row_active[sz(i)]) continue;
         const auto entry = rows[sz(i)].find(j);
         if (entry != rows[sz(i)].end()) {
-            const f64 shift = entry->second * value;
-            row_lo[sz(i)] -= shift;
-            row_hi[sz(i)] -= shift;
+            model::ExactSum shift;
+            shift.add_product(entry->second, value);
+            const f64 delta = shift.value().convert_to<f64>();
+            row_lo[sz(i)] -= delta;
+            row_hi[sz(i)] -= delta;
             rows[sz(i)].erase(j);
         }
         queue_row(i);
@@ -641,19 +643,22 @@ bool LiveMatrix::try_cost_tight_doubleton(Index j) {
     }
     const f64 old_lo = row_lo[sz(i)], old_hi = row_hi[sz(i)];
     row_lo[sz(i)] = row_hi[sz(i)] = side;
+    DualRecoveryStep side_step;
+    side_step.kind = DualRecoveryKind::RowSideFixed;
+    side_step.row = i;
+    side_step.col = j;
+    side_step.coeff = a;
+    side_step.old_lo = old_lo;
+    side_step.old_hi = old_hi;
+    side_step.new_lo = side;
+    record_column_dual_state(side_step, i, j);
+    out->recovery_steps.push_back(std::move(side_step));
     if (!try_doubleton_equality(i, true)) {
+        out->recovery_steps.pop_back();
         row_lo[sz(i)] = old_lo;
         row_hi[sz(i)] = old_hi;
         return false;
     }
-    DualRecoveryStep step;
-    step.kind = DualRecoveryKind::RowSideFixed;
-    step.row = i;
-    step.col = j;
-    step.old_lo = old_lo;
-    step.old_hi = old_hi;
-    step.new_lo = side;
-    out->recovery_steps.push_back(std::move(step));
     return true;
 }
 
@@ -819,6 +824,17 @@ bool LiveMatrix::try_duplicate_rows() {
             const f64 keep_lo = row_lo[sz(keep)], keep_hi = row_hi[sz(keep)];
             row_lo[sz(keep)] = std::max(row_lo[sz(keep)], implied_lo);
             row_hi[sz(keep)] = std::min(row_hi[sz(keep)], implied_hi);
+            {
+                const f64 tol = options.feasibility_tol *
+                                (1.0 + std::fabs(row_lo[sz(keep)]));
+                if (row_lo[sz(keep)] > row_hi[sz(keep)] + tol) {
+                    *status = PresolveStatus::Infeasible;
+                    *witness_row = keep;
+                    *reason = "parallel row merge crossed bounds on row " +
+                              std::to_string(keep);
+                    return false;
+                }
+            }
             for (const auto& [j, a] : rows[sz(rem)]) {
                 (void)a;
                 col_rows[sz(j)].erase(rem);
@@ -946,6 +962,16 @@ bool LiveMatrix::run_until_stable() {
                 for (const auto& [j, a] : rows[sz(i)])
                     if (col_active[sz(j)] && a != 0.0) ++live;
                 if (live == 0) {
+                    const f64 rhs = row_lo[sz(i)];
+                    const f64 scale = 1.0 + std::fabs(rhs);
+                    const f64 tol = options.feasibility_tol * scale;
+                    if (std::isfinite(rhs) && std::fabs(rhs) > tol) {
+                        *status = PresolveStatus::Infeasible;
+                        *witness_row = i;
+                        *reason = "empty equality row " + std::to_string(i) +
+                                  " has activity outside its bounds";
+                        return false;
+                    }
                     row_active[sz(i)] = 0;
                     ++out->stats.rows_removed;
                 }
@@ -971,6 +997,7 @@ bool LiveMatrix::run_until_stable() {
 
         if (options.dominated_columns) try_dominated_columns();
         if (options.parallel_rows) try_duplicate_rows();
+        if (*status != PresolveStatus::Reduced) break;
         if (options.parallel_columns) try_duplicate_columns();
 
         for (Index j = 0; j < n; ++j) {

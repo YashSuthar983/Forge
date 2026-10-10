@@ -318,6 +318,14 @@ using SymMul = std::function<void(const std::vector<f64>&, std::vector<f64>&)>;
 f64 fgmres_solve(const la::Ldlt& fac, const SymMul& mul, std::vector<f64>& rhs,
                  int max_krylov, f64 tol_rel, const char* phase = nullptr);
 
+// Same iteration, with an arbitrary preconditioner application (rhs in, solution
+// out, in place).  The LDL' overload is this with prec = fac.solve.  The LP
+// normal-equation path uses it so the Krylov product stays the unregularised
+// augmented matrix while the preconditioner is the m-by-m factor.
+f64 fgmres_solve(const std::function<void(std::vector<f64>&)>& prec, const SymMul& mul,
+                 std::vector<f64>& rhs, int max_krylov, f64 tol_rel,
+                 const char* phase = nullptr);
+
 // Solution polishing (OSQP paper, s.5): guess the active set from (x, y),
 // solve the resulting equality-constrained QP exactly, and keep the result
 // ONLY if kkt_original passes on it.  On success x, y and out are replaced;

@@ -191,11 +191,11 @@ int main() {
         io::MpsReadReport rep;
         const auto p = io::read_mps(in, rep);
         CHECK(p.row_hi[0] == 4.0 && p.row_lo[0] == 3.0);  // RHS1 and RNG1
-        CHECK(p.row_lo[1] == 2.0);   // unnamed 1.0, then RHS1's 2.0
+        CHECK(p.row_lo[1] == 2.0);   // anonymous R2 skipped; RHS1's 2.0 stands
         CHECK(p.col_hi[0] == 2.0);   // BND1, its last value
         CHECK(p.col_lo[1] == -forge::model::kInf && p.col_hi[1] == forge::model::kInf);
-        CHECK(rep.ignored_set_lines == 3);
-        CHECK(rep.repeated_entries == 2);  // R2 in RHS1, X's UP in BND1
+        CHECK(rep.ignored_set_lines == 4);  // RHS2, anonymous R2, RNG2, BND2
+        CHECK(rep.repeated_entries == 1);  // X's UP in BND1
         int set_warnings = 0;
         for (const auto& w : rep.warnings)
             set_warnings += w.find("is the one used") != std::string::npos;
@@ -267,6 +267,10 @@ int main() {
         CHECK_NEAR(p.c[static_cast<std::size_t>(a)], 1.0, 1e-15);
         CHECK_NEAR(p.c[static_cast<std::size_t>(b)], 2.0, 1e-15);
         CHECK_NEAR(p.c[static_cast<std::size_t>(c)], -1.0, 1e-15);
+        bool free_n_warned = false;
+        for (const auto& w : rep.warnings)
+            free_n_warned |= w.find("extra free N row") != std::string::npos;
+        CHECK(free_n_warned);
 
         // RHS on the objective row is the negative of the constant.
         CHECK_NEAR(p.obj_offset, 7.0, 1e-15);
@@ -296,6 +300,46 @@ int main() {
         CHECK(std::isinf(p.col_hi[static_cast<std::size_t>(c)]));
         CHECK(p.is_integer[static_cast<std::size_t>(b)]);
         CHECK(!p.is_integer[static_cast<std::size_t>(a)]);
+    }
+
+    // ---- Fortran D-exponent literals ----
+    {
+        const std::string mps =
+            "NAME          DEXP\n"
+            "ROWS\n"
+            " N  OBJ\n"
+            " L  R1\n"
+            "COLUMNS\n"
+            "    X         OBJ       1.0D0       R1        1.0D-1\n"
+            "RHS\n"
+            "    RHS       R1        2.0d+0\n"
+            "ENDATA\n";
+        std::istringstream in(mps);
+        io::MpsReadReport rep;
+        const auto p = io::read_mps(in, rep);
+        CHECK_NEAR(p.c[0], 1.0, 1e-15);
+        CHECK_NEAR(coeff(p, 0, 0), 0.1, 1e-15);
+        CHECK_NEAR(p.row_hi[0], 2.0, 1e-15);
+    }
+
+    // ---- OBJSENS MAX (alias spelling) ----
+    {
+        const std::string mps =
+            "NAME          M\n"
+            "OBJSENS MAXIMIZE\n"
+            "ROWS\n"
+            " N  OBJ\n"
+            " L  R1\n"
+            "COLUMNS\n"
+            "    X         OBJ       1.0        R1        1.0\n"
+            "RHS\n"
+            "    RHS       R1        2.0\n"
+            "ENDATA\n";
+        std::istringstream in(mps);
+        io::MpsReadReport rep;
+        const auto p = io::read_mps(in, rep);
+        CHECK(p.maximize);
+        CHECK(rep.had_objsense_max);
     }
 
     // ---- OBJSENSE MAX ----

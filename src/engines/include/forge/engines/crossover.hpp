@@ -19,10 +19,14 @@ struct CrossoverOptions {
     const SimplexOptions* simplex_policy = nullptr;
     f64 primal_tol = 1e-7;
     f64 dual_tol = 1e-7;
+    // Duality-gap tolerance for cleanup optimality claims. Defaults match
+    // LpOptions::gap_tol (1e-9); callers must thread the user value through.
+    f64 gap_tol = 1e-9;
     f64 trigger_primal_dual_tol = 1e-4;
     f64 trigger_gap_tol = 1e-2;
     f64 useful_budget_point_tol = 1e-2;
-    f64 useful_budget_gap_tol = 1e-1;
+    // Interrupted FO handoff: was 1e-1 (10% gap), which built invalid bases.
+    f64 useful_budget_gap_tol = 1e-3;
     // Numerical rank threshold used consistently while building and repairing
     // the crossover basis.  Exposed so tests and numerical experiments do not
     // have to depend on a coefficient accidentally straddling a hidden value.
@@ -44,6 +48,13 @@ struct CrossoverDiagnostics {
     std::uint64_t upper_active = 0;
     std::uint64_t fixed = 0;
     std::uint64_t superbasic = 0;
+    std::uint64_t triangular_crash_columns = 0;
+    std::uint64_t dual_bound_flips = 0;
+    std::uint64_t dual_pushes = 0;
+    std::uint64_t dual_ftran_calls = 0;
+    std::uint64_t dual_ratio_tests = 0;
+    std::uint64_t dual_basis_pivots = 0;
+    std::uint64_t dual_failed_pushes = 0;
     std::uint64_t spiral_pushes = 0;
     std::uint64_t spiral_ftran_calls = 0;
     std::uint64_t spiral_ratio_tests = 0;

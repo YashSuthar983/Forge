@@ -14,6 +14,13 @@
 #include <limits>
 #include <stdexcept>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
 namespace forge::la {
 namespace {
 
@@ -221,6 +228,8 @@ bool BasisFactor::factorize(Index m,
     u_alloc_nnz_ = 0;
     scratch_.work_since_factor_ = 0;
     scratch_.eta_work_since_factor_ = 0;
+    scratch_.hypersparse_solves_ = 0;
+    scratch_.triangular_solves_ = 0;
     if (singular_slots) singular_slots->clear();
     if (vacant_rows)    vacant_rows->clear();
 
@@ -1188,14 +1197,61 @@ void BasisFactor::u_order_move_to_back(Index p) {
 // Triangular solves, in pivot coordinates
 // ---------------------------------------------------------------------------
 
+namespace {
+#ifndef FORGE_RESTRICT
+#define FORGE_RESTRICT __restrict
+#endif
+// Packed mul of 4 multipliers by zk, then scalar scatter in index order.
+// Same FP ops as the scalar unroll (mul then -= per entry); AVX only packs
+// the multiplies. When simd is false, pure scalar unroll (bit-identical).
+inline void scatter_axpy4(f64* FORGE_RESTRICT v,
+                          const Index* FORGE_RESTRICT idx,
+                          const f64* FORGE_RESTRICT val,
+                          Offset t, f64 zk, bool simd) {
+#if defined(__AVX2__)
+    if (simd) {
+        const __m256d z = _mm256_set1_pd(zk);
+        const __m256d a = _mm256_loadu_pd(val + t);
+        alignas(32) f64 prod[4];
+        _mm256_storeu_pd(prod, _mm256_mul_pd(a, z));
+        v[sz(idx[t])]     -= prod[0];
+        v[sz(idx[t + 1])] -= prod[1];
+        v[sz(idx[t + 2])] -= prod[2];
+        v[sz(idx[t + 3])] -= prod[3];
+        return;
+    }
+#else
+    (void)simd;
+#endif
+    v[sz(idx[t])]     -= val[t]     * zk;
+    v[sz(idx[t + 1])] -= val[t + 1] * zk;
+    v[sz(idx[t + 2])] -= val[t + 2] * zk;
+    v[sz(idx[t + 3])] -= val[t + 3] * zk;
+}
+inline bool simd_solves_enabled() {
+#if defined(__AVX2__)
+    return !core::env_switches().lu_no_simd_solves;
+#else
+    return false;
+#endif
+}
+}  // namespace
+
 void BasisFactor::solve_lower(std::vector<f64>& v) const {
     const auto n = base_->piv_val_.size();
+    const bool simd = simd_solves_enabled();
     for (std::size_t k = 0; k < n; ++k) {
         const f64 zk = v[k];
         if (zk == 0.0) continue;
         const Offset beg = base_->l_start_[k], end = base_->l_start_[k + 1];
-        for (Offset t = beg; t < end; ++t)
-            v[sz(base_->l_idx_[sz(t)])] -= base_->l_val_[sz(t)] * zk;
+        Offset t = beg;
+        const Offset lim = beg + ((end - beg) & ~Offset{3});
+        const Index* idx = base_->l_idx_.data();
+        const f64* val = base_->l_val_.data();
+        for (; t < lim; t += 4)
+            scatter_axpy4(v.data(), idx, val, t, zk, simd);
+        for (; t < end; ++t)
+            v[sz(idx[t])] -= val[t] * zk;
     }
 }
 
@@ -1222,14 +1278,21 @@ void BasisFactor::solve_lower_pair(std::vector<f64>& a,
 // is what kept the hypersparse path running up to half of n.
 void BasisFactor::solve_upper(std::vector<f64>& v) const {
     const auto n = base_->piv_val_.size();
+    const bool simd = simd_solves_enabled();
     const auto step = [&](const std::size_t k) {
         f64 wk = v[k];
         if (wk == 0.0) return;
         wk /= base_->piv_val_[k];
         v[k] = wk;
         const Offset beg = base_->u_cstart_[k], end = beg + base_->u_clen_[k];
-        for (Offset q = beg; q < end; ++q)
-            v[sz(base_->u_crow_[sz(q)])] -= base_->u_cval_[sz(q)] * wk;
+        Offset q = beg;
+        const Offset lim = beg + ((end - beg) & ~Offset{3});
+        const Index* idx = base_->u_crow_.data();
+        const f64* val = base_->u_cval_.data();
+        for (; q < lim; q += 4)
+            scatter_axpy4(v.data(), idx, val, q, wk, simd);
+        for (; q < end; ++q)
+            v[sz(idx[q])] -= val[q] * wk;
     };
     if (u_reordered_) {
         for (std::size_t t = n; t-- > 0;) step(sz(base_->uord_[t]));
@@ -1998,6 +2061,7 @@ bool BasisFactor::ftran_impl(SolveScratch& sc, std::vector<f64>& b,
             learn_density(sc.ftran_density_, in_bucket,
                           static_cast<f64>(nonzeros) / static_cast<f64>(n));
     }
+    ++sc.triangular_solves_;
     if (sp) ++sc.hypersparse_solves_;
     if (sp && learn)
         learn_density(sc.ftran_density_, in_bucket,
@@ -2385,6 +2449,7 @@ bool BasisFactor::btran_impl(SolveScratch& sc, std::vector<f64>& d,
             learn_density(sc.btran_density_, in_bucket,
                           static_cast<f64>(nonzeros) / static_cast<f64>(n));
     }
+    ++sc.triangular_solves_;
     if (sp) ++sc.hypersparse_solves_;
     if (sp && learn)
         learn_density(sc.btran_density_, in_bucket,
@@ -2588,9 +2653,17 @@ Offset BasisFactor::eta_nnz() const {
 // a DSE log error of 0.29 and a cost shift of 6.3e+47. u_nnz_ratio and
 // ft_update_limit below are the FT-specific cadence that fixes that; they are
 // checked only once a row eta exists, so the product-form path is untouched.
+f64 BasisFactor::hypersparse_hit_rate() const noexcept {
+    const std::uint64_t hits = scratch_.hypersparse_solves_;
+    const std::uint64_t total = scratch_.triangular_solves_;
+    if (total == 0) return 1.0;
+    return static_cast<f64>(hits) / static_cast<f64>(total);
+}
+
 bool BasisFactor::needs_refactor(int update_limit, f64 eta_nnz_ratio,
                                  Index bump_width_max, f64 work_ratio_max,
-                                 f64 u_nnz_ratio, int ft_update_limit) const {
+                                 f64 u_nnz_ratio, int ft_update_limit,
+                                 f64 hypersparse_hit_floor) const {
     if (update_limit > 0 && static_cast<int>(n_updates()) >= update_limit)
         return true;
     if (eta_nnz_ratio > 0.0 && stats_.factor_nnz > 0) {
@@ -2606,13 +2679,29 @@ bool BasisFactor::needs_refactor(int update_limit, f64 eta_nnz_ratio,
             static_cast<f64>(u_live_nnz_) >
                 u_nnz_ratio * static_cast<f64>(stats_.factor_nnz))
             return true;
-        if (ft_update_limit > 0 &&
-            static_cast<int>(r_pos_.size()) >= ft_update_limit)
+        // Hard floor: if the caller disarmed FT count, still refuse to fly
+        // past a decade of compounding (kForrestTomlinHardUpdateFloor).
+        const int armed_ft_limit =
+            ft_update_limit > 0 ? ft_update_limit : kForrestTomlinHardUpdateFloor;
+        if (static_cast<int>(r_pos_.size()) >= armed_ft_limit)
             return true;
     }
     if (work_ratio_max > 0.0 && stats_.factor_nnz > 0) {
         const f64 limit = work_ratio_max * static_cast<f64>(stats_.factor_nnz);
         if (static_cast<f64>(scratch_.work_since_factor_) > limit) return true;
+    }
+    // Hypersparse miss rate: once enough solves have been observed on a
+    // non-trivial factor, a sustained drop below the floor means the update
+    // file has densified the solves and a refactor is cheaper than more dense
+    // triangular work. Small bases (factor_nnz < 4096) and short samples
+    // (< 256 solves) are skipped: early dense-history noise otherwise forces
+    // extra full factorizations on Netlib-scale models (grow7 regression).
+    if (hypersparse_hit_floor > 0.0 && hypersparse_hit_floor < 1.0 &&
+        stats_.factor_nnz >= 4096) {
+        const std::uint64_t total = scratch_.triangular_solves_;
+        if (total >= 256 && hypersparse_hit_rate() < hypersparse_hit_floor &&
+            n_updates() > 0)
+            return true;
     }
     return false;
 }
@@ -2953,6 +3042,19 @@ bool BasisFactor::update_ft(Index p, const std::vector<f64>& alpha,
         u_col_append(ps, k, val);
     }
     base_->piv_val_[sz(ps)] = new_diag;
+
+    // Post-update stability: reject if the installed diagonal drifted from
+    // the pre-mutation product, or if a row-eta multiplier is enormous.
+    // Caller then refactorizes (Forrest–Tomlin / Suhl-style guard).
+    {
+        const f64 expected = u_pp * ap;
+        const f64 scale = std::max({std::fabs(expected), std::fabs(new_diag), 1e-300});
+        if (!(std::fabs(new_diag - expected) <= 1e-6 * scale)) return false;
+        for (const Index k : ft_vsupport_) {
+            if (k == ps) continue;
+            if (std::fabs(ft_v_[sz(k)]) > 1e8) return false;
+        }
+    }
 
     // ---- the row eta ----------------------------------------------------
     for (const Index k : ft_vsupport_) {

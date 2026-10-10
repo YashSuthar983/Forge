@@ -98,6 +98,9 @@ struct QpOptions {
     int tighten_retries = 3;
     f64 halpern_theta = 0.0;
     bool verbose = false;
+    // Gondzio centrality correctors after the Mehrotra corrector (0 disables).
+    // LP barrier (Q=0) defaults to 4; general QP keeps 2.
+    int gondzio_correctors = 2;
 };
 
 struct QpDiagnostics {

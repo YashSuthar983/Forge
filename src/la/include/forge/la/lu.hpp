@@ -60,19 +60,34 @@ using core::f64;
 using core::Index;
 using core::Offset;
 
+// Absolute LU pivot floor (Markowitz acceptance). Must stay strictly below the
+// simplex eligibility pivot_tol (default 1e-7) so engines never build a basis
+// from pivots they would themselves reject in a ratio test.
+constexpr f64 kDefaultLuPivotTol = 1e-11;
+// Forrest-Tomlin update error compounds ~1 decade per this many row etas.
+// needs_refactor() refuses to fly past this floor even when the caller leaves
+// ft_update_limit disarmed.
+constexpr int kForrestTomlinHardUpdateFloor = 45;
+
 struct LuOptions {
     // Threshold pivoting: accept a Markowitz pivot only if its magnitude is at
     // least this fraction of the largest remaining magnitude in its column.
     // Lower preserves sparsity, higher preserves accuracy.
-    f64 markowitz_threshold = 0.1;
+    // Gurobi MarkowitzTol ≈ 0.0078; 0.03 is a measured compromise vs the
+    // old 0.1 (sparser factors, acceptable stability on Netlib).
+    f64 markowitz_threshold = 0.03;
 
     // Absolute floor. A candidate below this is not a pivot at any threshold;
     // the column is reported singular instead of producing a huge multiplier.
-    f64 pivot_tol = 1e-11;
+    // Must stay <= SimplexOptions::pivot_tol (eligibility floor); see
+    // engines::numerics and validate_simplex_numerics.
+    f64 pivot_tol = kDefaultLuPivotTol;
 
     // Columns examined per Markowitz pivot search. Unbounded search is
     // O(nnz) per pivot, which dominates everything on large bases.
-    int max_search_cols = 8;
+    // Raised from 8 so a later cost-0 pivot is not missed after a mediocre
+    // early candidate (fill / refactor count on pilot87).
+    int max_search_cols = 16;
 
     bool blocked_nucleus = true;
     Index dense_nucleus_limit = 512;
@@ -80,6 +95,11 @@ struct LuOptions {
     bool adaptive_threshold = true;
     f64 condition_limit = 1e9;
     f64 stable_threshold = 0.5;
+    // AVX2/SSE2 packed mul for long L/U columns. When false, the scalar
+    // (unroll-4) path runs and is bit-identical to the historical loop.
+    // Default true on hosts that compile with AVX2; scalar fallback always
+    // available via FORGE_NO_SIMD_SOLVES / this flag.
+    bool simd_dense_solves = true;
 };
 
 // Which basis-slot-replacement representation update_ft() vs. update() uses.
@@ -215,6 +235,8 @@ struct SolveScratch {
     std::array<f64, 33> btran_density_{};
     // Solves whose final triangular solve took the reach-set path.
     std::uint64_t hypersparse_solves_ = 0;
+    // Total FTRAN/BTRAN attempts since factorize (for hypersparse hit rate).
+    std::uint64_t triangular_solves_ = 0;
     // Solve work since the factorization (see work_since_factor()).
     Offset work_since_factor_ = 0;
     // The part of it the update file added: every solve crosses all of
@@ -432,7 +454,14 @@ public:
     bool needs_refactor(int update_limit, f64 eta_nnz_ratio,
                         Index bump_width_max = 0, f64 work_ratio_max = 0.0,
                         f64 u_nnz_ratio = 0.0,
-                        int ft_update_limit = 0) const;
+                        int ft_update_limit = 0,
+                        // When >0 and enough solves have been observed since
+                        // the last factor, force a refactor if the recent
+                        // hypersparse hit rate drops below this fraction
+                        // (dense fallback dominating = etas too fat).
+                        f64 hypersparse_hit_floor = 0.0) const;
+    // Fraction of FTRAN/BTRAN calls that stayed hypersparse since factorize.
+    f64 hypersparse_hit_rate() const noexcept;
 
     Index dimension()  const noexcept { return m_; }
     // Pending updates in EITHER file: product-form etas plus Forrest-Tomlin row

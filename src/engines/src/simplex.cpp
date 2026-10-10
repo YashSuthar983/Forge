@@ -3,6 +3,7 @@
 #include "forge/core/work_clock.hpp"
 #include "forge/la/basis_numerics.hpp"
 #include "forge/engines/dual_simplex.hpp"
+#include "forge/engines/farkas.hpp"
 #include "simplex_prepared.hpp"
 #include "triangular_crash.hpp"
 #include "forge/certify/finalize.hpp"
@@ -32,6 +33,15 @@
 
 namespace forge::engines {
 namespace {
+
+static_assert(static_cast<int>(NonbasicStatus::Basic) ==
+              static_cast<int>(presolve::PostsolveNonbasicStatus::Basic));
+static_assert(static_cast<int>(NonbasicStatus::AtLower) ==
+              static_cast<int>(presolve::PostsolveNonbasicStatus::AtLower));
+static_assert(static_cast<int>(NonbasicStatus::AtUpper) ==
+              static_cast<int>(presolve::PostsolveNonbasicStatus::AtUpper));
+static_assert(static_cast<int>(NonbasicStatus::AtZeroFree) ==
+              static_cast<int>(presolve::PostsolveNonbasicStatus::AtZeroFree));
 
 using core::Offset;
 using la::BasisFactor;
@@ -273,7 +283,7 @@ void rematerialize_original(const model::LpProblem& original,
                      dres_is_row ? "row" : "column", dres_index,
                      dres_value, dres_lo, dres_hi, dres_reduced, dres);
     }
-    report_simplex_dual_bound(pmin, sense, yout, aty, diag);
+    report_simplex_dual_bound(pmin, sense, yout, aty, diag, opts.dual_feas_tol);
     if (!raw.exact_dual.empty()) {
         const auto bound = certify::exact_dual_lower_bound(original, raw.exact_dual);
         if (bound.finite && (!diag.dual_bound_finite || sense * bound.value > sense * diag.dual_objective)) {
@@ -288,341 +298,40 @@ void rematerialize_original(const model::LpProblem& original,
 void accumulate_work(SimplexDiagnostics& total,
                      const SimplexDiagnostics& stage) {
     FORGE_FN();
-    total.iterations        += stage.iterations;
-    total.phase1_iterations += stage.phase1_iterations;
-    total.phase2_iterations += stage.phase2_iterations;
-    total.bound_flips       += stage.bound_flips;
-    total.refactorizations  += stage.refactorizations;
-    total.residual_refactors += stage.residual_refactors;
-    total.numerical_zero_dual_steps += stage.numerical_zero_dual_steps;
-    total.refinement_corrections += stage.refinement_corrections;
-    total.factor_adoptions  += stage.factor_adoptions;
-    total.bound_delta_xB += stage.bound_delta_xB;
-    total.bound_delta_prices += stage.bound_delta_prices;
-    total.objective_limit_exits += stage.objective_limit_exits;
-    total.objective_limit_checks += stage.objective_limit_checks;
-    total.collective_ft_collapses += stage.collective_ft_collapses;
-    total.collective_ft_skips += stage.collective_ft_skips;
-    total.degenerate_steps  += stage.degenerate_steps;
-    total.bland_iterations  += stage.bland_iterations;
-    total.expand_steps      += stage.expand_steps;
-    total.basis_repairs     += stage.basis_repairs;
-    total.phase_restarts    += stage.phase_restarts;
-    total.dual_rebuilds     += stage.dual_rebuilds;
-    total.dual_resyncs      += stage.dual_resyncs;
-    total.phase1_cost_change_iterations += stage.phase1_cost_change_iterations;
-    total.phase1_cost_changes += stage.phase1_cost_changes;
-    total.phase1_cost_change_max = std::max(total.phase1_cost_change_max,
-                                            stage.phase1_cost_change_max);
-    total.primal_btran_sparse += stage.primal_btran_sparse;
-    total.primal_btran_dense += stage.primal_btran_dense;
-    total.primal_btran_support_entries += stage.primal_btran_support_entries;
-    total.phase1_composite_updates += stage.phase1_composite_updates;
-    total.phase1_composite_sparse += stage.phase1_composite_sparse;
-    total.phase1_composite_dense += stage.phase1_composite_dense;
-    total.phase1_composite_fallbacks += stage.phase1_composite_fallbacks;
-    total.phase1_composite_support_entries +=
-        stage.phase1_composite_support_entries;
-    total.phase1_composite_max_abs_error = std::max(
-        total.phase1_composite_max_abs_error,
-        stage.phase1_composite_max_abs_error);
-    total.primal_price_heap_rebuilds += stage.primal_price_heap_rebuilds;
-    total.primal_price_heap_updates += stage.primal_price_heap_updates;
-    total.primal_price_full_scans += stage.primal_price_full_scans;
-    total.primal_price_columns_scored += stage.primal_price_columns_scored;
-    total.primal_price_heap_max_size = std::max(
-        total.primal_price_heap_max_size, stage.primal_price_heap_max_size);
-    total.primal_ftran_dense_switches += stage.primal_ftran_dense_switches;
-    total.primal_crash_columns += stage.primal_crash_columns;
-    total.dual_crash_columns += stage.dual_crash_columns;
-    total.primal_crash_infeasibility_before +=
-        stage.primal_crash_infeasibility_before;
-    total.primal_crash_infeasibility_after +=
-        stage.primal_crash_infeasibility_after;
-    total.devex_frameworks  += stage.devex_frameworks;
-    total.devex_weight_checks += stage.devex_weight_checks;
-    total.dse_weight_checks += stage.dse_weight_checks;
-    total.dse_weight_reuses += stage.dse_weight_reuses;
-    total.dse_weight_rebuilds += stage.dse_weight_rebuilds;
-    total.dse_weight_rejections += stage.dse_weight_rejections;
-    total.dse_to_devex_switches += stage.dse_to_devex_switches;
-    total.dse_accuracy_switches += stage.dse_accuracy_switches;
-    total.dse_stability_switches += stage.dse_stability_switches;
-    total.costly_dse_iterations += stage.costly_dse_iterations;
-    total.dual_paired_ftrans += stage.dual_paired_ftrans;
-    total.dual_pivotal_entries_full += stage.dual_pivotal_entries_full;
-    total.dual_pivotal_entries_kept += stage.dual_pivotal_entries_kept;
-    total.dual_dantzig_starts += stage.dual_dantzig_starts;
-    total.dual_devex_starts += stage.dual_devex_starts;
-    total.dual_dse_starts += stage.dual_dse_starts;
-    total.perturbed_costs += stage.perturbed_costs;
-    total.perturbation_cleanups += stage.perturbation_cleanups;
-    total.stall_perturbations += stage.stall_perturbations;
-    total.stagnation_perturbations += stage.stagnation_perturbations;
-    total.cycling_exits += stage.cycling_exits;
-    total.cycling_recoveries += stage.cycling_recoveries;
-    total.cycling_recovered += stage.cycling_recovered;
-    total.cost_shifts += stage.cost_shifts;
-    total.wrong_sign_entering_shifts += stage.wrong_sign_entering_shifts;
-    total.wrong_sign_backward_steps += stage.wrong_sign_backward_steps;
-    total.cost_shift_max = std::max(total.cost_shift_max, stage.cost_shift_max);
-    total.primal_cleanups += stage.primal_cleanups;
-    total.primal_cleanup_iterations += stage.primal_cleanup_iterations;
-    total.primal_bound_perturbations += stage.primal_bound_perturbations;
-    total.primal_perturbed_bounds += stage.primal_perturbed_bounds;
-    total.primal_bound_restorations += stage.primal_bound_restorations;
-    total.primal_bound_restore_iterations += stage.primal_bound_restore_iterations;
-    // Per-hand-off quantities, so the worst hand-off in the run is the one
-    // worth reporting (same convention as cost_shift_max). The primal engine
-    // never sets either, so folding its clean-up stage in keeps the dual's.
-    total.cleanup_dual_infeasibility =
-        std::max(total.cleanup_dual_infeasibility, stage.cleanup_dual_infeasibility);
-    total.cleanup_primal_infeasibility =
-        std::max(total.cleanup_primal_infeasibility, stage.cleanup_primal_infeasibility);
-    total.ratio_groups += stage.ratio_groups;
-    total.ratio_backoffs += stage.ratio_backoffs;
-    total.ratio_exhausted += stage.ratio_exhausted;
-    total.ratio_small_pivot_exclusions += stage.ratio_small_pivot_exclusions;
-    total.ratio_sorted_candidates += stage.ratio_sorted_candidates;
-    total.rho_sparse_iters += stage.rho_sparse_iters;
-    total.rho_dense_iters += stage.rho_dense_iters;
-    total.rho_support_entries += stage.rho_support_entries;
-    total.numerical_trouble_refactors += stage.numerical_trouble_refactors;
-    total.refused_cost_shifts += stage.refused_cost_shifts;
-    total.alpha_sparse_iters += stage.alpha_sparse_iters;
-    total.alpha_dense_iters += stage.alpha_dense_iters;
-    total.alpha_support_entries += stage.alpha_support_entries;
-    total.flip_batches += stage.flip_batches;
-    total.flip_ms += stage.flip_ms;
-    total.pivot_apply_ms += stage.pivot_apply_ms;
-    total.warm_starts       += stage.warm_starts;
-    total.pricing_calls     += stage.pricing_calls;
-    total.solve_calls       += stage.solve_calls;
-    total.scaling_ms        += stage.scaling_ms;
-    total.csc_ms            += stage.csc_ms;
-    total.preprocessing_ms  += stage.preprocessing_ms;
-    total.factor_ms         += stage.factor_ms;
-    total.first_factor_ms += stage.first_factor_ms;
-    total.after_first_factor_ms += stage.after_first_factor_ms;
-    total.dse_rebuild_ms += stage.dse_rebuild_ms;
-    total.post_solve_ms += stage.post_solve_ms;
-    total.factor_reuse_ms   += stage.factor_reuse_ms;
-    total.factor_reused      = total.factor_reused || stage.factor_reused;
-    total.factor_reuse_carrier_empty += stage.factor_reuse_carrier_empty;
-    total.factor_reuse_matrix_null += stage.factor_reuse_matrix_null;
-    total.factor_reuse_rows_mismatch += stage.factor_reuse_rows_mismatch;
-    total.factor_reuse_preparation_mismatch += stage.factor_reuse_preparation_mismatch;
-    total.factor_reuse_basis_mismatch += stage.factor_reuse_basis_mismatch;
-    total.factor_reuse_skipped_refill_primal_cleanup += stage.factor_reuse_skipped_refill_primal_cleanup;
-
-    total.price_ms          += stage.price_ms;
-    total.chuzr_ms          += stage.chuzr_ms;
-    total.chuzr_calls       += stage.chuzr_calls;
-    total.chuzr_rows_scanned += stage.chuzr_rows_scanned;
-    total.chuzr_heap_rebuilds += stage.chuzr_heap_rebuilds;
-    total.chuzr_heap_updates += stage.chuzr_heap_updates;
-    total.chuzr_full_scans += stage.chuzr_full_scans;
-    total.chuzr_heap_max_size = std::max(total.chuzr_heap_max_size,
-                                          stage.chuzr_heap_max_size);
-    total.prow_price_ms     += stage.prow_price_ms;
-    total.prow_price_calls  += stage.prow_price_calls;
-    total.prow_entries_scanned += stage.prow_entries_scanned;
-    total.solve_ms          += stage.solve_ms;
-    total.ftran_ms          += stage.ftran_ms;
-    total.btran_ms          += stage.btran_ms;
-    total.pivotal_row_ms    += stage.pivotal_row_ms;
-    total.ratio_test_ms     += stage.ratio_test_ms;
-    total.basis_update_ms   += stage.basis_update_ms;
-    total.ftran_calls       += stage.ftran_calls;
-    total.btran_calls       += stage.btran_calls;
-    total.basis_update_calls += stage.basis_update_calls;
-    total.dse_drift_rebuilds += stage.dse_drift_rebuilds;
-    total.presolve_ms += stage.presolve_ms;
-    total.presolve_retries += stage.presolve_retries;
-    total.lifted_basis_rejections += stage.lifted_basis_rejections;
-    total.residual_checks += stage.residual_checks;
-    total.ftran_seeded_sparse_calls += stage.ftran_seeded_sparse_calls;
-    total.ftran_seeded_dense_calls += stage.ftran_seeded_dense_calls;
-    total.ftran_unseeded_calls += stage.ftran_unseeded_calls;
-    total.ftran_seeded_sparse_ms += stage.ftran_seeded_sparse_ms;
-    total.ftran_seeded_dense_ms += stage.ftran_seeded_dense_ms;
-    total.ftran_unseeded_ms += stage.ftran_unseeded_ms;
-    total.loop_ms           += stage.loop_ms;
-    total.total_ms          += stage.total_ms;
-    total.preprocessing_builds += stage.preprocessing_builds;
-    total.certificate_stages += stage.certificate_stages;
-    total.certificate_iterations += stage.certificate_iterations;
-    total.certificate_preprocessing_builds += stage.certificate_preprocessing_builds;
-    total.largest_update_multiplier = std::max(total.largest_update_multiplier,
-                                               stage.largest_update_multiplier);
+#define FORGE_DIAG_ADD(field) total.field += stage.field;
+#define FORGE_DIAG_MAX(field) total.field = std::max(total.field, stage.field);
+#define FORGE_DIAG_OR(field)  total.field = total.field || stage.field;
+#define FORGE_DIAG_SET(field) ((void)0);
+#include "simplex_diagnostics_work.inc"
+#undef FORGE_DIAG_ADD
+#undef FORGE_DIAG_MAX
+#undef FORGE_DIAG_OR
+#undef FORGE_DIAG_SET
+    // Per-hand-off quantities: keep the worst / latest cleanup request identity.
+    if (stage.cleanup_request_cause != 0) {
+        total.cleanup_request_cause = stage.cleanup_request_cause;
+        total.cleanup_request_phase = stage.cleanup_request_phase;
+        total.cleanup_working_dual_infeasibility =
+            std::max(total.cleanup_working_dual_infeasibility,
+                     stage.cleanup_working_dual_infeasibility);
+        total.cleanup_restored_model_costs =
+            total.cleanup_restored_model_costs || stage.cleanup_restored_model_costs;
+    }
     ++total.stages;
 }
 
 void install_work_totals(SimplexDiagnostics& chosen,
                          const SimplexDiagnostics& total) {
     FORGE_FN();
-    chosen.iterations         = total.iterations;
-    chosen.phase1_iterations = total.phase1_iterations;
-    chosen.phase2_iterations = total.phase2_iterations;
-    chosen.bound_flips        = total.bound_flips;
-    chosen.refactorizations   = total.refactorizations;
-    chosen.residual_refactors = total.residual_refactors;
-    chosen.numerical_zero_dual_steps = total.numerical_zero_dual_steps;
-    chosen.refinement_corrections = total.refinement_corrections;
-    chosen.factor_adoptions = total.factor_adoptions;
-    chosen.bound_delta_xB = total.bound_delta_xB;
-    chosen.bound_delta_prices = total.bound_delta_prices;
-    chosen.objective_limit_exits = total.objective_limit_exits;
-    chosen.objective_limit_checks = total.objective_limit_checks;
-    chosen.collective_ft_collapses = total.collective_ft_collapses;
-    chosen.collective_ft_skips = total.collective_ft_skips;
-    chosen.degenerate_steps   = total.degenerate_steps;
-    chosen.bland_iterations   = total.bland_iterations;
-    chosen.expand_steps       = total.expand_steps;
-    chosen.basis_repairs      = total.basis_repairs;
-    chosen.phase_restarts     = total.phase_restarts;
-    chosen.dual_rebuilds      = total.dual_rebuilds;
-    chosen.dual_resyncs       = total.dual_resyncs;
-    chosen.phase1_cost_change_iterations = total.phase1_cost_change_iterations;
-    chosen.phase1_cost_changes = total.phase1_cost_changes;
-    chosen.phase1_cost_change_max = total.phase1_cost_change_max;
-    chosen.primal_btran_sparse = total.primal_btran_sparse;
-    chosen.primal_btran_dense = total.primal_btran_dense;
-    chosen.primal_btran_support_entries = total.primal_btran_support_entries;
-    chosen.phase1_composite_updates = total.phase1_composite_updates;
-    chosen.phase1_composite_sparse = total.phase1_composite_sparse;
-    chosen.phase1_composite_dense = total.phase1_composite_dense;
-    chosen.phase1_composite_fallbacks = total.phase1_composite_fallbacks;
-    chosen.phase1_composite_support_entries =
-        total.phase1_composite_support_entries;
-    chosen.phase1_composite_max_abs_error =
-        total.phase1_composite_max_abs_error;
-    chosen.primal_price_heap_rebuilds = total.primal_price_heap_rebuilds;
-    chosen.primal_price_heap_updates = total.primal_price_heap_updates;
-    chosen.primal_price_full_scans = total.primal_price_full_scans;
-    chosen.primal_price_columns_scored = total.primal_price_columns_scored;
-    chosen.primal_price_heap_max_size = total.primal_price_heap_max_size;
-    chosen.primal_ftran_dense_switches = total.primal_ftran_dense_switches;
-    chosen.primal_crash_columns = total.primal_crash_columns;
-    chosen.dual_crash_columns = total.dual_crash_columns;
-    chosen.primal_crash_infeasibility_before =
-        total.primal_crash_infeasibility_before;
-    chosen.primal_crash_infeasibility_after =
-        total.primal_crash_infeasibility_after;
-    chosen.devex_frameworks   = total.devex_frameworks;
-    chosen.devex_weight_checks = total.devex_weight_checks;
-    chosen.dse_weight_checks  = total.dse_weight_checks;
-    chosen.dse_weight_reuses  = total.dse_weight_reuses;
-    chosen.dse_weight_rebuilds = total.dse_weight_rebuilds;
-    chosen.dse_weight_rejections = total.dse_weight_rejections;
-    chosen.dse_to_devex_switches = total.dse_to_devex_switches;
-    chosen.dse_accuracy_switches = total.dse_accuracy_switches;
-    chosen.dse_stability_switches = total.dse_stability_switches;
-    chosen.costly_dse_iterations = total.costly_dse_iterations;
-    chosen.dual_paired_ftrans = total.dual_paired_ftrans;
-    chosen.dual_pivotal_entries_full = total.dual_pivotal_entries_full;
-    chosen.dual_pivotal_entries_kept = total.dual_pivotal_entries_kept;
-    chosen.dual_dantzig_starts = total.dual_dantzig_starts;
-    chosen.dual_devex_starts = total.dual_devex_starts;
-    chosen.dual_dse_starts = total.dual_dse_starts;
-    chosen.perturbed_costs = total.perturbed_costs;
-    chosen.perturbation_cleanups = total.perturbation_cleanups;
-    chosen.stall_perturbations = total.stall_perturbations;
-    chosen.cost_shifts = total.cost_shifts;
-    chosen.wrong_sign_entering_shifts = total.wrong_sign_entering_shifts;
-    chosen.wrong_sign_backward_steps = total.wrong_sign_backward_steps;
-    chosen.cost_shift_max = total.cost_shift_max;
-    chosen.primal_cleanups = total.primal_cleanups;
-    chosen.primal_cleanup_iterations = total.primal_cleanup_iterations;
-    chosen.primal_bound_perturbations = total.primal_bound_perturbations;
-    chosen.primal_perturbed_bounds = total.primal_perturbed_bounds;
-    chosen.primal_bound_restorations = total.primal_bound_restorations;
-    chosen.primal_bound_restore_iterations = total.primal_bound_restore_iterations;
-    chosen.cleanup_dual_infeasibility = total.cleanup_dual_infeasibility;
-    chosen.cleanup_primal_infeasibility = total.cleanup_primal_infeasibility;
-    chosen.ratio_groups = total.ratio_groups;
-    chosen.ratio_backoffs = total.ratio_backoffs;
-    chosen.ratio_exhausted = total.ratio_exhausted;
-    chosen.ratio_small_pivot_exclusions = total.ratio_small_pivot_exclusions;
-    chosen.ratio_sorted_candidates = total.ratio_sorted_candidates;
-    chosen.rho_sparse_iters = total.rho_sparse_iters;
-    chosen.rho_dense_iters = total.rho_dense_iters;
-    chosen.rho_support_entries = total.rho_support_entries;
-    chosen.numerical_trouble_refactors = total.numerical_trouble_refactors;
-    chosen.refused_cost_shifts = total.refused_cost_shifts;
-    chosen.alpha_sparse_iters = total.alpha_sparse_iters;
-    chosen.alpha_dense_iters = total.alpha_dense_iters;
-    chosen.alpha_support_entries = total.alpha_support_entries;
-    chosen.flip_batches = total.flip_batches;
-    chosen.flip_ms = total.flip_ms;
-    chosen.pivot_apply_ms = total.pivot_apply_ms;
-    chosen.warm_starts        = total.warm_starts;
-    chosen.pricing_calls      = total.pricing_calls;
-    chosen.solve_calls        = total.solve_calls;
-    chosen.stages             = total.stages;
-    chosen.primal_stages      = total.primal_stages;
-    chosen.dual_stages        = total.dual_stages;
-    chosen.cold_stages        = total.cold_stages;
-    chosen.basis_restarts     = total.basis_restarts;
-    chosen.scaling_ms         = total.scaling_ms;
-    chosen.csc_ms             = total.csc_ms;
-    chosen.preprocessing_ms   = total.preprocessing_ms;
-    chosen.factor_ms          = total.factor_ms;
-    chosen.first_factor_ms = total.first_factor_ms;
-    chosen.after_first_factor_ms = total.after_first_factor_ms;
-    chosen.dse_rebuild_ms = total.dse_rebuild_ms;
-    chosen.post_solve_ms = total.post_solve_ms;
-    chosen.factor_reuse_ms    = total.factor_reuse_ms;
-    chosen.factor_reused      = total.factor_reused;
-    chosen.factor_reuse_carrier_empty = total.factor_reuse_carrier_empty;
-    chosen.factor_reuse_matrix_null = total.factor_reuse_matrix_null;
-    chosen.factor_reuse_rows_mismatch = total.factor_reuse_rows_mismatch;
-    chosen.factor_reuse_preparation_mismatch = total.factor_reuse_preparation_mismatch;
-    chosen.factor_reuse_basis_mismatch = total.factor_reuse_basis_mismatch;
-    chosen.factor_reuse_skipped_refill_primal_cleanup = total.factor_reuse_skipped_refill_primal_cleanup;
-
-    chosen.price_ms           = total.price_ms;
-    chosen.chuzr_ms           = total.chuzr_ms;
-    chosen.chuzr_calls        = total.chuzr_calls;
-    chosen.chuzr_rows_scanned = total.chuzr_rows_scanned;
-    chosen.chuzr_heap_rebuilds = total.chuzr_heap_rebuilds;
-    chosen.chuzr_heap_updates = total.chuzr_heap_updates;
-    chosen.chuzr_full_scans = total.chuzr_full_scans;
-    chosen.chuzr_heap_max_size = total.chuzr_heap_max_size;
-    chosen.prow_price_ms      = total.prow_price_ms;
-    chosen.prow_price_calls   = total.prow_price_calls;
-    chosen.prow_entries_scanned = total.prow_entries_scanned;
-    chosen.solve_ms           = total.solve_ms;
-    chosen.ftran_ms           = total.ftran_ms;
-    chosen.btran_ms           = total.btran_ms;
-    chosen.pivotal_row_ms     = total.pivotal_row_ms;
-    chosen.ratio_test_ms      = total.ratio_test_ms;
-    chosen.basis_update_ms    = total.basis_update_ms;
-    chosen.ftran_calls        = total.ftran_calls;
-    chosen.btran_calls        = total.btran_calls;
-    chosen.basis_update_calls = total.basis_update_calls;
-    chosen.stagnation_perturbations = total.stagnation_perturbations;
-    chosen.cycling_exits = total.cycling_exits;
-    chosen.cycling_recoveries = total.cycling_recoveries;
-    chosen.cycling_recovered = total.cycling_recovered;
-    chosen.dse_drift_rebuilds = total.dse_drift_rebuilds;
-    chosen.presolve_ms = total.presolve_ms;
-    chosen.presolve_retries = total.presolve_retries;
-    chosen.lifted_basis_rejections = total.lifted_basis_rejections;
-    chosen.residual_checks = total.residual_checks;
-    chosen.ftran_seeded_sparse_calls = total.ftran_seeded_sparse_calls;
-    chosen.ftran_seeded_dense_calls = total.ftran_seeded_dense_calls;
-    chosen.ftran_unseeded_calls = total.ftran_unseeded_calls;
-    chosen.ftran_seeded_sparse_ms = total.ftran_seeded_sparse_ms;
-    chosen.ftran_seeded_dense_ms = total.ftran_seeded_dense_ms;
-    chosen.ftran_unseeded_ms = total.ftran_unseeded_ms;
-    chosen.loop_ms            = total.loop_ms;
-    chosen.total_ms           = total.total_ms;
-    chosen.preprocessing_builds = total.preprocessing_builds;
-    chosen.certificate_stages = total.certificate_stages;
-    chosen.certificate_iterations = total.certificate_iterations;
-    chosen.certificate_preprocessing_builds = total.certificate_preprocessing_builds;
-    chosen.largest_update_multiplier = total.largest_update_multiplier;
+#define FORGE_DIAG_ADD(field) chosen.field = total.field;
+#define FORGE_DIAG_MAX(field) chosen.field = total.field;
+#define FORGE_DIAG_OR(field)  chosen.field = total.field;
+#define FORGE_DIAG_SET(field) chosen.field = total.field;
+#include "simplex_diagnostics_work.inc"
+#undef FORGE_DIAG_ADD
+#undef FORGE_DIAG_MAX
+#undef FORGE_DIAG_OR
+#undef FORGE_DIAG_SET
 }
 
 }  // namespace
@@ -648,11 +357,12 @@ void install_simplex_work_totals(SimplexDiagnostics& chosen,
 void report_simplex_dual_bound(const model::LpProblem& pmin, f64 sense,
                               const std::vector<f64>& y_min,
                               const std::vector<long double>& aty,
-                              SimplexDiagnostics& diag) {
+                              SimplexDiagnostics& diag,
+                              f64 dual_feas_tol) {
     FORGE_FN();
     (void)aty; // Rounded stationarity is a diagnostic, never a bound producer.
     const auto bound = certify::safe_lagrangian_lower_bound(
-        pmin, y_min, pmin.col_lo, pmin.col_hi);
+        pmin, y_min, pmin.col_lo, pmin.col_hi, dual_feas_tol);
     diag.dual_bound_finite = bound.finite;
     diag.dual_objective = std::numeric_limits<f64>::quiet_NaN();
     if (bound.finite) {
@@ -796,6 +506,19 @@ bool detail::prefer_simplex_candidate(const core::RawResult& candidate,
     const bool candidate_farkas = farkas_proved(candidate, candidate_diag);
     const bool incumbent_farkas = farkas_proved(incumbent, incumbent_diag);
     if (candidate_farkas != incumbent_farkas) return candidate_farkas;
+
+    // Unbounded/Infeasible claims beat Interrupted/NumericalFailure even when
+    // the ray is not yet certified (primal rescue must not bury them).
+    // Optimal is NOT included: an unproved Optimal label can lose to a
+    // primal-feasible Interrupted point (see prefer unit test).
+    const auto ray_claim = [](core::Status s) {
+        FORGE_FN();
+        return s == core::Status::Unbounded ||
+               s == core::Status::Infeasible;
+    };
+    const bool candidate_ray_claim = ray_claim(candidate.proposed_status);
+    const bool incumbent_ray_claim = ray_claim(incumbent.proposed_status);
+    if (candidate_ray_claim != incumbent_ray_claim) return candidate_ray_claim;
 
     // A reportable feasible point is more useful than any infeasible iterate,
     // independent of which engine produced it or what its (invalid) gap says.
@@ -973,6 +696,10 @@ bool detail::dual_stage_needs_fallback(const core::RawResult& result,
     switch (result.proposed_status) {
         case core::Status::NumericalFailure: return true;
         case core::Status::Infeasible:       return !infeasibility_certified;
+        // Uncertified Unbounded (no ray) is not a proof; the primal may
+        // still produce a certified improving direction.
+        case core::Status::Unbounded:
+            return result.primal_ray.direction.empty() && result.ray.empty();
         case core::Status::Interrupted:      return diag.cycling_exits > 0;
         default:                             return false;
     }
@@ -999,6 +726,7 @@ SimplexPrepared prepare_simplex_model(const model::LpProblem& problem,
     const auto t_all = Clock::now();
     SimplexPrepared out;
     out.sense = problem.maximize ? -1.0 : 1.0;
+    out.lu_pivot_tol = opts.basis_lu.pivot_tol;
     out.pmin = model::minimization_form(problem);
     out.scaled = out.pmin;
     const auto t_scale = Clock::now();
@@ -1098,17 +826,18 @@ SimplexPrepared prepare_simplex_model(const model::LpProblem& problem,
 
     out.dual_tolerance.assign(sz(nt), opts.dual_feas_tol);
     out.primal_tolerance.assign(sz(nt), opts.primal_feas_tol);
+    // Exact scale map (see prepared_tolerances): do not floor at 1e-12.
     for (Index j = 0; j < ns; ++j) {
         out.dual_tolerance[sz(j)] =
-            std::max(opts.dual_feas_tol * out.scaling.col_scale[sz(j)], 1e-12);
+            std::max(opts.dual_feas_tol * out.scaling.col_scale[sz(j)], 0.0);
         out.primal_tolerance[sz(j)] =
-            std::max(opts.primal_feas_tol / out.scaling.col_scale[sz(j)], 1e-12);
+            std::max(opts.primal_feas_tol / out.scaling.col_scale[sz(j)], 0.0);
     }
     for (Index i = 0; i < m; ++i) {
         out.dual_tolerance[sz(ns + i)] =
-            std::max(opts.dual_feas_tol / out.scaling.row_scale[sz(i)], 1e-12);
+            std::max(opts.dual_feas_tol / out.scaling.row_scale[sz(i)], 0.0);
         out.primal_tolerance[sz(ns + i)] =
-            std::max(opts.primal_feas_tol * out.scaling.row_scale[sz(i)], 1e-12);
+            std::max(opts.primal_feas_tol * out.scaling.row_scale[sz(i)], 0.0);
     }
     out.total_ms = ms_since(t_all);
     return out;
@@ -1133,6 +862,8 @@ core::RawResult solve_primal_simplex_prepared(
     if (out_factor && out_factor->has_factor && warm &&
         out_factor->basis == warm->basic &&
         out_factor->scaling_identity == prepared.factor_scaling_identity &&
+        same_factor_operator(out_factor->operator_identity,
+                             prepared.factor_operator_identity) &&
         out_factor->factor.is_valid() &&
         out_factor->factor.dimension() == prepared.scaled.n_rows()) {
         incoming_factor = std::move(out_factor->factor);
@@ -1144,7 +875,7 @@ core::RawResult solve_primal_simplex_prepared(
     }
     diag = SimplexDiagnostics{};
     const auto t_all = Clock::now();
-    const bool time_detail = opts.verbose;   // see the note on clock cost below
+    const bool time_detail = opts.time_detail || opts.verbose;
     const bool force_dense_primal_btran =
         core::env_switches().primal_dense_btran;
     const bool force_dense_primal_ftran =
@@ -1319,6 +1050,13 @@ core::RawResult solve_primal_simplex_prepared(
         diag.primal_crash_columns = crash.columns;
         diag.primal_crash_infeasibility_before = crash.infeasibility_before;
         diag.primal_crash_infeasibility_after = crash.infeasibility_after;
+        if (opts.crash_style == CrashStyle::TwoPass &&
+            crash.columns > 0) {
+            const auto crash2 = detail::triangular_crash(
+                p, ac, lo, hi, ptol, basis, slot_of, st, value);
+            diag.primal_crash_columns += crash2.columns;
+            diag.primal_crash_infeasibility_after = crash2.infeasibility_after;
+        }
     }
 
     auto& nonbasic = ws.nonbasic; nonbasic.clear();
@@ -1374,7 +1112,6 @@ core::RawResult solve_primal_simplex_prepared(
         return factor.btran_seeded_with_support(v, seed, support);
     };
     la::LuOptions lu_opts = opts.basis_lu;
-    lu_opts.pivot_tol = std::min(opts.pivot_tol, 1e-11);
 
     auto& bcp = ws.bcp; bcp.clear();
     auto& bri = ws.bri; bri.clear();
@@ -1667,7 +1404,7 @@ core::RawResult solve_primal_simplex_prepared(
     bool expand_active = opts.use_expand;
     f64 expand_eps = expand_start;
 
-    const auto do_factorize = [&]() {
+    const auto do_factorize = [&]() -> bool {
         FORGE_FN();
         const auto t0 = Clock::now();
         const auto repairs_before = diag.basis_repairs;
@@ -1691,7 +1428,15 @@ core::RawResult solve_primal_simplex_prepared(
                 ++diag.basis_repairs;
             }
             build_basis_matrix();
-            factor.factorize(m, bcp, bri, bvals, lu_opts, &bad_slots, &vacant_rows);
+            if (!factor.factorize(m, bcp, bri, bvals, lu_opts, &bad_slots,
+                                  &vacant_rows) ||
+                !factor.is_valid()) {
+                // Repair failed to produce a valid factor; do not solve
+                // against a truncated/fictitious representation.
+                return false;
+            }
+        } else if (!factor.is_valid()) {
+            return false;
         }
         ++diag.refactorizations;
         diag.factor_ms += ms_since(t0);
@@ -1715,6 +1460,7 @@ core::RawResult solve_primal_simplex_prepared(
             // Turning it off is always safe -- it only ever widened a tolerance.
             if (diag.phase_restarts > 32) expand_active = false;
         }
+        return true;
     };
 
     if (incoming_valid && warm_installed && basis == warm->basic) {
@@ -1781,12 +1527,13 @@ core::RawResult solve_primal_simplex_prepared(
             ++diag.bound_delta_prices;
         }
         d_valid = continue_prices;
-    } else {
-        do_factorize();
     }
+    bool factor_ok = true;
+    if (!(incoming_valid && warm_installed && basis == warm->basic))
+        factor_ok = do_factorize();
     // A crash basis that required singular repair is not the triangular
     // construction we claimed. Restore the all-logical start and refactor.
-    if (crash_snapshot_valid && diag.primal_crash_columns > 0 &&
+    if (factor_ok && crash_snapshot_valid && diag.primal_crash_columns > 0 &&
         diag.basis_repairs > 0) {
         basis = crash_basis_save;
         slot_of = crash_slot_save;
@@ -1797,10 +1544,12 @@ core::RawResult solve_primal_simplex_prepared(
             diag.primal_crash_infeasibility_before;
         rebuild_nonbasic();
         diag.basis_repairs = 0;
-        do_factorize();
+        factor_ok = do_factorize();
     }
-    if (primal_infeasibility() <= 0.0) phase = 2;
-    else d_valid = false; // phase I has a different, piecewise objective
+    if (factor_ok) {
+        if (primal_infeasibility() <= 0.0) phase = 2;
+        else d_valid = false; // phase I has a different, piecewise objective
+    }
 
     // Step at which basis slot i hits a blocking bound, or +inf. `slack`
     // relaxes the target bound: that is the first Harris pass. slack == 0 gives
@@ -1903,7 +1652,8 @@ core::RawResult solve_primal_simplex_prepared(
                                                     opts.bump_width_max,
                                                     opts.refactor_work_ratio,
                                                     opts.refactor_u_nnz_ratio,
-                                                    opts.ft_update_limit);
+                                                    opts.ft_update_limit,
+                                                    opts.refactor_hypersparse_hit_floor);
         const auto update_t0 = Clock::now();
         const bool updated =
             opts.update_method == la::UpdateMethod::ForrestTomlin && !factor.is_bordered()
@@ -1936,7 +1686,10 @@ core::RawResult solve_primal_simplex_prepared(
                 ++diag.collective_ft_skips;
             }
         }
-        do_factorize();
+        if (!do_factorize()) {
+            factor_ok = false;
+            return;
+        }
         since_refactor = 0;
     };
 
@@ -2009,8 +1762,10 @@ core::RawResult solve_primal_simplex_prepared(
                         static_cast<unsigned long long>(diag.primal_perturbed_bounds));
     };
 
-    core::Status status = core::Status::NotSolved;
-    std::string reason;
+    core::Status status = factor_ok ? core::Status::NotSolved
+                                    : core::Status::NumericalFailure;
+    std::string reason = factor_ok ? std::string{}
+                                   : "basis factor invalid after refactor";
     std::vector<std::string> terminal_exact_dual;
 
 
@@ -2079,6 +1834,11 @@ core::RawResult solve_primal_simplex_prepared(
 
      const auto t_loop = Clock::now();
     for (;;) {
+        if (!factor_ok) {
+            status = core::Status::NumericalFailure;
+            reason = "basis factor invalid after refactor";
+            break;
+        }
         if (iter >= max_iter) {
             status = core::Status::Interrupted;
             reason = "iteration limit (" + std::to_string(max_iter) + ")";
@@ -2144,7 +1904,11 @@ core::RawResult solve_primal_simplex_prepared(
         if (opts.residual_refactor_tol > 0 && opts.residual_check_interval > 0 &&
             since_refactor > 0 && (iter % static_cast<std::uint64_t>(opts.residual_check_interval)) == 0 &&
             drift_exceeds_limit()) {
-            do_factorize();
+            if (!do_factorize()) {
+                status = core::Status::NumericalFailure;
+                reason = "basis factor invalid after refactor";
+                break;
+            }
             since_refactor = 0;
             ++diag.residual_refactors;
             continue;
@@ -2275,7 +2039,7 @@ core::RawResult solve_primal_simplex_prepared(
             // the one failure this codebase is built to prevent. This is also
             // what makes the maintained d[] safe: an accumulated error can
             // hide an improving column, but it cannot survive this check.
-            if (since_refactor > 0) { do_factorize(); since_refactor = 0; continue; }
+            if (since_refactor > 0) { if (!do_factorize()) { status = core::Status::NumericalFailure; reason = "basis factor invalid after refactor"; break; } since_refactor = 0; continue; }
             if (phase == 1) {
                 if (primal_infeasibility() > 0.0) {
                     status = core::Status::Infeasible;
@@ -2484,7 +2248,7 @@ core::RawResult solve_primal_simplex_prepared(
         else if (st[sz(q)] == NonbasicStatus::AtUpper && lo[sz(q)] > -kInf)
             t_bound = hi[sz(q)] - lo[sz(q)];
 
-        const f64 harris_slack = opts.harris_slack +
+        const f64 harris_slack = std::min(opts.harris_slack, min_ptol) +
                                  (expand_active ? expand_eps : 0.0);
         f64 t_max = t_bound;
         const auto harris_pass1 = [&](Index i) {
@@ -2524,7 +2288,7 @@ core::RawResult solve_primal_simplex_prepared(
             // updates. A drifted B^{-1} yields a wrong alpha, the ratio test
             // then finds no blocking row, and the solver declares a bounded LP
             // unbounded -- observed on 80bau3b (true optimum 987224.19).
-            if (since_refactor > 0) { do_factorize(); since_refactor = 0; continue; }
+            if (since_refactor > 0) { if (!do_factorize()) { status = core::Status::NumericalFailure; reason = "basis factor invalid after refactor"; break; } since_refactor = 0; continue; }
             if (phase == 2) {
                 primal_direction.assign(sz(ns), 0.0);
                 if (q < ns) primal_direction[sz(q)] = static_cast<f64>(qdir) * scaling.col_scale[sz(q)];
@@ -2616,10 +2380,19 @@ core::RawResult solve_primal_simplex_prepared(
                 if (use_devex) {
                     const f64 ap2 = std::max(arq * arq, 1e-30);
                     const f64 wq = col_w[sz(q)];
-                    for (const Index j : prow_idx) {
-                        if (st[sz(j)] == NonbasicStatus::Basic) continue;
-                        const f64 aj = prow[sz(j)];
-                        col_w[sz(j)] = std::max({1.0, col_w[sz(j)], (aj * aj / ap2) * wq});
+                    // Reference-framework reset: when the leaving weight has
+                    // grown far above the geometric mean of the framework,
+                    // Harris / Paula-style Devex restarts from column norms.
+                    constexpr f64 kDevexResetFactor = 1e6;
+                    if (wq > kDevexResetFactor) {
+                        reset_weights();
+                    } else {
+                        for (const Index j : prow_idx) {
+                            if (st[sz(j)] == NonbasicStatus::Basic) continue;
+                            const f64 aj = prow[sz(j)];
+                            col_w[sz(j)] = std::max(
+                                {1.0, col_w[sz(j)], (aj * aj / ap2) * wq});
+                        }
                     }
                 }
                 // Both reduced costs and (under Devex) heap denominators have
@@ -2955,10 +2728,14 @@ core::RawResult solve_primal_simplex_prepared(
     // reporting an unproved optimum and gives the certificate pass an
     // independent representation of the same basis.
     if (status == core::Status::Optimal && factor.n_updates() > 0) {
-        do_factorize();
-        since_refactor = 0;
-        if (primal_infeasibility() > opts.primal_feas_tol)
+        if (!do_factorize()) {
             status = core::Status::NumericalFailure;
+            reason = "basis factor invalid after refactor";
+        } else {
+            since_refactor = 0;
+            if (primal_infeasibility() > opts.primal_feas_tol)
+                status = core::Status::NumericalFailure;
+        }
         diag.status = status;
     }
 
@@ -3044,9 +2821,10 @@ core::RawResult solve_primal_simplex_prepared(
 
     // Check the true, unscaled Lagrangian. Numerical feasibility tolerance
     // cannot turn a nonzero reduced cost times infinity into zero.
-    report_simplex_dual_bound(pmin, sense, yout, aty, diag);
+    report_simplex_dual_bound(pmin, sense, yout, aty, diag, opts.dual_feas_tol);
     auto rc_enclosure = certify::enclose_reduced_costs_from_sums(
-        pmin, yout, aty, aty_abs, aty_count, pmin.col_lo, pmin.col_hi);
+        pmin, yout, aty, aty_abs, aty_count, pmin.col_lo, pmin.col_hi,
+        opts.dual_feas_tol);
 
     if (out_basis) {
         out_basis->n_struct = ns;
@@ -3211,6 +2989,41 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         diag.status = raw.proposed_status;
         return raw;
     }
+    if (opts.enable_sifting &&
+        static_cast<std::uint64_t>(problem.n_cols()) >
+            5u * static_cast<std::uint64_t>(
+                std::max<core::Index>(1, problem.n_rows()))) {
+        model::LpProblem working = problem;
+        const auto nc = static_cast<std::size_t>(problem.n_cols());
+        std::vector<bool> keep(nc, false);
+        for (std::size_t j = 0; j < nc; ++j) {
+            if (std::fabs(problem.c[j]) > 0.0) keep[j] = true;
+        }
+        const auto m = static_cast<std::size_t>(problem.n_rows());
+        for (std::size_t j = 0; j < std::min(nc, m); ++j) keep[j] = true;
+        std::size_t kept = 0;
+        for (bool k : keep) if (k) ++kept;
+        if (kept < nc) {
+            for (std::size_t j = 0; j < nc; ++j) {
+                if (!keep[j]) {
+                    working.col_lo[j] = 0.0;
+                    working.col_hi[j] = 0.0;
+                }
+            }
+            SimplexOptions pass_opts = opts;
+            pass_opts.enable_sifting = false;
+            SimplexDiagnostics pass_diag;
+            const auto pass1 = solve_simplex(working, pass_opts, pass_diag,
+                                             out_basis, out_session);
+            SimplexDiagnostics full_diag;
+            auto pass2 = solve_simplex(problem, pass_opts, full_diag,
+                                       out_basis, out_session);
+            pass2.iterations += pass1.iterations;
+            diag = full_diag;
+            diag.iterations = pass2.iterations;
+            return pass2;
+        }
+    }
     // A tall LP is solved through its dual LP, whose basis has one row per
     // column here. Its optimal equation multipliers are minus x, its variable
     // values sum to y, and the point is then judged on this model exactly as
@@ -3277,6 +3090,8 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
     presolve::PresolveMap pmap;
     bool used_presolve = false;
     presolve::PresolveStatus presolve_status = presolve::PresolveStatus::Reduced;
+    Index presolve_witness_row = -1;
+    std::string presolve_reason;
     const auto presolve_t0 = Clock::now();
     if (opts.presolve) {
         presolve::PresolveOptions popts;
@@ -3285,13 +3100,18 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         popts.domain_probing = opts.presolve_domain_probing;
         popts.implied_slack = opts.presolve_implied_slack;
         popts.live_reductions = opts.presolve_live_reductions;
-        popts.parallel_rows = opts.presolve_live_reductions;
+        popts.parallel_rows = opts.presolve_parallel_rows;
+        popts.implied_bounds = opts.presolve_implied_bounds;
+        popts.dominated_columns = opts.presolve_dominated_columns;
+        popts.parallel_columns = opts.presolve_parallel_columns;
         if (opts.time_limit_s > 0.0)
             popts.deadline = presolve_t0 +
                 std::chrono::duration_cast<Clock::duration>(
                     std::chrono::duration<double>(opts.time_limit_s));
         auto outcome = presolve::presolve(problem, popts);
         presolve_status = outcome.status;
+        presolve_witness_row = outcome.witness_row;
+        presolve_reason = std::move(outcome.reason);
         pmap = std::move(outcome.map);
         if (presolve_status == presolve::PresolveStatus::NumericalFailure) {
             // A rejected transformation is not a model conclusion.  Solve the
@@ -3319,8 +3139,34 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
     if (opts.presolve &&
         (presolve_status == presolve::PresolveStatus::Unbounded ||
          presolve_status == presolve::PresolveStatus::Infeasible)) {
-        // A presolve conclusion is a search hint until an original-model
-        // witness exists. Use the remaining allowance to extract that witness.
+        // Prefer a cheap unit witness from the presolve tip before a full
+        // original-model re-solve (the dominant failure-path cost).
+        if (presolve_status == presolve::PresolveStatus::Infeasible &&
+            presolve_witness_row >= 0 &&
+            presolve_witness_row < problem.n_rows()) {
+            std::vector<f64> ray(sz(problem.n_rows()), 0.0);
+            for (const f64 sign : {1.0, -1.0}) {
+                ray[sz(presolve_witness_row)] = sign;
+                if (farkas_violation(problem, ray) <= opts.primal_feas_tol) {
+                    core::RawResult terminal;
+                    terminal.proposed_status = core::Status::Infeasible;
+                    terminal.proposed_level = core::ProofLevel::BoundOnly;
+                    terminal.ray = ray;
+                    terminal.dual_farkas_ray.multipliers = ray;
+                    terminal.engine = "presolve+farkas";
+                    terminal.termination_reason = presolve_reason;
+                    diag = SimplexDiagnostics{};
+                    diag.status = core::Status::Infeasible;
+                    diag.ray_violation = farkas_violation(problem, ray);
+                    diag.presolve_ms = presolve_ms;
+                    diag.total_ms = presolve_ms;
+                    copy_presolve_diag(diag);
+                    return terminal;
+                }
+            }
+        }
+        // Tip did not certify: fall back to extracting a witness on the
+        // untouched original with the remaining allowance.
         SimplexOptions continuation = simplex_options_after_elapsed(opts, presolve_ms / 1000.0);
         continuation.presolve = false;
         auto terminal = solve_simplex(problem, continuation, diag, out_basis, out_session);
@@ -3509,15 +3355,24 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         // the BFRT fix; kept as the safety net for whatever comes next.
         const bool dual_failed = detail::dual_stage_needs_fallback(
             raw, diag, infeasibility_certified(raw));
+        const double dual_elapsed =
+            std::chrono::duration<double>(Clock::now() - t_dual).count();
         double fallback_time_left = opts.time_limit_s;
         if (opts.time_limit_s > 0.0)
-            fallback_time_left -=
-                std::chrono::duration<double>(Clock::now() - t_dual).count();
+            fallback_time_left -= dual_elapsed;
+        // Rescue budget: remaining wall time when limited; otherwise at least
+        // the dual's elapsed time (and up to 2x so a late dual failure can
+        // still finish). Prefer-candidate still decides the winner.
+        const double rescue_cap = opts.time_limit_s > 0.0
+            ? fallback_time_left
+            : std::max(2.0 * dual_elapsed, 1e-9);
         if (dual_failed && have_pivot_allowance() &&
             (opts.time_limit_s <= 0.0 || fallback_time_left > 0.0)) {
             SimplexOptions prim_opts = opts;
             if (opts.time_limit_s > 0.0)
-                prim_opts.time_limit_s = fallback_time_left;
+                prim_opts.time_limit_s = std::max(fallback_time_left, 0.0);
+            else
+                prim_opts.time_limit_s = rescue_cap;
             SimplexBasis prim_basis2;
             const auto dual_raw = raw;
             const auto dual_diag = diag;
@@ -3589,12 +3444,17 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
 
         const bool dual_failed = detail::dual_stage_needs_fallback(
             raw, diag, infeasibility_certified(raw));
+        const double dual_elapsed = elapsed(dual_t0);
         const bool time_left = opts.time_limit_s <= 0.0 ||
-            elapsed(dual_t0) < opts.time_limit_s * 0.95;
+            dual_elapsed < opts.time_limit_s * 0.95;
         if (dual_failed && time_left && have_pivot_allowance()) {
             SimplexOptions primal_opts = opts;
+            // Remaining wall budget when limited; else up to 2x dual time.
             if (opts.time_limit_s > 0.0)
-                primal_opts.time_limit_s = opts.time_limit_s - elapsed(dual_t0);
+                primal_opts.time_limit_s =
+                    std::max(opts.time_limit_s - dual_elapsed, 0.0);
+            else
+                primal_opts.time_limit_s = std::max(2.0 * dual_elapsed, 1e-9);
             const SimplexBasis* warm =
                 (dual_basis.basic.empty() ||
                  !warm_basis_is_mature(dual_basis, dual_diag))
@@ -3624,94 +3484,41 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
     diag.total_ms += presolve_ms;
     copy_presolve_diag(diag);
     raw.iterations = diag.iterations;
-    // Both presolved and original-space solves use the same checked recovery.
+    // Both presolved and original-space solves use the same checked recovery
+    // (continue_certificate_from_basis) as FO/barrier close_lifted_certificate.
     const auto continue_original_certificate = [&](const SimplexBasis& warm_basis,
                                                    std::uint64_t pivot_cap = 0) {
         if (!opts.exact_proof ||
-            raw.proposed_status != core::Status::Optimal ||
-            (diag.dual_bound_finite && diag.gap_rel <= opts.gap_tol) ||
-            warm_basis.status.empty() ||
-            diag.certificate_iterations >= simplex_certificate_pivot_allowance ||
-            (opts.max_iterations != 0 && diag.iterations >= opts.max_iterations) ||
-            (opts.time_limit_s > 0 && ms_since(presolve_t0) >= 1000 * opts.time_limit_s)) return false;
-        SimplexOptions continuation = simplex_options_after_elapsed(opts, ms_since(presolve_t0) / 1000);
-        continuation.presolve = false;
-        continuation.method = SimplexMethod::Primal;
-        continuation.certificate_pricing = true;
-        // The continuation starts on an optimal-within-tolerance basis and
-        // only enters exact violators. Bound perturbation answers a phase-2
-        // plateau by moving the bounds and restoring them with a second warm
-        // solve; here that restoration consumed the whole allowance (greenbea,
-        // greenbeb: interrupted at the cap, then 3400 more certificate pivots)
-        // where the unperturbed continuation proves both in about 200.
-        continuation.primal_bound_perturbation = false;
-        const auto certificate_available = simplex_certificate_pivot_allowance - diag.certificate_iterations;
-        continuation.max_iterations = opts.max_iterations == 0 ? certificate_available
-            : std::min(certificate_available, opts.max_iterations - diag.iterations);
-        if (pivot_cap != 0)
-            continuation.max_iterations = std::min(continuation.max_iterations, pivot_cap);
-        SimplexDiagnostics continuation_work;
+            (opts.time_limit_s > 0 &&
+             ms_since(presolve_t0) >= 1000 * opts.time_limit_s))
+            return false;
+        const auto route_features = diag.route_features;
+        const bool route_features_valid = diag.route_features_valid;
+        SimplexOptions continuation =
+            simplex_options_after_elapsed(opts, ms_since(presolve_t0) / 1000);
         SimplexBasis repaired_basis;
-        auto candidate = solve_primal_simplex(problem, continuation, continuation_work,
-                                              &repaired_basis, &warm_basis);
-        auto checked = certify::check_lp_result(problem, candidate, simplex_evidence(continuation_work, continuation));
-        if (!checked.checker_passed && candidate.proposed_status == core::Status::Optimal &&
-            std::isfinite(candidate.dual_bound) && !raw.x.empty()) {
-            // Primal points and dual bounds are independent witnesses in
-            // the same model. Cleanup may improve the certificate while
-            // slightly worsening feasibility. Keep the earlier point only
-            // if the independent checker accepts the combined witnesses.
-            candidate.x = raw.x;
-            candidate.objective = problem.objective(candidate.x);
-            checked = certify::check_lp_result(problem, candidate,
-                simplex_evidence(continuation_work, continuation));
+        if (!continue_certificate_from_basis(problem, continuation, warm_basis,
+                                             pivot_cap, raw, diag,
+                                             &repaired_basis))
+            return false;
+        copy_presolve_diag(diag);
+        diag.route_features = route_features;
+        diag.route_features_valid = route_features_valid;
+        if (retain_prepared) {
+            retained_basis = repaired_basis;
+            retained_factor.clear();
+            retained_weights.clear();
         }
-        if (core::env_switches().certificate_debug)
-            std::fprintf(stderr, "[certificate-continuation] status=%s reason=%s pivots=%llu primal=%.9g dual=%.9g gap=%.9g\n",
-                core::to_string(candidate.proposed_status).data(), candidate.termination_reason.c_str(),
-                static_cast<unsigned long long>(continuation_work.iterations),
-                checked.max_primal_violation, checked.max_dual_violation, checked.gap_rel);
-        continuation_work.certificate_stages = std::max<std::uint64_t>(1, continuation_work.stages);
-        continuation_work.certificate_iterations = continuation_work.iterations;
-        continuation_work.certificate_preprocessing_builds = continuation_work.preprocessing_builds;
-        accumulate_simplex_work(diag, continuation_work);
-        if (checked.checker_passed && checked.reported_values_consistent &&
-            checked.max_dual_violation <= opts.dual_feas_tol &&
-            std::isfinite(checked.gap_rel) && checked.gap_rel <= opts.gap_tol &&
-            candidate.proposed_status == core::Status::Optimal) {
-            const auto totals = diag;
-            diag = continuation_work;
-            install_work_totals(diag, totals);
-            // The continuation's diagnostics describe an unpresolved solve;
-            // the reductions and routing summary of the run it finished
-            // belong to the result (perold reported "0 rows / 0 cols" for a
-            // presolve that had removed 144 rows).
-            copy_presolve_diag(diag);
-            diag.route_features = totals.route_features;
-            diag.route_features_valid = totals.route_features_valid;
-            diag.primal_residual = checked.max_primal_violation;
-            diag.dual_residual = checked.max_dual_violation;
-            diag.primal_objective = candidate.objective;
-            diag.dual_objective = checked.checked_dual_bound;
-            diag.dual_bound_finite = std::isfinite(checked.checked_dual_bound);
-            diag.gap_rel = checked.gap_rel;
-            raw = std::move(candidate);
-            raw.engine = "simplex+certificate-continuation";
-            if (retain_prepared) {
-                retained_basis = repaired_basis;
-                retained_factor.clear();
-                retained_weights.clear();
-            }
-            if (out_basis) *out_basis = std::move(repaired_basis);
-            return true;
-        }
-        return false;
+        if (out_basis) *out_basis = std::move(repaired_basis);
+        return true;
     };
     bool presolve_recovery_validated = false;
     if (used_presolve) {
         presolve::PresolveReducedSolve rs;
         rs.x = raw.x;
         rs.y = raw.y;
+        rs.proposed_level = raw.proposed_level;
+        rs.proposed_status = raw.proposed_status;
         if (!reduced_winner_basis.status.empty()) {
             rs.has_basis = true;
             rs.basis.n_struct = reduced_winner_basis.n_struct;
@@ -3753,16 +3560,7 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         raw.rc_lo.clear();
         raw.rc_hi.clear();
         raw.rc_bound = core::kNaN;
-        if (raw.proposed_status == core::Status::Unbounded &&
-            !raw.primal_ray.direction.empty()) {
-            raw.primal_ray = presolve::recover_primal_ray(
-                problem, pmap, raw.primal_ray, opts.primal_feas_tol);
-        }
-        if (raw.proposed_status == core::Status::Infeasible &&
-            !raw.dual_farkas_ray.multipliers.empty()) {
-            raw.dual_farkas_ray = presolve::recover_dual_farkas_ray(
-                problem, pmap, raw.dual_farkas_ray, opts.primal_feas_tol);
-        }
+        recover_terminal_rays(problem, pmap, raw, opts.primal_feas_tol);
         presolve_recovery_validated = recovered.validated;
         rematerialize_original(problem, raw, diag, opts);
         // Infinite or loose: either way the lifted basis's own certificate is

@@ -105,7 +105,8 @@ ExactDualAssessment assess_exact_dual(const model::LpProblem& problem,
 SafeLpBound safe_lagrangian_lower_bound(const model::LpProblem& problem,
                                         const std::vector<f64>& y_min,
                                         const std::vector<f64>& col_lo,
-                                        const std::vector<f64>& col_hi);
+                                        const std::vector<f64>& col_hi,
+                                        f64 dual_feas_tol = 1e-7);
 
 // Reduced-cost bound tightening from ONE certified Lagrangian. With L the
 // safe bound above for multipliers y_min over [col_lo, col_hi], and d_j the
@@ -171,7 +172,8 @@ RcEnclosure enclose_reduced_costs_from_sums(const model::LpProblem& problem,
                                             const std::vector<long double>& ab,
                                             const std::vector<std::uint32_t>& cnt,
                                             const std::vector<f64>& col_lo,
-                                            const std::vector<f64>& col_hi);
+                                            const std::vector<f64>& col_hi,
+                                            f64 dual_feas_tol = 1e-7);
 // The tightenings of interval_reduced_cost_tightenings from an enclosure of
 // the same box (rc_lo / rc_hi / bound as in RawResult or RcEnclosure).
 IntervalRcFixing reduced_cost_tightenings_from(const std::vector<f64>& rc_lo,
