@@ -26,8 +26,10 @@ DualInitialPricingStrategy choose_dual_initial_pricing(
         return DualInitialPricingStrategy::Dantzig;
     // Wide boxed models still benefit from edge weights. Box density alone
     // does not justify Dantzig pricing; retain DSE and its measured fallback.
+    // Include pilot87-class models (m≈2031, aspect≈3.3): measured 12395
+    // Devex iterations vs 15956 DSE on that instance.
     if (rows >= 1000 && rows < 3000 && aspect >= 1.0L &&
-        aspect < 2.0L && row_degree < 8.0L)
+        aspect < 5.0L && row_degree < 12.0L)
         return DualInitialPricingStrategy::Devex;
     return DualInitialPricingStrategy::DSE;
 }

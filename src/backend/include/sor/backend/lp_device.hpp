@@ -34,6 +34,7 @@ struct ScaledLp {
     std::vector<f64> row_lo, row_hi;
     // Unscale: x_orig = col_scale ⊙ x_hat, y_orig = row_scale ⊙ y_hat.
     std::vector<f64> row_scale, col_scale;
+    f64 magnitude_scale = 1.0; // PDLP bound/objective rescale (export factor)
     f64 obj_offset = 0.0;
     f64 sense = 1.0;           // +1 minimize, -1 was-maximize (already flipped)
 
@@ -91,6 +92,10 @@ struct LpSolution {
     std::vector<f64> dual_farkas_ray;  // scaled row multiplier candidate
 };
 
+// Contract: one LpDevice instance per thread. The CPU and Vulkan backends keep
+// mutable iterate/epoch state with no internal lock; sharing a device across
+// threads is undefined. Re-upload (or bind_bounds_batch) before solving a
+// different model on the same instance — bind resets iterates for batch_size 1.
 class LpDevice {
 public:
     virtual ~LpDevice() = default;
@@ -105,6 +110,7 @@ public:
     // ---- BatchLP seam (shared A, k bound vectors) -------------------------
     // batch_size() is 1 until bind_bounds_batch(k>1). hpr_steps / reduce_kkt
     // always apply to the active slot (slot 0 when batch_size()==1).
+    // bind_bounds_batch(1) resets iterates/epoch (same as a fresh batch slot).
     virtual std::uint32_t batch_size() const { return 1; }
 
     virtual void bind_bounds_batch(std::uint32_t batch_size,

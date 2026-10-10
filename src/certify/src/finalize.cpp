@@ -77,8 +77,12 @@ ProofLevel supported_level(const ProofEvidence& ev) {
         ev.max_primal_violation <= ev.primal_feas_tol;
     if (!feasible) return std::isfinite(ev.checked_dual_bound)
         ? ProofLevel::BoundOnly : ProofLevel::None;
-    if (ev.claimed_level >= ProofLevel::ProvedOptimalFP &&
-        ev.has_basis && lp_optimality_within_tolerance(ev)) {
+    // A basis whose independently checked residuals and gap close is
+    // ProvedOptimalFP even when the producer claimed only ProvedKKT (e.g.
+    // CLI exact_proof off: engine gap used the unsnapped dual bound).
+    if (ev.has_basis && lp_optimality_within_tolerance(ev) &&
+        (ev.claimed_level >= ProofLevel::ProvedOptimalFP ||
+         ev.claimed_level == ProofLevel::ProvedKKT)) {
         if (ev.vipr_verified) return ProofLevel::ProvedOptimalCertified;
         if (ev.rational_verified) return ProofLevel::ProvedOptimalExact;
         return ProofLevel::ProvedOptimalFP;
@@ -359,7 +363,8 @@ ProofEvidence check_lp_point(const model::LpProblem& problem,
 
     std::vector<f64> y_min(m);
     for (std::size_t i = 0; i < m; ++i) y_min[i] = sense * raw.y[i];
-    auto bound = safe_lagrangian_lower_bound(problem, y_min, problem.col_lo, problem.col_hi);
+    auto bound = safe_lagrangian_lower_bound(problem, y_min, problem.col_lo,
+                                             problem.col_hi, dual_feas_tol);
     if (!raw.exact_dual.empty()) {
         const auto exact = exact_dual_lower_bound(problem, raw.exact_dual);
         if (exact.finite && (!bound.finite || exact.value > bound.value)) bound = exact;
@@ -371,8 +376,11 @@ ProofEvidence check_lp_point(const model::LpProblem& problem,
         ev.gap_rel = std::fabs(ev.checked_objective - ev.checked_dual_bound) /
                      (1.0 + std::fabs(ev.checked_objective));
     }
+    // checker_passed means full KKT at the stated tolerances when duals
+    // are present, not merely a finite dual residual.
     ev.checker_passed = ev.checker_passed &&
-                        std::isfinite(ev.max_dual_violation);
+                        std::isfinite(ev.max_dual_violation) &&
+                        ev.max_dual_violation <= dual_feas_tol;
     return ev;
 }
 
@@ -846,14 +854,11 @@ SolveResult finalize_result(RawResult raw, const ProofEvidence& ev) {
         r.ray = r.dual_farkas_ray.multipliers;
 
     const bool checked_dual_ray =
-        ((!r.dual_farkas_ray.multipliers.empty() || !r.dual_farkas_ray.exact_multipliers.empty()) &&
-         ((std::isfinite(ev.dual_farkas_violation) &&
-           ev.dual_farkas_violation <= ev.primal_feas_tol &&
-           ev.dual_farkas_contradiction > ev.primal_feas_tol) ||
-          // One-release compatibility for simplex's legacy independent
-          // farkas_violation() evidence.
-          (std::isfinite(ev.ray_violation) &&
-           ev.ray_violation <= ev.primal_feas_tol)));
+        ((!r.dual_farkas_ray.multipliers.empty() ||
+          !r.dual_farkas_ray.exact_multipliers.empty()) &&
+         std::isfinite(ev.dual_farkas_violation) &&
+         ev.dual_farkas_violation <= ev.primal_feas_tol &&
+         ev.dual_farkas_contradiction > ev.primal_feas_tol);
     if (r.status == Status::Infeasible && checked_dual_ray) {
         r.ray_certified = true;
         r.dual_farkas_ray.certified = true;
@@ -865,9 +870,12 @@ SolveResult finalize_result(RawResult raw, const ProofEvidence& ev) {
         r.dual_farkas_ray = core::DualFarkasRay{};
     }
 
+    // Unbounded needs a feasible point + improving ray. Do NOT require
+    // checker_passed (full KKT): an unbounded LP is dual-infeasible, so the
+    // dual residual check that now gates checker_passed would always fail.
     const bool checked_primal_ray =
         r.status == Status::Unbounded && !r.primal_ray.direction.empty() &&
-        ev.checker_passed && ev.max_primal_violation <= ev.primal_feas_tol &&
+        ev.max_primal_violation <= ev.primal_feas_tol &&
         std::isfinite(ev.primal_ray_violation) &&
         ev.primal_ray_violation <= ev.primal_feas_tol &&
         std::isfinite(ev.primal_ray_objective) &&
@@ -950,13 +958,46 @@ SolveResult finalize_result(RawResult raw, const ProofEvidence& ev) {
 // is accumulated in long double and reduced by a conservative bound on its
 // own rounding error.
 namespace {
+// Round reduced costs that sit within dual_feas_tol on a free/infinite bound
+// side to zero so a dual-feasible point within tolerance keeps a finite bound.
+// Enclosures often straddle 0 as [-e, e] from rounding; the one-sided tests
+// alone miss that and leave the interval path with no finite chargeable bound
+// even though every point in the enclosure is dual-feasible within tolerance.
+void snap_infinite_bound_reduced_cost(long double& lo_d, long double& hi_d,
+                                     f64 col_lo, f64 col_hi, f64 dual_feas_tol) {
+    const bool free_below = !std::isfinite(col_lo);
+    const bool free_above = !std::isfinite(col_hi);
+    if (!free_below && !free_above) return;
+    f64 scale = 1.0;
+    if (std::isfinite(col_lo)) scale = std::max(scale, std::fabs(col_lo));
+    if (std::isfinite(col_hi)) scale = std::max(scale, std::fabs(col_hi));
+    const f64 tol = dual_feas_tol * (1.0 + scale);
+    // Whole enclosure inside the dual-feasibility band around 0.
+    if (static_cast<f64>(hi_d) <= tol && static_cast<f64>(-lo_d) <= tol) {
+        lo_d = hi_d = 0.0L;
+        return;
+    }
+    if (free_below && lo_d > 0.0L && static_cast<f64>(lo_d) <= tol)
+        lo_d = hi_d = 0.0L;
+    if (free_above && hi_d < 0.0L && static_cast<f64>(-hi_d) <= tol)
+        lo_d = hi_d = 0.0L;
+}
+
+void snap_infinite_bound_reduced_cost(long double& d, f64 col_lo, f64 col_hi,
+                                      f64 dual_feas_tol) {
+    long double lo = d, hi = d;
+    snap_infinite_bound_reduced_cost(lo, hi, col_lo, col_hi, dual_feas_tol);
+    d = lo;
+}
+
 // The bound itself, optionally exporting the reduced costs d = c - A'y of the
 // (possibly corrected) multipliers it was computed from.
 SafeLpBound lagrangian_bound_impl(const model::LpProblem& problem,
                                   const std::vector<f64>& y_min,
                                   const std::vector<f64>& col_lo,
                                   const std::vector<f64>& col_hi,
-                                  std::vector<model::Rational>* d_out) {
+                                  std::vector<model::Rational>* d_out,
+                                  f64 dual_feas_tol) {
     core::WorkScope work_scope_(core::WorkCat::Exact);
     SafeLpBound out;
     const core::Index m = problem.n_rows(), n = problem.n_cols();
@@ -978,6 +1019,9 @@ SafeLpBound lagrangian_bound_impl(const model::LpProblem& problem,
             d[sz(ci[sz(k)])] -= t2;
         }
     }
+    for (core::Index j = 0; j < n; ++j)
+        snap_infinite_bound_reduced_cost(d[sz(j)], col_lo[sz(j)], col_hi[sz(j)],
+                                         dual_feas_tol);
     std::vector<f64> imp_lo, imp_hi;
     const auto ensure_implied = [&]() {
         if (imp_lo.empty()) row_implied_bounds(problem, col_lo, col_hi, imp_lo, imp_hi);
@@ -1103,8 +1147,9 @@ SafeLpBound lagrangian_bound_impl(const model::LpProblem& problem,
                        core::WorkTag::Interval);
         for (core::Index j = 0; j < n && fast_ok; ++j) {
             const long double e = gamma(static_cast<long double>(cnt[sz(j)]) + 2.0L) * ab[sz(j)];
-            const long double lo_d = dl[sz(j)] - e, hi_d = dl[sz(j)] + e;
+            long double lo_d = dl[sz(j)] - e, hi_d = dl[sz(j)] + e;
             const f64 l = col_lo[sz(j)], h = col_hi[sz(j)];
+            snap_infinite_bound_reduced_cost(lo_d, hi_d, l, h, dual_feas_tol);
             long double contrib;
             if (lo_d == 0.0L && hi_d == 0.0L) continue;
             if (lo_d >= 0.0L) {
@@ -1163,7 +1208,19 @@ SafeLpBound lagrangian_bound_impl(const model::LpProblem& problem,
             b = sign > 0 ? imp_lo[sz(j)] : imp_hi[sz(j)];
             ++out.implied_bound_uses;
         }
-        if (!std::isfinite(b)) return out;
+        if (!std::isfinite(b)) {
+            // Same tolerance snap as the interval path: a dual-feasible
+            // residual on an infinite side is charged as zero, not -inf.
+            f64 scale = 1.0;
+            if (std::isfinite(col_lo[sz(j)]))
+                scale = std::max(scale, std::fabs(col_lo[sz(j)]));
+            if (std::isfinite(col_hi[sz(j)]))
+                scale = std::max(scale, std::fabs(col_hi[sz(j)]));
+            const f64 tol = dual_feas_tol * (1.0 + scale);
+            const f64 mag = std::fabs(dj.nearest());
+            if (std::isfinite(mag) && mag <= tol) continue;
+            return out;
+        }
         exact_L.add_sum_product(dj, b);
     }
     out.value = exact_L.down();
@@ -1176,8 +1233,10 @@ SafeLpBound lagrangian_bound_impl(const model::LpProblem& problem,
 SafeLpBound safe_lagrangian_lower_bound(const model::LpProblem& problem,
                                         const std::vector<f64>& y_min,
                                         const std::vector<f64>& col_lo,
-                                        const std::vector<f64>& col_hi) {
-    return lagrangian_bound_impl(problem, y_min, col_lo, col_hi, nullptr);
+                                        const std::vector<f64>& col_hi,
+                                        f64 dual_feas_tol) {
+    return lagrangian_bound_impl(problem, y_min, col_lo, col_hi, nullptr,
+                                 dual_feas_tol);
 }
 
 RcEnclosure enclose_reduced_costs_from_sums(const model::LpProblem& problem,
@@ -1186,7 +1245,8 @@ RcEnclosure enclose_reduced_costs_from_sums(const model::LpProblem& problem,
                                             const std::vector<long double>& ab,
                                             const std::vector<std::uint32_t>& cnt,
                                             const std::vector<f64>& col_lo,
-                                            const std::vector<f64>& col_hi) {
+                                            const std::vector<f64>& col_hi,
+                                            f64 dual_feas_tol) {
     core::WorkScope work_scope_(core::WorkCat::Exact);
     RcEnclosure out;
     const core::Index m = problem.n_rows(), n = problem.n_cols();
@@ -1241,11 +1301,12 @@ RcEnclosure enclose_reduced_costs_from_sums(const model::LpProblem& problem,
         const long double e = gamma(static_cast<long double>(cnt[sz(j)]) + 2.0L) *
                               (std::fabs(c) + ab[sz(j)]) +
                               (widened ? widen[sz(j)] * (1.0L + 4.0L * u) : 0.0L);
-        const long double lo_d = d - e, hi_d = d + e;
+        long double lo_d = d - e, hi_d = d + e;
+        const f64 l = col_lo[sz(j)], h = col_hi[sz(j)];
+        snap_infinite_bound_reduced_cost(lo_d, hi_d, l, h, dual_feas_tol);
         out.lo[sz(j)] = down(lo_d);
         out.hi[sz(j)] = up(hi_d);
         if (lo_d == 0.0L && hi_d == 0.0L) continue;
-        const f64 l = col_lo[sz(j)], h = col_hi[sz(j)];
         long double contrib;
         if (lo_d >= 0.0L) {
             if (!std::isfinite(l)) return out;
@@ -1388,7 +1449,7 @@ std::vector<RcBoundChange> safe_reduced_cost_tightenings(
     const core::Index n = problem.n_cols();
     std::vector<model::Rational> d;
     const SafeLpBound lb =
-        lagrangian_bound_impl(problem, y_min, col_lo, col_hi, &d);
+        lagrangian_bound_impl(problem, y_min, col_lo, col_hi, &d, 1e-7);
     if (bound_out != nullptr) *bound_out = lb;
     if (!lb.finite || !std::isfinite(cutoff_min) || d.size() != sz(n) ||
         problem.is_integer.size() != sz(n))

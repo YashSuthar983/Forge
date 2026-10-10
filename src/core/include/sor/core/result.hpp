@@ -72,8 +72,7 @@ enum class ProofLevel {
     ProvedOptimalCertified   // VIPR proof log accepted by sor_verify
 };
 
-// Public serial LP strategy.  `Simplex` retains the shipped default; `Auto`
-// is opt-in until the promotion gates in the LP execution plan are met.
+// Public LP strategy. `Auto` races concurrent dual/primal/barrier arms (Tier 4).
 enum class LpStrategy : std::uint8_t {
     Auto = 0,
     Simplex,
@@ -134,23 +133,51 @@ struct DualFarkasRay {
 // Solver-wide options intentionally contain only engine-neutral fields.  The
 // top-level dispatcher translates these into the existing explicit-engine
 // option records, keeping the L0 contract independent of L4 engine headers.
+// Tolerance regime for commercial-comparable vs integrity benchmarks.
+enum class LpTolerancePreset : std::uint8_t {
+    Verified = 0,  // 1e-7 / 1e-7 / 1e-9 + full certification (default)
+    Speed = 1,     // 1e-6 / 1e-6 / 1e-6 commercial-comparable
+};
+
 struct LpOptions {
-    int concurrent_solves = 1;
-    LpStrategy strategy = LpStrategy::Simplex;
+    // Auto route runs at least three arms; set to 1 to force serial Auto.
+    int concurrent_solves = 3;
+    // Gurobi Method=4 analogue: fixed arm order, equal budgets, lowest-index
+    // proved winner (no first-to-finish cancel race).
+    bool concurrent_deterministic = false;
+    LpStrategy strategy = LpStrategy::Auto;
     std::uint64_t max_iterations = 0;  // 0 = engine default
     f64 time_limit_s = 0.0;            // 0 = unlimited
     f64 primal_feas_tol = 1e-7;
     f64 dual_feas_tol = 1e-7;
     f64 gap_tol = 1e-9;
+    LpTolerancePreset tolerance_preset = LpTolerancePreset::Verified;
     bool presolve = true;
     bool presolve_implied_slack = false;
     bool fo_polish = true;
     bool fo_certificates = true;
     bool fo_crossover = true;
+    bool use_pock_chambolle = true;
+    bool enable_sifting = false;
+    bool enable_network_simplex = false;
     LpAutoBudgetSplit auto_budget_split =
         LpAutoBudgetSplit::Fo60Crossover25Simplex15;
     std::string backend = "cpu";
 };
+
+inline void apply_lp_tolerance_preset(LpOptions& options,
+                                      LpTolerancePreset preset) {
+    options.tolerance_preset = preset;
+    if (preset == LpTolerancePreset::Speed) {
+        options.primal_feas_tol = 1e-6;
+        options.dual_feas_tol = 1e-6;
+        options.gap_tol = 1e-6;
+    } else {
+        options.primal_feas_tol = 1e-7;
+        options.dual_feas_tol = 1e-7;
+        options.gap_tol = 1e-9;
+    }
+}
 
 struct LpStructuralFeatures {
     Index rows = 0;
@@ -209,6 +236,11 @@ struct LpDiagnostics {
     f64 max_dual_violation = kPosInf;
     f64 gap_rel = kPosInf;
     std::string termination_reason;
+    // Concurrent race (Tier 4); populated when solve_lp uses multiple arms.
+    int concurrent_arm_count = 0;
+    int concurrent_winner_arm = -1;
+    std::string concurrent_winner_kind;
+    bool concurrent_deterministic = false;
 };
 
 // ---------------------------------------------------------------------------

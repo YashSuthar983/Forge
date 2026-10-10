@@ -3,6 +3,7 @@
 #include "sor/engines/pdhg.hpp"
 #include "sor/engines/dual_simplex.hpp"
 #include "sor/engines/simplex.hpp"
+#include "sor/presolve/presolve.hpp"
 #include "sor/sparse/csc.hpp"
 #include "sor/sparse/spmv_plan.hpp"
 #include "sor/core/parallel.hpp"
@@ -13,12 +14,39 @@
 
 namespace sor::engines {
 
+// Shared ray lift (M-O2): one path for FO/barrier and simplex postsolve.
+inline void recover_terminal_rays(const model::LpProblem& original,
+                                  const presolve::PresolveMap& pmap,
+                                  core::RawResult& raw,
+                                  core::f64 feas_tol) {
+    if (raw.proposed_status == core::Status::Unbounded &&
+        !raw.primal_ray.direction.empty()) {
+        raw.primal_ray = presolve::recover_primal_ray(
+            original, pmap, raw.primal_ray, feas_tol);
+    }
+    if (raw.proposed_status == core::Status::Infeasible &&
+        !raw.dual_farkas_ray.multipliers.empty()) {
+        raw.dual_farkas_ray = presolve::recover_dual_farkas_ray(
+            original, pmap, raw.dual_farkas_ray, feas_tol);
+    }
+}
+
 inline void validate_simplex_numerics(const SimplexOptions& opts) {
     if (opts.pricing_threads < 1 || opts.pricing_threads > 256 ||
         opts.refinement_steps < 0 || !std::isfinite(opts.refinement_target) || opts.refinement_target <= 0 ||
         !std::isfinite(opts.residual_refactor_tol) || opts.residual_refactor_tol < 0 ||
         opts.residual_check_interval < 0)
         throw std::invalid_argument("simplex: invalid numerical policy");
+    if (opts.basis_lu.pivot_tol > opts.pivot_tol)
+        throw std::invalid_argument(
+            "simplex: basis_lu.pivot_tol must not exceed pivot_tol");
+    // Forrest-Tomlin update error compounds (~1 decade / 45 updates). At least
+    // one of the FT-specific refactor triggers must stay armed.
+    if (opts.update_method == la::UpdateMethod::ForrestTomlin &&
+        !(opts.refactor_u_nnz_ratio > 0.0) && !(opts.ft_update_limit > 0))
+        throw std::invalid_argument(
+            "simplex: ForrestTomlin requires refactor_u_nnz_ratio > 0 "
+            "or ft_update_limit > 0");
 }
 
 // Immutable preprocessing shared by every stage of the Auto dispatcher.
@@ -41,6 +69,8 @@ struct SimplexPrepared {
     std::vector<f64> dual_tolerance;
     std::vector<f64> primal_tolerance;
     f64 sense = 1.0;
+    // Snapshot of opts.basis_lu.pivot_tol at prepare time (crossover X3).
+    f64 lu_pivot_tol = la::kDefaultLuPivotTol;
     double scaling_ms = 0.0;
     double csc_ms = 0.0;
     double total_ms = 0.0;
@@ -63,12 +93,20 @@ inline std::vector<f64> prepared_tolerances(const SimplexPrepared& p,
     const auto n = static_cast<std::size_t>(p.scaled.n_cols());
     const auto m = static_cast<std::size_t>(p.scaled.n_rows());
     std::vector<f64> tolerance(n + m);
-    for (std::size_t j = 0; j < n; ++j)
-        tolerance[j] = std::max(dual ? opts.dual_feas_tol * p.scaling.col_scale[j]
-                                    : opts.primal_feas_tol / p.scaling.col_scale[j], 1e-12);
-    for (std::size_t i = 0; i < m; ++i)
-        tolerance[n + i] = std::max(dual ? opts.dual_feas_tol / p.scaling.row_scale[i]
-                                        : opts.primal_feas_tol * p.scaling.row_scale[i], 1e-12);
+    // Exact scale map: a floored scaled tolerance no longer implies the
+    // original 1e-7 residual once |scale| leaves about [1e-5, 1e5]. Keep the
+    // mathematical identity here; pivot cutoffs may still use a numeric floor
+    // elsewhere.
+    for (std::size_t j = 0; j < n; ++j) {
+        const f64 mapped = dual ? opts.dual_feas_tol * p.scaling.col_scale[j]
+                                : opts.primal_feas_tol / p.scaling.col_scale[j];
+        tolerance[j] = std::max(mapped, 0.0);
+    }
+    for (std::size_t i = 0; i < m; ++i) {
+        const f64 mapped = dual ? opts.dual_feas_tol / p.scaling.row_scale[i]
+                                : opts.primal_feas_tol * p.scaling.row_scale[i];
+        tolerance[n + i] = std::max(mapped, 0.0);
+    }
     return tolerance;
 }
 
@@ -210,6 +248,10 @@ struct DualPassWorkspace {
     std::vector<long double> aty_abs;
     std::vector<long double> ax;
     std::vector<std::uint32_t> aty_cnt;
+    // Generation-stamped BFRT flip membership for the damage oracle (avoids
+    // per-event unordered_set rebuilds of ratio_ws.flips).
+    std::vector<std::uint32_t> flip_stamp;
+    std::uint32_t flip_generation = 0;
 };
 
 struct DualPartitionState {
@@ -266,12 +308,25 @@ bool repair_simplex_dual(const model::LpProblem& problem, core::RawResult& raw,
 bool repair_simplex_support(const model::LpProblem& problem, core::RawResult& raw,
                             const SimplexOptions& opts, SimplexDiagnostics& diag);
 
+// Shared certificate continuation: warm primal from `basis` with exact
+// pricing, under a pivot allowance. Returns true when the independent
+// checker accepts Optimal with a finite gap. Used by both the simplex
+// presolve-lift path and FO/barrier close_lifted_certificate.
+bool continue_certificate_from_basis(const model::LpProblem& problem,
+                                     const SimplexOptions& opts,
+                                     const SimplexBasis& basis,
+                                     std::uint64_t pivot_cap,
+                                     core::RawResult& raw,
+                                     SimplexDiagnostics& diag,
+                                     SimplexBasis* out_basis = nullptr);
+
 // Original-scale dual reporting, shared by primal, dual and postsolve paths.
 // An infinite bound absorbs only an EXACT zero coefficient; otherwise use
 // the independently recomputed/repaired Lagrangian or report no finite bound.
 void report_simplex_dual_bound(const model::LpProblem& pmin, f64 sense,
                               const std::vector<f64>& y_min,
                               const std::vector<long double>& aty,
-                              SimplexDiagnostics& diag);
+                              SimplexDiagnostics& diag,
+                              f64 dual_feas_tol = 1e-7);
 
 }  // namespace sor::engines

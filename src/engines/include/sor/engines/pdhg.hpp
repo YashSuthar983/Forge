@@ -80,6 +80,8 @@ struct PdhgDiagnostics {
 struct RuizScaling {
     std::vector<f64> row_scale;   // D_r
     std::vector<f64> col_scale;   // D_c  (x_original = D_c * x_scaled)
+    // PDLP-style objective/bound magnitude normalization composed after Ruiz.
+    f64 magnitude_scale = 1.0;
 };
 
 // Scales `p` in place. Exposed for testing.
@@ -99,6 +101,10 @@ RuizScaling ruiz_scale(model::LpProblem& p, int iterations,
 // alpha=1 gives inverse-square-root row/column l1 scaling.
 void pock_chambolle_scale(model::LpProblem& p, RuizScaling& accumulated,
                           f64 alpha = 1.0);
+
+// One pass: divide objective and finite bounds by max(1, max |c|, |bound|).
+// Composes onto `accumulated.magnitude_scale`; unscales primal/dual on export.
+void pdlp_magnitude_rescale(model::LpProblem& p, RuizScaling& accumulated);
 
 // Solves and returns a RawResult. The caller must pass it through
 // certify::finalize_result to obtain a reportable SolveResult. This engine

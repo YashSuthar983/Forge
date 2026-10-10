@@ -19,6 +19,24 @@ using core::f64;
 using core::Index;
 using core::Offset;
 
+// Named numerics defaults (also printed by sor_solve --help). Callers that
+// override a tolerance should still respect the documented relations:
+//   basis_lu.pivot_tol <= pivot_tol
+//   scale-adjusted per-column floors use kScaleAdjustedTolFloor
+//   Forrest-Tomlin hard update floor is kForrestTomlinHardUpdateFloor
+namespace numerics {
+constexpr f64 kDefaultPrimalFeasTol = 1e-7;
+constexpr f64 kDefaultDualFeasTol = 1e-7;
+constexpr f64 kDefaultGapTol = 1e-9;
+constexpr f64 kDefaultPivotTol = 1e-7;
+constexpr f64 kDefaultHarrisSlack = 1e-7;
+constexpr f64 kDefaultLuPivotTol = la::kDefaultLuPivotTol;
+constexpr f64 kScaleAdjustedTolFloor = 1e-12;
+constexpr f64 kDefaultExpandDelta = 1e-6;
+constexpr f64 kDefaultExpandMax = 1e-3;
+constexpr int kForrestTomlinHardUpdateFloor = la::kForrestTomlinHardUpdateFloor;
+}  // namespace numerics
+
 enum class NonbasicStatus : std::uint8_t {
     Basic = 0,
     AtLower,
@@ -39,6 +57,10 @@ enum class DualizePolicy : std::uint8_t {
     Never = 1,
     Always = 2,  // whenever it is allowed at all (tests, experiments)
 };
+
+// Crash style A/B: Triangular (default) vs experimental two-pass
+// (second pass re-scores after the first triangular installation).
+enum class CrashStyle : std::uint8_t { Triangular = 0, TwoPass = 1 };
 
 enum class SimplexMethod : std::uint8_t {
     Auto   = 0,   // dual first, primal fallback
@@ -71,9 +93,18 @@ struct SimplexOptions {
     bool presolve_equation_sparsification = true;
     bool presolve_domain_probing = false;
     // Live presolve rules (doubleton equalities with bound transfer,
-    // cost-forced inequalities, dual fixing) and parallel rows, each with
-    // its primal, dual and basis recovery.
+    // cost-forced inequalities, dual fixing), each with primal/dual/basis
+    // recovery. Parallel rows are a separate opt-in (see below).
     bool presolve_live_reductions = true;
+    // Parallel/duplicate row merges. On after C6 ray-lift coverage; the FO/LP
+    // route already enables the same rule (lp.cpp probe_fo_presolve).
+    bool presolve_parallel_rows = true;
+    // Tier-3 strength (measured 2026-10-10 on 80bau3b/d2q06c/greenbea):
+    // parallel + dominated columns are Netlib-safe; implied bounds alone
+    // doubled 80bau3b and Interrupted greenbea at 35s — keep that opt-in.
+    bool presolve_implied_bounds = false;
+    bool presolve_dominated_columns = true;
+    bool presolve_parallel_columns = true;
     std::uint64_t max_iterations = 0;
     double time_limit_s = 900.0;
 
@@ -85,11 +116,11 @@ struct SimplexOptions {
     // lose.
     const core::CancelToken* cancel = nullptr;
 
-    f64 primal_feas_tol = 1e-7;
-    f64 dual_feas_tol   = 1e-7;
-    f64 gap_tol         = 1e-9;
-    f64 pivot_tol       = 1e-7;
-    f64 harris_slack    = 1e-7;
+    f64 primal_feas_tol = numerics::kDefaultPrimalFeasTol;
+    f64 dual_feas_tol   = numerics::kDefaultDualFeasTol;
+    f64 gap_tol         = numerics::kDefaultGapTol;
+    f64 pivot_tol       = numerics::kDefaultPivotTol;
+    f64 harris_slack    = numerics::kDefaultHarrisSlack;
 
     std::uint64_t max_basis_repairs = 200;
 
@@ -110,6 +141,12 @@ struct SimplexOptions {
     // -13%, total time -30%; dfl001 newly proved, pilot87 lost to an
     // exact-certificate size limit on its different final basis.
     bool allow_cost_shifts = true;
+    // Task 4 cancel-path regression hook (default off). After the first
+    // non-initial phase-2 refactor, inject a wrong-sign working-cost bump on
+    // one one-sided nonbasic so request_primal_cleanup must restore and — when
+    // the model is dual feasible — drop the request and continue. Never enable
+    // in production solves.
+    bool dual_test_inject_working_dual_obstruction = false;
     // Repair and exact certification of a terminal Optimal bound. The
     // presolve route clears it for the reduced solve: only the lifted
     // original-model proof counts, and it is certified after postsolve.
@@ -148,7 +185,11 @@ struct SimplexOptions {
     // variant is intentionally NOT the default: measured Netlib gains from
     // perturbation are concentrated in phase 2 (e.g. nesm), so gating to
     // phase 1 would be a no-op on the models that benefit.
+    // Legacy absolute multiplier (0 = use Koberstein path when dual_perturbation).
     f64 dual_cost_perturbation_multiplier = 0.0;
+    // Applied only on dual cycling recovery when the first pass stalled with
+    // dual_cost_perturbation_multiplier == 0.
+    f64 dual_cycling_recovery_perturbation_multiplier = 1.0;
 
     // Dual cost perturbation exactly as in Koberstein (2005 thesis §6.3.1):
     // perturb all structural non-fixed, non-free costs before the first
@@ -196,7 +237,7 @@ struct SimplexOptions {
     // iterations (39.7 s), with the stalling branch alone 8,455 (2.4 s);
     // supportcase7 finished only without it. The stalling branch is kept
     // exactly as the thesis specifies.
-    bool dual_perturbation_at_start = false;
+    bool dual_perturbation_at_start = true;
 
     // Refactor after this many basis updates. Product-form etas are as dense
     // as the FTRAN'd entering columns, so the file has to be recycled on the
@@ -283,6 +324,12 @@ struct SimplexOptions {
     // 100, 0.76x at 200) and is also the one whose DSE log error the old
     // comment flagged, so re-check that pair together if this is retuned.
     int ft_update_limit = 200;
+    // When >0: refactor if hypersparse hit rate since the last factor drops
+    // below this floor after enough solves (0 disables). Default 0.15 —
+    // densified FT update files trigger a refactor before dense solves dominate.
+    // Armed only when factor_nnz >= 4096 and >= 256 triangular solves have
+    // been observed (see BasisFactor::needs_refactor).
+    f64 refactor_hypersparse_hit_floor = 0.15;
     // Collective FT (Huangfu & Hall 2015, phase 2): when the product-form
     // eta file hits
     // refactor_eta_ratio, try BasisFactor::collapse_pending_into_ft() (fold
@@ -311,9 +358,9 @@ struct SimplexOptions {
     bool primal_bound_perturbation = true;
     // Trace phase-2 progress and recovery even inside normally silent MILP LPs.
     bool trace_degeneracy = false;
-    f64   expand_delta      = 1e-6;
+    f64   expand_delta      = numerics::kDefaultExpandDelta;
     f64   expand_factor     = 10.0;
-    f64   expand_max        = 1e-3;
+    f64   expand_max        = numerics::kDefaultExpandMax;
 
     // Rebuild dual multipliers and reduced costs periodically to bound drift
     // on long degenerate dual runs. Zero disables the refresh.
@@ -334,6 +381,8 @@ struct SimplexOptions {
     // columns to zero working cost, preserving its initial dual feasibility.
     bool primal_crash = false;
     bool dual_crash = true;
+    // Crash style A/B: Triangular (default) vs experimental two-pass.
+    CrashStyle crash_style = CrashStyle::Triangular;
 
 
     // Diagnostic-only early abort when the dual merit function goes flat.
@@ -347,11 +396,17 @@ struct SimplexOptions {
     // Enable the presolve implied-slack reduction (zero-cost singleton column
     // -> bound transfer). Off by default on measurement; see presolve.hpp.
     bool presolve_implied_slack = false;
+    bool enable_sifting = false;
+    bool enable_network_simplex = false;
     // Round every Ruiz factor to the nearest power of two, which makes the
     // scaling exact in floating point (see ruiz_scale). Off by default until
     // it clears the 93-model gate.
     bool ruiz_power_of_two = false;
     bool verbose = false;
+    // Phase-share timers (FTRAN/BTRAN/price/ratio ms). Default ON so
+    // benchmarks and nightly jobs see real diag.*_ms. Disable on hosts whose
+    // clocksource demoted to hpet (~40 us/pivot tax); see dual_simplex tick().
+    bool time_detail = true;
 };
 
 // Pre-solve structural summary of the model the engine is about to solve.
@@ -412,6 +467,16 @@ struct SimplexDiagnostics {
     std::uint64_t refactorizations  = 0;
     std::uint64_t residual_refactors = 0;
     std::uint64_t numerical_zero_dual_steps = 0;
+    // Max |c_eff,q - a_q^T π| observed when a numerical-zero dual step forced
+    // the cached basic reduced cost to 0 while costs/π were left unchanged.
+    // Within dual feasibility tolerance this is an intentional approximation,
+    // not a published-proof identity.
+    f64 numerical_zero_stationarity_max = 0.0;
+    // Bare working-cost price refreshes (periodic / post-pivot fallback /
+    // phase-1 no-leave) and how often the post-refresh sign/parking contract
+    // actually repaired something beyond tolerance.
+    std::uint64_t working_price_refreshes = 0;
+    std::uint64_t working_price_refresh_repairs = 0;
     std::uint64_t refinement_corrections = 0;
     std::uint64_t collective_ft_collapses = 0;  // full refactors avoided via collapse_pending_into_ft()
     std::uint64_t collective_ft_skips = 0;      // rejected by bounded-work production guard
@@ -538,6 +603,20 @@ struct SimplexDiagnostics {
     // hand-off came from a no-entering-column exit, where the basis is
     // primal infeasible by construction.
     f64 cleanup_primal_infeasibility = 0.0;
+    // Task 4 handoff identity: why cleanup was requested, dual phase at the
+    // request, working-cost residual before model restore, and whether model
+    // costs were in place before the handoff decision. Cause codes:
+    // 0 none; 1 terminal true-cost; 2 after-factor shift disabled/refused;
+    // 3 after price-refresh refused; 4 harmful wrong-sign refused (fresh);
+    // 5 mid-solve audit residual; 6 phase-1 no dual-feasible basis.
+    std::uint32_t cleanup_request_cause = 0;
+    int cleanup_request_phase = 0;
+    f64 cleanup_working_dual_infeasibility = 0.0;
+    bool cleanup_restored_model_costs = false;
+    // Task 4: restore→reevaluate calls, and how often restore cleared the
+    // obstruction so the cleanup request was dropped (dual continues).
+    std::uint64_t cleanup_reevaluations = 0;
+    std::uint64_t cleanup_requests_dropped = 0;
     // Dual ratio-test (CHUZC) behaviour: Harris groups visited in total,
     // stability back-offs to an earlier group, sweeps that passed every
     // breakpoint with positive slope, and relatively tiny entries excluded.
@@ -560,6 +639,10 @@ struct SimplexDiagnostics {
     // large. Both are numerical-trouble signals rather than policy.
     std::uint64_t numerical_trouble_refactors = 0;
     std::uint64_t refused_cost_shifts = 0;
+    // Harmful wrong-sign enters where shift_cost refused on an already-fresh
+    // factor: the pivot was aborted (cleanup handoff or NumericalFailure)
+    // rather than taking a silent backward dual step.
+    std::uint64_t harmful_shift_fresh_factor_blocks = 0;
     std::uint64_t warm_starts      = 0;
     // Work counters are cumulative across Auto's primary/fallback stages. The
     // timing fields below are cumulative too; these counters make a profile

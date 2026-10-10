@@ -6,6 +6,11 @@
 // it was called on every cost shift of the dual and about fifteen times per
 // LP solve, which a short MILP node LP notices. This is also the one place
 // that lists them all.
+//
+// Boolean flags treat unset/empty/"0"/"false"/"off"/"no" as disabled; any
+// other non-empty value enables. Default-off A/B validation must unset the
+// variable (or set it to an explicit disable spelling), not export FOO=0
+// and expect the old presence-only reader.
 #pragma once
 
 #include <cstdint>
@@ -28,6 +33,9 @@ struct EnvSwitches {
     bool dual_indexed_chuzr = false;              // SOR_DUAL_INDEXED_CHUZR
     bool dual_fullscan_chuzr = false;             // SOR_DUAL_FULLSCAN_CHUZR
     bool dual_no_cost_shift = false;              // SOR_DUAL_NO_COST_SHIFT
+    bool dual_bfrt_damage_guard = false;          // SOR_DUAL_BFRT_DAMAGE_GUARD
+    bool dual_bfrt_prefer_safe = false;           // SOR_DUAL_BFRT_PREFER_SAFE
+    bool dual_mid_solve_cost_audit = false;       // SOR_DUAL_MID_SOLVE_COST_AUDIT
     std::uint64_t dual_verbose_every = 0;         // SOR_DUAL_VERBOSE_EVERY (0: default)
     std::string dual_trace;                       // SOR_DUAL_TRACE=<file>
 
@@ -42,6 +50,7 @@ struct EnvSwitches {
 
     // LU.
     bool lu_comparison_sort = false;              // SOR_LU_COMPARISON_SORT
+    bool lu_no_simd_solves = false;               // SOR_NO_SIMD_SOLVES (force scalar)
     std::string lu_update_log;                    // SOR_LU_UPDATE_LOG=<file>
 
     // Driver, presolve and certificates.

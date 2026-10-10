@@ -35,6 +35,12 @@ inline double ms_since(Clock::time_point t0) {
 
 f64 fgmres_solve(const la::Ldlt& fac, const SymMul& mul, std::vector<f64>& rhs,
                  int max_krylov, f64 tol_rel, const char* phase) {
+    return fgmres_solve([&](std::vector<f64>& b) { fac.solve(b); }, mul, rhs, max_krylov,
+                        tol_rel, phase);
+}
+
+f64 fgmres_solve(const std::function<void(std::vector<f64>&)>& prec, const SymMul& mul,
+                 std::vector<f64>& rhs, int max_krylov, f64 tol_rel, const char* phase) {
     const std::size_t nn = rhs.size();
     core::ThreadPool& pool = core::global_pool();
     // Fixed chunk size for deterministic dot product reductions (independent of thread count).
@@ -71,7 +77,7 @@ f64 fgmres_solve(const la::Ldlt& fac, const SymMul& mul, std::vector<f64>& rhs,
     std::vector<f64> x0 = rhs, r0;
     {
         Clock::time_point t0 = Clock::now();
-        fac.solve(x0);
+        prec(x0);
         prec_ms += ms_since(t0);
     }
     f64 best = resid(x0, r0);
@@ -92,7 +98,7 @@ f64 fgmres_solve(const la::Ldlt& fac, const SymMul& mul, std::vector<f64>& rhs,
             std::vector<f64> zk = V[kr];
             {
                 Clock::time_point t0 = Clock::now();
-                fac.solve(zk);
+                prec(zk);
                 prec_ms += ms_since(t0);
             }
             bool finite = true;

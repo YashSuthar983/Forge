@@ -1,7 +1,8 @@
 // SOR - LP presolve with a chronological postsolve journal.
 //
 // LAYER L3. Reversible reductions recover primal/dual solutions on the original
-// model. Proof steps (C6) are not emitted from presolve itself.
+// model. Terminal presolve proofs (empty-column unbounded, row infeasible)
+// carry unit rays in PresolveOutcome for finalize.
 #pragma once
 
 #include "sor/core/result.hpp"
@@ -71,7 +72,7 @@ struct PresolveOptions {
     bool parallel_columns = false;
     int max_passes = 64;
     f64 feasibility_tol = 1e-7;
-    f64 stability_tol_scale = 1e-9;
+    f64 stability_tol_scale = 1e-3;
     Offset max_substitution_fill = 512;
     bool equation_sparsification = false;
     bool domain_probing = false;
@@ -227,6 +228,9 @@ struct PresolveOutcome {
     Index witness_row = -1;
     Index witness_col = -1;
     std::string reason;
+    // Unit certificates for early presolve terminations (lifted in lp layer).
+    core::PrimalRay terminal_primal_ray;
+    core::DualFarkasRay terminal_dual_farkas;
 
     bool reduced() const noexcept {
         return status == PresolveStatus::Reduced ||
@@ -262,6 +266,8 @@ struct PresolveReducedSolve {
     std::vector<f64> y;
     PostsolveBasis basis;
     bool has_basis = false;
+    core::ProofLevel proposed_level = core::ProofLevel::None;
+    core::Status proposed_status = core::Status::NoSolutionFound;
 };
 
 struct PresolveRecoveryOptions {
@@ -270,6 +276,9 @@ struct PresolveRecoveryOptions {
     f64 primal_feas_tol = 1e-7;
     f64 dual_feas_tol = 1e-7;
     f64 gap_tol = 1e-9;
+    // Interior-point candidates are not on bounds; skip bound-tightening dual
+    // recovery until crossover supplies a vertex basis.
+    bool skip_bound_tightening_dual = false;
     // Check the lifted point on the original model (evidence, validated).
     // A caller that re-evaluates the lifted point itself and never reads
     // the verdict clears it (the simplex route without the exact proof).

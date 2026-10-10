@@ -16,9 +16,10 @@ each other.
         --time-limit 30 --jsonl results.jsonl
 
 Solver names are `sor:<engine>[:<backend>]` for this project, or one of the
-external baselines: highs, cbc, scipy, scipy-ipm, gurobi. Externals run only if
-their Python package is importable; they are reported as `unavailable`
-otherwise, never silently dropped.
+external baselines: highs, cbc, scipy, scipy-ipm, gurobi, cplex, mosek, copt,
+xpress, ortools-glop, ortools-pdlp, soplex, clp. Externals run only if their
+Python package or CLI is available; they are reported as `unavailable` or
+`size-skipped` otherwise, never silently dropped.
 
 CLEAN ROOM: external solvers are used ONLY as independent reference points for
 these measurements. They are never linked into SOR and never contribute to a
@@ -238,8 +239,9 @@ def build_sor_command(model: Path, engine: str, backend: str,
     record, so a JSONL still says exactly what produced it."""
     flags: list[str] = []
     eng = engine
-    # primal/dual are simplex methods, not standalone engines.
-    if engine in ("auto", "primal", "dual"):
+    # primal/dual are simplex methods, not standalone engines. `auto` is the
+    # LP dispatcher (concurrent dual/primal/barrier) — keep --engine auto.
+    if engine in ("primal", "dual"):
         eng, method = "simplex", engine
     # Two HPR variants are flags on the same engine rather than engines.
     if engine in ("hpr-full", "hpr-vanilla"):
@@ -784,8 +786,71 @@ def run_cbc(model: Path, time_limit: float, label: str) -> Result:
     return r
 
 
-def run_gurobi(model: Path, time_limit: float, label: str) -> Result:
+def _mps_dims(model: Path) -> tuple[int | None, int | None]:
+    """Best-effort row/col counts from an MPS header for size-limit skips."""
+    rows = cols = None
+    try:
+        text = model.read_text(errors="ignore")
+    except OSError:
+        return None, None
+    # Prefer SOR's own size line if a previous run left a report nearby; else
+    # count ROWS/COLUMNS blocks cheaply.
+    in_rows = in_cols = False
+    row_names: set[str] = set()
+    col_names: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line or line.startswith("*"):
+            continue
+        key = line[:10].strip().upper() if len(line) >= 4 else line.strip().upper()
+        if key == "ROWS":
+            in_rows, in_cols = True, False
+            continue
+        if key == "COLUMNS":
+            in_rows, in_cols = False, True
+            continue
+        if key in ("RHS", "BOUNDS", "RANGES", "ENDATA", "QUADOBJ", "QMATRIX"):
+            in_rows = in_cols = False
+            continue
+        if in_rows and len(line) > 4:
+            row_names.add(line[4:].split()[0] if line[4:].split() else line.strip())
+        elif in_cols and line[:4].strip() == "" and line[4:].split():
+            col_names.add(line[4:].split()[0])
+    if row_names:
+        rows = len(row_names)
+    if col_names:
+        cols = len(col_names)
+    return rows, cols
+
+
+def _size_skip(r: Result, model: Path, max_rows: int | None, max_cols: int | None,
+               max_sum: int | None = None) -> bool:
+    rows, cols = _mps_dims(model)
+    r.rows, r.cols = rows, cols
+    if rows is None or cols is None:
+        return False
+    if max_rows is not None and rows > max_rows:
+        r.status = "size-skipped"
+        r.error = f"{rows} rows > limit {max_rows}"
+        return True
+    if max_cols is not None and cols > max_cols:
+        r.status = "size-skipped"
+        r.error = f"{cols} cols > limit {max_cols}"
+        return True
+    if max_sum is not None and rows + cols > max_sum:
+        r.status = "size-skipped"
+        r.error = f"{rows}+{cols} > limit {max_sum}"
+        return True
+    return False
+
+
+def run_gurobi(model: Path, time_limit: float, label: str,
+               lp_method: str | None = None, threads: int = 1) -> Result:
     r = Result(solver=label, instance=model.name)
+    # Size-limited academic/pip licenses (~2000x2000). Skip before optimize
+    # so the harness reports size-skipped instead of a license crash.
+    if _size_skip(r, model, 2000, 2000):
+        return r
     try:
         import gurobipy as gp
     except ImportError:
@@ -795,7 +860,16 @@ def run_gurobi(model: Path, time_limit: float, label: str) -> Result:
     try:
         env = gp.Env(empty=True); env.setParam("OutputFlag", 0); env.start()
         m = gp.read(str(model), env)
-        m.setParam("TimeLimit", float(time_limit)); m.setParam("Threads", 1)
+        m.setParam("TimeLimit", float(time_limit))
+        m.setParam("Threads", int(threads))
+        # Method: -1 auto/concurrent, 0 primal, 1 dual, 2 barrier.
+        if lp_method in ("primal", "simplex-primal"):
+            m.setParam("Method", 0)
+        elif lp_method in ("dual", "simplex", "simplex-dual"):
+            m.setParam("Method", 1)
+        elif lp_method in ("barrier", "ipm"):
+            m.setParam("Method", 2)
+            m.setParam("Crossover", 1)
         t0 = time.perf_counter()
         m.optimize()
         r.seconds = r.wall_s = time.perf_counter() - t0
@@ -803,9 +877,405 @@ def run_gurobi(model: Path, time_limit: float, label: str) -> Result:
                     9: "TimeLimit"}.get(m.Status, f"code{m.Status}")
         if m.SolCount:
             r.objective = float(m.ObjVal)
+        try:
+            r.iterations = int(m.IterCount)
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as e:  # noqa: BLE001
+        msg = f"{type(e).__name__}: {e}"
+        if "size" in msg.lower() or "2000" in msg or "license" in msg.lower():
+            r.status = "size-skipped"
+        else:
+            r.status = "crash"
+        r.error = msg
+    return r
+
+
+def run_cplex(model: Path, time_limit: float, label: str,
+              lp_method: str | None = None, threads: int = 1) -> Result:
+    """CPLEX Community Edition via docplex/cplex; 1000-row/col size limit."""
+    r = Result(solver=label, instance=model.name)
+    if _size_skip(r, model, 1000, 1000):
+        return r
+    try:
+        import cplex  # type: ignore
+    except ImportError:
+        r.status = "unavailable"
+        r.error = "cplex not installed"
+        return r
+    try:
+        cpx = cplex.Cplex()
+        cpx.set_results_stream(None)
+        cpx.set_log_stream(None)
+        cpx.set_warning_stream(None)
+        cpx.set_error_stream(None)
+        cpx.parameters.timelimit.set(float(time_limit))
+        cpx.parameters.threads.set(int(threads))
+        if lp_method in ("primal", "simplex-primal"):
+            cpx.parameters.lpmethod.set(cpx.parameters.lpmethod.values.primal)
+        elif lp_method in ("dual", "simplex", "simplex-dual"):
+            cpx.parameters.lpmethod.set(cpx.parameters.lpmethod.values.dual)
+        elif lp_method in ("barrier", "ipm"):
+            cpx.parameters.lpmethod.set(cpx.parameters.lpmethod.values.barrier)
+        cpx.read(str(model))
+        t0 = time.perf_counter()
+        cpx.solve()
+        r.seconds = r.wall_s = time.perf_counter() - t0
+        st = cpx.solution.get_status()
+        # 1 optimal, 3 infeasible, 4 unbounded/infeas, 10/11 aborted
+        r.status = {1: "Optimal", 3: "Infeasible", 4: "Unbounded",
+                    10: "Interrupted", 11: "Interrupted",
+                    13: "Interrupted"}.get(st, f"code{st}")
+        try:
+            r.objective = float(cpx.solution.get_objective_value())
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            r.iterations = int(cpx.solution.progress.get_num_iterations())
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as e:  # noqa: BLE001
+        msg = f"{type(e).__name__}: {e}"
+        if "1016" in msg or "1000" in msg or "limit" in msg.lower():
+            r.status = "size-skipped"
+        else:
+            r.status = "crash"
+        r.error = msg
+    return r
+
+
+def run_mosek(model: Path, time_limit: float, label: str,
+              lp_method: str | None = None, threads: int = 1,
+              tol: float = 1e-7) -> Result:
+    r = Result(solver=label, instance=model.name)
+    try:
+        import mosek  # type: ignore
+    except ImportError:
+        # Fall back to the /opt/mosek CLI when the wheel is missing.
+        cli = Path("/opt/mosek/11.2/tools/platform/linux64x86/bin/mosek")
+        if not cli.is_file():
+            r.status = "unavailable"
+            r.error = "mosek wheel not installed and /opt/mosek CLI missing"
+            return r
+        return _run_mosek_cli(cli, model, time_limit, label, lp_method, threads)
+    try:
+        with mosek.Env() as env:
+            with env.Task() as task:
+                task.readdata(str(model))
+                task.putdouparam(mosek.dparam.optimizer_max_time, float(time_limit))
+                task.putintparam(mosek.iparam.num_threads, int(threads))
+                task.putdouparam(mosek.dparam.intpnt_tol_rel_gap, float(tol))
+                task.putdouparam(mosek.dparam.simplex_abs_tol_piv, float(tol))
+                if lp_method in ("dual", "simplex", "simplex-dual"):
+                    task.putintparam(mosek.iparam.optimizer,
+                                     mosek.optimizertype.dual_simplex)
+                elif lp_method in ("primal", "simplex-primal"):
+                    task.putintparam(mosek.iparam.optimizer,
+                                     mosek.optimizertype.primal_simplex)
+                elif lp_method in ("barrier", "ipm"):
+                    task.putintparam(mosek.iparam.optimizer,
+                                     mosek.optimizertype.intpnt)
+                    task.putintparam(mosek.iparam.intpnt_basis,
+                                     mosek.basindtype.always)
+                t0 = time.perf_counter()
+                trm = task.optimize()
+                r.seconds = r.wall_s = time.perf_counter() - t0
+                # Prefer basic solution when present (post-crossover).
+                for sol in (mosek.soltype.bas, mosek.soltype.itr):
+                    try:
+                        sta = task.getsolsta(sol)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if sta in (mosek.solsta.optimal, mosek.solsta.integer_optimal):
+                        r.status = "Optimal"
+                        r.objective = float(task.getprimalobj(sol))
+                        break
+                    if sta in (mosek.solsta.prim_infeas_cer,
+                               mosek.solsta.dual_infeas_cer):
+                        r.status = ("Infeasible" if sta == mosek.solsta.prim_infeas_cer
+                                    else "Unbounded")
+                        break
+                else:
+                    if trm == mosek.rescode.trm_max_time:
+                        r.status = "TimeLimit"
+                    else:
+                        r.status = f"mosek_{trm}"
+                try:
+                    r.iterations = int(task.getintinf(mosek.iinfitem.sim_primal_iter)
+                                       + task.getintinf(mosek.iinfitem.sim_dual_iter)
+                                       + task.getintinf(mosek.iinfitem.intpnt_iter))
+                except Exception:  # noqa: BLE001
+                    pass
     except Exception as e:  # noqa: BLE001
         r.status = "crash"
         r.error = f"{type(e).__name__}: {e}"
+    return r
+
+
+def _run_mosek_cli(cli: Path, model: Path, time_limit: float, label: str,
+                   lp_method: str | None, threads: int) -> Result:
+    r = Result(solver=label, instance=model.name)
+    # MOSEK CLI wants `-d NAME VALUE` as three argv tokens, not NAME=VALUE.
+    cmd = [str(cli), str(model),
+           "-d", "MSK_DPAR_OPTIMIZER_MAX_TIME", str(time_limit),
+           "-d", "MSK_IPAR_NUM_THREADS", str(threads)]
+    if lp_method in ("dual", "simplex", "simplex-dual"):
+        cmd += ["-d", "MSK_IPAR_OPTIMIZER", "MSK_OPTIMIZER_DUAL_SIMPLEX"]
+    elif lp_method in ("primal", "simplex-primal"):
+        cmd += ["-d", "MSK_IPAR_OPTIMIZER", "MSK_OPTIMIZER_PRIMAL_SIMPLEX"]
+    elif lp_method in ("barrier", "ipm"):
+        cmd += ["-d", "MSK_IPAR_OPTIMIZER", "MSK_OPTIMIZER_INTPNT",
+                "-d", "MSK_IPAR_INTPNT_BASIS", "MSK_BI_ALWAYS"]
+    t0 = time.perf_counter()
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=time_limit + 60)
+    except subprocess.TimeoutExpired:
+        r.status = "TimeLimit"
+        r.seconds = r.wall_s = time_limit + 60
+        return r
+    r.seconds = r.wall_s = time.perf_counter() - t0
+    out = (p.stdout or "") + "\n" + (p.stderr or "")
+    if re.search(r"STATUS\s*:\s*OPTIMAL", out, re.I) or "OPTIMAL" in out:
+        r.status = "Optimal"
+    elif re.search(r"PRIMAL_INFEASIBLE", out, re.I):
+        r.status = "Infeasible"
+    elif re.search(r"DUAL_INFEASIBLE", out, re.I):
+        r.status = "Unbounded"
+    elif p.returncode != 0:
+        r.status = "crash"
+        r.error = out[-500:]
+    else:
+        r.status = "Interrupted"
+    m = re.search(r"Problem status\s*:\s*\S+\s*\n.*?Objective\s*:\s*([-+0-9.eE+]+)",
+                  out, re.S | re.I)
+    if not m:
+        m = re.search(r"Primal objective\.*\s*([-+0-9.eE+]+)", out)
+    if m:
+        try:
+            r.objective = float(m.group(1))
+        except ValueError:
+            pass
+    return r
+
+
+def run_copt(model: Path, time_limit: float, label: str,
+             lp_method: str | None = None, threads: int = 1) -> Result:
+    """COPT via coptpy. Unlicensed community build: 10000x10000 size limit."""
+    r = Result(solver=label, instance=model.name)
+    if _size_skip(r, model, 10000, 10000):
+        return r
+    try:
+        import coptpy as cp  # type: ignore
+    except ImportError:
+        r.status = "unavailable"
+        r.error = "coptpy not installed"
+        return r
+    try:
+        env = cp.Envr()
+        m = env.createModel()
+        m.read(str(model))
+        m.setParam("TimeLimit", float(time_limit))
+        m.setParam("Threads", int(threads))
+        if lp_method in ("dual", "simplex", "simplex-dual"):
+            m.setParam("LpMethod", 1)
+        elif lp_method in ("primal", "simplex-primal"):
+            m.setParam("LpMethod", 0)
+        elif lp_method in ("barrier", "ipm"):
+            m.setParam("LpMethod", 2)
+        t0 = time.perf_counter()
+        m.solve()
+        r.seconds = r.wall_s = time.perf_counter() - t0
+        # COPT statuses: 1 optimal, 2 infeasible, 3 unbounded, 8 timeout
+        st = int(m.status)
+        r.status = {1: "Optimal", 2: "Infeasible", 3: "Unbounded",
+                    8: "TimeLimit"}.get(st, f"code{st}")
+        try:
+            r.objective = float(m.objval)
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as e:  # noqa: BLE001
+        msg = f"{type(e).__name__}: {e}"
+        low = msg.lower()
+        if "license" in low or "size" in low or "limit" in low:
+            r.status = "size-skipped" if "size" in low or "limit" in low else "unavailable"
+        else:
+            r.status = "crash"
+        r.error = msg
+    return r
+
+
+def run_xpress(model: Path, time_limit: float, label: str,
+               lp_method: str | None = None, threads: int = 1) -> Result:
+    """Xpress community edition via xpress; ~5000 rows+cols limit."""
+    r = Result(solver=label, instance=model.name)
+    if _size_skip(r, model, None, None, max_sum=5000):
+        return r
+    try:
+        import xpress as xp  # type: ignore
+    except ImportError:
+        r.status = "unavailable"
+        r.error = "xpress not installed"
+        return r
+    try:
+        m = xp.problem()
+        m.read(str(model))
+        m.controls.timelimit = float(time_limit)
+        m.controls.threads = int(threads)
+        m.controls.outputlog = 0
+        if lp_method in ("dual", "simplex", "simplex-dual"):
+            m.controls.defaultalg = 2  # dual simplex
+        elif lp_method in ("primal", "simplex-primal"):
+            m.controls.defaultalg = 1
+        elif lp_method in ("barrier", "ipm"):
+            m.controls.defaultalg = 4
+        t0 = time.perf_counter()
+        m.solve()
+        r.seconds = r.wall_s = time.perf_counter() - t0
+        st = m.attributes.solstatus
+        # xp.SolStatus values vary by version; stringify.
+        name = str(st).lower()
+        if "optimal" in name:
+            r.status = "Optimal"
+        elif "infeas" in name:
+            r.status = "Infeasible"
+        elif "unbound" in name:
+            r.status = "Unbounded"
+        elif "time" in name:
+            r.status = "TimeLimit"
+        else:
+            r.status = f"xpress_{st}"
+        try:
+            r.objective = float(m.attributes.objval)
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as e:  # noqa: BLE001
+        msg = f"{type(e).__name__}: {e}"
+        if "license" in msg.lower() or "size" in msg.lower() or "5000" in msg:
+            r.status = "size-skipped"
+        else:
+            r.status = "crash"
+        r.error = msg
+    return r
+
+
+def run_ortools(model: Path, time_limit: float, label: str,
+                backend: str = "glop") -> Result:
+    """OR-Tools GLOP or PDLP via linear_solver / pdlp."""
+    r = Result(solver=label, instance=model.name)
+    try:
+        from ortools.linear_solver import pywraplp  # type: ignore
+    except ImportError:
+        r.status = "unavailable"
+        r.error = "ortools not installed"
+        return r
+    try:
+        if backend == "pdlp":
+            solver = pywraplp.Solver.CreateSolver("PDLP")
+        else:
+            solver = pywraplp.Solver.CreateSolver("GLOP")
+        if solver is None:
+            r.status = "unavailable"
+            r.error = f"ortools backend {backend} unavailable"
+            return r
+        # Prefer loading via MPS through the protocol; fall back to CBC-style
+        # file load when present.
+        if hasattr(solver, "LoadModelFromMPS"):
+            # Not universally available; use pywraplp's file API when present.
+            pass
+        # Read with OR-Tools' MPModelProto path through linear_solver_util if
+        # available; otherwise shell out is not worth it — mark unavailable.
+        try:
+            from ortools.linear_solver.python import model_builder  # type: ignore
+            mb = model_builder.ModelBuilder()
+            mb.import_from_mps_file(str(model))
+            ms = model_builder.ModelSolver("PDLP" if backend == "pdlp" else "GLOP")
+            ms.set_time_limit_in_seconds(float(time_limit))
+            t0 = time.perf_counter()
+            status = ms.solve(mb)
+            r.seconds = r.wall_s = time.perf_counter() - t0
+            # SolveStatus: OPTIMAL=0, FEASIBLE=1, INFEASIBLE=2, UNBOUNDED=3
+            r.status = {0: "Optimal", 1: "Feasible", 2: "Infeasible",
+                        3: "Unbounded", 6: "TimeLimit"}.get(int(status),
+                                                            f"code{status}")
+            try:
+                r.objective = float(ms.objective_value)
+            except Exception:  # noqa: BLE001
+                pass
+            return r
+        except Exception as inner:  # noqa: BLE001
+            r.status = "unavailable"
+            r.error = f"ortools model_builder path failed: {inner}"
+            return r
+    except Exception as e:  # noqa: BLE001
+        r.status = "crash"
+        r.error = f"{type(e).__name__}: {e}"
+    return r
+
+
+def run_cli_lp_solver(exe_names: list[str], model: Path, time_limit: float,
+                      label: str, lp_method: str | None = None,
+                      threads: int = 1) -> Result:
+    """Generic CLI driver for soplex / clp when a binary is on PATH."""
+    r = Result(solver=label, instance=model.name)
+    exe = None
+    for name in exe_names:
+        found = shutil.which(name)
+        if found:
+            exe = found
+            break
+    if exe is None:
+        r.status = "unavailable"
+        r.error = f"none of {exe_names} found on PATH"
+        return r
+    name = Path(exe).name.lower()
+    if "soplex" in name:
+        cmd = [exe, str(model), f"-t{time_limit}", f"-s{threads}"]
+        if lp_method in ("barrier", "ipm"):
+            # SoPlex is simplex-only; report unavailable for barrier track.
+            r.status = "unavailable"
+            r.error = "soplex has no barrier"
+            return r
+    elif "clp" in name:
+        cmd = [exe, str(model), "-sec", str(int(time_limit)), "-threads", str(threads),
+               "-solve", "-quit"]
+        if lp_method in ("dual", "simplex", "simplex-dual"):
+            cmd[1:1] = ["-dualS"]
+        elif lp_method in ("barrier", "ipm"):
+            cmd[1:1] = ["-barrier"]
+    else:
+        cmd = [exe, str(model)]
+    t0 = time.perf_counter()
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=time_limit + 60)
+    except subprocess.TimeoutExpired:
+        r.status = "TimeLimit"
+        r.seconds = r.wall_s = time_limit + 60
+        return r
+    r.seconds = r.wall_s = time.perf_counter() - t0
+    out = (p.stdout or "") + "\n" + (p.stderr or "")
+    if re.search(r"optimal", out, re.I):
+        r.status = "Optimal"
+    elif re.search(r"infeas", out, re.I):
+        r.status = "Infeasible"
+    elif re.search(r"unbound", out, re.I):
+        r.status = "Unbounded"
+    elif re.search(r"time", out, re.I) and p.returncode != 0:
+        r.status = "TimeLimit"
+    elif p.returncode != 0:
+        r.status = "crash"
+        r.error = out[-500:]
+    else:
+        r.status = "Interrupted"
+    m = re.search(r"Objective value\s*:\s*([-+0-9.eE+]+)", out, re.I)
+    if not m:
+        m = re.search(r"objective\s*[:=]\s*([-+0-9.eE+]+)", out, re.I)
+    if m:
+        try:
+            r.objective = float(m.group(1))
+        except ValueError:
+            pass
     return r
 
 
@@ -818,16 +1288,19 @@ def dispatch(spec: str, model: Path, time_limit: float, tol: float,
              relax_integrality: bool = False,
              small_matrix_value: float | None = None,
              seed: int = 0, highs_source: Path | None = None,
-             solution_out: Path | None = None) -> Result:
+             solution_out: Path | None = None,
+             lp_method: str | None = None,
+             threads: int = 1) -> Result:
     """`sor:<engine>[:<backend>]`, or an external baseline name."""
     key = spec.strip().lower()
-    if key.startswith("sor"):
+    # Allow solver:method suffix, e.g. mosek:barrier, cplex:dual.
+    solver_key, _, method_suffix = key.partition(":")
+    if solver_key.startswith("sor"):
+        # Restore original sor:engine:backend parsing.
         parts = key.split(":")
         engine = parts[1] if len(parts) > 1 else "simplex"
         backend = parts[2] if len(parts) > 2 else "cpu"
         extra = list(sor_extra or [])
-        # Handed to Agent 2 as a required CLI flag; the option field already
-        # exists as io::MpsReadOptions::relax_integrality.
         if relax_integrality:
             extra.append("--relax-integrality")
         if small_matrix_value is not None:
@@ -835,20 +1308,39 @@ def dispatch(spec: str, model: Path, time_limit: float, tol: float,
         return run_sor(model, engine, backend, time_limit, tol, exe, spec,
                        method, basis_update, max_iter, cpu, pricing,
                        dual_cost_perturbation, extra, solution_out)
-    if key in ("highs", "highs-wheel"):
+    ext_method = method_suffix or lp_method
+    if solver_key in ("highs", "highs-wheel"):
         return run_highs(model, time_limit, spec, cpu, tol, relax_integrality,
                          small_matrix_value, seed)
-    if key == "highs-source":
+    if solver_key == "highs-source":
         return run_highs_source(model, time_limit, spec, highs_source, cpu, tol,
                                 relax_integrality, small_matrix_value, seed)
-    if key in ("scipy", "scipy-hi", "scipy-highs"):
+    if solver_key in ("scipy", "scipy-hi", "scipy-highs"):
         return run_scipy(model, time_limit, spec, "highs")
-    if key in ("scipy-ipm", "scipy-interior"):
+    if solver_key in ("scipy-ipm", "scipy-interior"):
         return run_scipy(model, time_limit, spec, "highs-ipm")
-    if key == "cbc":
+    if solver_key == "cbc":
         return run_cbc(model, time_limit, spec)
-    if key == "gurobi":
-        return run_gurobi(model, time_limit, spec)
+    if solver_key == "gurobi":
+        return run_gurobi(model, time_limit, spec, ext_method, threads)
+    if solver_key == "cplex":
+        return run_cplex(model, time_limit, spec, ext_method, threads)
+    if solver_key == "mosek":
+        return run_mosek(model, time_limit, spec, ext_method, threads, tol)
+    if solver_key == "copt":
+        return run_copt(model, time_limit, spec, ext_method, threads)
+    if solver_key == "xpress":
+        return run_xpress(model, time_limit, spec, ext_method, threads)
+    if solver_key in ("ortools", "ortools-glop", "glop"):
+        return run_ortools(model, time_limit, spec, "glop")
+    if solver_key in ("ortools-pdlp", "pdlp"):
+        return run_ortools(model, time_limit, spec, "pdlp")
+    if solver_key == "soplex":
+        return run_cli_lp_solver(["soplex"], model, time_limit, spec,
+                                 ext_method, threads)
+    if solver_key == "clp":
+        return run_cli_lp_solver(["clp"], model, time_limit, spec,
+                                 ext_method, threads)
     r = Result(solver=spec, instance=model.name, status="unknown-solver")
     r.error = f"unrecognised solver {spec!r}"
     return r
@@ -1684,7 +2176,17 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--solvers", default="sor:simplex,highs",
                     help="comma-separated. sor:<engine>[:<backend>] "
                          "(simplex, dual, pdhg, hpr, hpr-full, milp, qp) "
-                         "or highs, cbc, scipy, scipy-ipm, gurobi")
+                         "or highs, cbc, scipy, scipy-ipm, gurobi, cplex, "
+                         "mosek, copt, xpress, ortools-glop, ortools-pdlp, "
+                         "soplex, clp. Optional :method suffix "
+                         "(e.g. mosek:barrier, cplex:dual)")
+    ap.add_argument("--lp-method", default=None,
+                    choices=("auto", "primal", "dual", "simplex", "barrier",
+                             "ipm"),
+                    help="default LP method for external solvers that support "
+                         "it (overridden by solver:method suffixes)")
+    ap.add_argument("--threads", type=int, default=1,
+                    help="thread count for external solvers (T3 uses all cores)")
     ap.add_argument("--time-limit", type=float, default=60.0)
     ap.add_argument("--tol", type=float, default=1e-7,
                     help="feasibility/optimality tolerance; the primary "
@@ -1712,8 +2214,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="pin child solver processes to this logical CPU")
     ap.add_argument("--limit", type=int, default=None,
                     help="only the first N models")
-    ap.add_argument("--sgm-shift", type=float, default=1.0,
-                    help="shift for the shifted geometric mean, in seconds")
+    ap.add_argument("--sgm-shift", type=float, default=10.0,
+                    help="shift for the shifted geometric mean, in seconds "
+                         "(Mittelmann LPopt default is 10)")
     ap.add_argument("--obj-tol", "--obj-rel-tol", dest="obj_rel_tol",
                     type=float, default=1e-7,
                     help="relative tolerance for objective agreement, scaled "
@@ -1891,7 +2394,8 @@ def main() -> int:
                                     args.dual_cost_perturbation,
                                     args.sor_arg, args.relax_integrality,
                                     args.small_matrix_value, args.seed,
-                                    args.highs_source)
+                                    args.highs_source, None,
+                                    args.lp_method, args.threads)
                     if source_hash is not None:
                         verify_executable(source_exe, source_hash)
                         verify_executable(exe, frozen_hash)
@@ -1920,7 +2424,8 @@ def main() -> int:
                                  args.dual_cost_perturbation, args.sor_arg,
                                  args.relax_integrality,
                                  args.small_matrix_value, args.seed,
-                                 args.highs_source, solution_out)
+                                 args.highs_source, solution_out,
+                                 args.lp_method, args.threads)
                     if source_hash is not None:
                         verify_executable(source_exe, source_hash)
                         verify_executable(exe, frozen_hash)

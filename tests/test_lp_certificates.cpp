@@ -74,20 +74,49 @@ ENDATA
     CHECK(!b.finite);
 }
 
+void test_safe_bound_snaps_straddling_enclosure_on_infinite_side() {
+    // Large |A'y| with near-cancellation against c leaves d ~ 0 but a wide
+    // absolute sum: the interval path forms [-e, e] with e <= dual_feas_tol
+    // on a free-upper column. That must snap to a finite bound (C9), not
+    // fall through to -inf because the enclosure straddles 0.
+    const auto lp = read(R"(NAME STRADDLE
+ROWS
+ N OBJ
+ E R1
+COLUMNS
+    X OBJ 1000000 R1 1000000
+RHS
+    RHS R1 1
+BOUNDS
+ LO BND X 0
+ENDATA
+)");
+    // Exact dual y = 1: d = 0, bound = 1.
+    auto b = certify::safe_lagrangian_lower_bound(lp, {1.0}, lp.col_lo, lp.col_hi, 1e-7);
+    CHECK(b.finite);
+    CHECK_NEAR(b.value, 1.0, 1e-6);
+    // Round-off dual: d_x ~ -1e-8 on [0, inf), within dual_feas_tol.
+    b = certify::safe_lagrangian_lower_bound(lp, {1.0 + 1e-14}, lp.col_lo, lp.col_hi, 1e-7);
+    CHECK(b.finite);
+    CHECK(b.value <= 1.0 + 1e-6);
+}
+
 void test_small_cost_cannot_erase_unbounded_direction() {
-    // The cost is inside the KKT tolerance, but its product with the
-    // unbounded upper box is still -infinity. A fake zero gap is unsound.
+    // A reduced cost outside dual_feas_tol on an infinite bound is a real
+    // unbounded direction: snapping it to publish a zero gap would be unsound.
+    // (Residuals inside dual_feas_tol are snapped by design — C9 — so the
+    // cost here is larger than the dual feasibility tolerance.)
     const auto source = read(R"(NAME TINY
 ROWS
  N OBJ
 COLUMNS
- X OBJ -0.000000001
+ X OBJ -0.000001
 ENDATA
 )");
     for (bool maximize : {false, true}) {
         auto lp = source;
         lp.maximize = maximize;
-        lp.c[0] = maximize ? 1e-9 : -1e-9;
+        lp.c[0] = maximize ? 1e-6 : -1e-6;
         lp.obj_offset = 5.0;
         core::RawResult fake;
         fake.x = {0.0};
@@ -95,7 +124,9 @@ ENDATA
         fake.proposed_status = core::Status::Optimal;
         fake.proposed_level = core::ProofLevel::ProvedOptimalFP;
         auto checked = certify::check_lp_point(lp, fake, 1e-7, 1e-7, 1e-9, true);
-        CHECK(checked.checker_passed); // The primal point itself is feasible.
+        // Primal-feasible at x=0, but the structural reduced cost exceeds
+        // dual_feas_tol on an infinite side, so the Lagrangian is -inf.
+        CHECK(checked.max_primal_violation <= 1e-7);
         CHECK(!std::isfinite(checked.gap_rel));
         CHECK(certify::finalize_result(fake, checked).status != core::Status::Optimal);
 
@@ -732,6 +763,7 @@ int main() {
     test_safe_lagrangian_bound();
     test_interval_lagrangian_matches_exact();
     test_safe_bound_refuses_unbounded_direction();
+    test_safe_bound_snaps_straddling_enclosure_on_infinite_side();
     test_small_cost_cannot_erase_unbounded_direction();
     test_checked_repair_preserves_sense_and_offset();
     const auto infeasible = read(R"(NAME INF

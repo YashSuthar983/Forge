@@ -24,6 +24,26 @@ namespace {
 
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 
+void fill_terminal_certificates(PresolveOutcome& outcome,
+                                const model::LpProblem& in) {
+    if (outcome.status == PresolveStatus::Unbounded &&
+        outcome.witness_col >= 0 &&
+        outcome.witness_col < in.n_cols()) {
+        outcome.terminal_primal_ray.direction.assign(sz(in.n_cols()), 0.0);
+        outcome.terminal_primal_ray.exact_direction.assign(sz(in.n_cols()), "0");
+        outcome.terminal_primal_ray.direction[sz(outcome.witness_col)] = 1.0;
+        outcome.terminal_primal_ray.exact_direction[sz(outcome.witness_col)] = "1";
+    }
+    if (outcome.status == PresolveStatus::Infeasible &&
+        outcome.witness_row >= 0 &&
+        outcome.witness_row < in.n_rows()) {
+        outcome.terminal_dual_farkas.multipliers.assign(sz(in.n_rows()), 0.0);
+        outcome.terminal_dual_farkas.exact_multipliers.assign(sz(in.n_rows()), "0");
+        outcome.terminal_dual_farkas.multipliers[sz(outcome.witness_row)] = 1.0;
+        outcome.terminal_dual_farkas.exact_multipliers[sz(outcome.witness_row)] = "1";
+    }
+}
+
 }  // namespace
 
 namespace {
@@ -281,6 +301,7 @@ PresolveMap run_presolve_until_deadline(const model::LpProblem& in,
                 }
             }
             if (live_count < 2) continue;  // singleton rule below owns this case
+            if (in.row_lo[sz(i)] > in.row_hi[sz(i)]) continue;
 
             const bool at_max =
                 std::isfinite(in.row_lo[sz(i)]) && activity.finite_maximum() &&
@@ -755,8 +776,10 @@ post_fixed_point:
             if (it != mutable_rows[sz(i)].end())
                 column_scale = std::max(column_scale, std::fabs(it->second));
         }
-        return std::fabs(pivot) >= 1e-9 * row_scale &&
-               std::fabs(pivot) >= 1e-9 * column_scale;
+        // Andersen / HiGHS-style relative floor: pivots below ~1e-3 of the
+        // row/column max amplify bound transfer and cost updates too much.
+        return std::fabs(pivot) >= 1e-3 * row_scale &&
+               std::fabs(pivot) >= 1e-3 * column_scale;
     };
 
     const auto push_best_candidate = [&](Index row) {
@@ -983,7 +1006,14 @@ post_fixed_point:
             else if (std::isfinite(work_hi[sz(j)])) value = work_hi[sz(j)];
             else value = 0.0;
         } else {
-            continue;
+            status = PresolveStatus::Unbounded;
+            witness_col = j;
+            reason = "empty column " + std::to_string(j) +
+                     " improves the objective toward an infinite bound";
+            out.stats.elapsed_ms =
+                std::chrono::duration<double, std::milli>(
+                    PresolveClock::now() - presolve_t0).count();
+            return out;
         }
         col_live[sz(j)] = 0;
         fixed[sz(j)] = value;
@@ -1223,7 +1253,7 @@ post_fixed_point:
     }
     for (Index i = 0; i < m && status == PresolveStatus::Reduced; ++i) {
         if (!row_live[sz(i)]) continue;
-        const f64 lo = in.row_lo[sz(i)], hi = in.row_hi[sz(i)];
+        const f64 lo = mutable_row_lo[sz(i)], hi = mutable_row_hi[sz(i)];
         if (lo > hi + tol * (1.0 + std::fabs(lo))) {
             status = PresolveStatus::Infeasible;
             witness_row = i;
@@ -1290,6 +1320,7 @@ PresolveOutcome presolve(const model::LpProblem& in,
     PresolveOutcome outcome;
     outcome.map = run_presolve(in, opts, outcome.status, outcome.witness_row,
                                outcome.witness_col, outcome.reason);
+    fill_terminal_certificates(outcome, in);
     return outcome;
 }
 
