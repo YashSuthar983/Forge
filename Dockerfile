@@ -31,8 +31,6 @@ COPY scripts scripts
 COPY bindings bindings
 COPY examples examples
 # Instance files the ctest suite reads (build stage only; not shipped).
-COPY benchmarks/netlib/mps     benchmarks/netlib/mps
-COPY benchmarks/miplib-easy/mps benchmarks/miplib-easy/mps
 COPY benchmarks/miplib2017/benchmark-v2.test benchmarks/miplib2017/benchmark-v2.test
 COPY web/lp_text.py web/lp_text.py
 
