@@ -898,6 +898,14 @@ def _parse_sol(text: str) -> dict[str, Any]:
     return {"scalars": scalars, "vectors": vectors}
 
 
+@app.get("/api/solution/raw")
+async def solution_raw(sol_token: str) -> FileResponse:
+    sol_file = _session_dir(sol_token) / "out.sol"
+    if not sol_file.is_file():
+        raise HTTPException(404, "Solution file missing")
+    return FileResponse(sol_file, media_type="text/plain", filename="solution.sol")
+
+
 @app.get("/api/solution")
 async def solution(sol_token: str) -> dict[str, Any]:
     session = _session_dir(sol_token)
