@@ -1,0 +1,73 @@
+# Manual deploy of the web console to Cloud Run (forge.pointblank.club).
+#
+# Run: Actions -> "Deploy to Cloud Run" -> Run workflow -> pick a branch.
+# Rollback: open an earlier successful run and press "Re-run all jobs". A re-run
+# deploys the exact commit of that run, and its image is reused, so no rebuild.
+#
+# The new revision gets no traffic until it passes a smoke test, so a broken
+# build never reaches users. GCP auth is keyless (Workload Identity Federation,
+# limited to this repo); the setup is in the deployment guide, section 13.
+
+name: Deploy to Cloud Run
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-cloud-run
+  cancel-in-progress: false
+
+env:
+  REGION: asia-southeast1
+  SERVICE: forge
+  IMAGE_REPO: asia-south1-docker.pkg.dev/forge-511313/forge/forge
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/354550325069/locations/global/workloadIdentityPools/github/providers/forge-repo
+          service_account: github-deployer@forge-511313.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build and push image (skipped if this commit was built before)
+        run: |
+          IMG="$IMAGE_REPO:${GITHUB_SHA::12}"
+          echo "IMG=$IMG" >> "$GITHUB_ENV"
+          if gcloud artifacts docker images describe "$IMG" >/dev/null 2>&1; then
+            echo "Image $IMG already exists, reusing it."
+          else
+            gcloud auth configure-docker "${IMAGE_REPO%%/*}" --quiet
+            docker build -t "$IMG" .
+            docker push "$IMG"
+          fi
+
+      - name: Deploy new revision with no traffic
+        # Only the image changes; CPU, memory, env vars etc. carry over from the service.
+        run: gcloud run deploy "$SERVICE" --image "$IMG" --region "$REGION" --no-traffic --tag candidate --quiet
+
+      - name: Smoke test the new revision
+        run: |
+          URL=$(gcloud run services describe "$SERVICE" --region "$REGION" --format=json \
+            | jq -r '.status.traffic[] | select(.tag=="candidate") | .url')
+          echo "Testing $URL"
+          curl -fsS "$URL/api/health" | jq -e '.bins.sor_solve and .bins.sor_check' >/dev/null
+          curl -fsS -X POST "$URL/api/solve" -F model=examples/crude_blending/blend_s42.mps -F time_limit=30 \
+            | jq -e '.status == "Optimal" and (.objective - 1708676.1279 | fabs) < 0.01'
+
+      - name: Send all traffic to the new revision
+        run: gcloud run services update-traffic "$SERVICE" --region "$REGION" --to-latest --quiet
+
+      - name: Summary
+        run: |
+          echo "Deployed \`$IMG\` (commit $GITHUB_SHA) to https://forge.pointblank.club" >> "$GITHUB_STEP_SUMMARY"
