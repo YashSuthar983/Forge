@@ -72,7 +72,8 @@ enum class ProofLevel {
     ProvedOptimalCertified   // VIPR proof log accepted by forge_verify
 };
 
-// Public LP strategy. `Auto` races concurrent dual/primal/barrier arms (Tier 4).
+// Public LP strategy. `Auto` routes by model shape and races engines only for
+// large models (LpOptions::concurrent_*); every other value is that engine.
 enum class LpStrategy : std::uint8_t {
     Auto = 0,
     Simplex,
@@ -140,10 +141,23 @@ enum class LpTolerancePreset : std::uint8_t {
 };
 
 struct LpOptions {
-    // Auto route runs at least three arms; set to 1 to force serial Auto.
-    int concurrent_solves = 3;
-    // Gurobi Method=4 analogue: fixed arm order, equal budgets, lowest-index
-    // proved winner (no first-to-finish cancel race).
+    // Most engines Auto may race on one model (1 = never race, the default).
+    // Arms, in order: the routed simplex (dual first, primal fallback), the
+    // barrier, the primal simplex; each is the full pipeline (presolve,
+    // postsolve, independent check) on one core. Explicit strategies never
+    // race. Off by default, measured on the MIPLIB-23 relaxations (100 s,
+    // three arms on three cores against the routed engine alone on one):
+    // the race solved neos-3402294-bobin (primal arm, 41 s; alone: no
+    // result) but lost three the routed engine solves -- the arms' memory
+    // adds up (neos-4722843-widden killed at 10.8 GB; alone 2.6 s) and they
+    // slow each other (neos-4763324-toguru alone 75 s, raced past 100 s;
+    // neos-631710 alone 48 s, raced only Feasible).
+    int concurrent_solves = 1;
+    // Auto races only models with at least this many nonzeros. Below it one
+    // engine on one core wins: on Netlib the three-arm race was 1.24x the
+    // plain dual simplex's wall time on three cores, never faster.
+    std::uint64_t concurrent_min_nonzeros = 200000;
+    // Same answer every run: Auto never races, it runs the routed engine.
     bool concurrent_deterministic = false;
     LpStrategy strategy = LpStrategy::Auto;
     std::uint64_t max_iterations = 0;  // 0 = engine default
@@ -236,11 +250,14 @@ struct LpDiagnostics {
     f64 max_dual_violation = kPosInf;
     f64 gap_rel = kPosInf;
     std::string termination_reason;
-    // Concurrent race (Tier 4); populated when solve_lp uses multiple arms.
+    // Concurrent race; populated when Auto raced. `iterations` and the
+    // stage counts are the winner's; this is every arm's work, the losers'
+    // partial runs included.
     int concurrent_arm_count = 0;
     int concurrent_winner_arm = -1;
     std::string concurrent_winner_kind;
     bool concurrent_deterministic = false;
+    std::uint64_t concurrent_all_arm_iterations = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -259,6 +276,14 @@ struct ProofEvidence {
     f64 max_primal_violation = kPosInf;
     f64 max_dual_violation   = kPosInf;
     f64 gap_rel              = kPosInf;
+    // Row violations in the units of x: max_i viol_i / (||a_i||_inf *
+    // (1 + max_{j in row i} |x_j|)), the point's relative distance from each
+    // row's feasible side. max_primal_violation is absolute, so a row with
+    // tiny coefficients (1e-9 x >= 5e-9) passes it with x five units away;
+    // the objective error follows the distance, not the absolute residual.
+    // ProvedOptimalFP needs it within primal_feas_tol; +inf until measured
+    // by the independent check.
+    f64 max_primal_distance  = kPosInf;
 
     f64 primal_feas_tol = 1e-7;
     f64 dual_feas_tol   = 1e-7;
@@ -281,6 +306,12 @@ struct ProofEvidence {
     f64 primal_ray_objective = kNaN;
     f64 dual_farkas_violation = kPosInf;
     f64 dual_farkas_contradiction = 0.0;
+    // The multipliers the independent check certified: normalised, with
+    // entries facing infinite row sides dropped and residuals on unbounded
+    // columns repaired (check_dual_farkas_ray). That repaired vector, not the
+    // producer's, is what the residual and contradiction above describe, so
+    // finalize_result publishes it; without it no dual ray is certified.
+    std::vector<f64> dual_farkas_multipliers;
 
     // The model's own data has a column or row with lower bound above upper
     // bound: infeasible with no certificate needed, and none exists in row

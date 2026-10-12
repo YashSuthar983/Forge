@@ -190,8 +190,6 @@ public:
         checkpoint_Ax_.assign(nr_, 0.0);
         avg_count_ = 0;
         epoch_step_ = 0;
-        epoch_max_restart_metric_ = 0.0;
-        epoch_max_gap_rel_ = 0.0;
         last_dx_ = 0.0;
         last_dy_ = 0.0;
         last_operator_lhs_ = 0.0;
@@ -414,11 +412,6 @@ public:
                 Ax_fixed_[i] = 0.5 * (Ax_[i] + Ax_current_[i]);
             }
             last_dy_ = std::sqrt(dy2);
-            const f64 step_fpr = std::sqrt(
-                last_primal_weight_ * last_dx_ * last_dx_ +
-                last_dy_ * last_dy_ / last_primal_weight_);
-            epoch_max_restart_metric_ =
-                std::max(epoch_max_restart_metric_, step_fpr);
             const f64 operator_lhs = 2.0 * std::fabs(interaction);
             const f64 operator_rhs =
                 (p.tau > 0.0 ? dx2 / p.tau : kInf) +
@@ -570,9 +563,13 @@ public:
         }
         k.epoch_dx_norm = std::sqrt(epoch_dx2);
         k.epoch_dy_norm = std::sqrt(epoch_dy2);
-        if (k.dual_bound_finite && std::isfinite(k.gap_rel))
-            epoch_max_gap_rel_ = std::max(epoch_max_gap_rel_, k.gap_rel);
-        k.restart_metric = std::max(epoch_max_restart_metric_, epoch_max_gap_rel_);
+        // The restart test compares this value against the one at the start
+        // of the epoch (sufficient / necessary decay), so it must be the
+        // current weighted fixed-point residual ||z - T(z)||_M, as the Vulkan
+        // device reports. A running epoch maximum cannot decay within an
+        // epoch, and the relative gap is not a residual of the same norm.
+        k.restart_metric = std::sqrt(last_primal_weight_ * last_dx_ * last_dx_ +
+                                     last_dy_ * last_dy_ / last_primal_weight_);
         k.operator_lhs = last_operator_lhs_;
         k.operator_rhs = last_operator_rhs_;
         evaluate_ray_candidates(k);
@@ -589,8 +586,6 @@ public:
         Ax_anchor_ = Ax_current_;
         // Every new anchor begins a new Halpern/certificate epoch.
         epoch_step_ = 0;
-        epoch_max_restart_metric_ = 0.0;
-        epoch_max_gap_rel_ = 0.0;
         std::fill(last_x_delta_.begin(), last_x_delta_.end(), 0.0);
         std::fill(last_y_delta_.begin(), last_y_delta_.end(), 0.0);
     }
@@ -877,8 +872,6 @@ private:
     f64 last_primal_weight_ = 1.0;
     f64 last_primal_tol_ = 1e-7;
     f64 last_dual_tol_ = 1e-7;
-    f64 epoch_max_restart_metric_ = 0.0;
-    f64 epoch_max_gap_rel_ = 0.0;
     TransferStats stats_{};
 };
 

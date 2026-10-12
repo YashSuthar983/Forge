@@ -74,7 +74,6 @@ int main() {
 
     core::LpOptions options;
     options.strategy = core::LpStrategy::Auto;
-    options.concurrent_solves = 1;
     options.time_limit_s = 2.0;
     options.primal_feas_tol = 1e-7;
     options.dual_feas_tol = 1e-7;
@@ -153,7 +152,6 @@ int main() {
         const auto staged_problem = multistage_problem();
         core::LpOptions unavailable;
         unavailable.strategy = core::LpStrategy::Auto;
-        unavailable.concurrent_solves = 1;
         unavailable.backend = "cuda";
         unavailable.time_limit_s = 1.0;
         core::LpDiagnostics diagnostics;
@@ -172,7 +170,6 @@ int main() {
         const auto staged_problem = multistage_problem();
         core::LpOptions staged_options;
         staged_options.strategy = core::LpStrategy::Auto;
-        staged_options.concurrent_solves = 1;
         // Leave enough headroom for sanitizer-instrumented sparse-model
         // construction and scaling, which are not interruptible mid-kernel.
         // The stage timers below still prove that both stages are charged to
@@ -215,7 +212,6 @@ int main() {
         const auto staged_problem = multistage_problem();
         core::LpOptions tiny_budget;
         tiny_budget.strategy = core::LpStrategy::Auto;
-        tiny_budget.concurrent_solves = 1;
         tiny_budget.max_iterations = 1;
         tiny_budget.time_limit_s = 1.0;
         tiny_budget.presolve = false;
@@ -244,7 +240,6 @@ int main() {
         bad.col_hi = {1.0, 1.0};
         core::LpOptions hpr_options;
         hpr_options.strategy = core::LpStrategy::Hpr;
-        hpr_options.concurrent_solves = 1;
         hpr_options.time_limit_s = 5.0;
         core::LpDiagnostics diagnostics;
         core::ProofEvidence evidence;
@@ -262,7 +257,6 @@ int main() {
     // default policies. Invalid engine-specific settings cannot disappear.
     {
         core::LpOptions opts;
-        opts.concurrent_solves = 1;
         opts.presolve = false;
         opts.fo_crossover = false;
         opts.max_iterations = 2;

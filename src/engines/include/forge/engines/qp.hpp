@@ -12,6 +12,7 @@
 #include "forge/backend/device_buffer.hpp"
 #include "forge/backend/batched_pdhcg_device.hpp"
 #include "forge/backend/pdhcg_device.hpp"
+#include "forge/core/cancel.hpp"
 #include "forge/core/options.hpp"
 #include "forge/core/result.hpp"
 #include "forge/model/lp.hpp"
@@ -44,6 +45,9 @@ struct QpOptions {
     // was available -- same bug class as PdhgOptions's missing
     // time_limit_s.
     f64 time_limit_s = 0.0;
+    // Concurrent-race stop (see core/cancel.hpp): the barrier IPM polls it
+    // with its time limit. Null on every serial path.
+    const core::CancelToken* cancel = nullptr;
     std::uint64_t check_every = 10;
     int inner_max_iterations = 100;
     // Sparse-Q inner loop: how many inner iterations one host round trip

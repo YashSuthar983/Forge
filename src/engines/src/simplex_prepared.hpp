@@ -1,5 +1,6 @@
 #pragma once
 
+#include "forge/certify/finalize.hpp"
 #include "forge/engines/pdhg.hpp"
 #include "forge/engines/dual_simplex.hpp"
 #include "forge/engines/simplex.hpp"
@@ -206,6 +207,8 @@ struct DualPassWorkspace {
     std::vector<core::Index> vacant_rows;
     std::vector<core::f64> bvals;
     std::vector<core::f64> rhs;
+    // Owned by the dual's BFRT flip shift alone (see apply_flip_shift).
+    std::vector<core::f64> flip_rhs;
     std::vector<core::f64> y;
     std::vector<core::f64> alpha;
     std::vector<core::f64> cB;
@@ -218,6 +221,10 @@ struct DualPassWorkspace {
     std::vector<std::uint32_t> leave_heap_dirty_stamp;
     std::vector<core::Index> chuzr_candidates;
     std::vector<std::uint32_t> chuzr_candidate_stamp;
+    // CHUZR's exact set of primal-infeasible basis slots (packed list and
+    // each slot's place in it, -1 when feasible).
+    std::vector<core::Index> infeasible_rows;
+    std::vector<core::Index> infeasible_pos;
     std::vector<std::uint8_t> devex_reference;
     std::vector<core::f64> tau;
     std::vector<core::Index> tau_support;
@@ -240,6 +247,11 @@ struct DualPassWorkspace {
     std::vector<std::pair<core::f64, core::Index>> chuzr_scored;
     std::vector<std::pair<core::f64, core::Index>> row_slice_winners;
     std::vector<long double> equation_residual;
+    // Persistent-degeneracy trigger (dual_simplex.cpp): columns owed a cost
+    // perturbation when they next leave the basis, and the phase-2 pivot at
+    // which each variable last left it (0 = not yet).
+    std::vector<std::uint8_t> perturb_on_leave;
+    std::vector<std::uint64_t> last_left_pivot;
     std::vector<long double> equation_scale;
     std::vector<core::f64> farkas_ray;
     std::vector<core::f64> x;
@@ -325,8 +337,41 @@ bool continue_certificate_from_basis(const model::LpProblem& problem,
 // the independently recomputed/repaired Lagrangian or report no finite bound.
 void report_simplex_dual_bound(const model::LpProblem& pmin, f64 sense,
                               const std::vector<f64>& y_min,
-                              const std::vector<long double>& aty,
-                              SimplexDiagnostics& diag,
-                              f64 dual_feas_tol = 1e-7);
+                              SimplexDiagnostics& diag);
+// The same report from a reduced-cost enclosure (the interval Lagrangian,
+// no multiplier correction and no row-implied bounds): diag says no finite
+// bound when the enclosure is not finite. Finalizers try this, then
+// strengthen_basis_duals, and call report_simplex_dual_bound only when
+// neither closes, because its correction asks for row-implied bounds and
+// their propagation can cost more than the rest of the finalization.
+void report_enclosure_dual_bound(const certify::RcEnclosure& enclosure, f64 sense,
+                                 SimplexDiagnostics& diag);
+
+// How far reduced cost (or row multiplier) d of a variable at value v in
+// [l, u] is from complementary, the rule every simplex dual residual uses:
+// a variable counts as on a bound within at_tol scaled by that bound.
+inline f64 complementarity_violation(f64 v, f64 l, f64 u, f64 d, f64 at_tol) {
+    const bool at_lo = (l > -model::kInf) && (v <= l + at_tol * (1.0 + std::fabs(l)));
+    const bool at_hi = (u <  model::kInf) && (v >= u - at_tol * (1.0 + std::fabs(u)));
+    if (at_lo && at_hi) return 0.0;                       // fixed: no sign condition
+    if (at_lo) return std::max(0.0, -d);
+    if (at_hi) return std::max(0.0, d);
+    return std::fabs(d);
+}
+
+// The terminal multipliers' Lagrangian bound must be finite and close the
+// gap for the result to be ProvedOptimalFP. Rounded basis duals miss that
+// whenever a basic column with a single chargeable side lands an ulp on the
+// wrong one (32 of 90 Netlib proofs). When diag says the bound is infinite or
+// the gap open, replace y_min by certify::inward_basis_duals of `basis` if
+// those prove a better bound with a dual residual no larger than
+// max(dual_feas_tol, diag.dual_residual). True when y_min was replaced; the
+// caller then recomputes everything it derived from y_min.
+bool strengthen_basis_duals(const model::LpProblem& pmin, f64 sense,
+                            const std::vector<Index>& basis,
+                            const std::vector<f64>& x,
+                            const SimplexOptions& opts,
+                            const SimplexDiagnostics& diag,
+                            std::vector<f64>& y_min);
 
 }  // namespace forge::engines

@@ -50,7 +50,6 @@ struct EnvSwitches {
 
     // LU.
     bool lu_comparison_sort = false;              // FORGE_LU_COMPARISON_SORT
-    bool lu_no_simd_solves = false;               // FORGE_NO_SIMD_SOLVES (force scalar)
     std::string lu_update_log;                    // FORGE_LU_UPDATE_LOG=<file>
 
     // Driver, presolve and certificates.

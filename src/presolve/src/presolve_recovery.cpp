@@ -19,14 +19,16 @@ inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 // prices, +1 lower, -1 upper, 0 a zero multiplier (either side); for a
 // bound tightening: the side of the singleton row the lift gave a nonzero
 // multiplier (the row is tight, its column basic), else 0.
-// forcing_col[t] for a forcing row at step t: the forced column whose
-// reduced cost fixes a nonzero multiplier (it is basic in the original
-// vertex and the row nonbasic at its forced side), -1 when the multiplier
-// is zero.
+// forcing_cols[t] for a forcing row at step t: the forced columns the
+// row's nonzero multiplier prices to zero, the one that fixed the multiplier
+// first. One of them is basic in the original vertex and the row nonbasic
+// at its forced side. Empty when the multiplier is zero: the row's logical
+// stays basic, since every forced column then keeps a reduced cost of the
+// sign its bound allows and none may be called basic.
 struct LiftChoices {
     std::vector<signed char> transfer_case;
     std::vector<signed char> row_side;
-    std::vector<Index> forcing_col;
+    std::vector<std::vector<Index>> forcing_cols;
 };
 
 void lift_row_duals(const model::LpProblem& original,
@@ -41,7 +43,7 @@ void lift_row_duals(const model::LpProblem& original,
     auto& transfer_case = choices.transfer_case;
     transfer_case.assign(map.doubleton_equalities.size(), 0);
     choices.row_side.assign(map.recovery_steps.size(), 0);
-    choices.forcing_col.assign(map.recovery_steps.size(), -1);
+    choices.forcing_cols.assign(map.recovery_steps.size(), {});
     const Index rm = map.problem.n_rows();
     y_out.assign(sz(original.n_rows()), 0.0);
     if (static_cast<Index>(y_reduced.size()) == rm &&
@@ -378,7 +380,23 @@ void lift_row_duals(const model::LpProblem& original,
             }
             if (pricing_col < 0 && target != 0.0) continue;
             add_row_multiplier(step.row, target - ycanon[sz(step.row)]);
-            if (target != 0.0) choices.forcing_col[t] = pricing_col;
+            if (target != 0.0) {
+                // Columns tied with pricing_col are priced to zero as well;
+                // the basis lift may need one when pricing_col's own slot is
+                // taken. Measured after the multiplier, against the same
+                // stage costs that fixed it.
+                auto& tied = choices.forcing_cols[t];
+                tied.push_back(pricing_col);
+                for (std::size_t q = 0; q < step.columns.size(); ++q) {
+                    const Index j = step.columns[q];
+                    if (j == pricing_col || column_basic(j)) continue;
+                    const f64 c = zero_objective ? 0.0
+                        : sense_ * (step.column_costs.size() == step.columns.size()
+                            ? step.column_costs[q] : original.c[sz(j)]);
+                    if (std::fabs(c - aty[sz(j)]) <= opts.dual_feas_tol)
+                        tied.push_back(j);
+                }
+            }
             continue;
         }
 
@@ -568,12 +586,14 @@ PostsolveBasis lift_basis(const model::LpProblem& original,
                                 : PostsolveNonbasicStatus::AtUpper;
                 return true;
             };
-            Index j = t < choices.forcing_col.size() ? choices.forcing_col[t] : -1;
-            if (!assign_forcing(j) &&
-                step.columns.size() == step.coefficients.size()) {
-                for (std::size_t q = 0; q < step.columns.size(); ++q)
-                    if (assign_forcing(step.columns[q])) break;
-            }
+            // Only a column the lifted multiplier prices to zero may take the
+            // row's slot. Any other forced column has a nonzero reduced cost,
+            // so calling it basic names a vertex the lifted duals do not
+            // price (4ca20b05 fell back to the first free column, which made
+            // a column with d = 2 basic beside a zero row multiplier).
+            if (t < choices.forcing_cols.size())
+                for (const Index j : choices.forcing_cols[t])
+                    if (assign_forcing(j)) break;
             continue;
         }
         if (step.kind == DualRecoveryKind::RowSideFixed) {

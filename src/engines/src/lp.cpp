@@ -8,7 +8,6 @@
 #include "forge/engines/hpr.hpp"
 #include "forge/engines/pdhg.hpp"
 #include "forge/engines/qp.hpp"
-#include "forge/engines/network_detect.hpp"
 #include "forge/engines/simplex.hpp"
 #include "forge/presolve/presolve.hpp"
 #include "simplex_prepared.hpp"
@@ -323,6 +322,7 @@ std::pair<core::RawResult, core::ProofEvidence> close_lifted_certificate(
     };
     SimplexDiagnostics diag;
     diag.primal_residual = ev.max_primal_violation;
+    diag.primal_distance = ev.max_primal_distance;
     diag.dual_residual = ev.max_dual_violation;
     diag.dual_bound_finite = std::isfinite(raw.dual_bound);
     diag.gap_rel = ev.gap_rel;
@@ -389,7 +389,8 @@ void install_budget_split(core::LpAutoBudgetSplit split,
 // independent LP checker and crossover decide what the point proves.
 core::RawResult solve_lp_barrier(const model::LpProblem& problem,
                                  const core::LpOptions& options, double time_limit_s,
-                                 core::ProofEvidence& producer, bool verbose) {
+                                 core::ProofEvidence& producer, bool verbose,
+                                 const core::CancelToken* cancel) {
     QpProblem qp;
     qp.linear = model::minimization_form(problem);
     qp.q_diag.assign(static_cast<std::size_t>(problem.n_cols()), 0.0);   // Q = 0, diagonal form
@@ -403,6 +404,7 @@ core::RawResult solve_lp_barrier(const model::LpProblem& problem,
     ipm.assume_psd = true;   // Q = 0
     ipm.gondzio_correctors = 4;  // LP-tuned: more centrality corrections
     ipm.verbose = verbose;
+    ipm.cancel = cancel;
     QpDiagnostics diag;
     core::RawResult raw = solve_qp_ipm(qp, ipm, diag);
     raw.engine = "barrier";
@@ -534,13 +536,12 @@ core::RawResult solve_lp(const model::LpProblem& problem,
     }
     if (options.concurrent_solves < 1 || options.concurrent_solves > 16)
         throw std::invalid_argument("LP concurrent_solves must be in [1,16]");
-    if (options.concurrent_solves > 1) {
-        LpOptions race = options;
-        if (options.strategy == LpStrategy::Auto)
-            race.concurrent_solves = std::max(3, options.concurrent_solves);
-        return solve_lp_concurrent(problem, race, diagnostics, evidence,
-                                   simplex_policy);
-    }
+    // Only Auto races, and only where it can pay; an explicit strategy is
+    // that engine (the race used to replace every strategy, and the tests
+    // set concurrent_solves = 1 to get the engine they named).
+    if (lp_concurrent_arm_count(problem, options, simplex_policy) >= 2)
+        return solve_lp_concurrent(problem, options, diagnostics, evidence,
+                                   simplex_policy, hpr_policy, pdhg_policy);
     const auto start = Clock::now();
     diagnostics = LpDiagnostics{};
     diagnostics.requested_strategy = options.strategy;
@@ -553,9 +554,14 @@ core::RawResult solve_lp(const model::LpProblem& problem,
     diagnostics.holdout_manifest_hash =
         "unavailable-pending-frozen-holdout-manifest";
     diagnostics.auto_promoted = false;
-    diagnostics.fo_target_tolerance = std::min(
-        1e-4,
-        std::max(options.primal_feas_tol, 1000.0 * options.primal_feas_tol));
+    // Auto's first-order phase aims three decades looser than the requested
+    // primal tolerance, capped at 1e-4 (the default, at tol 1e-7). Compare
+    // the tolerance itself rather than min(1e-4, 1e3 * tol): 1e3 * 1e-7
+    // rounds to 9.999999999999999e-05, one ulp under the cap, so the
+    // default tolerance never produced the default target.
+    diagnostics.fo_target_tolerance = options.primal_feas_tol >= 1e-7
+        ? 1e-4
+        : 1e3 * options.primal_feas_tol;
 
     LpStrategy route = options.strategy;
     if (route == LpStrategy::Auto)
@@ -627,18 +633,10 @@ core::RawResult solve_lp(const model::LpProblem& problem,
         simplex_options.gap_tol = options.gap_tol;
         simplex_options.presolve = options.presolve;
         simplex_options.presolve_implied_slack = options.presolve_implied_slack;
-        // Structure auto-select (Tier 6): wide LPs sift; pure network incidence
-        // arms the detect stub. Explicit CLI flags still win when already on.
-        const auto nc = static_cast<std::uint64_t>(
-            std::max<core::Index>(0, work_problem.n_cols()));
-        const auto nr = static_cast<std::uint64_t>(
-            std::max<core::Index>(1, work_problem.n_rows()));
-        simplex_options.enable_sifting =
-            options.enable_sifting || (options.strategy == LpStrategy::Auto && nc > 5u * nr);
-        simplex_options.enable_network_simplex =
-            options.enable_network_simplex ||
-            (options.strategy == LpStrategy::Auto &&
-             detect_network_structure(work_problem));
+        // Explicit opt-ins only (see solve_lp_concurrent): the sifting pass
+        // and the network route are not yet algorithms worth arming by shape.
+        simplex_options.enable_sifting = options.enable_sifting;
+        simplex_options.enable_network_simplex = options.enable_network_simplex;
         SimplexDiagnostics simplex_diag;
         const auto simplex_start = Clock::now();
         core::RawResult raw = solve_simplex(problem, simplex_options, simplex_diag);
@@ -677,7 +675,8 @@ core::RawResult solve_lp(const model::LpProblem& problem,
         const auto fo_start = Clock::now();
         if (barrier) {
             raw = solve_lp_barrier(work_problem, options, stage_time, producer_ev,
-                                   simplex_policy && simplex_policy->verbose);
+                                   simplex_policy && simplex_policy->verbose,
+                                   simplex_policy ? simplex_policy->cancel : nullptr);
         } else {
             auto backend = backend::make_backend(options.backend);
             if (!backend) return unsupported(

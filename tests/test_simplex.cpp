@@ -140,7 +140,6 @@ void test_empty_domain_is_infeasible() {
                                 forge::core::LpStrategy::Barrier}) {
         forge::core::LpOptions o;
         o.strategy = strategy;
-        o.concurrent_solves = 1;
         forge::core::LpDiagnostics d;
         forge::core::ProofEvidence ev;
         auto raw = forge::engines::solve_lp(lp, o, d, &ev);
@@ -217,7 +216,6 @@ void test_maximization_offset_is_reported_in_model_sense() {
                                 forge::core::LpStrategy::Barrier}) {
         forge::core::LpOptions o;
         o.strategy = strategy;
-        o.concurrent_solves = 1;
         forge::core::LpDiagnostics d;
         forge::core::ProofEvidence ev;
         auto raw = forge::engines::solve_lp(lp, o, d, &ev);
@@ -1083,6 +1081,37 @@ void test_auto_candidate_order_uses_feasibility_before_gap() {
     later_diag.dual_bound_finite = false;
     CHECK(forge::engines::detail::prefer_simplex_candidate(
         later, later_diag, early, early_diag, opts, false));
+
+    // An Infeasible claim whose ray is not certified must not outrank a
+    // primal-feasible rescue point: that point contradicts the claim.
+    forge::core::RawResult claim, rescue, stalled;
+    SimplexDiagnostics claim_diag, rescue_diag, stalled_diag;
+    claim.proposed_status = Status::Infeasible;
+    claim.ray = {1.0};
+    claim_diag.primal_residual = 0.5;
+    claim_diag.ray_violation = 1.0;           // not certified
+    rescue.proposed_status = Status::Interrupted;
+    rescue_diag.primal_residual = 0.0;
+    rescue_diag.dual_residual = 1.0;
+    CHECK(forge::engines::detail::prefer_simplex_candidate(
+        rescue, rescue_diag, claim, claim_diag, opts, false));
+    CHECK(!forge::engines::detail::prefer_simplex_candidate(
+        claim, claim_diag, rescue, rescue_diag, opts, false));
+    // ...but it still beats an iterate that is no more feasible than it.
+    stalled.proposed_status = Status::NumericalFailure;
+    stalled_diag.primal_residual = 2.0;
+    stalled_diag.dual_residual = 1.0;
+    CHECK(forge::engines::detail::prefer_simplex_candidate(
+        claim, claim_diag, stalled, stalled_diag, opts, false));
+    // An Unbounded claim carries its feasible point and beats an Interrupted
+    // feasible point.
+    forge::core::RawResult unbounded;
+    SimplexDiagnostics unbounded_diag;
+    unbounded.proposed_status = Status::Unbounded;
+    unbounded_diag.primal_residual = 0.0;
+    unbounded_diag.dual_residual = 1.0;
+    CHECK(forge::engines::detail::prefer_simplex_candidate(
+        unbounded, unbounded_diag, rescue, rescue_diag, opts, false));
 }
 
 // The presolved candidate and its unpresolved retry must be accepted by the

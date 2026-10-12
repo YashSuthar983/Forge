@@ -151,6 +151,17 @@ struct SimplexOptions {
     // presolve route clears it for the reduced solve: only the lifted
     // original-model proof counts, and it is certified after postsolve.
     bool certify_terminal = true;
+    // The terminal multipliers' Lagrangian bound is the one this solve
+    // publishes. When their reduced-cost enclosure does not close the gap,
+    // a terminal Optimal is then given the basis's inward duals if those
+    // prove a better bound (strengthen_basis_duals: binary64, one
+    // factorization and a few solves, never exact arithmetic), and failing
+    // that the full corrected Lagrangian (which may propagate row-implied
+    // bounds) is evaluated. Off, the enclosure's bound is reported as it is.
+    // The presolve route clears it for the reduced solve: postsolve rebuilds
+    // the multipliers and rematerialize_original does this work once, on the
+    // original model.
+    bool terminal_bound_published = true;
     // Close the result with an exactly evaluated dual bound within gap_tol
     // (dyadic refinement, targeted/exact basis certificates, support
     // selection, exact-pricing continuation). Without it a solve stops at
@@ -236,8 +247,11 @@ struct SimplexOptions {
     // 2026-09-25, 120 s MIPLIB root LPs: with it mzzv42z needed 43,746
     // iterations (39.7 s), with the stalling branch alone 8,455 (2.4 s);
     // supportcase7 finished only without it. The stalling branch is kept
-    // exactly as the thesis specifies.
-    bool dual_perturbation_at_start = true;
+    // exactly as the thesis specifies. Re-measured 2026-10-11 on Netlib-93
+    // at 1e-7: on, the pivot geomean is 347 vs 337 off, and every model it
+    // moves by more than 15% is worse (pilot.ja 3,719 vs 1,738, perold
+    // 2,333 vs 1,589, cycle 308 vs 143).
+    bool dual_perturbation_at_start = false;
 
     // Refactor after this many basis updates. Product-form etas are as dense
     // as the FTRAN'd entering columns, so the file has to be recycled on the
@@ -572,6 +586,14 @@ struct SimplexDiagnostics {
     std::uint64_t perturbation_cleanups = 0;
     // Times dual phase 2 perturbed nonbasic costs after a degenerate window.
     std::uint64_t stall_perturbations = 0;
+    // Persistent-degeneracy trigger (dual phase 2): times it fired, the
+    // phase-2 pivot at which it did, and the evidence -- the most degenerate
+    // window after the first and that window's revisit fraction (pivots
+    // whose leaving variable had already left within the window).
+    std::uint64_t degeneracy_perturbations = 0;
+    std::uint64_t degeneracy_perturbation_pivot = 0;
+    f64 degeneracy_window_fraction = 0.0;
+    f64 degeneracy_window_revisits = 0.0;
     // Dual working-cost management (Koberstein 2005 §6.2.2.3). cost_shifts
     // counts every shift applied to a nonbasic working cost: the entering
     // column's wrong-sign reduced cost zeroed before a pivot, and the phase-2
@@ -676,6 +698,10 @@ struct SimplexDiagnostics {
     // The reduced basis lifted to a malformed basis of the original and was
     // dropped (the result then carries no basis).
     std::uint64_t lifted_basis_rejections = 0;
+    // Terminal multipliers replaced by certify::inward_basis_duals because
+    // the basis's own rounded duals left the Lagrangian bound infinite or the
+    // gap open, and the replacement proved a better bound.
+    std::uint64_t inward_dual_corrections = 0;
 
     // The dual engine's merit function (total primal infeasibility) at the start
     // of the run and the best value it reached. Diagnostic only: it shows at a
@@ -690,6 +716,10 @@ struct SimplexDiagnostics {
     int  final_phase = 1;
 
     f64 primal_residual  = 0.0;
+    // LpProblem::max_row_distance of the reported point (the row violations
+    // in units of x); +inf until measured. simplex_evidence passes it on, and
+    // ProvedOptimalFP needs it within primal_feas_tol.
+    f64 primal_distance  = core::kPosInf;
     f64 dual_residual    = 0.0;
     f64 primal_objective = 0.0;
     f64 dual_objective   = 0.0;

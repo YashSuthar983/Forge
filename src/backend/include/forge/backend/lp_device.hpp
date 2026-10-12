@@ -34,7 +34,6 @@ struct ScaledLp {
     std::vector<f64> row_lo, row_hi;
     // Unscale: x_orig = col_scale ⊙ x_hat, y_orig = row_scale ⊙ y_hat.
     std::vector<f64> row_scale, col_scale;
-    f64 magnitude_scale = 1.0; // PDLP bound/objective rescale (export factor)
     f64 obj_offset = 0.0;
     f64 sense = 1.0;           // +1 minimize, -1 was-maximize (already flipped)
 

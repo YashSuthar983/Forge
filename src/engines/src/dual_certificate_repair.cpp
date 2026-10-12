@@ -185,6 +185,17 @@ bool repair_simplex_dual(const model::LpProblem& p, core::RawResult& raw,
                 diag.dual_bound_finite = true; diag.gap_rel = gap;
                 return true;
             }
+            // The witness stays in raw.exact_dual, so the result checker
+            // takes the better of its bound and the floating-point one
+            // (check_lp_point). Report that same bound: leaving the weaker
+            // floating-point value in raw.dual_bound made the reported and
+            // checked bounds disagree, and finalize_result turned a KKT
+            // optimum into NumericalFailure (etamacro, --engine auto).
+            if (!diag.dual_bound_finite || !std::isfinite(raw.dual_bound) ||
+                bound.value > raw.dual_bound) {
+                raw.dual_bound = diag.dual_objective = bound.value;
+                diag.dual_bound_finite = true; diag.gap_rel = gap;
+            }
         }
         // Keep the offending exact term for warm pricing. Repeating a cold
         // correction solve here did not improve the strict Netlib witnesses
@@ -518,6 +529,7 @@ bool continue_certificate_from_basis(const model::LpProblem& problem,
     diag = work;
     install_simplex_work_totals(diag, totals);
     diag.primal_residual = checked.max_primal_violation;
+    diag.primal_distance = checked.max_primal_distance;
     diag.dual_residual = checked.max_dual_violation;
     diag.primal_objective = candidate.objective;
     diag.dual_objective = checked.checked_dual_bound;

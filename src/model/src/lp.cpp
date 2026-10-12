@@ -76,6 +76,60 @@ f64 LpProblem::max_row_violation(const std::vector<f64>& x) const {
     return worst;
 }
 
+f64 LpProblem::max_row_distance(const std::vector<f64>& x) const {
+    if (x.size() != c.size()) return kInf;
+    for (f64 value : x) if (!std::isfinite(value)) return kInf;
+    const auto& rp = A.pattern.row_ptr();
+    const auto& ci = A.pattern.col_idx();
+    // As max_row_violation: rows certainly inside their sides by the long
+    // double bound are skipped, the rest are summed exactly.
+    constexpr long double u = std::numeric_limits<long double>::epsilon() / 2.0L;
+    f64 worst = 0.0;
+    for (Index r = 0; r < A.n_rows(); ++r) {
+        const f64 lo = row_lo[static_cast<std::size_t>(r)];
+        const f64 hi = row_hi[static_cast<std::size_t>(r)];
+        const core::Offset beg = rp[static_cast<std::size_t>(r)];
+        const core::Offset end = rp[static_cast<std::size_t>(r) + 1];
+        long double s = 0.0L, mag = 0.0L, row_max = 0.0L, x_max = 0.0L;
+        for (core::Offset k = beg; k < end; ++k) {
+            const f64 a = A.vals[static_cast<std::size_t>(k)];
+            const f64 xj = x[static_cast<std::size_t>(ci[static_cast<std::size_t>(k)])];
+            const long double t = static_cast<long double>(a) * xj;
+            s += t;
+            mag += std::fabs(t);
+            row_max = std::max(row_max, std::fabs(static_cast<long double>(a)));
+            x_max = std::max(x_max, std::fabs(static_cast<long double>(xj)));
+        }
+        const long double kk = static_cast<long double>(end - beg) + 2.0L;
+        const long double err = (kk * u) / (1.0L - kk * u) * mag;
+        if (std::isfinite(mag) && (!std::isfinite(lo) || s - err >= lo) &&
+            (!std::isfinite(hi) || s + err <= hi))
+            continue;
+        DyadicSum act;
+        for (core::Offset k = beg; k < end; ++k)
+            act.add_product(A.vals[static_cast<std::size_t>(k)],
+                            x[static_cast<std::size_t>(ci[static_cast<std::size_t>(k)])]);
+        f64 viol = 0.0;
+        if (std::isfinite(lo) && act.compare(lo) < 0) {
+            DyadicSum gap = act;
+            gap.negate();
+            gap.add(lo);
+            viol = std::max(viol, gap.up());
+        }
+        if (std::isfinite(hi) && act.compare(hi) > 0) {
+            DyadicSum gap = act;
+            gap.add(-hi);
+            viol = std::max(viol, gap.up());
+        }
+        if (viol <= 0.0) continue;
+        if (row_max == 0.0L) return kInf;
+        // The quotient, enlarged by a few ulps so rounding cannot understate it.
+        const long double scale = row_max * (1.0L + x_max);
+        worst = std::max(worst, static_cast<f64>(static_cast<long double>(viol) / scale * (1.0L + 4.0L * u)));
+    }
+    return worst;
+}
+
 f64 LpProblem::max_bound_violation(const std::vector<f64>& x) const {
     if (x.size() != c.size()) return kInf;
     for (f64 value : x) if (!std::isfinite(value)) return kInf;

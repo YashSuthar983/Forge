@@ -91,11 +91,8 @@ OriginalKkt evaluate_original(const model::LpProblem& problem,
 
     const f64 sense = problem.maximize ? -1.0 : 1.0;
     std::vector<f64> x(n), y_min(m), aty(n, 0.0), activity(m, 0.0);
-    const f64 mag = scaled.magnitude_scale;
-    for (std::size_t j = 0; j < n; ++j)
-        x[j] = xs[j] * scaled.col_scale[j] * mag;
-    for (std::size_t i = 0; i < m; ++i)
-        y_min[i] = ys[i] * scaled.row_scale[i] * mag;
+    for (std::size_t j = 0; j < n; ++j) x[j] = xs[j] * scaled.col_scale[j];
+    for (std::size_t i = 0; i < m; ++i) y_min[i] = ys[i] * scaled.row_scale[i];
 
     out.primal_res = std::max(problem.max_row_violation(x),
                               problem.max_bound_violation(x));
@@ -431,7 +428,13 @@ backend::ScaledLp build_scaled_lp(model::LpProblem& p, int ruiz_iterations,
     RuizScaling scaling = ruiz_scale(p, ruiz_iterations);
     if (use_pock_chambolle)
         pock_chambolle_scale(p, scaling, pock_chambolle_alpha);
-    pdlp_magnitude_rescale(p, scaling);
+    // No pdlp_magnitude_rescale here. One factor dividing c and every bound
+    // scales the whole HPR trajectory from the zero anchor by 1/factor: the
+    // step size depends on A, the primal weight and the restart tests on
+    // ratios, so the iterates are the same up to rounding (Netlib, tol 1e-6:
+    // equal iteration counts on 17 of 18 models). Every consumer of the
+    // scaled LP (device KKT, ray checks, polishing faces, batch probes, the
+    // Vulkan kernels) would have to carry the factor, and none did.
     backend::ScaledLp lp;
     lp.A_csr = p.A;
     // TODO(lp): single CSR storage + planned transpose SpMV instead of CSR+CSC.
@@ -443,7 +446,6 @@ backend::ScaledLp build_scaled_lp(model::LpProblem& p, int ruiz_iterations,
     lp.row_hi = p.row_hi;
     lp.row_scale = std::move(scaling.row_scale);
     lp.col_scale = std::move(scaling.col_scale);
-    lp.magnitude_scale = scaling.magnitude_scale;
     lp.obj_offset = p.obj_offset;
     lp.sense = 1.0;
     return lp;
@@ -642,7 +644,7 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
         step.use_halpern = opts.use_halpern && halpern_armed;
         step.use_reflection = opts.use_reflection;
         step.reflection_gamma = opts.reflection_gamma;
-        step.update_average = true;
+        step.update_average = false;
         if (opts.use_adaptive_step && !device.snapshot_step_checkpoint()) {
             device_failure = true;
             diag.termination_reason =
@@ -948,11 +950,11 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
                         weight = std::clamp(weight, opts.weight_min, opts.weight_max);
                     }
 
-                    const bool use_average =
-                        (sufficient || necessary_stall) && !artificial;
-                    device.restart_to(use_average
-                        ? backend::RestartPoint::Average
-                        : backend::RestartPoint::Current);
+                    // Halpern-PR restarts at the current T(z) (the device's
+                    // RestartPoint::Current). The ergodic average is PDHG's
+                    // restart candidate; Halpern's last iterate already has
+                    // the O(1/k) rate, and averaging costs a pass per step.
+                    device.restart_to(backend::RestartPoint::Current);
                     ++diag.restarts;
                     if (sufficient) {
                         ++diag.sufficient_restarts;
@@ -1007,11 +1009,10 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
     const auto m = static_cast<std::size_t>(scaled.n_rows());
     raw.x.resize(n);
     raw.y.resize(m);
-    const f64 mag = scaled.magnitude_scale;
     for (std::size_t j = 0; j < n; ++j)
-        raw.x[j] = solution.x[j] * scaled.col_scale[j] * mag;
+        raw.x[j] = solution.x[j] * scaled.col_scale[j];
     for (std::size_t i = 0; i < m; ++i)
-        raw.y[i] = -sense * solution.y[i] * scaled.row_scale[i] * mag;
+        raw.y[i] = -sense * solution.y[i] * scaled.row_scale[i];
 
     const OriginalKkt final_kkt = evaluate_original(
         problem, scaled, solution.x, solution.y,
@@ -1032,7 +1033,7 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
         std::vector<f64> direction = solution.primal_ray;
         if (direction.size() == n)
             for (std::size_t j = 0; j < n; ++j)
-                direction[j] *= scaled.col_scale[j] * mag;
+                direction[j] *= scaled.col_scale[j];
         diag.primal_ray = validate_primal_ray(problem, std::move(direction),
                                               opts.primal_tol);
         diag.primal_ray_violation = std::max(
@@ -1045,7 +1046,7 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
         std::vector<f64> multipliers = solution.dual_farkas_ray;
         if (multipliers.size() == m)
             for (std::size_t i = 0; i < m; ++i)
-                multipliers[i] *= scaled.row_scale[i] * mag;
+                multipliers[i] *= scaled.row_scale[i];
         diag.dual_farkas_ray = validate_dual_ray(problem, std::move(multipliers),
                                                  opts.primal_tol);
         diag.dual_farkas_violation = diag.dual_farkas_ray.max_sign_residual;
