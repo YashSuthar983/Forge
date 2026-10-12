@@ -108,5 +108,40 @@ int main() {
     sor::core::DualFarkasRay reduced_farkas;
     reduced_farkas.multipliers = {-1,1}; reduced_farkas.exact_multipliers = {"-1","1"};
     CHECK(sor::presolve::recover_dual_farkas_ray(p,map,reduced_farkas,1e-7).certified);
+    // Eliminating z through z + 0.1 x + 0.3 y = 1 (z implied free) rewrites
+    // 3 z + 0.3 x + 0.9 y + w + v >= 4 as w + v >= 1: x and y cancel in
+    // decimal, and in binary leave 0.3 - 3 * 0.1 = -5.6e-17 and 1.1e-16.
+    // That residue is not the model's; kept, a later pass read such a row as
+    // a constraint (scorpion presolved twice became infeasible).
+    {
+        sor::model::LpProblem d;
+        // columns: z x y w v
+        d.A = sor::sparse::from_triplets(2, 5, {0,0,0,1,1,1,1,1},
+                                         {0,1,2,0,1,2,3,4},
+                                         {1,0.1,0.3,3,0.3,0.9,1,1});
+        d.c = {0, 1, 1, 1, 2};
+        d.col_lo = {-10, 0, 0, 0, 0};
+        d.col_hi = {10, 1, 1, sor::model::kInf, sor::model::kInf};
+        d.row_lo = {1, 4};
+        d.row_hi = {1, sor::model::kInf};
+        sor::presolve::PresolveOptions o;
+        const auto reduced = sor::presolve::presolve(d, o);
+        CHECK(reduced.map.stats.equality_aggregations == 1);
+        const auto& r = reduced.map.problem;
+        for (std::size_t k = 0; k < r.A.vals.size(); ++k)
+            CHECK(std::fabs(r.A.vals[k]) > 1e-12);
+        // The rewritten row holds w and v only.
+        for (sor::core::Index i = 0; i < r.n_rows(); ++i)
+            if (reduced.map.row_new_to_orig[static_cast<std::size_t>(i)] == 1)
+                CHECK(r.A.pattern.row_ptr()[static_cast<std::size_t>(i) + 1] -
+                      r.A.pattern.row_ptr()[static_cast<std::size_t>(i)] == 2);
+        const std::vector<double> point{0, 0.5, 0.5, 1, 0};   // z x y w v
+        std::vector<double> reduced_point;
+        for (auto original : reduced.map.new_to_orig)
+            reduced_point.push_back(point[static_cast<std::size_t>(original)]);
+        const auto lifted = sor::presolve::postsolve(reduced.map, reduced_point);
+        CHECK(d.max_row_violation(lifted) < 1e-12);
+        CHECK(d.max_bound_violation(lifted) < 1e-12);
+    }
     return sor::test::finish("test_advanced_presolve");
 }

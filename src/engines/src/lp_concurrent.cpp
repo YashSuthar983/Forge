@@ -1,79 +1,60 @@
 #include "sor/engines/lp.hpp"
-#include "sor/engines/network_detect.hpp"
 #include "sor/engines/simplex.hpp"
 #include "sor/certify/finalize.hpp"
-#include "simplex_prepared.hpp"
 #include "lp_proof.hpp"
 
-#include <chrono>
 #include <algorithm>
-#include <limits>
+#include <chrono>
+#include <cmath>
 #include <exception>
+#include <limits>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
 namespace sor::engines {
 namespace {
 
-enum class ConcurrentArmKind : std::uint8_t {
-    Dual = 0,
-    Primal = 1,
-    Barrier = 2,
-    DualAltPricing = 3,
+// The arms, in the order LpOptions::concurrent_solves admits them. Each is
+// a complete solve_lp pipeline: presolve, the engine, postsolve and the
+// independent original-model check, so the race compares checked evidence
+// and its winner is exactly what that strategy would have returned alone.
+struct ArmSpec {
+    LpStrategy strategy;
+    const char* name;
 };
-
-ConcurrentArmKind arm_kind(std::size_t arm) noexcept {
-    if (arm == 0) return ConcurrentArmKind::Dual;
-    if (arm == 1) return ConcurrentArmKind::Primal;
-    if (arm == 2) return ConcurrentArmKind::Barrier;
-    if (arm == 3) return ConcurrentArmKind::DualAltPricing;
-    return (arm % 2 == 0) ? ConcurrentArmKind::Dual : ConcurrentArmKind::Primal;
-}
-
-const char* arm_kind_name(ConcurrentArmKind kind) noexcept {
-    switch (kind) {
-        case ConcurrentArmKind::Primal: return "primal";
-        case ConcurrentArmKind::DualAltPricing: return "dual-alt";
-        case ConcurrentArmKind::Barrier: return "barrier";
-        default: return "dual";
-    }
-}
-
-bool arm_terminal(const core::RawResult& raw, const core::ProofEvidence& ev) {
-    return lp_proof::proved_terminal(raw, ev);
-}
-
-double objective_merit(const model::LpProblem& problem,
-                       const core::RawResult& raw,
-                       const core::ProofEvidence& ev) {
-    if (!ev.checker_passed) return core::kPosInf;
-    return problem.maximize ? -raw.objective : raw.objective;
-}
+constexpr ArmSpec kArms[] = {
+    {LpStrategy::Simplex, "simplex"},           // dual first, primal fallback
+    {LpStrategy::Barrier, "barrier"},
+    {LpStrategy::PrimalSimplex, "primal"},
+};
+constexpr std::size_t kMaxArms = sizeof(kArms) / sizeof(kArms[0]);
 
 struct Arm {
     core::RawResult raw;
     core::ProofEvidence evidence;
     LpDiagnostics diagnostics;
-    SimplexDiagnostics sx_diag;
     std::exception_ptr error;
-    ConcurrentArmKind kind = ConcurrentArmKind::Dual;
     bool terminal = false;
 };
 
-std::size_t pick_proof_winner(const model::LpProblem& problem,
-                              const std::vector<Arm>& arms,
-                              std::size_t count) {
-    std::size_t winner = count;
+double objective_merit(const model::LpProblem& problem, const core::RawResult& raw) {
+    if (!std::isfinite(raw.objective)) return core::kPosInf;
+    return problem.maximize ? -raw.objective : raw.objective;
+}
+
+// Best arm by proof rank; among primal-feasible answers (rank 1) the better
+// objective, otherwise the earlier arm.
+std::size_t pick_winner(const model::LpProblem& problem, const std::vector<Arm>& arms) {
+    std::size_t winner = arms.size();
     int best_rank = std::numeric_limits<int>::max();
     double best_merit = core::kPosInf;
-    for (std::size_t arm = 0; arm < count; ++arm) {
+    for (std::size_t arm = 0; arm < arms.size(); ++arm) {
         if (arms[arm].error) continue;
         const int rank = lp_proof::proof_rank(arms[arm].raw, arms[arm].evidence);
-        const double merit =
-            objective_merit(problem, arms[arm].raw, arms[arm].evidence);
-        if (rank < best_rank ||
-            (rank == best_rank && merit < best_merit)) {
+        const double merit = rank == 1 ? objective_merit(problem, arms[arm].raw) : core::kPosInf;
+        if (rank < best_rank || (rank == best_rank && merit < best_merit)) {
             winner = arm;
             best_rank = rank;
             best_merit = merit;
@@ -84,56 +65,33 @@ std::size_t pick_proof_winner(const model::LpProblem& problem,
 
 }  // namespace
 
+std::size_t lp_concurrent_arm_count(const model::LpProblem& problem,
+                                    const LpOptions& options,
+                                    const SimplexOptions* policy) {
+    if (options.strategy != LpStrategy::Auto || options.concurrent_deterministic ||
+        options.concurrent_solves < 2)
+        return 1;
+    if (static_cast<std::uint64_t>(problem.nnz()) < options.concurrent_min_nonzeros) return 1;
+    // One core per arm, within the thread budget (--threads).
+    const int threads = policy ? policy->pricing_threads : 1;
+    const auto arms = std::min<std::size_t>({static_cast<std::size_t>(options.concurrent_solves),
+                                             static_cast<std::size_t>(std::max(threads, 1)),
+                                             kMaxArms});
+    return arms >= 2 ? arms : 1;
+}
+
 core::RawResult solve_lp_concurrent(const model::LpProblem& problem,
     const LpOptions& options, LpDiagnostics& diagnostics,
-    core::ProofEvidence* evidence, const SimplexOptions* policy) {
+    core::ProofEvidence* evidence, const SimplexOptions* policy,
+    const HprOptions* hpr_policy, const PdhgOptions* pdhg_policy) {
     problem.validate();
     model::validate_lp_policy(options.primal_feas_tol, options.dual_feas_tol,
         options.gap_tol, options.time_limit_s);
-    if (options.concurrent_solves < 1 || options.concurrent_solves > 16)
-        throw std::invalid_argument("LP concurrent_solves must be in [1,16]");
+    const std::size_t count = lp_concurrent_arm_count(problem, options, policy);
+    if (count < 2)
+        throw std::invalid_argument("solve_lp_concurrent: the options do not admit a race");
 
-    diagnostics = LpDiagnostics{};
-    diagnostics.requested_strategy = options.strategy;
-    diagnostics.routed_strategy = LpStrategy::Auto;
-    diagnostics.global_iteration_limit = options.max_iterations;
-    diagnostics.global_time_limit_s = options.time_limit_s;
-    diagnostics.concurrent_deterministic = options.concurrent_deterministic;
-    diagnostics.route_rationale = options.concurrent_deterministic
-        ? "deterministic concurrent race (dual/primal/barrier)"
-        : "concurrent race (dual/primal/barrier)";
-
-    const bool deterministic = options.concurrent_deterministic;
     const auto start = std::chrono::steady_clock::now();
-    const auto count = options.max_iterations > 0
-        ? static_cast<std::size_t>(std::min<std::uint64_t>(
-              options.concurrent_solves, options.max_iterations))
-        : static_cast<std::size_t>(options.concurrent_solves);
-    diagnostics.concurrent_arm_count = static_cast<int>(count);
-
-    SimplexOptions base_sx = policy ? *policy : SimplexOptions{};
-    base_sx.primal_feas_tol = options.primal_feas_tol;
-    base_sx.dual_feas_tol = options.dual_feas_tol;
-    base_sx.gap_tol = options.gap_tol;
-    base_sx.presolve = false;
-    base_sx.time_limit_s = options.time_limit_s;
-    {
-        const auto nc = static_cast<std::uint64_t>(
-            std::max<core::Index>(0, problem.n_cols()));
-        const auto nr = static_cast<std::uint64_t>(
-            std::max<core::Index>(1, problem.n_rows()));
-        base_sx.enable_sifting =
-            options.enable_sifting ||
-            (options.strategy == LpStrategy::Auto && nc > 5u * nr);
-        base_sx.enable_network_simplex =
-            options.enable_network_simplex ||
-            (options.strategy == LpStrategy::Auto &&
-             detect_network_structure(problem));
-    }
-    if (options.max_iterations > 0)
-        base_sx.max_iterations = options.max_iterations;
-    const SimplexPrepared shared_prepared = prepare_simplex_model(problem, base_sx);
-
     core::CancelToken stop(policy ? policy->cancel : nullptr);
     std::vector<Arm> arms(count);
     std::vector<std::thread> workers;
@@ -145,96 +103,29 @@ core::RawResult solve_lp_concurrent(const model::LpProblem& problem,
     };
     try {
         for (std::size_t arm = 0; arm < count; ++arm) workers.emplace_back([&, arm] {
+            auto& result = arms[arm];
             try {
-                arms[arm].kind = arm_kind(arm);
-                auto& result = arms[arm];
-                SimplexOptions simplex = base_sx;
-                simplex.cancel = &stop;
-                simplex.pricing_threads =
-                    deterministic ? 1
-                                  : std::max(1, base_sx.pricing_threads);
-                if (options.time_limit_s > 0) {
-                    const auto elapsed = std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - start).count();
-                    simplex.time_limit_s = std::max(
-                        std::numeric_limits<double>::min(),
-                        options.time_limit_s - elapsed);
-                    if (deterministic)
-                        simplex.time_limit_s = std::min(
-                            simplex.time_limit_s,
-                            options.time_limit_s / static_cast<double>(count));
-                }
+                LpOptions arm_options = options;
+                arm_options.strategy = kArms[arm].strategy;
+                arm_options.concurrent_solves = 1;
+                // An iteration limit is shared, a time limit is not: the arms
+                // run at the same time.
                 if (options.max_iterations > 0)
-                    simplex.max_iterations =
+                    arm_options.max_iterations = std::max<std::uint64_t>(1,
                         options.max_iterations / count +
-                        (arm < options.max_iterations % count ? 1 : 0);
-                simplex.perturbation_seed += arm * 104729u;
-
-                if (result.kind == ConcurrentArmKind::Barrier) {
-                    auto arm_options = options;
-                    arm_options.concurrent_solves = 1;
-                    arm_options.strategy = LpStrategy::Barrier;
-                    arm_options.time_limit_s = simplex.time_limit_s;
-                    arm_options.max_iterations = simplex.max_iterations;
-                    result.raw = solve_lp(problem, arm_options, result.diagnostics,
-                                          &result.evidence, &simplex);
-                } else {
-                    SimplexBasis basis;
-                    if (result.kind == ConcurrentArmKind::DualAltPricing) {
-                        simplex.dual_cost_perturbation_multiplier = 1;
-                        simplex.pricing = SimplexPricing::Devex;
-                    }
-                    // Wide-LP sifting lives in solve_simplex; the prepared
-                    // dual/primal arms would skip it.
-                    if (simplex.enable_sifting) {
-                        simplex.method = result.kind == ConcurrentArmKind::Primal
-                            ? SimplexMethod::Primal
-                            : SimplexMethod::Dual;
-                        result.raw = solve_simplex(
-                            problem, simplex, result.sx_diag, &basis);
-                        result.raw.engine =
-                            result.kind == ConcurrentArmKind::Primal
-                                ? "concurrent/primal+sift"
-                                : result.kind == ConcurrentArmKind::DualAltPricing
-                                    ? "concurrent/dual-alt+sift"
-                                    : "concurrent/dual+sift";
-                    } else if (result.kind == ConcurrentArmKind::Primal) {
-                        result.raw = solve_primal_simplex_prepared(
-                            shared_prepared, simplex, result.sx_diag, &basis,
-                            nullptr);
-                        result.raw.engine = "concurrent/primal";
-                    } else {
-                        if (count >= 2 && arm == count - 1 &&
-                            result.kind == ConcurrentArmKind::DualAltPricing &&
-                            problem.n_rows() > problem.n_cols()) {
-                            auto arm_options = options;
-                            arm_options.concurrent_solves = 1;
-                            arm_options.strategy = LpStrategy::DualSimplex;
-                            arm_options.time_limit_s = simplex.time_limit_s;
-                            simplex.dualize = DualizePolicy::Always;
-                            result.raw = solve_lp(problem, arm_options,
-                                result.diagnostics, &result.evidence, &simplex);
-                        } else {
-                            result.raw = solve_dual_simplex_prepared(
-                                shared_prepared, simplex, result.sx_diag, &basis,
-                                nullptr);
-                            result.raw.engine =
-                                result.kind == ConcurrentArmKind::DualAltPricing
-                                    ? "concurrent/dual-alt"
-                                    : "concurrent/dual";
-                        }
-                    }
-                    result.diagnostics.iterations = result.sx_diag.iterations;
-                    result.diagnostics.simplex_iterations =
-                        result.sx_diag.iterations;
-                    result.evidence = simplex_evidence(result.sx_diag, simplex);
-                }
-
-                const auto checked = certify::finalize_result(
-                    certify::check_lp_candidate(problem, result.raw,
-                                                result.evidence));
-                result.terminal = arm_terminal(result.raw, result.evidence);
-                if (result.terminal && !deterministic) {
+                        (arm < options.max_iterations % count ? 1 : 0));
+                SimplexOptions simplex = policy ? *policy : SimplexOptions{};
+                simplex.cancel = &stop;
+                // One core per arm: the arms are the parallelism. Pricing
+                // threads would share one pool across arms, which serialises
+                // its callers.
+                simplex.pricing_threads = 1;
+                simplex.parallel_basis_solves = false;
+                simplex.perturbation_seed += static_cast<std::uint32_t>(arm) * 104729u;
+                result.raw = solve_lp(problem, arm_options, result.diagnostics,
+                                      &result.evidence, &simplex, hpr_policy, pdhg_policy);
+                result.terminal = lp_proof::proved_terminal(result.raw, result.evidence);
+                if (result.terminal) {
                     std::lock_guard<std::mutex> lock(mutex);
                     if (winner == count) {
                         winner = arm;
@@ -242,7 +133,7 @@ core::RawResult solve_lp_concurrent(const model::LpProblem& problem,
                     }
                 }
             } catch (...) {
-                arms[arm].error = std::current_exception();
+                result.error = std::current_exception();
             }
         });
     } catch (...) {
@@ -252,71 +143,24 @@ core::RawResult solve_lp_concurrent(const model::LpProblem& problem,
     }
     join();
 
-    if (deterministic) {
-        for (std::size_t arm = 0; arm < count; ++arm) {
-            if (arms[arm].terminal) {
-                winner = arm;
-                break;
-            }
-        }
-    }
+    if (winner == count) winner = pick_winner(problem, arms);
+    if (winner == count) std::rethrow_exception(arms.front().error);
 
-    if (winner == count)
-        winner = pick_proof_winner(problem, arms, count);
-    // Rank 4 means "no certificate", but Optimal/Unbounded/Infeasible/
-    // Feasible claims are still publishable race outcomes. Only discard when
-    // the best arm has no terminal claim at all.
-    if (winner != count &&
-        lp_proof::proof_rank(arms[winner].raw, arms[winner].evidence) >= 4) {
-        const auto st = arms[winner].raw.proposed_status;
-        if (st != core::Status::Optimal &&
-            st != core::Status::Unbounded &&
-            st != core::Status::Infeasible &&
-            st != core::Status::Feasible)
-            winner = count;
-    }
-
-    if (winner == count) {
-        if (arms.front().error) std::rethrow_exception(arms.front().error);
-        core::RawResult interrupted;
-        interrupted.proposed_status = core::Status::Interrupted;
-        interrupted.engine = "concurrent";
-        interrupted.termination_reason =
-            "concurrent LP: no arm produced a proved result";
-        diagnostics.termination_reason = interrupted.termination_reason;
-        diagnostics.elapsed_s = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - start).count();
-        if (evidence) *evidence = core::ProofEvidence{};
-        return interrupted;
-    }
-
-    std::uint64_t total_iterations = 0, total_simplex = 0;
-    for (const auto& arm : arms) {
-        total_iterations += arm.diagnostics.iterations;
-        total_simplex += arm.diagnostics.simplex_iterations;
-    }
-    const auto winner_kind = arms[winner].kind;
-    const std::string route =
-        std::string(deterministic ? "deterministic-concurrent/" : "concurrent/") +
-        arm_kind_name(winner_kind) + " arm " + std::to_string(winner) +
-        " (shared-prepare)";
+    std::uint64_t all_iterations = 0;
+    for (const auto& arm : arms) all_iterations += arm.diagnostics.iterations;
     diagnostics = std::move(arms[winner].diagnostics);
     diagnostics.requested_strategy = options.strategy;
-    diagnostics.routed_strategy = LpStrategy::Auto;
     diagnostics.concurrent_arm_count = static_cast<int>(count);
     diagnostics.concurrent_winner_arm = static_cast<int>(winner);
-    diagnostics.concurrent_winner_kind = arm_kind_name(winner_kind);
-    diagnostics.concurrent_deterministic = options.concurrent_deterministic;
-    diagnostics.iterations = total_iterations;
-    diagnostics.simplex_iterations = total_simplex;
+    diagnostics.concurrent_winner_kind = kArms[winner].name;
+    diagnostics.concurrent_deterministic = false;
+    diagnostics.concurrent_all_arm_iterations = all_iterations;
+    diagnostics.route_rationale = std::string("concurrent race of ") + std::to_string(count) +
+        " arms, " + kArms[winner].name + " arm " + std::to_string(winner) +
+        (arms[winner].terminal ? " proved first" : " best result");
     diagnostics.elapsed_s = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
-    diagnostics.route_rationale = route;
-    diagnostics.termination_reason = arms[winner].raw.termination_reason;
     if (evidence) *evidence = arms[winner].evidence;
-    auto raw = std::move(arms[winner].raw);
-    raw.iterations = total_iterations;
-    raw.engine = diagnostics.route_rationale;
-    return raw;
+    return std::move(arms[winner].raw);
 }
 }  // namespace sor::engines

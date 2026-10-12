@@ -53,6 +53,12 @@ struct LpProblem {
 
     // max_i dist(  (Ax)_i , [row_lo_i, row_hi_i] )
     f64 max_row_violation(const std::vector<f64>& x) const;
+    // The same violations in the units of x, relative to the point's size:
+    // max_i viol_i / (max_j |a_ij| * (1 + max_{j in row i} |x_j|)), rounded
+    // up. max_row_violation is absolute, so 1e-9 x >= 5e-9 at x = 0 passes a
+    // 1e-7 tolerance while x is five units from the row; the objective error
+    // follows this distance. +inf for a violated empty row.
+    f64 max_row_distance(const std::vector<f64>& x) const;
     // max_j dist( x_j, [col_lo_j, col_hi_j] )
     f64 max_bound_violation(const std::vector<f64>& x) const;
 

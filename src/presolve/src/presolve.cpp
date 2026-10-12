@@ -139,6 +139,62 @@ PresolveMap run_presolve_until_deadline(const model::LpProblem& in,
         }
     };
 
+    // Float activity of row i over [lo_j, hi_j] (fixed columns at their
+    // value), with a rigorous bound on its distance from the exact sums:
+    // (2t + 2) u sum(|a l| + |a u|) over the t finite terms, the bound the
+    // live kernel's row_activity_within_sides uses. It settles almost every
+    // row's redundancy/forcing test on its own; only a row it cannot decide
+    // pays for the exact (dyadic) sums, so every decision is the exact one.
+    struct FloatActivity {
+        f64 min = 0.0, max = 0.0, err = 0.0;
+        std::size_t min_inf = 0, max_inf = 0;
+        Index live = 0;
+        bool usable = true;   // false: a product overflowed; use exact sums
+    };
+    const auto float_activity = [&](Index i) {
+        FloatActivity f;
+        f64 magnitude = 0.0;
+        std::size_t terms = 0;
+        for (Offset k = in.A.pattern.row_ptr()[sz(i)];
+             k < in.A.pattern.row_ptr()[sz(i) + 1]; ++k) {
+            const Index j = in.A.pattern.col_idx()[sz(k)];
+            const f64 a = in.A.vals[sz(k)];
+            if (a == 0.0) continue;
+            const bool live_j = col_live[sz(j)] != 0;
+            if (live_j) ++f.live;
+            const f64 l = live_j ? work_lo[sz(j)] : fixed[sz(j)];
+            const f64 u = live_j ? work_hi[sz(j)] : fixed[sz(j)];
+            const f64 lower = a > 0.0 ? l : u, upper = a > 0.0 ? u : l;
+            if (std::isfinite(lower)) {
+                const f64 p = a * lower;
+                if (!std::isfinite(p)) f.usable = false;
+                f.min += p;
+                magnitude += std::fabs(p);
+                ++terms;
+            } else {
+                ++f.min_inf;
+            }
+            if (std::isfinite(upper)) {
+                const f64 p = a * upper;
+                if (!std::isfinite(p)) f.usable = false;
+                f.max += p;
+                magnitude += std::fabs(p);
+                ++terms;
+            } else {
+                ++f.max_inf;
+            }
+        }
+        if (!std::isfinite(magnitude)) f.usable = false;
+        f.err = (2.0 * static_cast<f64>(terms) + 2.0) * 0x1p-53 * magnitude * (1.0 + 0x1p-50);
+        return f;
+    };
+    // -1: the exact sum is below `side`, +1 above, 0: undecided (or equal).
+    const auto float_side = [](f64 value, f64 err, f64 side) {
+        if (value + err < side) return -1;
+        if (value - err > side) return 1;
+        return 0;
+    };
+
     bool changed = true;
     // A pass sweeps the live rows and columns; charged as one sweep of the
     // input (the deterministic clock cannot see presolve otherwise).
@@ -259,18 +315,44 @@ PresolveMap run_presolve_until_deadline(const model::LpProblem& in,
         for (Index i = 0; i < m; ++i) {
             detail::poll_deadline(options, deadline_polls);
             if (!row_live[sz(i)]) continue;
-            model::ExactIntervalSum activity;
-            for (Offset k = in.A.pattern.row_ptr()[sz(i)];
-                 k < in.A.pattern.row_ptr()[sz(i) + 1]; ++k) {
-                const Index j = in.A.pattern.col_idx()[sz(k)];
-                const f64 a = in.A.vals[sz(k)];
-                if (!col_live[sz(j)]) {
-                    activity.add(a, fixed[sz(j)], fixed[sz(j)]);
-                } else {
-                    activity.add(a, work_lo[sz(j)], work_hi[sz(j)]);
-                }
+            // lower() >= row_lo and upper() <= row_hi, decided in floats
+            // where the error bound allows (an infinite side passes; an
+            // unbounded activity fails a finite side).
+            const f64 rlo = in.row_lo[sz(i)], rhi = in.row_hi[sz(i)];
+            const FloatActivity f = float_activity(i);
+            int lower_ok = -1, upper_ok = -1;   // -1 undecided, 0 no, 1 yes
+            if (rlo == -model::kInf) lower_ok = 1;
+            else if (f.min_inf > 0) lower_ok = 0;
+            else if (f.usable && std::isfinite(rlo)) {
+                const int side = float_side(f.min, f.err, rlo);
+                if (side != 0) lower_ok = side > 0 ? 1 : 0;
             }
-            if (activity.lower() >= in.row_lo[sz(i)] && activity.upper() <= in.row_hi[sz(i)]) {
+            if (rhi == model::kInf) upper_ok = 1;
+            else if (f.max_inf > 0) upper_ok = 0;
+            else if (f.usable && std::isfinite(rhi)) {
+                const int side = float_side(f.max, f.err, rhi);
+                if (side != 0) upper_ok = side < 0 ? 1 : 0;
+            }
+            bool redundant;
+            if (lower_ok == 0 || upper_ok == 0) {
+                redundant = false;
+            } else if (lower_ok == 1 && upper_ok == 1) {
+                redundant = true;
+            } else {
+                model::ExactIntervalSum activity;
+                for (Offset k = in.A.pattern.row_ptr()[sz(i)];
+                     k < in.A.pattern.row_ptr()[sz(i) + 1]; ++k) {
+                    const Index j = in.A.pattern.col_idx()[sz(k)];
+                    const f64 a = in.A.vals[sz(k)];
+                    if (!col_live[sz(j)]) {
+                        activity.add(a, fixed[sz(j)], fixed[sz(j)]);
+                    } else {
+                        activity.add(a, work_lo[sz(j)], work_hi[sz(j)]);
+                    }
+                }
+                redundant = activity.lower() >= rlo && activity.upper() <= rhi;
+            }
+            if (redundant) {
                 row_live[sz(i)] = 0;
                 ++out.stats.rows_removed;
                 changed = true;
@@ -287,21 +369,26 @@ PresolveMap run_presolve_until_deadline(const model::LpProblem& in,
         for (Index i = 0; i < m; ++i) {
             detail::poll_deadline(options, deadline_polls);
             if (!row_live[sz(i)]) continue;
+            const FloatActivity f = float_activity(i);
+            const Index live_count = f.live;
+            if (live_count < 2) continue;  // singleton rule below owns this case
+            if (in.row_lo[sz(i)] > in.row_hi[sz(i)]) continue;
+            // Exact equality of an extreme activity with a side: impossible
+            // whenever the float sum is provably away from it.
+            const bool max_may_hit = std::isfinite(in.row_lo[sz(i)]) && f.max_inf == 0 &&
+                (!f.usable || float_side(f.max, f.err, in.row_lo[sz(i)]) == 0);
+            const bool min_may_hit = std::isfinite(in.row_hi[sz(i)]) && f.min_inf == 0 &&
+                (!f.usable || float_side(f.min, f.err, in.row_hi[sz(i)]) == 0);
+            if (!max_may_hit && !min_may_hit) continue;
             model::ExactIntervalSum activity;
-            Index live_count = 0;
             for (Offset k = in.A.pattern.row_ptr()[sz(i)];
                  k < in.A.pattern.row_ptr()[sz(i) + 1]; ++k) {
                 const Index j = in.A.pattern.col_idx()[sz(k)];
                 const f64 a = in.A.vals[sz(k)];
                 if (a == 0) continue;
                 if (!col_live[sz(j)]) activity.add(a, fixed[sz(j)], fixed[sz(j)]);
-                else {
-                    ++live_count;
-                    activity.add(a, work_lo[sz(j)], work_hi[sz(j)]);
-                }
+                else activity.add(a, work_lo[sz(j)], work_hi[sz(j)]);
             }
-            if (live_count < 2) continue;  // singleton rule below owns this case
-            if (in.row_lo[sz(i)] > in.row_hi[sz(i)]) continue;
 
             const bool at_max =
                 std::isfinite(in.row_lo[sz(i)]) && activity.finite_maximum() &&
@@ -507,19 +594,21 @@ PresolveMap run_presolve_until_deadline(const model::LpProblem& in,
             Index col = -1;
             f64 a = 0.0;
             int cnt = 0;
-            model::ExactSum shift; // exact contribution of fixed columns
             for (Offset k = in.A.pattern.row_ptr()[sz(i)];
                  k < in.A.pattern.row_ptr()[sz(i) + 1]; ++k) {
                 const Index j = in.A.pattern.col_idx()[sz(k)];
-                if (!col_live[sz(j)]) {
-                    shift.add_product(in.A.vals[sz(k)], fixed[sz(j)]);
-                    continue;
-                }
-                ++cnt;
+                if (!col_live[sz(j)]) continue;
+                if (++cnt > 1) break;
                 col = j;
                 a = in.A.vals[sz(k)];
             }
             if (cnt != 1 || a == 0.0) continue;
+            model::ExactSum shift; // exact contribution of fixed columns
+            for (Offset k = in.A.pattern.row_ptr()[sz(i)];
+                 k < in.A.pattern.row_ptr()[sz(i) + 1]; ++k) {
+                const Index j = in.A.pattern.col_idx()[sz(k)];
+                if (!col_live[sz(j)]) shift.add_product(in.A.vals[sz(k)], fixed[sz(j)]);
+            }
             const f64 clo = work_lo[sz(col)];
             const f64 chi = work_hi[sz(col)];
             if (in.row_lo[sz(i)] == in.row_hi[sz(i)]) {
@@ -607,6 +696,9 @@ PresolveMap run_presolve_until_deadline(const model::LpProblem& in,
 
 post_fixed_point:
     detail::LiveMatrix live;
+    // The live kernel records the same immutable column incidence; hand it
+    // over rather than rebuild it (n small vectors).
+    live.original_column_entries = std::move(original_column_entries);
     if (options.live_reductions) {
         if (status == PresolveStatus::Reduced &&
             !detail::run_live_presolve_passes(
@@ -714,15 +806,70 @@ post_fixed_point:
     const Offset max_positive_fill = aggregation_initial_nnz / 2;
     Offset positive_fill = 0;
 
-    // `whole` (optional) is the exact activity interval of the entire row;
-    // the rest of the row is then one exact removal instead of a fresh
-    // O(row) exact sum per candidate column.
+    // The row's activity interval for the bound proofs below, kept two
+    // ways: in floats with a rigorous error bound (always), and exactly
+    // (formed on first need). The float form settles the proof's sign tests
+    // whenever the error bound allows; the exact sums are only built for a
+    // test it cannot decide, so every decision is the exact one. greenbea's
+    // candidate scoring ran 350,724 exact proofs and 15.9 of 21 ms.
+    struct RowActivityCache {
+        const SparseRow* entries = nullptr;
+        f64 fmin = 0.0, fmax = 0.0, err = 0.0;
+        std::size_t min_inf = 0, max_inf = 0;
+        bool usable = true;
+        model::ExactIntervalSum exact;
+        bool exact_ready = false;
+    };
+    const auto make_row_cache = [&](RowActivityCache& cache, const SparseRow& entries) {
+        cache = RowActivityCache{};
+        cache.entries = &entries;
+        f64 magnitude = 0.0;
+        std::size_t terms = 0;
+        for (const auto& [j, a] : entries) {
+            if (a == 0.0) continue;
+            const f64 lower = a > 0 ? work_lo[sz(j)] : work_hi[sz(j)];
+            const f64 upper = a > 0 ? work_hi[sz(j)] : work_lo[sz(j)];
+            if (std::isfinite(lower)) {
+                const f64 t = a * lower;
+                cache.fmin += t; magnitude += std::fabs(t); ++terms;
+            } else {
+                ++cache.min_inf;
+            }
+            if (std::isfinite(upper)) {
+                const f64 t = a * upper;
+                cache.fmax += t; magnitude += std::fabs(t); ++terms;
+            } else {
+                ++cache.max_inf;
+            }
+        }
+        cache.usable = std::isfinite(magnitude) && std::isfinite(cache.fmin) &&
+                       std::isfinite(cache.fmax);
+        cache.err = (2.0 * static_cast<f64>(terms) + 2.0) * 0x1p-53 * magnitude * (1.0 + 0x1p-50);
+    };
+    const auto exact_of = [&](RowActivityCache& cache) -> const model::ExactIntervalSum& {
+        if (!cache.exact_ready) {
+            for (const auto& [j, a] : *cache.entries) cache.exact.add(a, work_lo[sz(j)], work_hi[sz(j)]);
+            cache.exact_ready = true;
+        }
+        return cache.exact;
+    };
+
+    // `cache` (optional) describes the entire row (see RowActivityCache);
+    // without it the proof builds the exact sums from the row. A caller
+    // walking the row passes the pivot's coefficient (`pivot_value`) and
+    // spares the search for it.
     const auto pivot_bounds_redundant = [&](Index row, Index col,
-                                            const model::ExactIntervalSum* whole = nullptr) {
+                                            RowActivityCache* cache = nullptr,
+                                            const f64* pivot_value = nullptr) {
         const auto& entries = mutable_rows[sz(row)];
-        const auto pivot_it = entries.find(col);
-        if (pivot_it == entries.end()) return false;
-        const f64 pivot = pivot_it->second;
+        f64 pivot;
+        if (pivot_value != nullptr) {
+            pivot = *pivot_value;
+        } else {
+            const auto pivot_it = entries.find(col);
+            if (pivot_it == entries.end()) return false;
+            pivot = pivot_it->second;
+        }
         if (pivot == 0.0 || !std::isfinite(pivot)) return false;
 
         const f64 lo = work_lo[sz(col)], hi = work_hi[sz(col)];
@@ -731,22 +878,65 @@ post_fixed_point:
             // column-scale scan: on fit2p, shared dense columns made those
             // doomed scans dominate six seconds of a presolve that accepted
             // no aggregations.
-            model::ExactIntervalSum other;
-            if (whole) {
-                other = *whole;
-                other.remove(pivot, lo, hi);
-            } else {
-                for (const auto& [j, a] : entries)
-                    if (j != col) other.add(a, work_lo[sz(j)], work_hi[sz(j)]);
-            }
             // x = (rhs - other) / pivot; compare without dividing:
             // (rhs - e) / p < l  <=>  (rhs - e) < p l  for p > 0, reversed for p < 0.
             // sign(rhs - e - p bound) decides both, exactly.
             const f64 rhs = mutable_row_lo[sz(row)];
-            const bool lower_finite = pivot > 0 ? other.finite_maximum() : other.finite_minimum();
-            const bool upper_finite = pivot > 0 ? other.finite_minimum() : other.finite_maximum();
-            const auto excess = [&](const model::DyadicSum& other_end, f64 bound) {
-                model::DyadicSum t = other_end;
+            // The rest of the row, other = row - pivot term, in floats:
+            // its ends, their infinite counts, and an error bound that adds
+            // the term's and the subtraction's rounding to the row's.
+            const f64 term_lower = pivot > 0 ? lo : hi, term_upper = pivot > 0 ? hi : lo;
+            int sign_lo = 2, sign_hi = 2;   // 2: not decided in floats
+            bool lower_finite = true, upper_finite = true;
+            if (cache != nullptr) {
+                const std::size_t omin_inf = cache->min_inf - (std::isfinite(term_lower) ? 0 : 1);
+                const std::size_t omax_inf = cache->max_inf - (std::isfinite(term_upper) ? 0 : 1);
+                lower_finite = pivot > 0 ? omax_inf == 0 : omin_inf == 0;
+                upper_finite = pivot > 0 ? omin_inf == 0 : omax_inf == 0;
+                if (cache->usable) {
+                    const f64 tmin = std::isfinite(term_lower) ? pivot * term_lower : 0.0;
+                    const f64 tmax = std::isfinite(term_upper) ? pivot * term_upper : 0.0;
+                    const f64 omin = cache->fmin - tmin, omax = cache->fmax - tmax;
+                    const f64 oerr = cache->err +
+                        0x1p-52 * (std::fabs(tmin) + std::fabs(tmax) + std::fabs(omin) + std::fabs(omax));
+                    const auto float_excess = [&](f64 other_end, f64 bound) {
+                        const f64 pb = pivot * bound, d = rhs - other_end, x = d - pb;
+                        const f64 e = (oerr + 0x1p-52 * (std::fabs(pb) + std::fabs(d) + std::fabs(x))) *
+                                      (1.0 + 0x1p-50);
+                        if (!std::isfinite(x) || !std::isfinite(e)) return 2;
+                        if (x > e) return 1;
+                        if (x < -e) return -1;
+                        return 2;
+                    };
+                    if (std::isfinite(lo) && lower_finite)
+                        sign_lo = float_excess(pivot > 0 ? omax : omin, lo);
+                    if (std::isfinite(hi) && upper_finite)
+                        sign_hi = float_excess(pivot > 0 ? omin : omax, hi);
+                }
+            }
+            model::ExactIntervalSum other;
+            bool other_ready = false;
+            const auto exact_other = [&]() -> const model::ExactIntervalSum& {
+                if (!other_ready) {
+                    if (cache != nullptr) {
+                        other = exact_of(*cache);
+                        other.remove(pivot, lo, hi);
+                    } else {
+                        for (const auto& [j, a] : entries)
+                            if (j != col) other.add(a, work_lo[sz(j)], work_hi[sz(j)]);
+                    }
+                    other_ready = true;
+                }
+                return other;
+            };
+            if (cache == nullptr) {
+                const auto& o = exact_other();
+                lower_finite = pivot > 0 ? o.finite_maximum() : o.finite_minimum();
+                upper_finite = pivot > 0 ? o.finite_minimum() : o.finite_maximum();
+            }
+            const auto excess = [&](bool use_max, f64 bound) {
+                const auto& o = exact_other();
+                model::DyadicSum t = use_max ? o.maximum_sum() : o.minimum_sum();
                 t.negate();
                 t.add(rhs);
                 t.add_product(-pivot, bound);
@@ -754,12 +944,12 @@ post_fixed_point:
             };
             if (std::isfinite(lo)) {
                 if (!lower_finite) return false;
-                const int s = excess(pivot > 0 ? other.maximum_sum() : other.minimum_sum(), lo);
+                const int s = sign_lo != 2 ? sign_lo : excess(pivot > 0, lo);
                 if (pivot > 0 ? s < 0 : s > 0) return false;
             }
             if (std::isfinite(hi)) {
                 if (!upper_finite) return false;
-                const int s = excess(pivot > 0 ? other.minimum_sum() : other.maximum_sum(), hi);
+                const int s = sign_hi != 2 ? sign_hi : excess(!(pivot > 0), hi);
                 if (pivot > 0 ? s > 0 : s < 0) return false;
             }
         }
@@ -782,6 +972,7 @@ post_fixed_point:
                std::fabs(pivot) >= 1e-3 * column_scale;
     };
 
+    RowActivityCache push_cache;
     const auto push_best_candidate = [&](Index row) {
         if (row < 0 || row >= m || !row_live[sz(row)] ||
             mutable_row_lo[sz(row)] != mutable_row_hi[sz(row)])
@@ -791,13 +982,11 @@ post_fixed_point:
             return;
         AggregationCandidate best;
         bool found = false;
-        model::ExactIntervalSum whole;
-        for (const auto& [col, a] : entries) whole.add(a, work_lo[sz(col)], work_hi[sz(col)]);
+        make_row_cache(push_cache, entries);
         for (const auto& [col, a] : entries) {
-            (void)a;
             if (!col_live[sz(col)] ||
                 (!in.is_integer.empty() && in.is_integer[sz(col)]) ||
-                !pivot_bounds_redundant(row, col, &whole))
+                !pivot_bounds_redundant(row, col, &push_cache, &a))
                 continue;
             const auto row_part = static_cast<std::uint64_t>(entries.size() - 1);
             const auto col_part = static_cast<std::uint64_t>(
@@ -882,7 +1071,7 @@ post_fixed_point:
                     if (o->first != pivot_col) rewritten.v.push_back(*o);
                 f64 prior = 0.0;
                 if (o != old.end() && o->first == col) { prior = o->second; ++o; }
-                const f64 value = prior - multiplier * a;
+                const f64 value = detail::combined_coefficient(prior, multiplier * a);
                 if (!std::isfinite(value)) { safe = false; break; }
                 if (value != 0.0) rewritten.v.emplace_back(col, value);
             }

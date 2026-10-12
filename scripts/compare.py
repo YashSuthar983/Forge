@@ -961,11 +961,23 @@ def run_mosek(model: Path, time_limit: float, label: str,
     try:
         with mosek.Env() as env:
             with env.Task() as task:
-                task.readdata(str(model))
+                # Fixed-column Netlib files (blank RHS/RANGES set names)
+                # misparse under MOSEK's default free-ish reader.
+                try:
+                    task.putintparam(mosek.iparam.read_mps_format,
+                                     mosek.mpsformat.strict)
+                    task.readdata(str(model))
+                except mosek.Error:
+                    task.putintparam(mosek.iparam.read_mps_format,
+                                     mosek.mpsformat.free)
+                    task.readdata(str(model))
                 task.putdouparam(mosek.dparam.optimizer_max_time, float(time_limit))
                 task.putintparam(mosek.iparam.num_threads, int(threads))
                 task.putdouparam(mosek.dparam.intpnt_tol_rel_gap, float(tol))
-                task.putdouparam(mosek.dparam.simplex_abs_tol_piv, float(tol))
+                task.putdouparam(mosek.dparam.intpnt_tol_pfeas, float(tol))
+                task.putdouparam(mosek.dparam.intpnt_tol_dfeas, float(tol))
+                task.putdouparam(mosek.dparam.basis_tol_x, float(tol))
+                task.putdouparam(mosek.dparam.basis_tol_s, float(tol))
                 if lp_method in ("dual", "simplex", "simplex-dual"):
                     task.putintparam(mosek.iparam.optimizer,
                                      mosek.optimizertype.dual_simplex)
@@ -979,7 +991,11 @@ def run_mosek(model: Path, time_limit: float, label: str,
                                      mosek.basindtype.always)
                 t0 = time.perf_counter()
                 trm = task.optimize()
-                r.seconds = r.wall_s = time.perf_counter() - t0
+                r.wall_s = time.perf_counter() - t0
+                try:
+                    r.seconds = float(task.getdouinf(mosek.dinfitem.optimizer_time))
+                except Exception:  # noqa: BLE001
+                    r.seconds = r.wall_s
                 # Prefer basic solution when present (post-crossover).
                 for sol in (mosek.soltype.bas, mosek.soltype.itr):
                     try:

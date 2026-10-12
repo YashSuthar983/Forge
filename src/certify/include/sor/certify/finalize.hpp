@@ -67,6 +67,25 @@ bool repair_basis_certificate(const model::LpProblem& problem, core::RawResult& 
 // not exact pricing.
 bool repair_dual_certificate(const model::LpProblem& problem, core::RawResult& raw,
                              const ExactCertificatePolicy& policy = {});
+// Binary64 multipliers (minimization form) for `basis` (structural index j,
+// or n_cols + i for row i's logical) that safe_lagrangian_lower_bound can
+// charge in full. Exact basis duals leave every basic reduced cost at zero;
+// rounded ones leave about +-u * |terms|, and a basic column with only one
+// chargeable side (x >= 0 with no upper bound, say) is then on the wrong side
+// half of the time, which makes the Lagrangian bound -inf. These are the
+// basis duals refactorized on this model and refined, then moved along
+// w = B^-T g, g_j = +-|terms_j| toward each such column's chargeable side, by
+// the smallest step that clears the rounding of every one-sided term (basic
+// or not, rows included) and keeps basic logicals at exactly zero; a
+// nonbasic one-sided term the step would push the wrong way is exchanged
+// into the solved equations for a two-sided basic one. The cost in the bound
+// is about a few u per term. Where no step exists (the dual face pins a
+// one-sided or free term to exactly zero) the proposal is the basis's
+// refined duals themselves, which the bound accepts when the exact duals
+// are binary64 numbers. False only when the basis cannot be factorized. A
+// proposal only: the caller accepts it through the safe bound.
+bool inward_basis_duals(const model::LpProblem& problem,
+                        const std::vector<core::Index>& basis, std::vector<f64>& y_min);
 bool repair_basis_primal_ray(const model::LpProblem& problem, core::RawResult& raw,
     core::Index entering_variable, int direction, const ExactCertificatePolicy& policy = {});
 core::PrimalRay check_exact_primal_ray(const model::LpProblem& problem,
@@ -105,8 +124,7 @@ ExactDualAssessment assess_exact_dual(const model::LpProblem& problem,
 SafeLpBound safe_lagrangian_lower_bound(const model::LpProblem& problem,
                                         const std::vector<f64>& y_min,
                                         const std::vector<f64>& col_lo,
-                                        const std::vector<f64>& col_hi,
-                                        f64 dual_feas_tol = 1e-7);
+                                        const std::vector<f64>& col_hi);
 
 // Reduced-cost bound tightening from ONE certified Lagrangian. With L the
 // safe bound above for multipliers y_min over [col_lo, col_hi], and d_j the
@@ -172,8 +190,7 @@ RcEnclosure enclose_reduced_costs_from_sums(const model::LpProblem& problem,
                                             const std::vector<long double>& ab,
                                             const std::vector<std::uint32_t>& cnt,
                                             const std::vector<f64>& col_lo,
-                                            const std::vector<f64>& col_hi,
-                                            f64 dual_feas_tol = 1e-7);
+                                            const std::vector<f64>& col_hi);
 // The tightenings of interval_reduced_cost_tightenings from an enclosure of
 // the same box (rc_lo / rc_hi / bound as in RawResult or RcEnclosure).
 IntervalRcFixing reduced_cost_tightenings_from(const std::vector<f64>& rc_lo,

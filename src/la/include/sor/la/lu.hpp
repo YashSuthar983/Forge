@@ -19,8 +19,9 @@
 //   Phase B - Markowitz elimination on whatever is left (the "nucleus").
 //   Pivot (r,c) minimizes (rcount_r - 1) * (ccount_c - 1), subject to the
 //   threshold-pivoting stability test |a_rc| >= threshold * max_i |a_ic|.
-//   Columns are searched in increasing-count order with a bounded candidate
-//   list, so pivot search does not cost O(nnz) per pivot.
+//   Columns and rows are searched in increasing-count order with a bounded
+//   candidate list, so pivot search does not cost O(nnz) per pivot; a dense
+//   remainder goes to a blocked dense kernel. See lu_markowitz.hpp.
 //
 // BASIS UPDATE: two selectable representations (LuOptions-adjacent
 // UpdateMethod), both against the SAME L/U from factorize():
@@ -83,10 +84,10 @@ struct LuOptions {
     // engines::numerics and validate_simplex_numerics.
     f64 pivot_tol = kDefaultLuPivotTol;
 
-    // Columns examined per Markowitz pivot search. Unbounded search is
-    // O(nnz) per pivot, which dominates everything on large bases.
-    // Raised from 8 so a later cost-0 pivot is not missed after a mediocre
-    // early candidate (fill / refactor count on pilot87).
+    // Rows and columns examined per Markowitz pivot search once a candidate
+    // exists (lu_markowitz.cpp; the search also stops when no unexamined
+    // entry can beat the best merit). Unbounded search is O(nnz) per pivot,
+    // which dominates everything on large bases.
     int max_search_cols = 16;
 
     bool blocked_nucleus = true;
@@ -95,11 +96,6 @@ struct LuOptions {
     bool adaptive_threshold = true;
     f64 condition_limit = 1e9;
     f64 stable_threshold = 0.5;
-    // AVX2/SSE2 packed mul for long L/U columns. When false, the scalar
-    // (unroll-4) path runs and is bit-identical to the historical loop.
-    // Default true on hosts that compile with AVX2; scalar fallback always
-    // available via SOR_NO_SIMD_SOLVES / this flag.
-    bool simd_dense_solves = true;
 };
 
 // Which basis-slot-replacement representation update_ft() vs. update() uses.
@@ -127,6 +123,9 @@ struct LuStats {
     Index  singular_count  = 0;
     f64    largest_multiplier = 0.0;
     f64    condition_estimate = 1.0;
+    // max |U| / max |B| (diagonal included): the factor's backward error
+    // grows with it. See factorize()'s stability redo.
+    f64    element_growth = 1.0;
     f64    effective_threshold = 0.0;
     // Deterministic cost of producing this factor (the work units
     // factorize() charges): what one refactorization costs, for the economy
@@ -153,6 +152,27 @@ struct SpikeCapture {
     std::vector<core::f64>   val;
     bool valid = false;             // false: caller did not ask, or m == 0
     void clear() { pos.clear(); val.clear(); valid = false; }
+};
+
+// The Forrest-Tomlin row eta of a basis slot, e_p^T U^-1 in POSITION
+// coordinates, as BTRAN forms it on its way through: it is the state between
+// the U' solve and the row etas when the input is the unit vector of slot p.
+//
+// The dual simplex BTRANs exactly that unit vector for every leaving row (the
+// pivotal row rho = B^-T e_p), and update_ft() needs exactly this vector to
+// eliminate the leaving position. Capturing it here saves update_ft() its own
+// U' solve, which was most of an update's cost on bases with long U rows.
+// Entries are stored in ascending position order, the canonical row-eta order
+// update_ft() uses on its own path as well. `factor_gen` and `n_row_etas` pin
+// the U the capture describes; update_ft() ignores a capture of any other U.
+struct RowEtaCapture {
+    std::vector<core::Index> pos;   // position coordinates, ascending
+    std::vector<core::f64>   val;
+    core::Index pivot_pos = -1;     // position of the unit input slot
+    std::uint64_t factor_gen = 0;
+    core::Index n_row_etas = -1;
+    bool valid = false;
+    void clear() { pos.clear(); val.clear(); pivot_pos = -1; valid = false; }
 };
 
 // LU factors of one basis matrix, plus the eta file of subsequent updates.
@@ -385,9 +405,14 @@ public:
     // must satisfy the partial-write reset contract above (previous support
     // ∪ previous input seed slot). Same fallback and bit-identity
     // properties as the seeded FTRAN.
+    // `row_eta` (optional): when the declared seed is a single slot p whose
+    // entry is exactly 1 and no product-form eta is pending, receives
+    // e_p^T U^-1 for update_ft() (see RowEtaCapture); otherwise it is left
+    // invalid.
     bool btran_seeded_with_support(std::vector<f64>& d,
                                    const std::vector<Index>& seed_slots,
-                                   std::vector<Index>& support) const;
+                                   std::vector<Index>& support,
+                                   RowEtaCapture* row_eta = nullptr) const;
 
     // Record that basis slot p has been replaced by a column whose image under
     // the PRE-update basis is `alpha` (i.e. alpha = B^-1 a_q, the FTRAN result
@@ -412,10 +437,16 @@ public:
     // `alpha`. When absent (or invalid) the spike is recomputed as U * alpha,
     // which is the historical behaviour and carries rounding residue into U;
     // see SpikeCapture.
+    // `row_eta` is the leaving slot's e_p^T U^-1 captured by the BTRAN that
+    // priced the pivotal row (see RowEtaCapture). When it describes this
+    // very U (same factorization, same update count) and this slot, the
+    // update takes it instead of solving U' e_p again; any other capture is
+    // ignored and the solve runs as before.
     bool update_ft(Index p, const std::vector<f64>& alpha,
                    const LuOptions& opts, f64 min_pivot = 1e-11,
                    const std::vector<Index>* alpha_support = nullptr,
-                   const SpikeCapture* spike = nullptr);
+                   const SpikeCapture* spike = nullptr,
+                   const RowEtaCapture* row_eta = nullptr);
 
     // Collective FT (Huangfu & Hall 2015 Phase 2): folds every PENDING product-form eta (from update(), not
     // update_ft()) into L/U via a sequence of update_ft() calls -- reusing
@@ -492,11 +523,12 @@ public:
         };
         add(base_->piv_row_); add(base_->piv_slot_); add(base_->piv_val_); add(base_->rpos_); add(base_->cpos_);
         add(base_->u_off_); add(base_->u_len_); add(base_->u_cap_); add(base_->u_idx_); add(base_->u_val_);
-        add(base_->uord_); add(base_->upos_);
+        add(base_->uord_); add(base_->upos_); add(base_->u_dead_steps_);
+        add(base_->u_rmirror_); add(base_->u_cmirror_);
         add(base_->u_cstart_); add(base_->u_clen_); add(base_->u_ccap_); add(base_->u_crow_); add(base_->u_cval_);
         add(r_pos_); add(r_start_); add(r_idx_); add(r_val_);
         add(ft_atilde_); add(ft_v_); add(ft_support_); add(ft_vsupport_);
-        add(ft_seed_); add(ft_stamp_); add(ft_move_idx_); add(ft_move_val_);
+        add(ft_seed_); add(ft_stamp_);
         add(base_->l_start_); add(base_->l_idx_); add(base_->l_val_); add(base_->l_col_start_); add(base_->l_col_row_); add(base_->l_row_val_);
         add(eta_p_); add(eta_start_); add(eta_idx_); add(eta_val_); add(eta_pivot_);
         for (const auto& r : rev_) total += r.capacity() * sizeof(Index);
@@ -585,7 +617,8 @@ private:
     // Record work_ between the row etas and the U solve -- the exact spike.
     void capture_spike(SolveScratch& sc, SpikeCapture& out, bool have_seed) const;
     bool btran_impl(SolveScratch& sc, std::vector<f64>& d, std::vector<Index>* support,
-                    const std::vector<Index>* seed_slots) const;
+                    const std::vector<Index>* seed_slots,
+                    RowEtaCapture* row_eta = nullptr) const;
 
     void build_col_patterns();
     // Size and clear a scratch for the current factorization.
@@ -595,18 +628,22 @@ private:
     // Row/column edits on U's two mirrored stores. Each pair keeps the other
     // consistent; callers use them so that no code outside these four has to
     // know about capacities, relocation or dead space.
-    void u_row_append(Index row, Index col, f64 val);
-    void u_col_append(Index col, Index row, f64 val);
-    void u_row_erase(Index row, Index col);    // no-op if absent
-    void u_col_erase(Index col, Index row);    // no-op if absent
+    void u_row_reserve(Index row, Index extra);
+    void u_col_reserve(Index col, Index extra);
+    void u_append(Index row, Index col, f64 val);   // to both stores, linked
+    void u_row_drop(Index row, Offset rs);          // row-store slot rs only
+    void u_col_drop(Index col, Offset cs);          // column-store slot cs only
 
-    // Move position `p` to the END of U's elimination order, shifting the
-    // positions after it one step earlier. Sets u_reordered_.
-    void u_order_move_to_back(Index p);
+    // Move position `p` to the END of U's elimination order: it takes a new
+    // step appended to base_->uord_, and its old step becomes a hole. Returns
+    // the number of live steps from its old place to the end (p included).
+    // Sets u_reordered_.
+    Index u_order_move_to_back(Index p);
 
     // Rebuild both U mirrors packed. Contents are preserved exactly; only the
     // storage layout changes, so no solve can observe it.
     void compact_u_storage();
+    void pack_u();
 
     // Sort a reach set into U's elimination order. While u_reordered_ is false
     // that is the index order and this is the plain sort the hypersparse
@@ -625,6 +662,12 @@ private:
         std::vector<f64> piv_val_;
         std::vector<Offset> u_off_, u_cstart_, l_start_, l_col_start_;
         std::vector<Index> u_len_, u_cap_, u_idx_, uord_, upos_, u_clen_, u_ccap_, u_crow_, l_idx_, l_col_row_;
+        // Holes in uord_ (steps whose position moved to the back), oldest first.
+        std::vector<Index> u_dead_steps_;
+        // Twin links between U's stores, relative to the twin's segment:
+        // u_rmirror_[rs] is the offset inside its column's segment of the
+        // entry at row-store slot rs, u_cmirror_ the reverse.
+        std::vector<Index> u_rmirror_, u_cmirror_;
         std::vector<f64> u_val_, u_cval_, l_val_, l_row_val_;
     };
     // Shared snapshots of the base LU. Product-form updates only append to
@@ -675,7 +718,9 @@ private:
     // time; what an FT update changes is only WHEN position k is eliminated.
     // base_->uord_[t] is the position eliminated at step t and base_->upos_ is its inverse,
     // so U's triangularity condition is base_->upos_[column] > base_->upos_[row] rather than
-    // column > row.
+    // column > row. Updates only append steps: a step whose position moved to
+    // the back holds -1 until the next factorization (base_->u_dead_steps_),
+    // so uord_ has n + (updates since the factorization) entries.
     //
     // This is what lets L stay untouched by an update, which is the whole point
     // of Forrest-Tomlin: L and U are two independent sequences of operations
@@ -714,8 +759,6 @@ private:
     std::vector<Index> ft_support_, ft_vsupport_, ft_seed_;
     std::vector<std::uint32_t> ft_stamp_;   // support membership, by generation
     std::uint32_t ft_gen_ = 0;
-    std::vector<Index> ft_move_idx_;        // relocation staging (see u_row_append)
-    std::vector<f64>   ft_move_val_;
 
     // L multipliers, by pivot order, indices in pivot coordinates, strictly
     // greater than the pivot index. Unit diagonal is implicit. Frozen between

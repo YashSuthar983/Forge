@@ -38,12 +38,32 @@ int main() {
     for (auto& rhs : serial) factor.btran(rhs);
     factor.solve_batch(batch, &pool, true);
     CHECK(batch == serial);
+    // An ill-conditioned nucleus whose pivots the Markowitz search picks
+    // under the threshold (no singletons; the dense kernel, which pivots by
+    // rows and ignores the threshold, switched off) is refactored with the
+    // stable threshold.
+    const std::vector<Offset> nucleus_p{0, 2, 4};
+    const std::vector<Index> nucleus_r{0, 1, 0, 1};
+    const std::vector<f64> nucleus_a{1, 1, 1, 1 + 1e-10};
+    LuOptions markowitz; markowitz.blocked_nucleus = false;
+    CHECK(factor.factorize(2, nucleus_p, nucleus_r, nucleus_a, markowitz));
+    CHECK(factor.stats().condition_estimate >= 1e9);
+    CHECK(factor.stats().effective_threshold == 0.5);
+    LuOptions fixed = markowitz; fixed.adaptive_threshold = false;
+    CHECK(factor.factorize(2, nucleus_p, nucleus_r, nucleus_a, fixed));
+    CHECK(factor.stats().effective_threshold == fixed.markowitz_threshold);
+    // A triangular basis takes only singleton pivots, which no threshold
+    // governs: the stable redo would return the same factor, so it is not
+    // estimated or redone, and the factor is still exact.
     const std::vector<Offset> diagonal_p{0, 1, 2};
     const std::vector<Index> diagonal_r{0, 1};
     CHECK(factor.factorize(2, diagonal_p, diagonal_r, {1, 1e-10}, {}));
-    CHECK(factor.stats().condition_estimate >= 1e9);
-    CHECK(factor.stats().effective_threshold == 0.5);
-    LuOptions fixed; fixed.adaptive_threshold = false;
+    CHECK(factor.stats().effective_threshold == LuOptions{}.markowitz_threshold);
+    {
+        std::vector<f64> rhs{2, 3e-10};
+        factor.ftran(rhs);
+        CHECK(rhs[0] == 2 && std::fabs(rhs[1] - 3) < 1e-12);
+    }
     CHECK(factor.factorize(2, diagonal_p, diagonal_r, {1, 1e-10}, fixed));
     CHECK(factor.stats().effective_threshold == fixed.markowitz_threshold);
     x = {1, std::numeric_limits<f64>::infinity()};

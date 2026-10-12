@@ -294,8 +294,10 @@ void usage() {
         "  --lp-exit-refactor always|economy  rebuild the dual simplex factor at every would-be\n"
         "                      optimum carrying updates, or only once its update file has cost a\n"
         "                      factorization (default always)\n"
-        "  --lp-concurrent N  race N independently checked arms (dual/primal/alt/barrier)\n"
-        "  --lp-concurrent-deterministic  Method=4-style: fixed budgets, lowest-index winner\n"
+        "  --lp-concurrent N  Auto may race up to N engines (simplex/barrier/primal, one core\n"
+        "                     each, within --threads) on models with >= 200k nonzeros; default 1\n"
+        "                     (no race): the arms share memory and bandwidth\n"
+        "  --lp-concurrent-deterministic  Auto never races (also implied by --deterministic)\n"
         "  --lp-preset verified|speed  verified=1e-7/1e-9 (default); speed=1e-6 commercial\n"
         "  --lp-parallel-basis  evaluate paired basis solves with private worker factors\n"
         "  --lp-dualize off|on|auto  solve the LP through its dual LP (simplex, no\n"
@@ -4515,7 +4517,9 @@ int main(int argc, char** argv) {
             lp_opts.strategy = sor::core::LpStrategy::Auto;
             if (lp_concurrent_given)
                 lp_opts.concurrent_solves = lp_concurrent;
-            lp_opts.concurrent_deterministic = lp_concurrent_deterministic;
+            // A race's winner depends on timing; a deterministic run must
+            // not depend on it.
+            lp_opts.concurrent_deterministic = lp_concurrent_deterministic || deterministic;
             if (lp_preset == "speed")
                 sor::core::apply_lp_tolerance_preset(
                     lp_opts, sor::core::LpTolerancePreset::Speed);
@@ -4560,6 +4564,10 @@ int main(int argc, char** argv) {
             std::printf("route:             %s (%s)\n",
                         std::string(sor::core::to_string(diag.routed_strategy)).c_str(),
                         diag.route_rationale.c_str());
+            if (diag.concurrent_arm_count > 0)
+                std::printf("race:              %d arms, winner %s; all arms %llu iterations\n",
+                            diag.concurrent_arm_count, diag.concurrent_winner_kind.c_str(),
+                            static_cast<unsigned long long>(diag.concurrent_all_arm_iterations));
             std::printf("max primal viol:   %.3e\n", r.max_primal_violation);
             std::printf("dual residual:     %.3e\n", r.max_dual_violation);
             std::printf("iterations:        %llu (FO %llu, crossover %llu, simplex %llu)\n",
@@ -4721,6 +4729,10 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(diag.perturbed_costs),
                         static_cast<unsigned long long>(diag.perturbation_cleanups),
                         static_cast<unsigned long long>(diag.stall_perturbations));
+            std::printf("  degeneracy       window %.3f degenerate, %.3f revisits; %llu perturbation(s), at phase-2 pivot %llu\n",
+                        diag.degeneracy_window_fraction, diag.degeneracy_window_revisits,
+                        static_cast<unsigned long long>(diag.degeneracy_perturbations),
+                        static_cast<unsigned long long>(diag.degeneracy_perturbation_pivot));
             std::printf("  primal bounds    %10llu perturbations, %llu bounds, %llu restorations (%llu pivots)\n",
                         (unsigned long long)diag.primal_bound_perturbations,
                         (unsigned long long)diag.primal_perturbed_bounds,
@@ -4774,6 +4786,13 @@ int main(int argc, char** argv) {
                             diag.rho_sparse_iters
                                 ? diag.rho_support_entries / diag.rho_sparse_iters
                                 : 0));
+            std::printf("  CHUZR          %10.3f  (%llu calls, %llu full scans, %.1f rows scored per call)\n",
+                        diag.chuzr_ms,
+                        static_cast<unsigned long long>(diag.chuzr_calls),
+                        static_cast<unsigned long long>(diag.chuzr_full_scans),
+                        diag.chuzr_calls ? static_cast<double>(diag.chuzr_rows_scanned) /
+                                               static_cast<double>(diag.chuzr_calls)
+                                         : 0.0);
             std::printf("  ratio sorted     %10llu candidates\n",
                         static_cast<unsigned long long>(
                             diag.ratio_sorted_candidates));

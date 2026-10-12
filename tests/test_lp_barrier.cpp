@@ -30,7 +30,6 @@ core::SolveResult solve(const model::LpProblem& problem, bool crossover, bool pr
                         core::LpDiagnostics& diagnostics) {
     core::LpOptions options;
     options.strategy = core::LpStrategy::Barrier;
-    options.concurrent_solves = 1;
     options.time_limit_s = 60;
     options.primal_feas_tol = 1e-7;
     options.dual_feas_tol = 1e-7;
@@ -90,7 +89,6 @@ int main() {
         const auto scsd6 = read_netlib("scsd6");
         core::LpOptions options;
         options.strategy = core::LpStrategy::Barrier;
-        options.concurrent_solves = 1;
         options.time_limit_s = 60;
         engines::SimplexOptions policy;
         policy.exact_proof = false;

@@ -205,6 +205,7 @@ void rematerialize_original(const model::LpProblem& original,
     const Index ns = original.n_cols();
     diag.primal_residual = std::max(original.max_row_violation(raw.x),
                                     original.max_bound_violation(raw.x));
+    diag.primal_distance = original.max_row_distance(raw.x);
     raw.objective = original.objective(raw.x);
     diag.primal_objective = raw.objective;
 
@@ -218,22 +219,7 @@ void rematerialize_original(const model::LpProblem& original,
     std::vector<f64> yout(sz(m), 0.0);
     for (Index i = 0; i < m; ++i) yout[sz(i)] = sense * raw.y[sz(i)];
 
-    std::vector<long double> aty(sz(ns), 0.0L), ax(sz(m), 0.0L);
-    {
-        const auto& rp = pmin.A.pattern.row_ptr();
-        const auto& ci = pmin.A.pattern.col_idx();
-        for (Index i = 0; i < m; ++i) {
-            long double s = 0.0L;
-            for (Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
-                const auto j = sz(ci[sz(k)]);
-                const f64 v = pmin.A.vals[sz(k)];
-                aty[j] += static_cast<long double>(v) * yout[sz(i)];
-                s += static_cast<long double>(v) * raw.x[j];
-            }
-            ax[sz(i)] = s;
-        }
-    }
-
+    std::vector<long double> aty(sz(ns)), ax(sz(m));
     f64 dres = 0.0;
     Index dres_index = -1;
     bool dres_is_row = false;
@@ -253,12 +239,7 @@ void rematerialize_original(const model::LpProblem& original,
     const auto accum_dual = [&](Index index, bool is_row,
                                 f64 v, f64 l, f64 u, f64 d) {
         SOR_FN();
-        const bool at_lo = (l > -kInf) && (v <= l + at_tol * (1.0 + std::fabs(l)));
-        const bool at_hi = (u <  kInf) && (v >= u - at_tol * (1.0 + std::fabs(u)));
-        if (at_lo && at_hi) return;
-        const f64 violation = at_lo ? std::max(0.0, -d)
-                              : at_hi ? std::max(0.0, d)
-                                      : std::fabs(d);
+        const f64 violation = complementarity_violation(v, l, u, d, at_tol);
         if (violation > dres) {
             dres = violation;
             dres_index = index;
@@ -269,13 +250,44 @@ void rematerialize_original(const model::LpProblem& original,
             dres_reduced = d;
         }
     };
-    for (Index j = 0; j < ns; ++j)
-        accum_dual(j, false, raw.x[sz(j)], pmin.col_lo[sz(j)], pmin.col_hi[sz(j)],
-                   pmin.c[sz(j)] - static_cast<f64>(aty[sz(j)]));
-    for (Index i = 0; i < m; ++i)
-        accum_dual(i, true, static_cast<f64>(ax[sz(i)]), pmin.row_lo[sz(i)], pmin.row_hi[sz(i)],
-                   yout[sz(i)]);
-    diag.dual_residual = dres;
+    const auto evaluate_duals = [&] {
+        std::fill(aty.begin(), aty.end(), 0.0L);
+        std::fill(ax.begin(), ax.end(), 0.0L);
+        const auto& rp = pmin.A.pattern.row_ptr();
+        const auto& ci = pmin.A.pattern.col_idx();
+        for (Index i = 0; i < m; ++i) {
+            long double s = 0.0L;
+            for (Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+                const auto j = sz(ci[sz(k)]);
+                const f64 v = pmin.A.vals[sz(k)];
+                aty[j] += static_cast<long double>(v) * yout[sz(i)];
+                s += static_cast<long double>(v) * raw.x[j];
+            }
+            ax[sz(i)] = s;
+        }
+        dres = 0.0;
+        dres_index = -1;
+        for (Index j = 0; j < ns; ++j)
+            accum_dual(j, false, raw.x[sz(j)], pmin.col_lo[sz(j)], pmin.col_hi[sz(j)],
+                       pmin.c[sz(j)] - static_cast<f64>(aty[sz(j)]));
+        for (Index i = 0; i < m; ++i)
+            accum_dual(i, true, static_cast<f64>(ax[sz(i)]), pmin.row_lo[sz(i)], pmin.row_hi[sz(i)],
+                       yout[sz(i)]);
+        diag.dual_residual = dres;
+        report_enclosure_dual_bound(
+            certify::enclose_reduced_costs(pmin, yout, pmin.col_lo, pmin.col_hi), sense, diag);
+    };
+    evaluate_duals();
+    // The lifted basis's rounded duals miss the bound by an ulp on a
+    // one-sided basic column; its inward duals on this model do not.
+    if (raw.proposed_status == core::Status::Optimal && opts.terminal_bound_published &&
+        strengthen_basis_duals(pmin, sense, raw.certificate_basis, raw.x, opts, diag, yout)) {
+        for (Index i = 0; i < m; ++i) raw.y[sz(i)] = sense * yout[sz(i)];
+        ++diag.inward_dual_corrections;
+        evaluate_duals();
+    }
+    if (!diag.dual_bound_finite && opts.terminal_bound_published)
+        report_simplex_dual_bound(pmin, sense, yout, diag);
     if (core::env_switches().presolve_trace_recovery && dres_index >= 0) {
         std::fprintf(stderr,
                      "presolve recovery max dual residual: %s %d value %.17g "
@@ -283,10 +295,11 @@ void rematerialize_original(const model::LpProblem& original,
                      dres_is_row ? "row" : "column", dres_index,
                      dres_value, dres_lo, dres_hi, dres_reduced, dres);
     }
-    report_simplex_dual_bound(pmin, sense, yout, aty, diag, opts.dual_feas_tol);
     if (!raw.exact_dual.empty()) {
         const auto bound = certify::exact_dual_lower_bound(original, raw.exact_dual);
-        if (bound.finite && (!diag.dual_bound_finite || sense * bound.value > sense * diag.dual_objective)) {
+        // bound.value is the minimization-form bound; diag.dual_objective is
+        // in the model's sense, so compare in minimization form.
+        if (bound.finite && (!diag.dual_bound_finite || bound.value > sense * diag.dual_objective)) {
             diag.dual_objective = sense * bound.value;
             diag.dual_bound_finite = true;
             diag.gap_rel = std::fabs(raw.objective - diag.dual_objective) / (1 + std::fabs(raw.objective));
@@ -356,13 +369,10 @@ void install_simplex_work_totals(SimplexDiagnostics& chosen,
 
 void report_simplex_dual_bound(const model::LpProblem& pmin, f64 sense,
                               const std::vector<f64>& y_min,
-                              const std::vector<long double>& aty,
-                              SimplexDiagnostics& diag,
-                              f64 dual_feas_tol) {
+                              SimplexDiagnostics& diag) {
     SOR_FN();
-    (void)aty; // Rounded stationarity is a diagnostic, never a bound producer.
     const auto bound = certify::safe_lagrangian_lower_bound(
-        pmin, y_min, pmin.col_lo, pmin.col_hi, dual_feas_tol);
+        pmin, y_min, pmin.col_lo, pmin.col_hi);
     diag.dual_bound_finite = bound.finite;
     diag.dual_objective = std::numeric_limits<f64>::quiet_NaN();
     if (bound.finite) {
@@ -374,6 +384,62 @@ void report_simplex_dual_bound(const model::LpProblem& pmin, f64 sense,
         ? std::fabs(diag.primal_objective - diag.dual_objective) /
               (1.0 + std::fabs(diag.primal_objective))
         : std::numeric_limits<f64>::infinity();
+}
+
+void report_enclosure_dual_bound(const certify::RcEnclosure& enclosure, f64 sense,
+                                 SimplexDiagnostics& diag) {
+    diag.dual_bound_finite = false;
+    diag.dual_objective = std::numeric_limits<f64>::quiet_NaN();
+    if (enclosure.finite) {
+        const model::Rational reported = model::Rational(sense) * model::Rational(enclosure.bound);
+        diag.dual_objective = sense > 0 ? model::rounded_down(reported) : model::rounded_up(reported);
+        diag.dual_bound_finite = std::isfinite(diag.dual_objective);
+    }
+    diag.gap_rel = diag.dual_bound_finite
+        ? std::fabs(diag.primal_objective - diag.dual_objective) /
+              (1.0 + std::fabs(diag.primal_objective))
+        : std::numeric_limits<f64>::infinity();
+}
+
+bool strengthen_basis_duals(const model::LpProblem& pmin, f64 sense,
+                            const std::vector<Index>& basis,
+                            const std::vector<f64>& x,
+                            const SimplexOptions& opts,
+                            const SimplexDiagnostics& diag,
+                            std::vector<f64>& y_min) {
+    SOR_FN();
+    if (diag.dual_bound_finite && diag.gap_rel <= opts.gap_tol) return false;
+    const Index m = pmin.n_rows(), n = pmin.n_cols();
+    if (static_cast<Index>(basis.size()) != m || static_cast<Index>(x.size()) != n ||
+        static_cast<Index>(y_min.size()) != m || m == 0)
+        return false;
+    std::vector<f64> candidate;
+    if (!certify::inward_basis_duals(pmin, basis, candidate)) return false;
+    const auto bound = certify::safe_lagrangian_lower_bound(pmin, candidate, pmin.col_lo, pmin.col_hi);
+    if (!bound.finite) return false;
+    // diag.dual_objective is the minimization bound in the original sense,
+    // rounded outward.
+    if (diag.dual_bound_finite && !(bound.value > sense * diag.dual_objective)) return false;
+    std::vector<long double> aty(sz(n), 0.0L), ax(sz(m), 0.0L);
+    const auto& rp = pmin.A.pattern.row_ptr();
+    const auto& ci = pmin.A.pattern.col_idx();
+    for (Index i = 0; i < m; ++i)
+        for (Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+            const auto j = sz(ci[sz(k)]);
+            aty[j] += static_cast<long double>(pmin.A.vals[sz(k)]) * candidate[sz(i)];
+            ax[sz(i)] += static_cast<long double>(pmin.A.vals[sz(k)]) * x[j];
+        }
+    const f64 at_tol = std::max(kAtBound, opts.primal_feas_tol);
+    f64 dres = 0.0;
+    for (Index j = 0; j < n; ++j)
+        dres = std::max(dres, complementarity_violation(x[sz(j)], pmin.col_lo[sz(j)], pmin.col_hi[sz(j)],
+                                                        pmin.c[sz(j)] - static_cast<f64>(aty[sz(j)]), at_tol));
+    for (Index i = 0; i < m; ++i)
+        dres = std::max(dres, complementarity_violation(static_cast<f64>(ax[sz(i)]), pmin.row_lo[sz(i)],
+                                                        pmin.row_hi[sz(i)], candidate[sz(i)], at_tol));
+    if (!(dres <= std::max(opts.dual_feas_tol, diag.dual_residual))) return false;
+    y_min = std::move(candidate);
+    return true;
 }
 
 RouteFeatures detail::route_features(const model::LpProblem& problem,
@@ -507,10 +573,26 @@ bool detail::prefer_simplex_candidate(const core::RawResult& candidate,
     const bool incumbent_farkas = farkas_proved(incumbent, incumbent_diag);
     if (candidate_farkas != incumbent_farkas) return candidate_farkas;
 
-    // Unbounded/Infeasible claims beat Interrupted/NumericalFailure even when
-    // the ray is not yet certified (primal rescue must not bury them).
-    // Optimal is NOT included: an unproved Optimal label can lose to a
-    // primal-feasible Interrupted point (see prefer unit test).
+    // A reportable feasible point is more useful than any infeasible iterate,
+    // independent of which engine produced it or what its (invalid) gap says.
+    // That includes an Infeasible claim whose ray is not certified: a primal
+    // rescue that found a point within tolerance contradicts the claim, and
+    // the uncertified claim must not outrank it.
+    const bool candidate_primal =
+        std::isfinite(candidate_diag.primal_residual) &&
+        candidate_diag.primal_residual <= opts.primal_feas_tol;
+    const bool incumbent_primal =
+        std::isfinite(incumbent_diag.primal_residual) &&
+        incumbent_diag.primal_residual <= opts.primal_feas_tol;
+    if (candidate_primal != incumbent_primal) return candidate_primal;
+
+    // Among points equally (in)feasible, Unbounded/Infeasible claims beat
+    // Interrupted/NumericalFailure even when the ray is not yet certified
+    // (primal rescue must not bury them): an Unbounded claim with its
+    // feasible point over another feasible point, an Infeasible claim over
+    // another infeasible iterate. Optimal is NOT included: an unproved
+    // Optimal label can lose to a primal-feasible Interrupted point (see
+    // prefer unit test).
     const auto ray_claim = [](core::Status s) {
         SOR_FN();
         return s == core::Status::Unbounded ||
@@ -519,16 +601,6 @@ bool detail::prefer_simplex_candidate(const core::RawResult& candidate,
     const bool candidate_ray_claim = ray_claim(candidate.proposed_status);
     const bool incumbent_ray_claim = ray_claim(incumbent.proposed_status);
     if (candidate_ray_claim != incumbent_ray_claim) return candidate_ray_claim;
-
-    // A reportable feasible point is more useful than any infeasible iterate,
-    // independent of which engine produced it or what its (invalid) gap says.
-    const bool candidate_primal =
-        std::isfinite(candidate_diag.primal_residual) &&
-        candidate_diag.primal_residual <= opts.primal_feas_tol;
-    const bool incumbent_primal =
-        std::isfinite(incumbent_diag.primal_residual) &&
-        incumbent_diag.primal_residual <= opts.primal_feas_tol;
-    if (candidate_primal != incumbent_primal) return candidate_primal;
 
     const bool candidate_dual =
         std::isfinite(candidate_diag.dual_residual) &&
@@ -1859,7 +1931,7 @@ core::RawResult solve_primal_simplex_prepared(
             reason = "time limit (" + std::to_string(opts.time_limit_s) + "s)";
             break;
         }
-        if ((iter % 64) == 0 && core::cancel_requested(opts.cancel)) {
+        if (core::cancel_requested(opts.cancel)) {   // every pivot: one atomic load
             status = core::Status::Interrupted;
             reason = "cancelled (concurrent race lost)";
             break;
@@ -2761,29 +2833,12 @@ core::RawResult solve_primal_simplex_prepared(
     // A bug in the iteration therefore shows up as a residual rather than
     // hiding behind the iteration's own view of itself.
     diag.primal_residual = std::max(pmin.max_row_violation(x), pmin.max_bound_violation(x));
+    diag.primal_distance = pmin.max_row_distance(x);
 
-    auto& aty = ws.aty; aty.assign(sz(ns), 0.0L);
-    auto& aty_abs = ws.aty_abs; aty_abs.assign(sz(ns), 0.0L);
-    auto& aty_count = ws.aty_count; aty_count.assign(sz(ns), 0);
-    auto& ax = ws.ax; ax.assign(sz(m), 0.0L);
-    {
-        const auto& rp = pmin.A.pattern.row_ptr();
-        const auto& ci = pmin.A.pattern.col_idx();
-        for (Index i = 0; i < m; ++i) {
-            long double s = 0.0L;
-            for (Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
-                const auto j = sz(ci[sz(k)]);
-                const f64 v = pmin.A.vals[sz(k)];
-                const long double term = static_cast<long double>(v) * yout[sz(i)];
-                aty[j] += term;
-                aty_abs[j] += std::fabs(term);
-                ++aty_count[j];
-                s += static_cast<long double>(v) * x[j];
-            }
-            ax[sz(i)] = s;
-        }
-    }
-
+    auto& aty = ws.aty;
+    auto& aty_abs = ws.aty_abs;
+    auto& aty_count = ws.aty_count;
+    auto& ax = ws.ax;
     f64 dres = 0.0;
     // A variable counts as "on its bound" for complementarity at the same
     // tolerance the primal point was actually solved to, scaled by the bound's
@@ -2799,32 +2854,65 @@ core::RawResult solve_primal_simplex_prepared(
     const f64 at_tol = std::max(kAtBound, opts.primal_feas_tol);
     const auto accum_dual = [&](f64 v, f64 l, f64 u, f64 d) {
         SOR_FN();
-        const bool at_lo = (l > -kInf) && (v <= l + at_tol * (1.0 + std::fabs(l)));
-        const bool at_hi = (u <  kInf) && (v >= u - at_tol * (1.0 + std::fabs(u)));
-        if (at_lo && at_hi) return;                       // fixed: no sign condition
-        if (at_lo)      dres = std::max(dres, std::max(0.0, -d));
-        else if (at_hi) dres = std::max(dres, std::max(0.0,  d));
-        else            dres = std::max(dres, std::fabs(d));
+        dres = std::max(dres, complementarity_violation(v, l, u, d, at_tol));
     };
-    for (Index j = 0; j < ns; ++j)
-        accum_dual(x[sz(j)], pmin.col_lo[sz(j)], pmin.col_hi[sz(j)],
-                   pmin.c[sz(j)] - aty[sz(j)]);
-    // The logical of row i has reduced cost y_i, so dual feasibility of the
-    // rows is the same test applied to the row activity.
-    for (Index i = 0; i < m; ++i)
-        accum_dual(ax[sz(i)], pmin.row_lo[sz(i)], pmin.row_hi[sz(i)], yout[sz(i)]);
-    diag.dual_residual = dres;
-
     f64 obj_min = 0.0;
     for (Index j = 0; j < ns; ++j) obj_min += pmin.c[sz(j)] * x[sz(j)];
     diag.primal_objective = sense * (obj_min + pmin.obj_offset);
-
-    // Check the true, unscaled Lagrangian. Numerical feasibility tolerance
-    // cannot turn a nonzero reduced cost times infinity into zero.
-    report_simplex_dual_bound(pmin, sense, yout, aty, diag, opts.dual_feas_tol);
-    auto rc_enclosure = certify::enclose_reduced_costs_from_sums(
-        pmin, yout, aty, aty_abs, aty_count, pmin.col_lo, pmin.col_hi,
-        opts.dual_feas_tol);
+    certify::RcEnclosure rc_enclosure;
+    const auto evaluate_duals = [&] {
+        aty.assign(sz(ns), 0.0L);
+        aty_abs.assign(sz(ns), 0.0L);
+        aty_count.assign(sz(ns), 0);
+        ax.assign(sz(m), 0.0L);
+        const auto& rp = pmin.A.pattern.row_ptr();
+        const auto& ci = pmin.A.pattern.col_idx();
+        for (Index i = 0; i < m; ++i) {
+            long double s = 0.0L;
+            for (Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+                const auto j = sz(ci[sz(k)]);
+                const f64 v = pmin.A.vals[sz(k)];
+                const long double term = static_cast<long double>(v) * yout[sz(i)];
+                aty[j] += term;
+                aty_abs[j] += std::fabs(term);
+                ++aty_count[j];
+                s += static_cast<long double>(v) * x[j];
+            }
+            ax[sz(i)] = s;
+        }
+        dres = 0.0;
+        for (Index j = 0; j < ns; ++j)
+            accum_dual(x[sz(j)], pmin.col_lo[sz(j)], pmin.col_hi[sz(j)],
+                       pmin.c[sz(j)] - aty[sz(j)]);
+        // The logical of row i has reduced cost y_i, so dual feasibility of the
+        // rows is the same test applied to the row activity.
+        for (Index i = 0; i < m; ++i)
+            accum_dual(ax[sz(i)], pmin.row_lo[sz(i)], pmin.row_hi[sz(i)], yout[sz(i)]);
+        diag.dual_residual = dres;
+        // Check the true, unscaled Lagrangian. Numerical feasibility tolerance
+        // cannot turn a nonzero reduced cost times infinity into zero.
+        rc_enclosure = certify::enclose_reduced_costs_from_sums(
+            pmin, yout, aty, aty_abs, aty_count, pmin.col_lo, pmin.col_hi);
+        report_enclosure_dual_bound(rc_enclosure, sense, diag);
+    };
+    evaluate_duals();
+    // A'y of the engine's own basis duals for the session carry (see the
+    // dual finalizer): the strengthened multipliers are not basis duals.
+    std::vector<long double> engine_aty;
+    if (status == core::Status::Optimal && opts.terminal_bound_published) {
+        engine_aty = aty;
+        if (strengthen_basis_duals(pmin, sense, basis, x, opts, diag, yout)) {
+            ++diag.inward_dual_corrections;
+            evaluate_duals();
+        } else {
+            engine_aty.clear();
+        }
+    }
+    const auto& carry_aty = engine_aty.empty() ? aty : engine_aty;
+    // Multipliers that need a correction (a column without the finite bound
+    // its reduced cost's sign needs): the full routine.
+    if (!rc_enclosure.finite && opts.terminal_bound_published)
+        report_simplex_dual_bound(pmin, sense, yout, diag);
 
     if (out_basis) {
         out_basis->n_struct = ns;
@@ -2909,7 +2997,11 @@ core::RawResult solve_primal_simplex_prepared(
             {.time_limit_s = opts.time_limit_s > 0 ? std::max(std::numeric_limits<double>::min(),
                 opts.time_limit_s - ms_since(t_all) / 1000) : 0})) {
         const auto exact = certify::exact_dual_lower_bound(pmin, raw.exact_dual);
-        if (exact.finite) {
+        // repair_dual_certificate also keeps a targeted witness weaker than
+        // the floating-point bound; the result checker takes the better of
+        // the two, so only a better exact bound replaces the reported one.
+        if (exact.finite && (!diag.dual_bound_finite || !std::isfinite(raw.dual_bound) ||
+                             exact.value > sense * raw.dual_bound)) {
             const model::Rational reported =
                 model::Rational(sense) * model::Rational(exact.value);
             raw.dual_bound = diag.dual_objective = sense > 0
@@ -2930,7 +3022,7 @@ core::RawResult solve_primal_simplex_prepared(
         ws.last_cost = cost; ws.last_y = y;
         ws.last_redcost.resize(sz(nt));
         for (Index j = 0; j < ns; ++j)
-            ws.last_redcost[sz(j)] = (pmin.c[sz(j)] - static_cast<f64>(aty[sz(j)])) *
+            ws.last_redcost[sz(j)] = (pmin.c[sz(j)] - static_cast<f64>(carry_aty[sz(j)])) *
                                      scaling.col_scale[sz(j)];
         for (Index i = 0; i < m; ++i) ws.last_redcost[sz(ns+i)] = y[sz(i)];
         ws.last_point_valid = true;
@@ -3246,6 +3338,7 @@ core::RawResult solve_simplex(const model::LpProblem& problem,
         SimplexOptions stage_opts = o;
         // The reduced model's bound is never the published proof.
         if (used_presolve || !opts.exact_proof) stage_opts.certify_terminal = false;
+        if (used_presolve) stage_opts.terminal_bound_published = false;
         if (opts.time_limit_s > 0.0) {
             const auto remaining = simplex_options_after_elapsed(
                 opts, std::chrono::duration<double>(Clock::now() - presolve_t0).count());
@@ -3746,6 +3839,7 @@ core::ProofEvidence simplex_evidence(const SimplexDiagnostics& diag,
     // what lets finalize_result accept ProvedOptimalFP at all.
     ev.has_basis = true;
     ev.max_primal_violation = diag.primal_residual;
+    ev.max_primal_distance  = diag.primal_distance;
     ev.max_dual_violation   = diag.dual_residual;
     ev.gap_rel              = diag.gap_rel;
     ev.primal_feas_tol      = opts.primal_feas_tol;

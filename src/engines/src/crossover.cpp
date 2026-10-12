@@ -1,5 +1,6 @@
 #include "sor/engines/crossover.hpp"
 #include "sor/core/work_clock.hpp"
+#include "sor/core/cancel.hpp"
 
 #include "sor/certify/finalize.hpp"
 #include "sor/engines/dual_simplex.hpp"
@@ -24,6 +25,21 @@ namespace sor::engines {
 namespace {
 
 using Clock = sor::core::SolverClock;
+
+// When basis construction must stop: its wall-clock deadline, or a rival arm
+// winning a concurrent race (the cleanup simplex inherits the same token
+// through simplex_policy). Without the token the push loops ran to the end
+// after the race was decided: gdb at 3 s and 5 s of a 7.5 s Auto solve of
+// 80bau3b found the dual and primal arms done and only this barrier arm
+// alive, in dual_push_infeasibilities. A stop is reported as
+// time_limit_reached: either way the construction is abandoned.
+struct ConstructionBudget {
+    Clock::time_point deadline;
+    const core::CancelToken* cancel = nullptr;
+    bool expired() const {
+        return Clock::now() >= deadline || core::cancel_requested(cancel);
+    }
+};
 inline double ms_since(Clock::time_point t0) {
     SOR_FN();
     return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
@@ -149,7 +165,7 @@ bool factor_basis(const model::LpProblem& problem,
 bool factor_and_repair(const model::LpProblem& problem,
                        SimplexBasis& basis,
                        f64 pivot_tol,
-                       Clock::time_point deadline,
+                       const ConstructionBudget& budget,
                        CrossoverDiagnostics& diag, la::BasisFactor& factor) {
     SOR_FN();
     const core::Index m = problem.n_rows();
@@ -157,7 +173,7 @@ bool factor_and_repair(const model::LpProblem& problem,
     la::LuOptions lu_opts;
     lu_opts.pivot_tol = std::max<f64>(0.0, pivot_tol);
     for (core::Index attempt = 0; attempt <= m; ++attempt) {
-        if (Clock::now() >= deadline) {
+        if (budget.expired()) {
             diag.time_limit_reached = true;
             return false;
         }
@@ -222,7 +238,7 @@ void dual_push_infeasibilities(
     f64 primal_tol,
     f64 dual_tol,
     f64 basis_pivot_tol,
-    Clock::time_point deadline,
+    const ConstructionBudget& budget,
     SimplexBasis& basis,
     CrossoverDiagnostics& diag,
     const SimplexPrepared* prepared, la::BasisFactor& factor, bool& factor_valid) {
@@ -268,7 +284,7 @@ void dual_push_infeasibilities(
 
     std::vector<f64> alpha(sz(m)), scaled_alpha(sz(m));
     for (const core::Index variable : candidates) {
-        if (Clock::now() >= deadline) {
+        if (budget.expired()) {
             diag.time_limit_reached = true;
             break;
         }
@@ -505,7 +521,7 @@ void spiral_push_superbasics(
     const std::vector<core::Index>& order,
     f64 primal_tol,
     f64 basis_pivot_tol,
-    Clock::time_point deadline,
+    const ConstructionBudget& budget,
     SimplexBasis& basis,
     CrossoverDiagnostics& diag,
     const SimplexPrepared* prepared, la::BasisFactor& factor, bool& factor_valid) {
@@ -539,7 +555,7 @@ void spiral_push_superbasics(
     };
     std::vector<f64> alpha(sz(m)), scaled_alpha(sz(m));
     for (const core::Index entering : order) {
-        if (Clock::now() >= deadline) {
+        if (budget.expired()) {
             diag.time_limit_reached = true;
             break;
         }
@@ -723,17 +739,19 @@ static bool build_crossover_basis_impl(const model::LpProblem& problem,
                            const SimplexPrepared* prepared, FactorCarrier* carrier) {
     SOR_FN();
     const auto t0 = Clock::now();
-    const auto deadline = opts.time_limit_s > 0.0
-        ? t0 + std::chrono::duration_cast<Clock::duration>(
-                   std::chrono::duration<double>(opts.time_limit_s))
-        : Clock::time_point::max();
+    const ConstructionBudget budget{
+        opts.time_limit_s > 0.0
+            ? t0 + std::chrono::duration_cast<Clock::duration>(
+                       std::chrono::duration<double>(opts.time_limit_s))
+            : Clock::time_point::max(),
+        opts.simplex_policy ? opts.simplex_policy->cancel : nullptr};
     const core::Index m = problem.n_rows();
     const core::Index n = problem.n_cols();
     if (fo_result.x.size() != sz(n)) return false;
 
     const auto classes = classify_crossover_variables(
         problem, fo_result, opts.primal_tol, opts.dual_tol);
-    if (Clock::now() >= deadline) {
+    if (budget.expired()) {
         diag.time_limit_reached = true;
         diag.basis_build_ms = ms_since(t0);
         return false;
@@ -842,7 +860,7 @@ static bool build_crossover_basis_impl(const model::LpProblem& problem,
             }
         }
     }
-    if (Clock::now() < deadline) {
+    if (!budget.expired()) {
         const auto crash = detail::triangular_crash(
             work, work_csc, work_lo, work_hi, work_ptol, basis.basic, slot_of,
             basis.status, work_value, &crash_eligible);
@@ -874,7 +892,7 @@ static bool build_crossover_basis_impl(const model::LpProblem& problem,
         return score(a) < score(b);
     });
 
-    if (Clock::now() >= deadline) {
+    if (budget.expired()) {
         diag.time_limit_reached = true;
         diag.basis_build_ms = ms_since(t0);
         return false;
@@ -889,14 +907,14 @@ static bool build_crossover_basis_impl(const model::LpProblem& problem,
         : opts.basis_pivot_tol;
     dual_push_infeasibilities(problem, fo_result, augmented_reduced,
                               opts.primal_tol, opts.dual_tol, pivot_floor,
-                              deadline, basis, diag, prepared, factor,
+                              budget, basis, diag, prepared, factor,
                               factor_valid);
     if (diag.time_limit_reached) {
         diag.basis_build_ms = ms_since(t0);
         return false;
     }
     spiral_push_superbasics(problem, fo_result, classes, reduced, order,
-                            opts.primal_tol, pivot_floor, deadline,
+                            opts.primal_tol, pivot_floor, budget,
                             basis, diag, prepared, factor, factor_valid);
     if (diag.time_limit_reached) {
         diag.basis_build_ms = ms_since(t0);
@@ -904,7 +922,7 @@ static bool build_crossover_basis_impl(const model::LpProblem& problem,
     }
     diag.basis_candidate_built = true;
     diag.basis_candidate_factorized = factor_valid || factor_and_repair(
-        prepared ? prepared->scaled : problem, basis, pivot_floor, deadline, diag, factor);
+        prepared ? prepared->scaled : problem, basis, pivot_floor, budget, diag, factor);
     if (diag.basis_candidate_factorized && carrier && prepared) {
         carrier->matrix = &problem;
         carrier->rows = m; carrier->cols = n;
@@ -1044,9 +1062,11 @@ core::RawResult crossover_to_simplex(const model::LpProblem& problem,
     }
 
     // Warm cleanup that reaches Optimal within primal/dual feasibility is a
-    // proved basis for crossover. Requiring a closed Lagrangian gap here
+    // usable basis for crossover. Requiring a closed Lagrangian gap here
     // forced a full cold dual on d2q06c whenever the cleanup arm ran with
-    // certify_terminal off — finalize's C9 snap closes that gap independently.
+    // certify_terminal off. The gap is the independent check's business:
+    // it labels the result ProvedOptimalFP only when its own rigorous bound
+    // closes, ProvedKKT otherwise.
     const bool warm_proved = basis_ok && raw.proposed_status == core::Status::Optimal &&
         diag.simplex.primal_residual <= opts.primal_tol &&
         diag.simplex.dual_residual <= opts.dual_tol;

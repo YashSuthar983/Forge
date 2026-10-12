@@ -167,47 +167,6 @@ void pock_chambolle_scale(model::LpProblem& p, RuizScaling& accumulated,
     }
 }
 
-void pdlp_magnitude_rescale(model::LpProblem& p, RuizScaling& accumulated) {
-    p.validate(/*allow_empty_domains=*/true);
-    const auto nr = static_cast<std::size_t>(p.n_rows());
-    const auto nc = static_cast<std::size_t>(p.n_cols());
-    f64 mag = 0.0;
-    for (std::size_t j = 0; j < nc; ++j)
-        mag = std::max(mag, std::fabs(p.c[j]));
-    for (std::size_t j = 0; j < nc; ++j) {
-        if (p.col_lo[j] > -kInf) mag = std::max(mag, std::fabs(p.col_lo[j]));
-        if (p.col_hi[j] <  kInf) mag = std::max(mag, std::fabs(p.col_hi[j]));
-    }
-    for (std::size_t i = 0; i < nr; ++i) {
-        if (p.row_lo[i] > -kInf) mag = std::max(mag, std::fabs(p.row_lo[i]));
-        if (p.row_hi[i] <  kInf) mag = std::max(mag, std::fabs(p.row_hi[i]));
-    }
-    if (!(mag > 0.0) || !std::isfinite(mag)) return;
-    const f64 scale = std::max(1.0, mag);
-    if (scale == 1.0) return;
-    const auto finite_scaled = [](f64 original, f64 value) {
-        if (!std::isfinite(value) || (original != 0.0 && value == 0.0))
-            throw std::invalid_argument("PDLP magnitude rescale: overflow or underflow");
-        return value;
-    };
-    for (std::size_t j = 0; j < nc; ++j)
-        p.c[j] = finite_scaled(p.c[j], p.c[j] / scale);
-    for (std::size_t j = 0; j < nc; ++j) {
-        if (p.col_lo[j] > -kInf)
-            p.col_lo[j] = finite_scaled(p.col_lo[j], p.col_lo[j] / scale);
-        if (p.col_hi[j] <  kInf)
-            p.col_hi[j] = finite_scaled(p.col_hi[j], p.col_hi[j] / scale);
-    }
-    for (std::size_t i = 0; i < nr; ++i) {
-        if (p.row_lo[i] > -kInf)
-            p.row_lo[i] = finite_scaled(p.row_lo[i], p.row_lo[i] / scale);
-        if (p.row_hi[i] <  kInf)
-            p.row_hi[i] = finite_scaled(p.row_hi[i], p.row_hi[i] / scale);
-    }
-    accumulated.magnitude_scale = finite_scaled(
-        accumulated.magnitude_scale, accumulated.magnitude_scale * scale);
-}
-
 core::RawResult solve_pdhg(const model::LpProblem& problem,
                               const PdhgOptions& opts,
                               KernelBackend& be,
@@ -234,7 +193,6 @@ core::RawResult solve_pdhg(const model::LpProblem& problem,
     RuizScaling scaling = ruiz_scale(p, opts.ruiz_iterations, false, stop_requested);
     if (opts.use_pock_chambolle && !stop_requested())
         pock_chambolle_scale(p, scaling, opts.pock_chambolle_alpha);
-    if (!stop_requested()) pdlp_magnitude_rescale(p, scaling);
     diag.scaling_ms = ms_since(t_scale);
 
     const auto nr = static_cast<std::size_t>(p.n_rows());
@@ -425,12 +383,10 @@ core::RawResult solve_pdhg(const model::LpProblem& problem,
     // ---- 4. unscale and report ------------------------------------------
     core::RawResult raw;
     raw.x.resize(nc);
-    const f64 mag = scaling.magnitude_scale;
-    for (std::size_t j = 0; j < nc; ++j)
-        raw.x[j] = x[j] * scaling.col_scale[j] * mag;
+    for (std::size_t j = 0; j < nc; ++j) raw.x[j] = x[j] * scaling.col_scale[j];
     raw.y.resize(nr);
     for (std::size_t i = 0; i < nr; ++i)
-        raw.y[i] = -sense * y[i] * scaling.row_scale[i] * mag;
+        raw.y[i] = -sense * y[i] * scaling.row_scale[i];
 
     raw.objective  = diag.primal_objective;
     raw.dual_bound = diag.dual_objective;

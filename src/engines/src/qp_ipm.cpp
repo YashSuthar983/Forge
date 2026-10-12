@@ -985,11 +985,16 @@ Result run_ipm(const Core& k, const QpOptions& opts, Clock::time_point t0,
     for (int it = 0; it < max_it; ++it) {
         const auto it_t0 = Clock::now();
         const f64 fac_at_it = fac_ms, sol_at_it = solve_ms;
-        res.iterations = it + 1;
         if (opts.time_limit_s > 0.0 && ms_since(t0) > opts.time_limit_s * 1000.0) {
             res.reason = "time limit";
             break;
         }
+        if (core::cancel_requested(opts.cancel)) {
+            res.reason = "cancelled (concurrent race lost)";
+            break;
+        }
+        // Counted once it runs: a step stopped before any work is none.
+        res.iterations = it + 1;
         // Residuals.
         std::vector<f64> x(z.begin(), z.begin() + n);
         q_mul(k, x, qx);
@@ -1543,7 +1548,14 @@ core::RawResult solve_qp_ipm(const QpProblem& p, const QpOptions& opts, QpDiagno
     bool polished = false;
     // Polished in the Ruiz-scaled space, as OSQP does: unscaled, 10034 gave
     // a row regularisation of 4.8e9 and garbage solves.
-    if (!ok && opts.polish) polished = ok = qpc::polish_scaled(p, ob, sc, ps, sb, opts, raw.x, raw.y, last);
+    // Not once the time is spent: the loop stopped at the limit, and the
+    // polish's active-set factorization is unbounded work (dfl001,
+    // --time-limit 2: the interior point stopped at 1.2 s, the polish ran
+    // another 4.9 s).
+    const bool time_left = opts.time_limit_s <= 0.0 ||
+        ms_since(t0) < opts.time_limit_s * 1000.0;
+    if (!ok && opts.polish && time_left && !core::cancel_requested(opts.cancel))
+        polished = ok = qpc::polish_scaled(p, ob, sc, ps, sb, opts, raw.x, raw.y, last);
     diag.iterations = static_cast<std::uint64_t>(r.iterations);
     diag.worst_solve_residual = r.worst_solve_residual;
     diag.primal_residual = last.primal;

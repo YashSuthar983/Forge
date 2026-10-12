@@ -445,6 +445,11 @@ static core::RawResult dual_prepared_pass(
     // Declared early so enter_phase2 can mark a boundary perturbation and the
     // mid-run stall path will not fire a second bulk edit.
     bool stall_perturbation_done = costs_perturbed;
+    // Columns the persistent-degeneracy trigger found basic; each takes its
+    // perturbation when it leaves the basis. Emptied whenever the true costs
+    // come back, so a cleanup never resurrects a perturbation.
+    auto& perturb_on_leave = pass_ws.perturb_on_leave;
+    perturb_on_leave.clear();
 
     // Per-column dual-feasibility thresholds in SCALED space, chosen so that
     // "d_j within tolerance" means the same thing on the UNSCALED model the
@@ -637,9 +642,19 @@ static core::RawResult dual_prepared_pass(
     BasisFactor factor;
     std::uint64_t drift_solve_base = 0;   // solve work of earlier factors
     auto& pricing_pool = pass_ws.pricing_pool;
-    // Gate at m > 2000 so pilot87 (m=2031) gets the pricing pool; smaller
-    // bases skip it (pool start/join was ~5% of awhea's tree search).
-    if (opts.pricing_threads > 1 && m > 2000) {
+    // The pool splits whole-basis row scans (the dense-regime CHUZR, the
+    // indexed heap's rebuild) into one contiguous slice per worker. Measured
+    // on neos-3402294-bobin (896 dense scans of 524k rows): 1,083 ms on one
+    // thread, 828 ms on two, 776 ms on four -- the scan is bandwidth-bound,
+    // so slicing saves ~0.55 ns per row whatever the worker count, against
+    // ~6 us for a ThreadPool::run dispatch and join. It pays from ~11k rows.
+    // (pilot87, dfl001, fit2p and the other Netlib models above the old
+    // m > 2000 gate gained nothing from it: 1 vs 4 threads within 1%.)
+    constexpr f64 kPoolDispatchNs = 6000.0;
+    constexpr f64 kPoolRowSavingNs = 0.55;
+    const bool pool_pays = opts.pricing_threads > 1 &&
+        kPoolRowSavingNs * static_cast<f64>(m) > kPoolDispatchNs;
+    if (pool_pays) {
         if (!pricing_pool || pricing_pool->size() != opts.pricing_threads)
             pricing_pool = std::make_unique<core::ThreadPool>(opts.pricing_threads);
     } else pricing_pool.reset();
@@ -648,6 +663,10 @@ static core::RawResult dual_prepared_pass(
     // representation is live; the product-form path never asks for it.
     la::SpikeCapture entering_spike;
     const bool want_spike = opts.update_method == la::UpdateMethod::ForrestTomlin;
+    // The leaving row's e_p^T U^-1, captured by the pivotal-row BTRAN for the
+    // same update (la::RowEtaCapture); the update checks it describes the
+    // factor it is applied to.
+    la::RowEtaCapture leave_row_eta;
     const auto do_ftran = [&](std::vector<f64>& v, bool capture = false) {
         SOR_FN();
         const auto t0 = tick();
@@ -665,7 +684,7 @@ static core::RawResult dual_prepared_pass(
                                    bool capture = false) {
         SOR_FN();
         const auto t0 = tick();
-        if (opts.parallel_basis_solves && pricing_pool && m > 2000) {
+        if (opts.parallel_basis_solves && pricing_pool) {
             std::vector<std::vector<f64>> rhs;
             rhs.push_back(std::move(a)); rhs.push_back(std::move(b));
             std::vector<la::SpikeCapture> spikes;
@@ -746,7 +765,8 @@ static core::RawResult dual_prepared_pass(
             v[sz(previous_btran_seed)] = 0.0;
         btran_seed[0] = seed_slot;
         const auto t0 = tick();
-        const bool sparse = factor.btran_seeded_with_support(v, btran_seed, support);
+        const bool sparse = factor.btran_seeded_with_support(
+            v, btran_seed, support, want_spike ? &leave_row_eta : nullptr);
         const double dt = tock(t0);
         ++diag.solve_calls;
         ++diag.btran_calls;
@@ -836,6 +856,32 @@ static core::RawResult dual_prepared_pass(
     chuzr_candidate_stamp.assign(sz(m), 0);
     std::uint32_t chuzr_candidate_generation = 1;
     f64 chuzr_theta = 0.0;
+    // The rows a CHUZR scan has to look at: every slot outside its working
+    // bounds by more than its tolerance (score > 0), and no other. Valid
+    // under the same discipline as the candidates -- a full scan rebuilds it
+    // after any wholesale change of x_B or the slot bounds (invalidate), and
+    // in between every changed row comes through the dirty list, where its
+    // membership is re-decided. Membership depends on x_B and the slot
+    // bounds only, not on the row weights, so a weight update needs nothing.
+    auto& infeasible_rows = pass_ws.infeasible_rows;
+    infeasible_rows.clear();
+    auto& infeasible_pos = pass_ws.infeasible_pos;
+    infeasible_pos.assign(sz(m), -1);
+    const auto set_row_infeasible = [&](Index i, bool infeasible) {
+        Index& at = infeasible_pos[sz(i)];
+        if (infeasible) {
+            if (at >= 0) return;
+            at = static_cast<Index>(infeasible_rows.size());
+            infeasible_rows.push_back(i);
+        } else {
+            if (at < 0) return;
+            const Index last = infeasible_rows.back();
+            infeasible_rows[sz(at)] = last;
+            infeasible_pos[sz(last)] = at;
+            infeasible_rows.pop_back();
+            at = -1;
+        }
+    };
     const auto mark_leave_row_dirty = [&](Index row) {
         SOR_FN();
         if (leave_heap_all_dirty || row < 0 || row >= m) return;
@@ -877,6 +923,7 @@ static core::RawResult dual_prepared_pass(
     f64 average_log_low_dse_error = 0.0;
     f64 average_log_high_dse_error = 0.0;
     bool dse_switch_pending = false;
+    bool dse_cost_switch_pending = false;
     bool dse_accuracy_switch_pending = false;
     // Dual ratio-test candidates: (column, pivot-row entry, reduced cost) in
     // one fused pass. The old code computed aj and d_j twice per iteration
@@ -991,16 +1038,17 @@ static core::RawResult dual_prepared_pass(
     const bool use_indexed_chuzr =
         core::env_switches().dual_indexed_chuzr ||
         verify_heap_requested;
-    // Hypersparse CHUZR: keep the best rows of the last full scan and the
-    // bound theta every other row stayed under, then re-score only the rows
-    // a pivot touched (the dirty rows above). The best candidate is the full
+    // Hypersparse CHUZR: keep the best rows of the last scan and the bound
+    // theta every other row stayed under, then re-score only the rows a
+    // pivot touched (the dirty rows above). The best candidate is the full
     // scan's answer, ties included, whenever it beats theta strictly;
-    // otherwise rescan. On supportcase12's LP relaxation (m = 28k, about 75
-    // rows touched per pivot) the full scan was 101 us of every pivot.
-    // Below kCandidateChuzrRows a full scan is too cheap to beat.
-    constexpr Index kCandidateChuzrRows = 4096;
+    // otherwise rescan -- and a rescan reads only the infeasible rows, which
+    // are maintained exactly (infeasible_rows), not all m. On
+    // supportcase12's LP relaxation (m = 28k, about 75 rows touched per
+    // pivot) the full scan was 101 us of every pivot; on fit2p (m = 3,000)
+    // the full scans were 13% of the solve.
     const bool use_candidate_chuzr = !use_indexed_chuzr &&
-        !core::env_switches().dual_fullscan_chuzr && m >= kCandidateChuzrRows;
+        !core::env_switches().dual_fullscan_chuzr;
     const bool force_full_chuzr =
         core::env_switches().dual_fullscan_chuzr ||
         (!use_indexed_chuzr && !use_candidate_chuzr);
@@ -1561,8 +1609,16 @@ static core::RawResult dual_prepared_pass(
     // instead costs a sweep over every nonbasic column plus an FTRAN, which
     // on flip-heavy runs dominated the dual's phase 1 (maros-r7: 3783
     // phase-1 iterations, 12.9s -> under a second of flip maintenance).
-    // Previous flip-FTRAN support (zero-before-reuse). Invalid means the last
-    // flip used a dense write and rhs may be dirty everywhere.
+    // The seeded FTRAN below is valid only if its input is zero outside the
+    // previous output support and the new seed (BasisFactor contract). That
+    // invariant is kept by clearing the previous support, which is sound only
+    // while nothing else writes the buffer: sharing `rhs` with recompute_xB()
+    // (dense x_B left behind) fed stale entries into every later flip, and
+    // 80bau3b drifted by whole bound ranges every 32 pivots from pivot 224.
+    // So the flip shift owns its buffer. Invalid support means the last flip
+    // used a dense write and the buffer may be dirty everywhere.
+    auto& flip_rhs = pass_ws.flip_rhs;
+    flip_rhs.assign(sz(m), 0.0);
     std::vector<Index> flip_support;
     bool flip_support_valid = false;
     std::vector<Index> flip_seed;
@@ -1574,9 +1630,9 @@ static core::RawResult dual_prepared_pass(
         const auto flip_t0 = tick();
         ++diag.flip_batches;
         if (flip_support_valid) {
-            for (const Index i : flip_support) rhs[sz(i)] = 0.0;
+            for (const Index i : flip_support) flip_rhs[sz(i)] = 0.0;
         } else {
-            std::fill(rhs.begin(), rhs.end(), 0.0);
+            std::fill(flip_rhs.begin(), flip_rhs.end(), 0.0);
         }
         flip_seed.clear();
         flip_seed.reserve(flipped.size() * 8);
@@ -1589,7 +1645,7 @@ static core::RawResult dual_prepared_pass(
             if (delta == 0.0) continue;
             for_col(j, [&](Index i, f64 v) {
                 SOR_FN();
-                rhs[sz(i)] -= v * delta;
+                flip_rhs[sz(i)] -= v * delta;
                 flip_seed.push_back(i);
             });
         }
@@ -1603,7 +1659,7 @@ static core::RawResult dual_prepared_pass(
         flip_seed.erase(std::unique(flip_seed.begin(), flip_seed.end()),
                         flip_seed.end());
         if (alpha_sparse_enabled) {
-            (void)do_ftran_seeded(rhs, flip_seed, flip_support);
+            (void)do_ftran_seeded(flip_rhs, flip_seed, flip_support);
             if (++flip_stamp_gen == 0) {
                 std::fill(flip_stamp.begin(), flip_stamp.end(), 0);
                 flip_stamp_gen = 1;
@@ -1611,15 +1667,15 @@ static core::RawResult dual_prepared_pass(
             for (const Index i : flip_support)
                 flip_stamp[sz(i)] = flip_stamp_gen;
             for (const Index i : flip_seed)
-                if (flip_stamp[sz(i)] != flip_stamp_gen) rhs[sz(i)] = 0.0;
+                if (flip_stamp[sz(i)] != flip_stamp_gen) flip_rhs[sz(i)] = 0.0;
             for (const Index i : flip_support) {
-                xB[sz(i)] += rhs[sz(i)];
+                xB[sz(i)] += flip_rhs[sz(i)];
                 mark_leave_row_dirty(i);
             }
             flip_support_valid = true;
         } else {
-            do_ftran(rhs);
-            for (Index i = 0; i < m; ++i) xB[sz(i)] += rhs[sz(i)];
+            do_ftran(flip_rhs);
+            for (Index i = 0; i < m; ++i) xB[sz(i)] += flip_rhs[sz(i)];
             invalidate_leave_heap();
             flip_support_valid = false;
             flip_support.clear();
@@ -1869,6 +1925,7 @@ static core::RawResult dual_prepared_pass(
         if (costs_perturbed) ++diag.perturbation_cleanups;
         costs_perturbed = false;
         costs_shifted = false;
+        perturb_on_leave.clear();
         shifts_since_restore = 0;
         recompute_pi();
         return true;
@@ -2685,9 +2742,17 @@ static core::RawResult dual_prepared_pass(
     const auto refresh_leave_heap = [&]() {
         SOR_FN();
         if (leave_heap_all_dirty) {
-            if (pricing_pool && m > 2000) {
-                pricing_pool->parallel_for(m, [&](Offset row, int) {
-                    parallel_row_scores[sz(row)] = leave_row_score(static_cast<Index>(row));
+            if (pricing_pool) {
+                // One contiguous slice per worker. A task per row put a
+                // shared atomic increment and an indirect call on every row:
+                // supportcase12's CHUZR (SOR_DUAL_INDEXED_CHUZR) went from
+                // 41 ms on one thread to 82 ms on four; sliced, 47 ms.
+                const int workers = pricing_pool->size();
+                pricing_pool->run(workers, [&](int worker) {
+                    const Index begin = static_cast<Index>(static_cast<std::int64_t>(m)*worker/workers);
+                    const Index end = static_cast<Index>(static_cast<std::int64_t>(m)*(worker+1)/workers);
+                    for (Index i = begin; i < end; ++i)
+                        parallel_row_scores[sz(i)] = leave_row_score(i);
                 });
                 leave_heap.rebuild(m, [&](Index row) { return parallel_row_scores[sz(row)]; });
             } else {
@@ -2848,10 +2913,12 @@ static core::RawResult dual_prepared_pass(
                     ++costly_dse_iterations;
                     ++diag.costly_dse_iterations;
                 }
-                dse_switch_pending = dse_switch_pending ||
+                // Too dear, not inaccurate: rebuilding the weights would only
+                // pay m BTRANs to stay dear, so this one hands off to Devex.
+                dse_cost_switch_pending = dse_cost_switch_pending ||
                     (allow_dse_adaptive &&
                      dual_dse_should_switch_to_devex(
-                         costly_dse_iterations, dse_local_iterations, nt));
+                         costly_dse_iterations, dse_local_iterations));
                 dse_switch_pending = dse_switch_pending ||
                     (allow_dse_to_devex_switch &&
                      dual_dse_stability_requires_devex(diag.phase_restarts));
@@ -2952,7 +3019,8 @@ static core::RawResult dual_prepared_pass(
                 ? factor.update_ft(leave, alpha, lu_opts, opts.pivot_tol,
                                    alpha_is_sparse ? &alpha_support : nullptr,
                                    entering_spike.valid ? &entering_spike
-                                                        : nullptr)
+                                                        : nullptr,
+                                   &leave_row_eta)
                 : factor.update(leave, alpha, opts.pivot_tol);
         diag.basis_update_ms += tock(update_t0);
         ++diag.basis_update_calls;
@@ -3033,13 +3101,8 @@ static core::RawResult dual_prepared_pass(
                drift_solve_base +
                static_cast<std::uint64_t>(factor.work_since_factor());
     };
-    // Max |equation residual| seen by the last drift check (0 if none).
-    // Used to refuse a residual-triggered refactor on a catastrophically
-    // inconsistent basis — those factorizations can fail to return.
-    long double drift_max_residual = 0.0L;
     const auto drift_exceeds_limit = [&]() {
         std::uint64_t scanned = 0;
-        drift_max_residual = 0.0L;
         struct Record {
             std::uint64_t& scanned; std::uint64_t& cost; std::uint64_t& mark; std::uint64_t now;
             ~Record() { cost = scanned; mark = now; }
@@ -3060,7 +3123,6 @@ static core::RawResult dual_prepared_pass(
         }
         for (Index i = 0; i < m; ++i) {
             const long double r = equation_residual[sz(i)];
-            drift_max_residual = std::max(drift_max_residual, std::fabs(r));
             if (!std::isfinite(r) ||
                 std::fabs(r) > opts.residual_refactor_tol * (1.0L + equation_scale[sz(i)])) {
                 if (opts.verbose)
@@ -3079,7 +3141,6 @@ static core::RawResult dual_prepared_pass(
                     scale += std::fabs(term);
                     ++scanned;
                 });
-                drift_max_residual = std::max(drift_max_residual, std::fabs(residual));
                 if (!std::isfinite(residual) ||
                     std::fabs(residual) > opts.residual_refactor_tol * (1.0L + scale)) {
                     if (opts.verbose)
@@ -3169,6 +3230,78 @@ static core::RawResult dual_prepared_pass(
         diag.perturbed_costs += changed;
         ++diag.stall_perturbations;
         SOR_ROUTE(1, "simplex_dual", "stall_perturbation");
+    };
+
+    // ---- persistent-degeneracy trigger -------------------------------------
+    // Perturbing costs up front (--dual-perturbation-at-start) takes
+    // neos-957323 from 50,119 dual pivots to ~5,000, and costs Netlib 3% and
+    // some MIPLIB relaxations 5-20x (widden 3,040 -> 63,059, net12 3,590 ->
+    // 19,647): only a stalling run should pay it, and a run's first pivots do
+    // not say whether it stalls. Evidence is gathered over windows of
+    // K = min(500, 2m) phase-2 pivots:
+    //   * the degenerate fraction: pivots whose entering reduced cost is
+    //     within its dual tolerance, so the dual objective does not move;
+    //   * the revisit fraction: pivots whose leaving variable already left
+    //     the basis within the last K pivots.
+    // Degeneracy alone does not separate the cases, and neither does the
+    // first window: every Netlib model starts with a degenerate burst
+    // (perold 0.85, nesm 0.80, pilot.ja 0.75) that is gone a window later
+    // (0.25, 0.03, 0.07), and several MIPLIB relaxations stay 0.9-1.0
+    // degenerate while still converging in fewer pivots than rows
+    // (neos-631710: 5,734 pivots, m = 169,576), because each degenerate
+    // pivot repairs a fresh row. A stall is degeneracy that keeps returning
+    // to the same variables: neos-957323 windows 2-3 are 0.95/0.98
+    // degenerate with 0.072/0.054 revisits, the converging degenerate runs
+    // (ex9, neos-631710, widden, app1-2, net12, momentum1) stay at or below
+    // 0.022 revisits, and no Netlib window after the first reaches 0.8
+    // degeneracy (grow22 0.71 is the highest). Two consecutive windows at
+    // >= 0.8 degenerate and >= 0.05 revisits fire it, once.
+    //
+    // It then perturbs every nonbasic structural cost (sign by its bound, so
+    // |d_j| only grows and no feasibility is lost) and marks the basic ones,
+    // which take theirs when they leave -- by then the end state of an
+    // up-front perturbation, reached without restarting the dual. The
+    // terminal cleanup_working_costs removes it like any other perturbation.
+    constexpr f64 kDegenerateWindowFraction = 0.8;
+    constexpr f64 kRevisitWindowFraction = 0.05;
+    const std::uint64_t degen_window =
+        std::min<std::uint64_t>(500, 2 * static_cast<std::uint64_t>(std::max<Index>(m, 1)));
+    std::uint64_t phase2_pivots = 0;
+    std::uint64_t window_degenerate = 0, window_revisits = 0;
+    int stalled_windows = 0;
+    auto& last_left_pivot = pass_ws.last_left_pivot;
+    last_left_pivot.assign(sz(nt), 0);
+    const auto perturbation_delta = [&](Index j, NonbasicStatus s_j) {
+        return koberstein_perturbation(
+            cost[sz(j)], s_j == NonbasicStatus::AtUpper,
+            deterministic_fraction(static_cast<std::uint64_t>(j) + opts.perturbation_seed),
+            column_nonzeros(j), opts.dual_feas_tol, mean_abs_cost);
+    };
+    const auto perturb_persistent_degeneracy = [&]() {
+        SOR_FN();
+        stall_perturbation_done = true;
+        perturb_on_leave.assign(sz(ns), 0);
+        std::uint64_t changed = 0, deferred = 0;
+        for (Index j = 0; j < ns; ++j) {
+            if (!perturbable(j)) continue;
+            const NonbasicStatus s_j = st[sz(j)];
+            if (s_j == NonbasicStatus::Basic) {
+                perturb_on_leave[sz(j)] = 1;
+                ++deferred;
+                continue;
+            }
+            if (s_j != NonbasicStatus::AtLower && s_j != NonbasicStatus::AtUpper) continue;
+            const f64 delta = perturbation_delta(j, s_j);
+            work_cost[sz(j)] += delta;
+            redcost[sz(j)] += delta;
+            ++changed;
+        }
+        if (changed + deferred == 0) { perturb_on_leave.clear(); return; }
+        costs_perturbed = true;
+        diag.perturbed_costs += changed;
+        ++diag.degeneracy_perturbations;
+        diag.degeneracy_perturbation_pivot = phase2_pivots;
+        SOR_ROUTE(1, "simplex_dual", "degeneracy_perturbation");
     };
 
     // ---- objective-stagnation detector -----------------------------------
@@ -3388,9 +3521,10 @@ static core::RawResult dual_prepared_pass(
             route_simplex_dual_terminal("terminal_status", status, iter, phase);
             break;
         }
-        // Same cadence, no clock read: a rival arm has already proved this LP,
-        // so everything this one computes from here is discarded.
-        if ((iter % 64) == 0 && core::cancel_requested(opts.cancel)) {
+        // Every pivot: a rival arm has already proved this LP, so everything
+        // this one computes from here is discarded, and the test is one
+        // relaxed atomic load (on a tall model 64 pivots were half a second).
+        if (core::cancel_requested(opts.cancel)) {
             status = core::Status::Interrupted;
             reason = "cancelled (concurrent race lost)";
             route_simplex_dual_terminal("terminal_status", status, iter, phase);
@@ -3400,19 +3534,16 @@ static core::RawResult dual_prepared_pass(
             since_refactor > 0 && (iter % static_cast<std::uint64_t>(opts.residual_check_interval)) == 0 &&
             drift_pivot_work() - drift_work_mark >= kDriftWorkRatio * drift_check_cost &&
             drift_exceeds_limit()) {
-            // Round-off drift is small relative to activity. An O(1) residual
-            // means the primal point and basis have diverged; refactorizing
-            // that basis can spend unbounded time in LU (80bau3b hung here).
-            // Hand off so Dual/Auto can fall back to primal. Crossover cleanup
-            // should disable residual checks (residual_check_interval = 0).
-            constexpr long double kCatastrophicResidual = 1.0e-2L;
-            if (drift_max_residual >= kCatastrophicResidual ||
-                diag.residual_refactors >= 2) {
-                status = core::Status::NumericalFailure;
-                reason = "catastrophic primal equation drift; refusing residual refactor";
-                route_simplex_dual_terminal("numerical_failure", status, iter, phase);
-                break;
-            }
+            // Always refactor: the rebuild re-derives x_B and the prices from
+            // the factor, which removes update drift of any size. Handing the
+            // run to the primal instead (tried when an O(1) residual was
+            // blamed on LU) threw away the whole dual phase: d2q06c 12,669
+            // pivots against 4,961. The large residuals were the flip-buffer
+            // aliasing fixed in apply_flip_shift, and the "LU hang" was the
+            // negative-step redo spinning on a fresh factor. Repeats are
+            // bounded: the check needs since_refactor > 0 and at least
+            // residual_check_interval pivots, and its work gate, between
+            // firings.
             do_factorize();
             since_refactor = 0;
             ++diag.residual_refactors;
@@ -3521,7 +3652,7 @@ static core::RawResult dual_prepared_pass(
                 f64 best = 0.0;
                 Index selected = -1;
                 bool selected_to_lower = true;
-                if (pricing_pool && m > 2000) {
+                if (pricing_pool) {
                     const int workers = pricing_pool->size();
                     pricing_pool->run(workers, [&](int worker) {
                         const Index begin = static_cast<Index>(static_cast<std::int64_t>(m)*worker/workers);
@@ -3557,7 +3688,12 @@ static core::RawResult dual_prepared_pass(
 
             // Full scan for the candidate CHUZR: the answer exactly as
             // exhaustive_leave gives it, plus the best kCandidates rows and
-            // theta, the best score among the rest.
+            // theta, the best score among the rest. After a wholesale change
+            // it reads every row and rebuilds the infeasible set; otherwise
+            // that set is current and holds every row with a positive score,
+            // so reading it alone gives the same answer. Its order is not the
+            // index order, so ties go to the lower index explicitly, as the
+            // ascending exhaustive scan breaks them.
             const auto candidate_full_scan = [&](bool* direction) -> Index {
                 SOR_FN();
                 constexpr std::size_t kCandidates = 64;
@@ -3565,12 +3701,31 @@ static core::RawResult dual_prepared_pass(
                 Index selected = -1;
                 bool selected_to_lower = true;
                 chuzr_scored.clear();
-                for (Index i = 0; i < m; ++i) {
-                    bool to_lower = true;
-                    const f64 score = leave_row_score(i, &to_lower);
-                    if (score <= 0.0) continue;
+                const auto consider = [&](Index i, f64 score, bool to_lower) {
                     chuzr_scored.emplace_back(score, i);
-                    if (score > best) { best = score; selected = i; selected_to_lower = to_lower; }
+                    if (score > best || (score == best && i < selected)) {
+                        best = score; selected = i; selected_to_lower = to_lower;
+                    }
+                };
+                if (leave_heap_all_dirty) {
+                    for (const Index i : infeasible_rows) infeasible_pos[sz(i)] = -1;
+                    infeasible_rows.clear();
+                    for (Index i = 0; i < m; ++i) {
+                        bool to_lower = true;
+                        const f64 score = leave_row_score(i, &to_lower);
+                        if (score <= 0.0) continue;
+                        infeasible_pos[sz(i)] = static_cast<Index>(infeasible_rows.size());
+                        infeasible_rows.push_back(i);
+                        consider(i, score, to_lower);
+                    }
+                    diag.chuzr_rows_scanned += static_cast<std::uint64_t>(m);
+                } else {
+                    for (const Index i : infeasible_rows) {
+                        bool to_lower = true;
+                        const f64 score = leave_row_score(i, &to_lower);
+                        consider(i, score, to_lower);
+                    }
+                    diag.chuzr_rows_scanned += infeasible_rows.size();
                 }
                 chuzr_candidates.clear();
                 chuzr_theta = 0.0;
@@ -3598,7 +3753,6 @@ static core::RawResult dual_prepared_pass(
                     std::fill(leave_heap_dirty_stamp.begin(), leave_heap_dirty_stamp.end(), 0);
                     leave_heap_dirty_generation = 1;
                 }
-                diag.chuzr_rows_scanned += static_cast<std::uint64_t>(m);
                 ++diag.chuzr_full_scans;
                 if (direction != nullptr) *direction = selected_to_lower;
                 return selected;
@@ -3606,10 +3760,13 @@ static core::RawResult dual_prepared_pass(
             const auto candidate_leave = [&](bool* direction) -> Index {
                 SOR_FN();
                 if (leave_heap_all_dirty) return candidate_full_scan(direction);
-                // Rows a pivot changed may now beat theta.
+                // Rows a pivot changed: re-decide infeasibility; they may
+                // now beat theta.
                 for (const Index i : leave_heap_dirty_rows) {
+                    const f64 score = leave_row_score(i);
+                    set_row_infeasible(i, score > 0.0);
                     if (chuzr_candidate_stamp[sz(i)] == chuzr_candidate_generation) continue;
-                    if (leave_row_score(i) > chuzr_theta) {
+                    if (score > chuzr_theta) {
                         chuzr_candidate_stamp[sz(i)] = chuzr_candidate_generation;
                         chuzr_candidates.push_back(i);
                     }
@@ -3651,9 +3808,13 @@ static core::RawResult dual_prepared_pass(
                 return candidate_full_scan(direction);
             };
 
-            if (use_candidate_chuzr) {
+            // The candidate set only pays while x_B moves on sparse supports.
+            // Once the alpha density gate has sent the updates dense, every
+            // pivot invalidates it and the plain scan is the cheaper way to
+            // the same answer.
+            if (use_candidate_chuzr && alpha_sparse_enabled) {
                 leave = candidate_leave(&leave_to_lower);
-            } else if (force_full_chuzr) {
+            } else if (use_candidate_chuzr || force_full_chuzr) {
                 leave = exhaustive_leave(true, &leave_to_lower);
             } else {
                 refresh_leave_heap();
@@ -4323,12 +4484,20 @@ static core::RawResult dual_prepared_pass(
             // A negative step means FTRAN and the ratio-test direction
             // disagree. Clamping to 0 then exchanging the basis parks the
             // leaver on its bound while x_B is still off that bound. Refactor
-            // and redo instead (same recovery as a vanished pivot).
+            // and redo instead (same recovery as a vanished pivot) -- but only
+            // on an updated factor. On a fresh one the redo recomputes the
+            // same step from the same factor, so it can only repeat: with the
+            // flip-buffer aliasing, 80bau3b and d2q06c refactored here until
+            // the time limit. There, clamp as before; the residual check and
+            // the final unscaled checks judge the result.
             if (t_step < 0.0) {
-                do_factorize();
-                since_refactor = 0;
-                ++diag.numerical_trouble_refactors;
-                continue;
+                if (since_refactor > 0) {
+                    do_factorize();
+                    since_refactor = 0;
+                    ++diag.numerical_trouble_refactors;
+                    continue;
+                }
+                t_step = 0.0;
             }
         }
 
@@ -4394,7 +4563,30 @@ static core::RawResult dual_prepared_pass(
                 ++diag.dual_resyncs;
                 after_working_price_refresh("post_pivot_fallback");
             }
-            if (dse_switch_pending) {
+            // A column the degeneracy trigger found basic takes its
+            // perturbation now, with the sign its new bound needs. It is
+            // nonbasic, so only its own reduced cost moves.
+            if (!perturb_on_leave.empty() && leave_var >= 0 && leave_var < ns &&
+                perturb_on_leave[sz(leave_var)] != 0) {
+                perturb_on_leave[sz(leave_var)] = 0;
+                const NonbasicStatus s_l = st[sz(leave_var)];
+                if (s_l == NonbasicStatus::AtLower || s_l == NonbasicStatus::AtUpper) {
+                    const f64 delta = perturbation_delta(leave_var, s_l);
+                    work_cost[sz(leave_var)] += delta;
+                    redcost[sz(leave_var)] += delta;
+                    ++diag.perturbed_costs;
+                }
+            }
+            if (dse_cost_switch_pending && dse_active) {
+                dse_cost_switch_pending = false;
+                dse_switch_pending = false;
+                dse_accuracy_switch_pending = false;
+                dse_active = false;
+                reset_devex_framework();
+                ++diag.dse_to_devex_switches;
+                SOR_ROUTE(1, "simplex_dual", "dse_to_devex",
+                          "\"reason\":\"costly_dse\"");
+            } else if (dse_switch_pending) {
                 if (allow_dse_to_devex_switch) {
                     dse_active = false;
                     dse_switch_pending = false;
@@ -4429,6 +4621,33 @@ static core::RawResult dual_prepared_pass(
         const bool degenerate_step = q >= 0 && std::fabs(d_enter) <= dtol[sz(q)];
         if (degenerate_step) ++no_improvement;
         else no_improvement = 0;
+        if (phase == 2 && q >= 0 && leave_var >= 0) {
+            ++phase2_pivots;
+            window_degenerate += degenerate_step;
+            std::uint64_t& left = last_left_pivot[sz(leave_var)];
+            if (left != 0 && phase2_pivots - left <= degen_window) ++window_revisits;
+            left = phase2_pivots;
+            if (phase2_pivots % degen_window == 0) {
+                const f64 k = static_cast<f64>(degen_window);
+                const f64 degenerate_fraction = static_cast<f64>(window_degenerate) / k;
+                const f64 revisit_fraction = static_cast<f64>(window_revisits) / k;
+                // Record the most degenerate window after the first (the
+                // start-up burst says nothing), so the decision is auditable.
+                if (phase2_pivots > degen_window &&
+                    degenerate_fraction > diag.degeneracy_window_fraction) {
+                    diag.degeneracy_window_fraction = degenerate_fraction;
+                    diag.degeneracy_window_revisits = revisit_fraction;
+                }
+                stalled_windows = degenerate_fraction >= kDegenerateWindowFraction &&
+                                          revisit_fraction >= kRevisitWindowFraction
+                                      ? stalled_windows + 1 : 0;
+                if (stalled_windows >= 2 && koberstein_perturbation_on &&
+                    !stall_perturbation_done)
+                    perturb_persistent_degeneracy();
+                window_degenerate = 0;
+                window_revisits = 0;
+            }
+        }
         if (t_step <= 1e-12) {
             ++diag.degenerate_steps;
             if (expand_active) {
@@ -4575,6 +4794,7 @@ static core::RawResult dual_prepared_pass(
         diag.status = pdiag.status;
         diag.final_phase = pdiag.final_phase;
         diag.primal_residual = pdiag.primal_residual;
+        diag.primal_distance = pdiag.primal_distance;
         diag.dual_residual = pdiag.dual_residual;
         diag.primal_objective = pdiag.primal_objective;
         diag.dual_objective = pdiag.dual_objective;
@@ -4641,19 +4861,37 @@ static core::RawResult dual_prepared_pass(
     // A bug in the iteration therefore shows up as a residual rather than
     // hiding behind the iteration's own view of itself.
     diag.primal_residual = std::max(pmin.max_row_violation(x), pmin.max_bound_violation(x));
+    diag.primal_distance = pmin.max_row_distance(x);
 
     // A'y with its magnitudes and term counts, in one pass: the dual residual
     // below and the rigorous dual bound (with the reduced-cost enclosure the
     // result exports for reduced-cost fixing) both come from it.
     auto& aty = pass_ws.aty;
-    aty.assign(sz(ns), 0.0L);
     auto& aty_abs = pass_ws.aty_abs;
-    aty_abs.assign(sz(ns), 0.0L);
     auto& ax = pass_ws.ax;
-    ax.assign(sz(m), 0.0L);
     auto& aty_cnt = pass_ws.aty_cnt;
-    aty_cnt.assign(sz(ns), 0);
-    {
+    f64 dres = 0.0;
+    // A variable counts as "on its bound" for complementarity at the same
+    // tolerance the primal point was actually solved to, scaled by the bound's
+    // own magnitude. This was a hard-coded absolute 1e-9, which charges the FULL
+    // multiplier of any variable sitting inside primal_feas_tol but outside
+    // 1e-9. Measured on grow15: row 75 sat 1.31e-9 from its bound and
+    // contributed its entire multiplier, 1.056, to the dual residual while the
+    // duality gap was 2.8e-16 -- a provably optimal point reported dual
+    // infeasible, and non-monotone in the tolerance (1e-6 fail, 1e-7 pass,
+    // 1e-8 fail with residual 12.4). Demanding complementarity to a precision
+    // the primal was never required to reach is not a stronger check, just an
+    // inconsistent one.
+    const f64 at_tol = std::max(kAtBound, opts.primal_feas_tol);
+    const auto accum_dual = [&](f64 v, f64 l, f64 u, f64 d) {
+        SOR_FN();
+        dres = std::max(dres, complementarity_violation(v, l, u, d, at_tol));
+    };
+    const auto evaluate_duals = [&] {
+        aty.assign(sz(ns), 0.0L);
+        aty_abs.assign(sz(ns), 0.0L);
+        ax.assign(sz(m), 0.0L);
+        aty_cnt.assign(sz(ns), 0);
         const auto& rp = pmin.A.pattern.row_ptr();
         const auto& ci = pmin.A.pattern.col_idx();
         for (Index i = 0; i < m; ++i) {
@@ -4670,36 +4908,15 @@ static core::RawResult dual_prepared_pass(
             }
             ax[sz(i)] = s;
         }
-    }
-
-    f64 dres = 0.0;
-    // A variable counts as "on its bound" for complementarity at the same
-    // tolerance the primal point was actually solved to, scaled by the bound's
-    // own magnitude. This was a hard-coded absolute 1e-9, which charges the FULL
-    // multiplier of any variable sitting inside primal_feas_tol but outside
-    // 1e-9. Measured on grow15: row 75 sat 1.31e-9 from its bound and
-    // contributed its entire multiplier, 1.056, to the dual residual while the
-    // duality gap was 2.8e-16 -- a provably optimal point reported dual
-    // infeasible, and non-monotone in the tolerance (1e-6 fail, 1e-7 pass,
-    // 1e-8 fail with residual 12.4). Demanding complementarity to a precision
-    // the primal was never required to reach is not a stronger check, just an
-    // inconsistent one.
-    const f64 at_tol = std::max(kAtBound, opts.primal_feas_tol);
-    const auto accum_dual = [&](f64 v, f64 l, f64 u, f64 d) {
-        SOR_FN();
-        const bool at_lo = (l > -kInf) && (v <= l + at_tol * (1.0 + std::fabs(l)));
-        const bool at_hi = (u <  kInf) && (v >= u - at_tol * (1.0 + std::fabs(u)));
-        if (at_lo && at_hi) return;
-        if (at_lo)      dres = std::max(dres, std::max(0.0, -d));
-        else if (at_hi) dres = std::max(dres, std::max(0.0,  d));
-        else            dres = std::max(dres, std::fabs(d));
+        dres = 0.0;
+        for (Index j = 0; j < ns; ++j)
+            accum_dual(x[sz(j)], pmin.col_lo[sz(j)], pmin.col_hi[sz(j)],
+                       pmin.c[sz(j)] - static_cast<f64>(aty[sz(j)]));
+        for (Index i = 0; i < m; ++i)
+            accum_dual(static_cast<f64>(ax[sz(i)]), pmin.row_lo[sz(i)], pmin.row_hi[sz(i)], yout[sz(i)]);
+        diag.dual_residual = dres;
     };
-    for (Index j = 0; j < ns; ++j)
-        accum_dual(x[sz(j)], pmin.col_lo[sz(j)], pmin.col_hi[sz(j)],
-                   pmin.c[sz(j)] - static_cast<f64>(aty[sz(j)]));
-    for (Index i = 0; i < m; ++i)
-        accum_dual(static_cast<f64>(ax[sz(i)]), pmin.row_lo[sz(i)], pmin.row_hi[sz(i)], yout[sz(i)]);
-    diag.dual_residual = dres;
+    evaluate_duals();
 
     // Retract Optimal when unscaled residuals miss the user tolerances.
     // Scaled leave/enter tests can declare optimality while the original
@@ -4715,23 +4932,34 @@ static core::RawResult dual_prepared_pass(
     for (Index j = 0; j < ns; ++j) obj_min += pmin.c[sz(j)] * x[sz(j)];
     diag.primal_objective = sense * (obj_min + pmin.obj_offset);
 
-    certify::RcEnclosure rc_enclosure = certify::enclose_reduced_costs_from_sums(
-        pmin, yout, aty, aty_abs, aty_cnt, pmin.col_lo, pmin.col_hi,
-        opts.dual_feas_tol);
-    if (rc_enclosure.finite) {
-        const model::Rational reported =
-            model::Rational(sense) * model::Rational(rc_enclosure.bound);
-        diag.dual_objective = sense > 0 ? model::rounded_down(reported) : model::rounded_up(reported);
-        diag.dual_bound_finite = std::isfinite(diag.dual_objective);
-        diag.gap_rel = diag.dual_bound_finite
-            ? std::fabs(diag.primal_objective - diag.dual_objective) /
-                  (1.0 + std::fabs(diag.primal_objective))
-            : std::numeric_limits<f64>::infinity();
-    } else {
-        // Multipliers that need a correction (a column without the finite
-        // bound its reduced cost's sign needs): the full routine.
-        report_simplex_dual_bound(pmin, sense, yout, aty, diag, opts.dual_feas_tol);
+    certify::RcEnclosure rc_enclosure;
+    const auto report_bound = [&] {
+        rc_enclosure = certify::enclose_reduced_costs_from_sums(
+            pmin, yout, aty, aty_abs, aty_cnt, pmin.col_lo, pmin.col_hi);
+        report_enclosure_dual_bound(rc_enclosure, sense, diag);
+    };
+    report_bound();
+    // The rounded basis duals can leave a one-sided basic column an ulp on
+    // its unchargeable side; the basis's inward duals do not.
+    // A'y of the engine's own basis duals: the session carry below pairs
+    // them with `y`, and must not take reduced costs of the strengthened
+    // multipliers (basic reduced costs nonzero) for a basis-dual state.
+    std::vector<long double> engine_aty;
+    if (status == core::Status::Optimal && opts.terminal_bound_published) {
+        engine_aty = aty;
+        if (strengthen_basis_duals(pmin, sense, basis, x, opts, diag, yout)) {
+            ++diag.inward_dual_corrections;
+            evaluate_duals();
+            report_bound();
+        } else {
+            engine_aty.clear();
+        }
     }
+    const auto& carry_aty = engine_aty.empty() ? aty : engine_aty;
+    // Multipliers that need a correction (a column without the finite bound
+    // its reduced cost's sign needs): the full routine.
+    if (!rc_enclosure.finite && opts.terminal_bound_published)
+        report_simplex_dual_bound(pmin, sense, yout, diag);
 
     if (out_basis) {
         out_basis->n_struct = ns;
@@ -4768,7 +4996,7 @@ static core::RawResult dual_prepared_pass(
             ps.last_pi.assign(y.begin(), y.end());
             ps.last_redcost.assign(sz(nt), 0);
             for (Index j = 0; j < ns; ++j)
-                ps.last_redcost[sz(j)] = (pmin.c[sz(j)] - static_cast<f64>(aty[sz(j)])) *
+                ps.last_redcost[sz(j)] = (pmin.c[sz(j)] - static_cast<f64>(carry_aty[sz(j)])) *
                                          scaling.col_scale[sz(j)];
             for (Index i = 0; i < m; ++i) ps.last_redcost[sz(ns+i)] = y[sz(i)];
             // A factor/basis match permits algebraic continuation, but does
@@ -4850,7 +5078,11 @@ static core::RawResult dual_prepared_pass(
             {.time_limit_s = opts.time_limit_s > 0 ? std::max(std::numeric_limits<double>::min(),
                 opts.time_limit_s - ms_since(t_all) / 1000) : 0})) {
         const auto exact = certify::exact_dual_lower_bound(pmin, raw.exact_dual);
-        if (exact.finite) {
+        // repair_dual_certificate also keeps a targeted witness weaker than
+        // the floating-point bound; the result checker takes the better of
+        // the two, so only a better exact bound replaces the reported one.
+        if (exact.finite && (!diag.dual_bound_finite || !std::isfinite(raw.dual_bound) ||
+                             exact.value > sense * raw.dual_bound)) {
             const model::Rational reported =
                 model::Rational(sense) * model::Rational(exact.value);
             raw.dual_bound = diag.dual_objective = sense > 0

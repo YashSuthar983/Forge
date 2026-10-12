@@ -137,16 +137,34 @@ void test_pricing_scans_are_separately_attributed() {
     CHECK(diag.chuzr_rows_scanned > 0);
     CHECK(diag.prow_entries_scanned > 0);
 
-    // CHUZR's production path is a sequential exact scan. Controlled Netlib
-    // comparisons found it 2--13% faster than indexed-heap maintenance across
-    // ten varied models, including hypersparse fit1p and bnl2, with identical
-    // pivots. The heap remains an opt-in cross-check rather than a default.
+    // CHUZR's production path is the candidate set over the exactly
+    // maintained infeasible rows while x_B moves on sparse supports, and the
+    // sequential exact scan once the updates go dense. The indexed heap lost
+    // every controlled comparison (2--13%) and remains an opt-in cross-check.
+    // On 25fv47 the candidate path runs, so most calls score far fewer than
+    // m rows.
     const auto m = static_cast<std::uint64_t>(diag.basis_dimension);
     CHECK(m > 0);
     CHECK(diag.chuzr_heap_rebuilds == 0);
     CHECK(diag.chuzr_heap_updates == 0);
-    CHECK(diag.chuzr_full_scans == diag.chuzr_calls);
-    CHECK(diag.chuzr_rows_scanned == diag.chuzr_calls * m);
+    CHECK(diag.chuzr_full_scans < diag.chuzr_calls);
+    CHECK(diag.chuzr_rows_scanned < diag.chuzr_calls * m);
+
+    // ...and it is exact: the plain scan takes the same pivots, and the
+    // per-pivot cross-check against it (SOR_DUAL_VERIFY_CHUZR, which stops
+    // the dual on the first disagreement) changes nothing.
+    const auto rerun = [&](const char* env) {
+        ::setenv(env, "1", 1);
+        sor::core::reload_env_switches();
+        SimplexDiagnostics d;
+        const auto r = sor::engines::solve_simplex(problem, opts, d);
+        ::unsetenv(env);
+        sor::core::reload_env_switches();
+        CHECK(r.proposed_status == Status::Optimal);
+        return d.iterations;
+    };
+    CHECK(rerun("SOR_DUAL_FULLSCAN_CHUZR") == diag.iterations);
+    CHECK(rerun("SOR_DUAL_VERIFY_CHUZR") == diag.iterations);
 
     // The parts may not exceed the whole they were split out of.
     CHECK(diag.chuzr_ms <= diag.price_ms + 1e-9);

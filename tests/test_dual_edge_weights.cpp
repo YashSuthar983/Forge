@@ -2,6 +2,7 @@
 #include "sor/engines/dual_simplex.hpp"
 #include "sor/la/lu.hpp"
 #include "sor/sparse/csr.hpp"
+#include "test_helpers.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -13,44 +14,38 @@
 
 namespace {
 
+// Count a failure and name where it happened (file:line), so a failing run
+// says which check broke rather than only how many did.
+int fail_at(int line, const char* what = "check failed") {
+    ::sor::test::report(false, what, __FILE__, line);
+    return 1;
+}
+
 int test_initial_pricing_content_boundaries() {
     using sor::engines::DualInitialPricingStrategy;
     using sor::engines::choose_dual_initial_pricing;
     int failures = 0;
-    const auto expect = [&](DualInitialPricingStrategy wanted,
+    const auto expect = [&](int line, DualInitialPricingStrategy wanted,
                             sor::core::Index rows,
                             sor::core::Index cols,
                             sor::core::Offset nnz,
                             sor::core::Index boxed) {
         if (choose_dual_initial_pricing(rows, cols, nnz, boxed) != wanted)
-            ++failures;
+            failures += fail_at(line, "choose_dual_initial_pricing");
     };
 
     // Invalid descriptions fail closed to exact steepest edge.
-    expect(DualInitialPricingStrategy::DSE, 0, 1, 1, 0);
-    expect(DualInitialPricingStrategy::DSE, 10, -1, 1, 0);
-    expect(DualInitialPricingStrategy::DSE, 10, 5, -1, 0);
-    expect(DualInitialPricingStrategy::DSE, 10, 5, 1, 6);
+    expect(__LINE__, DualInitialPricingStrategy::DSE, 0, 1, 1, 0);
+    expect(__LINE__, DualInitialPricingStrategy::DSE, 10, -1, 1, 0);
+    expect(__LINE__, DualInitialPricingStrategy::DSE, 10, 5, -1, 0);
+    expect(__LINE__, DualInitialPricingStrategy::DSE, 10, 5, 1, 6);
 
-    // Low-degree near-square regime: all inequalities are strict except the
-    // dimension floor.
-    expect(DualInitialPricingStrategy::Dantzig, 512, 511, 2047, 0);
-    expect(DualInitialPricingStrategy::DSE, 511, 510, 2043, 0);
-    expect(DualInitialPricingStrategy::DSE, 512, 512, 2047, 0);
-    expect(DualInitialPricingStrategy::DSE, 512, 511, 2048, 0);
-
-    // Wide boxed models retain DSE; bounds alone do not justify Dantzig.
-    expect(DualInitialPricingStrategy::DSE, 512, 2049, 10240, 1025);
-    expect(DualInitialPricingStrategy::DSE, 512, 2048, 10240, 1024);
-    expect(DualInitialPricingStrategy::DSE, 512, 2049, 10239, 1025);
-    expect(DualInitialPricingStrategy::DSE, 512, 2049, 10240, 1024);
-
-    // Medium sparse regime uses Devex, with [1000,3000), [1,2), and degree<8.
-    expect(DualInitialPricingStrategy::Devex, 1000, 1000, 7999, 0);
-    expect(DualInitialPricingStrategy::DSE, 999, 999, 7991, 0);
-    expect(DualInitialPricingStrategy::DSE, 3000, 3000, 23999, 0);
-    expect(DualInitialPricingStrategy::DSE, 1000, 2000, 7999, 0);
-    expect(DualInitialPricingStrategy::DSE, 1000, 1000, 8000, 0);
+    // Every valid shape starts on DSE: the cost measurement, not a shape
+    // window, decides on Devex (see choose_dual_initial_pricing). These are
+    // the shapes the removed Dantzig and Devex windows used to select.
+    expect(__LINE__, DualInitialPricingStrategy::DSE, 512, 511, 2047, 0);
+    expect(__LINE__, DualInitialPricingStrategy::DSE, 1000, 1000, 7999, 0);
+    expect(__LINE__, DualInitialPricingStrategy::DSE, 512, 2049, 10240, 1025);
     return failures;
 }
 
@@ -67,10 +62,10 @@ int test_rebuild_small_fixture() {
             v[1] = (1.0 / 3.0) * b;
         },
         weights);
-    if (!ok || weights.size() != 2) ++failures;
+    if (!ok || weights.size() != 2) failures += fail_at(__LINE__);
     if (weights.size() == 2) {
-        if (std::fabs(weights[0] - 0.25) > 1e-12) ++failures;
-        if (std::fabs(weights[1] - (5.0 / 36.0)) > 1e-12) ++failures;
+        if (std::fabs(weights[0] - 0.25) > 1e-12) failures += fail_at(__LINE__);
+        if (std::fabs(weights[1] - (5.0 / 36.0)) > 1e-12) failures += fail_at(__LINE__);
     }
     return failures;
 }
@@ -85,13 +80,13 @@ int test_rebuild_stops_at_deadline() {
     const auto btran = [&](std::vector<double>&) { ++solves; };
     if (!sor::engines::rebuild_dual_edge_weights(4, btran, weights, {},
             sor::core::SolverClock::now() + std::chrono::hours(1)))
-        ++failures;
-    if (solves != 4) ++failures;
+        failures += fail_at(__LINE__);
+    if (solves != 4) failures += fail_at(__LINE__);
     solves = 0;
     if (sor::engines::rebuild_dual_edge_weights(4, btran, weights, {},
             sor::core::SolverClock::now() - std::chrono::seconds(1)))
-        ++failures;
-    if (solves != 0) ++failures;
+        failures += fail_at(__LINE__);
+    if (solves != 0) failures += fail_at(__LINE__);
     return failures;
 }
 
@@ -104,91 +99,93 @@ int test_devex_reference_weight_and_reset_policy() {
     const std::vector<std::uint8_t> reference{1, 0, 1, 1, 0};
     const double weight = sor::engines::dual_devex_reference_weight(
         row, support, reference);
-    if (std::fabs(weight - 20.0) > 1e-12) ++failures;
+    if (std::fabs(weight - 20.0) > 1e-12) failures += fail_at(__LINE__);
 
     // An over-approximate support may contain explicit zeros, but not
     // duplicates: production's pivotal-row generation is duplicate-free.
     const std::vector<Index> sparse_support{0, 3};
     if (sor::engines::dual_devex_reference_weight(
             row, sparse_support, reference) != 4.0)
-        ++failures;
+        failures += fail_at(__LINE__);
 
     // Malformed input and overflow fail closed rather than poisoning CHUZR.
     if (std::isfinite(sor::engines::dual_devex_reference_weight(
             row, std::vector<Index>{9}, reference)))
-        ++failures;
+        failures += fail_at(__LINE__);
     auto huge = row;
     huge[0] = std::numeric_limits<double>::max();
     if (std::isfinite(sor::engines::dual_devex_reference_weight(
             huge, std::vector<Index>{0}, reference)))
-        ++failures;
+        failures += fail_at(__LINE__);
 
     using sor::engines::dual_devex_needs_new_framework;
-    if (dual_devex_needs_new_framework(9.0, 1.0, 0, 10)) ++failures;
-    if (!dual_devex_needs_new_framework(9.0001, 1.0, 0, 10)) ++failures;
-    if (!dual_devex_needs_new_framework(0.0, 1.0, 0, 10)) ++failures;
+    if (dual_devex_needs_new_framework(9.0, 1.0, 0, 10)) failures += fail_at(__LINE__);
+    if (!dual_devex_needs_new_framework(9.0001, 1.0, 0, 10)) failures += fail_at(__LINE__);
+    if (!dual_devex_needs_new_framework(0.0, 1.0, 0, 10)) failures += fail_at(__LINE__);
     if (!dual_devex_needs_new_framework(
             std::numeric_limits<double>::infinity(), 1.0, 0, 10))
-        ++failures;
-    if (dual_devex_needs_new_framework(1.0, 1.0, 1000, 10)) ++failures;
-    if (!dual_devex_needs_new_framework(1.0, 1.0, 1001, 10)) ++failures;
+        failures += fail_at(__LINE__);
+    if (dual_devex_needs_new_framework(1.0, 1.0, 1000, 10)) failures += fail_at(__LINE__);
+    if (!dual_devex_needs_new_framework(1.0, 1.0, 1001, 10)) failures += fail_at(__LINE__);
 
     using sor::engines::dual_dse_accept_weight;
-    if (!dual_dse_accept_weight(0.25, 1.0)) ++failures;
-    if (dual_dse_accept_weight(0.249999, 1.0)) ++failures;
-    if (!dual_dse_accept_weight(100.0, 1.0)) ++failures;
-    if (dual_dse_accept_weight(0.0, 1.0)) ++failures;
+    if (!dual_dse_accept_weight(0.25, 1.0)) failures += fail_at(__LINE__);
+    if (dual_dse_accept_weight(0.249999, 1.0)) failures += fail_at(__LINE__);
+    if (!dual_dse_accept_weight(100.0, 1.0)) failures += fail_at(__LINE__);
+    if (dual_dse_accept_weight(0.0, 1.0)) failures += fail_at(__LINE__);
     if (dual_dse_accept_weight(1.0,
             std::numeric_limits<double>::infinity()))
-        ++failures;
+        failures += fail_at(__LINE__);
 
     using sor::engines::dual_update_running_density;
     if (std::fabs(dual_update_running_density(0.0, 1.0) - 0.05) > 1e-15)
-        ++failures;
+        failures += fail_at(__LINE__);
     if (std::fabs(dual_update_running_density(0.5, 0.5) - 0.5) > 1e-15)
-        ++failures;
-    if (std::isfinite(dual_update_running_density(-1.0, 0.5))) ++failures;
+        failures += fail_at(__LINE__);
+    if (std::isfinite(dual_update_running_density(-1.0, 0.5))) failures += fail_at(__LINE__);
 
     using sor::engines::dual_dse_iteration_is_costly;
     // Both policy comparisons are strict: equality at 1% density or a
     // squared density ratio of exactly 1000 must not switch.
     if (dual_dse_iteration_is_costly(0.01, 0.0001, 0.0001, 0.0001))
-        ++failures;
+        failures += fail_at(__LINE__);
     const double root1000 = std::sqrt(1000.0);
     if (dual_dse_iteration_is_costly(root1000 * 0.001, 0.001, 0.0, 0.0))
-        ++failures;
+        failures += fail_at(__LINE__);
     if (!dual_dse_iteration_is_costly(root1000 * 0.001001, 0.001, 0.0, 0.0))
-        ++failures;
-    if (dual_dse_iteration_is_costly(0.5, 0.0, 0.0, 0.0)) ++failures;
+        failures += fail_at(__LINE__);
+    if (dual_dse_iteration_is_costly(0.5, 0.0, 0.0, 0.0)) failures += fail_at(__LINE__);
     if (!dual_dse_iteration_is_costly(
             std::numeric_limits<double>::infinity(), 0.1, 0.1, 0.1))
-        ++failures;
+        failures += fail_at(__LINE__);
 
     using sor::engines::dual_dse_should_switch_to_devex;
-    if (dual_dse_should_switch_to_devex(6, 100, 1000)) ++failures;
-    if (dual_dse_should_switch_to_devex(5, 101, 1000)) ++failures;
-    if (!dual_dse_should_switch_to_devex(6, 101, 1000)) ++failures;
-    if (dual_dse_should_switch_to_devex(1, 1, 0)) ++failures;
+    // A sample of 100 pivots, then more than 5% of them costly.
+    if (dual_dse_should_switch_to_devex(50, 99)) failures += fail_at(__LINE__);
+    if (dual_dse_should_switch_to_devex(5, 100)) failures += fail_at(__LINE__);
+    if (!dual_dse_should_switch_to_devex(6, 100)) failures += fail_at(__LINE__);
+    if (!dual_dse_should_switch_to_devex(2579, 3092)) failures += fail_at(__LINE__);
+    if (dual_dse_should_switch_to_devex(0, 0)) failures += fail_at(__LINE__);
 
     using sor::engines::dual_update_dse_log_error;
     using sor::engines::dual_dse_accuracy_requires_devex;
     double low = 0.0, high = 0.0;
     if (!dual_update_dse_log_error(1.0, std::exp(100.0), low, high))
-        ++failures;
-    if (std::fabs(low - 1.0) > 1e-12 || high != 0.0) ++failures;
+        failures += fail_at(__LINE__);
+    if (std::fabs(low - 1.0) > 1e-12 || high != 0.0) failures += fail_at(__LINE__);
     if (!dual_update_dse_log_error(std::exp(200.0), 1.0, low, high))
-        ++failures;
-    if (std::fabs(high - 2.0) > 1e-12) ++failures;
-    if (dual_dse_accuracy_requires_devex(5.0, 5.0)) ++failures;
-    if (!dual_dse_accuracy_requires_devex(5.0001, 5.0)) ++failures;
+        failures += fail_at(__LINE__);
+    if (std::fabs(high - 2.0) > 1e-12) failures += fail_at(__LINE__);
+    if (dual_dse_accuracy_requires_devex(5.0, 5.0)) failures += fail_at(__LINE__);
+    if (!dual_dse_accuracy_requires_devex(5.0001, 5.0)) failures += fail_at(__LINE__);
     if (!dual_dse_accuracy_requires_devex(
             std::numeric_limits<double>::infinity(), 0.0))
-        ++failures;
-    if (dual_update_dse_log_error(0.0, 1.0, low, high)) ++failures;
+        failures += fail_at(__LINE__);
+    if (dual_update_dse_log_error(0.0, 1.0, low, high)) failures += fail_at(__LINE__);
 
     using sor::engines::dual_dse_stability_requires_devex;
-    if (dual_dse_stability_requires_devex(2)) ++failures;
-    if (!dual_dse_stability_requires_devex(3)) ++failures;
+    if (dual_dse_stability_requires_devex(2)) failures += fail_at(__LINE__);
+    if (!dual_dse_stability_requires_devex(3)) failures += fail_at(__LINE__);
     return failures;
 }
 
@@ -212,7 +209,7 @@ int test_dse_accuracy_switch_chain() {
         double low = 0.0, high = 0.0;
         for (int i = 0; i < 500; ++i)
             dual_update_dse_log_error(1.0 + 1e-9 * i, 1.0, low, high);
-        if (dual_dse_accuracy_requires_devex(low, high)) ++failures;
+        if (dual_dse_accuracy_requires_devex(low, high)) failures += fail_at(__LINE__);
     }
 
     // Persistent UNDERestimation is the dangerous direction: it makes a row
@@ -225,7 +222,7 @@ int test_dse_accuracy_switch_chain() {
             dual_update_dse_log_error(1.0, std::exp(20.0), low, high);
             switched = dual_dse_accuracy_requires_devex(low, high);
         }
-        if (!switched) ++failures;
+        if (!switched) failures += fail_at(__LINE__);
     }
 
     // Symmetric OVERestimation must also be visible -- it wastes the row
@@ -237,7 +234,7 @@ int test_dse_accuracy_switch_chain() {
             dual_update_dse_log_error(std::exp(20.0), 1.0, low, high);
             switched = dual_dse_accuracy_requires_devex(low, high);
         }
-        if (!switched) ++failures;
+        if (!switched) failures += fail_at(__LINE__);
     }
 
     // A degenerate weight must not move the average at all: a single
@@ -245,10 +242,10 @@ int test_dse_accuracy_switch_chain() {
     // switch a healthy run to Devex.
     {
         double low = 0.0, high = 0.0;
-        if (dual_update_dse_log_error(0.0, 1.0, low, high)) ++failures;
-        if (dual_update_dse_log_error(1.0, 0.0, low, high)) ++failures;
-        if (low != 0.0 || high != 0.0) ++failures;
-        if (dual_dse_accuracy_requires_devex(low, high)) ++failures;
+        if (dual_update_dse_log_error(0.0, 1.0, low, high)) failures += fail_at(__LINE__);
+        if (dual_update_dse_log_error(1.0, 0.0, low, high)) failures += fail_at(__LINE__);
+        if (low != 0.0 || high != 0.0) failures += fail_at(__LINE__);
+        if (dual_dse_accuracy_requires_devex(low, high)) failures += fail_at(__LINE__);
     }
     return failures;
 }
@@ -315,7 +312,7 @@ int test_dse_matches_other_pricing_on_larger_lps() {
                 "m=%lld: status mismatch dantzig=%d dse=%d\n",
                 static_cast<long long>(m), static_cast<int>(raw_dantzig.proposed_status),
                 static_cast<int>(raw_dse.proposed_status));
-            ++failures;
+            failures += fail_at(__LINE__);
             continue;
         }
         const f64 rel = std::fabs(raw_dantzig.objective - raw_dse.objective) /
@@ -324,7 +321,7 @@ int test_dse_matches_other_pricing_on_larger_lps() {
             std::fprintf(stderr,
                 "m=%lld: objective mismatch dantzig=%.10e dse=%.10e rel=%.3e\n",
                 static_cast<long long>(m), raw_dantzig.objective, raw_dse.objective, rel);
-            ++failures;
+            failures += fail_at(__LINE__);
         }
     }
     return failures;
@@ -359,7 +356,7 @@ int test_seeded_rebuild_is_bit_identical() {
     }
 
     BasisFactor factor;
-    if (!factor.factorize(m, cp, ri, bv, sor::la::LuOptions{})) return 1;
+    if (!factor.factorize(m, cp, ri, bv, sor::la::LuOptions{})) return fail_at(__LINE__);
 
     // Append etas so the seeded BTRAN exercises the firing-set path, not just
     // the eta-free base solve.
@@ -376,13 +373,13 @@ int test_seeded_rebuild_is_bit_identical() {
         if (std::fabs(alpha[static_cast<std::size_t>(leave)]) < 0.5)
             alpha[static_cast<std::size_t>(leave)] +=
                 alpha[static_cast<std::size_t>(leave)] < 0.0 ? -1.0 : 1.0;
-        if (!factor.update(leave, alpha)) return 1;
+        if (!factor.update(leave, alpha)) return fail_at(__LINE__);
     }
 
     std::vector<f64> dense;
     if (!sor::engines::rebuild_dual_edge_weights(
             m, [&](std::vector<f64>& v) { factor.btran(v); }, dense))
-        return 1;
+        return fail_at(__LINE__);
 
     std::vector<Index> seed(1, 0);
     std::uint64_t sparse_calls = 0;
@@ -396,22 +393,22 @@ int test_seeded_rebuild_is_bit_identical() {
                 if (sparse) ++sparse_calls;
                 return sparse;
             }))
-        return 1;
+        return fail_at(__LINE__);
 
     int failures = 0;
-    if (dense.size() != seeded.size()) return 1;
+    if (dense.size() != seeded.size()) return fail_at(__LINE__);
     for (std::size_t i = 0; i < dense.size(); ++i) {
         // Bitwise, not approximate.
         if (!(dense[i] == seeded[i])) {
             std::fprintf(stderr,
                          "seeded DSE rebuild differs at row %zu: dense=%.17g seeded=%.17g\n",
                          i, dense[i], seeded[i]);
-            ++failures;
+            failures += fail_at(__LINE__);
         }
     }
     if (sparse_calls == 0) {
         std::fprintf(stderr, "seeded DSE rebuild never took the sparse path\n");
-        ++failures;
+        failures += fail_at(__LINE__);
     }
     return failures;
 }
@@ -458,11 +455,11 @@ int test_dse_weight_carrier() {
     carrier.matrix = static_cast<const void*>(&lp);   // caller-declared identity
     const auto parent = sor::engines::solve_dual_simplex(
         lp, opts, parent_diag, &parent_basis, nullptr, &carrier);
-    if (parent.proposed_status != sor::core::Status::Optimal) return 1;
+    if (parent.proposed_status != sor::core::Status::Optimal) return fail_at(__LINE__);
     if (carrier.weights.size() != static_cast<std::size_t>(m) ||
         carrier.basis.size() != static_cast<std::size_t>(m)) {
         std::fprintf(stderr, "carrier not filled by the parent solve\n");
-        return 1;
+        return fail_at(__LINE__);
     }
 
     // Branch: tighten one bound, which changes the LP but not its matrix.
@@ -487,19 +484,19 @@ int test_dse_weight_carrier() {
         std::fprintf(stderr, "carried weights not adopted (reuses=%llu rebuilds=%llu)\n",
                      static_cast<unsigned long long>(warm_diag.dse_weight_reuses),
                      static_cast<unsigned long long>(warm_diag.dse_weight_rebuilds));
-        ++failures;
+        failures += fail_at(__LINE__);
     }
     if (cold_diag.dse_weight_rebuilds != 1 || cold_diag.dse_weight_reuses != 0) {
         std::fprintf(stderr, "no-carrier solve did not rebuild (rebuilds=%llu)\n",
                      static_cast<unsigned long long>(cold_diag.dse_weight_rebuilds));
-        ++failures;
+        failures += fail_at(__LINE__);
     }
     if (cold.proposed_status != warm.proposed_status ||
         std::fabs(cold.objective - warm.objective) >
             1e-7 * (1.0 + std::fabs(cold.objective))) {
         std::fprintf(stderr, "carried-weight solve changed the answer: %.12g vs %.12g\n",
                      cold.objective, warm.objective);
-        ++failures;
+        failures += fail_at(__LINE__);
     }
 
     // Guard 1: weights that belong to a different basis are refused.
@@ -509,7 +506,7 @@ int test_dse_weight_carrier() {
     (void)solve_child(&wrong_basis, wrong_diag);
     if (wrong_diag.dse_weight_reuses != 0 || wrong_diag.dse_weight_rebuilds != 1) {
         std::fprintf(stderr, "mismatched basis was not refused\n");
-        ++failures;
+        failures += fail_at(__LINE__);
     }
 
     // Guard 2: a carrier with no declared matrix is never adopted -- clear()
@@ -520,7 +517,7 @@ int test_dse_weight_carrier() {
     (void)solve_child(&anonymous, anon_diag);
     if (anon_diag.dse_weight_reuses != 0) {
         std::fprintf(stderr, "carrier with no matrix token was adopted\n");
-        ++failures;
+        failures += fail_at(__LINE__);
     }
 
     // Guard 3: the engine refuses weights whose shape no longer matches the
@@ -542,7 +539,7 @@ int test_dse_weight_carrier() {
                                            nullptr, &stale);
     if (stale_diag.dse_weight_reuses != 0) {
         std::fprintf(stderr, "weights were adopted after the shape changed\n");
-        ++failures;
+        failures += fail_at(__LINE__);
     }
     return failures;
 }
@@ -587,7 +584,7 @@ int test_warm_dse_reset_skips_rebuild() {
     sor::engines::SimplexBasis parent_basis;
     const auto parent = sor::engines::solve_dual_simplex(lp, opts, parent_diag,
                                                           &parent_basis);
-    if (parent.proposed_status != sor::core::Status::Optimal) return 1;
+    if (parent.proposed_status != sor::core::Status::Optimal) return fail_at(__LINE__);
 
     // Branch: tighten one bound. B does not change, but the parent basis
     // (captured at B != -I, since the parent itself started logical and
@@ -605,7 +602,7 @@ int test_warm_dse_reset_skips_rebuild() {
         std::fprintf(stderr,
                      "expected the exact rebuild by default (rebuilds=%llu)\n",
                      static_cast<unsigned long long>(default_diag.dse_weight_rebuilds));
-        ++failures;
+        failures += fail_at(__LINE__);
     }
 
     sor::engines::SimplexOptions warm_opts = opts;
@@ -618,14 +615,14 @@ int test_warm_dse_reset_skips_rebuild() {
         std::fprintf(stderr,
                      "warm_dse_reset did not skip the rebuild (rebuilds=%llu)\n",
                      static_cast<unsigned long long>(warm_diag.dse_weight_rebuilds));
-        ++failures;
+        failures += fail_at(__LINE__);
     }
     if (default_result.proposed_status != warm_result.proposed_status ||
         std::fabs(default_result.objective - warm_result.objective) >
             1e-7 * (1.0 + std::fabs(default_result.objective))) {
         std::fprintf(stderr, "warm_dse_reset changed the answer: %.12g vs %.12g\n",
                      default_result.objective, warm_result.objective);
-        ++failures;
+        failures += fail_at(__LINE__);
     }
     return failures;
 }
@@ -656,11 +653,11 @@ int test_incremental_dse_matches_full_rebuild() {
     }
 
     BasisFactor factor;
-    if (!factor.factorize(m, cp, ri, bv, sor::la::LuOptions{})) return 1;
+    if (!factor.factorize(m, cp, ri, bv, sor::la::LuOptions{})) return fail_at(__LINE__);
     std::vector<f64> propagated;
     if (!sor::engines::rebuild_dual_edge_weights(
             m, [&](std::vector<f64>& v) { factor.btran(v); }, propagated))
-        return 1;
+        return fail_at(__LINE__);
 
     std::mt19937 rng(9173);
     std::uniform_real_distribution<f64> dist(-1.0, 1.0);
@@ -696,11 +693,11 @@ int test_incremental_dse_matches_full_rebuild() {
         propagated[static_cast<std::size_t>(leave)] =
             old_pivotal / (ap * ap);
 
-        if (!factor.update(leave, alpha, 1e-12)) return 1;
+        if (!factor.update(leave, alpha, 1e-12)) return fail_at(__LINE__);
         std::vector<f64> rebuilt;
         if (!sor::engines::rebuild_dual_edge_weights(
                 m, [&](std::vector<f64>& v) { factor.btran(v); }, rebuilt))
-            return 1;
+            return fail_at(__LINE__);
         for (Index i = 0; i < m; ++i) {
             const f64 scale = 1.0 + std::fabs(rebuilt[static_cast<std::size_t>(i)]);
             if (std::fabs(propagated[static_cast<std::size_t>(i)] -
@@ -710,7 +707,7 @@ int test_incremental_dse_matches_full_rebuild() {
                              step, static_cast<long long>(i),
                              propagated[static_cast<std::size_t>(i)],
                              rebuilt[static_cast<std::size_t>(i)]);
-                return 1;
+                return fail_at(__LINE__);
             }
         }
     }
