@@ -2406,13 +2406,19 @@ bool BasisFactor::update_ft(Index p, const std::vector<f64>& alpha,
         ft_atilde_.assign(n, 0.0);
         ft_v_.assign(n, 0.0);
         ft_stamp_.assign(n, 0);
+        ft_cstamp_.assign(n, 0);
         ft_gen_ = 0;
     } else {
         for (const Index k : ft_support_) ft_atilde_[sz(k)] = 0.0;
         for (const Index k : ft_vsupport_) ft_v_[sz(k)] = 0.0;
     }
     ft_support_.clear();
-    if (++ft_gen_ == 0) { std::fill(ft_stamp_.begin(), ft_stamp_.end(), 0); ft_gen_ = 1; }
+    if (ft_cstamp_.size() != n) ft_cstamp_.assign(n, 0);
+    if (++ft_gen_ == 0) {
+        std::fill(ft_stamp_.begin(), ft_stamp_.end(), 0);
+        std::fill(ft_cstamp_.begin(), ft_cstamp_.end(), 0);
+        ft_gen_ = 1;
+    }
     const auto touch = [&](Index k) {
         if (ft_stamp_[sz(k)] == ft_gen_) return;
         ft_stamp_[sz(k)] = ft_gen_;
@@ -2453,7 +2459,8 @@ bool BasisFactor::update_ft(Index p, const std::vector<f64>& alpha,
             if (xk == 0.0) continue;
             const Index k = base_->cpos_[sz(slot)];
             if (k < 0 || sz(k) >= n) continue;
-            if (ft_stamp_[sz(k)] == ft_gen_) continue;   // duplicate slot
+            if (ft_cstamp_[sz(k)] == ft_gen_) continue;   // duplicate slot
+            ft_cstamp_[sz(k)] = ft_gen_;
             add_alpha_column(sz(k), xk);
         }
     } else {

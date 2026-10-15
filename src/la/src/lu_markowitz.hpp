@@ -86,6 +86,14 @@ private:
     std::vector<std::uint32_t> mark_, seen_;
     std::uint32_t mark_gen_ = 0, seen_gen_ = 0;
     std::vector<Index> pivot_rows_;
+    // Row-driven update of one pivot (see pivot()): the pivot-column rows'
+    // entries bucketed by column, for the columns of the pivot row.
+    struct BucketEntry { Index row; Index slot; Index next; };
+    std::vector<BucketEntry> bucket_;
+    std::vector<Index> bucket_head_;
+    std::vector<std::uint32_t> bucket_stamp_;
+    std::uint32_t bucket_gen_ = 0;
+    std::vector<Index> pending_;
     Offset active_nnz_ = 0;
     Index live_ = 0;
     Index linked_cols_ = 0, linked_rows_ = 0;   // currently in a count list

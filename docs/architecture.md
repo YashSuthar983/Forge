@@ -33,14 +33,14 @@ papers each component is implemented from.
 | Global spatial B&B | shipped | `global_qp.cpp` |
 | Binary quadratic (tabu + QCR bound) | shipped | `binquad.cpp`, `bqp_bab.cpp` |
 | AHL lattice reformulation | opt-in (`--lattice-reform`) | `lattice_reform.cpp` |
-| Vulkan compute (LP, QP, PDHCG, binquad devices; 44 shaders) | shipped | `src/backend/src/vulkan/` |
+| Vulkan compute (LP, QP, PDHCG, binquad devices; 50 production shaders + 2 bench) | shipped | `src/backend/vulkan/shaders/`, `SOR_SHADER_NAMES` in `src/backend/CMakeLists.txt` |
 | CUDA device | stub (returns `nullptr`) | `make_cuda_lp_device()` |
 | `finalize_result` proof gate | shipped | `src/certify/` |
 | `sor_check` independent checker | shipped for LP | `apps/sor_check.cpp` |
 | Deterministic fork-join thread pool | shipped | `src/core/src/parallel.cpp` |
-| LP barrier / IPM | not built | — |
+| LP barrier / IPM | shipped (CLI `--engine barrier`) | `src/engines/src/lp.cpp` (`solve_lp_barrier`); less mature than simplex / Auto |
 | Exact rational / VIPR verifier (`sor_verify`) | not built | proof-level enums exist, but there is no target |
-| Minimal NLP / MINLP placeholders | placeholder | `nlp.cpp`, `minlp.cpp` (MINLP is enumeration over finite integer domains) |
+| Minimal NLP / MINLP placeholders | placeholder | `src/engines/src/nlp.cpp`, `src/search/src/minlp.cpp` (MINLP is enumeration over finite integer domains) |
 
 ---
 
@@ -49,7 +49,7 @@ papers each component is implemented from.
 | Principle | How it is enforced |
 |---|---|
 | **Clean room** | No solver library in the link graph. `tests/test_forbidden_dependencies.py` checks CMake and the binary with `ldd`, `readelf` and `nm` (§8). |
-| **Strict layering** | The `add_subdirectory()` order *is* the layer order. `target_link_libraries` only reaches lower layers. |
+| **Layered modules** | The `add_subdirectory()` order *is* the layer order. Most links reach lower layers; `sor_certify` is also linked from `sor_presolve`, `sor_engines`, and `sor_search` so those layers can call the proof gate without going through `sor_solve`. |
 | **One shared model** | LP, MILP and every quadratic class use `model::LpProblem`. `engines::QpProblem` wraps an `LpProblem` and adds `Q` or a diagonal Q. |
 | **Only certified claims** | Engines return a `RawResult`. Only `certify::finalize_result()` can set `Status::Optimal` (§4). |
 | **Determinism** | Thread chunk sizes do not depend on the thread count, and `SOR_DETERMINISTIC_FP=ON` sets `-ffp-contract=off`. Results are bit-identical at any `--threads`. |
@@ -64,7 +64,7 @@ papers each component is implemented from.
 L8  FRONT ENDS     sor_solve · sor_check · sor_gen · sor_ldlt_bench · sor_gpu_bench
 L7  VERIFICATION   sor_certify   (finalize_result, check_lp_point, Farkas checks)
 L5  SEARCH         sor_search    (bab · cuts · propagate · heuristics · miqp_bb · global_qp · binquad)
-L4  ENGINES        sor_engines   (simplex · dual_simplex · pdhg · hpr · crossover · qp_ipm · qp_pdhcg · qcqp_local)
+L4  ENGINES        sor_engines   (simplex · dual_simplex · pdhg · hpr · crossover · lp/barrier · qp_ipm · qp_pdhcg · hpr_qp · qcqp_local · …)
 L3  TRANSFORM      sor_presolve
 L2  MODEL / I/O    sor_model · sor_io
 L1  LINEAR ALGEBRA sor_sparse · sor_la_cpu · sor_backend (+ Vulkan shaders)
@@ -76,9 +76,9 @@ flowchart TB
   solve[sor_solve] --> io & eng & search & cert & be
   check[sor_check] --> io & eng & cert
   gen[sor_gen] --> io
-  search[sor_search] --> eng
-  eng[sor_engines] --> model & be & la & pre
-  pre[sor_presolve] --> model
+  search[sor_search] --> eng & cert & io
+  eng[sor_engines] --> model & be & la & pre & cert
+  pre[sor_presolve] --> model & cert
   io[sor_io] --> model
   model[sor_model] --> sp
   be[sor_backend] --> sp
@@ -163,7 +163,7 @@ flowchart TD
   `check_every` iterations.
 - **Shaders.** SpMV (CSR/CSC), primal and dual steps, Halpern mixing,
   averaging, PDHCG and QP steps, and binquad tabu/bound kernels: 44 compute
-  shaders compiled to SPIR-V at build time.
+  shaders compiled to SPIR-V at build time (50 production + 2 bench kernels).
 - **Honest timing.** GPU wall times include host–device transfer
   (`transfer_stats()`).
 - **Proof boundary.** A first-order method alone cannot claim
@@ -319,8 +319,9 @@ sor_check MODEL SOLUTION.sol [--tol T]
 sor_gen   blend|schedule|dispatch|all [--seed N] [-o PATH | --outdir DIR]
 ```
 
-The full reference is in [`../CLI_FLAGS.md`](../CLI_FLAGS.md): 142 flags and
-68 `KEY=VALUE` engine options.
+The full reference is in [`../CLI_FLAGS.md`](../CLI_FLAGS.md) (about 190
+documented `--` flags and about 68 `KEY=VALUE` engine options; the parsers are
+authoritative).
 
 ---
 

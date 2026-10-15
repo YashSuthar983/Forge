@@ -261,6 +261,57 @@ void MarkowitzKernel::pivot(Index r, Index c, Offset at, FactorSink& out) {
     Index u_count = 0;
     const Offset rb = rs_[sz(r)];
     const Index rlen = rl_[sz(r)];
+
+    // Finding the rows of column c inside each column j of the pivot row by
+    // scanning j costs |j| per column -- quadratic once a few columns are
+    // long (chromaticindex1024-7's crossover bases: 78M entries scanned per
+    // factorization for 123k updates).  When the rows of column c are the
+    // shorter side, bucket their live entries by column instead and update
+    // in place through those.  The updates are the same; layout changes
+    // (erasures) only come from exact cancellation, and a column where one
+    // would happen -- and every column after it in this pivot -- goes back
+    // to the scan, so the factor is identical either way.
+    bool row_driven = false;
+    if (!pivot_rows_.empty()) {
+        Offset cost_col = 0, cost_row = 0;
+        for (Index t = 0; t < rlen; ++t) {
+            const Index j = rcol_[sz(rb + t)];
+            if (j != c && col_state_[sz(j)] != 1) cost_col += cl_[sz(j)];
+        }
+        for (const Index i : pivot_rows_) cost_row += rl_[sz(i)];
+        row_driven = 2 * cost_row < cost_col;
+    }
+    if (row_driven) {
+        if (bucket_head_.size() != sz(m_)) {
+            bucket_head_.assign(sz(m_), -1);
+            bucket_stamp_.assign(sz(m_), 0);
+            bucket_gen_ = 0;
+        }
+        if (++bucket_gen_ == 0) {
+            std::fill(bucket_stamp_.begin(), bucket_stamp_.end(), 0u);
+            bucket_gen_ = 1;
+        }
+        bucket_.clear();
+        for (Index t = 0; t < rlen; ++t) {
+            const Index j = rcol_[sz(rb + t)];
+            if (j == c || col_state_[sz(j)] == 1) continue;
+            bucket_stamp_[sz(j)] = bucket_gen_;
+            bucket_head_[sz(j)] = -1;
+        }
+        // Each entry is held by its offset in column j: nothing moves column
+        // j's entries before its own turn below except the erasure of row
+        // r's entry, which moves j's last entry into that slot.  (Row slots
+        // would not do: a fill compacts its row.)
+        for (const Index i : pivot_rows_) {
+            const Offset ib = rs_[sz(i)];
+            for (Index t = 0; t < rl_[sz(i)]; ++t) {
+                const Index j = rcol_[sz(ib + t)];
+                if (bucket_stamp_[sz(j)] != bucket_gen_ || col_state_[sz(j)] == 1) continue;
+                bucket_.push_back({i, rlink_[sz(ib + t)], bucket_head_[sz(j)]});
+                bucket_head_[sz(j)] = static_cast<Index>(bucket_.size()) - 1;
+            }
+        }
+    }
     for (Index t = 0; t < rlen; ++t) {
         const Index j = rcol_[sz(rb + t)];
         if (j == c || col_state_[sz(j)] == 1) continue;
@@ -274,7 +325,48 @@ void MarkowitzKernel::pivot(Index r, Index c, Offset at, FactorSink& out) {
 
         if (!pivot_rows_.empty() && arj != 0.0) {
             const std::uint32_t sgen = next_seen();
-            Index p = 0;
+            if (row_driven) {
+                // This column's entries in the pivot-column rows, visited in
+                // ascending offset as the scan below visits them, with its
+                // erase-and-revisit on exact cancellation (frequent on 0/1
+                // bases): the erasure moves the column's last entry into
+                // the freed slot, and if that entry is one of ours it is the
+                // largest pending offset and is taken next, at the slot.
+                // The removal of row r above moved slot cl_[j] (the old
+                // last) into p_r.
+                const Index moved_from = cl_[sz(j)];
+                pending_.clear();
+                for (Index e = bucket_head_[sz(j)]; e >= 0; e = bucket_[sz(e)].next) {
+                    const Index p = bucket_[sz(e)].slot;
+                    pending_.push_back(p == moved_from ? p_r : p);
+                }
+                std::sort(pending_.begin(), pending_.end());
+                std::size_t k = 0;
+                while (k < pending_.size()) {
+                    const Index p = pending_[k];
+                    const Offset at_p = cs_[sz(j)] + p;
+                    const Index i = crow_[sz(at_p)];
+                    seen_[sz(i)] = sgen;
+                    const f64 v = cval_[sz(at_p)] - mult_[sz(i)] * arj;
+                    if (v != 0.0) {
+                        cval_[sz(at_p)] = v;
+                        ++k;
+                        continue;
+                    }
+                    const Index q = clink_[sz(at_p)];
+                    const Index last = cl_[sz(j)] - 1;
+                    col_erase(j, p);
+                    row_erase(i, q);
+                    --active_nnz_;
+                    if (last != p && pending_.back() == last && k + 1 < pending_.size()) {
+                        pending_[k] = p;
+                        pending_.pop_back();
+                    } else {
+                        ++k;
+                    }
+                }
+            }
+            Index p = row_driven ? cl_[sz(j)] : 0;   // the scan, unless done above
             while (p < cl_[sz(j)]) {
                 const Offset at_p = cs_[sz(j)] + p;
                 const Index i = crow_[sz(at_p)];

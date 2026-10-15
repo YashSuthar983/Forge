@@ -281,6 +281,65 @@ int main() {
         }
         core::set_global_threads(0);
         std::printf("  grid 256x256: L/D and solve bit-identical at 1,2,3,5,8 threads\n");
+
+        // solve_many: every column bit-identical to solve() on it alone, at
+        // any thread count, across a block boundary (k = 37 > 32).
+        CHECK(f.factorize(a, pos, 1e-14));
+        const Index k = 37;
+        const std::size_t n = static_cast<std::size_t>(a.n);
+        std::vector<f64> B(n * static_cast<std::size_t>(k));
+        for (auto& v : B) v = 2.0 * g.next() - 1.0;
+        for (std::size_t i = 0; i < n; i += 7) B[i] = 0.0;   // zeros take solve()'s skip path
+        std::vector<std::uint64_t> want(static_cast<std::size_t>(k));
+        for (Index r = 0; r < k; ++r) {
+            std::vector<f64> b(B.begin() + static_cast<std::ptrdiff_t>(r * a.n),
+                               B.begin() + static_cast<std::ptrdiff_t>((r + 1) * a.n));
+            f.solve(b);
+            want[static_cast<std::size_t>(r)] = hash_bits(b);
+        }
+        for (int p : {1, 3, 8}) {
+            core::set_global_threads(p);
+            auto X = B;
+            f.solve_many(X.data(), k);
+            for (Index r = 0; r < k; ++r) {
+                std::vector<f64> col(X.begin() + static_cast<std::ptrdiff_t>(r * a.n),
+                                     X.begin() + static_cast<std::ptrdiff_t>((r + 1) * a.n));
+                CHECK(hash_bits(col) == want[static_cast<std::size_t>(r)]);
+            }
+        }
+        core::set_global_threads(0);
+        std::printf("  grid 256x256: solve_many(37) bit-identical to 37 solves at 1,3,8 threads\n");
+    }
+
+    // ---- ordering caps: lower bounds that hold, and abandon a hopeless one ----
+    {
+        const auto a = grid_laplacian(100);
+        la::Ldlt full;
+        full.analyze(a);
+        la::AmdCaps probe;
+        probe.max_flops = 1e300;   // cap far away: the bounds are only accumulated
+        const auto perm = la::amd_order(a, nullptr, &probe);
+        CHECK(!probe.exceeded);
+        CHECK(is_perm(perm, a.n));
+        // Bounds from the elimination never exceed what the analysis counts.
+        CHECK(probe.nnz_l_lb <= static_cast<double>(full.nnz_l()) * (1.0 + 1e-12));
+        CHECK(probe.flops_lb <= full.flops() * (1.0 + 1e-12));
+        la::LdltOptions o;
+        o.max_flops = 0.5 * full.flops();
+        la::Ldlt capped;
+        capped.set_options(o);
+        capped.analyze(a);
+        CHECK(!capped.fits());
+        CHECK(capped.over_cost());
+        o.max_flops = 2.0 * full.flops();
+        la::Ldlt roomy;
+        roomy.set_options(o);
+        roomy.analyze(a);
+        CHECK(roomy.fits());
+        CHECK(!roomy.over_cost());
+        CHECK(roomy.nnz_l() == full.nnz_l());
+        std::printf("  grid 100x100: AMD bounds nnz(L) %.0f <= %lld, flops %.3e <= %.3e\n",
+                    probe.nnz_l_lb, static_cast<long long>(full.nnz_l()), probe.flops_lb, full.flops());
     }
 
     // ---- relaxed amalgamation: same L, more stored zeros, same answer ----

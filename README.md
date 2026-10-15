@@ -25,7 +25,7 @@ benchmark references.
 | **LP** | Solves all 93 Netlib LPs, with objectives matching reference solvers to 3×10⁻¹⁰ relative. Proved and independently checked a 1,002 × 3,000 LP with 1.26 M nonzeros in about 5 s. |
 | **MILP** | Branch-and-cut with presolve, cuts, symmetry handling, conflict analysis and a portfolio of LNS heuristics. Proves 12 of the 20 MIPLIB-easy instances within 60 s. |
 | **QP family** | Convex QP/QCQP by interior point, first-order QP, local nonconvex QCQP, MIQP branch-and-bound, and spatial branch-and-bound for global nonconvex QP. |
-| **GPU** | Vendor-neutral Vulkan compute backend (44 SPIR-V shaders) for the first-order LP/QP engines. It runs up to about 5× faster than CPU above roughly 16 k variables, and returns the same objective as the CPU path. |
+| **GPU** | Vendor-neutral Vulkan compute backend (50 production SPIR-V shaders, plus 2 `sor_gpu_bench` kernels) for the first-order LP/QP engines. It runs up to about 5× faster than CPU at large sizes (see the GPU table below), and returns the same objective as the CPU path. |
 | **Proof discipline** | Only one function, `finalize_result`, can set `Optimal`, and it needs proof evidence to do so. A separate `sor_check` binary re-checks LP solutions against the original model file. |
 | **Determinism** | Threading uses fixed chunk sizes, so results are bit-identical at 1, 2, 4 or 8 threads. |
 
@@ -85,14 +85,15 @@ exported as an installable package.
 
 | `--engine` | Model class | Method | What it can claim |
 |---|---|---|---|
-| `simplex` *(default)*, `primal`, `dual` | LP | Revised primal/dual simplex | `ProvedOptimalFP` |
-| `auto` | LP / any QPLIB file | For LP: first-order → crossover → simplex. For QPLIB: routes by problem class | Whatever the chosen engine can claim |
+| `auto` *(default)* | LP / any QPLIB file | For LP: concurrent / first-order → crossover → simplex routing. For QPLIB: routes by problem class | Whatever the chosen engine can claim |
+| `simplex`, `primal`, `dual` | LP | Revised primal/dual simplex | `ProvedOptimalFP` |
 | `pdhg`, `hpr` | LP | First-order (PDHG, Halpern-restarted PDHG), CPU or Vulkan | Feasible with gap; `Optimal` only after crossover |
+| `barrier` | LP | Primal-dual interior-point LP path | Feasible / KKT-style claims only when the barrier evidence passes `finalize_result` |
 | `milp` | MILP | Branch-and-cut | `ProvedGlobalEpsilon` when the tree closes |
 | `qpipm` | Convex QP / QCQP | Interior point, supernodal LDLᵀ + FGMRES | `ProvedKKT`; refuses a model it cannot confirm is convex |
 | `qp`, `hprqp`, `qpauto` | QP | First-order PDHCG / HPR-QP, CPU or Vulkan | `Optimal` only if its residual test passes |
 | `qcqplocal` | Nonconvex QCQP | Local barrier method with a restoration phase | Feasible at best, never optimal |
-| `miqp`, `miqcqp` | MIQP / MIQCQP | B&B with convex node relaxations | Optimal when the tree closes |
+| `miqp` | MIQP / MIQCQP | B&B with convex node relaxations; MIQCQP is selected automatically on QPLIB with quadratic constraints (there is no separate `--engine miqcqp`) | Optimal when the tree closes |
 | `global` | Nonconvex QP/QCQP, integers allowed | Spatial B&B (McCormick/RLT, αBB, PSD cuts, FBBT/OBBT) | Proved global optimum when the tree closes |
 | `binquad` | Binary quadratic | Tabu search + QCR bound, CPU or Vulkan | Incumbent plus a certified bound |
 
@@ -194,7 +195,7 @@ src/
   search/     MILP branch-and-cut, MIQP, spatial B&B, binary QP, heuristics
   certify/    finalize_result: the only function that can write Optimal
 apps/         sor_solve, sor_check, sor_gen, benchmarks for LDLᵀ and GPU
-tests/        80 C++ and Python tests (ctest)
+tests/        140 ctest cases (128 C++ test binaries, 7 Python tests, plus profiled/extra cases)
 examples/     small seeded LP / MILP / QP models
 benchmarks/   industrial ladder (S → HUGE), refinery LPs, result files
 scripts/      benchmark fetcher, comparison harness, QPLIB evaluator, REPL
@@ -202,8 +203,10 @@ web/          browser console (FastAPI)
 docs/         architecture, benchmarks, references
 ```
 
-Layering is enforced through CMake: a module can only link modules in lower
-layers. See [`docs/architecture.md`](docs/architecture.md).
+Module order is layered through CMake (`add_subdirectory` order). Most
+targets link only lower layers; `sor_certify` is also linked from
+presolve/engines/search so they can call the proof gate. See
+[`docs/architecture.md`](docs/architecture.md).
 
 ## Benchmark data
 
@@ -241,9 +244,10 @@ corpus and the pooling generators are not.
   answers, because it applies the LP dual/gap test. It does not read QPS
   quadratic terms. QPLIB points are re-checked by `scripts/qplib_eval.py`.
 - **GPU.** Only the first-order engines use the GPU, and the GPU path is
-  slower than CPU below about 4 k variables. CUDA is a stub: Vulkan is the
-  only GPU backend.
-- **No LP barrier method.** Interior point exists for QP/QCQP only.
+  slower than CPU at small sizes (see the GPU table: n = 1,000 is CPU-faster).
+  CUDA is a stub: Vulkan is the only GPU backend.
+- **LP barrier is available but immature.** `--engine barrier` is wired; QP/QCQP
+  interior point (`qpipm`) is the mature IPM path.
 - **No exact or VIPR certificates.** Proofs are at floating-point tolerance
   (`ProvedOptimalFP`), not rational.
 - **Industrial data is synthetic.** No MRPL plant data has been used.

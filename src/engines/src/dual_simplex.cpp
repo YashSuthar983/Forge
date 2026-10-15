@@ -1390,6 +1390,19 @@ static core::RawResult dual_prepared_pass(
         ++diag.devex_frameworks;
     };
 
+    bool dse_rebuild_pending = false;
+    const auto materialize_dse_weights = [&]() {
+        SOR_FN();
+        if (!dse_rebuild_pending) return;
+        dse_rebuild_pending = false;
+        if (!dse_active) return;
+        ++diag.dse_weight_rebuilds;
+        const auto t_dse = Clock::now();
+        if (!rebuild_dual_edge_weights(m, do_btran, row_w, dse_rebuild_btran, dse_deadline))
+            std::fill(row_w.begin(), row_w.end(), 1.0);
+        diag.dse_rebuild_ms += ms_since(t_dse);
+        invalidate_leave_heap();
+    };
     const auto reset_weights = [&]() {
         SOR_FN();
         if (dse_active) {
@@ -1405,15 +1418,20 @@ static core::RawResult dual_prepared_pass(
                 }
             if (logical_basis) {
                 std::fill(row_w.begin(), row_w.end(), 1.0);
+                dse_rebuild_pending = false;
             } else if (opts.warm_dse_reset) {
                 std::fill(row_w.begin(), row_w.end(), 1.0);
+                dse_rebuild_pending = false;
             } else {
-                ++diag.dse_weight_rebuilds;
-                const auto t_dse = Clock::now();
-                if (!rebuild_dual_edge_weights(m, do_btran, row_w,
-                                               dse_rebuild_btran, dse_deadline))
-                    std::fill(row_w.begin(), row_w.end(), 1.0);
-                diag.dse_rebuild_ms += ms_since(t_dse);
+                // The m-BTRAN rebuild is deferred to the first iteration
+                // that has a row to price (materialize_dse_weights): a warm
+                // start that is already optimal -- a crossover basis -- never
+                // reads a weight (qap15: 1.7 s of BTRANs for a cleanup that
+                // made no pivot).  The weights depend on B alone and B does
+                // not change before that iteration, so a run that pivots
+                // prices with exactly the weights it got before.
+                std::fill(row_w.begin(), row_w.end(), 1.0);
+                dse_rebuild_pending = true;
             }
         } else if (use_devex) {
             reset_devex_framework();
@@ -3633,6 +3651,15 @@ static core::RawResult dual_prepared_pass(
         bool pivot_to_lower = true;
 
         ++diag.pricing_calls;
+        if (dse_rebuild_pending) {
+            // Only once there is a row to price (see reset_weights).
+            for (Index i = 0; i < m; ++i)
+                if (xB[sz(i)] < slot_lo[sz(i)] - slot_ptol[sz(i)] ||
+                    xB[sz(i)] > slot_hi[sz(i)] + slot_ptol[sz(i)]) {
+                    materialize_dse_weights();
+                    break;
+                }
+        }
         {
             // ---- the iteration, shared by BOTH phases -------------------
             // Leave a basic variable that violates its WORKING bound; the
@@ -4972,7 +4999,7 @@ static core::RawResult dual_prepared_pass(
     // final basis, and only while exact DSE is still the live pricing -- a
     // mid-solve fall back to Devex leaves reference weights in row_w, which
     // are not ||B^-T e_i||^2 and must not be passed off as such.
-    if (carrier != nullptr && dse_active) {
+    if (carrier != nullptr && dse_active && !dse_rebuild_pending) {
         carrier->basis.assign(basis.begin(), basis.end());
         carrier->weights.assign(row_w.begin(), row_w.end());
     }

@@ -464,7 +464,17 @@ int test_dse_weight_carrier() {
 
     // Branch: tighten one bound, which changes the LP but not its matrix.
     LpProblem child = lp;
-    child.col_hi[3] = 2.0;
+    // Cut a BASIC column below its value, so the warm start is primal
+    // infeasible and must price: exact weights are built lazily, on the
+    // first iteration that has a row to price, and a child the parent's
+    // basis still solves never builds them.
+    {
+        Index cut = -1;
+        for (const Index v : parent_basis.basic)
+            if (v < n && parent.x[static_cast<std::size_t>(v)] > 1e-6) { cut = v; break; }
+        if (cut < 0) return fail_at(__LINE__);
+        child.col_hi[static_cast<std::size_t>(cut)] = 0.5 * parent.x[static_cast<std::size_t>(cut)];
+    }
 
     const auto solve_child = [&](sor::engines::DualEdgeWeightCarrier* c,
                                  sor::engines::SimplexDiagnostics& d) {
@@ -591,7 +601,17 @@ int test_warm_dse_reset_skips_rebuild() {
     // pivoted away from it) is non-logical, so reset_weights() takes the
     // exact-rebuild branch on a plain warm start.
     LpProblem child = lp;
-    child.col_hi[3] = 2.0;
+    // Cut a BASIC column below its value, so the warm start is primal
+    // infeasible and must price: exact weights are built lazily, on the
+    // first iteration that has a row to price, and a child the parent's
+    // basis still solves never builds them.
+    {
+        Index cut = -1;
+        for (const Index v : parent_basis.basic)
+            if (v < n && parent.x[static_cast<std::size_t>(v)] > 1e-6) { cut = v; break; }
+        if (cut < 0) return fail_at(__LINE__);
+        child.col_hi[static_cast<std::size_t>(cut)] = 0.5 * parent.x[static_cast<std::size_t>(cut)];
+    }
 
     sor::engines::SimplexOptions default_opts = opts;
     sor::engines::SimplexDiagnostics default_diag;

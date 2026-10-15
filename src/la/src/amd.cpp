@@ -31,9 +31,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <numeric>
 #include <stdexcept>
-#include <unordered_map>
+#include <utility>
 
 namespace sor::la {
 namespace {
@@ -44,25 +45,43 @@ inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 
 }  // namespace
 
-std::vector<Index> amd_order(const SymCsc& a) {
+std::vector<Index> amd_order(const SymCsc& a, const std::function<bool()>* stop, AmdCaps* caps) {
     const Index n = a.n;
     std::vector<Index> order;
     order.reserve(sz(n));
     if (n == 0) return order;
 
-    // Symmetric adjacency without self loops or duplicates.
-    std::vector<std::vector<Index>> adj(sz(n));
+    // Symmetric adjacency without self loops or duplicates, as one CSR
+    // (counted, filled, then each row sorted and deduplicated in place):
+    // a vector per row grown by push_back cost a sixth of the ordering on
+    // maros-r7's dual normal equations.
+    std::vector<Offset> ap(sz(n) + 1, 0);
     for (Index j = 0; j < n; ++j)
         for (Offset t = a.col_ptr[sz(j)]; t < a.col_ptr[sz(j) + 1]; ++t) {
             const Index i = a.row_idx[static_cast<std::size_t>(t)];
             if (i == j) continue;
             if (i < 0 || i >= n) throw std::invalid_argument("amd_order: row index out of range");
-            adj[sz(i)].push_back(j);
-            adj[sz(j)].push_back(i);
+            ++ap[sz(i) + 1];
+            ++ap[sz(j) + 1];
         }
-    for (auto& v : adj) {
-        std::sort(v.begin(), v.end());
-        v.erase(std::unique(v.begin(), v.end()), v.end());
+    for (Index i = 0; i < n; ++i) ap[sz(i) + 1] += ap[sz(i)];
+    std::vector<Index> aj(static_cast<std::size_t>(ap[sz(n)]));
+    {
+        std::vector<Offset> fill(ap.begin(), ap.end() - 1);
+        for (Index j = 0; j < n; ++j)
+            for (Offset t = a.col_ptr[sz(j)]; t < a.col_ptr[sz(j) + 1]; ++t) {
+                const Index i = a.row_idx[static_cast<std::size_t>(t)];
+                if (i == j) continue;
+                aj[static_cast<std::size_t>(fill[sz(i)]++)] = j;
+                aj[static_cast<std::size_t>(fill[sz(j)]++)] = i;
+            }
+    }
+    std::vector<Offset> alen(sz(n), 0);   // distinct neighbours, at the front of each row
+    for (Index i = 0; i < n; ++i) {
+        Index* b = aj.data() + ap[sz(i)];
+        Index* e = aj.data() + ap[sz(i) + 1];
+        std::sort(b, e);
+        alen[sz(i)] = std::unique(b, e) - b;
     }
 
     std::vector<std::uint8_t> status(sz(n), kVar);
@@ -70,7 +89,7 @@ std::vector<Index> amd_order(const SymCsc& a) {
         std::max<std::size_t>(16, static_cast<std::size_t>(10.0 * std::sqrt(static_cast<double>(n))));
     std::vector<Index> dense;
     for (Index i = 0; i < n; ++i)
-        if (adj[sz(i)].size() > dense_thr) {
+        if (static_cast<std::size_t>(alen[sz(i)]) > dense_thr) {
             status[sz(i)] = kDense;
             dense.push_back(i);
         }
@@ -80,12 +99,20 @@ std::vector<Index> amd_order(const SymCsc& a) {
     std::vector<Offset> elem_w(sz(n), 0);
     for (Index i = 0; i < n; ++i) {
         if (status[sz(i)] == kDense) continue;
-        for (Index j : adj[sz(i)])
-            if (status[sz(j)] != kDense) A[sz(i)].push_back(j);
+        const Index* b = aj.data() + ap[sz(i)];
+        std::size_t keep = 0;
+        for (Offset t = 0; t < alen[sz(i)]; ++t) keep += status[sz(b[t])] != kDense;
+        A[sz(i)].reserve(keep);
+        for (Offset t = 0; t < alen[sz(i)]; ++t)
+            if (status[sz(b[t])] != kDense) A[sz(i)].push_back(b[t]);
         degree[sz(i)] = static_cast<Index>(A[sz(i)].size());
     }
-    adj.clear();
-    adj.shrink_to_fit();
+    aj.clear();
+    aj.shrink_to_fit();
+    ap.clear();
+    ap.shrink_to_fit();
+    alen.clear();
+    alen.shrink_to_fit();
 
     // Degree buckets: doubly linked lists, head per degree.
     std::vector<Index> head(sz(n) + 1, -1), next(sz(n), -1), prev(sz(n), -1);
@@ -113,8 +140,16 @@ std::vector<Index> amd_order(const SymCsc& a) {
     Index min_deg = 0;
     std::vector<Index> elim;   // principal pivots in elimination order
     std::vector<Index> Lp;
+    std::vector<std::pair<std::uint64_t, Index>> sv;     // supervariable detection: (hash, position in Lp)
+    std::vector<std::int64_t> smark(sz(n), -1);
+    std::int64_t sstamp = 0;
 
+    std::size_t polls = 0;
     while (n_left > 0) {
+        // The caller's deadline: a large graph's ordering is the one setup
+        // step that can outlast a time limit (set-cover-model's dense
+        // 10k-row normal equations ran 120 s past its limit).
+        if (stop && (++polls & 255u) == 0 && (*stop)()) return {};
         // ---- pick a minimum-degree variable ----
         while (min_deg <= n && head[sz(min_deg)] < 0) ++min_deg;
         if (min_deg > n) break;   // defensive: nothing left in the buckets
@@ -149,6 +184,33 @@ std::vector<Index> amd_order(const SymCsc& a) {
 
         Offset lp_w = 0;
         for (Index i : Lp) lp_w += nv[sz(i)];
+        if (caps) {
+            // The k = nv(p) columns of p's supervariable have lp_w + k - 1,
+            // ..., lp_w entries below the diagonal (Ldlt counts the strict
+            // lower part).
+            const double k = static_cast<double>(nv[sz(p)]), lw = static_cast<double>(lp_w);
+            caps->nnz_l_lb += k * lw + 0.5 * k * (k - 1.0);
+            caps->flops_lb += k * lw * lw + lw * k * (k - 1.0) + (k - 1.0) * k * (2.0 * k - 1.0) / 6.0;
+            // Eliminating p leaves Lp a CLIQUE of the remaining graph, and
+            // fill only adds edges: whatever the order of the rest, the
+            // clique's own columns, eliminated later, have at least
+            // w-1, w-2, ..., 0 entries below the diagonal (w = lp_w).  Those
+            // columns are disjoint from the ones counted so far, so their
+            // sum c^2 adds to the bound.  The total cost of a factor is
+            // concentrated in its last, densest columns; counting the
+            // eliminated columns alone, the bound reached the cap only near
+            // the end of the ordering (dfl001's dual normal equations: a
+            // trial ordered to the end, 42 ms, to lose; now abandoned).
+            const double fut_nnz = 0.5 * lw * (lw - 1.0);
+            const double fut_flops = (lw - 1.0) * lw * (2.0 * lw - 1.0) / 6.0;
+            if ((caps->max_flops > 0.0 && caps->flops_lb + fut_flops > caps->max_flops) ||
+                (caps->max_nnz_l > 0.0 && caps->nnz_l_lb + fut_nnz > caps->max_nnz_l)) {
+                caps->exceeded = true;
+                caps->flops_lb += fut_flops;
+                caps->nnz_l_lb += fut_nnz;
+                return {};
+            }
+        }
 
         // ---- w(e) = |L(e) \ Lp| for elements touching Lp ----
         ++stamp;
@@ -205,25 +267,39 @@ std::vector<Index> amd_order(const SymCsc& a) {
         }
 
         // ---- supervariables: identical A and E after the update ----
+        // Candidates are found by sorting (hash, position in Lp) -- runs of
+        // equal hash are the groups, each scanned in Lp order as before --
+        // and compared exactly by marking i's lists and checking j's against
+        // them (the lists hold no duplicates, so equal sizes and inclusion
+        // mean equal sets).  A hash map of groups and sorted copies of every
+        // compared list took a third of the ordering on maros-r7's dual
+        // normal equations (36 of 105 ms).
         if (Lp.size() > 1) {
-            std::unordered_map<std::uint64_t, std::vector<Index>> groups;
-            for (Index i : Lp) groups[hash[sz(i)]].push_back(i);
-            for (auto& [hv, g] : groups) {
-                if (g.size() < 2) continue;
-                for (std::size_t x = 0; x < g.size(); ++x) {
-                    const Index i = g[x];
+            sv.clear();
+            for (std::size_t x = 0; x < Lp.size(); ++x) sv.emplace_back(hash[sz(Lp[x])], static_cast<Index>(x));
+            std::sort(sv.begin(), sv.end());
+            for (std::size_t g0 = 0; g0 < sv.size();) {
+                std::size_t g1 = g0 + 1;
+                while (g1 < sv.size() && sv[g1].first == sv[g0].first) ++g1;
+                for (std::size_t x = g0; g1 - g0 > 1 && x < g1; ++x) {
+                    const Index i = Lp[sz(sv[x].second)];
                     if (status[sz(i)] != kVar) continue;
-                    auto ai = A[sz(i)], ei = E[sz(i)];
-                    std::sort(ai.begin(), ai.end());
-                    std::sort(ei.begin(), ei.end());
-                    for (std::size_t y = x + 1; y < g.size(); ++y) {
-                        const Index j = g[y];
+                    bool marked = false;
+                    for (std::size_t y = x + 1; y < g1; ++y) {
+                        const Index j = Lp[sz(sv[y].second)];
                         if (status[sz(j)] != kVar) continue;
-                        if (A[sz(j)].size() != ai.size() || E[sz(j)].size() != ei.size()) continue;
-                        auto aj = A[sz(j)], ej = E[sz(j)];
-                        std::sort(aj.begin(), aj.end());
-                        std::sort(ej.begin(), ej.end());
-                        if (aj != ai || ej != ei) continue;
+                        if (A[sz(j)].size() != A[sz(i)].size() || E[sz(j)].size() != E[sz(i)].size()) continue;
+                        if (!marked) {
+                            ++sstamp;
+                            for (Index v : A[sz(i)]) smark[sz(v)] = sstamp;
+                            for (Index e : E[sz(i)]) smark[sz(e)] = sstamp;
+                            marked = true;
+                        }
+                        bool same = true;
+                        for (Index v : A[sz(j)]) if (smark[sz(v)] != sstamp) { same = false; break; }
+                        for (std::size_t t = 0; same && t < E[sz(j)].size(); ++t)
+                            if (smark[sz(E[sz(j)][t])] != sstamp) same = false;
+                        if (!same) continue;
                         // j is indistinguishable from i: merge.
                         nv[sz(i)] += nv[sz(j)];
                         degree[sz(i)] = std::max<Index>(0, degree[sz(i)] - nv[sz(j)]);
@@ -234,6 +310,7 @@ std::vector<Index> amd_order(const SymCsc& a) {
                         E[sz(j)].clear(); E[sz(j)].shrink_to_fit();
                     }
                 }
+                g0 = g1;
             }
         }
 

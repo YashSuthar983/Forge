@@ -51,7 +51,7 @@ namespace {
 void usage() {
     std::fputs(
         "usage: sor_solve MODEL.{mps,lp,qps,qplib} [options]\n"
-        "  --engine NAME    simplex (default) | auto | primal | dual | pdhg | hpr | barrier | milp | qp\n"
+        "  --engine NAME    auto (default) | simplex | primal | dual | pdhg | hpr | barrier | milp | qp\n"
         "  --q-diag LIST    comma-separated diagonal of Q (if not using .qps)\n"
         "  --backend NAME   cpu (default) | vulkan | cuda\n"
         "  --engine hprqp   GPU-capable HPR-QP convex QP engine (honours --backend)\n"
@@ -4854,12 +4854,17 @@ int main(int argc, char** argv) {
                     : 0;
                 lp_opts.time_limit_s = engine_name == "hpr"
                     ? hpr_opts.time_limit_s : pdhg_opts.time_limit_s;
-                lp_opts.primal_feas_tol = engine_name == "hpr"
-                    ? hpr_opts.primal_tol : pdhg_opts.primal_tol;
-                lp_opts.dual_feas_tol = engine_name == "hpr"
-                    ? hpr_opts.dual_tol : pdhg_opts.dual_tol;
-                lp_opts.gap_tol = engine_name == "hpr"
-                    ? hpr_opts.gap_tol : pdhg_opts.gap_tol;
+                // The barrier is not a first-order method: with crossover it
+                // returns a basis, and it answers to the LP contract (1e-7,
+                // gap 1e-9) like the simplex engines.  It used to take
+                // PDHG's 1e-6 defaults and so claimed Optimal on points the
+                // checker rejects at the LP tolerance (s100: dual 8.4e-7).
+                lp_opts.primal_feas_tol = engine_name == "hpr" ? hpr_opts.primal_tol
+                    : engine_name == "barrier" ? sx_opts.primal_feas_tol : pdhg_opts.primal_tol;
+                lp_opts.dual_feas_tol = engine_name == "hpr" ? hpr_opts.dual_tol
+                    : engine_name == "barrier" ? sx_opts.dual_feas_tol : pdhg_opts.dual_tol;
+                lp_opts.gap_tol = engine_name == "hpr" ? hpr_opts.gap_tol
+                    : engine_name == "barrier" ? sx_opts.gap_tol : pdhg_opts.gap_tol;
                 lp_opts.presolve = sx_opts.presolve;
                 lp_opts.presolve_implied_slack = sx_opts.presolve_implied_slack;
                 lp_opts.fo_polish = fo_polish;

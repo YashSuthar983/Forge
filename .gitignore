@@ -98,3 +98,60 @@ scripts/refinery_bench.py
 
 # superseded by QP_PERFS.md
 QPLIB_TIMING.md
+
+# ---- local clutter (never product docs / never ship) -----------------------
+# Presentation exports, agent handoffs, chat dumps, and local backup trees.
+# Product docs stay: README.md, CLI_FLAGS.md, QP.md, QP_PERFS.md,
+# docs/{architecture,benchmarks,paper_bibliography}.md, web/README.md.
+backup/
+backups/
+demo_out/
+Testing/
+.pytest_cache/
+.worktrees/
+.agents/
+.aws/
+.codex/
+cscope.out
+gmon.out
+tags
+TAGS
+*.tar.gz
+*.tar.gz.sha256
+SOURCE_REVIEW_*
+DEMO_VIDEO_SCRIPT*.md
+arch_idea_*
+architecture_slide.*
+engine_flow.*
+methodology.*
+technical_approach*
+web_flow.*
+docs/AGENT*
+docs/HANDOFF_*
+docs/MILP_*
+docs/LP_*
+docs/SESSION_HANDOFF.md
+docs/HISTORY_CONSOLIDATION_*
+docs/PERFORMANCE_REGRESSION_*
+docs/NETLIB_BASELINE_FREEZE.md
+docs/DUAL_WORKING_COST_*
+docs/gg_audit.md
+docs/commercial_audit_*/
+docs/cpu_campaign_*/
+
+# Downloaded third-party corpora (regenerate / refetch; do not commit)
+benchmarks/lpopt/
+benchmarks/industry/dispatch-qp/
+benchmarks/industry/miplib-blend/
+benchmarks/industry/netlib-blend/
+benchmarks/industry/netlib-large/
+benchmarks/industry/sor-gen-refinery/
+
+# Unlinked Julia vendor tree is optional local material; keep ignore soft via
+# VENDORED.md. Binaries under solver_accl/bin must never be committed.
+solver_accl/bin/
+solver_accl/Manifest.toml
+
+# Scratch dumps often left in the tree root
+d1h*.txt
+gurobi.log

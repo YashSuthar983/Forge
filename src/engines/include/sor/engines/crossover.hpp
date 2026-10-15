@@ -64,6 +64,12 @@ struct CrossoverDiagnostics {
     std::uint64_t remaining_superbasics = 0;
     std::uint64_t matched_structural_columns = 0;
     std::uint64_t rank_repairs = 0;
+    // The final basis's basic values recomputed as B^-1 (-N x_N) -- what a
+    // simplex started on it sees -- against the bounds: the largest
+    // violation (scaled model) and whether all are within the primal
+    // tolerance.
+    double pushed_basis_max_violation = 0.0;
+    bool pushed_basis_primal_feasible = false;
     std::uint64_t warm_cleanup_iterations = 0;
     std::uint64_t cold_fallback_iterations = 0;
     bool triggered_by_tolerances = false;

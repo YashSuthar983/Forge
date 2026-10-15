@@ -2,7 +2,7 @@
 
 This page lists every user-facing command-line flag in Forge. The binaries keep
 their `sor_` names.
-It was audited against the argument parsers on 2026-09-25. The implementation
+It was re-audited against the argument parsers on 2026-10-11. The implementation
 is authoritative; update this document whenever a parser changes.
 
 ## `sor_solve`
@@ -13,7 +13,7 @@ Usage: `sor_solve MODEL [options]`
 
 | Flag | Value / default | Purpose |
 |---|---|---|
-| `--engine` | `NAME`; `simplex` | Select `simplex`, `auto`, `primal`, `dual`, `pdhg`, `hpr`, `milp`, `qp`, `hprqp`, `qpauto`, `qpipm`, `qcqplocal`, `miqp`, `miqcqp`, `global`, or `binquad`, as applicable to the model. |
+| `--engine` | `NAME`; `auto` | Select `auto` (CLI default), `simplex`, `primal`, `dual`, `pdhg`, `hpr`, `barrier`, `milp`, `qp`, `hprqp`, `qpauto`, `qpipm`, `qcqplocal`, `miqp`, `global`, or `binquad`, as applicable to the model. There is no `--engine miqcqp`; MIQCQP is reached via `--engine miqp` on QPLIB instances with quadratic constraints. |
 | `--backend` | `cpu\|vulkan\|cuda`; `cpu` | Select the compute backend. CUDA is currently a stub. |
 | `--q-diag` | comma-separated numbers | Supply a diagonal quadratic objective when it is not present in the model. |
 | `--eval-solution` | `FILE` or `zero` | Evaluate a QPLIB solution without solving. |
@@ -29,7 +29,7 @@ Usage: `sor_solve MODEL [options]`
 | `--threads` | integer `1..256` | Sparse-linear-algebra worker count. |
 | `--verbose` | switch; off | Enable iteration/node logging. |
 | `-h`, `--help` | switch | Print help. |
-| `--list-opts` `[ENGINE]` | optional engine | Print the dynamic option tables and exit. Supported table names: `qp`, `qcqp`, `miqp`, `global`, or `all`. |
+| `--list-opts` `[ENGINE]` | optional engine | Print the dynamic option tables and exit. Supported table names: `qp`, `qpipm`, `qpauto`, `hprqp`, `qcqp`, `qcqplocal`, `miqp`, `global`, or `all`. |
 
 ### Shared limits and tolerances
 
@@ -235,7 +235,9 @@ Engine: `qcqplocal`; this engine never claims more than local feasibility.
 
 #### `--miqp-opt` — mixed-integer quadratic B&B
 
-Engines: `miqp` and `miqcqp`; node relaxations must certify convexity.
+Engine: `--engine miqp` (MIQCQP is the internal route for QPLIB with quadratic
+constraints; there is no separate `--engine miqcqp`). Node relaxations must
+certify convexity.
 
 | Key | Type | Default | Purpose |
 |---|---|---:|---|
@@ -297,6 +299,9 @@ Usage: `sor_check MODEL.mps SOLUTION.sol [options]`
 | Flag | Value / default | Purpose |
 |---|---|---|
 | `--tol` | positive real; `1e-7` | Independent verification tolerance. |
+| `--gap-tol` | positive real | Gap tolerance used when checking dual/gap claims (separate from `--tol`). |
+| `--strict` | switch | Require a dual/gap bound for every claimed LP optimum. |
+| `--strict-mps` | switch | Kept for compatibility; currently a no-op (strict MPS behaviour is the default). |
 | `--relax-integrality` | switch | Check the continuous relaxation. |
 | `--small-matrix-value` | positive real | Apply the same coefficient-drop threshold used during solving. |
 | `--fixed-mps` / `--free-mps` | switches | Force the MPS format. |

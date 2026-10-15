@@ -78,7 +78,10 @@ EnvSwitches read_environment() {
     s.ref_trace = flag("SOR_REF_TRACE");
     s.fgmres_profile = flag("SOR_FGMRES_PROFILE");
     s.dump_kkt = text("SOR_DUMP_KKT");
+    s.barrier_point_out = text("SOR_BARRIER_POINT_OUT");
+    s.barrier_point_in = text("SOR_BARRIER_POINT_IN");
     s.stall_window = static_cast<int>(number("SOR_STALL_WINDOW"));
+    s.ipm_gondzio = number("SOR_IPM_GONDZIO") > 0 ? static_cast<int>(number("SOR_IPM_GONDZIO")) : -1;
     s.resto_ms = static_cast<long>(number("SOR_RESTO_MS"));
     return s;
 }
