@@ -130,9 +130,9 @@ requires convex node relaxations and pooling's bilinear rows never are.
 
 ## QPLIB
 
-All 453 instances parse and route. Measured: 311 feasible, 138 matching the
-published objective, 43 proved, 0 disagreements with the independent re-check
-(`QP_PERFS.md` §1). Two routing changes suggested by the
+All 453 instances parse and route. Measured (Oct 2026, 120 s, CPU+GPU best-of):
+317 feasible, 164 matching the published objective, 45 proved, 0 disagreements
+with the independent re-check (`QP_PERFS.md` §1). Two routing changes suggested by the
 refinery work were tested on the affected classes and **refused**: sending the
 52 continuous quadratic-constrained instances to the spatial branch-and-bound
 gives 12 feasible against 33, winning on none; sending the 134 mixed-integer

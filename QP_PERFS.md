@@ -8,6 +8,28 @@ under. A number without its conditions is not a measurement.
 
 ## 1. QPLIB, all 453 instances
 
+### Oct 2026 campaign (best results)
+
+`--engine auto`, 120 s wall limit each, 14 parallel workers × 1 thread (CPU)
+plus 4 concurrent GPU jobs (binquad on AMD RX 9060 XT via Vulkan), Release +
+`-march=native` build, AMD Ryzen 7 desktop. Every objective independently
+re-checked by a second reader that shares no code with the solver.
+
+| | Oct 2026 (CPU+GPU best-of) | Sept 2026 | Sept 2026 prev |
+|---|---:|---:|---:|
+| read and routed | 453 | 453 | 453 |
+| ran | 453 | 452 | 452 |
+| feasible | **317** | 311 | 287 |
+| matching the published objective (<=1e-6 rel) | **164** | 138 | 114 |
+| proved optimal | **45** | 43 | — |
+| independent re-check disagreements | **0** | 0 | 0 |
+
+CPU-only (120 s): 45 Optimal, 270 Feasible. GPU-only (binquad, 120 s): 31 Optimal, 284 Feasible.
+Best-of takes the better status first (Optimal > Feasible > NSF), then the better objective
+accounting for sense.
+
+### Sept 2026 campaign (original)
+
 `--engine auto`, 60 s wall limit each, 8 threads per solve, 4 solves
 concurrent. Every objective independently re-checked by a second reader that
 shares no code with the solver.
