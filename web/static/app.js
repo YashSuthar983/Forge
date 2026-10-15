@@ -739,10 +739,14 @@
   $("sol-dl").addEventListener("click", () => {
     if (!state.sol) return;
     const a = el("a");
-    a.href = URL.createObjectURL(new Blob([state.sol.text], { type: "text/plain" }));
-    a.download = `${(state.current?.title || "model").replace(/\W+/g, "_")}.sol`;
+    const name = `${(state.current?.title || "model").replace(/\W+/g, "_")}.sol`;
+    // Truncated view: fetch the full file from the server instead of the 400 KB preview.
+    a.href = state.sol.truncated && state.solToken
+      ? `/api/solution/raw?sol_token=${encodeURIComponent(state.solToken)}`
+      : URL.createObjectURL(new Blob([state.sol.text], { type: "text/plain" }));
+    a.download = name;
     a.click();
-    URL.revokeObjectURL(a.href);
+    if (a.href.startsWith("blob:")) URL.revokeObjectURL(a.href);
   });
 
   $("copy-cmd").addEventListener("click", async () => {

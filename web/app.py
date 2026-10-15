@@ -20,12 +20,13 @@ import shutil
 import subprocess
 import tempfile
 import time
+from collections import defaultdict, deque
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from lp_text import LpTextError, lp_text_to_mps
@@ -63,6 +64,11 @@ DEFAULT_TIME_LIMIT = float(_env("WEB_TIME_LIMIT", "30"))
 MAX_TIME_LIMIT = float(_env("WEB_MAX_TIME_LIMIT", "300"))
 EDITOR_MAX_BYTES = int(_env("WEB_EDITOR_MAX_BYTES", "400000"))
 UPLOAD_MAX_BYTES = int(_env("WEB_UPLOAD_MAX_BYTES", "40000000"))
+# Public-deployment guards: per-IP POST budget per 10 min (0 = off), solver
+# processes run at once, and how long session files are kept.
+RATE_LIMIT = int(_env("WEB_RATE_LIMIT", "30"))
+MAX_CONCURRENT = int(_env("WEB_MAX_CONCURRENT", "2"))
+SESSION_TTL_S = float(_env("WEB_SESSION_TTL", "3600"))
 # Model classes whose sor_check verdict is authoritative today (see the evidence
 # report, section L: MILP dual/gap checks and QPS objectives are not supported yet).
 CHECK_CLASSES = {c.strip().upper() for c in (_env("CHECK_CLASSES") or "LP").split(",") if c.strip()}
@@ -591,7 +597,15 @@ def _parse_check_output(text: str) -> dict[str, Any]:
     return {"checks": checks, "verdict": verdict, "warnings": warnings}
 
 
+_SLOTS = asyncio.Semaphore(MAX_CONCURRENT)
+
+
 async def _run(cmd: list[str], *, timeout: float) -> dict[str, Any]:
+    async with _SLOTS:  # extra requests queue here instead of oversubscribing CPU/RAM
+        return await _run_now(cmd, timeout=timeout)
+
+
+async def _run_now(cmd: list[str], *, timeout: float) -> dict[str, Any]:
     t0 = time.perf_counter()
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -637,6 +651,14 @@ def _session_dir(token: str) -> Path:
 
 
 def _new_session() -> Path:
+    # ponytail: O(n) sweep per new session, fine for a demo's few hundred dirs.
+    cutoff = time.time() - SESSION_TTL_S
+    for d in SESSIONS.glob("sor_sol_*"):
+        try:
+            if d.stat().st_mtime < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            pass
     return Path(tempfile.mkdtemp(prefix="sor_sol_", dir=SESSIONS))
 
 
@@ -655,6 +677,23 @@ def _fix_suffix(path: Path) -> Path:
 
 app = FastAPI(title="FORGE Demo Console", version="0.2.0")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+_hits: dict[str, deque[float]] = defaultdict(deque)
+
+
+@app.middleware("http")
+async def rate_limit(request: Request, call_next):
+    if RATE_LIMIT and request.method == "POST" and request.url.path in {"/api/solve", "/api/upload", "/api/check"}:
+        # Cloud Run appends the real client IP last; earlier entries are client-supplied.
+        fwd = request.headers.get("x-forwarded-for", "")
+        ip = fwd.split(",")[-1].strip() or (request.client.host if request.client else "?")
+        now, q = time.monotonic(), _hits[ip]
+        while q and now - q[0] > 600:
+            q.popleft()
+        if len(q) >= RATE_LIMIT:
+            return JSONResponse({"detail": "Too many requests from your network - try again in a few minutes"}, status_code=429)
+        q.append(now)
+    return await call_next(request)
 
 
 @app.get("/")
@@ -857,6 +896,14 @@ def _parse_sol(text: str) -> dict[str, Any]:
                 pass
         scalars.append([key, " ".join(p[1:])])
     return {"scalars": scalars, "vectors": vectors}
+
+
+@app.get("/api/solution/raw")
+async def solution_raw(sol_token: str) -> FileResponse:
+    sol_file = _session_dir(sol_token) / "out.sol"
+    if not sol_file.is_file():
+        raise HTTPException(404, "Solution file missing")
+    return FileResponse(sol_file, media_type="text/plain", filename="solution.sol")
 
 
 @app.get("/api/solution")
