@@ -12,6 +12,7 @@
 #include "sor/backend/device_buffer.hpp"
 #include "sor/backend/batched_pdhcg_device.hpp"
 #include "sor/backend/pdhcg_device.hpp"
+#include "sor/core/cancel.hpp"
 #include "sor/core/options.hpp"
 #include "sor/core/result.hpp"
 #include "sor/model/lp.hpp"
@@ -44,6 +45,15 @@ struct QpOptions {
     // was available -- same bug class as PdhgOptions's missing
     // time_limit_s.
     f64 time_limit_s = 0.0;
+    // LP barrier only, 0 = none: past this many seconds the interior point
+    // continues only while its recent convergence rate projects the
+    // tolerances to be met before time_limit_s.  An IPM that converges gets
+    // the time it needs; one that will not is stopped here, leaving the rest
+    // to crossover and the simplex.
+    f64 soft_time_limit_s = 0.0;
+    // Concurrent-race stop (see core/cancel.hpp): the barrier IPM polls it
+    // with its time limit. Null on every serial path.
+    const core::CancelToken* cancel = nullptr;
     std::uint64_t check_every = 10;
     int inner_max_iterations = 100;
     // Sparse-Q inner loop: how many inner iterations one host round trip
@@ -98,6 +108,9 @@ struct QpOptions {
     int tighten_retries = 3;
     f64 halpern_theta = 0.0;
     bool verbose = false;
+    // Gondzio centrality correctors after the Mehrotra corrector (0 disables).
+    // LP barrier (Q=0) defaults to 4; general QP keeps 2.
+    int gondzio_correctors = 2;
 };
 
 struct QpDiagnostics {
@@ -127,6 +140,9 @@ struct QpDiagnostics {
     double total_ms = 0.0;
     backend::TransferStats device_stats;   // general path only; transfer included
     std::string termination_reason;
+    // The run ended on its time budget (hard or soft limit, or a deadline
+    // during the setup) rather than by converging or stalling.
+    bool stopped_on_time = false;
 };
 
 // Dispatches to the exact diagonal/equality fast path when possible and to

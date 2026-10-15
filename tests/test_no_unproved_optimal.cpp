@@ -29,6 +29,7 @@ ProofEvidence good_evidence() {
     ev.has_basis            = true;
     ev.checker_passed       = true;
     ev.max_primal_violation = 1e-12;
+    ev.max_primal_distance  = 1e-12;
     ev.max_dual_violation   = 1e-12;
     ev.gap_rel              = 0.0;
     return ev;
@@ -46,6 +47,20 @@ int main() {
         CHECK(r.status == Status::Feasible);
         CHECK(r.proof == ProofLevel::FeasibleWithGap);
         CHECK(!r.downgrade_reason.empty());
+    }
+
+    // 1b. Absolute residuals within tolerance but the point far from a row
+    // in the units of x (1e-9 x >= 5e-9 at x = 0) -> the closed gap proves
+    // nothing about the objective: not ProvedOptimalFP, and not Optimal.
+    {
+        ProofEvidence ev = good_evidence();
+        ev.max_primal_distance = 5.0;
+        const auto r = finalize_result(claim_optimal(), ev);
+        CHECK(r.proof != ProofLevel::ProvedOptimalFP);
+        CHECK(r.status != Status::Optimal);
+        CHECK(!r.downgrade_reason.empty());
+        ev.max_primal_distance = std::numeric_limits<double>::infinity();   // never measured
+        CHECK(finalize_result(claim_optimal(), ev).proof != ProofLevel::ProvedOptimalFP);
     }
 
     // 2. Residuals above tolerance -> cannot be Optimal.
@@ -134,19 +149,49 @@ int main() {
     }
 
     // 10. Infeasibility rays are retained only after the independent
-    // violation check; all other statuses and failed checks clear them.
+    // Farkas check (check_lp_result publishes dual_farkas_violation and a
+    // separating contradiction only when check_dual_farkas_ray certifies);
+    // all other statuses and failed checks clear them.
     {
         RawResult raw;
         raw.proposed_status = Status::Infeasible;
         raw.ray = {1.0, -2.0};
         ProofEvidence ev;
+        ev.dual_farkas_violation = 0.0;
+        ev.dual_farkas_contradiction = 1.0;
         ev.ray_violation = 0.0;
+        ev.dual_farkas_multipliers = {0.5, -1.0};   // what the check certified
         auto accepted = finalize_result(std::move(raw), ev);
         CHECK(accepted.ray_certified);
         CHECK(accepted.ray.size() == 2);
+        // The published ray is the certified one, not the producer's.
+        CHECK(accepted.ray == ev.dual_farkas_multipliers);
+        CHECK(accepted.dual_farkas_ray.multipliers == ev.dual_farkas_multipliers);
+        // Evidence that does not name the multipliers it certified is no
+        // certificate.
+        {
+            RawResult again;
+            again.proposed_status = Status::Infeasible;
+            again.ray = {1.0, -2.0};
+            ProofEvidence unnamed = ev;
+            unnamed.dual_farkas_multipliers.clear();
+            CHECK(!finalize_result(std::move(again), unnamed).ray_certified);
+        }
+
+        // The legacy scalar alone is no longer a certificate: a zero
+        // homogeneous residual says nothing about the contradiction b'y.
+        raw.proposed_status = Status::Infeasible;
+        raw.ray = {1.0, -2.0};
+        ProofEvidence legacy;
+        legacy.ray_violation = 0.0;
+        auto legacy_only = finalize_result(std::move(raw), legacy);
+        CHECK(!legacy_only.ray_certified);
+        CHECK(legacy_only.status != Status::Infeasible);
+        CHECK(legacy_only.ray.empty());
 
         raw.proposed_status = Status::Infeasible;
         raw.ray = {1.0};
+        ev.dual_farkas_violation = std::numeric_limits<double>::infinity();
         ev.ray_violation = std::numeric_limits<double>::infinity();
         auto rejected = finalize_result(std::move(raw), ev);
         CHECK(!rejected.ray_certified);
@@ -154,8 +199,51 @@ int main() {
 
         raw.proposed_status = Status::Feasible;
         raw.ray = {1.0};
+        ev.dual_farkas_violation = 0.0;
         ev.ray_violation = 0.0;
         CHECK(finalize_result(std::move(raw), ev).ray.empty());
+    }
+
+    // 11. A complete search whose relaxation bounds were partly taken at f64
+    // tolerances claims ProvedGlobalFP: accepted as Optimal at that level
+    // (never lifted to ProvedGlobalEpsilon), and held to the same checks.
+    // Evidence shaped as milp_evidence() builds it: no basis, no gap.
+    {
+        CHECK(ProofLevel::ProvedKKT < ProofLevel::ProvedGlobalFP);
+        CHECK(ProofLevel::ProvedGlobalFP < ProofLevel::ProvedGlobalEpsilon);
+        CHECK(sor::core::to_string(ProofLevel::ProvedGlobalFP) == "ProvedGlobalFP");
+        RawResult raw;
+        raw.proposed_status = Status::Optimal;
+        raw.proposed_level  = ProofLevel::ProvedGlobalFP;
+        raw.objective       = 7.0;
+        raw.dual_bound      = 7.0;
+        raw.engine          = "milp_bab";
+        ProofEvidence ev;
+        ev.claimed_level        = ProofLevel::ProvedGlobalFP;
+        ev.has_basis            = false;
+        ev.checker_passed       = true;
+        ev.max_primal_violation = 1e-12;
+        ev.max_dual_violation   = 0.0;
+        ev.gap_rel              = 0.0;
+        auto r = finalize_result(RawResult(raw), ev);
+        CHECK(r.status == Status::Optimal);
+        CHECK(r.proof == ProofLevel::ProvedGlobalFP);
+        ev.max_primal_violation = 1e-3;
+        CHECK(finalize_result(RawResult(raw), ev).status != Status::Optimal);
+
+        // The same complete search with no incumbent proves infeasibility,
+        // at the same level.
+        RawResult inf;
+        inf.proposed_status = Status::Infeasible;
+        inf.proposed_level  = ProofLevel::BoundOnly;
+        inf.engine          = "milp_bab";
+        ProofEvidence iev;
+        iev.claimed_level        = ProofLevel::ProvedGlobalFP;
+        iev.max_primal_violation = 0.0;
+        iev.max_dual_violation   = 0.0;
+        r = finalize_result(std::move(inf), iev);
+        CHECK(r.status == Status::Infeasible);
+        CHECK(r.proof == ProofLevel::ProvedGlobalFP);
     }
 
     return sor::test::finish("test_no_unproved_optimal");

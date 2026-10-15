@@ -1,10 +1,12 @@
 #include "sor/engines/dual_ratio_test.hpp"
 
+#include "sor/core/env_switches.hpp"
 #include "sor/model/lp.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <unordered_set>
 
 namespace sor::engines {
 namespace {
@@ -104,6 +106,19 @@ DualRatioResult dual_ratio_test(const DualRatioInput& in,
             default: continue;   // basic: never a candidate
         }
         const f64 dpos = std::max(dfeas, 0.0);
+        // Opt-in: reject Harris-slack wrong-sign candidates whose dual update
+        // would move some other reduced cost by more than dual_feas_tol
+        // (|d| * max|alpha| / |alpha_j|). Measured on pilot87/dfl001/pilot
+        // (2026-10-09): enabling this by default cut wrong-sign cost shifts
+        // but inflated phase-1 / primal-cleanup pivots and timed out dfl001.
+        // Keep the hook for A/B; production fills dual_feas_tol but only
+        // honors it when the caller sets a positive value AND the env switch
+        // is on (see DualRatioInput::dual_feas_tol docs).
+        if (in.dual_feas_tol > 0.0 && dfeas < 0.0 && d != 0.0 &&
+            core::env_switches().dual_bfrt_damage_guard) {
+            const f64 projected_damage = std::fabs(d) * max_alpha / aa;
+            if (projected_damage > in.dual_feas_tol) continue;
+        }
         const f64 l = lo[sz(j)], u = hi[sz(j)];
         const bool boxed = l > -kInf && u < kInf && l < u &&
                            status[sz(j)] != NonbasicStatus::AtZeroFree;
@@ -157,6 +172,32 @@ DualRatioResult dual_ratio_test(const DualRatioInput& in,
     for (std::size_t k = 0; k < n_cand; ++k)
         theta_bound = std::min(theta_bound, ws.relaxed[k]);
 
+    // Prefer a right-sign enter over a larger-|alpha| wrong-sign that would
+    // force a zero dual step via cost shift. Wrong-sign candidates stay
+    // eligible (the shift_cost blast shield still catches them); this only
+    // changes the tie-break inside the final Harris group.
+    //
+    // Damage-tolerant "safe wrong-sign" (projected |d|*max|alpha|/|alpha| <=
+    // dual_feas_tol) was tried and rejected: it agrees with the post-hoc
+    // shift skip, so those enters take backward dual steps. Measured on
+    // pilot87/dfl001/pilot that roughly halved shifts but ~2x wall time and
+    // dropped pilot from ProvedOptimalFP to ProvedKKT. Preferring only
+    // right-sign avoids that class of pivot.
+    // dual_feas_tol <= 0 keeps the historical max-|alpha| rule bit-identical.
+    const auto is_safe = [&](std::size_t e) {
+        if (in.dual_feas_tol <= 0.0) return true;
+        return ws.wrong_sign[e] == 0;
+    };
+    const auto better_than = [&](std::size_t cand, std::size_t cur) {
+        if (cur == n_cand) return true;
+        const bool c_safe = is_safe(cand);
+        const bool b_safe = is_safe(cur);
+        if (c_safe != b_safe) return c_safe;
+        if (ws.alpha_abs[cand] != ws.alpha_abs[cur])
+            return ws.alpha_abs[cand] > ws.alpha_abs[cur];
+        return ws.column[cand] < ws.column[cur];
+    };
+
     // ---- fast path: the first group is the final one -----------------------
     // Overwhelmingly the common case (dfl001 19,649 groups for 19,623 pivots).
     // Everything the result needs is available in one more O(k) scan: no sort,
@@ -170,13 +211,8 @@ DualRatioResult dual_ratio_test(const DualRatioInput& in,
             ++members;
             if (ws.range[k] == kInfRange) has_nonflippable = true;
             else change += ws.alpha_abs[k] * ws.range[k];
-            // Same tie-break as best_in() below: larger |alpha|, then lower
-            // column index.
-            if (best == n_cand ||
-                ws.alpha_abs[k] > ws.alpha_abs[best] ||
-                (ws.alpha_abs[k] == ws.alpha_abs[best] &&
-                 ws.column[k] < ws.column[best]))
-                best = k;
+            // Prefer damage-safe, then larger |alpha|, then lower column index.
+            if (better_than(k, best)) best = k;
         }
         // members >= 1 always: theta_bound is some candidate's `relaxed`, and
         // relaxed >= ratio for that same candidate, so it is in the group.
@@ -316,15 +352,12 @@ DualRatioResult dual_ratio_test(const DualRatioInput& in,
         goto retry_with_wider_bound;
     }
 
-    // ---- pivot: largest |alpha| in the final group, with stability back-off
+    // ---- pivot: prefer damage-safe, then largest |alpha|, with stability
+    // back-off. order[] entries are workspace indices.
     const auto best_in = [&](std::size_t b, std::size_t e) {
         std::size_t best = b;
         for (std::size_t k = b + 1; k < e; ++k) {
-            const Index ek = ws.order[k], eb = ws.order[best];
-            if (ws.alpha_abs[sz(ek)] > ws.alpha_abs[sz(eb)] ||
-                (ws.alpha_abs[sz(ek)] == ws.alpha_abs[sz(eb)] &&
-                 ws.column[sz(ek)] < ws.column[sz(eb)]))
-                best = k;
+            if (better_than(sz(ws.order[k]), sz(ws.order[best]))) best = k;
         }
         return best;
     };
@@ -355,6 +388,186 @@ DualRatioResult dual_ratio_test(const DualRatioInput& in,
 
     emit_pivot(out, ws, in, status, sz(ws.order[best]));
     return out;
+}
+
+f64 dual_sign_violation(NonbasicStatus status, f64 reduced_cost, f64 dual_tol) {
+    const f64 tol = (std::isfinite(dual_tol) && dual_tol > 0.0) ? dual_tol : 0.0;
+    switch (status) {
+        case NonbasicStatus::AtLower:
+            return reduced_cost < -tol ? -reduced_cost - tol : 0.0;
+        case NonbasicStatus::AtUpper:
+            return reduced_cost > tol ? reduced_cost - tol : 0.0;
+        case NonbasicStatus::AtZeroFree: {
+            const f64 ad = std::fabs(reduced_cost);
+            return ad > tol ? ad - tol : 0.0;
+        }
+        default:
+            return 0.0;
+    }
+}
+
+DualEnterShieldDecision classify_dual_enter_shield(
+    bool enter_wrong_sign, f64 d_enter, f64 alpha_enter,
+    f64 enter_dual_tol, bool allow_cost_shifts,
+    const std::vector<Index>& prow_idx,
+    const std::vector<f64>& prow,
+    const std::vector<f64>& redcost,
+    const std::vector<NonbasicStatus>& status,
+    const std::vector<Index>& planned_flips,
+    const std::vector<f64>& lo,
+    const std::vector<f64>& hi,
+    const std::vector<f64>& dual_tol,
+    Index enter,
+    Index leave_var,
+    NonbasicStatus leave_status,
+    const std::vector<std::uint32_t>* flip_stamp,
+    std::uint32_t flip_generation) {
+    DualEnterShieldDecision out;
+    out.enter_wrong_sign = enter_wrong_sign;
+    if (!enter_wrong_sign || d_enter == 0.0) return out;
+    const f64 alpha_q = std::fabs(alpha_enter);
+    out.theta_predict =
+        (alpha_enter != 0.0 && std::isfinite(alpha_enter) &&
+         std::isfinite(d_enter))
+            ? (d_enter / alpha_enter)
+            : std::numeric_limits<f64>::quiet_NaN();
+    out.harmful =
+        !(alpha_q > 0.0) || !std::isfinite(out.theta_predict) ||
+        dual_row_step_worsens_feasibility(
+            prow_idx, prow, redcost, status, planned_flips, lo, hi, dual_tol,
+            enter, leave_var, leave_status, out.theta_predict,
+            flip_stamp, flip_generation);
+    if (!out.harmful) {
+        out.kind = DualEnterShieldKind::HarmlessProceed;
+        return out;
+    }
+    if (!allow_cost_shifts && std::fabs(d_enter) <= enter_dual_tol) {
+        out.kind = DualEnterShieldKind::ZeroStepApprox;
+        return out;
+    }
+    out.kind = DualEnterShieldKind::NeedsCostShift;
+    return out;
+}
+
+bool dual_row_step_worsens_feasibility(
+    const std::vector<Index>& prow_idx,
+    const std::vector<f64>& prow,
+    const std::vector<f64>& redcost,
+    const std::vector<NonbasicStatus>& status,
+    const std::vector<Index>& planned_flips,
+    const std::vector<f64>& lo,
+    const std::vector<f64>& hi,
+    const std::vector<f64>& dual_tol,
+    Index enter,
+    Index leave_var,
+    NonbasicStatus leave_status,
+    f64 theta,
+    const std::vector<std::uint32_t>* flip_stamp,
+    std::uint32_t flip_generation) {
+    if (!std::isfinite(theta)) return true;
+
+    // Prefer the caller's generation-stamped membership (O(1), no alloc).
+    // Fall back to a one-shot set only when the stamp is absent.
+    const bool use_stamp =
+        flip_stamp != nullptr &&
+        flip_stamp->size() >= dual_tol.size() &&
+        flip_generation != 0;
+    std::unordered_set<Index> flipped_fallback;
+    if (!use_stamp)
+        flipped_fallback.insert(planned_flips.begin(), planned_flips.end());
+    const auto is_flipped = [&](Index j) -> bool {
+        if (use_stamp) return (*flip_stamp)[sz(j)] == flip_generation;
+        return flipped_fallback.count(j) != 0;
+    };
+    const auto status_after_flips = [&](Index j) {
+        NonbasicStatus s = status[sz(j)];
+        if (!is_flipped(j)) return s;
+        if (s == NonbasicStatus::AtLower) return NonbasicStatus::AtUpper;
+        if (s == NonbasicStatus::AtUpper) return NonbasicStatus::AtLower;
+        return s;
+    };
+
+    const auto worsens = [](f64 v_old, f64 v_new) {
+        if (!(v_new > 0.0)) return false;
+        const f64 slack = 1e-18 * (1.0 + std::fabs(v_old));
+        return v_new > v_old + slack;
+    };
+
+    for (const Index j : prow_idx) {
+        if (j == enter) continue;
+        if (status[sz(j)] == NonbasicStatus::Basic) continue;
+        const f64 l = lo[sz(j)], u = hi[sz(j)];
+        if (l == u) continue;  // fixed: not a dual breakpoint
+        if (!(j >= 0 && sz(j) < prow.size() && sz(j) < redcost.size() &&
+              sz(j) < dual_tol.size()))
+            return true;
+        const NonbasicStatus s = status_after_flips(j);
+        const f64 d_old = redcost[sz(j)];
+        const f64 d_new = d_old - theta * prow[sz(j)];
+        if (!std::isfinite(d_new)) return true;
+        const f64 tj = dual_tol[sz(j)];
+        if (worsens(dual_sign_violation(s, d_old, tj),
+                    dual_sign_violation(s, d_new, tj)))
+            return true;
+    }
+
+    if (leave_var >= 0 && sz(leave_var) < dual_tol.size()) {
+        const f64 d_new = -theta;
+        if (!std::isfinite(d_new)) return true;
+        if (worsens(0.0, dual_sign_violation(leave_status, d_new,
+                                             dual_tol[sz(leave_var)])))
+            return true;
+    }
+    return false;
+}
+
+WorkingPriceRefreshAction classify_working_price_refresh_column(
+    int phase, NonbasicStatus status, f64 reduced_cost,
+    f64 lo, f64 hi, f64 dual_tol) {
+    WorkingPriceRefreshAction out;
+    out.new_status = status;
+    if (status == NonbasicStatus::Basic) return out;
+    if (lo == hi) return out; // fixed: no sign condition
+    const f64 tj = dual_tol;
+    const f64 d = reduced_cost;
+    const bool boxed = lo > -kInf && hi < kInf;
+    const bool beyond_lower = status == NonbasicStatus::AtLower && d < -tj;
+    const bool beyond_upper = status == NonbasicStatus::AtUpper && d > tj;
+    const bool beyond_free = status == NonbasicStatus::AtZeroFree &&
+                             std::fabs(d) > tj;
+    if (!(beyond_lower || beyond_upper || beyond_free)) {
+        out.kind = WorkingPriceRefreshKind::NoOp;
+        return out;
+    }
+    if (phase == 1) {
+        // Beyond-tol parking only; within-tol handled above as NoOp.
+        if (beyond_lower) {
+            out.kind = WorkingPriceRefreshKind::FlipEndpoint;
+            out.new_status = NonbasicStatus::AtUpper;
+            out.new_value = hi;
+        } else if (beyond_upper) {
+            out.kind = WorkingPriceRefreshKind::FlipEndpoint;
+            out.new_status = NonbasicStatus::AtLower;
+            out.new_value = lo;
+        }
+        return out;
+    }
+    // Phase 2 (and any non-phase-1 refresh): boxed mismatches are visible but
+    // must not flip mid-search; one-sided/free need a shift (or explicit refusal).
+    if (boxed && status != NonbasicStatus::AtZeroFree) {
+        out.kind = WorkingPriceRefreshKind::BoxedMismatchIgnored;
+        return out;
+    }
+    out.kind = WorkingPriceRefreshKind::ShiftOneSided;
+    return out;
+}
+
+bool apply_working_price_endpoint_flip(WorkingPriceRefreshAction action,
+                                       NonbasicStatus& status, f64& value) {
+    if (action.kind != WorkingPriceRefreshKind::FlipEndpoint) return false;
+    status = action.new_status;
+    value = action.new_value;
+    return true;
 }
 
 }  // namespace sor::engines

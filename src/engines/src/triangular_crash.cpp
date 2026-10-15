@@ -1,4 +1,5 @@
 #include "triangular_crash.hpp"
+#include "sor/core/work_clock.hpp"
 #include <algorithm>
 #include <cmath>
 namespace sor::engines::detail {
@@ -12,6 +13,8 @@ TriangularCrashStats triangular_crash(const model::LpProblem& p, const sparse::C
     const std::vector<f64>* eligible_costs) {
     const auto ns = p.n_cols(), m = p.n_rows();
     const auto& acp = ac.pattern.col_ptr(); const auto& ari = ac.pattern.row_idx();
+    core::work_add(static_cast<std::uint64_t>(p.nnz()) / 2 +
+                   static_cast<std::uint64_t>(ns + m), ::sor::core::WorkTag::Crash);
     constexpr f64 kInf = model::kInf;
     TriangularCrashStats stats;
     const auto& rp = p.A.pattern.row_ptr();

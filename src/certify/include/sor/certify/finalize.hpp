@@ -67,6 +67,25 @@ bool repair_basis_certificate(const model::LpProblem& problem, core::RawResult& 
 // not exact pricing.
 bool repair_dual_certificate(const model::LpProblem& problem, core::RawResult& raw,
                              const ExactCertificatePolicy& policy = {});
+// Binary64 multipliers (minimization form) for `basis` (structural index j,
+// or n_cols + i for row i's logical) that safe_lagrangian_lower_bound can
+// charge in full. Exact basis duals leave every basic reduced cost at zero;
+// rounded ones leave about +-u * |terms|, and a basic column with only one
+// chargeable side (x >= 0 with no upper bound, say) is then on the wrong side
+// half of the time, which makes the Lagrangian bound -inf. These are the
+// basis duals refactorized on this model and refined, then moved along
+// w = B^-T g, g_j = +-|terms_j| toward each such column's chargeable side, by
+// the smallest step that clears the rounding of every one-sided term (basic
+// or not, rows included) and keeps basic logicals at exactly zero; a
+// nonbasic one-sided term the step would push the wrong way is exchanged
+// into the solved equations for a two-sided basic one. The cost in the bound
+// is about a few u per term. Where no step exists (the dual face pins a
+// one-sided or free term to exactly zero) the proposal is the basis's
+// refined duals themselves, which the bound accepts when the exact duals
+// are binary64 numbers. False only when the basis cannot be factorized. A
+// proposal only: the caller accepts it through the safe bound.
+bool inward_basis_duals(const model::LpProblem& problem,
+                        const std::vector<core::Index>& basis, std::vector<f64>& y_min);
 bool repair_basis_primal_ray(const model::LpProblem& problem, core::RawResult& raw,
     core::Index entering_variable, int direction, const ExactCertificatePolicy& policy = {});
 core::PrimalRay check_exact_primal_ray(const model::LpProblem& problem,
@@ -126,6 +145,62 @@ std::vector<RcBoundChange> safe_reduced_cost_tightenings(
     f64 cutoff_min, SafeLpBound* bound_out = nullptr,
     std::uint64_t* candidates_out = nullptr);
 
+// The same tightening at interval cost, for every node LP. Each reduced
+// cost d_j = (sense c - A'y)_j is enclosed in [d_lo_j, d_hi_j] (long double
+// accumulation, Higham's bound gamma_{k+2} * sum |terms| per column), the
+// Lagrangian's minimum over the box is bounded below by L, every term taken
+// at its worst corner, and a column charged to its finite lower bound l
+// (d_lo > 0) keeps x_j <= l + floor(up((cutoff_min - L) / d_lo)): a point
+// t units above l costs at least L + d_lo t, and the floor of an upward
+// quotient keeps every t the exact arithmetic would keep. Symmetrically at
+// the upper bound. Not finite (no changes) when a column whose sign the
+// enclosure cannot decide, or that needs an infinite bound, would enter L:
+// the exact routine above is the fallback, not this one. `sides` (optional)
+// receives, per column, which of its bounds L rests on: bit 0 the lower,
+// bit 1 the upper (both when the sign is undecided).
+struct IntervalRcFixing {
+    bool finite = false;
+    f64 bound = 0.0;   // L, minimization sense, rounded down
+    std::vector<RcBoundChange> changes;
+};
+IntervalRcFixing interval_reduced_cost_tightenings(
+    const model::LpProblem& problem, const std::vector<f64>& y_min,
+    const std::vector<f64>& col_lo, const std::vector<f64>& col_hi,
+    f64 cutoff_min, const std::vector<char>* integer_mask,
+    std::vector<unsigned char>* sides = nullptr);
+
+// The enclosure both of the above rest on: d_j in [lo_j, hi_j] (f64,
+// rounded outward) for d = sense c - A'y, and the Lagrangian L over
+// [col_lo, col_hi] rounded down. finite = false when a multiplier sits on a
+// side its row does not have, or a column needs an infinite bound.
+struct RcEnclosure {
+    bool finite = false;
+    f64 bound = 0.0;
+    std::vector<f64> lo, hi;
+};
+RcEnclosure enclose_reduced_costs(const model::LpProblem& problem,
+                                  const std::vector<f64>& y_min,
+                                  const std::vector<f64>& col_lo,
+                                  const std::vector<f64>& col_hi);
+// Same from sums a caller already accumulated in long double, row by row:
+// aty_j = sum_i y_i a_ij over cnt_j products and ab_j = sum_i |y_i a_ij|.
+RcEnclosure enclose_reduced_costs_from_sums(const model::LpProblem& problem,
+                                            const std::vector<f64>& y_min,
+                                            const std::vector<long double>& aty,
+                                            const std::vector<long double>& ab,
+                                            const std::vector<std::uint32_t>& cnt,
+                                            const std::vector<f64>& col_lo,
+                                            const std::vector<f64>& col_hi);
+// The tightenings of interval_reduced_cost_tightenings from an enclosure of
+// the same box (rc_lo / rc_hi / bound as in RawResult or RcEnclosure).
+IntervalRcFixing reduced_cost_tightenings_from(const std::vector<f64>& rc_lo,
+                                               const std::vector<f64>& rc_hi, f64 bound,
+                                               const std::vector<f64>& col_lo,
+                                               const std::vector<f64>& col_hi,
+                                               f64 cutoff_min,
+                                               const std::vector<char>& integer_mask,
+                                               std::vector<unsigned char>* sides = nullptr);
+
 // LP-based conflict analysis (plan 3H; Witzig, Berthold & Heinz): from a
 // Farkas ray y proving {row sides, box [col_lo, col_hi]} infeasible, the
 // bounds the proof actually uses that are tighter than the root box
@@ -144,6 +219,39 @@ std::vector<FarkasBoundUse> farkas_conflict_bounds(
     const std::vector<f64>& col_lo, const std::vector<f64>& col_hi,
     const std::vector<f64>& root_lo, const std::vector<f64>& root_hi,
     f64 tolerance = 1e-7);
+
+// Rigorous long double enclosure of a multiplier vector's Farkas sums, the
+// cheap first pass of every ray check (the exact evaluation runs only when
+// this cannot decide). With d = A'y and upper = sum_i y_i side_i (row_hi for
+// y_i > 0, row_lo for y_i < 0), each exact value lies within its radius:
+// d_j in [d[j] - d_rad[j], d[j] + d_rad[j]] (d_terms[j] == 0: d_j is exactly
+// 0), upper in [upper - upper_rad, upper + upper_rad]. Radii are
+// gamma(2k + 2) * sum |terms| over k accumulated terms, gamma(k) =
+// k u / (1 - k u), u = 2^-64: one rounding per product and per addition,
+// with room for the rounding of the magnitude sums. upper_finite is false
+// when a multiplier faces an infinite row side.
+struct DualRayEnclosure {
+    std::vector<long double> d, d_rad;
+    std::vector<std::uint32_t> d_terms;
+    long double upper = 0.0L, upper_rad = 0.0L;
+    bool upper_finite = true;
+};
+DualRayEnclosure enclose_dual_ray(const model::LpProblem& problem,
+                                  const std::vector<f64>& multipliers);
+
+// Enclosure of lower = sum_j d_j b_j, where b_j is lo[j] for d_j > 0 and
+// hi[j] for d_j < 0, over the d intervals of `ray`. `decided` is false when
+// some d_j could take a sign whose bound is infinite (only an exact
+// evaluation can tell); `needs_infinite` is true when some d_j is certainly
+// nonzero on the side of an infinite bound (no finite lower exists).
+struct RayLowerEnclosure {
+    long double lo = 0.0L, hi = 0.0L;   // lo <= lower <= hi
+    bool decided = false;
+    bool needs_infinite = false;
+};
+RayLowerEnclosure enclose_ray_lower(const DualRayEnclosure& ray,
+                                    const std::vector<f64>& lo,
+                                    const std::vector<f64>& hi);
 
 core::DualFarkasRay check_dual_farkas_ray(
     const model::LpProblem& problem,

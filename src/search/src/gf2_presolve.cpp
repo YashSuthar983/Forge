@@ -14,10 +14,16 @@ inline bool nearly_fixed(f64 lo, f64 hi, f64 tol) {
     return std::isfinite(lo) && std::isfinite(hi) && hi - lo <= tol;
 }
 
-inline bool is_binary_col(const model::LpProblem& lp, Index j,
-                          const std::vector<f64>& lo, const std::vector<f64>& hi,
-                          f64 tol) {
-    if (lp.is_integer.empty() || !lp.is_integer[sz(j)]) return false;
+inline bool integer_col(const model::LpProblem& lp, const std::vector<char>* mask,
+                        Index j) {
+    if (mask != nullptr) return sz(j) < mask->size() && (*mask)[sz(j)];
+    return sz(j) < lp.is_integer.size() && lp.is_integer[sz(j)];
+}
+
+inline bool is_binary_col(const model::LpProblem& lp, const std::vector<char>* mask,
+                          Index j, const std::vector<f64>& lo,
+                          const std::vector<f64>& hi, f64 tol) {
+    if (!integer_col(lp, mask, j)) return false;
     return std::fabs(lo[sz(j)]) <= tol && std::fabs(hi[sz(j)] - 1.0) <= tol;
 }
 
@@ -40,8 +46,8 @@ struct Eq {
     int rhs = 0;              // mod 2
 };
 
-bool collect_equation(const model::LpProblem& lp, Index row,
-                      const std::vector<f64>& col_lo,
+bool collect_equation(const model::LpProblem& lp, const std::vector<char>* mask,
+                      Index row, const std::vector<f64>& col_lo,
                       const std::vector<f64>& col_hi, f64 tol, Eq& out) {
     const f64 rlo = lp.row_lo[sz(row)];
     const f64 rhi = lp.row_hi[sz(row)];
@@ -74,8 +80,13 @@ bool collect_equation(const model::LpProblem& lp, Index row,
             continue;
         }
 
-        // Free term must be binary with odd integer coefficient.
-        if (!is_binary_col(lp, j, col_lo, col_hi, tol)) return false;
+        // An even integer coefficient on an integer column vanishes mod 2,
+        // whatever the column's domain: x + y - 2k = 1 is x XOR y = 1.
+        if (integer_col(lp, mask, j) && nearly_integer(a, tol) &&
+            (static_cast<long long>(std::llround(a)) & 1LL) == 0)
+            continue;
+        // Any other free term must be binary with odd integer coefficient.
+        if (!is_binary_col(lp, mask, j, col_lo, col_hi, tol)) return false;
         if (!odd_int_coef(a, tol)) return false;
         out.cols.push_back(j);
     }
@@ -115,6 +126,7 @@ Gf2PresolveDiagnostics apply_gf2_presolve(const model::LpProblem& lp,
         eqs.reserve(sz(std::min(m, opts.max_equations)));
 
         for (Index i = 0; i < m; ++i) {
+            if (core::cancel_requested(opts.cancel)) { diag.truncated = true; return diag; }
             if (static_cast<Index>(eqs.size()) >= opts.max_equations) {
                 diag.truncated = true;
                 break;
@@ -123,7 +135,7 @@ Gf2PresolveDiagnostics apply_gf2_presolve(const model::LpProblem& lp,
             // Modular arithmetic is valid only for exact integer data and
             // exact equalities. A coefficient below feasibility tolerance
             // can still have unit activity on a wide integer domain.
-            if (!collect_equation(lp, i, col_lo, col_hi, 0.0, e))
+            if (!collect_equation(lp, opts.integer_mask, i, col_lo, col_hi, 0.0, e))
                 continue;
             if (e.cols.empty()) {
                 if (e.rhs != 0) {
@@ -206,6 +218,7 @@ Gf2PresolveDiagnostics apply_gf2_presolve(const model::LpProblem& lp,
         std::vector<Index> pivot_of_var(sz(nv), -1);
         Index rank = 0;
         for (Index col = 0; col < nv && rank < ne; ++col) {
+            if (core::cancel_requested(opts.cancel)) { diag.truncated = true; return diag; }
             Index piv = -1;
             for (Index r = rank; r < ne; ++r) {
                 if (bit_get(mat[sz(r)], col)) {
@@ -233,6 +246,7 @@ Gf2PresolveDiagnostics apply_gf2_presolve(const model::LpProblem& lp,
         // Check inconsistency / extract singleton fixings.
         bool any_fix = false;
         for (Index r = 0; r < ne; ++r) {
+            if (core::cancel_requested(opts.cancel)) { diag.truncated = true; return diag; }
             if (row_empty(mat[sz(r)])) {
                 if (rhs[sz(r)] != 0) {
                     diag.infeasible = true;

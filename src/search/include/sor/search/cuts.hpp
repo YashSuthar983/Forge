@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <functional>
+#include <optional>
 #include <utility>
 #include <vector>
 #include "sor/core/route_debug.hpp"
@@ -160,7 +161,10 @@ struct CutOptions {
     bool marginal_gate = false;
     int marginal_gate_round = 0;
     f64 marginal_gate_min_rel = 1e-6;
-    bool purge_nonbinding_cuts = false;
+    // On (2026-10-05): deterministic runs, root bound unchanged by
+    // construction; timtab1 purges 410 of 566 cut rows, node LPs 5.2 ->
+    // 1.6 ms, 4973 -> 17360 nodes; pg purges 215 of 1484, 58.9 -> 48.1 ms.
+    bool purge_nonbinding_cuts = true;
     f64 purge_dual_tol = 1e-9;
     f64 purge_slack_tol = 1e-7;
     // Reject a cut whose max|coef|/min|coef| exceeds this. 1e6 (the old
@@ -308,6 +312,20 @@ struct CutOptions {
     // proved on miplib-easy became 11. It also did not fix the problem it was
     // written for (see MILP_PRIMAL_20260907.md 3c).
     f64 parallel_to_row_max = 2.0;
+    // Every cut row that is not exact integer data enters the model relaxed
+    // outward by rel * (|side| + sum |a_j| * reach_j) + abs, reach_j the
+    // larger magnitude of x_j's finite bounds (1 when unbounded). A cut is
+    // computed in floating point from tableau rows or aggregations, and is
+    // only as valid as that arithmetic: on a random 6x6 binary model
+    // (test_milp_oracle seed 770) a MIR row and a GMI row were tight at the
+    // optimum and violated it by 1.2e-9 and 1.0e-9 at magnitudes of 8 and
+    // 24. Everything downstream reads the stored row as data -- covers round
+    // it, propagation rounds bounds from it, a restart folds it into the
+    // model and presolves it -- so the stored row is the one that must hold.
+    // Rows with integral coefficients and sides (covers, cliques, zero-half,
+    // nogoods) are exact by construction and enter unchanged.
+    f64 derived_cut_rel_margin = 1e-9;
+    f64 derived_cut_abs_margin = 1e-9;
 };
 
 struct CutDiagnostics {
@@ -320,6 +338,10 @@ struct CutDiagnostics {
     std::uint64_t gmi_cuts_added = 0;
     std::uint64_t gmi_missing_basis = 0;
     std::uint64_t gmi_invalid_factor = 0;
+    // Tableau rows taken from the engine's factor, and rows whose check
+    // failed (recomputed with GMI's own factorization).
+    std::uint64_t gmi_engine_rows = 0, gmi_engine_rows_rejected = 0;
+    std::uint64_t gmi_own_factorizations = 0;
     std::uint64_t gmi_empty_rows = 0;
     std::uint64_t rejected_dynamism = 0;
     std::uint64_t dynamism_repaired = 0;    // small terms relaxed away
@@ -351,6 +373,10 @@ struct CutDiagnostics {
     std::uint64_t pool_aged_out = 0;
     std::uint64_t pool_evicted = 0;
     std::uint64_t pool_selected = 0;
+    // Entries whose `active` flag was cleared because the working LP no longer
+    // carries their row (purge / retract). They may be reselected when violated.
+    std::uint64_t pool_released = 0;
+    std::uint64_t pool_reactivated = 0;
     f64 root_bound_before = core::kNaN;
     f64 root_bound_after = core::kNaN;
 };
@@ -382,6 +408,19 @@ struct CutFilterStats {
     }
 };
 
+// Does the root box [root_lo, root_hi] imply x_j >= b (upper = false) or
+// x_j <= b (upper = true)? A derivation that consumed only such bounds holds
+// wherever the root box does, whatever box it was run under. A null box
+// implies nothing.
+inline bool root_implies_bound(const std::vector<f64>* root_lo,
+                               const std::vector<f64>* root_hi, Index j,
+                               bool upper, f64 b) {
+    if (root_lo == nullptr || root_hi == nullptr || j < 0) return false;
+    const auto k = static_cast<std::size_t>(j);
+    if (k >= root_lo->size() || k >= root_hi->size()) return false;
+    return upper ? (*root_hi)[k] <= b : (*root_lo)[k] >= b;
+}
+
 // A single valid inequality in two-sided row form: row_lo <= sum(vals[k] * x[cols[k]]) <= row_hi.
 struct CutRow {
     std::vector<Index> cols;
@@ -406,15 +445,40 @@ struct CutRow {
     //
     // DEFAULT true = "assume local", so a separator that has not been taught
     // to track provenance stays conservative and its node cuts stay local.
+    // A separator handed the root box sets it false when every bound its
+    // derivation consumed is implied by that box (root_implies_bound); GMI,
+    // lifted covers, zero-half and MIR do.
     bool used_local_bound = true;
+
+    // The separator derived this row in exact arithmetic from exact data, so
+    // it enters the LP unchanged. Every other row is stored with the outward
+    // margin of CutOptions::derived_cut_*_margin, whatever its numbers look
+    // like: integer-looking data says nothing about how it was derived.
+    // Set by zero-half, clique and assignment-nogood cuts.
+    bool exact = false;
+    // The coefficients and sides are already the row to be delivered to the
+    // LP. Independent of exact: compiling a floating derivation does not
+    // turn it into an exact derivation. Never pad a compiled row again.
+    bool compiled = false;
 };
 
-// A bounded global pool for generated, not-yet-active cuts. Cuts are stored in
-// a scale-invariant <= representation so positive rescalings are recognized as
+// Canonicalize without coefficient loss and apply the storage margin once,
+// before efficacy/duplicate/selection decisions. False means the row has no
+// representable canonical coefficients or valid support.
+bool compile_cut(CutRow& cut, const model::LpProblem& lp, const CutOptions& opts);
+// -1/0/+1 compares RHS in a common <= scale; nullopt for distinct normals.
+std::optional<int> compare_cut_rhs(const CutRow& a, const CutRow& b);
+
+// A bounded global pool for generated cuts. Cuts are stored in a
+// scale-invariant <= representation so positive rescalings are recognized as
 // duplicates. Selection ranks normalized violation (efficacy), rejects nearly
-// parallel rows within a batch, and ages unused candidates. Once selected, a
-// cut remains fingerprinted as active so a later separator round cannot append
-// the same LP row again.
+// parallel rows within a batch, and ages unused candidates.
+//
+// `active` means the inequality is currently present in the working LP, not
+// that it was ever selected. After a purge removes nonbinding cut rows,
+// sync_active_with_model clears that flag so a later violated round can
+// reselect the retained pool entry (reactivation). Fingerprints alone must
+// not permanently exile a valid cut from the LP working set.
 class CutPool {
 public:
     explicit CutPool(const CutOptions& opts) : opts_(opts) { SOR_FN();}
@@ -424,6 +488,9 @@ public:
     // measured against, and which columns are integral. Without it the pool
     // falls back to ranking on efficacy alone.
     void set_scoring_context(const model::LpProblem& lp);
+    void set_reference_points(std::vector<std::vector<f64>> points) {
+        references_ = std::move(points);
+    }
     // Optional external score for sequence selection (HGTSM under Latest).
     // When set, select_violated ranks by scorer(cut, x) instead of the efficacy
     // composite. Violation / density / parallelism filters are unchanged.
@@ -441,6 +508,15 @@ public:
     void add(const std::vector<CutRow>& candidates, CutDiagnostics& diag);
     std::vector<CutRow> select_violated(const std::vector<f64>& x,
                                         CutDiagnostics& diag);
+    // Clear `active` on every pool entry whose normalized form is absent from
+    // LP rows [first_cut_row, n_rows). Purged inequalities become selectable
+    // again; survivors stay marked so selection does not re-append them.
+    std::uint64_t sync_active_with_model(const model::LpProblem& lp,
+                                         Index first_cut_row,
+                                         CutDiagnostics* diag = nullptr);
+    // Inequalities previously selected into the LP but no longer present
+    // after sync (candidates for GCS reinjection / later reactivation).
+    std::vector<CutRow> retained_inactive() const;
     std::size_t size() const { SOR_FN(); return entries_.size(); }
     std::size_t active_size() const;
 
@@ -452,7 +528,8 @@ private:
         f64 last_efficacy = 0.0;
         f64 last_score = 0.0;
         int age = 0;
-        bool active = false;
+        bool active = false;       // currently in the working LP
+        bool ever_selected = false;  // was in the LP at least once (reactivation)
     };
 
     CutOptions opts_;
@@ -463,6 +540,7 @@ private:
     f64 max_locks_ = 0.0;
     Index n_cols_ = 0;
     const model::LpProblem* lp_ctx_ = nullptr;
+    std::vector<std::vector<f64>> references_;
     ExternalScoreFn external_score_;
     ExternalBatchScoreFn external_batch_score_;
 };
@@ -472,13 +550,15 @@ private:
 // its extreme contribution over the box [lo, hi] into `rhs`. The result is a
 // weaker inequality, valid wherever the input was and the box holds. Returns
 // false, leaving the arguments untouched, if a dropped term has no finite
-// bound on the side it needs or nothing would survive. `used_bounds`
-// receives (column, bound) for each substitution so a caller can tell
-// whether a non-root bound was used.
+// bound on the side it needs or nothing would survive. When `used_local` is
+// given it is set true if a substituted bound is not implied by the root box
+// [root_lo, root_hi] on the side it was used (root_implies_bound).
 bool relax_small_terms(std::vector<Index>& cols, std::vector<f64>& vals, f64& rhs,
                        bool geq, const std::vector<f64>& lo,
                        const std::vector<f64>& hi, f64 dynamism_max,
-                       std::vector<std::pair<Index, f64>>* used_bounds = nullptr);
+                       const std::vector<f64>* root_lo = nullptr,
+                       const std::vector<f64>* root_hi = nullptr,
+                       bool* used_local = nullptr);
 
 // One separation pass over a proved-optimal relaxation of `lp` at point `x`
 // with basis `basis` (as returned by engines::solve_simplex/solve_dual_simplex
@@ -486,11 +566,29 @@ bool relax_small_terms(std::vector<Index>& cols, std::vector<f64>& vals, f64& rh
 // already filtered by `opts`'s numerical thresholds. Rows whose basic integer
 // variable is within `opts.frac_min` of an integer, or that touch a free
 // (AtZeroFree) nonbasic, are skipped rather than cut.
+//
+// With the root box given, each cut's used_local_bound reports whether its
+// derivation consumed a bound of lp's box the root box does not imply: the
+// bound each nonbasic column is shifted onto, the basic column's bound in the
+// tableau c-MIR, and every bound a small term leaves through. Rows are taken
+// as they are in `lp`; whether they are global is the caller's question.
+//
+// `inverse_row` (optional) supplies row `slot` of the basis inverse in lp's
+// row space -- y = B^-T e_slot, typically from the LP engine's own final
+// factor (DualProbeSession::basis_inverse_row) -- so the basis need not be
+// factorized again. Every row it supplies is checked for free: the tableau
+// row y^T [A | -I] must be the unit vector on the basic columns. A refusal
+// or a failed check falls back to this function's own factorization (built
+// on first need).
+using BasisInverseRow = std::function<bool(Index slot, std::vector<f64>& y)>;
 std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
                                        const std::vector<f64>& x,
                                        const engines::SimplexBasis& basis,
                                        const CutOptions& opts,
-                                       CutDiagnostics& diag);
+                                       CutDiagnostics& diag,
+                                       const std::vector<f64>* root_lo = nullptr,
+                                       const std::vector<f64>* root_hi = nullptr,
+                                       const BasisInverseRow* inverse_row = nullptr);
 
 // Everything one apply_cuts_inplace() call changed about an LpProblem, in the
 // form needed to put it back. Recorded so a root cut ROUND can be retracted

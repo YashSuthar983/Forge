@@ -1,4 +1,5 @@
 #include "padic_solve.hpp"
+#include "sor/core/work_clock.hpp"
 
 #include <algorithm>
 #include <deque>
@@ -119,6 +120,7 @@ public:
                 const u64 multiplier = f_.mul(rows_[r].at(pivot), s.inv);
                 s.updates.emplace_back(r, multiplier);
                 for (const auto& [j, v] : rows_[chosen]) {
+                    core::work_add(32, ::sor::core::WorkTag::ExactSolve);
                     if (++operations > max_operations) return false;
                     auto it = rows_[r].find(j);
                     const u64 value = f_.sub(it == rows_[r].end() ? 0 : it->second, f_.mul(multiplier, v));

@@ -103,6 +103,25 @@ struct FlatSet {
 
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 
+// The coefficient a row operation leaves, prior - m a, with cancellation
+// residue read as the zero it stands for. Model data written in decimal
+// (scorpion: 0.4512, 0.0141) are proportional in decimal and not in binary,
+// and eliminating through them leaves 1e-18..1e-15 where the model has
+// nothing; each further elimination adds its own rounding. Such a value is
+// at the level of the inputs' representation error, not information, and
+// exact reasoning on it derives constraints the model does not have: a later
+// pass read 4.4e-16 x = 0 as a singleton row and fixed x, and SOR's own
+// reduced scorpion presolved again came out infeasible. 64 u bounds the
+// representation and rounding error of a few chained eliminations relative
+// to the terms that produced the value; dropping below it moves a row's
+// activity by at most 7e-15 (|prior| + |m a|) |x_j|.
+inline f64 combined_coefficient(f64 prior, f64 product) {
+    const f64 value = prior - product;
+    constexpr f64 kResidue = 64.0 * 0x1p-53;
+    return std::fabs(value) <= kResidue * (std::fabs(prior) + std::fabs(product))
+        ? 0.0 : value;
+}
+
 inline void add_interval(f64& lo, f64& hi, f64 a, f64 l, f64 u) {
     if (a >= 0.0) {
         lo += a * l;

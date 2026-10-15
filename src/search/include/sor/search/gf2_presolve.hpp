@@ -7,6 +7,8 @@
 // does. Pairing with zero-half: tighter binary boxes improve ZH bases later.
 #pragma once
 
+#include "sor/core/cancel.hpp"
+
 #include "sor/core/result.hpp"
 #include "sor/model/lp.hpp"
 
@@ -19,6 +21,7 @@ using core::f64;
 using core::Index;
 
 struct Gf2PresolveOptions {
+    const core::CancelToken* cancel = nullptr;
     bool enabled = true;
     // Max free binaries participating in the GF(2) system (cost ~ O(e^2)).
     Index max_vars = 512;
@@ -26,6 +29,12 @@ struct Gf2PresolveOptions {
     Index max_equations = 1024;
     int max_rounds = 8;
     f64 tol = 1e-9;
+    // Columns integral at EVERY feasible point (the caller's integers). A
+    // parity deduction is a feasibility fact, so it may rest only on those:
+    // an implied-integer mark that only guarantees an integral optimum does
+    // not make x + y - 2k = 1 a parity relation at every point. Null: the
+    // model's is_integer.
+    const std::vector<char>* integer_mask = nullptr;
 };
 
 struct Gf2PresolveDiagnostics {

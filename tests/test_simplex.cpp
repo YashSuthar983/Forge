@@ -729,7 +729,115 @@ ENDATA
         // Neither engine runs a phase-1 pivot on this model.
         CHECK(diag.phase1_iterations == 0);
         CHECK(diag.primal_cleanup_iterations <= 4);
+
+        // Task 4 handoff identity: terminal true-cost restore, model costs in
+        // place, phase-2. Working residual may be 0 here — perturbation hid
+        // the dual infeasibility — while model residual drives the handoff.
+        CHECK(diag.cleanup_request_cause == 1);
+        CHECK(diag.cleanup_request_phase == 2);
+        CHECK(diag.cleanup_restored_model_costs);
+        CHECK(diag.cleanup_working_dual_infeasibility >= 0.0);
+        CHECK(diag.cleanup_dual_infeasibility > 0.0);
     }
+}
+
+// Task 4: !allow_cost_shifts must not request cleanup from a working-price
+// residual alone. After restore+reevaluate, every cleanup handoff reports
+// model-cost identity (cause, phase, working-vs-model residuals, restored).
+void test_cleanup_handoff_reports_model_cost_identity() {
+    SOR_FN();
+    const std::string mps = R"(NAME          WSA2CLEAN
+ROWS
+ N  COST
+ E  R1
+COLUMNS
+    X0        COST      1.0        R1        1.0
+    X1        COST      1.0        R1        1.0
+    XBIG      COST      100.0      R1        1.0
+    X3        COST      1.00001    R1        1.0
+RHS
+    RHS       R1        5.0
+BOUNDS
+ UP BND       X0        1.0
+ FX BND       XBIG      0.0
+ LO BND       X3        4.5
+ UP BND       X3        5.0
+ENDATA
+)";
+    sor::io::MpsReadReport rep;
+    std::istringstream in(mps);
+    auto problem = sor::io::read_mps(in, rep);
+
+    SimplexOptions opts;
+    opts.method = sor::engines::SimplexMethod::Dual;
+    opts.presolve = false;
+    opts.ruiz_iterations = 0;
+    opts.dual_cost_perturbation_multiplier = 1.0;
+    opts.allow_cost_shifts = false;
+
+    SimplexBasis start;
+    start.n_struct = 4;
+    start.basic = {3};
+    start.status = {NonbasicStatus::AtLower, NonbasicStatus::AtLower,
+                    NonbasicStatus::AtLower, NonbasicStatus::Basic,
+                    NonbasicStatus::AtLower};
+
+    SimplexDiagnostics diag;
+    SimplexBasis final_basis;
+    auto raw = sor::engines::solve_dual_simplex(problem, opts, diag,
+                                                &final_basis, &start);
+    const auto result = sor::certify::finalize_result(
+        std::move(raw), sor::engines::simplex_evidence(diag, opts));
+
+    CHECK(result.status == Status::Optimal);
+    CHECK(diag.primal_cleanups == 1);
+    CHECK(diag.cleanup_request_cause != 0);
+    CHECK(diag.cleanup_restored_model_costs);
+    CHECK(diag.cleanup_dual_infeasibility > 0.0);
+    CHECK(diag.cleanup_primal_infeasibility == 0.0);
+    // Working residual is recorded even when perturbation made it zero.
+    CHECK(diag.cleanup_working_dual_infeasibility >= 0.0);
+    CHECK(diag.cleanup_request_phase == 1 || diag.cleanup_request_phase == 2);
+}
+
+// Task 4: restore clears a working-only obstruction → drop cleanup → continue
+// with consistent model prices / values / pricing state (no handoff diags).
+// Needs a one-sided (not boxed) nonbasic so the inject hook can plant a
+// working-cost bump that model restore removes.
+void test_cleanup_cancel_continues_with_consistent_state() {
+    SOR_FN();
+    const std::string mps = R"(NAME          CANCEL4
+ROWS
+ N  COST
+ E  R1
+COLUMNS
+    X0        COST      1.0        R1        1.0
+    X1        COST      2.0        R1        1.0
+RHS
+    RHS       R1        1.0
+BOUNDS
+ LO BND       X0        0.0
+ LO BND       X1        0.0
+ENDATA
+)";
+    SimplexOptions opts;
+    opts.method = sor::engines::SimplexMethod::Dual;
+    opts.presolve = false;
+    opts.allow_cost_shifts = false;
+    opts.dual_test_inject_working_dual_obstruction = true;
+    opts.refactor_interval = 1;
+    opts.dual_resync_interval = 1; // hit after_working_price_refresh every pivot
+    const auto run = solve_text(mps, opts);
+    CHECK(run.r.status == Status::Optimal);
+    CHECK(run.r.proof == ProofLevel::ProvedOptimalFP ||
+          run.r.proof == ProofLevel::ProvedKKT);
+    CHECK(run.diag.cleanup_reevaluations >= 1);
+    CHECK(run.diag.cleanup_requests_dropped >= 1);
+    // Dropped request must not leave a committed handoff.
+    CHECK(run.diag.cleanup_request_cause == 0);
+    CHECK(run.diag.primal_cleanups == 0);
+    CHECK(run.diag.primal_residual <= 1e-6);
+    CHECK(run.diag.dual_residual <= 1e-6);
 }
 
 // Partitioned vs full row PRICE, over many random bases.
@@ -871,6 +979,61 @@ void test_numerical_trouble_trigger_and_shift_bound() {
     }
 }
 
+// Task 2 (2026-10-09): refused harmful shifts must not fall through to a
+// silent backward dual step on a fresh factor, and repair refusals must not
+// be ignored. Healthy models still prove with shifts disabled; any fresh-
+// factor block must surface as cleanup handoff or numerical failure rather
+// than an unexplained Optimal from the dual alone.
+void test_cost_shift_refusal_has_explicit_outcomes() {
+    SOR_FN();
+    SimplexOptions opts;
+    opts.method = sor::engines::SimplexMethod::Dual;
+    opts.presolve = false;
+
+    {
+        SimplexOptions no_shift = opts;
+        no_shift.allow_cost_shifts = false;
+        const auto run = solve_text(sor::test::kTestLpMps, no_shift);
+        CHECK(run.r.status == Status::Optimal);
+        CHECK(run.r.proof == ProofLevel::ProvedOptimalFP ||
+              run.r.proof == ProofLevel::ProvedKKT);
+        // A block aborts the dual pivot; a healthy fixture should not need it.
+        CHECK(run.diag.harmful_shift_fresh_factor_blocks == 0);
+    }
+
+    {
+        ScopedEnvironment ablation("SOR_DUAL_NO_COST_SHIFT", "1");
+        const auto run = solve_text(sor::test::kTestLpMps, opts);
+        const bool ok = run.r.status == Status::Optimal ||
+                        run.r.status == Status::NumericalFailure ||
+                        run.r.status == Status::NotSolved;
+        CHECK(ok);
+        if (run.diag.harmful_shift_fresh_factor_blocks > 0) {
+            CHECK(run.r.status == Status::NumericalFailure ||
+                  run.r.status == Status::NotSolved ||
+                  run.diag.primal_cleanups > 0);
+        }
+    }
+}
+
+// Task 3: bare working-price refreshes must run the post-refresh sign/parking
+// contract without flipping within-tol zeros. Aggressive resync still proves.
+void test_working_price_refresh_contract() {
+    SOR_FN();
+    SimplexOptions opts;
+    opts.method = sor::engines::SimplexMethod::Dual;
+    opts.presolve = false;
+    opts.dual_resync_interval = 1; // every pivot: exercise after_working_price_refresh
+    const auto run = solve_text(sor::test::kTestLpMps, opts);
+    CHECK(run.r.status == Status::Optimal);
+    CHECK(run.r.proof == ProofLevel::ProvedOptimalFP ||
+          run.r.proof == ProofLevel::ProvedKKT);
+    CHECK(run.diag.working_price_refreshes > 0);
+    // Approximate-zero stationarity residual must stay within dual feasibility
+    // tolerance when the path fires (or remain zero if it never does).
+    CHECK(run.diag.numerical_zero_stationarity_max <= opts.dual_feas_tol + 1e-18);
+}
+
 void test_auto_candidate_order_uses_feasibility_before_gap() {
     SOR_FN();
     SimplexOptions opts;
@@ -918,6 +1081,37 @@ void test_auto_candidate_order_uses_feasibility_before_gap() {
     later_diag.dual_bound_finite = false;
     CHECK(sor::engines::detail::prefer_simplex_candidate(
         later, later_diag, early, early_diag, opts, false));
+
+    // An Infeasible claim whose ray is not certified must not outrank a
+    // primal-feasible rescue point: that point contradicts the claim.
+    sor::core::RawResult claim, rescue, stalled;
+    SimplexDiagnostics claim_diag, rescue_diag, stalled_diag;
+    claim.proposed_status = Status::Infeasible;
+    claim.ray = {1.0};
+    claim_diag.primal_residual = 0.5;
+    claim_diag.ray_violation = 1.0;           // not certified
+    rescue.proposed_status = Status::Interrupted;
+    rescue_diag.primal_residual = 0.0;
+    rescue_diag.dual_residual = 1.0;
+    CHECK(sor::engines::detail::prefer_simplex_candidate(
+        rescue, rescue_diag, claim, claim_diag, opts, false));
+    CHECK(!sor::engines::detail::prefer_simplex_candidate(
+        claim, claim_diag, rescue, rescue_diag, opts, false));
+    // ...but it still beats an iterate that is no more feasible than it.
+    stalled.proposed_status = Status::NumericalFailure;
+    stalled_diag.primal_residual = 2.0;
+    stalled_diag.dual_residual = 1.0;
+    CHECK(sor::engines::detail::prefer_simplex_candidate(
+        claim, claim_diag, stalled, stalled_diag, opts, false));
+    // An Unbounded claim carries its feasible point and beats an Interrupted
+    // feasible point.
+    sor::core::RawResult unbounded;
+    SimplexDiagnostics unbounded_diag;
+    unbounded.proposed_status = Status::Unbounded;
+    unbounded_diag.primal_residual = 0.0;
+    unbounded_diag.dual_residual = 1.0;
+    CHECK(sor::engines::detail::prefer_simplex_candidate(
+        unbounded, unbounded_diag, rescue, rescue_diag, opts, false));
 }
 
 // The presolved candidate and its unpresolved retry must be accepted by the
@@ -1249,6 +1443,14 @@ ENDATA
     CHECK(direct.proposed_status == Status::Infeasible);
     CHECK(direct_diag.phase1_iterations > 0);
     CHECK(!direct.ray.empty());
+    // Phase-1 / budget handoffs keep their own transition reasons; a cleared
+    // dual residual on some other path must not erase them. Cause 6 is the
+    // phase-1 no-dual-feasible-basis handoff when cleanup was requested.
+    if (direct_diag.primal_cleanups > 0 ||
+        direct_diag.cleanup_request_cause == 6) {
+        CHECK(direct.termination_reason.find("phase 1") != std::string::npos ||
+              direct.termination_reason.find("primal") != std::string::npos);
+    }
 
     // The dual's phase 1 hands this model to the primal inside its own pass,
     // and that finish carries a Farkas ray that checks. A checked ray is a
@@ -2473,8 +2675,12 @@ int main() {
     test_pruned_fixed_pivotal_entries_match_retained_path();
     test_dual_cost_perturbation_cleans_before_optimality();
     test_dual_cleanup_hands_over_a_primal_feasible_basis();
+    test_cleanup_handoff_reports_model_cost_identity();
+    test_cleanup_cancel_continues_with_consistent_state();
     test_partitioned_price_matches_full_scan_on_random_bases();
     test_numerical_trouble_trigger_and_shift_bound();
+    test_cost_shift_refusal_has_explicit_outcomes();
+    test_working_price_refresh_contract();
     test_auto_candidate_order_uses_feasibility_before_gap();
     test_optimum_acceptance_follows_exact_proof_setting();
     test_dual_stage_fallback_decision();

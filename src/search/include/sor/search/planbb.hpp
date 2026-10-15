@@ -1,15 +1,20 @@
-// SOR - PlanB&B (AAAI 2026 / arXiv:2511.09219 clean-room).
-//
-// Paper-complete path (MuZero-style MBRL over B&B):
-//   * Representation h - BranchFeatureVec + pooled bipartite state → latent
-//   * Dynamics g - latent + action → child dual gains / prune / next latent
-//   * Prediction f - policy prior (PUCT), value, branchability
-//   * Full MCTS - selection / expansion / simulation / backpropagation
-//
-// Lite fallback (v1): linear PlanBbPolicy + one-step / shallow UCT over probe
-// gains when paper mode is off and no paper model is loaded.
-//
-// VARIABLE-CHOICE ONLY - never writes dual bounds.
+// SOR - a learned branching-variable ranker with lookahead, after PlanB&B
+// (AAAI 2026 / arXiv:2511.09219). It is NOT that paper's algorithm: the
+// paper's dynamics model two child states, imagined open subtrees and
+// subtree-size values, trained on real search trajectories. What is here:
+//   * Representation - BranchFeatureVec + pooled bipartite state -> latent;
+//   * Dynamics - latent + action -> the action's predicted down/up gains and
+//     prune probability, trained on strong-branch probes. Its next-latent
+//     output is NOT learned: no child state is ever observed in training, so
+//     PlanBbModel::transition_learned is false and the search below never
+//     expands or values a predicted next latent;
+//   * Prediction - a policy prior and a value of the current latent, both
+//     fit to normalized strong-branch products (a ranking proxy, not a
+//     subtree size);
+//   * MCTS - over the root's actions only (one step) while no transition is
+//     learned; the lite path is a linear policy with shallow UCT over probe
+//     gains.
+// It ranks candidates; it never writes dual bounds.
 #pragma once
 
 #include "sor/search/features.hpp"
@@ -134,6 +139,10 @@ struct PlanBbModel {
     PlanBbMlp policy;    // [feats|graph] → logit
     PlanBbMlp value;     // latent → scalar subtree value (higher = better dual progress)
     bool loaded = false;
+    // The dynamics' next-latent output was fit to observed child states. No
+    // trainer here does that (it has no child observations), so it is false
+    // for every model this code builds or loads.
+    bool transition_learned = false;
 
     void clear();
     bool ready() const { return loaded && repr.valid() && dynamics.valid() &&

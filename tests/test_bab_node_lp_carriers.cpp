@@ -54,19 +54,29 @@ void test_node_lp_carriers_reuse_weights_and_match_brute_force() {
     auto lp = read_text(build_knapsack_mps(value, weight, capacity));
 
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.time_limit_s = 20.0;
     opts.max_nodes = 2000000;
     // This test is about carrying factors and weights between node LPs, which
     // needs a tree; the opt-in tableau c-MIR would close this knapsack at the
     // root, so pin it off.
     opts.cut.tableau_cmir = false;
+    // Likewise the root cut purge changes the root LP enough to close this
+    // knapsack in fewer nodes.
+    opts.cut.purge_nonbinding_cuts = false;
     opts.root_primal_early = false;   // a tree is needed to carry LP state
+    // The root cut loop alone now closes this knapsack (one node), and the
+    // carriers need a tree to be carried through.
+    opts.cuts_enabled = false;
     BabDiagnostics diag;
     auto raw = sor::search::solve_milp(lp, opts, diag);
     const auto ev = sor::search::milp_evidence(diag, opts);
     const auto r = sor::certify::finalize_result(std::move(raw), ev);
 
-    CHECK(diag.nodes > 10);
+    // A tree is all this needs (the reuse counters below are the actual
+    // checks). Strong-branch bounds handed to the children closed this
+    // knapsack in 9 nodes instead of 16, so ask for a tree, not a size.
+    CHECK(diag.nodes > 5);
     CHECK(diag.node_lp_dse_reuses > 0);
     CHECK(diag.node_lp_factor_reuses > 0);
     CHECK(diag.node_lp_factor_reuse_rows_mismatch == 0);

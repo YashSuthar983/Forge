@@ -1,4 +1,6 @@
 #include "sor/search/mir.hpp"
+#include "sor/search/certificate_rows.hpp"
+#include "sor/core/work_clock.hpp"
 #include "sor/search/conflict.hpp"
 
 #include <algorithm>
@@ -182,9 +184,19 @@ void substitute_variable_bounds(const BaseRow& row, const std::vector<f64>& x,
     merged.vals.clear();
     merged.rhs = row.rhs;
     slacks.clear();
+    // Position map (see make_cut's emit): a scan of the merged row made each
+    // base quadratic in its length.
+    thread_local std::vector<Index> merged_pos;
+    if (merged_pos.size() < x.size()) merged_pos.assign(x.size(), -1);
+    struct PosReset {
+        std::vector<Index>& pos;
+        const std::vector<Index>& cols;
+        ~PosReset() { for (const Index j : cols) pos[sz(j)] = -1; }
+    } pos_reset{merged_pos, merged.cols};
     const auto add = [&](Index j, f64 v) {
-        for (std::size_t k = 0; k < merged.cols.size(); ++k)
-            if (merged.cols[k] == j) { merged.vals[k] += v; return; }
+        Index& at = merged_pos[sz(j)];
+        if (at >= 0) { merged.vals[sz(at)] += v; return; }
+        at = static_cast<Index>(merged.cols.size());
         merged.cols.push_back(j);
         merged.vals.push_back(v);
     };
@@ -244,21 +256,42 @@ void substitute_variable_bounds(const BaseRow& row, const std::vector<f64>& x,
     }
 }
 
+// A final cut coefficient v on x_j too small to keep in a <= cut leaves it
+// only by moving its minimum over the box into the right-hand side
+// (v x_j >= v * lo_j for v > 0, v * hi_j for v < 0): deleting a negative
+// term would strengthen the cut. Returns false -- keep the term -- when that
+// bound is infinite. A bound tighter than the root's makes the cut local.
+bool relax_small_cut_term(Index j, f64 v, f64& cut_rhs, const std::vector<f64>& lo,
+                          const std::vector<f64>& hi, const std::vector<f64>* root_lo,
+                          const std::vector<f64>* root_hi, bool& used_local) {
+    const bool lower = v > 0.0;
+    const f64 b = lower ? lo[sz(j)] : hi[sz(j)];
+    if (!std::isfinite(b)) return false;
+    cut_rhs -= v * b;
+    if (!root_implies_bound(root_lo, root_hi, j, !lower, b)) used_local = true;
+    return true;
+}
+
 bool build_base_from(const model::LpProblem& lp, const BaseRow& row_in, f64 delta,
                      const std::vector<f64>& x, const std::vector<f64>& lo,
                      const std::vector<f64>& hi, const MirOptions& opts,
                      std::vector<Term>& terms, f64& rhs, MirDiagnostics& diag,
                      const std::vector<f64>* root_lo,
                      const std::vector<f64>* root_hi, bool* used_local,
-                     const std::vector<Term>& slacks) {
+                     const std::vector<Term>& slacks,
+                     const std::vector<Index>* flip = nullptr) {
     terms.clear();
     const BaseRow& row = row_in;
     rhs = delta * row.rhs;
     for (auto t : slacks) {
         t.coef *= delta;
         // Positive continuous coefficients on s >= 0 can be dropped, exactly
-        // as for any continuous term below.
-        if (!(t.coef < 0.0) || std::fabs(t.coef) <= opts.tol) continue;
+        // as for any continuous term below. A negative one never can, however
+        // small: removing c s with c < 0 from a <= row strengthens it. With
+        // M = 2^40, M x + z <= M/2 and z <= M y gave the slack -s/M, which was
+        // dropped, and MIR then derived x + y <= 0 although x = 0, y = 1,
+        // z = M/2 is feasible (the valid cut keeps -2 s/M).
+        if (!(t.coef < 0.0)) continue;
         terms.push_back(t);
     }
     for (std::size_t q = 0; q < row.cols.size(); ++q) {
@@ -275,21 +308,25 @@ bool build_base_from(const model::LpProblem& lp, const BaseRow& row_in, f64 delt
                 return false;
             }
             rhs -= a * bound;
-            if (used_local != nullptr && root_lo != nullptr && root_hi != nullptr &&
-                sz(j) < root_lo->size() && sz(j) < root_hi->size()) {
-                const f64 root_bound = lower ? (*root_lo)[sz(j)] : (*root_hi)[sz(j)];
-                if (bound != root_bound) *used_local = true;
-            }
+            if (used_local != nullptr && !root_implies_bound(root_lo, root_hi, j, !lower, bound))
+                *used_local = true;
             continue;
         }
 
         const f64 l = lo[sz(j)], u = hi[sz(j)], xv = x[sz(j)];
         const bool integral = !lp.is_integer.empty() && lp.is_integer[sz(j)];
 
-        // Prefer the nearer bound; fall back to whichever one is finite.
+        // Prefer the nearer bound; fall back to whichever one is finite. An
+        // integer column on the complementation list takes the other bound
+        // (both finite): every choice is a valid substitution, and the
+        // complementation step in try_mir_on_base keeps the better cut.
         bool use_upper;
-        if (std::isfinite(l) && std::isfinite(u))
+        if (std::isfinite(l) && std::isfinite(u)) {
             use_upper = (u - xv) < (xv - l);
+            if (flip != nullptr && integral && !flip->empty() &&
+                std::find(flip->begin(), flip->end(), j) != flip->end())
+                use_upper = !use_upper;
+        }
         else if (std::isfinite(l))
             use_upper = false;
         else if (std::isfinite(u))
@@ -312,11 +349,9 @@ bool build_base_from(const model::LpProblem& lp, const BaseRow& row_in, f64 delt
         // Provenance: this term is substituted onto `t.bound`. If that bound
         // is tighter than the root's, the resulting cut is only valid inside
         // this subtree.
-        if (used_local != nullptr && root_lo != nullptr && root_hi != nullptr &&
-            sz(j) < root_lo->size() && sz(j) < root_hi->size()) {
-            const f64 rb = use_upper ? (*root_hi)[sz(j)] : (*root_lo)[sz(j)];
-            if (!(t.bound == rb)) *used_local = true;
-        }
+        if (used_local != nullptr &&
+            !root_implies_bound(root_lo, root_hi, j, use_upper, t.bound))
+            *used_local = true;
         // x_j = bound + s  (lower)  or  x_j = bound - s  (upper), s >= 0
         t.coef = use_upper ? -a : a;
         t.shifted_x = use_upper ? (u - xv) : (xv - l);
@@ -395,6 +430,12 @@ bool lifted_cover_on_base(const model::LpProblem& lp, const BaseRow& base,
         Term& t = terms[k];
         if (!t.integral) continue;  // continuous survivors carry c_k <= 0
         const f64 width = hi[sz(t.col)] - lo[sz(t.col)];
+        // Both of this column's bounds enter from here on: a zero width
+        // drops the term (s = 0), a unit width makes s binary, and the
+        // complement below substitutes onto the other bound.
+        if (!root_implies_bound(root_lo, root_hi, t.col, false, lo[sz(t.col)]) ||
+            !root_implies_bound(root_lo, root_hi, t.col, true, hi[sz(t.col)]))
+            used_local = true;
         if (width == 0.0) { t.coef = 0.0; continue; }  // shifted value is 0
         // General integers need the mixed-integer lifting; c-MIR covers them.
         if (width != 1.0) return false;
@@ -405,11 +446,6 @@ bool lifted_cover_on_base(const model::LpProblem& lp, const BaseRow& base,
             t.at_upper = !t.at_upper;
             t.bound = t.at_upper ? hi[sz(t.col)] : lo[sz(t.col)];
             t.shifted_x = 1.0 - t.shifted_x;
-            if (!used_local && root_lo != nullptr && root_hi != nullptr) {
-                const f64 rb = t.at_upper ? (*root_hi)[sz(t.col)]
-                                          : (*root_lo)[sz(t.col)];
-                if (!(t.bound == rb)) used_local = true;
-            }
         }
         if (t.coef <= opts.tol) { t.coef = 0.0; continue; }  // relaxation
         bins.push_back(k);
@@ -450,13 +486,16 @@ bool lifted_cover_on_base(const model::LpProblem& lp, const BaseRow& base,
     std::vector<f64> prefix(big.size());
     f64 run = 0.0;
     for (std::size_t i = 0; i < big.size(); ++i) prefix[i] = (run += big[i]);
+    // The first prefix sum >= a decides both pieces (no earlier index can
+    // satisfy either test), so a binary search gives the same value as the
+    // former scan in O(log |big|) per term.
     const auto phi = [&](f64 a) {
-        for (std::size_t i = 0; i < prefix.size(); ++i) {
-            if (a <= prefix[i] - lambda) return static_cast<f64>(i) * lambda;
-            if (a <= prefix[i])
-                return static_cast<f64>(i + 1) * lambda - (prefix[i] - a);
-        }
-        return static_cast<f64>(prefix.size()) * lambda + (a - prefix.back());
+        const auto it = std::lower_bound(prefix.begin(), prefix.end(), a);
+        if (it == prefix.end())
+            return static_cast<f64>(prefix.size()) * lambda + (a - prefix.back());
+        const auto i = static_cast<std::size_t>(it - prefix.begin());
+        if (a <= prefix[i] - lambda) return static_cast<f64>(i) * lambda;
+        return static_cast<f64>(i + 1) * lambda - (prefix[i] - a);
     };
 
     // Cut in shifted space: sum g_j z_j + sum c_k s_k <= rhs.
@@ -477,16 +516,27 @@ bool lifted_cover_on_base(const model::LpProblem& lp, const BaseRow& base,
     f64 lhs_at_x = 0.0;
     std::vector<Index> out_cols;
     std::vector<f64> out_vals;
+    // Position map (see make_cut's emit in try_mir_on_base).
+    thread_local std::vector<Index> cover_pos;
+    if (cover_pos.size() < sz(lp.n_cols())) cover_pos.assign(sz(lp.n_cols()), -1);
+    struct PosReset {
+        std::vector<Index>& pos;
+        const std::vector<Index>& cols;
+        ~PosReset() { for (const Index j : cols) pos[sz(j)] = -1; }
+    } pos_reset{cover_pos, out_cols};
     const auto emit = [&](Index j, f64 v) {
-        for (std::size_t k = 0; k < out_cols.size(); ++k)
-            if (out_cols[k] == j) { out_vals[k] += v; return; }
+        Index& at = cover_pos[sz(j)];
+        if (at >= 0) { out_vals[sz(at)] += v; return; }
+        at = static_cast<Index>(out_cols.size());
         out_cols.push_back(j);
         out_vals.push_back(v);
     };
     f64 cut_rhs = rhs;
     for (const auto& t : terms) {
         const f64 c = t.coef;
-        if (std::fabs(c) <= opts.tol) continue;
+        // A small positive coefficient on s >= 0 may go (relaxation); a
+        // negative one stays, see build_base_from.
+        if (c == 0.0 || (c > 0.0 && c <= opts.tol)) continue;
         if (!std::isfinite(c)) return false;
         lhs_at_x += c * t.shifted_x;
         if (t.vb_y >= 0) {
@@ -501,9 +551,16 @@ bool lifted_cover_on_base(const model::LpProblem& lp, const BaseRow& base,
         emit(t.col, back);
     }
     f64 norm2 = 0.0, amax = 0.0, amin = kInf;
+    bool relaxed = false;
     for (std::size_t k = 0; k < out_cols.size(); ++k) {
-        if (std::fabs(out_vals[k]) <= opts.tol) continue;
         if (!std::isfinite(out_vals[k])) return false;
+        if (out_vals[k] == 0.0) continue;
+        if (std::fabs(out_vals[k]) <= opts.tol &&
+            relax_small_cut_term(out_cols[k], out_vals[k], cut_rhs, lo, hi, root_lo,
+                                 root_hi, used_local)) {
+            relaxed = true;
+            continue;
+        }
         cut.cols.push_back(out_cols[k]);
         cut.vals.push_back(out_vals[k]);
         norm2 += out_vals[k] * out_vals[k];
@@ -512,6 +569,14 @@ bool lifted_cover_on_base(const model::LpProblem& lp, const BaseRow& base,
     }
     if (cut.cols.empty() || !std::isfinite(cut_rhs)) return false;
     if (amin > 0.0 && amax / amin > opts.max_dynamism) return false;
+    if (relaxed) {
+        // Terms moved into the rhs: measure the cut as stated.
+        f64 act = 0.0;
+        for (std::size_t k = 0; k < cut.cols.size(); ++k)
+            act += cut.vals[k] * x[sz(cut.cols[k])];
+        lhs_at_x = act;
+        rhs = cut_rhs;
+    }
     if (!(lhs_at_x > rhs + opts.violation_min)) return false;
     efficacy = (lhs_at_x - rhs) / std::sqrt(norm2);
     cut.used_local_bound = used_local;
@@ -533,6 +598,7 @@ void try_mir_on_base(const model::LpProblem& lp, const BaseRow& base_in,
                      const std::vector<f64>* root_hi = nullptr,
                      const VarBounds* vub = nullptr,
                      Index base_row = -1) {
+    core::work_add(16 + 4 * base_in.cols.size(), ::sor::core::WorkTag::Mir);   // substitution, deltas, rounding
     BaseRow substituted;
     std::vector<Term> slacks;
     const BaseRow* basep = &base_in;
@@ -547,12 +613,14 @@ void try_mir_on_base(const model::LpProblem& lp, const BaseRow& base_in,
     // divides by 1/delta). Returns false when no acceptable cut results;
     // otherwise fills `cut` and its efficacy (violation / norm at x).
     std::vector<Term> terms;
+    // Integer columns substituted at their FARTHER bound (complementation).
+    std::vector<Index> flips;
     const auto make_cut = [&](f64 delta, CutRow& cut, f64& efficacy,
                               bool& violated) -> bool {
         f64 rhs = 0.0;
         bool used_local = (root_lo == nullptr || root_hi == nullptr);
         if (!build_base_from(lp, base, delta, x, lo, hi, opts, terms, rhs, diag,
-                             root_lo, root_hi, &used_local, slacks))
+                             root_lo, root_hi, &used_local, slacks, &flips))
             return false;
         const f64 fl = std::floor(rhs + opts.tol);
         const f64 f = rhs - fl;
@@ -567,11 +635,25 @@ void try_mir_on_base(const model::LpProblem& lp, const BaseRow& base_in,
         f64 amax = 0.0, amin = kInf;
         // Back-substitution can put one column in the cut twice (y from its
         // own term and from a variable-bound slack), so accumulate first.
+        // Position map, not a scan of the cut so far: the scan made every cut
+        // quadratic in its length, and a base built on a dense row (an
+        // objective-cutoff row is tight at the LP point, so aggregation starts
+        // from it) cost ~4M steps per scaling -- 3.6 s of separation in three
+        // objective-face children on binkar10_1, against 133 ms for the
+        // parent's whole cut loop.
         std::vector<Index> out_cols;
         std::vector<f64> out_vals;
+        thread_local std::vector<Index> out_pos;
+        if (out_pos.size() < sz(lp.n_cols())) out_pos.assign(sz(lp.n_cols()), -1);
+        struct PosReset {
+            std::vector<Index>& pos;
+            const std::vector<Index>& cols;
+            ~PosReset() { for (const Index j : cols) pos[sz(j)] = -1; }
+        } pos_reset{out_pos, out_cols};
         const auto emit = [&](Index j, f64 v) {
-            for (std::size_t k = 0; k < out_cols.size(); ++k)
-                if (out_cols[k] == j) { out_vals[k] += v; return; }
+            Index& at = out_pos[sz(j)];
+            if (at >= 0) { out_vals[sz(at)] += v; return; }
+            at = static_cast<Index>(out_cols.size());
             out_cols.push_back(j);
             out_vals.push_back(v);
         };
@@ -584,7 +666,9 @@ void try_mir_on_base(const model::LpProblem& lp, const BaseRow& base_in,
             } else {
                 c = t.coef * inv;   // only non-positive coefs survive build_base
             }
-            if (std::fabs(c) <= opts.tol) continue;
+            // A small positive coefficient on s >= 0 may go (relaxation); a
+            // negative one stays, see build_base_from.
+            if (c == 0.0 || (c > 0.0 && c <= opts.tol)) continue;
             if (!std::isfinite(c)) return false;
             lhs_at_x += c * t.shifted_x;
             if (t.vb_y >= 0) {
@@ -600,9 +684,16 @@ void try_mir_on_base(const model::LpProblem& lp, const BaseRow& base_in,
             emit(t.col, back);
         }
         f64 norm2 = 0.0;
+        bool relaxed = false;   // a term moved into the rhs: measure the final cut
         for (std::size_t k = 0; k < out_cols.size(); ++k) {
-            if (std::fabs(out_vals[k]) <= opts.tol) continue;
             if (!std::isfinite(out_vals[k])) return false;
+            if (out_vals[k] == 0.0) continue;
+            if (std::fabs(out_vals[k]) <= opts.tol &&
+                relax_small_cut_term(out_cols[k], out_vals[k], cut_rhs, lo, hi, root_lo,
+                                     root_hi, used_local)) {
+                relaxed = true;
+                continue;
+            }
             cut.cols.push_back(out_cols[k]);
             cut.vals.push_back(out_vals[k]);
             norm2 += out_vals[k] * out_vals[k];
@@ -612,22 +703,16 @@ void try_mir_on_base(const model::LpProblem& lp, const BaseRow& base_in,
         if (cut.cols.empty()) return false;
         bool repaired = false;
         if (amin > 0.0 && amax / amin > opts.max_dynamism) {
-            std::vector<std::pair<Index, f64>> used_bounds;
             if (!opts.relax_small_terms ||
                 !relax_small_terms(cut.cols, cut.vals, cut_rhs, false, lo, hi,
-                                   opts.max_dynamism, &used_bounds)) {
+                                   opts.max_dynamism, root_lo, root_hi, &used_local)) {
                 ++diag.rejected_dynamism;
                 return false;
             }
             ++diag.dynamism_repaired;
             repaired = true;
-            if (root_lo != nullptr && root_hi != nullptr)
-                for (const auto& [j, b] : used_bounds)
-                    if (sz(j) < root_lo->size() &&
-                        b != (*root_lo)[sz(j)] && b != (*root_hi)[sz(j)])
-                        used_local = true;
         }
-        if (repaired) {
+        if (repaired || relaxed) {
             // Stated over the original columns: measure against its own rhs.
             f64 act = 0.0;
             norm2 = 0.0;
@@ -728,6 +813,7 @@ void try_mir_on_base(const model::LpProblem& lp, const BaseRow& base_in,
         return;
     }
     const f64 star = best_delta;
+    f64 best_scale = star;
     for (const f64 mult : {2.0, 4.0, 8.0}) {
         CutRow cut;
         f64 eff = 0.0;
@@ -735,8 +821,52 @@ void try_mir_on_base(const model::LpProblem& lp, const BaseRow& base_in,
         if (!make_cut(star * mult, cut, eff, viol) || !viol) continue;
         if (eff > best_eff) {
             best_eff = eff;
+            best_scale = star * mult;
             best = std::move(cut);
         }
+    }
+    // Complementation (Marchand & Wolsey 2001; Achterberg 2007, Alg. 8.2):
+    // an integer term strictly inside two finite bounds may be substituted
+    // at either one, and the nearer-bound choice is only a default. At the
+    // best scaling, try the other bound for such terms, farthest from their
+    // chosen bound first (their substitution is the least natural), and keep
+    // each flip that raises the cut's efficacy. Every flipped base is a valid
+    // MIR base, so this only chooses among valid cuts.
+    if (opts.complementation_max > 0) {
+        f64 rhs0 = 0.0;
+        bool ul = true;
+        MirDiagnostics scratch;
+        std::vector<std::pair<f64, Index>> cand;
+        if (build_base_from(lp, base, best_scale, x, lo, hi, opts, terms, rhs0, scratch,
+                            nullptr, nullptr, &ul, slacks)) {
+            for (const auto& t : terms) {
+                if (!t.integral || t.vb_y >= 0) continue;
+                const f64 l = lo[sz(t.col)], u = hi[sz(t.col)];
+                if (!std::isfinite(l) || !std::isfinite(u)) continue;
+                const f64 width = u - l;
+                if (t.shifted_x > opts.tol && t.shifted_x < width - opts.tol)
+                    cand.emplace_back(t.shifted_x, t.col);
+            }
+        }
+        std::stable_sort(cand.begin(), cand.end(),
+                         [](const auto& a, const auto& b) { return a.first > b.first; });
+        if (static_cast<int>(cand.size()) > opts.complementation_max)
+            cand.resize(sz(static_cast<Index>(opts.complementation_max)));
+        for (const auto& c : cand) {
+            flips.push_back(c.second);
+            CutRow cut;
+            f64 eff = 0.0;
+            bool viol = false;
+            if (make_cut(best_scale, cut, eff, viol) && viol &&
+                eff > best_eff + 1e-9 * std::max(1.0, std::fabs(best_eff))) {
+                best_eff = eff;
+                best = std::move(cut);
+                ++diag.complemented;
+            } else {
+                flips.pop_back();
+            }
+        }
+        flips.clear();
     }
     if (static_cast<int>(cuts.size()) >= opts.max_cuts) return;
     if (have_cover && cover_eff > best_eff) {
@@ -776,6 +906,7 @@ std::vector<CutRow> separate_mir(const model::LpProblem& lp,
                                  const std::vector<f64>* root_lo,
                                  const std::vector<f64>* root_hi,
                                  const ConflictGraph* global_implications) {
+    core::WorkScope work_scope_(core::WorkCat::Separation);
     MirOptions gen = opts;
     gen.max_cuts = std::max(opts.max_cuts,
                             opts.max_cuts * std::max(1, opts.candidate_factor));
@@ -841,10 +972,10 @@ std::vector<CutRow> generate_mir(const model::LpProblem& lp,
     const int single_limit = opts.aggregate
         ? std::max(1, opts.max_cuts - std::max(1, opts.max_cuts / 4))
         : opts.max_cuts;
-    const auto mir_started = std::chrono::steady_clock::now();
+    const auto mir_started = sor::core::SolverClock::now();
     const auto out_of_time = [&](Index i) {
         if (opts.time_limit_s <= 0.0 || (i & 31) != 0) return false;
-        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - mir_started).count() <
+        if (std::chrono::duration<double>(sor::core::SolverClock::now() - mir_started).count() <
             opts.time_limit_s)
             return false;
         ++diag.time_stops;
@@ -940,6 +1071,7 @@ std::vector<CutRow> generate_mir(const model::LpProblem& lp,
                      [](const auto& a, const auto& b) { return a.first < b.first; });
 
     std::vector<f64> dense(sz(n), 0.0);
+    std::vector<model::DyadicSum> exact_dense(sz(n));
     // Explicit membership, NOT `dense[j] == 0.0`. A cancelled column is set to
     // exactly zero on purpose, and two contributions can cancel to zero by
     // arithmetic, so the value cannot double as the membership test: it lets a
@@ -971,11 +1103,24 @@ std::vector<CutRow> generate_mir(const model::LpProblem& lp,
             for (std::size_t q = 0; q < base.cols.size(); ++q) {
                 const Index j = base.cols[q];
                 if (!in_support[sz(j)]) { in_support[sz(j)] = 1; support.push_back(j); }
-                dense[sz(j)] += base.vals[q];
+                exact_dense[sz(j)].add(base.vals[q]);
+                dense[sz(j)] = exact_dense[sz(j)].nearest();
             }
-            f64 agg_rhs = base.rhs;
+            model::DyadicSum exact_rhs; exact_rhs.add(base.rhs);
             std::vector<char> used(sz(lp.n_rows()), 0);
             used[sz(i0)] = 1;
+            // A term leaves the aggregate (a <= row) only by moving its
+            // minimum over the box into the rhs; with root bounds the
+            // aggregate stays globally valid. False: keep it (infinite bound).
+            const std::vector<f64>& agg_lo = root_lo != nullptr ? *root_lo : col_lo;
+            const std::vector<f64>& agg_hi = root_hi != nullptr ? *root_hi : col_hi;
+            const auto relax_out = [&](Index j, f64 v) {
+                const f64 b = v > 0.0 ? agg_lo[sz(j)] : agg_hi[sz(j)];
+                if (!std::isfinite(b)) return false;
+                exact_rhs.add_sum_product(exact_dense[sz(j)], -b);
+                exact_dense[sz(j)] = {};
+                return true;
+            };
 
             for (int step = 0; step < opts.max_aggregations &&
                                static_cast<int>(cuts.size()) < opts.max_cuts; ++step) {
@@ -1028,23 +1173,32 @@ std::vector<CutRow> generate_mir(const model::LpProblem& lp,
                     for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
                         const Index j = ci[sz(k)];
                         if (!in_support[sz(j)]) { in_support[sz(j)] = 1; support.push_back(j); }
-                        dense[sz(j)] += lambda * sign * av[sz(k)];
+                        exact_dense[sz(j)].add_product(lambda * sign, av[sz(k)]);
+                        dense[sz(j)] = exact_dense[sz(j)].nearest();
                     }
-                    agg_rhs += lambda * bound;
+                    exact_rhs.add_product(lambda, bound);
                     used[sz(i)] = 1;
-                    dense[sz(target)] = 0.0;   // exact by construction
+                    // lambda = -alpha/a_ij is rounded, so the target keeps a
+                    // residual of rounding size; it is not zero by
+                    // construction, and deleting it needs its bound.
+                    if (!exact_dense[sz(target)].is_zero() && !relax_out(target,
+                        exact_dense[sz(target)].sign() > 0 ? 1.0 : -1.0)) break;
+                    dense[sz(target)] = 0.0;
                     cancelled = true;
                 }
                 if (!cancelled) break;
 
-                // Separate on the aggregate as it now stands.
-                BaseRow agg;
-                agg.rhs = agg_rhs;
-                for (const Index j : support)
-                    if (std::fabs(dense[sz(j)]) > opts.tol) {
-                        agg.cols.push_back(j);
-                        agg.vals.push_back(dense[sz(j)]);
-                    }
+                // Reconstruct the exact aggregate before MIR. Greedy weight
+                // selection is guidance; it must not erase multiply-add
+                // residuals or silently round an aggregate into a restriction.
+                auto geq = exact_dense;
+                for (auto& coefficient : geq) coefficient.negate();
+                auto side = exact_rhs; side.negate();
+                CutRow compiled;
+                if (!compile_geq_exact(geq, side, agg_lo, agg_hi, compiled)) break;
+                BaseRow agg; agg.cols = std::move(compiled.cols); agg.vals = std::move(compiled.vals);
+                for (auto& coefficient : agg.vals) coefficient = -coefficient;
+                agg.rhs = -compiled.row_lo;
                 if (agg.cols.size() >= 2 && agg.cols.size() <= opts.max_row_len) {
                     ++diag.aggregations;
                     try_mir_on_base(lp, agg, x, col_lo, col_hi, opts, true, diag,
@@ -1052,7 +1206,7 @@ std::vector<CutRow> generate_mir(const model::LpProblem& lp,
                 }
             }
 
-            for (const Index j : support) { dense[sz(j)] = 0.0; in_support[sz(j)] = 0; }
+            for (const Index j : support) { dense[sz(j)] = 0.0; exact_dense[sz(j)] = {}; in_support[sz(j)] = 0; }
         }
     }
     return cuts;

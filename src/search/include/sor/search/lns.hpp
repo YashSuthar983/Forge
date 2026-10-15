@@ -74,6 +74,11 @@ struct NeighborhoodProblem {
     bool replace_objective = false;
     f64 objective_cutoff = core::kPosInf;   // in the ORIGINAL sense
     bool has_objective_cutoff = false;
+    // The neighbourhood means nothing without a strictly-better cutoff on the
+    // original objective (Proximity replaces the objective). The caller states
+    // it -- in offset-free, lattice-aware units, as for every arm -- or does
+    // not build the neighbourhood.
+    bool requires_objective_cutoff = false;
     // How many integer columns ended up fixed, and how many stayed free. The
     // scheduler needs both to tell "this neighborhood was too big to solve"
     // apart from "this neighborhood was empty".
@@ -180,15 +185,27 @@ private:
 class SolutionPool {
 public:
     explicit SolutionPool(std::size_t cap) : cap_(cap) {}
-    // Keeps the pool sorted best-first and drops duplicates.
+    // The columns whose values make a pattern (the integer columns): two
+    // points that agree on them are one pattern, and the pool keeps the
+    // better. Recombination (Crossover) reads only these values, so eight
+    // continuous completions of one assignment would be eight copies of the
+    // same input to it, and would push the other patterns out. Without a
+    // mask every coordinate counts (the old behaviour).
+    void set_pattern_mask(std::vector<char> mask) { mask_ = std::move(mask); }
+    // Keeps the pool sorted best-first and one point per pattern.
     void add(const std::vector<f64>& x, f64 objective, bool maximize);
     std::size_t size() const noexcept { return entries_.size(); }
     const std::vector<f64>& at(std::size_t i) const { return entries_[i].x; }
+    // Changes whenever the contents change: what an arm's availability is
+    // judged against.
+    std::uint64_t version() const noexcept { return version_; }
 
 private:
     struct Entry { std::vector<f64> x; f64 obj; };
     std::size_t cap_;
     std::vector<Entry> entries_;
+    std::vector<char> mask_;
+    std::uint64_t version_ = 0;
 };
 
 // Builds the restricted sub-problem for `kind`. Returns false when the

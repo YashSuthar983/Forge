@@ -120,7 +120,7 @@ int BalansScheduler::select(const std::vector<bool>& usable) {
     return best;
 }
 
-void BalansScheduler::reward(int arm, LnsOutcome outcome, double seconds) {
+void BalansScheduler::reward(int arm, LnsOutcome outcome, double seconds, f64 gap_closed) {
     if (arm < 0 || arm >= static_cast<int>(arms_.size())) return;
     auto& a = arms_[sz(arm)];
     if (outcome == LnsOutcome::NotBuilt) return;
@@ -132,7 +132,7 @@ void BalansScheduler::reward(int arm, LnsOutcome outcome, double seconds) {
     f64 r = opts_.reward_nothing;
     switch (outcome) {
         case LnsOutcome::NewBest:
-            r = opts_.reward_new_best;
+            r = gap_closed >= 0.0 ? std::clamp(gap_closed, 0.0, 1.0) : opts_.reward_new_best;
             ++a.hits;
             break;
         case LnsOutcome::Feasible: r = opts_.reward_feasible; break;
@@ -140,14 +140,19 @@ void BalansScheduler::reward(int arm, LnsOutcome outcome, double seconds) {
         default: break;
     }
     if (opts_.call_time_s > 0.0) {
-        const f64 frac = std::min(1.0, seconds / opts_.call_time_s);
+        const f64 frac = std::max(0.0, seconds) / opts_.call_time_s;
         r *= 1.0 / (1.0 + frac);
     }
     a.reward_sum += r;
 
     const bool success = outcome == LnsOutcome::NewBest ||
                          outcome == LnsOutcome::Feasible;
-    if (success) a.fixing_rate -= opts_.fixing_rate_step_down;
+    // A settled neighbourhood (Exhausted: searched to the end, nothing
+    // better) is evidence about a region, not about its size being too large:
+    // with nested neighbourhoods every stricter one is empty too, so it widens
+    // like a success. Only a budget-limited miss (Nothing) asks for a smaller
+    // region.
+    if (success || outcome == LnsOutcome::Exhausted) a.fixing_rate -= opts_.fixing_rate_step_down;
     else a.fixing_rate += opts_.fixing_rate_step_up;
     a.fixing_rate = std::min(std::max(a.fixing_rate, opts_.fixing_rate_min),
                              opts_.fixing_rate_max);

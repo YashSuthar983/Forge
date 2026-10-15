@@ -1,5 +1,6 @@
 #include "simplex_prepared.hpp"
 #include "sor/core/env_switches.hpp"
+#include "sor/core/work_clock.hpp"
 #include "sor/certify/finalize.hpp"
 #include "sor/model/exact.hpp"
 
@@ -18,13 +19,14 @@ using model::Rational;
 // decide whether any proposed witness is useful.
 bool refined_basis_dual(const model::LpProblem& p, core::RawResult& raw,
                         const SimplexOptions& opts, SimplexDiagnostics& diag) {
+    core::WorkScope work_scope_(core::WorkCat::Exact);
     const auto m = static_cast<std::size_t>(p.n_rows());
     const auto n = static_cast<std::size_t>(p.n_cols());
     if (raw.certificate_basis.size() != m || raw.y.size() != m || p.maximize) return false;
-    const auto started = std::chrono::steady_clock::now();
+    const auto started = sor::core::SolverClock::now();
     const auto expired = [&] {
         return opts.time_limit_s > 0 &&
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() >= opts.time_limit_s;
+            std::chrono::duration<double>(sor::core::SolverClock::now() - started).count() >= opts.time_limit_s;
     };
     const auto csc = sparse::to_csc(p.A);
     const auto& cp = csc.pattern.col_ptr();
@@ -153,21 +155,22 @@ bool refined_basis_dual(const model::LpProblem& p, core::RawResult& raw,
 // generator: only the independent exact Lagrangian computation can accept it.
 bool repair_simplex_dual(const model::LpProblem& p, core::RawResult& raw,
                          const SimplexOptions& opts, SimplexDiagnostics& diag) {
+    core::WorkScope work_scope_(core::WorkCat::Exact);
     const auto m = static_cast<std::size_t>(p.n_rows());
     const auto n = static_cast<std::size_t>(p.n_cols());
     if (raw.y.size() != m || p.maximize) return false;
-    const auto started = std::chrono::steady_clock::now();
+    const auto started = sor::core::SolverClock::now();
     const auto remaining = [&] {
         return opts.time_limit_s > 0 ? opts.time_limit_s -
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() : 0;
+            std::chrono::duration<double>(sor::core::SolverClock::now() - started).count() : 0;
     };
     if (raw.exact_dual.empty()) {
-        const auto refinement_started = std::chrono::steady_clock::now();
+        const auto refinement_started = sor::core::SolverClock::now();
         const bool refined = refined_basis_dual(p, raw, opts, diag);
         if (core::env_switches().certificate_debug)
             std::fprintf(stderr, "certificate dyadic refinement: m=%zu n=%zu accepted=%d elapsed=%.6f\n",
                 m, n, refined ? 1 : 0,
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - refinement_started).count());
+                std::chrono::duration<double>(sor::core::SolverClock::now() - refinement_started).count());
         if (refined) return true;
         if (opts.time_limit_s > 0 && remaining() <= 0) return false;
         certify::repair_dual_certificate(p, raw,
@@ -181,6 +184,17 @@ bool repair_simplex_dual(const model::LpProblem& p, core::RawResult& raw,
                 raw.dual_bound = diag.dual_objective = bound.value;
                 diag.dual_bound_finite = true; diag.gap_rel = gap;
                 return true;
+            }
+            // The witness stays in raw.exact_dual, so the result checker
+            // takes the better of its bound and the floating-point one
+            // (check_lp_point). Report that same bound: leaving the weaker
+            // floating-point value in raw.dual_bound made the reported and
+            // checked bounds disagree, and finalize_result turned a KKT
+            // optimum into NumericalFailure (etamacro, --engine auto).
+            if (!diag.dual_bound_finite || !std::isfinite(raw.dual_bound) ||
+                bound.value > raw.dual_bound) {
+                raw.dual_bound = diag.dual_objective = bound.value;
+                diag.dual_bound_finite = true; diag.gap_rel = gap;
             }
         }
         // Keep the offending exact term for warm pricing. Repeating a cold
@@ -272,6 +286,10 @@ bool repair_simplex_dual(const model::LpProblem& p, core::RawResult& raw,
     const double gap = std::fabs(raw.objective - bound.value) / (1 + std::fabs(raw.objective));
     if (gap > opts.gap_tol) return false;
     raw.y = std::move(candidate);
+    const auto enclosure = certify::enclose_reduced_costs(p, raw.y, p.col_lo, p.col_hi);
+    raw.rc_lo = enclosure.finite ? enclosure.lo : std::vector<double>{};
+    raw.rc_hi = enclosure.finite ? enclosure.hi : std::vector<double>{};
+    raw.rc_bound = enclosure.finite ? enclosure.bound : core::kNaN;
     raw.exact_dual.clear();
     raw.dual_bound = diag.dual_objective = bound.value;
     diag.dual_bound_finite = true;
@@ -289,10 +307,10 @@ bool repair_simplex_support(const model::LpProblem& p, core::RawResult& raw,
     if (p.maximize || raw.y.size() != m || raw.x.size() != n || m == 0 ||
         diag.certificate_iterations >= simplex_certificate_pivot_allowance ||
         (opts.max_iterations > 0 && diag.iterations >= opts.max_iterations)) return false;
-    const auto started = std::chrono::steady_clock::now();
+    const auto started = sor::core::SolverClock::now();
     const auto remaining = [&] {
         return opts.time_limit_s > 0 ? opts.time_limit_s -
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() : 0;
+            std::chrono::duration<double>(sor::core::SolverClock::now() - started).count() : 0;
     };
     const auto expired = [&] { return opts.time_limit_s > 0 && remaining() <= 0; };
     constexpr double radius = 1e-10;
@@ -441,6 +459,10 @@ bool repair_simplex_support(const model::LpProblem& p, core::RawResult& raw,
         !std::isfinite(checked.gap_rel) || checked.gap_rel > opts.gap_tol) return false;
     // The auxiliary basis is not a basis of p. Retain the original basis only.
     raw.y = std::move(candidate.y);
+    const auto enclosure = certify::enclose_reduced_costs(p, raw.y, p.col_lo, p.col_hi);
+    raw.rc_lo = enclosure.finite ? enclosure.lo : std::vector<double>{};
+    raw.rc_hi = enclosure.finite ? enclosure.hi : std::vector<double>{};
+    raw.rc_bound = enclosure.finite ? enclosure.bound : core::kNaN;
     raw.exact_dual = std::move(candidate.exact_dual);
     raw.dual_bound = diag.dual_objective = bound.value;
     diag.dual_residual = checked.max_dual_violation;
@@ -448,4 +470,75 @@ bool repair_simplex_support(const model::LpProblem& p, core::RawResult& raw,
     diag.gap_rel = checked.gap_rel;
     return true;
 }
+
+bool continue_certificate_from_basis(const model::LpProblem& problem,
+                                     const SimplexOptions& opts,
+                                     const SimplexBasis& basis,
+                                     std::uint64_t pivot_cap,
+                                     core::RawResult& raw,
+                                     SimplexDiagnostics& diag,
+                                     SimplexBasis* out_basis) {
+    if (raw.proposed_status != core::Status::Optimal ||
+        basis.status.empty() ||
+        (diag.dual_bound_finite && diag.gap_rel <= opts.gap_tol) ||
+        diag.certificate_iterations >= simplex_certificate_pivot_allowance)
+        return false;
+    if (opts.max_iterations != 0 && diag.iterations >= opts.max_iterations)
+        return false;
+
+    SimplexOptions continuation = opts;
+    continuation.presolve = false;
+    continuation.method = SimplexMethod::Primal;
+    continuation.certificate_pricing = true;
+    continuation.primal_bound_perturbation = false;
+    const auto certificate_available =
+        simplex_certificate_pivot_allowance - diag.certificate_iterations;
+    continuation.max_iterations = opts.max_iterations == 0
+        ? certificate_available
+        : std::min(certificate_available, opts.max_iterations - diag.iterations);
+    if (pivot_cap != 0)
+        continuation.max_iterations =
+            std::min(continuation.max_iterations, pivot_cap);
+    if (continuation.max_iterations == 0) return false;
+
+    SimplexDiagnostics work;
+    SimplexBasis repaired;
+    auto candidate =
+        solve_primal_simplex(problem, continuation, work, &repaired, &basis);
+    auto checked = certify::check_lp_result(
+        problem, candidate, simplex_evidence(work, continuation));
+    if (!checked.checker_passed &&
+        candidate.proposed_status == core::Status::Optimal &&
+        std::isfinite(candidate.dual_bound) && !raw.x.empty()) {
+        candidate.x = raw.x;
+        candidate.objective = problem.objective(candidate.x);
+        checked = certify::check_lp_result(
+            problem, candidate, simplex_evidence(work, continuation));
+    }
+    work.certificate_stages = std::max<std::uint64_t>(1, work.stages);
+    work.certificate_iterations = work.iterations;
+    work.certificate_preprocessing_builds = work.preprocessing_builds;
+    accumulate_simplex_work(diag, work);
+    if (!(checked.checker_passed && checked.reported_values_consistent &&
+          checked.max_dual_violation <= opts.dual_feas_tol &&
+          std::isfinite(checked.gap_rel) && checked.gap_rel <= opts.gap_tol &&
+          candidate.proposed_status == core::Status::Optimal))
+        return false;
+
+    const auto totals = diag;
+    diag = work;
+    install_simplex_work_totals(diag, totals);
+    diag.primal_residual = checked.max_primal_violation;
+    diag.primal_distance = checked.max_primal_distance;
+    diag.dual_residual = checked.max_dual_violation;
+    diag.primal_objective = candidate.objective;
+    diag.dual_objective = checked.checked_dual_bound;
+    diag.dual_bound_finite = std::isfinite(checked.checked_dual_bound);
+    diag.gap_rel = checked.gap_rel;
+    raw = std::move(candidate);
+    raw.engine = "simplex+certificate-continuation";
+    if (out_basis) *out_basis = std::move(repaired);
+    return true;
+}
+
 }  // namespace sor::engines

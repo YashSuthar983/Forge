@@ -7,6 +7,8 @@
 // retain an optimum; FBBT and enumeration preserve every feasible point.
 #pragma once
 
+#include "sor/core/cancel.hpp"
+
 #include "sor/core/result.hpp"
 #include "sor/model/lp.hpp"
 
@@ -19,6 +21,7 @@ using core::f64;
 using core::Index;
 
 struct ComponentPresolveOptions {
+    const core::CancelToken* cancel = nullptr;
     bool enabled = true;
     // Independent dual-fix + FBBT per component with ≥2 columns.
     bool tighten = true;

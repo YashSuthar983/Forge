@@ -19,6 +19,24 @@ using core::f64;
 using core::Index;
 using core::Offset;
 
+// Named numerics defaults (also printed by sor_solve --help). Callers that
+// override a tolerance should still respect the documented relations:
+//   basis_lu.pivot_tol <= pivot_tol
+//   scale-adjusted per-column floors use kScaleAdjustedTolFloor
+//   Forrest-Tomlin hard update floor is kForrestTomlinHardUpdateFloor
+namespace numerics {
+constexpr f64 kDefaultPrimalFeasTol = 1e-7;
+constexpr f64 kDefaultDualFeasTol = 1e-7;
+constexpr f64 kDefaultGapTol = 1e-9;
+constexpr f64 kDefaultPivotTol = 1e-7;
+constexpr f64 kDefaultHarrisSlack = 1e-7;
+constexpr f64 kDefaultLuPivotTol = la::kDefaultLuPivotTol;
+constexpr f64 kScaleAdjustedTolFloor = 1e-12;
+constexpr f64 kDefaultExpandDelta = 1e-6;
+constexpr f64 kDefaultExpandMax = 1e-3;
+constexpr int kForrestTomlinHardUpdateFloor = la::kForrestTomlinHardUpdateFloor;
+}  // namespace numerics
+
 enum class NonbasicStatus : std::uint8_t {
     Basic = 0,
     AtLower,
@@ -39,6 +57,10 @@ enum class DualizePolicy : std::uint8_t {
     Never = 1,
     Always = 2,  // whenever it is allowed at all (tests, experiments)
 };
+
+// Crash style A/B: Triangular (default) vs experimental two-pass
+// (second pass re-scores after the first triangular installation).
+enum class CrashStyle : std::uint8_t { Triangular = 0, TwoPass = 1 };
 
 enum class SimplexMethod : std::uint8_t {
     Auto   = 0,   // dual first, primal fallback
@@ -71,9 +93,18 @@ struct SimplexOptions {
     bool presolve_equation_sparsification = true;
     bool presolve_domain_probing = false;
     // Live presolve rules (doubleton equalities with bound transfer,
-    // cost-forced inequalities, dual fixing) and parallel rows, each with
-    // its primal, dual and basis recovery.
+    // cost-forced inequalities, dual fixing), each with primal/dual/basis
+    // recovery. Parallel rows are a separate opt-in (see below).
     bool presolve_live_reductions = true;
+    // Parallel/duplicate row merges. On after C6 ray-lift coverage; the FO/LP
+    // route already enables the same rule (lp.cpp probe_fo_presolve).
+    bool presolve_parallel_rows = true;
+    // Tier-3 strength (measured 2026-10-10 on 80bau3b/d2q06c/greenbea):
+    // parallel + dominated columns are Netlib-safe; implied bounds alone
+    // doubled 80bau3b and Interrupted greenbea at 35s — keep that opt-in.
+    bool presolve_implied_bounds = false;
+    bool presolve_dominated_columns = true;
+    bool presolve_parallel_columns = true;
     std::uint64_t max_iterations = 0;
     double time_limit_s = 900.0;
 
@@ -85,11 +116,11 @@ struct SimplexOptions {
     // lose.
     const core::CancelToken* cancel = nullptr;
 
-    f64 primal_feas_tol = 1e-7;
-    f64 dual_feas_tol   = 1e-7;
-    f64 gap_tol         = 1e-9;
-    f64 pivot_tol       = 1e-7;
-    f64 harris_slack    = 1e-7;
+    f64 primal_feas_tol = numerics::kDefaultPrimalFeasTol;
+    f64 dual_feas_tol   = numerics::kDefaultDualFeasTol;
+    f64 gap_tol         = numerics::kDefaultGapTol;
+    f64 pivot_tol       = numerics::kDefaultPivotTol;
+    f64 harris_slack    = numerics::kDefaultHarrisSlack;
 
     std::uint64_t max_basis_repairs = 200;
 
@@ -110,10 +141,27 @@ struct SimplexOptions {
     // -13%, total time -30%; dfl001 newly proved, pilot87 lost to an
     // exact-certificate size limit on its different final basis.
     bool allow_cost_shifts = true;
+    // Task 4 cancel-path regression hook (default off). After the first
+    // non-initial phase-2 refactor, inject a wrong-sign working-cost bump on
+    // one one-sided nonbasic so request_primal_cleanup must restore and — when
+    // the model is dual feasible — drop the request and continue. Never enable
+    // in production solves.
+    bool dual_test_inject_working_dual_obstruction = false;
     // Repair and exact certification of a terminal Optimal bound. The
     // presolve route clears it for the reduced solve: only the lifted
     // original-model proof counts, and it is certified after postsolve.
     bool certify_terminal = true;
+    // The terminal multipliers' Lagrangian bound is the one this solve
+    // publishes. When their reduced-cost enclosure does not close the gap,
+    // a terminal Optimal is then given the basis's inward duals if those
+    // prove a better bound (strengthen_basis_duals: binary64, one
+    // factorization and a few solves, never exact arithmetic), and failing
+    // that the full corrected Lagrangian (which may propagate row-implied
+    // bounds) is evaluated. Off, the enclosure's bound is reported as it is.
+    // The presolve route clears it for the reduced solve: postsolve rebuilds
+    // the multipliers and rematerialize_original does this work once, on the
+    // original model.
+    bool terminal_bound_published = true;
     // Close the result with an exactly evaluated dual bound within gap_tol
     // (dyadic refinement, targeted/exact basis certificates, support
     // selection, exact-pricing continuation). Without it a solve stops at
@@ -148,7 +196,11 @@ struct SimplexOptions {
     // variant is intentionally NOT the default: measured Netlib gains from
     // perturbation are concentrated in phase 2 (e.g. nesm), so gating to
     // phase 1 would be a no-op on the models that benefit.
+    // Legacy absolute multiplier (0 = use Koberstein path when dual_perturbation).
     f64 dual_cost_perturbation_multiplier = 0.0;
+    // Applied only on dual cycling recovery when the first pass stalled with
+    // dual_cost_perturbation_multiplier == 0.
+    f64 dual_cycling_recovery_perturbation_multiplier = 1.0;
 
     // Dual cost perturbation exactly as in Koberstein (2005 thesis §6.3.1):
     // perturb all structural non-fixed, non-free costs before the first
@@ -195,7 +247,10 @@ struct SimplexOptions {
     // 2026-09-25, 120 s MIPLIB root LPs: with it mzzv42z needed 43,746
     // iterations (39.7 s), with the stalling branch alone 8,455 (2.4 s);
     // supportcase7 finished only without it. The stalling branch is kept
-    // exactly as the thesis specifies.
+    // exactly as the thesis specifies. Re-measured 2026-10-11 on Netlib-93
+    // at 1e-7: on, the pivot geomean is 347 vs 337 off, and every model it
+    // moves by more than 15% is worse (pilot.ja 3,719 vs 1,738, perold
+    // 2,333 vs 1,589, cycle 308 vs 143).
     bool dual_perturbation_at_start = false;
 
     // Refactor after this many basis updates. Product-form etas are as dense
@@ -211,6 +266,20 @@ struct SimplexOptions {
     // at 171k pivots with a 6.3e+47 cost shift. FT has its own cadence in
     // refactor_u_nnz_ratio / ft_update_limit below.
     int refactor_interval = 5000;
+    // At a would-be optimum on a factor carrying updates, the duals and basic
+    // values are always re-derived from the factor before the dual simplex
+    // concludes. Whether the factor is rebuilt first is an economy question:
+    // with this on it is rebuilt only once the work its update file has added
+    // to solves since the last factorization (carried factors included)
+    // exceeds a factorization's cost, when a refinement since then needed a
+    // correction, or when the ordinary triggers ask; otherwise the updated
+    // factor is used for the re-derivation and handed on. Off (default):
+    // rebuild at every such exit. Measured 2026-10-08, 30 s serial wall:
+    // nu25-pr12 4024 vs 3772 nodes and mas76 226.6k vs 220.1k for the rebuild.
+    // The saved factorization is outweighed by what a carried update file
+    // costs the next node's solves and refinement (nu25-pr12: refinement
+    // 7.6% -> 16.5% of samples before the accuracy condition was added).
+    bool exit_refactor_by_economy = false;
     // Also refactor when update nnz exceeds this fraction of factor nnz (0
     // disables). The classical product-form break-even is ~1.0: solve cost
     // doubles once the eta file matches the factors. Measured cliff on
@@ -269,6 +338,12 @@ struct SimplexOptions {
     // 100, 0.76x at 200) and is also the one whose DSE log error the old
     // comment flagged, so re-check that pair together if this is retuned.
     int ft_update_limit = 200;
+    // When >0: refactor if hypersparse hit rate since the last factor drops
+    // below this floor after enough solves (0 disables). Default 0.15 —
+    // densified FT update files trigger a refactor before dense solves dominate.
+    // Armed only when factor_nnz >= 4096 and >= 256 triangular solves have
+    // been observed (see BasisFactor::needs_refactor).
+    f64 refactor_hypersparse_hit_floor = 0.15;
     // Collective FT (Huangfu & Hall 2015, phase 2): when the product-form
     // eta file hits
     // refactor_eta_ratio, try BasisFactor::collapse_pending_into_ft() (fold
@@ -297,9 +372,9 @@ struct SimplexOptions {
     bool primal_bound_perturbation = true;
     // Trace phase-2 progress and recovery even inside normally silent MILP LPs.
     bool trace_degeneracy = false;
-    f64   expand_delta      = 1e-6;
+    f64   expand_delta      = numerics::kDefaultExpandDelta;
     f64   expand_factor     = 10.0;
-    f64   expand_max        = 1e-3;
+    f64   expand_max        = numerics::kDefaultExpandMax;
 
     // Rebuild dual multipliers and reduced costs periodically to bound drift
     // on long degenerate dual runs. Zero disables the refresh.
@@ -320,6 +395,8 @@ struct SimplexOptions {
     // columns to zero working cost, preserving its initial dual feasibility.
     bool primal_crash = false;
     bool dual_crash = true;
+    // Crash style A/B: Triangular (default) vs experimental two-pass.
+    CrashStyle crash_style = CrashStyle::Triangular;
 
 
     // Diagnostic-only early abort when the dual merit function goes flat.
@@ -333,11 +410,17 @@ struct SimplexOptions {
     // Enable the presolve implied-slack reduction (zero-cost singleton column
     // -> bound transfer). Off by default on measurement; see presolve.hpp.
     bool presolve_implied_slack = false;
+    bool enable_sifting = false;
+    bool enable_network_simplex = false;
     // Round every Ruiz factor to the nearest power of two, which makes the
     // scaling exact in floating point (see ruiz_scale). Off by default until
     // it clears the 93-model gate.
     bool ruiz_power_of_two = false;
     bool verbose = false;
+    // Phase-share timers (FTRAN/BTRAN/price/ratio ms). Default ON so
+    // benchmarks and nightly jobs see real diag.*_ms. Disable on hosts whose
+    // clocksource demoted to hpet (~40 us/pivot tax); see dual_simplex tick().
+    bool time_detail = true;
 };
 
 // Pre-solve structural summary of the model the engine is about to solve.
@@ -398,6 +481,16 @@ struct SimplexDiagnostics {
     std::uint64_t refactorizations  = 0;
     std::uint64_t residual_refactors = 0;
     std::uint64_t numerical_zero_dual_steps = 0;
+    // Max |c_eff,q - a_q^T π| observed when a numerical-zero dual step forced
+    // the cached basic reduced cost to 0 while costs/π were left unchanged.
+    // Within dual feasibility tolerance this is an intentional approximation,
+    // not a published-proof identity.
+    f64 numerical_zero_stationarity_max = 0.0;
+    // Bare working-cost price refreshes (periodic / post-pivot fallback /
+    // phase-1 no-leave) and how often the post-refresh sign/parking contract
+    // actually repaired something beyond tolerance.
+    std::uint64_t working_price_refreshes = 0;
+    std::uint64_t working_price_refresh_repairs = 0;
     std::uint64_t refinement_corrections = 0;
     std::uint64_t collective_ft_collapses = 0;  // full refactors avoided via collapse_pending_into_ft()
     std::uint64_t collective_ft_skips = 0;      // rejected by bounded-work production guard
@@ -493,6 +586,14 @@ struct SimplexDiagnostics {
     std::uint64_t perturbation_cleanups = 0;
     // Times dual phase 2 perturbed nonbasic costs after a degenerate window.
     std::uint64_t stall_perturbations = 0;
+    // Persistent-degeneracy trigger (dual phase 2): times it fired, the
+    // phase-2 pivot at which it did, and the evidence -- the most degenerate
+    // window after the first and that window's revisit fraction (pivots
+    // whose leaving variable had already left within the window).
+    std::uint64_t degeneracy_perturbations = 0;
+    std::uint64_t degeneracy_perturbation_pivot = 0;
+    f64 degeneracy_window_fraction = 0.0;
+    f64 degeneracy_window_revisits = 0.0;
     // Dual working-cost management (Koberstein 2005 §6.2.2.3). cost_shifts
     // counts every shift applied to a nonbasic working cost: the entering
     // column's wrong-sign reduced cost zeroed before a pivot, and the phase-2
@@ -524,6 +625,20 @@ struct SimplexDiagnostics {
     // hand-off came from a no-entering-column exit, where the basis is
     // primal infeasible by construction.
     f64 cleanup_primal_infeasibility = 0.0;
+    // Task 4 handoff identity: why cleanup was requested, dual phase at the
+    // request, working-cost residual before model restore, and whether model
+    // costs were in place before the handoff decision. Cause codes:
+    // 0 none; 1 terminal true-cost; 2 after-factor shift disabled/refused;
+    // 3 after price-refresh refused; 4 harmful wrong-sign refused (fresh);
+    // 5 mid-solve audit residual; 6 phase-1 no dual-feasible basis.
+    std::uint32_t cleanup_request_cause = 0;
+    int cleanup_request_phase = 0;
+    f64 cleanup_working_dual_infeasibility = 0.0;
+    bool cleanup_restored_model_costs = false;
+    // Task 4: restore→reevaluate calls, and how often restore cleared the
+    // obstruction so the cleanup request was dropped (dual continues).
+    std::uint64_t cleanup_reevaluations = 0;
+    std::uint64_t cleanup_requests_dropped = 0;
     // Dual ratio-test (CHUZC) behaviour: Harris groups visited in total,
     // stability back-offs to an earlier group, sweeps that passed every
     // breakpoint with positive slope, and relatively tiny entries excluded.
@@ -546,6 +661,10 @@ struct SimplexDiagnostics {
     // large. Both are numerical-trouble signals rather than policy.
     std::uint64_t numerical_trouble_refactors = 0;
     std::uint64_t refused_cost_shifts = 0;
+    // Harmful wrong-sign enters where shift_cost refused on an already-fresh
+    // factor: the pivot was aborted (cleanup handoff or NumericalFailure)
+    // rather than taking a silent backward dual step.
+    std::uint64_t harmful_shift_fresh_factor_blocks = 0;
     std::uint64_t warm_starts      = 0;
     // Work counters are cumulative across Auto's primary/fallback stages. The
     // timing fields below are cumulative too; these counters make a profile
@@ -579,6 +698,10 @@ struct SimplexDiagnostics {
     // The reduced basis lifted to a malformed basis of the original and was
     // dropped (the result then carries no basis).
     std::uint64_t lifted_basis_rejections = 0;
+    // Terminal multipliers replaced by certify::inward_basis_duals because
+    // the basis's own rounded duals left the Lagrangian bound infinite or the
+    // gap open, and the replacement proved a better bound.
+    std::uint64_t inward_dual_corrections = 0;
 
     // The dual engine's merit function (total primal infeasibility) at the start
     // of the run and the best value it reached. Diagnostic only: it shows at a
@@ -593,6 +716,10 @@ struct SimplexDiagnostics {
     int  final_phase = 1;
 
     f64 primal_residual  = 0.0;
+    // LpProblem::max_row_distance of the reported point (the row violations
+    // in units of x); +inf until measured. simplex_evidence passes it on, and
+    // ProvedOptimalFP needs it within primal_feas_tol.
+    f64 primal_distance  = core::kPosInf;
     f64 dual_residual    = 0.0;
     f64 primal_objective = 0.0;
     f64 dual_objective   = 0.0;
@@ -628,6 +755,17 @@ struct SimplexDiagnostics {
     // Kept separate deliberately -- the reuse/copy tradeoff must be visible,
     // not assumed. Zero when no FactorCarrier was supplied or adopted.
     double factor_reuse_ms = 0.0;
+    // Dual row-store partition carried from the previous solve of a session
+    // (DualPartitionState), and the columns moved to bring it up to date.
+    std::uint64_t partition_carried = 0;
+    // Would-be optima concluded on a re-derivation from the updated factor
+    // (exit_refactor_by_economy) instead of a rebuild.
+    std::uint64_t exit_rederives = 0;
+    std::uint64_t partition_moved_columns = 0;
+    // Session warm starts where xB was continued from the previous solve by
+    // a sparse bound-delta FTRAN rather than a full nonbasic RHS rebuild.
+    std::uint64_t bound_delta_xB = 0;
+    std::uint64_t bound_delta_prices = 0;
     // 1 if this solve adopted a carried factorization (skipped the initial
     // do_factorize()), 0 otherwise. Distinguishes "carrier supplied but
     // rejected" (basis/dims/token mismatch -> fell back to a full factorize,
@@ -786,10 +924,11 @@ void install_simplex_work_totals(SimplexDiagnostics& chosen,
                                  const SimplexDiagnostics& total);
 
 // One prepared LP (scaling, column-wise matrix, tolerances) re-solved for a
-// sequence of OBJECTIVES over the same rows and bounds -- what a feasibility
-// pump does every round. A cost change leaves the basis primal feasible, so
-// each solve is a warm PRIMAL simplex from the previous basis; nothing is
-// rebuilt or re-scaled between rounds.
+// sequence of objectives and bound/row-side edits over a fixed matrix.
+// Retains preparation, work arrays, the equality point, pricing history and
+// the numerical basis factorization. Cost-only edits
+// preserve primal feasibility; side/bound edits enter primal phase I whenever
+// the continued equality solution is outside the new box.
 class PrimalCostSession {
 public:
     PrimalCostSession(const model::LpProblem& problem, const SimplexOptions& opts);
@@ -800,6 +939,14 @@ public:
     // Replace the objective (in the sense of the problem given to the
     // constructor, size n_cols). O(n).
     void set_costs(const std::vector<core::f64>& c);
+
+    // Replace all column bounds (O(n), the transform prepare applies).
+    void set_column_bounds(const std::vector<core::f64>& lo,
+                           const std::vector<core::f64>& hi);
+
+    // Replace row sides without rebuilding the matrix or its factorization.
+    void set_row_bounds(const std::vector<core::f64>& lo,
+                        const std::vector<core::f64>& hi);
 
     // Solve from `warm` (empty / null: cold). The basis reached is returned in
     // `out_basis` for the next round.

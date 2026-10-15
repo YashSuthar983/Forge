@@ -485,6 +485,9 @@ bool polish(const QpProblem& p, const backend::LaneBounds& b, const QpOptions& o
     std::vector<char> tried(sz(n), 0);
     int stuck_rounds = 0;
     for (int round = 0; round < kRounds; ++round) {
+        // Each round is a fresh LDL' plus Krylov refinement; a concurrent
+        // race that already has its answer must not wait for ten of them.
+        if (core::cancel_requested(opts.cancel)) return false;
         const int got = attempt(round);
         if (got < 0) return false;
         if (got == 1) {

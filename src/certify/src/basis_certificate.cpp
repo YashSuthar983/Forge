@@ -1,5 +1,6 @@
 #include "sor/certify/finalize.hpp"
 #include "sor/core/env_switches.hpp"
+#include "sor/core/work_clock.hpp"
 #include "padic_solve.hpp"
 #include "sor/la/lu.hpp"
 #include "sor/sparse/csc.hpp"
@@ -11,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <set>
 #include <stdexcept>
 #include <cstdio>
@@ -101,9 +103,9 @@ bool solve_basis_transpose(const model::LpProblem& p,
     const auto m = static_cast<std::size_t>(p.n_rows());
     const auto n = p.n_cols();
     if (basis.size() != m) return false;
-    const auto started = std::chrono::steady_clock::now();
+    const auto started = sor::core::SolverClock::now();
     const auto expired = [&] { return policy.time_limit_s > 0 &&
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() >= policy.time_limit_s; };
+        std::chrono::duration<double>(sor::core::SolverClock::now() - started).count() >= policy.time_limit_s; };
     std::vector<Row> source_rows(m);
     std::vector<Rational> source_rhs(m), source_direction(m);
     std::vector<std::set<std::size_t>> incidence(m);
@@ -163,7 +165,7 @@ bool solve_basis_transpose(const model::LpProblem& p,
         // fallback with its own operation budget (see padic_solve.hpp).
         std::vector<std::vector<Rational>> solved;
         detail::PadicStats stats;
-        const auto t0 = std::chrono::steady_clock::now();
+        const auto t0 = sor::core::SolverClock::now();
         // Dense nucleus: each row takes >= 64 structural updates on average
         // (see padic_solve.hpp for the measured crossover).
         const bool lifted = detail::padic_solve(rows, {rhs, rhs_direction}, solved,
@@ -176,7 +178,7 @@ bool solve_basis_transpose(const model::LpProblem& p,
                 m, lifted ? "solved" : stats.declined ? "declined" : "fell back", static_cast<unsigned long long>(stats.operations),
                 static_cast<unsigned long long>(stats.lifting_steps),
                 static_cast<unsigned long long>(stats.reconstruction_attempts), stats.denominator_bits,
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                std::chrono::duration<double>(sor::core::SolverClock::now() - t0).count());
         if (lifted) {
             y = std::move(solved[0]);
             direction = std::move(solved[1]);
@@ -225,6 +227,7 @@ bool solve_basis_transpose(const model::LpProblem& p,
                 value *= scale;
             }
             for (const auto& [j, v] : rows[chosen]) {
+                core::work_add(32, ::sor::core::WorkTag::ExactSolve);
                 if (++operations > policy.max_operations || ((operations % 16) == 0 && expired())) {
                     if (core::env_switches().certificate_debug) std::fprintf(stderr, "exact certificate: operation limit m=%zu step=%zu\n", m, step);
                     return false;
@@ -459,20 +462,23 @@ bool repair_basis_farkas_certificate(const model::LpProblem& p, core::RawResult&
 }
 
 namespace {
-// Floating duals of a basis on this model (min sense, logicals -e_i): one LU,
-// BTRAN and a long-double residual refinement step.
-bool floating_basis_duals(const model::LpProblem& p, const std::vector<core::Index>& basis,
-                          std::vector<f64>& y) {
-    y.clear();
+// The basis matrix of `basis` on this model (min sense, logicals -e_i, so a
+// logical's reduced cost is its row multiplier) with its LU factors.
+struct FloatingBasis {
+    std::vector<core::Offset> bp{0};
+    std::vector<core::Index> br;
+    std::vector<f64> bv, cb;
+    la::BasisFactor factor;
+};
+
+bool factor_floating_basis(const model::LpProblem& p, const sparse::CscMatrix& csc,
+                           const std::vector<core::Index>& basis, FloatingBasis& b) {
     const auto m = static_cast<std::size_t>(p.n_rows());
     const auto n = p.n_cols();
     if (basis.size() != m || m == 0) return false;
-    const auto csc = sparse::to_csc(p.A);
     const auto& cp = csc.pattern.col_ptr();
     const auto& ri = csc.pattern.row_idx();
-    std::vector<core::Offset> bp{0};
-    std::vector<core::Index> br;
-    std::vector<f64> bv, cb(m, 0.0);
+    b.cb.assign(m, 0.0);
     std::vector<char> seen(static_cast<std::size_t>(n) + m, 0);
     const double sense = p.maximize ? -1.0 : 1.0;
     for (std::size_t k = 0; k < m; ++k) {
@@ -480,30 +486,35 @@ bool floating_basis_duals(const model::LpProblem& p, const std::vector<core::Ind
         if (j < 0 || j >= n + static_cast<core::Index>(m) || seen[static_cast<std::size_t>(j)]) return false;
         seen[static_cast<std::size_t>(j)] = 1;
         if (j < n) {
-            cb[k] = sense * p.c[static_cast<std::size_t>(j)];
+            b.cb[k] = sense * p.c[static_cast<std::size_t>(j)];
             for (auto z = cp[static_cast<std::size_t>(j)]; z < cp[static_cast<std::size_t>(j) + 1]; ++z) {
-                br.push_back(ri[static_cast<std::size_t>(z)]);
-                bv.push_back(csc.vals[static_cast<std::size_t>(z)]);
+                b.br.push_back(ri[static_cast<std::size_t>(z)]);
+                b.bv.push_back(csc.vals[static_cast<std::size_t>(z)]);
             }
         } else {
-            br.push_back(j - n);
-            bv.push_back(-1.0);
+            b.br.push_back(j - n);
+            b.bv.push_back(-1.0);
         }
-        bp.push_back(static_cast<core::Offset>(br.size()));
+        b.bp.push_back(static_cast<core::Offset>(b.br.size()));
     }
-    la::BasisFactor factor;
-    if (!factor.factorize(static_cast<core::Index>(m), bp, br, bv, la::LuOptions{})) return false;
-    y = cb;
-    factor.btran(y);
+    return b.factor.factorize(static_cast<core::Index>(m), b.bp, b.br, b.bv, la::LuOptions{});
+}
+
+// y with B'y = rhs: one BTRAN and one refinement step against the residual
+// accumulated in long double.
+bool refined_basis_btran(FloatingBasis& b, const std::vector<f64>& rhs, std::vector<f64>& y) {
+    const auto m = rhs.size();
+    y = rhs;
+    b.factor.btran(y);
     std::vector<f64> r(m);
     for (std::size_t k = 0; k < m; ++k) {
-        long double s = cb[k];
-        for (auto z = bp[k]; z < bp[k + 1]; ++z)
-            s -= static_cast<long double>(bv[static_cast<std::size_t>(z)]) *
-                 y[static_cast<std::size_t>(br[static_cast<std::size_t>(z)])];
+        long double s = rhs[k];
+        for (auto z = b.bp[k]; z < b.bp[k + 1]; ++z)
+            s -= static_cast<long double>(b.bv[static_cast<std::size_t>(z)]) *
+                 y[static_cast<std::size_t>(b.br[static_cast<std::size_t>(z)])];
         r[k] = static_cast<f64>(s);
     }
-    factor.btran(r);
+    b.factor.btran(r);
     for (std::size_t i = 0; i < m; ++i) {
         y[i] += r[i];
         if (!std::isfinite(y[i])) { y.clear(); return false; }
@@ -511,6 +522,259 @@ bool floating_basis_duals(const model::LpProblem& p, const std::vector<core::Ind
     return true;
 }
 
+// Floating duals of a basis on this model.
+bool floating_basis_duals(const model::LpProblem& p, const std::vector<core::Index>& basis,
+                          std::vector<f64>& y) {
+    y.clear();
+    FloatingBasis b;
+    if (!factor_floating_basis(p, sparse::to_csc(p.A), basis, b)) return false;
+    return refined_basis_btran(b, b.cb, y);
+}
+}  // namespace
+
+bool inward_basis_duals(const model::LpProblem& p, const std::vector<core::Index>& basis,
+                        std::vector<f64>& y) {
+    core::WorkScope work_scope_(core::WorkCat::Exact);
+    y.clear();
+    const auto m = static_cast<std::size_t>(p.n_rows());
+    const auto n = static_cast<std::size_t>(p.n_cols());
+    if (basis.size() != m || m == 0) return false;
+    const auto csc = sparse::to_csc(p.A);
+    const auto& cp = csc.pattern.col_ptr();
+    const auto& ri = csc.pattern.row_idx();
+    const double sense = p.maximize ? -1.0 : 1.0;
+    // Which sides each term can be charged to, over variables v < n
+    // (structurals) and v = n + i (row i's logical, whose reduced cost is the
+    // multiplier y_i: y_i > 0 is charged to row_lo). Declared bounds first.
+    // Row-implied ones (the rest of safe_lagrangian_lower_bound's rule) only
+    // once a round cannot finish without them: their propagation costs more
+    // than everything else here (cycle: 4.3 ms per model, the solve 22 ms),
+    // and the multipliers usually need none.
+    enum Side : unsigned char { kBoth, kLower, kUpper, kNeither };
+    std::vector<unsigned char> side(n + m);
+    const auto classify = [&](std::size_t v, bool lo, bool hi) {
+        side[v] = lo && hi ? kBoth : lo ? kLower : hi ? kUpper : kNeither;
+    };
+    for (std::size_t j = 0; j < n; ++j)
+        classify(j, std::isfinite(p.col_lo[j]), std::isfinite(p.col_hi[j]));
+    for (std::size_t i = 0; i < m; ++i)
+        classify(n + i, std::isfinite(p.row_lo[i]), std::isfinite(p.row_hi[i]));
+    bool implied_applied = false;
+    const auto apply_implied = [&] {
+        implied_applied = true;
+        bool changed = false;
+        std::pair<std::vector<f64>, std::vector<f64>> implied;
+        for (std::size_t j = 0; j < n; ++j) {
+            if (side[j] == kBoth) continue;
+            if (implied.first.empty()) implied = implied_lp_column_bounds(p);
+            const auto before = side[j];
+            classify(j, std::isfinite(p.col_lo[j]) || std::isfinite(implied.first[j]),
+                     std::isfinite(p.col_hi[j]) || std::isfinite(implied.second[j]));
+            changed |= side[j] != before;
+        }
+        return changed;
+    };
+    // The equations y is solved from: basic reduced costs (logicals: the
+    // multiplier itself) at an inward target. A nonbasic term that the
+    // inward step cannot clear is exchanged into this set for a basic term
+    // whose sign is free (two-sided), by pivots chosen on its tableau column,
+    // and the system is solved again.
+    std::vector<core::Index> cert(basis);
+    constexpr int kRounds = 6;
+    constexpr std::size_t kMaxExchange = 512;
+    constexpr long double u = 0x1p-53L;
+    std::vector<long double> d0(n), size(n), e(n);
+    // Exchange: tableau columns B'^-1 a_v of the blocking terms, rows
+    // restricted to positions whose term has a free sign (a two-sided
+    // structural, or the logical of a two-sided row), then elimination with
+    // partial pivoting picks one position per blocking term so the exchanged
+    // system stays nonsingular; a term dependent on earlier ones gets no
+    // position and the next round re-checks it. A one-sided term never
+    // leaves: it would become a requirement of its own, and where only such
+    // positions remain the dual face pins the blocking term to an exact zero
+    // (a nonnegative combination of one-sided columns along the optimal
+    // face), which binary64 multipliers cannot meet. That is the exact
+    // witness's job (targeted_basis_certificate).
+    const auto exchange = [&](FloatingBasis& b, const std::vector<std::size_t>& blocking) {
+        std::vector<std::size_t> free_pos;
+        for (std::size_t k = 0; k < m; ++k)
+            if (side[static_cast<std::size_t>(cert[k])] == kBoth) free_pos.push_back(k);
+        const std::size_t kq = blocking.size(), kc = free_pos.size();
+        if (kc == 0 || kq * kc > 4'000'000) return false;
+        std::vector<double> dense(kq * kc, 0.0);
+        std::vector<f64> col(m);
+        for (std::size_t q = 0; q < kq; ++q) {
+            std::fill(col.begin(), col.end(), 0.0);
+            const auto v = blocking[q];
+            if (v < n) {
+                for (auto z = cp[v]; z < cp[v + 1]; ++z)
+                    col[static_cast<std::size_t>(ri[static_cast<std::size_t>(z)])] = csc.vals[static_cast<std::size_t>(z)];
+            } else {
+                col[v - n] = -1.0;
+            }
+            b.factor.ftran(col);
+            for (std::size_t t = 0; t < kc; ++t) dense[q * kc + t] = col[free_pos[t]];
+        }
+        std::vector<char> used(kc, 0);
+        bool exchanged = false;
+        for (std::size_t q = 0; q < kq; ++q) {
+            std::size_t best = kc;
+            double best_abs = 1e-9;
+            for (std::size_t t = 0; t < kc; ++t)
+                if (!used[t] && std::fabs(dense[q * kc + t]) > best_abs) {
+                    best_abs = std::fabs(dense[q * kc + t]);
+                    best = t;
+                }
+            if (best == kc) continue;
+            used[best] = 1;
+            for (std::size_t r = q + 1; r < kq; ++r) {
+                const double f = dense[r * kc + best] / dense[q * kc + best];
+                if (f == 0.0) continue;
+                for (std::size_t t = 0; t < kc; ++t) dense[r * kc + t] -= f * dense[q * kc + t];
+            }
+            cert[free_pos[best]] = static_cast<core::Index>(blocking[q]);
+            exchanged = true;
+        }
+        return exchanged;
+    };
+    // The given basis's own refined duals: the proposal when no inward step
+    // exists. Where the dual face pins a one-sided term to exactly zero, no
+    // margin can be kept, but the exact duals are often binary64 numbers
+    // (y = 1 rather than 1 + 2^-52), and then these are exactly them.
+    std::vector<f64> refined;
+    const auto propose_refined = [&] {
+        if (refined.empty()) return false;
+        y = refined;
+        return true;
+    };
+    std::unique_ptr<FloatingBasis> factored;
+    for (int round = 0; round < kRounds; ++round) {
+        if (!factored) {
+            factored = std::make_unique<FloatingBasis>();
+            if (!factor_floating_basis(p, csc, cert, *factored)) return propose_refined();
+        }
+        FloatingBasis& b = *factored;
+        std::vector<char> in_cert(n + m, 0);
+        for (const auto v : cert) in_cert[static_cast<std::size_t>(v)] = 1;
+        // y0: the system's duals, refined; a logical in it pins its row's
+        // multiplier to exactly zero (always chargeable).
+        std::vector<f64> y0;
+        if (!refined_basis_btran(b, b.cb, y0)) return propose_refined();
+        for (std::size_t i = 0; i < m; ++i) if (in_cert[n + i]) y0[i] = 0.0;
+        if (refined.empty()) refined = y0;
+        for (std::size_t j = 0; j < n; ++j) {
+            long double d = sense * p.c[j], s = std::fabs(static_cast<long double>(p.c[j]));
+            for (auto z = cp[j]; z < cp[j + 1]; ++z) {
+                const long double t = static_cast<long double>(y0[static_cast<std::size_t>(ri[static_cast<std::size_t>(z)])]) *
+                    csc.vals[static_cast<std::size_t>(z)];
+                d -= t;
+                s += std::fabs(t);
+            }
+            d0[j] = d;
+            size[j] = s;
+        }
+        // Inward targets: g_k = +-|terms| for a one-sided structural in the
+        // system, so y(a) = y0 - a w with B'w = g moves it by a g_k.
+        std::vector<f64> g(m, 0.0), w(m, 0.0);
+        bool any_target = false;
+        for (std::size_t k = 0; k < m; ++k) {
+            const auto v = static_cast<std::size_t>(cert[k]);
+            if (v >= n) continue;
+            if (side[v] != kLower && side[v] != kUpper) continue;
+            g[k] = static_cast<f64>(side[v] == kLower ? size[v] : -size[v]);
+            any_target = true;
+        }
+        if (any_target && !refined_basis_btran(b, g, w)) return propose_refined();
+        for (std::size_t i = 0; i < m; ++i) if (in_cert[n + i]) w[i] = 0.0;
+        // A'w with the size of its terms. A coefficient below 2^-40 of that
+        // size is the solve's own rounding (a column the targets do not
+        // move): it is taken as zero, so the term is exchanged into the
+        // system if it needs to move, rather than setting a step of r / q
+        // from noise (scsd1: q = 8.7e-19 asked for a step of 2.6e4).
+        long double w_max = 0.0L;
+        for (std::size_t i = 0; i < m; ++i) w_max = std::max(w_max, std::fabs(static_cast<long double>(w[i])));
+        for (std::size_t j = 0; j < n; ++j) {
+            long double t = 0.0L, ts = 0.0L;
+            for (auto z = cp[j]; z < cp[j + 1]; ++z) {
+                const long double term = static_cast<long double>(w[static_cast<std::size_t>(ri[static_cast<std::size_t>(z)])]) *
+                    csc.vals[static_cast<std::size_t>(z)];
+                t += term;
+                ts += std::fabs(term);
+            }
+            e[j] = std::fabs(t) <= 0x1p-40L * ts ? 0.0L : t;
+        }
+        const auto row_step = [&](std::size_t i) {
+            const long double wi = w[i];
+            return std::fabs(wi) <= 0x1p-40L * w_max ? 0.0L : wi;
+        };
+        // Every one-sided term must end strictly on its side after y(a) is
+        // rounded to binary64: d(a)_j - d~(a)_j <= (2u + k 2^-63) * size_j,
+        // so require a margin of (8u + k 2^-60) * size_j. A multiplier keeps
+        // its sign under rounding, so rows need no margin. Each requirement
+        // reads p + a q >= r.
+        struct Requirement { std::size_t v; long double p, q, r; };
+        std::vector<Requirement> reqs;
+        bool exact_zero_needed = false;
+        for (std::size_t j = 0; j < n; ++j) {
+            if (side[j] == kBoth) continue;
+            if (side[j] == kNeither) {
+                if (d0[j] != 0.0L || e[j] != 0.0L) exact_zero_needed = true;
+                continue;
+            }
+            const auto terms = static_cast<long double>(cp[j + 1] - cp[j] + 2);
+            const long double margin = (8.0L * u + terms * 0x1p-60L) * size[j];
+            if (side[j] == kLower) reqs.push_back({j, d0[j], e[j], margin});
+            else reqs.push_back({j, -d0[j], -e[j], margin});
+        }
+        for (std::size_t i = 0; i < m; ++i) {
+            if (in_cert[n + i] || side[n + i] == kBoth) continue;
+            if (side[n + i] == kNeither) {
+                if (y0[i] != 0.0 || row_step(i) != 0.0L) exact_zero_needed = true;
+                continue;
+            }
+            if (side[n + i] == kLower) reqs.push_back({n + i, y0[i], -row_step(i), 0.0L});
+            else reqs.push_back({n + i, -static_cast<long double>(y0[i]), row_step(i), 0.0L});
+        }
+        // The step: twice the smallest one clearing every requirement that
+        // the direction helps; the ones it hurts must tolerate that step.
+        long double a_lo = 0.0L;
+        for (const auto& q : reqs)
+            if (q.q > 0.0L) a_lo = std::max(a_lo, (q.r - q.p) / q.q);
+        const long double a = 2.0L * a_lo;
+        std::vector<std::size_t> blocking;
+        for (const auto& q : reqs) {
+            const bool basic = in_cert[q.v] != 0;
+            if (basic && q.q > 0.0L) continue;
+            if (q.p + a * q.q < q.r) blocking.push_back(q.v);
+        }
+        if (!exact_zero_needed && blocking.empty()) {
+            y.resize(m);
+            for (std::size_t i = 0; i < m; ++i) {
+                y[i] = in_cert[n + i] ? 0.0 : static_cast<f64>(static_cast<long double>(y0[i]) - a * w[i]);
+                if (!std::isfinite(y[i])) { y.clear(); return propose_refined(); }
+            }
+            return true;
+        }
+        // Exchange first: one factorization. Row-implied bounds, which may
+        // make a blocking term two-sided, only when no exchange applies: on
+        // d6cube their propagation took 7.5 ms per model against well under
+        // a millisecond per exchange round. A free term (no chargeable side)
+        // that must move cannot be exchanged into anything that helps.
+        const bool basic_blocks = std::any_of(blocking.begin(), blocking.end(),
+                                              [&](std::size_t v) { return in_cert[v] != 0; });
+        if (!exact_zero_needed && !basic_blocks && round + 1 < kRounds &&
+            blocking.size() <= kMaxExchange && exchange(b, blocking)) {
+            factored.reset();
+            continue;
+        }
+        if (!implied_applied && apply_implied()) continue;
+        return propose_refined();
+    }
+    return propose_refined();
+}
+
+
+namespace {
 // A bound witness for the basis without solving it exactly. The Lagrangian
 // needs exactness only where a term faces a side with no finite (declared or
 // row-implied) bound: such a reduced cost must be exactly zero or of the
@@ -733,18 +997,18 @@ bool repair_basis_certificate(const model::LpProblem& problem, core::RawResult& 
     struct Trace {
         const model::LpProblem& problem;
         const core::RawResult& raw;
-        std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+        sor::core::SolverClock::time_point started = sor::core::SolverClock::now();
         ~Trace() {
             if (core::env_switches().certificate_debug)
                 std::fprintf(stderr, "exact certificate: m=%d n=%d witness=%zu elapsed=%.6f\n",
                     problem.n_rows(), problem.n_cols(), raw.exact_dual.size(),
-                    std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+                    std::chrono::duration<double>(sor::core::SolverClock::now() - started).count());
         }
     } trace{problem, raw};
     raw.exact_dual.clear();
-    const auto started = std::chrono::steady_clock::now();
+    const auto started = sor::core::SolverClock::now();
     const auto expired = [&] { return policy.time_limit_s > 0 &&
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() >= policy.time_limit_s; };
+        std::chrono::duration<double>(sor::core::SolverClock::now() - started).count() >= policy.time_limit_s; };
     std::vector<Rational> y, direction;
     // The inward direction only matters when y leaves a declared-unbounded
     // term with the wrong sign; an exact basis dual usually leaves none
@@ -973,9 +1237,9 @@ SafeLpBound lower_bound_from_terms(const model::LpProblem& p,
 bool repair_dual_certificate(const model::LpProblem& problem, core::RawResult& raw,
                              const ExactCertificatePolicy& policy) {
     validate_certificate_policy(policy);
-    const auto started = std::chrono::steady_clock::now();
+    const auto started = sor::core::SolverClock::now();
     const auto expired = [&] { return policy.time_limit_s > 0 &&
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() >= policy.time_limit_s; };
+        std::chrono::duration<double>(sor::core::SolverClock::now() - started).count() >= policy.time_limit_s; };
     std::vector<std::string> tokens;
     const char* reason = "";
     const bool targeted = targeted_basis_certificate(problem, raw.certificate_basis, policy,
@@ -983,7 +1247,7 @@ bool repair_dual_certificate(const model::LpProblem& problem, core::RawResult& r
     if (core::env_switches().certificate_debug)
         std::fprintf(stderr, "exact certificate: targeted %s (%s) m=%d elapsed=%.6f\n",
             targeted ? "accepted" : "declined", targeted ? "" : reason, problem.n_rows(),
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+            std::chrono::duration<double>(sor::core::SolverClock::now() - started).count());
     if (targeted && raw.x.size() == static_cast<std::size_t>(problem.n_cols())) {
         // A finite bound is not enough: a round-off reduced cost charged to a
         // huge declared bound (1e308) is finite and useless. The witness must
@@ -1011,7 +1275,7 @@ bool repair_dual_certificate(const model::LpProblem& problem, core::RawResult& r
     auto remaining = policy;
     if (policy.time_limit_s > 0)
         remaining.time_limit_s = std::max(std::numeric_limits<double>::min(), policy.time_limit_s -
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+            std::chrono::duration<double>(sor::core::SolverClock::now() - started).count());
     return repair_basis_certificate(problem, raw, remaining);
 }
 
@@ -1040,6 +1304,7 @@ SafeLpBound exact_dual_lower_bound(const model::LpProblem& p,
 
 ExactDualAssessment assess_exact_dual(const model::LpProblem& p,
     const std::vector<std::string>& witness, const std::vector<int>& allowed_directions) {
+    core::WorkScope work_scope_(core::WorkCat::Exact);
     ExactDualAssessment out;
     if (witness.size() != static_cast<std::size_t>(p.n_rows())) return out;
     try {

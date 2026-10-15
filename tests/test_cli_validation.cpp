@@ -975,30 +975,45 @@ void test_lp_engine_on_milp_claims_the_relaxation() {
 // inherited the SimplexOptions default (on) while the simplex route turned
 // it off, so --engine auto ran the exact machinery unasked (Netlib with
 // --engine auto: 51.7 -> 26.4 s once fixed) and reported ProvedOptimalFP
-// where --engine simplex reported ProvedKKT. blend separates the two.
+// where --engine simplex reported ProvedKKT. Auto's concurrent arms later
+// skipped solve_simplex and ran the terminal exact repair again (etamacro:
+// NumericalFailure, then ProvedOptimalFP against simplex's ProvedKKT).
+// brandy separates the two: its optimal dual face pins degenerate one-sided
+// terms to exactly zero, which binary64 multipliers cannot meet, so only the
+// exact witness closes its bound. blend and etamacro no longer separate:
+// since 129c9e67 a basis whose checked bound closes the gap is
+// ProvedOptimalFP without the exact proof, and since the inward basis duals
+// (patch 13) both bounds close in binary64. All three must still agree.
 void test_lp_routes_agree_on_the_exact_proof() {
     const std::string blend = SOR_SOURCE_DIR "/benchmarks/netlib/mps/blend.mps";
-    if (!std::ifstream(blend)) {
-        ::sor::test::skip("test_lp_routes_agree_on_the_exact_proof", blend);
-        return;
+    const std::string etamacro = SOR_SOURCE_DIR "/benchmarks/netlib/mps/etamacro.mps";
+    const std::string brandy = SOR_SOURCE_DIR "/benchmarks/netlib/mps/brandy.mps";
+    for (const std::string& mps : {blend, etamacro, brandy}) {
+        if (!std::ifstream(mps)) {
+            ::sor::test::skip("test_lp_routes_agree_on_the_exact_proof", mps);
+            return;
+        }
     }
-    const auto level = [&](const char* engine, bool exact) {
-        std::vector<std::string> args{solve_exe, blend, "--engine", engine};
+    const auto level = [&](const std::string& mps, const char* engine,
+                           bool exact) {
+        std::vector<std::string> args{solve_exe, mps, "--engine", engine};
         if (exact) args.push_back("--exact-proof");
         const Run r = run(args);
         const auto at = r.output.find("proof_level:");
         return at == std::string::npos ? std::string()
             : r.output.substr(at, r.output.find('\n', at) - at);
     };
-    for (const bool exact : {false, true}) {
-        const std::string simplex = level("simplex", exact);
-        const std::string automatic = level("auto", exact);
-        ::sor::test::report(!simplex.empty() && simplex == automatic,
-                            "auto and simplex routes claim the same proof level",
-                            __FILE__, __LINE__, simplex + " | " + automatic);
-    }
-    CHECK(contains(level("auto", false), "ProvedKKT"));
-    CHECK(contains(level("auto", true), "ProvedOptimalFP"));
+    for (const std::string& mps : {blend, etamacro, brandy})
+        for (const bool exact : {false, true}) {
+            const std::string simplex = level(mps, "simplex", exact);
+            const std::string automatic = level(mps, "auto", exact);
+            ::sor::test::report(!simplex.empty() && simplex == automatic,
+                                "auto and simplex routes claim the same proof level",
+                                __FILE__, __LINE__,
+                                mps + ": " + simplex + " | " + automatic);
+        }
+    CHECK(contains(level(brandy, "auto", false), "ProvedKKT"));
+    CHECK(contains(level(brandy, "auto", true), "ProvedOptimalFP"));
 }
 
 // A crossed bound is a readable, infeasible model. The readers used to throw,

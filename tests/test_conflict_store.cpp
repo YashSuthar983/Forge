@@ -100,6 +100,12 @@ void test_invalid_or_incomplete_reasons_rejected() {
     PropTrail frac;
     frac.push(0, BoundDir::Upper, 2.5, 10.0, ReasonKind::Branch, -1, 1);
     CHECK(negated_branch_decisions(frac, is_int, kRootLo, kRootHi).empty());
+    for (ReasonKind kind : {ReasonKind::Symmetry, ReasonKind::Cut, ReasonKind::Split}) {
+        PropTrail restricted;
+        restricted.push(0, BoundDir::Upper, 2, 10, ReasonKind::Branch, -1, 1);
+        restricted.push(2, BoundDir::Upper, 0, 10, kind, -1, 1);
+        CHECK(negated_branch_decisions(restricted, is_int, kRootLo, kRootHi).empty());
+    }
     // A vacuous clause (a literal the root box always satisfies) and an
     // over-long one are refused; a fractional literal is refused.
     ConflictStore st(4, 1 << 20, 2);
@@ -135,7 +141,7 @@ void test_eviction_under_budget() {
     CHECK(!clause_retained(result) && tiny.empty());
 }
 
-void test_deferred_scan_reports_pending() {
+void test_cancelled_scan_retains_pending_watches() {
     ConflictStore st(4, 1 << 20, 16);
     CHECK(st.add({{0, true, 0.0}, {1, false, 1.0}}, kRootLo, kRootHi));
     for (int i = 0; i < 2000; ++i) {
@@ -145,9 +151,10 @@ void test_deferred_scan_reports_pending() {
     auto lo = kRootLo, hi = kRootHi;
     lo[0] = 1.0;
     bool converged = true;
-    CHECK(st.propagate(lo, hi, kRootLo, kRootHi, &converged));
+    sor::core::CancelToken cancel; cancel.request_stop();
+    CHECK(st.propagate(lo, hi, kRootLo, kRootHi, &converged, nullptr, 0, nullptr, nullptr, &cancel));
     CHECK(!converged && lo[1] == 0.0);
-    // The scheduled complete scan must still enforce the clause.
+    // A fresh scheduling slice must still enforce the unvisited watch.
     for (int i = 0; i < 16 && !converged; ++i)
         CHECK(st.propagate(lo, hi, kRootLo, kRootHi, &converged));
     CHECK(converged && lo[1] == 1.0);
@@ -195,8 +202,113 @@ void test_analysis_keeps_only_relevant_decisions() {
                                   res.conflict_var).empty());
 }
 
+// First-UIP: the cut nearest the conflict on its level (audit rank 10).
+// Rows c >= a + b - 1, d >= c, e >= d, d + e <= 1 over binaries a..e;
+// decisions a = 1 (level 1), b = 1 (level 2). The decision clause is
+// a <= 0 or b <= 0; every path from the conflict to the level-2 decision
+// passes d >= 1, so the first-UIP clause is the unit d <= 0 -- valid on its
+// own, since d = 1 alone forces e = 1 and violates d + e <= 1.
+void test_first_uip_clause() {
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(4, 5, {0, 0, 0, 1, 1, 2, 2, 3, 3},
+                                      {0, 1, 2, 2, 3, 3, 4, 3, 4},
+                                      {-1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, 1.0, 1.0});
+    lp.row_lo = {-1.0, 0.0, 0.0, -1e30};
+    lp.row_hi = {1e30, 1e30, 1e30, 1.0};
+    lp.col_lo.assign(5, 0.0);
+    lp.col_hi.assign(5, 1.0);
+    lp.is_integer.assign(5, true);
+    lp.c.assign(5, 0.0);
+    const std::vector<double> rlo(5, 0.0), rhi(5, 1.0);
+    const std::vector<char> is_int(5, 1);
+    PropTrail t;
+    auto lo = rlo, hi = rhi;
+    t.push(0, BoundDir::Lower, 1.0, 0.0, ReasonKind::Branch, -1, 1);
+    lo[0] = 1.0;
+    t.push(1, BoundDir::Lower, 1.0, 0.0, ReasonKind::Branch, -1, 2);
+    lo[1] = 1.0;
+    const auto res = propagate_bounds_trail(lp, lo, hi, &t, 2);
+    CHECK(!res.feasible);
+    const auto dec = explain_conflict_clause(t, lp, lp.n_rows(), is_int, rlo, rhi, lo, hi,
+                                             res.conflict_var);
+    CHECK(dec.size() == 2);
+    const auto uip = explain_conflict_clause(t, lp, lp.n_rows(), is_int, rlo, rhi, lo, hi,
+                                             res.conflict_var, /*first_uip=*/true);
+    CHECK(uip.size() == 1);
+    if (uip.size() == 1) CHECK(uip[0].var == 3 && uip[0].upper && uip[0].bound == 0.0);
+}
+
+// The bound that empties a domain is the conflict, not a cut point. Row
+// x + y <= 0 over binaries, decision y = 1 (level 1): propagation records
+// x <= -1, which crosses x's root lower bound 0. First-UIP used to stop at
+// that entry (alone at its level) and learn "x >= 0" -- always true, so the
+// store refused it as redundant and the conflict was lost. The clause is
+// y <= 0.
+void test_first_uip_expands_the_crossing_bound() {
+    sor::model::LpProblem lp;
+    lp.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
+    lp.row_lo = {-1e30};
+    lp.row_hi = {0.0};
+    lp.col_lo.assign(2, 0.0);
+    lp.col_hi.assign(2, 1.0);
+    lp.is_integer.assign(2, true);
+    lp.c.assign(2, 0.0);
+    const std::vector<double> rlo(2, 0.0), rhi(2, 1.0);
+    const std::vector<char> is_int(2, 1);
+    PropTrail t;
+    auto lo = rlo, hi = rhi;
+    t.push(1, BoundDir::Lower, 1.0, 0.0, ReasonKind::Branch, -1, 1);
+    lo[1] = 1.0;
+    const auto res = propagate_bounds_trail(lp, lo, hi, &t, 1);
+    CHECK(!res.feasible);
+    CHECK(res.conflict_var == 0);
+    const auto uip = explain_conflict_clause(t, lp, lp.n_rows(), is_int, rlo, rhi, lo, hi,
+                                             res.conflict_var, /*first_uip=*/true);
+    CHECK(uip.size() == 1);
+    if (uip.size() == 1) CHECK(uip[0].var == 1 && uip[0].upper && uip[0].bound == 0.0);
+}
+
+// Graph and clause deductions carry reasons the explainer can resolve
+// (audit rank 3): decision a = 1; the stored clause (a <= 0 or c >= 1)
+// forces c = 1; the conflict-graph pair (c, d) forces d = 0; the row d >= 1
+// then empties d. The explanation runs through all three to a <= 0.
+void test_explanation_through_graph_and_clause_reasons() {
+    sor::model::LpProblem lp;   // columns a, b(unused), c, d
+    lp.A = sor::sparse::from_triplets(1, 4, {0}, {3}, {1.0});
+    lp.row_lo = {1.0};
+    lp.row_hi = {1e30};
+    lp.col_lo.assign(4, 0.0);
+    lp.col_hi.assign(4, 1.0);
+    lp.is_integer.assign(4, true);
+    lp.c.assign(4, 0.0);
+    const std::vector<double> rlo(4, 0.0), rhi(4, 1.0);
+    const std::vector<char> is_int(4, 1);
+    ConflictStore store(4, 1 << 20, 16);
+    ConflictLiteral l0{0, true, 0.0}, l1{2, false, 1.0};
+    CHECK(store.add_typed({l0, l1}, rlo, rhi) == ClauseResult::Inserted);
+    CHECK(store.clause_by_id(1) != nullptr);
+    PropTrail t;
+    auto lo = rlo, hi = rhi;
+    t.push(0, BoundDir::Lower, 1.0, 0.0, ReasonKind::Branch, -1, 1);
+    lo[0] = 1.0;
+    t.push(2, BoundDir::Lower, 1.0, 0.0, ReasonKind::Clause, 1, 1);
+    lo[2] = 1.0;
+    t.push(3, BoundDir::Upper, 0.0, 1.0, ReasonKind::Implication, 2 * 2 + 1, 1);
+    hi[3] = 0.0;
+    const auto res = propagate_bounds_trail(lp, lo, hi, &t, 1);
+    CHECK(!res.feasible);
+    const auto cl = explain_conflict_clause(t, lp, lp.n_rows(), is_int, rlo, rhi, lo, hi,
+                                            res.conflict_var, false, &store);
+    CHECK(cl.size() == 1);
+    if (cl.size() == 1) CHECK(cl[0].var == 0 && cl[0].upper && cl[0].bound == 0.0);
+    // Without the store the clause reason cannot be resolved: give up.
+    CHECK(explain_conflict_clause(t, lp, lp.n_rows(), is_int, rlo, rhi, lo, hi,
+                                  res.conflict_var, false, nullptr).empty());
+}
+
 BabOptions store_options(bool store) {
     BabOptions o;
+    o.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     o.para_bab.threads = 1;
     o.policy = MilpPolicy::Latest;
     o.conflict_cut.conflict_store = store;
@@ -334,7 +446,90 @@ void test_typed_outcomes() {
 
 }  // namespace
 
+// Watched-literal propagation reaches the same fixpoint (or conflict) as a
+// full rescan, in any box, after any sequence of boxes: watches moved at one
+// node must stay valid at the next, however unrelated (best-first jumps).
+void test_watched_propagation_matches_full_rescan() {
+    const int n = 14;
+    std::uint32_t st = 777u;
+    const auto rnd = [&](int m) { st = st * 1664525u + 1013904223u; return static_cast<int>((st >> 8) % static_cast<std::uint32_t>(m)); };
+    std::vector<double> root_lo(n, 0.0), root_hi(n, 1.0);
+    ConflictStore store(n, 1 << 20, 64);
+    std::vector<std::vector<ConflictLiteral>> clauses;
+    for (int c = 0; c < 60; ++c) {
+        std::vector<ConflictLiteral> lits;
+        const int len = 2 + rnd(4);
+        for (int t = 0; t < len; ++t) {
+            ConflictLiteral l;
+            l.var = rnd(n);
+            l.upper = rnd(2) == 0;           // x <= 0  or  x >= 1
+            l.bound = l.upper ? 0.0 : 1.0;
+            lits.push_back(l);
+        }
+        std::vector<ConflictLiteral> norm;
+        if (store.add_typed(lits, root_lo, root_hi, &norm) == ClauseResult::Inserted)
+            clauses.push_back(norm);
+    }
+    CHECK(!clauses.empty());
+    const auto naive = [&](std::vector<double>& lo, std::vector<double>& hi) {
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (const auto& cl : clauses) {
+                int open = -1, n_open = 0;
+                bool sat = false;
+                for (int t = 0; t < static_cast<int>(cl.size()); ++t) {
+                    const auto& l = cl[static_cast<std::size_t>(t)];
+                    const bool is_true = l.upper ? hi[l.var] <= l.bound : lo[l.var] >= l.bound;
+                    const bool is_false = l.upper ? lo[l.var] > l.bound : hi[l.var] < l.bound;
+                    if (is_true) { sat = true; break; }
+                    if (!is_false) { ++n_open; open = t; }
+                }
+                if (sat || n_open >= 2) continue;
+                if (n_open == 0) return false;
+                const auto& l = cl[static_cast<std::size_t>(open)];
+                if (l.upper) hi[l.var] = std::min(hi[l.var], l.bound);
+                else lo[l.var] = std::max(lo[l.var], l.bound);
+                if (lo[l.var] > hi[l.var]) return false;
+                changed = true;
+            }
+        }
+        return true;
+    };
+    int conflicts = 0, deductions = 0;
+    for (int trial = 0; trial < 400; ++trial) {
+        std::vector<double> lo = root_lo, hi = root_hi;
+        const int fixes = rnd(5);
+        for (int f = 0; f < fixes; ++f) {
+            const int j = rnd(n);
+            if (rnd(2)) hi[j] = 0.0; else lo[j] = 1.0;
+        }
+        if (lo != root_lo || hi != root_hi) {
+            bool bad = false;
+            for (int j = 0; j < n; ++j) bad |= lo[j] > hi[j];
+            if (bad) continue;
+        }
+        auto lo2 = lo, hi2 = hi;
+        const bool ok_naive = naive(lo2, hi2);
+        auto lo3 = lo, hi3 = hi;
+        bool converged = true;
+        const bool ok_store = store.propagate(lo3, hi3, root_lo, root_hi, &converged);
+        CHECK(converged);
+        CHECK(ok_store == ok_naive);
+        if (ok_naive && ok_store) {
+            CHECK(lo2 == lo3 && hi2 == hi3);
+            deductions += lo2 != lo || hi2 != hi;
+        }
+        conflicts += !ok_naive;
+    }
+    CHECK(conflicts > 0);
+    CHECK(deductions > 0);
+}
+
 int main() {
+    test_explanation_through_graph_and_clause_reasons();
+    test_first_uip_clause();
+    test_first_uip_expands_the_crossing_bound();
+    test_watched_propagation_matches_full_rescan();
     test_restart_clause_outcomes_reach_the_root();
     test_typed_outcomes();
     test_unit_propagation_and_conflict();
@@ -342,7 +537,7 @@ int main() {
     test_exact_integer_complements_from_decisions();
     test_invalid_or_incomplete_reasons_rejected();
     test_eviction_under_budget();
-    test_deferred_scan_reports_pending();
+    test_cancelled_scan_retains_pending_watches();
     test_analysis_keeps_only_relevant_decisions();
     oracle_stress();
     return sor::test::finish("test_conflict_store");

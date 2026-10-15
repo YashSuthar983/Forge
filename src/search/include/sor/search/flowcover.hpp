@@ -9,13 +9,17 @@
 //
 //   ∑_{j∈C} y_j  +  ∑_{j∈L} (u_j − λ)(1 − x_j)  ≤  b
 //
-// is valid. Sequence-independent lifting (Gu et al. Math. Prog. 1999, Thm. 8
-// specialised to N− = ∅) extends non-cover arcs L+ ⊆ N \ C using the
-// superadditive lifting function built from m₁ = max_{j∈C} u_j and λ:
+// is valid. Arcs outside the cover are lifted as y_k - g_k x_k with
+// g_k = H(u_k), H(t) = max_d min(λ + t - dλ, M_d - dλ) over the sorted
+// capacities of L (M_d their d largest summed): the exact bound of the
+// lifting problem without subset-sum gaps, subadditive (Gu, Nemhauser &
+// Savelsbergh 1999, N− = ∅), so all lifted arcs keep their own g_k at once.
+// (A version built from multiples of max_j u_j alone -- the equal-capacity
+// case -- produced invalid rows, and was held to trivial terms.)
 //
-//   ∑_{j∈C∪L+} y_j + ∑_{j∈L} (u_j−λ)(1−x_j) + ∑_{k∈L+} β_k x_k  ≤  b
-//
-// with β_k ∈ {−u_k + iλ, −i(m₁−λ)} on the Gu intervals for capacity u_k.
+// Every number is derived with directed rounding: capacities and b rounded up
+// (a relaxation of the flow set), u_j - λ rounded down, the side rounded up,
+// g_k rounded up, merged coefficients rounded down. The rows are exact.
 //
 // VUB structure is detected from explicit y − u x ≤ 0 rows and, more generally,
 // by projecting multi-column rows onto a (continuous, binary) pair at a safe
@@ -59,9 +63,6 @@ struct FlowCoverDiagnostics {
     std::uint64_t vubs_found = 0;
     std::uint64_t vubs_projected = 0;
     std::uint64_t si_lifted_arcs = 0;
-    // Arcs refused lifting because u + beta > 0 would have added slack the
-    // fixed rhs never paid for. Non-zero means the guard is doing work.
-    std::uint64_t rejected_unsafe_lift = 0;
     // Continuous columns refused as flow arcs because their lower bound is
     // negative (or unbounded below), which the 0 <= y <= u*x derivation
     // forbids.

@@ -202,6 +202,22 @@ End
         CHECK(row_warned);
     }
 
+    // ---- decorative row id before a label is not a coefficient ----
+    {
+        const auto p = parse(
+            "Minimize\n obj: x\nSubject To\n 3 c2: x >= 1\nBounds\n x <= 5\nEnd\n");
+        CHECK(p.n_rows() == 1);
+        CHECK(p.row_names[0] == "c2");
+        CHECK(p.row_lo[0] == 1.0);
+        CHECK(coeff(p, 0, 0) == 1.0);
+    }
+    // ---- bound underflow becomes an explicit 0; objective underflow fails ----
+    {
+        const auto p = parse(
+            "Minimize\n obj: x\nSubject To\n c: x >= 0\nBounds\n x >= 1e-999\nEnd\n");
+        CHECK(p.col_lo[0] == 0.0);
+    }
+
     // ---- rejected constructs are errors, never silently dropped ----
     CHECK(rejects("Minimize\n obj: 1e-999 x\nEnd\n", "underflows"));
     CHECK(rejects("Minimize\n obj: x\nSubject To\n c: x <= 1e308 + 1e308\nEnd\n", "overflows"));

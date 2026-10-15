@@ -1,6 +1,7 @@
 #pragma once
 
 #include <boost/container/small_vector.hpp>
+#include "sor/core/work_clock.hpp"
 #include <boost/multiprecision/cpp_int.hpp>
 #include <bit>
 #include <cmath>
@@ -40,6 +41,7 @@ class DyadicSum {
 public:
     void add(double v) { add_product(v, 1.0); }
     void add_product(double a, double b) {
+        ::sor::core::work_add(1, ::sor::core::WorkTag::ExactDyadic);
         if (a == 0.0 || b == 0.0) {
             if (!std::isfinite(a) || !std::isfinite(b))
                 throw std::invalid_argument("DyadicSum: nonfinite operand");

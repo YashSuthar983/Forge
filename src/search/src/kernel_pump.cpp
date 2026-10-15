@@ -1,4 +1,7 @@
 #include "sor/search/kernel_pump.hpp"
+#include "sor/search/l1_projection.hpp"
+#include "heuristic_lp.hpp"
+#include "sor/core/work_clock.hpp"
 
 #include "sor/sparse/csr.hpp"
 
@@ -10,7 +13,7 @@
 namespace sor::search {
 namespace {
 
-using Clock = std::chrono::steady_clock;
+using Clock = sor::core::SolverClock;
 
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 
@@ -51,7 +54,7 @@ void round_integers(const model::LpProblem& lp, const std::vector<f64>& current,
     for (Index j = 0; j < lp.n_cols(); ++j) {
         if (lp.is_integer.empty() || !lp.is_integer[sz(j)]) continue;
         f64 v = std::round(current[sz(j)]);
-        v = std::min(std::max(v, lp.col_lo[sz(j)]), lp.col_hi[sz(j)]);
+        v = std::min(std::max(v, std::ceil(lp.col_lo[sz(j)])), std::floor(lp.col_hi[sz(j)]));
         if (is_int_val(v, int_tol)) target[sz(j)] = v;
     }
 }
@@ -194,6 +197,14 @@ bool feasibility_pump_restricted(const model::LpProblem& mip,
         return true;
     }
 
+    std::vector<Index> integers;
+    for (Index j = 0; j < mip.n_cols(); ++j)
+        if (!mip.is_integer.empty() && mip.is_integer[sz(j)]) {
+            if (std::ceil(mip.col_lo[sz(j)]) > std::floor(mip.col_hi[sz(j)])) return false;
+            integers.push_back(j);
+        }
+    if (integers.empty()) return false;
+    std::unique_ptr<L1ProjectionSession> session;
     std::vector<f64> previous_target;
     for (int round = 0; round < max_pumps && !over(); ++round) {
         ++diag.pumps;
@@ -210,85 +221,23 @@ bool feasibility_pump_restricted(const model::LpProblem& mip,
         if (target == previous_target) break;
         previous_target = target;
 
-        // L1 projection LP toward the integer target (same construction as
-        // bab's classical FP, scoped to this module for clean layering).
         const Index n = mip.n_cols();
-        Index ni = 0;
-        for (Index j = 0; j < n; ++j)
-            if (!mip.is_integer.empty() && mip.is_integer[sz(j)]) ++ni;
-        if (ni == 0) return false;
-
-        model::LpProblem pump = mip;
-        pump.name = mip.name + "_kp_fp";
-        pump.maximize = false;
-        pump.obj_offset = 0.0;
-        pump.c.assign(static_cast<std::size_t>(n + ni), 0.0);
-        pump.col_lo = mip.col_lo;
-        pump.col_hi = mip.col_hi;
-        pump.col_lo.resize(static_cast<std::size_t>(n + ni), 0.0);
-        pump.col_hi.resize(static_cast<std::size_t>(n + ni), model::kInf);
-        pump.is_integer.assign(static_cast<std::size_t>(n + ni), false);
-        pump.row_lo = mip.row_lo;
-        pump.row_hi = mip.row_hi;
-        // Keep name vectors sized to the expanded LP. Presolve indexes
-        // col_names/row_names by the live dimensions; leaving them short
-        // (copying mip then adding aux vars/rows) is an OOB crash.
-        pump.row_names = mip.row_names;
-        if (!pump.row_names.empty() || !mip.row_names.empty())
-            pump.row_names.resize(static_cast<std::size_t>(mip.n_rows() + 2 * ni));
-        pump.col_names = mip.col_names;
-        if (!pump.col_names.empty() || !mip.col_names.empty())
-            pump.col_names.resize(static_cast<std::size_t>(n + ni));
-
-        std::vector<Index> rows, cols;
-        std::vector<f64> vals;
-        const auto& rp = mip.A.pattern.row_ptr();
-        const auto& ci = mip.A.pattern.col_idx();
-        for (Index i = 0; i < mip.n_rows(); ++i) {
-            for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
-                rows.push_back(i);
-                cols.push_back(ci[sz(k)]);
-                vals.push_back(mip.A.vals[sz(k)]);
-            }
-        }
-        Index d = 0;
-        for (Index j = 0; j < n; ++j) {
-            if (mip.is_integer.empty() || !mip.is_integer[sz(j)]) continue;
-            const Index dj = n + d;
-            pump.c[sz(dj)] = 1.0;
-            if (!pump.col_names.empty())
-                pump.col_names[sz(dj)] = "KP_D_" + std::to_string(j);
-            const Index r1 = mip.n_rows() + 2 * d;
-            const Index r2 = r1 + 1;
-            pump.row_lo.push_back(-model::kInf);
-            pump.row_hi.push_back(target[sz(j)]);
-            pump.row_lo.push_back(-model::kInf);
-            pump.row_hi.push_back(-target[sz(j)]);
-            if (!pump.row_names.empty()) {
-                pump.row_names[sz(r1)] = "KP_FP_P_" + std::to_string(j);
-                pump.row_names[sz(r2)] = "KP_FP_N_" + std::to_string(j);
-            }
-            rows.push_back(r1); cols.push_back(j);  vals.push_back(1.0);
-            rows.push_back(r1); cols.push_back(dj); vals.push_back(-1.0);
-            rows.push_back(r2); cols.push_back(j);  vals.push_back(-1.0);
-            rows.push_back(r2); cols.push_back(dj); vals.push_back(-1.0);
-            ++d;
-        }
-        pump.A = sparse::from_triplets(mip.n_rows() + 2 * ni, n + ni,
-                                       rows, cols, vals);
-        pump.validate();
-
         engines::SimplexOptions so;
+        heuristic_lp_options(so);
         so.method = engines::SimplexMethod::Primal;
-        so.presolve = true;
+        so.presolve = false;
         so.max_iterations = opts.max_lp_iterations;
         const double left =
             time_limit_s - ms_since(t0) / 1000.0;
-        so.time_limit_s = std::max(0.01, left);
+        if (left <= 0.0) break;
+        so.time_limit_s = left;
         so.primal_feas_tol = opts.feas_tol;
         so.dual_feas_tol = std::max(opts.feas_tol, 1e-7);
         engines::SimplexDiagnostics sd;
-        const auto pumped = engines::solve_simplex(pump, so, sd, nullptr);
+        if (!session)
+            session = std::make_unique<L1ProjectionSession>(mip, mip.col_lo, mip.col_hi,
+                                                             integers, so);
+        const auto pumped = session->solve(target, 0.0, 1.0, so, sd);
         ++diag.lp_solves;
         diag.lp_iterations += sd.iterations;
         if (pumped.proposed_status != core::Status::Optimal &&
@@ -315,6 +264,7 @@ bool kernel_pump(const model::LpProblem& mip,
                  const KernelPumpOptions& opts,
                  std::vector<f64>& x_out,
                  KernelPumpDiagnostics& diag) {
+    core::WorkScope work_scope_(core::WorkCat::Heuristic);
     diag = KernelPumpDiagnostics{};
     const auto t0 = Clock::now();
     if (!opts.enabled || opts.time_limit_s <= 0.0) {
@@ -354,8 +304,9 @@ bool kernel_pump(const model::LpProblem& mip,
                 refine.is_integer[sz(j)] = false;  // pure LP
         }
         engines::SimplexOptions so;
+        heuristic_lp_options(so);
         so.method = engines::SimplexMethod::Dual;
-        so.presolve = true;
+        so.presolve = false;
         so.max_iterations = opts.max_lp_iterations;
         so.time_limit_s = std::min(0.25, opts.time_limit_s * 0.15);
         so.primal_feas_tol = opts.feas_tol;

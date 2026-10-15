@@ -1,4 +1,5 @@
 #include "live_matrix.hpp"
+#include "sor/core/work_clock.hpp"
 #include "sor/model/exact.hpp"
 
 #include <algorithm>
@@ -47,6 +48,8 @@ void LiveMatrix::build(const model::LpProblem& problem,
                        std::vector<f64>& work_cost,
                        std::vector<f64>& fixed_vals,
                        f64& work_obj_offset) {
+    core::work_add(static_cast<std::uint64_t>(problem.nnz()) +
+                   static_cast<std::uint64_t>(problem.n_rows() + problem.n_cols()), ::sor::core::WorkTag::LpPresolve);
     SOR_FN();
     in = &problem;
     options = opts;
@@ -74,40 +77,71 @@ void LiveMatrix::build(const model::LpProblem& problem,
     row_queued.assign(sz(m), 0);
     col_queued.assign(sz(n), 0);
 
-    original_column_entries.assign(sz(n), {});
     std::uint32_t polls = 0;
-    for (Index i = 0; i < m; ++i) {
-        poll_deadline(options, polls);
-        for (Offset k = problem.A.pattern.row_ptr()[sz(i)];
-             k < problem.A.pattern.row_ptr()[sz(i) + 1]; ++k) {
-            const Index j = problem.A.pattern.col_idx()[sz(k)];
-            const f64 a = problem.A.vals[sz(k)];
-            if (a != 0.0) original_column_entries[sz(j)].push_back({i, a});
+    // The caller may hand over the incidence it already built (same loop).
+    if (original_column_entries.size() != sz(n)) {
+        original_column_entries.assign(sz(n), {});
+        for (Index i = 0; i < m; ++i) {
+            poll_deadline(options, polls);
+            for (Offset k = problem.A.pattern.row_ptr()[sz(i)];
+                 k < problem.A.pattern.row_ptr()[sz(i) + 1]; ++k) {
+                const Index j = problem.A.pattern.col_idx()[sz(k)];
+                const f64 a = problem.A.vals[sz(k)];
+                if (a != 0.0) original_column_entries[sz(j)].push_back({i, a});
+            }
         }
     }
 
+    const auto& row_ptr = problem.A.pattern.row_ptr();
+    const auto& col_idx = problem.A.pattern.col_idx();
+    std::vector<Index> col_count(sz(n), 0);
     for (Index i = 0; i < m; ++i) {
         poll_deadline(options, polls);
         if (!row_active[sz(i)]) continue;
         f64 shift = 0.0;
-        for (Offset k = problem.A.pattern.row_ptr()[sz(i)];
-             k < problem.A.pattern.row_ptr()[sz(i) + 1]; ++k) {
-            const Index j = problem.A.pattern.col_idx()[sz(k)];
-            const f64 a = problem.A.vals[sz(k)];
-            if (!col_active[sz(j)]) {
-                shift += a * fixed[sz(j)];
-                continue;
+        auto& row = rows[sz(i)];
+        // A row with ascending, distinct columns -- what the CSR holds --
+        // is the merge below without its searches: append the live nonzeros
+        // in order. Anything else takes the general merge.
+        bool ordered = true;
+        for (Offset k = row_ptr[sz(i)] + 1; k < row_ptr[sz(i) + 1]; ++k)
+            if (col_idx[sz(k)] <= col_idx[sz(k) - 1]) { ordered = false; break; }
+        if (ordered) {
+            row.v.reserve(sz(static_cast<Index>(row_ptr[sz(i) + 1] - row_ptr[sz(i)])));
+            for (Offset k = row_ptr[sz(i)]; k < row_ptr[sz(i) + 1]; ++k) {
+                const Index j = col_idx[sz(k)];
+                const f64 a = problem.A.vals[sz(k)];
+                if (!col_active[sz(j)]) {
+                    shift += a * fixed[sz(j)];
+                    continue;
+                }
+                if (a != 0.0) row.v.push_back({j, a});
             }
-            const f64 value = rows[sz(i)][j] + a;
-            if (value == 0.0) rows[sz(i)].erase(j);
-            else rows[sz(i)][j] = value;
+        } else {
+            for (Offset k = row_ptr[sz(i)]; k < row_ptr[sz(i) + 1]; ++k) {
+                const Index j = col_idx[sz(k)];
+                const f64 a = problem.A.vals[sz(k)];
+                if (!col_active[sz(j)]) {
+                    shift += a * fixed[sz(j)];
+                    continue;
+                }
+                const f64 value = row[j] + a;
+                if (value == 0.0) row.erase(j);
+                else row[j] = value;
+            }
         }
         row_lo[sz(i)] -= shift;
         row_hi[sz(i)] -= shift;
-        for (const auto& [j, a] : rows[sz(i)]) {
-            if (a == 0.0) continue;
-            col_rows[sz(j)].insert(i);
-        }
+        for (const auto& [j, a] : row)
+            if (a != 0.0) ++col_count[sz(j)];
+    }
+    // Rows are visited in ascending order, so appending keeps each column's
+    // row list sorted, as FlatSet::insert would.
+    for (Index j = 0; j < n; ++j) col_rows[sz(j)].v.reserve(sz(col_count[sz(j)]));
+    for (Index i = 0; i < m; ++i) {
+        if (!row_active[sz(i)]) continue;
+        for (const auto& [j, a] : rows[sz(i)])
+            if (a != 0.0) col_rows[sz(j)].v.push_back(i);
     }
     // Locks are not stored: dual fixing asks for the one it needs.
 }
@@ -211,9 +245,11 @@ bool LiveMatrix::fix_column(Index j, f64 value, DualRecoveryKind kind, Index row
         if (!row_active[sz(i)]) continue;
         const auto entry = rows[sz(i)].find(j);
         if (entry != rows[sz(i)].end()) {
-            const f64 shift = entry->second * value;
-            row_lo[sz(i)] -= shift;
-            row_hi[sz(i)] -= shift;
+            model::ExactSum shift;
+            shift.add_product(entry->second, value);
+            const f64 delta = shift.value().convert_to<f64>();
+            row_lo[sz(i)] -= delta;
+            row_hi[sz(i)] -= delta;
             rows[sz(i)].erase(j);
         }
         queue_row(i);
@@ -553,7 +589,8 @@ bool LiveMatrix::try_doubleton_equality(Index i, bool from_cost_tight) {
             // in the others after its elimination).
             const auto present = rows[sz(row)].find(h);
             const bool was_new = present == rows[sz(row)].end();
-            const f64 value = (was_new ? 0.0 : present->second) - mult * b;
+            const f64 value = combined_coefficient(
+                was_new ? 0.0 : present->second, mult * b);
             if (value == 0.0) {
                 if (!was_new) {
                     rows[sz(row)].erase(h);
@@ -638,38 +675,135 @@ bool LiveMatrix::try_cost_tight_doubleton(Index j) {
     }
     const f64 old_lo = row_lo[sz(i)], old_hi = row_hi[sz(i)];
     row_lo[sz(i)] = row_hi[sz(i)] = side;
+    DualRecoveryStep side_step;
+    side_step.kind = DualRecoveryKind::RowSideFixed;
+    side_step.row = i;
+    side_step.col = j;
+    side_step.coeff = a;
+    side_step.old_lo = old_lo;
+    side_step.old_hi = old_hi;
+    side_step.new_lo = side;
+    record_column_dual_state(side_step, i, j);
+    out->recovery_steps.push_back(std::move(side_step));
     if (!try_doubleton_equality(i, true)) {
+        out->recovery_steps.pop_back();
         row_lo[sz(i)] = old_lo;
         row_hi[sz(i)] = old_hi;
         return false;
     }
-    DualRecoveryStep step;
-    step.kind = DualRecoveryKind::RowSideFixed;
-    step.row = i;
-    step.col = j;
-    step.old_lo = old_lo;
-    step.old_hi = old_hi;
-    step.new_lo = side;
-    out->recovery_steps.push_back(std::move(step));
     return true;
 }
+
+namespace {
+// a * b == p + e exactly (Dekker's product with Veltkamp's split), or false
+// when the operands are outside the range where that identity holds (an
+// intermediate could overflow, or the product sits near the subnormals).
+bool two_product(f64 a, f64 b, f64& p, f64& e) {
+    p = a * b;
+    if (!(std::fabs(a) < 0x1p995 && std::fabs(b) < 0x1p995 &&
+          std::fabs(p) > 0x1p-969 && std::isfinite(p)))
+        return false;
+    constexpr f64 kSplit = 134217729.0;   // 2^27 + 1
+    const f64 ta = kSplit * a, ah = ta - (ta - a), al = a - ah;
+    const f64 tb = kSplit * b, bh = tb - (tb - b), bl = b - bh;
+    e = ((ah * bh - p) + ah * bl + al * bh) + al * bl;
+    return true;
+}
+// a * b == c, exactly.
+bool product_equals(f64 a, f64 b, f64 c) {
+    f64 p, e;
+    if (two_product(a, b, p, e)) return p == c && e == 0.0;
+    return model::Rational(a) * model::Rational(b) == model::Rational(c);
+}
+// a * b > c, exactly: float when the two are far apart relative to the
+// product's rounding error, rational otherwise.
+bool product_greater(f64 a, f64 b, f64 c) {
+    f64 p, e;
+    if (two_product(a, b, p, e)) {
+        const f64 gap = p - c;
+        const f64 scale = std::max(std::fabs(p), std::fabs(c));
+        if (std::isfinite(gap) && std::fabs(gap) > 0x1p-40 * scale) return gap > 0.0;
+    }
+    return model::Rational(a) * model::Rational(b) > model::Rational(c);
+}
+}  // namespace
 
 bool LiveMatrix::try_dominated_columns() {
     SOR_FN();
     constexpr std::size_t kMaxShared = 8;
     bool any = false;
-    
-    std::map<std::vector<Index>, std::vector<Index>> buckets;
+
+    // A pair (j dominates k) needs both columns continuous with lower bound
+    // 0 and the same short support, so only such columns are grouped. The
+    // groups used to be a std::map keyed by a freshly allocated support
+    // vector for every live column of at most kMaxShared entries, rebuilt on
+    // every pass: 4.1 of 14.3 ms of 80bau3b's presolve. Now one open-
+    // addressing table keyed by the support's hash (equality confirmed on
+    // the support itself) collects each group, columns ascending since they
+    // arrive in order. Groups are then processed in the map's order --
+    // supports ascending lexicographically -- which keeps the journal
+    // identical; distinct groups share no column.
+    const auto support_hash = [&](Index j) {
+        std::uint64_t h = 0x9e3779b97f4a7c15ULL ^ col_rows[sz(j)].size();
+        for (const Index i : col_rows[sz(j)]) {
+            h ^= static_cast<std::uint64_t>(i) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            h *= 0xbf58476d1ce4e5b9ULL;
+        }
+        return h;
+    };
+    std::size_t eligible = 0;
+    for (Index j = 0; j < n; ++j)
+        if (col_active[sz(j)] && col_lo[sz(j)] == 0.0 && !col_rows[sz(j)].empty() &&
+            col_rows[sz(j)].size() <= kMaxShared) ++eligible;
+    std::size_t slots = 16;
+    while (slots < 2 * eligible) slots <<= 1;
+    std::vector<std::uint64_t> slot_hash(slots, 0);
+    std::vector<Index> slot_group(slots, -1);
+    std::vector<std::vector<Index>> all_groups;
     for (Index j = 0; j < n; ++j) {
-        if (!col_active[sz(j)]) continue;
-        if (col_rows[sz(j)].size() > kMaxShared) continue;
-        std::vector<Index> support;
-        for (const Index i : col_rows[sz(j)]) support.push_back(i);
-        buckets[support].push_back(j);
+        if (!col_active[sz(j)] || col_lo[sz(j)] != 0.0) continue;
+        const std::size_t len = col_rows[sz(j)].size();
+        if (len == 0 || len > kMaxShared) continue;
+        if (!in->is_integer.empty() && in->is_integer[sz(j)]) continue;
+        const std::uint64_t h = support_hash(j);
+        std::size_t at = static_cast<std::size_t>(h) & (slots - 1);
+        for (;; at = (at + 1) & (slots - 1)) {
+            const Index g = slot_group[at];
+            if (g < 0) {
+                slot_hash[at] = h;
+                slot_group[at] = static_cast<Index>(all_groups.size());
+                all_groups.push_back({j});
+                break;
+            }
+            if (slot_hash[at] == h &&
+                col_rows[sz(all_groups[sz(g)].front())].v == col_rows[sz(j)].v) {
+                all_groups[sz(g)].push_back(j);
+                break;
+            }
+        }
     }
-    
-    for (const auto& [support, group] : buckets) {
-        if (group.size() < 2) continue;
+    std::vector<Index> order;
+    for (std::size_t g = 0; g < all_groups.size(); ++g)
+        if (all_groups[g].size() >= 2) order.push_back(static_cast<Index>(g));
+    std::sort(order.begin(), order.end(), [&](Index x, Index y) {
+        return col_rows[sz(all_groups[sz(x)].front())].v <
+               col_rows[sz(all_groups[sz(y)].front())].v;
+    });
+    std::vector<std::vector<Index>> groups;
+    groups.reserve(order.size());
+    for (const Index g : order) groups.push_back(std::move(all_groups[sz(g)]));
+
+    std::vector<f64> coef;   // coef[c * len + r]: group column c in support row r
+    for (const auto& group : groups) {
+        const auto support = col_rows[sz(group.front())].v;
+        const std::size_t len = support.size();
+        // Each pair compares the two columns row by row; read every
+        // member's coefficients once. Only a dominated column's entries
+        // change while the group is processed, and it is never read again.
+        coef.resize(group.size() * len);
+        for (std::size_t c = 0; c < group.size(); ++c)
+            for (std::size_t r = 0; r < len; ++r)
+                coef[c * len + r] = rows[sz(support[r])].at(group[c]);
         for (std::size_t j_idx = 0; j_idx < group.size(); ++j_idx) {
             const Index j = group[j_idx];
             if (!col_active[sz(j)]) continue;
@@ -685,16 +819,16 @@ bool LiveMatrix::try_dominated_columns() {
                 if (!in->is_integer.empty() && (in->is_integer[sz(j)] || in->is_integer[sz(k)])) continue;
                 f64 ratio = 0.0;
                 bool parallel = !support.empty();
-                for (const Index i : support) {
-                    const f64 aj = rows[sz(i)].at(j), ak = rows[sz(i)].at(k);
+                for (std::size_t r = 0; r < len; ++r) {
+                    const f64 aj = coef[j_idx * len + r], ak = coef[k_idx * len + r];
                     if (aj == 0.0) { parallel = false; break; }
                     if (ratio == 0.0) ratio = ak / aj;
                     if (!std::isfinite(ratio) || ratio <= 0 ||
-                        model::Rational(ak) != model::Rational(ratio) * model::Rational(aj)) {
+                        !product_equals(ratio, aj, ak)) {
                         parallel = false; break;
                     }
                 }
-                if (!parallel || model::Rational(cj) * model::Rational(ratio) > model::Rational(ck)) continue;
+                if (!parallel || product_greater(cj, ratio, ck)) continue;
                 auto k_rows = col_rows[sz(k)];
                 for (const Index i : k_rows) {
                     rows[sz(i)].erase(k);
@@ -816,6 +950,17 @@ bool LiveMatrix::try_duplicate_rows() {
             const f64 keep_lo = row_lo[sz(keep)], keep_hi = row_hi[sz(keep)];
             row_lo[sz(keep)] = std::max(row_lo[sz(keep)], implied_lo);
             row_hi[sz(keep)] = std::min(row_hi[sz(keep)], implied_hi);
+            {
+                const f64 tol = options.feasibility_tol *
+                                (1.0 + std::fabs(row_lo[sz(keep)]));
+                if (row_lo[sz(keep)] > row_hi[sz(keep)] + tol) {
+                    *status = PresolveStatus::Infeasible;
+                    *witness_row = keep;
+                    *reason = "parallel row merge crossed bounds on row " +
+                              std::to_string(keep);
+                    return false;
+                }
+            }
             for (const auto& [j, a] : rows[sz(rem)]) {
                 (void)a;
                 col_rows[sz(j)].erase(rem);
@@ -841,29 +986,83 @@ bool LiveMatrix::try_duplicate_rows() {
 
 bool LiveMatrix::try_duplicate_columns() {
     SOR_FN();
-    std::map<std::vector<std::pair<Index, f64>>, std::vector<Index>> buckets;
-    for (Index j = 0; j < n; ++j) {
-        if (!col_active[sz(j)]) continue;
-        if (col_rows[sz(j)].size() > 32) continue;
-        std::vector<std::pair<Index, f64>> norm;
-        f64 lead = 0.0;   // the first nonzero (see row_lead in try_duplicate_rows)
-        for (const Index i : col_rows[sz(j)]) {
-            const f64 a = rows[sz(i)].at(j);
-            if (a != 0.0) { lead = a; break; }
+    // Candidates are grouped by a 64-bit hash of the normalized pattern (row
+    // indices and coefficient / leading coefficient), then every pair is
+    // confirmed exactly below, so a collision can only skip an optional
+    // merge. The hashes come from one sequential sweep of the rows: rows in
+    // ascending order deliver each column's entries in col_rows order, so
+    // the first nonzero seen is the column's lead, and a zero entry
+    // normalizes to 0 whatever the lead. The previous grouping fetched each
+    // entry by binary search in its row and keyed an ordered map by the
+    // pattern vectors; it ran on every outer pass and cost fit2d (25 rows of
+    // ~10,500 entries) 21 ms per call, 47 of its 67 ms of presolve.
+    const auto mix = [](std::uint64_t x) {
+        x += 0x9e3779b97f4a7c15ULL;
+        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+        return x ^ (x >> 31);
+    };
+    const auto candidate = [&](Index j) {
+        return col_active[sz(j)] && col_rows[sz(j)].size() <= 32;
+    };
+    std::vector<std::uint64_t> hash(sz(n), 0);
+    std::vector<f64> lead(sz(n), 0.0);
+    for (Index j = 0; j < n; ++j)
+        if (candidate(j)) hash[sz(j)] = mix(col_rows[sz(j)].size());
+    for (Index i = 0; i < m; ++i) {
+        for (const auto& [j, a] : rows[sz(i)]) {
+            if (!candidate(j)) continue;
+            if (lead[sz(j)] == 0.0 && a != 0.0) lead[sz(j)] = a;
+            f64 ratio = a == 0.0 ? 0.0 : a / lead[sz(j)];
+            if (ratio == 0.0) ratio = 0.0;    // -0.0 and 0.0 compare equal
+            std::uint64_t bits = 0;
+            std::memcpy(&bits, &ratio, sizeof bits);
+            hash[sz(j)] = mix(hash[sz(j)] ^ mix(static_cast<std::uint64_t>(i)) ^
+                              (bits * 0x2545f4914f6cdd1dULL));
         }
-        if (lead == 0.0) continue;
-        for (const Index i : col_rows[sz(j)]) {
-            norm.push_back({i, rows[sz(i)].at(j) / lead});
-        }
-        buckets[norm].push_back(j);
     }
+    std::vector<std::pair<std::uint64_t, Index>> keyed;
+    keyed.reserve(sz(n));
+    for (Index j = 0; j < n; ++j) {
+        if (!candidate(j) || lead[sz(j)] == 0.0) continue;
+        // A merge needs c_rem = scale * c_keep with scale = lead_rem /
+        // lead_keep, i.e. equal c / lead: key on it too, so a group holds
+        // only columns that can merge with one another.
+        f64 cost_ratio = cost[sz(j)] / lead[sz(j)];
+        if (cost_ratio == 0.0) cost_ratio = 0.0;
+        std::uint64_t bits = 0;
+        std::memcpy(&bits, &cost_ratio, sizeof bits);
+        keyed.push_back({mix(hash[sz(j)] ^ (bits * 0x9e3779b97f4a7c15ULL)), j});
+    }
+    std::sort(keyed.begin(), keyed.end());
     bool any = false;
-    for (auto& [pattern, indices] : buckets) {
-        if (indices.size() < 2) continue;
-        const Index keep = indices[0];
-        for (std::size_t t = 1; t < indices.size(); ++t) {
-            const Index rem = indices[t];
-            if (!col_active[sz(rem)]) continue;
+    // Merged columns leave their rows in one compaction per touched row at
+    // the end: erasing each from the middle of a ~10,500-entry row shifted
+    // the row per merge, about 270 MB of moves for fit2d's 137 merges.
+    std::vector<char> merged(sz(n), 0), row_touched(sz(m), 0);
+    std::vector<Index> touched_rows;
+    for (std::size_t g = 0; g < keyed.size();) {
+        std::size_t e = g + 1;
+        while (e < keyed.size() && keyed[e].first == keyed[g].first) ++e;
+        const std::size_t group_begin = g;
+        const std::size_t group_end = e;
+        g = e;
+        if (group_end - group_begin < 2) continue;
+        // Finite boxes with exactly representable interval sums only. Wider
+        // cases remain unreduced until their lift/ray contract is supported,
+        // so the survivor is the group's first finite-box column.
+        const auto mergeable = [&](Index j) {
+            return col_active[sz(j)] && std::isfinite(col_lo[sz(j)]) &&
+                   std::isfinite(col_hi[sz(j)]) &&
+                   (in->is_integer.empty() || !in->is_integer[sz(j)]);
+        };
+        Index keep = -1;
+        for (std::size_t t = group_begin; t < group_end; ++t) {
+            const Index rem = keyed[t].second;
+            if (!mergeable(rem)) continue;
+            if (keep < 0) { keep = rem; continue; }
+            // Equal size plus keep's rows all present in rem: the same row set.
+            if (col_rows[sz(rem)].size() != col_rows[sz(keep)].size()) continue;
             f64 scale = 0.0;
             bool ok = true;
             for (const Index i : col_rows[sz(keep)]) {
@@ -875,20 +1074,23 @@ bool LiveMatrix::try_duplicate_columns() {
                 }
                 if (scale == 0.0 && a_keep != 0.0) scale = it->second / a_keep;
             }
-            if (!ok || scale == 0.0) continue;
-            if (!in->is_integer.empty() && (in->is_integer[sz(keep)] || in->is_integer[sz(rem)])) continue;
-            if (!std::isfinite(scale) ||
-                model::Rational(cost[sz(rem)]) != model::Rational(cost[sz(keep)]) * model::Rational(scale)) continue;
+            if (!ok || scale == 0.0 || !std::isfinite(scale)) continue;
+            // Floating prefilters: when an exact product equals a double, its
+            // rounded product equals that double too, so these only reject
+            // pairs the exact tests below would reject.
+            if (cost[sz(keep)] * scale != cost[sz(rem)]) continue;
+            bool close = true;
+            for (const Index i : col_rows[sz(keep)])
+                if (rows[sz(i)].at(keep) * scale != rows[sz(i)].at(rem)) { close = false; break; }
+            if (!close) continue;
+            if (model::Rational(cost[sz(rem)]) != model::Rational(cost[sz(keep)]) * model::Rational(scale)) continue;
             bool exact = true;
             for (const Index i : col_rows[sz(keep)])
                 if (model::Rational(rows[sz(i)].at(rem)) !=
                     model::Rational(scale) * model::Rational(rows[sz(i)].at(keep))) exact = false;
             if (!exact) continue;
-            // Finite boxes with exactly representable interval sums. Wider
-            // cases remain unreduced until their lift/ray contract is supported.
             const f64 kl = col_lo[sz(keep)], kh = col_hi[sz(keep)];
             const f64 rl = col_lo[sz(rem)], rh = col_hi[sz(rem)];
-            if (!std::isfinite(kl) || !std::isfinite(kh) || !std::isfinite(rl) || !std::isfinite(rh)) continue;
             const model::Rational sumlo = model::Rational(kl) + model::Rational(scale) * model::Rational(scale > 0 ? rl : rh);
             const model::Rational sumhi = model::Rational(kh) + model::Rational(scale) * model::Rational(scale > 0 ? rh : rl);
             const f64 newlo = sumlo.convert_to<f64>(), newhi = sumhi.convert_to<f64>();
@@ -900,8 +1102,11 @@ bool LiveMatrix::try_duplicate_columns() {
             step.old_lo = kl; step.old_hi = kh; step.new_lo = rl; step.new_hi = rh;
             out->recovery_steps.push_back(std::move(step));
             col_lo[sz(keep)] = newlo; col_hi[sz(keep)] = newhi;
-            const auto removed_rows = col_rows[sz(rem)];
-            for (const Index i : removed_rows) { rows[sz(i)].erase(rem); queue_row(i); }
+            for (const Index i : col_rows[sz(rem)]) {
+                if (!row_touched[sz(i)]) { row_touched[sz(i)] = 1; touched_rows.push_back(i); }
+                queue_row(i);
+            }
+            merged[sz(rem)] = 1;
             col_rows[sz(rem)].clear();
             col_active[sz(rem)] = 0; fixed[sz(rem)] = 0;
             // The merged variable z=x_keep+scale*x_rem retains cost c_keep.
@@ -909,6 +1114,12 @@ bool LiveMatrix::try_duplicate_columns() {
             queue_col(keep);
             any = true;
         }
+    }
+    for (const Index i : touched_rows) {
+        auto& entries = rows[sz(i)].v;
+        entries.erase(std::remove_if(entries.begin(), entries.end(),
+                                     [&](const auto& e) { return merged[sz(e.first)] != 0; }),
+                      entries.end());
     }
     return any;
 }
@@ -943,6 +1154,16 @@ bool LiveMatrix::run_until_stable() {
                 for (const auto& [j, a] : rows[sz(i)])
                     if (col_active[sz(j)] && a != 0.0) ++live;
                 if (live == 0) {
+                    const f64 rhs = row_lo[sz(i)];
+                    const f64 scale = 1.0 + std::fabs(rhs);
+                    const f64 tol = options.feasibility_tol * scale;
+                    if (std::isfinite(rhs) && std::fabs(rhs) > tol) {
+                        *status = PresolveStatus::Infeasible;
+                        *witness_row = i;
+                        *reason = "empty equality row " + std::to_string(i) +
+                                  " has activity outside its bounds";
+                        return false;
+                    }
                     row_active[sz(i)] = 0;
                     ++out->stats.rows_removed;
                 }
@@ -968,6 +1189,7 @@ bool LiveMatrix::run_until_stable() {
 
         if (options.dominated_columns) try_dominated_columns();
         if (options.parallel_rows) try_duplicate_rows();
+        if (*status != PresolveStatus::Reduced) break;
         if (options.parallel_columns) try_duplicate_columns();
 
         for (Index j = 0; j < n; ++j) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sor/core/result.hpp"
+#include "sor/core/work_clock.hpp"
 
 #include <chrono>
 #include <functional>
@@ -49,8 +50,7 @@ bool rebuild_dual_edge_weights(
     const std::function<void(std::vector<core::f64>&)>& btran,
     std::vector<core::f64>& weights,
     const SeededUnitBtran& btran_seeded = {},
-    std::chrono::steady_clock::time_point deadline =
-        std::chrono::steady_clock::time_point::max());
+    core::SolverClock::time_point deadline = core::SolverClock::time_point::max());
 
 // Exact Devex weight of a pivotal row for the current reference framework.
 // `reference[j] != 0` identifies the variables that were basic when the
@@ -81,9 +81,10 @@ bool dual_dse_accept_weight(core::f64 updated_weight,
 
 // Running-density and DSE-cost policy used by SimplexPricing::Choose. These
 // are pure functions so every strict boundary in the adaptive path is covered
-// without needing a benchmark-sized LP to happen upon it. Historically these
-// gated a one-way handoff to Devex; Choose now rebuilds exact DSE by default
-// and only uses the Devex handoff when SOR_DUAL_CHOOSE_DEVEX_FALLBACK is set.
+// without needing a benchmark-sized LP to happen upon it. When DSE is too
+// dear (dual_dse_should_switch_to_devex) Choose hands off to Devex for good;
+// when its weights have drifted inaccurate it rebuilds them exactly, and
+// takes the Devex handoff there only under SOR_DUAL_CHOOSE_DEVEX_FALLBACK.
 core::f64 dual_update_running_density(core::f64 previous,
                                       core::f64 local_density);
 
@@ -93,8 +94,7 @@ bool dual_dse_iteration_is_costly(core::f64 dse_density,
                                   core::f64 pivotal_row_density);
 
 bool dual_dse_should_switch_to_devex(std::uint64_t costly_iterations,
-                                     std::uint64_t local_iterations,
-                                     core::Index total_dimension);
+                                     std::uint64_t local_iterations);
 
 bool dual_update_dse_log_error(core::f64 updated_weight,
                                core::f64 computed_weight,

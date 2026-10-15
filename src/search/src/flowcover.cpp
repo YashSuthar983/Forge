@@ -1,4 +1,6 @@
 #include "sor/search/flowcover.hpp"
+#include "sor/core/work_clock.hpp"
+#include "sor/model/dyadic.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -35,29 +37,46 @@ struct FlowArc {
     bool in_cover = false;
 };
 
-// Gu et al. SI lifting coefficient β for a non-cover arc of capacity uk, given
-// m1 = max cover capacity and cover excess λ. Returns β ≤ 0 used as +β x on
-// the LHS of the ≤ form (together with +1 · y).
-f64 gu_si_beta(f64 uk, f64 m1, f64 lambda, f64 tol) {
-    if (uk <= tol || m1 <= tol || lambda <= tol) return 0.0;
-    // Search small i; capacities in MIPs are not astronomical relative to m1.
-    const int imax = static_cast<int>(std::floor(uk / m1)) + 3;
-    for (int i = 0; i <= imax; ++i) {
-        const f64 im1 = static_cast<f64>(i) * m1;
-        const f64 next = static_cast<f64>(i + 1) * m1;
-        // Interval A: i m1 ≤ uk ≤ (i+1) m1 − λ  →  β = −uk + i λ
-        const f64 a_hi = next - lambda;
-        if (uk + tol >= im1 && uk <= a_hi + tol && a_hi + tol >= im1)
-            return -uk + static_cast<f64>(i) * lambda;
-        // Interval B: i m1 − λ ≤ uk ≤ i m1  (i ≥ 1)  →  β = −i (m1 − λ)
-        if (i >= 1) {
-            const f64 b_lo = im1 - lambda;
-            if (uk + tol >= b_lo && uk <= im1 + tol)
-                return -static_cast<f64>(i) * (m1 - lambda);
-        }
+// Upward-rounded a * b (a, b finite).
+f64 mul_up(f64 a, f64 b) {
+    model::DyadicSum d;
+    d.add_product(a, b);
+    return d.up();
+}
+
+// Lifting function of the simple flow cover (C, lambda) for N- empty: with
+// the cover arcs of capacity above lambda sorted u_1 >= ... >= u_r and
+// M_d = u_1 + ... + u_d (M_0 = 0),
+//     H(t) = max_{d = 0..r} min(lambda + t - d lambda, M_d - d lambda).
+// Derivation: with a new arc carrying flow t the cover arcs keep b - t of
+// the capacity; closing a set D of them gains U(D) - |D| lambda while it
+// still fits (U(D) <= lambda + t) and t - (|D| - 1) lambda once it no longer
+// does, and both are at most min(lambda + t, M_|D|) - |D| lambda. So an arc
+// lifted as  y_k - g x_k  with g >= H(u_k) keeps the row valid, and H is
+// subadditive (Gu, Nemhauser & Savelsbergh 1999, the case N- = empty), which
+// lets every lifted arc use its own g at once. Exactly, rounded up.
+f64 lifting_h_up(f64 t, const std::vector<f64>& caps_desc, const model::DyadicSum& lambda) {
+    model::DyadicSum best;   // d = 0 gives min(lambda + t, 0) = 0
+    model::DyadicSum M;      // M_d
+    for (std::size_t d = 1; d <= caps_desc.size(); ++d) {
+        M.add(caps_desc[d - 1]);
+        model::DyadicSum a = lambda;                 // lambda + t - d lambda
+        a.add(t);
+        a.add_sum_product(lambda, -static_cast<f64>(d));
+        model::DyadicSum b = M;                      // M_d - d lambda
+        b.add_sum_product(lambda, -static_cast<f64>(d));
+        model::DyadicSum diff = a;
+        model::DyadicSum nb = b;
+        nb.negate();
+        diff.add_sum(nb);
+        const model::DyadicSum& m = diff.sign() <= 0 ? a : b;   // min(a, b)
+        model::DyadicSum gap = m;
+        model::DyadicSum nbest = best;
+        nbest.negate();
+        gap.add_sum(nbest);
+        if (gap.sign() > 0) best = m;
     }
-    // Safe fallback: β = −max(0, uk − λ) complements the (uk−λ)(1−x) pattern.
-    return -std::max(0.0, uk - lambda);
+    return best.up();
 }
 
 void record_vub(std::unordered_map<Index, std::pair<Index, f64>>& vub,
@@ -72,24 +91,23 @@ void record_vub(std::unordered_map<Index, std::pair<Index, f64>>& vub,
     }
 }
 
-// Try to read ay y + ax x ≤ rhs as y − u x ≤ 0 (after scaling).
+// Read ay y + ax x <= rhs (ay > 0, ax < 0, rhs <= 0, decided exactly) as the
+// VUB y <= u x with u = -ax / ay rounded UP: a capacity may only be
+// overstated. A positive residual, however small, is y <= u x + epsilon and
+// cannot be discarded in a validity proof for a cut; a negative one only
+// strengthens the row and is dropped.
+bool vub_from_pair(f64 ay, f64 ax, const model::DyadicSum& rhs, f64 tol, f64& u_out) {
+    if (!(ay > 0.0) || !(ax < 0.0)) return false;
+    if (rhs.sign() > 0) return false;
+    model::DyadicSum num;
+    num.add(-ax);
+    u_out = num.quotient_up(ay);
+    return u_out > tol && std::isfinite(u_out);
+}
 bool vub_from_pair(f64 ay, f64 ax, f64 rhs, f64 tol, f64& u_out) {
-    if (std::fabs(ay) <= tol) return false;
-    // Prefer ay > 0: y + (ax/ay) x ≤ rhs/ay.
-    f64 c = ax / ay;
-    f64 r = rhs / ay;
-    if (ay < 0.0) {
-        // Flipped by dividing by negative: inequality sense reverses - reject
-        // here; caller tries the ≥ form separately.
-        return false;
-    }
-    // A positive residual, however small, is y <= u*x + epsilon and cannot
-    // be discarded in a validity proof for a cut.
-    if (c < -tol && r <= 0.0 && r >= -tol) {
-        u_out = -c;
-        return u_out > tol;
-    }
-    return false;
+    model::DyadicSum r;
+    r.add(rhs);
+    return vub_from_pair(ay, ax, r, tol, u_out);
 }
 
 void collect_vubs(const model::LpProblem& lp, const std::vector<f64>& lo,
@@ -163,8 +181,10 @@ void collect_vubs(const model::LpProblem& lp, const std::vector<f64>& lo,
 
                     // For a <= row, the largest possible y occurs when the
                     // omitted terms have their MINIMUM activity. Using their
-                    // maximum would invent a stronger, invalid VUB.
-                    f64 rhs = bound;
+                    // maximum would invent a stronger, invalid VUB. Summed
+                    // exactly: the residual's sign decides validity.
+                    model::DyadicSum rhs;
+                    rhs.add(bound);
                     bool ok = true;
                     for (std::size_t t = 0; t < terms.size(); ++t) {
                         if (t == p || t == q) continue;
@@ -175,19 +195,16 @@ void collect_vubs(const model::LpProblem& lp, const std::vector<f64>& lo,
                             ok = false;
                             break;
                         }
-                        rhs -= a * at_min;
+                        rhs.add_product(-a, at_min);
                     }
                     if (!ok) continue;
                     f64 u = 0.0;
                     if (vub_from_pair(terms[p].a, terms[q].a, rhs, opts.tol,
                                       u)) {
-                        // Also tighten by column upper bound.
-                        if (std::isfinite(hi[sz(terms[p].j)])) {
-                            const f64 col_u =
-                                hi[sz(terms[p].j)] -
-                                std::min(0.0, lo[sz(terms[p].j)]);
-                            if (col_u > opts.tol) u = std::min(u, col_u);
-                        }
+                        // y <= hi_y as well (y >= 0 is required of every arc
+                        // later), so u may be reduced to hi_y.
+                        if (std::isfinite(hi[sz(terms[p].j)]) && hi[sz(terms[p].j)] > opts.tol)
+                            u = std::min(u, hi[sz(terms[p].j)]);
                         record_vub(vub, terms[p].j, terms[q].j, u, diag, true);
                     }
                 }
@@ -204,6 +221,11 @@ void collect_vubs(const model::LpProblem& lp, const std::vector<f64>& lo,
     // singleton row y ≤ 0 when some binary is 0 - skip (needs implications).
 }
 
+// The single-node flow set of a row: arcs a y (y >= 0 with a VUB y <= u x,
+// capacity a u rounded up) and the capacity b = side minus every other
+// term's minimum activity, summed exactly and rounded up. Overstating a
+// capacity or b only relaxes the flow set, so every cut of the rounded set is
+// valid for the row.
 bool build_flow_from_row(
     const model::LpProblem& lp, Index row, f64 sign, const std::vector<f64>& x,
     const std::vector<f64>& lo, const std::vector<f64>& hi,
@@ -218,7 +240,8 @@ bool build_flow_from_row(
     const auto& av = lp.A.vals;
 
     arcs.clear();
-    cap = bound;
+    model::DyadicSum cap_sum;
+    cap_sum.add(bound);
     for (core::Offset k = rp[sz(row)]; k < rp[sz(row) + 1]; ++k) {
         const Index j = ci[sz(k)];
         const f64 a = sign * av[sz(k)];
@@ -238,9 +261,9 @@ bool build_flow_from_row(
                     arc.y = j;
                     arc.x = it->second.first;
                     arc.scale = a;
-                    arc.u = a * it->second.second;
+                    arc.u = mul_up(a, it->second.second);
                     if (std::isfinite(hi[sz(j)]))
-                        arc.u = std::min(arc.u, a * hi[sz(j)]);
+                        arc.u = std::min(arc.u, mul_up(a, hi[sz(j)]));
                     if (arc.u > opts.tol) {
                         arc.y_val = a * x[sz(j)];
                         arc.x_val = x[sz(arc.x)];
@@ -256,9 +279,10 @@ bool build_flow_from_row(
         // available capacity. Dropping it produced invalid cuts.
         const f64 at_min = a > 0.0 ? lo[sz(j)] : hi[sz(j)];
         if (!std::isfinite(at_min)) return false;
-        cap -= a * at_min;
+        cap_sum.add_product(-a, at_min);
     }
-    if (arcs.size() < 2 || cap < -opts.tol) return false;
+    cap = cap_sum.up();
+    if (arcs.size() < 2 || cap < 0.0) return false;
     f64 total_u = 0.0;
     for (const auto& a : arcs) total_u += a.u;
     if (total_u <= cap + opts.tol) return false;
@@ -314,6 +338,7 @@ std::vector<CutRow> separate_flow_covers(const model::LpProblem& lp,
                                          const std::vector<f64>& col_hi,
                                          const FlowCoverOptions& opts,
                                          FlowCoverDiagnostics& diag) {
+    core::WorkScope work_scope_(core::WorkCat::Separation);
     std::vector<CutRow> cuts;
     const Index n = lp.n_cols();
     if (!opts.enabled || static_cast<Index>(x.size()) != n ||
@@ -350,101 +375,87 @@ std::vector<CutRow> separate_flow_covers(const model::LpProblem& lp,
             for (const std::size_t idx : cover)
                 arcs[idx].in_cover = true;
 
-            f64 m1 = 0.0;
-            for (const std::size_t idx : cover)
-                m1 = std::max(m1, arcs[idx].u);
+            // lambda = sum_C u - b, exactly; the cover needs it positive.
+            model::DyadicSum lambda_x;
+            for (const std::size_t idx : cover) lambda_x.add(arcs[idx].u);
+            lambda_x.add(-cap);
+            if (lambda_x.sign() <= 0) continue;
 
-            // ∑_{j∈C} y_j + ∑_{j∈L} (u_j−λ)(1−x_j) + SI terms ≤ cap
-            CutRow cut;
-            f64 rhs = cap;
-            f64 lhs = 0.0;
-            f64 cmin = kInf, cmax = 0.0;
-
-            auto push_coef = [&](Index col, f64 val, f64 xval) {
-                if (std::fabs(val) <= opts.tol) return;
-                cut.cols.push_back(col);
-                cut.vals.push_back(val);
-                lhs += val * xval;
-                cmin = std::min(cmin, std::fabs(val));
-                cmax = std::max(cmax, std::fabs(val));
+            // sum_{j in C} a_j y_j + sum_{j in C+} e_j (1 - x_j) <= b with
+            // e_j = u_j - lambda > 0 (exact sign), each e_j rounded DOWN (a
+            // smaller multiplier of 1 - x_j >= 0 only weakens the row) and
+            // the side b - sum e_j recomputed from the rounded values,
+            // rounded UP. Terms on one column are merged, the merged x
+            // coefficient rounded down. The row is then exact.
+            std::vector<std::pair<Index, model::DyadicSum>> terms;   // col -> coefficient
+            const auto add_term = [&](Index col, f64 v) {
+                for (auto& [c, d] : terms)
+                    if (c == col) { d.add(v); return; }
+                model::DyadicSum d;
+                d.add(v);
+                terms.emplace_back(col, std::move(d));
             };
-
+            model::DyadicSum side;
+            side.add(cap);
+            std::vector<f64> caps_plus;   // capacities of C+ (for lifting)
             for (const std::size_t idx : cover) {
                 const auto& a = arcs[idx];
-                push_coef(a.y, a.scale, x[sz(a.y)]);
-                const f64 excess = a.u - lambda;
-                if (excess > opts.tol) {
-                    // +(u−λ)(1−x) → −(u−λ) x and RHS −= (u−λ)
-                    push_coef(a.x, -excess, a.x_val);
-                    rhs -= excess;
-                }
+                add_term(a.y, a.scale);
+                model::DyadicSum e;
+                e.add(a.u);
+                model::DyadicSum nl = lambda_x;
+                nl.negate();
+                e.add_sum(nl);
+                if (e.sign() <= 0) continue;
+                caps_plus.push_back(a.u);
+                const f64 e_down = e.down();
+                if (!(e_down > 0.0)) continue;
+                add_term(a.x, -e_down);
+                side.add(-e_down);
             }
 
-            // Sequence-independent lifting of non-cover arcs (Gu Thm. 8, N−=∅).
-            if (opts.sequence_independent_lift && m1 > opts.tol) {
-                std::vector<std::size_t> outside;
-                for (std::size_t t = 0; t < arcs.size(); ++t)
-                    if (!arcs[t].in_cover) outside.push_back(t);
-                // Prefer arcs that look fractional / residual-open.
+            // Lifting of the arcs outside the cover: a_k y_k - g_k x_k with
+            // g_k = H(u_k) rounded up (lifting_h_up). Taken only when the
+            // term adds violation at x.
+            if (opts.sequence_independent_lift && !caps_plus.empty()) {
+                std::sort(caps_plus.begin(), caps_plus.end(), std::greater<f64>());
+                std::vector<std::pair<f64, std::size_t>> outside;
+                for (std::size_t t = 0; t < arcs.size(); ++t) {
+                    if (arcs[t].in_cover) continue;
+                    const f64 g = lifting_h_up(arcs[t].u, caps_plus, lambda_x);
+                    const f64 gain = arcs[t].y_val - g * arcs[t].x_val;
+                    if (gain > opts.tol) outside.emplace_back(gain, t);
+                }
                 std::sort(outside.begin(), outside.end(),
-                          [&](std::size_t a, std::size_t b) {
-                              const f64 sa =
-                                  arcs[a].y_val +
-                                  std::fabs(gu_si_beta(arcs[a].u, m1, lambda,
-                                                       opts.tol)) *
-                                      arcs[a].x_val;
-                              const f64 sb =
-                                  arcs[b].y_val +
-                                  std::fabs(gu_si_beta(arcs[b].u, m1, lambda,
-                                                       opts.tol)) *
-                                      arcs[b].x_val;
-                              return sa > sb;
-                          });
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
                 int lifted = 0;
-                for (const std::size_t idx : outside) {
+                for (const auto& [gain, t] : outside) {
                     if (lifted >= opts.max_lift_arcs) break;
-                    const auto& a = arcs[idx];
-                    const f64 beta = gu_si_beta(a.u, m1, lambda, opts.tol);
-                    // Skip vacuous (β ≈ 0 and we still add y - only add when
-                    // the pair can strengthen violation).
-                    // Include y with α=1 and binary with β (≤ 0).
-                    const f64 contrib =
-                        a.y_val + beta * a.x_val;  // vs 0 if excluded
-                    if (contrib <= opts.tol && beta >= -opts.tol) continue;
-                    // VALIDITY GUARD (2026-09-19). The rhs is fixed before this
-                    // loop and never adjusted, so a lifted arc may only be
-                    // added if its term cannot increase the left-hand side
-                    // beyond what the base inequality already allows.
-                    //
-                    // The arc contributes y + beta*x, and the VUB gives
-                    // y <= u*x, so its worst case over x in {0,1} is
-                    // max(0, u + beta). Validity without an rhs change
-                    // therefore needs u + beta <= 0. But gu_si_beta returns
-                    // -u + i*lambda on interval A, so for i >= 1 we get
-                    // u + beta = i*lambda > 0 -- each such arc silently adds
-                    // slack the rhs never paid for.
-                    //
-                    // Measured before this guard, with --verify-cuts against
-                    // blend2's true optimum: FC_0 reached activity 12040
-                    // against an rhs of 312, a factor of 38, and the solve
-                    // reported a FALSE Optimal of 16.554765 (true 7.5989850).
-                    //
-                    // NOT A VERIFIED FIX. u + beta <= 0 is a genuine
-                    // requirement of rhs-free lifting, so the guard is correct
-                    // to have, but blend2 STILL produced 57 invalid FC_ cuts
-                    // with it in place. Flow cover therefore remains default
-                    // OFF. Whatever is wrong is upstream of the lifting.
-                    if (a.u + beta > opts.tol) {
-                        ++diag.rejected_unsafe_lift;
-                        continue;
-                    }
-                    push_coef(a.y, a.scale, x[sz(a.y)]);
-                    push_coef(a.x, beta, a.x_val);
+                    (void)gain;
+                    const auto& a = arcs[t];
+                    const f64 g = lifting_h_up(a.u, caps_plus, lambda_x);
+                    add_term(a.y, a.scale);
+                    if (g > 0.0) add_term(a.x, -g);
                     ++lifted;
                     ++diag.si_lifted_arcs;
                 }
             }
 
+            CutRow cut;
+            f64 lhs = 0.0;
+            f64 cmin = kInf, cmax = 0.0;
+            for (const auto& [col, d] : terms) {
+                // y coefficients are exact row data; a merged x coefficient
+                // is rounded down (x >= 0: a smaller coefficient weakens).
+                const f64 v = d.down();
+                if (v == 0.0) continue;
+                cut.cols.push_back(col);
+                cut.vals.push_back(v);
+                lhs += v * x[sz(col)];
+                cmin = std::min(cmin, std::fabs(v));
+                cmax = std::max(cmax, std::fabs(v));
+            }
+            const f64 rhs = side.up();
             if (cut.cols.size() < 2) continue;
             if (cmin > 0.0 && cmax / cmin > opts.max_dynamism) {
                 ++diag.rejected_dynamism;
@@ -456,6 +467,7 @@ std::vector<CutRow> separate_flow_covers(const model::LpProblem& lp,
             }
             cut.row_lo = -kInf;
             cut.row_hi = rhs;
+            cut.exact = true;
             cut.name = "FC_" + std::to_string(cuts.size());
             cuts.push_back(std::move(cut));
             ++diag.cuts_emitted;

@@ -47,6 +47,8 @@ public:
     // SPMD: runs f(worker) once on each of the first `workers` workers
     // (clamped to size()), the caller being worker 0, and returns when all
     // have finished.  Workers may synchronize with barrier().
+    // Exceptions abort barriers, join all active workers, then propagate to
+    // the caller. The pool remains usable; no task survives this boundary.
     void run(int workers, const std::function<void(int worker)>& f);
 
     // f(task, worker) for task in [0, n_tasks), tasks handed out dynamically
@@ -64,6 +66,7 @@ public:
 
 private:
     void worker_loop(int id);
+    void invoke_job(const std::function<void(int)>&, int);
 
     struct Impl;
     Impl* impl_;

@@ -17,18 +17,17 @@ DualInitialPricingStrategy choose_dual_initial_pricing(
         boxed_structural_cols < 0 || boxed_structural_cols > structural_cols)
         return DualInitialPricingStrategy::DSE;
 
-    const long double row_count = static_cast<long double>(rows);
-    const long double aspect =
-        static_cast<long double>(structural_cols) / row_count;
-    const long double row_degree = static_cast<long double>(nnz) / row_count;
-
-    if (rows >= 512 && aspect < 1.0L && row_degree < 4.0L)
-        return DualInitialPricingStrategy::Dantzig;
-    // Wide boxed models still benefit from edge weights. Box density alone
-    // does not justify Dantzig pricing; retain DSE and its measured fallback.
-    if (rows >= 1000 && rows < 3000 && aspect >= 1.0L &&
-        aspect < 2.0L && row_degree < 8.0L)
-        return DualInitialPricingStrategy::Devex;
+    // Every model starts on exact DSE; the dual measures what DSE costs and
+    // hands off to Devex when it is too dear (dual_dse_should_switch_to_devex).
+    // Shape windows used to pick Dantzig (m >= 512, n/m < 1, nnz/m < 4) and
+    // Devex (1000 <= m < 3000, 1 <= n/m < 2, nnz/m < 8) up front. They
+    // selected sctap2/3 and sierra on Netlib (no gain either way) and five
+    // MIPLIB-23 relaxations, where Dantzig cost neos-4763324-toguru 39,768
+    // pivots / 48.6 s against DSE's 8,517 / 13.7 s and momentum1 1.58 s
+    // against 0.98 s, and won only on neos-4722843-widden -- the one model
+    // the cost measurement should have caught and could not (see there).
+    (void)structural_cols;
+    (void)nnz;
     return DualInitialPricingStrategy::DSE;
 }
 
@@ -37,7 +36,7 @@ bool rebuild_dual_edge_weights(
     const std::function<void(std::vector<core::f64>&)>& btran,
     std::vector<core::f64>& weights,
     const SeededUnitBtran& btran_seeded,
-    const std::chrono::steady_clock::time_point deadline) {
+    const core::SolverClock::time_point deadline) {
     if (m < 0 || !btran) return false;
     weights.assign(static_cast<std::size_t>(m), 1.0);
     std::vector<core::f64> rhs(static_cast<std::size_t>(m), 0.0);
@@ -58,9 +57,11 @@ bool rebuild_dual_edge_weights(
         return s;
     };
     std::vector<core::Index> support;
-    const bool timed = deadline != std::chrono::steady_clock::time_point::max();
+    // Solver clock: work time under --deterministic, so whether the rebuild
+    // finishes (and every pivot after it) does not depend on machine load.
+    const bool timed = deadline != core::SolverClock::time_point::max();
     for (core::Index i = 0; i < m; ++i) {
-        if (timed && (i & 63) == 0 && std::chrono::steady_clock::now() >= deadline)
+        if (timed && (i & 63) == 0 && core::SolverClock::now() >= deadline)
             return false;
         // rhs is all-zero here (start of loop, or restored by the tail below).
         rhs[static_cast<std::size_t>(i)] = 1.0;
@@ -190,13 +191,16 @@ bool dual_dse_iteration_is_costly(const core::f64 dse_density,
 
 bool dual_dse_should_switch_to_devex(
     const std::uint64_t costly_iterations,
-    const std::uint64_t local_iterations,
-    const core::Index total_dimension) {
-    if (total_dimension <= 0 || local_iterations == 0) return false;
-    constexpr core::f64 kMinimumIterationFraction = 0.1;
+    const std::uint64_t local_iterations) {
+    // A fixed sample, not a fraction of the dimension: the densities are
+    // running averages over ~20 pivots (dual_update_running_density), so 100
+    // pivots settle them whatever the model's size. The sample used to be
+    // 10% of n + m, which a large model solved in fewer pivots than that
+    // never reached: neos-4722843-widden (n + m = 191k) spent 2,579 of 3,092
+    // pivots with DSE costly and never switched.
+    constexpr std::uint64_t kMinimumSample = 100;
     constexpr core::f64 kMinimumCostlyFraction = 0.05;
-    return static_cast<core::f64>(local_iterations) >
-               kMinimumIterationFraction * static_cast<core::f64>(total_dimension) &&
+    return local_iterations >= kMinimumSample &&
            static_cast<core::f64>(costly_iterations) >
                kMinimumCostlyFraction * static_cast<core::f64>(local_iterations);
 }

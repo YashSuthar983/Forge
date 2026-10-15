@@ -50,6 +50,20 @@ struct CoverOptions {
     std::size_t max_row_len = 2048;
     f64 violation_min = 1e-4;
     f64 tol = 1e-9;
+    // Rows [0, exact_rows) carry the model's own data; -1 means every row
+    // does. Rows past it are cuts from earlier rounds, valid only to within
+    // their derivation's rounding error (the solver accepts a cut that admits
+    // a feasible point to primal_feas_tol). A cover ROUNDS its row: it claims
+    // the cover's items cannot all be 1, so a weight excess smaller than the
+    // row's own error turns into a whole unit of the cut's rhs. A random
+    // 6x6 binary model (test_milp_oracle seed 770) had a MIR row and a GMI row
+    // tight at the optimum and off by 1.2e-9 and 1.0e-9; covers on them with
+    // excess 1.2e-9 and 1.0e-9 cut the optimum off by 1, and the solve
+    // reported -6.75 for -7.75. So on a derived row the cover test, minimality
+    // and lifting all treat the capacity as uncertain by
+    // derived_row_tol * (|bound| + sum |a_j| * |x_j at its bound|).
+    Index exact_rows = -1;
+    f64 derived_row_tol = 1e-6;
     // Sequential lifting runs a dynamic program indexed by the cut's own
     // coefficient values, so its cost is bounded by how large those get rather
     // than by the weights (which are real). Past this the lifting stops and the
@@ -105,11 +119,16 @@ struct CoverDiagnostics {
 // Returns cuts in the same CutRow form the pool and apply_cuts() consume. Every
 // returned inequality is valid for every integer-feasible point of `lp`; it is
 // the caller's choice whether it is worth adding.
+//
+// With the root box given, each cut's used_local_bound reports whether its
+// knapsack rests on a bound of [col_lo, col_hi] the root box does not imply.
 std::vector<CutRow> separate_lifted_covers(const model::LpProblem& lp,
                                            const std::vector<f64>& x,
                                            const std::vector<f64>& col_lo,
                                            const std::vector<f64>& col_hi,
                                            const CoverOptions& opts,
-                                           CoverDiagnostics& diag);
+                                           CoverDiagnostics& diag,
+                                           const std::vector<f64>* root_lo = nullptr,
+                                           const std::vector<f64>* root_hi = nullptr);
 
 }  // namespace sor::search

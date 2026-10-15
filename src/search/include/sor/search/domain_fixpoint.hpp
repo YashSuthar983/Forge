@@ -20,9 +20,12 @@
 //               a loop that cannot help.
 #pragma once
 
+#include "sor/search/prop_trail.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 namespace sor::search {
@@ -46,6 +49,8 @@ struct DomainEvent {
     double new_bound = 0.0;
     std::int32_t level = 0;    // decision level (node depth)
     std::int32_t source = -1;  // propagator id that made the update
+    ReasonKind reason = ReasonKind::Unknown;
+    std::int32_t reason_id = -1;
 };
 
 class DomainEventLog {
@@ -55,11 +60,21 @@ public:
     std::size_t record_diff(const std::vector<double>& lo0, const std::vector<double>& hi0,
                             const std::vector<double>& lo1, const std::vector<double>& hi1,
                             int level, int source);
+    // One update, when the propagator already knows what it moved (its trail).
+    void record(std::int32_t var, bool upper, double old_bound, double new_bound,
+                int level, int source, ReasonKind reason = ReasonKind::Unknown,
+                std::int32_t reason_id = -1) {
+        events_.push_back({var, upper, old_bound, new_bound, level, source, reason, reason_id});
+    }
     std::size_t size() const { return events_.size(); }
     const std::vector<DomainEvent>& events() const { return events_; }
     // Distinct columns with an update at index >= cursor (order of first update).
     std::vector<std::int32_t> vars_since(std::size_t cursor) const;
     void clear() { events_.clear(); }
+    void truncate(std::size_t n) {
+        if (n > events_.size()) throw std::invalid_argument("domain event checkpoint");
+        events_.resize(n);
+    }
 
 private:
     std::vector<DomainEvent> events_;

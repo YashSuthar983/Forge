@@ -6,6 +6,11 @@
 // it was called on every cost shift of the dual and about fifteen times per
 // LP solve, which a short MILP node LP notices. This is also the one place
 // that lists them all.
+//
+// Boolean flags treat unset/empty/"0"/"false"/"off"/"no" as disabled; any
+// other non-empty value enables. Default-off A/B validation must unset the
+// variable (or set it to an explicit disable spelling), not export FOO=0
+// and expect the old presence-only reader.
 #pragma once
 
 #include <cstdint>
@@ -28,6 +33,9 @@ struct EnvSwitches {
     bool dual_indexed_chuzr = false;              // SOR_DUAL_INDEXED_CHUZR
     bool dual_fullscan_chuzr = false;             // SOR_DUAL_FULLSCAN_CHUZR
     bool dual_no_cost_shift = false;              // SOR_DUAL_NO_COST_SHIFT
+    bool dual_bfrt_damage_guard = false;          // SOR_DUAL_BFRT_DAMAGE_GUARD
+    bool dual_bfrt_prefer_safe = false;           // SOR_DUAL_BFRT_PREFER_SAFE
+    bool dual_mid_solve_cost_audit = false;       // SOR_DUAL_MID_SOLVE_COST_AUDIT
     std::uint64_t dual_verbose_every = 0;         // SOR_DUAL_VERBOSE_EVERY (0: default)
     std::string dual_trace;                       // SOR_DUAL_TRACE=<file>
 
@@ -50,9 +58,18 @@ struct EnvSwitches {
     bool certificate_debug = false;               // SOR_CERTIFICATE_DEBUG
     bool farkas_debug = false;                    // SOR_FARKAS_DEBUG
 
+    // MILP search.
+    bool ref_trace = false;                       // SOR_REF_TRACE (with --verify-cuts)
+
     // Quadratic engines.
     bool fgmres_profile = false;                  // SOR_FGMRES_PROFILE
     std::string dump_kkt;                         // SOR_DUMP_KKT=<file>
+    // LP barrier route: write the interior point (x, y of the model the
+    // barrier saw, after presolve) / read one instead of running the IPM,
+    // so crossover can be studied without repeating a long barrier run.
+    std::string barrier_point_out;                // SOR_BARRIER_POINT_OUT=<file>
+    std::string barrier_point_in;                 // SOR_BARRIER_POINT_IN=<file>
+    int ipm_gondzio = -1;                         // SOR_IPM_GONDZIO=<k> (LP barrier correctors; -1: default)
     int stall_window = 0;                         // SOR_STALL_WINDOW (0: default)
     long resto_ms = 0;                            // SOR_RESTO_MS (0: default)
 };

@@ -1,4 +1,5 @@
 #include "sor/engines/farkas.hpp"
+#include "sor/certify/finalize.hpp"
 #include "sor/model/exact.hpp"
 
 #include <cmath>
@@ -14,6 +15,22 @@ f64 farkas_violation(const model::LpProblem& lp, const std::vector<f64>& y) {
     const core::Index n = lp.n_cols();
     if (static_cast<core::Index>(y.size()) != m) return core::kPosInf;
 
+    for (const f64 v : y)
+        if (!std::isfinite(v)) return core::kPosInf;
+    // First pass in long double with every rounding bounded: either verdict
+    // that the enclosure settles is the exact one (lower > upper for every
+    // value in the enclosures, or lower <= upper for every value, or a
+    // column certainly nonzero against an infinite bound).
+    {
+        const auto ray = certify::enclose_dual_ray(lp, y);
+        if (!ray.upper_finite) return core::kPosInf;
+        const auto lower = certify::enclose_ray_lower(ray, lp.col_lo, lp.col_hi);
+        if (lower.needs_infinite) return core::kPosInf;
+        if (lower.decided) {
+            if (lower.lo > ray.upper + ray.upper_rad) return 0.0;
+            if (lower.hi <= ray.upper - ray.upper_rad) return core::kPosInf;
+        }
+    }
     // Terminal evidence uses exact products of the parsed binary64 inputs.
     // A tiny nonzero coefficient cannot be dropped against an infinite bound.
     std::vector<model::ExactSum> d(sz(n));

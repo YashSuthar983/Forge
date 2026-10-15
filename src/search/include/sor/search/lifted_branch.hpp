@@ -58,14 +58,22 @@ struct LiftedSbModel {
 
 struct LiftedSbSample {
     LiftedFeatureVec feats{};
-    f64 score = 0.0;  // SB product or lifted approximation label
+    f64 score = 0.0;  // strong-branch product of this candidate at its decision
+    // The branching decision (node) the candidate was scored at. Scores are
+    // comparable within one decision only: different nodes have different
+    // gap scales and censoring, so ranking pairs never cross decisions.
+    std::uint64_t decision = 0;
 };
 
+// A bounded record of the most recent decisions: when full, the oldest
+// decision's samples leave (it used to stop accepting, so every later refit
+// was fit to the first decisions of the search).
 struct LiftedSbCollector {
     std::vector<LiftedSbSample> samples;
     std::size_t max_samples = 50000;
     void clear() { samples.clear(); }
-    void add(const LiftedFeatureVec& feats, f64 score);
+    // False when the score is no usable label.
+    bool add(const LiftedFeatureVec& feats, f64 score, std::uint64_t decision = 0);
 };
 
 struct LiftedBranchState {
@@ -76,7 +84,10 @@ struct LiftedBranchState {
     bool seeded_from_file = false;
 
     void clear();
-    void observe(const LiftedFeatureVec& feats, f64 sb_score);
+    // The strong-branch product of a candidate at `decision`, unmixed: the
+    // expert's own prediction is no label (blending it in only smooths the
+    // expert toward itself; it cannot reveal a better subtree outcome).
+    void observe(const LiftedFeatureVec& feats, f64 sb_score, std::uint64_t decision);
     // Refit when enough new labels accumulated. Returns true on a new fit.
     bool maybe_refit(const LiftedBranchOptions& opts);
     bool ready() const { return expert.loaded; }

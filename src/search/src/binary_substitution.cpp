@@ -27,6 +27,8 @@ MilpPresolveResult substitute_binary_relations(const model::LpProblem &lp,
     auto identity = [&]() {
         MilpPresolveResult out;
         out.reduced = lp;
+        out.reduced_row.resize(static_cast<std::size_t>(lp.n_rows()));
+        std::iota(out.reduced_row.begin(), out.reduced_row.end(), 0);
         out.reduced_col.resize(static_cast<std::size_t>(n));
         std::iota(out.reduced_col.begin(), out.reduced_col.end(), 0);
         out.eliminated.assign(static_cast<std::size_t>(n), 0);
@@ -112,6 +114,8 @@ MilpPresolveResult substitute_binary_relations(const model::LpProblem &lp,
 
     MilpPresolveResult out;
     out.reduced = lp;
+    out.reduced_row.resize(static_cast<std::size_t>(lp.n_rows()));
+    std::iota(out.reduced_row.begin(), out.reduced_row.end(), 0);
     auto &reduced = out.reduced;
     reduced.c.assign(static_cast<std::size_t>(nr), 0.0);
     reduced.col_lo.resize(static_cast<std::size_t>(nr));
@@ -130,6 +134,7 @@ MilpPresolveResult substitute_binary_relations(const model::LpProblem &lp,
             return rejected();
         if (r != j) {
             out.eliminated[j] = 1;
+            out.journal.push_back({PostsolveKind::Binary, out.binary_substitution_steps.size()});
             out.binary_substitution_steps.push_back({j, r, parity[j] != 0});
         } else {
             out.reduced_col[j] = k;

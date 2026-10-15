@@ -84,7 +84,8 @@ int main() {
     CHECK(engines::build_crossover_basis(problem, point, options, candidate, diag));
     CHECK(diag.basis_candidate_built);
     CHECK(diag.basis_candidate_factorized);
-    CHECK(diag.spiral_pushes > 0);
+    // How many pushes a point needs depends on how much of it the crash
+    // basis already explains; the accounting and the outcome do not.
     CHECK(diag.spiral_ftran_calls >= diag.spiral_pushes);
     CHECK(diag.spiral_ratio_tests >= diag.spiral_pushes);
     CHECK(diag.spiral_pushes == diag.spiral_bound_pushes +
@@ -180,33 +181,67 @@ int main() {
     CHECK(repair_diag.remaining_superbasics == 0);
     CHECK(repair_diag.basis_candidate_factorized);
 
-    // A push may be algebraically nonzero yet fall below the configured
-    // factorization pivot floor.  Use an explicit, widely separated threshold
-    // instead of relying on a coefficient narrowly straddling a hidden
-    // default.  Rank repair must replace the structural column with the
-    // corresponding logical and refactor successfully.
+    // A basis that is numerically singular IN THE SCALED MODEL (scaling
+    // cannot repair a near-dependent pair of rows) must be repaired with a
+    // logical, not pivoted on: with the pivot floor at 1e-3 the second LU
+    // pivot, ~1e-5, is not one.  (A lone small coefficient is no test: the
+    // crossover runs on the Ruiz-scaled model, where 5e-4 x becomes x.)
     {
-        model::LpProblem tiny_pivot;
-        tiny_pivot.A = sparse::from_triplets(
-            1, 1, {0}, {0}, {5e-4});
-        tiny_pivot.c = {0.0};
-        tiny_pivot.col_lo = {-1.0};
-        tiny_pivot.col_hi = {1.0};
-        tiny_pivot.row_lo = {0.0};
-        tiny_pivot.row_hi = {0.0};
-        core::RawResult tiny_point;
-        tiny_point.x = {0.0};
-        tiny_point.y = {0.0};
-        tiny_point.objective = 0.0;
-        engines::CrossoverDiagnostics tiny_diag;
-        engines::SimplexBasis tiny_basis;
+        model::LpProblem near;
+        near.A = sparse::from_triplets(
+            2, 2, {0, 0, 1, 1}, {0, 1, 0, 1}, {1.0, 1.0, 1.0, 1.0 + 1e-5});
+        near.c = {0.0, 0.0};
+        near.col_lo = {0.0, 0.0};
+        near.col_hi = {10.0, 10.0};
+        near.row_lo = {1.0, 1.0 + 0.5e-5};
+        near.row_hi = near.row_lo;
+        core::RawResult near_point;
+        near_point.x = {0.5, 0.5};
+        near_point.y = {0.0, 0.0};
+        near_point.objective = 0.0;
+        engines::CrossoverDiagnostics near_diag;
+        engines::SimplexBasis near_basis;
         engines::CrossoverOptions repair_options = options;
         repair_options.basis_pivot_tol = 1e-3;
         CHECK(engines::build_crossover_basis(
-            tiny_pivot, tiny_point, repair_options, tiny_basis, tiny_diag));
-        CHECK(tiny_diag.spiral_basis_pivots == 1);
-        CHECK(tiny_diag.rank_repairs == 1);
-        CHECK(tiny_diag.basis_candidate_factorized);
+            near, near_point, repair_options, near_basis, near_diag));
+        CHECK(near_diag.rank_repairs >= 1);
+        CHECK(near_diag.basis_candidate_factorized);
+        CHECK(near_diag.remaining_superbasics == 0);
+        CHECK(near_basis.basic.size() == 2);
+    }
+
+    // An interior point of a degenerate optimal face: both columns are
+    // strictly inside their bounds with zero reduced cost and there is one
+    // row, so one of them must be pushed onto a bound.  The basis that comes
+    // out is optimal as it stands -- the cleanup needs no pivots.
+    {
+        model::LpProblem face;
+        face.A = sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
+        face.c = {1.0, 1.0};
+        face.col_lo = {0.0, 0.0};
+        face.col_hi = {core::kPosInf, core::kPosInf};
+        face.row_lo = {1.0};
+        face.row_hi = {core::kPosInf};
+        core::RawResult face_point;
+        face_point.x = {0.5, 0.5};
+        face_point.y = {1.0};
+        face_point.objective = 1.0;
+        engines::CrossoverOptions face_options;
+        face_options.interior_point_start = true;
+        engines::CrossoverDiagnostics face_diag;
+        engines::SimplexBasis face_basis;
+        CHECK(engines::build_crossover_basis(
+            face, face_point, face_options, face_basis, face_diag));
+        CHECK(face_diag.spiral_pushes == 1);
+        CHECK(face_diag.spiral_bound_pushes == 1);
+        CHECK(face_diag.remaining_superbasics == 0);
+        engines::CrossoverDiagnostics face_run;
+        auto face_raw = engines::crossover_to_simplex(face, face_point, face_options, face_run);
+        CHECK(face_raw.proposed_status == core::Status::Optimal);
+        CHECK_NEAR(face_raw.objective, 1.0, 1e-12);
+        CHECK(face_run.warm_cleanup_iterations == 0);
+        CHECK(!face_run.cold_fallback);
     }
 
     // If basis construction is deliberately rejected, cold cleanup receives

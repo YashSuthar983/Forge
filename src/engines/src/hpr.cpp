@@ -428,8 +428,16 @@ backend::ScaledLp build_scaled_lp(model::LpProblem& p, int ruiz_iterations,
     RuizScaling scaling = ruiz_scale(p, ruiz_iterations);
     if (use_pock_chambolle)
         pock_chambolle_scale(p, scaling, pock_chambolle_alpha);
+    // No pdlp_magnitude_rescale here. One factor dividing c and every bound
+    // scales the whole HPR trajectory from the zero anchor by 1/factor: the
+    // step size depends on A, the primal weight and the restart tests on
+    // ratios, so the iterates are the same up to rounding (Netlib, tol 1e-6:
+    // equal iteration counts on 17 of 18 models). Every consumer of the
+    // scaled LP (device KKT, ray checks, polishing faces, batch probes, the
+    // Vulkan kernels) would have to carry the factor, and none did.
     backend::ScaledLp lp;
     lp.A_csr = p.A;
+    // TODO(lp): single CSR storage + planned transpose SpMV instead of CSR+CSC.
     lp.A_csc = sparse::to_csc(p.A);
     lp.c = p.c;
     lp.col_lo = p.col_lo;
@@ -648,7 +656,6 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
         since_restart += chunk;
 
         const auto kkt = device.reduce_kkt();
-        apply_kkt(kkt);
 
         if (opts.verbose) {
             std::printf("  iter %8llu  pres %.3e  dres %.3e  gap %.3e  "
@@ -684,6 +691,8 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
             reset_certificate_streaks();
             continue;
         }
+
+        apply_kkt(kkt);
 
         if (kkt.primal_res <= opts.primal_tol &&
             kkt.dual_res <= opts.dual_tol &&
@@ -941,6 +950,10 @@ core::RawResult solve_hpr(const model::LpProblem& problem,
                         weight = std::clamp(weight, opts.weight_min, opts.weight_max);
                     }
 
+                    // Halpern-PR restarts at the current T(z) (the device's
+                    // RestartPoint::Current). The ergodic average is PDHG's
+                    // restart candidate; Halpern's last iterate already has
+                    // the O(1/k) rate, and averaging costs a pass per step.
                     device.restart_to(backend::RestartPoint::Current);
                     ++diag.restarts;
                     if (sufficient) {

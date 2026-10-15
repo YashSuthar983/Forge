@@ -870,31 +870,42 @@ void DynSepController::observe(const DynSepObserve& obs) {
     diag_.reward_sum[i] += r;
 }
 
-void DynSepController::observe_selected_names(
-    const std::vector<std::string>& names, f64 mean_efficacy) {
-    std::array<int, kSepFamilyCount> counts{};
-    for (const auto& n : names) {
-        SepFamily f = SepFamily::Gmi;
-        if (n.rfind("MIR_", 0) == 0) f = SepFamily::Mir;
-        else if (n.rfind("COV_", 0) == 0 || n.rfind("COVPC_", 0) == 0 ||
-                 n.rfind("COVGNS_", 0) == 0)
-            f = SepFamily::Cover;
-        else if (n.rfind("CLQ_", 0) == 0) f = SepFamily::Clique;
-        else if (n.rfind("VUB_", 0) == 0) f = SepFamily::ImpliedBound;
-        else if (n.rfind("ZH_", 0) == 0) f = SepFamily::ZeroHalf;
-        else if (n.rfind("FC_", 0) == 0) f = SepFamily::FlowCover;
-        else f = SepFamily::Gmi;
-        ++counts[static_cast<std::size_t>(f)];
-    }
+SepFamily DynSepController::family_of_name(const std::string& n) {
+    if (n.rfind("MIR_", 0) == 0) return SepFamily::Mir;
+    if (n.rfind("COV_", 0) == 0 || n.rfind("COVPC_", 0) == 0 || n.rfind("COVGNS_", 0) == 0)
+        return SepFamily::Cover;
+    if (n.rfind("CLQ_", 0) == 0) return SepFamily::Clique;
+    if (n.rfind("VUB_", 0) == 0) return SepFamily::ImpliedBound;
+    if (n.rfind("ZH_", 0) == 0) return SepFamily::ZeroHalf;
+    if (n.rfind("FC_", 0) == 0) return SepFamily::FlowCover;
+    return SepFamily::Gmi;
+}
+
+void DynSepController::note_selected(const std::array<int, kSepFamilyCount>& selected) {
+    for (int i = 0; i < kSepFamilyCount; ++i)
+        diag_.cuts_from[static_cast<std::size_t>(i)] +=
+            static_cast<std::uint64_t>(std::max(0, selected[static_cast<std::size_t>(i)]));
+}
+
+void DynSepController::observe_round(const DynSepDecision& ran,
+                                     const std::array<int, kSepFamilyCount>& selected,
+                                     const std::array<f64, kSepFamilyCount>& violation,
+                                     f64 progress) {
+    f64 total = 0.0;
+    for (const f64 v : violation) total += std::max(0.0, v);
+    const f64 gain = std::isfinite(progress) ? std::max(0.0, progress) : 0.0;
     for (int i = 0; i < kSepFamilyCount; ++i) {
-        if (counts[static_cast<std::size_t>(i)] == 0) continue;
-        DynSepObserve o;
-        o.family = static_cast<SepFamily>(i);
-        o.cuts_selected = counts[static_cast<std::size_t>(i)];
-        o.cuts_generated = o.cuts_selected;
-        o.total_efficacy =
-            mean_efficacy * static_cast<f64>(o.cuts_selected);
-        observe(o);
+        const auto ii = static_cast<std::size_t>(i);
+        const SepFamily f = static_cast<SepFamily>(i);
+        if (selected[ii] <= 0 && !decision_runs(ran, f)) continue;
+        f64 r = 0.0;
+        if (selected[ii] > 0 && total > 0.0)
+            r = gain * std::max(0.0, violation[ii]) / total;
+        ++plays_[ii];
+        ++total_plays_;
+        ++diag_.plays[ii];
+        reward_sum_[ii] += r;
+        diag_.reward_sum[ii] += r;
     }
 }
 

@@ -1,4 +1,6 @@
+#include "sor/model/dyadic.hpp"
 #include "sor/search/cuts.hpp"
+#include "sor/core/work_clock.hpp"
 #include "sor/search/mir.hpp"
 #include <bit>
 
@@ -32,13 +34,15 @@ bool canonicalize(CutRow& cut) {
               [](const auto& a, const auto& b) { SOR_FN(); return a.first < b.first; });
     cut.cols.clear();
     cut.vals.clear();
-    for (const auto& [col, val] : terms) {
-        if (!cut.cols.empty() && cut.cols.back() == col) {
-            cut.vals.back() += val;
-        } else {
-            cut.cols.push_back(col);
-            cut.vals.push_back(val);
-        }
+    for (std::size_t k = 0; k < terms.size();) {
+        const Index col = terms[k].first;
+        model::DyadicSum sum;
+        do { sum.add(terms[k++].second); }
+        while (k < terms.size() && terms[k].first == col);
+        f64 val = 0.0;
+        if (!sum.representable(val)) return false;
+        cut.cols.push_back(col);
+        cut.vals.push_back(val);
     }
     std::size_t write = 0;
     for (std::size_t read = 0; read < cut.vals.size(); ++read) {
@@ -96,10 +100,132 @@ f64 sparse_dot(const CutRow& a, const std::vector<f64>& av,
 
 }  // namespace
 
+bool compile_cut(CutRow& cut, const model::LpProblem& lp, const CutOptions& opts) {
+    if (!canonicalize(cut) || std::isnan(cut.row_lo) || std::isnan(cut.row_hi) ||
+        cut.row_lo > cut.row_hi) return false;
+    for (const Index j : cut.cols) if (j >= lp.n_cols()) return false;
+    if (cut.compiled) return true;
+    if (!cut.exact) {
+        long double reach_sum = 0.0L;
+        for (std::size_t k = 0; k < cut.cols.size(); ++k) {
+            const auto j = sz(cut.cols[k]);
+            const f64 lo = lp.col_lo[j], hi = lp.col_hi[j];
+            long double reach = std::max(std::isfinite(lo) ? std::fabs(lo) : 1.0,
+                                         std::isfinite(hi) ? std::fabs(hi) : 1.0);
+            reach_sum += std::fabs(static_cast<long double>(cut.vals[k])) * reach;
+        }
+        const auto side = [&](f64 rhs, bool upper) {
+            if (!std::isfinite(rhs)) return rhs;
+            const long double margin = opts.derived_cut_rel_margin *
+                (std::fabs(static_cast<long double>(rhs)) + reach_sum) + opts.derived_cut_abs_margin;
+            const long double v = rhs + (upper ? margin : -margin);
+            f64 result = static_cast<f64>(v);
+            if (upper ? static_cast<long double>(result) < v : static_cast<long double>(result) > v)
+                result = std::nextafter(result, upper ? model::kInf : -model::kInf);
+            return result;
+        };
+        cut.row_lo = side(cut.row_lo, false);
+        cut.row_hi = side(cut.row_hi, true);
+    }
+    cut.compiled = true;
+    return true;
+}
+
+std::optional<int> compare_cut_rhs(const CutRow& a, const CutRow& b) {
+    if (a.cols.empty() || a.cols != b.cols || a.vals.size() != b.vals.size()) return std::nullopt;
+    const bool au = std::isfinite(a.row_hi), bu = std::isfinite(b.row_hi);
+    if (au == std::isfinite(a.row_lo) || bu == std::isfinite(b.row_lo)) return std::nullopt;
+    const f64 as = au ? 1.0 : -1.0, bs = bu ? 1.0 : -1.0;
+    const f64 a0 = as * a.vals.front(), b0 = bs * b.vals.front();
+    if (a0 == 0.0 || b0 == 0.0 || (a0 < 0.0) != (b0 < 0.0)) return std::nullopt;
+    for (std::size_t k = 0; k < a.vals.size(); ++k) {
+        model::DyadicSum d;
+        d.add_product(as * a.vals[k], b0);
+        d.add_product(-bs * b.vals[k], a0);
+        if (!d.is_zero()) return std::nullopt;
+    }
+    model::DyadicSum d;
+    d.add_product(as * (au ? a.row_hi : a.row_lo), std::fabs(b0));
+    d.add_product(-bs * (bu ? b.row_hi : b.row_lo), std::fabs(a0));
+    return d.sign();
+}
+
 std::size_t CutPool::active_size() const {
     SOR_FN();
     return static_cast<std::size_t>(std::count_if(
         entries_.begin(), entries_.end(), [](const Entry& e) { SOR_FN(); return e.active; }));
+}
+
+std::uint64_t CutPool::sync_active_with_model(const model::LpProblem& lp,
+                                              Index first_cut_row,
+                                              CutDiagnostics* diag) {
+    SOR_FN();
+    if (first_cut_row < 0 || first_cut_row > lp.n_rows()) return 0;
+    struct Present {
+        std::vector<Index> cols;
+        std::vector<f64> unit_vals;
+        f64 rhs_unit = 0.0;
+    };
+    std::vector<Present> present;
+    present.reserve(sz(lp.n_rows() - first_cut_row));
+    const auto& rp = lp.A.pattern.row_ptr();
+    const auto& ci = lp.A.pattern.col_idx();
+    const auto& av = lp.A.vals;
+    for (Index i = first_cut_row; i < lp.n_rows(); ++i) {
+        CutRow cr;
+        const bool has_hi = std::isfinite(lp.row_hi[sz(i)]);
+        const bool has_lo = std::isfinite(lp.row_lo[sz(i)]);
+        if (!has_hi && !has_lo) continue;
+        // Match the pool's <= unit form: prefer a finite upper side, else
+        // negate a finite lower side. Two-sided rows contribute their upper.
+        const bool as_le = has_hi;
+        for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
+            const f64 a = av[sz(k)];
+            if (a == 0.0) continue;
+            cr.cols.push_back(ci[sz(k)]);
+            cr.vals.push_back(as_le ? a : -a);
+        }
+        cr.row_lo = -model::kInf;
+        cr.row_hi = as_le ? lp.row_hi[sz(i)] : -lp.row_lo[sz(i)];
+        Present p;
+        if (!normalized_le(cr, p.unit_vals, p.rhs_unit)) continue;
+        p.cols = std::move(cr.cols);
+        present.push_back(std::move(p));
+    }
+    const auto same = [](const Entry& e, const Present& p) {
+        if (e.cut.cols != p.cols || e.unit_vals.size() != p.unit_vals.size())
+            return false;
+        constexpr f64 kTol = 1e-9;
+        if (std::fabs(e.rhs_unit - p.rhs_unit) > kTol) return false;
+        for (std::size_t k = 0; k < e.unit_vals.size(); ++k)
+            if (std::fabs(e.unit_vals[k] - p.unit_vals[k]) > kTol) return false;
+        return true;
+    };
+    std::uint64_t released = 0;
+    for (Entry& e : entries_) {
+        if (!e.active) continue;
+        bool found = false;
+        for (const Present& p : present) {
+            if (same(e, p)) {
+                found = true;
+                break;
+            }
+        }
+        if (found) continue;
+        e.active = false;
+        e.age = 0;  // freshly released: do not age out before a reactivation chance
+        ++released;
+    }
+    if (diag != nullptr) diag->pool_released += released;
+    return released;
+}
+
+std::vector<CutRow> CutPool::retained_inactive() const {
+    SOR_FN();
+    std::vector<CutRow> out;
+    for (const Entry& e : entries_)
+        if (e.ever_selected && !e.active) out.push_back(e.cut);
+    return out;
 }
 
 void CutPool::start_round(CutDiagnostics& diag) {
@@ -119,11 +245,10 @@ void CutPool::start_round(CutDiagnostics& diag) {
 void CutPool::add(const std::vector<CutRow>& candidates,
                   CutDiagnostics& diag) {
     SOR_FN();
-    constexpr f64 kCosRoundoff = 1e-12;
     for (const auto& cut : candidates) {
         Entry incoming;
         incoming.cut = cut;
-        if (!canonicalize(incoming.cut) ||
+        if (!(lp_ctx_ ? compile_cut(incoming.cut, *lp_ctx_, opts_) : canonicalize(incoming.cut)) ||
             !normalized_le(incoming.cut, incoming.unit_vals, incoming.rhs_unit))
             continue;
         // Reject cuts whose support is outside the scoring context (stale
@@ -142,21 +267,11 @@ void CutPool::add(const std::vector<CutRow>& candidates,
                 ++it;
                 continue;
             }
-            const f64 cosine = sparse_dot(it->cut, it->unit_vals,
-                                          incoming.cut, incoming.unit_vals);
-            if (cosine < 1.0 - opts_.pool_duplicate_tol - kCosRoundoff) {
-                ++it;
-                continue;
-            }
-            const f64 rhs_delta = incoming.rhs_unit - it->rhs_unit;
-            if (std::fabs(rhs_delta) <= opts_.pool_duplicate_tol) {
-                ++diag.pool_duplicates;
-                reject = true;
-                break;
-            }
-            // In normalized <= form, the smaller rhs is the stronger cut.
-            if (rhs_delta > 0.0) {
-                ++diag.pool_dominated;
+            const auto comparison = compare_cut_rhs(incoming.cut, it->cut);
+            if (!comparison) { ++it; continue; }
+            if (*comparison >= 0) {
+                if (*comparison == 0) ++diag.pool_duplicates;
+                else ++diag.pool_dominated;
                 reject = true;
                 break;
             }
@@ -262,6 +377,13 @@ std::vector<CutRow> CutPool::select_violated(const std::vector<f64>& x,
             activity += entry.unit_vals[k] * x[sz(j)];
         }
         entry.last_efficacy = valid_point ? activity - entry.rhs_unit : 0.0;
+        for (const auto& point : references_) {
+            if (point.size() != x.size()) continue;
+            f64 a = 0.0;
+            for (std::size_t k = 0; k < entry.cut.cols.size(); ++k)
+                a += entry.unit_vals[k] * point[sz(entry.cut.cols[k])];
+            entry.last_efficacy = std::max(entry.last_efficacy, a - entry.rhs_unit);
+        }
         if (entry.last_efficacy < opts_.pool_efficacy_min) continue;
         max_eff = std::max(max_eff, entry.last_efficacy);
         order.push_back(i);
@@ -397,7 +519,10 @@ std::vector<CutRow> CutPool::select_violated(const std::vector<f64>& x,
         if (best == entries_.size()) break;
 
         alive[best] = 0;
+        if (entries_[best].ever_selected && !entries_[best].active)
+            ++diag.pool_reactivated;
         entries_[best].active = true;
+        entries_[best].ever_selected = true;
         entries_[best].age = 0;
         chosen.push_back(best);
         nnz_used += static_cast<f64>(entries_[best].cut.cols.size());
@@ -440,7 +565,8 @@ std::vector<CutRow> CutPool::select_violated(const std::vector<f64>& x,
 bool relax_small_terms(std::vector<Index>& cols, std::vector<f64>& vals, f64& rhs,
                        bool geq, const std::vector<f64>& lo,
                        const std::vector<f64>& hi, f64 dynamism_max,
-                       std::vector<std::pair<Index, f64>>* used_bounds) {
+                       const std::vector<f64>* root_lo,
+                       const std::vector<f64>* root_hi, bool* used_local) {
     if (cols.size() != vals.size() || cols.empty() || !(dynamism_max > 1.0))
         return false;
     f64 max_abs = 0.0;
@@ -449,7 +575,7 @@ bool relax_small_terms(std::vector<Index>& cols, std::vector<f64>& vals, f64& rh
     const f64 thr = max_abs / dynamism_max;
     std::vector<Index> kept_cols;
     std::vector<f64> kept_vals;
-    std::vector<std::pair<Index, f64>> used;
+    bool local = false;
     f64 new_rhs = rhs;
     for (std::size_t k = 0; k < cols.size(); ++k) {
         const f64 v = vals[k];
@@ -466,14 +592,14 @@ bool relax_small_terms(std::vector<Index>& cols, std::vector<f64>& vals, f64& rh
         const f64 bound = use_lower ? lo[sz(cols[k])] : hi[sz(cols[k])];
         if (!std::isfinite(bound)) return false;
         new_rhs -= v * bound;
-        used.emplace_back(cols[k], bound);
+        if (!root_implies_bound(root_lo, root_hi, cols[k], !use_lower, bound))
+            local = true;
     }
     if (kept_cols.empty() || !std::isfinite(new_rhs)) return false;
     cols = std::move(kept_cols);
     vals = std::move(kept_vals);
     rhs = new_rhs;
-    if (used_bounds != nullptr)
-        used_bounds->insert(used_bounds->end(), used.begin(), used.end());
+    if (used_local != nullptr && local) *used_local = true;
     return true;
 }
 
@@ -576,7 +702,11 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
                                        const std::vector<f64>& x,
                                        const engines::SimplexBasis& basis,
                                        const CutOptions& opts,
-                                       CutDiagnostics& diag) {
+                                       CutDiagnostics& diag,
+                                       const std::vector<f64>* root_lo,
+                                       const std::vector<f64>* root_hi,
+                                       const BasisInverseRow* inverse_row) {
+    core::WorkScope work_scope_(core::WorkCat::Separation);
     SOR_FN();
     const Index m = lp.n_rows();
     const Index ns = lp.n_cols();
@@ -594,38 +724,47 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
     const auto& ari = Acsc.pattern.row_idx();
     const auto& acv = Acsc.vals;
 
-    std::vector<core::Offset> bcol_ptr(sz(m) + 1, 0);
-    std::vector<Index> brow_idx;
-    std::vector<f64> bvals;
-    brow_idx.reserve(sz(lp.nnz()));
-    bvals.reserve(sz(lp.nnz()));
     for (Index slot = 0; slot < m; ++slot) {
         const Index bj = basis.basic[sz(slot)];
-        if (bj >= 0 && bj < ns) {
-            for (core::Offset k = acp[sz(bj)]; k < acp[sz(bj) + 1]; ++k) {
-                brow_idx.push_back(ari[sz(k)]);
-                bvals.push_back(acv[sz(k)]);
-            }
-        } else if (bj >= ns && bj < nt) {
-            brow_idx.push_back(bj - ns);
-            bvals.push_back(-1.0);
-        } else {
-            return {};  // malformed basis
-        }
-        bcol_ptr[sz(slot) + 1] = static_cast<core::Offset>(brow_idx.size());
+        if (bj < 0 || bj >= nt) return {};  // malformed basis
     }
-
+    // GMI's own factorization of the basis, built only when the engine's
+    // rows are unavailable or fail their check.
     la::BasisFactor factor;
-    la::LuOptions lu_opts;
-    std::vector<Index> singular_slots, vacant_rows;
-    const bool factored = factor.factorize(m, bcol_ptr, brow_idx, bvals, lu_opts,
-                                           &singular_slots, &vacant_rows);
-    // A partially-repaired factorization does not represent the true B^-1;
-    // skip this round rather than derive a cut from the wrong inverse.
-    if (!factored || !factor.is_valid()) {
-        ++diag.gmi_invalid_factor;
-        return {};
-    }
+    bool own_factor_tried = false, own_factor_ok = false;
+    const auto own_factor = [&]() -> bool {
+        if (own_factor_tried) return own_factor_ok;
+        own_factor_tried = true;
+        std::vector<core::Offset> bcol_ptr(sz(m) + 1, 0);
+        std::vector<Index> brow_idx;
+        std::vector<f64> bvals;
+        brow_idx.reserve(sz(lp.nnz()));
+        bvals.reserve(sz(lp.nnz()));
+        for (Index slot = 0; slot < m; ++slot) {
+            const Index bj = basis.basic[sz(slot)];
+            if (bj < ns) {
+                for (core::Offset k = acp[sz(bj)]; k < acp[sz(bj) + 1]; ++k) {
+                    brow_idx.push_back(ari[sz(k)]);
+                    bvals.push_back(acv[sz(k)]);
+                }
+            } else {
+                brow_idx.push_back(bj - ns);
+                bvals.push_back(-1.0);
+            }
+            bcol_ptr[sz(slot) + 1] = static_cast<core::Offset>(brow_idx.size());
+        }
+        la::LuOptions lu_opts;
+        std::vector<Index> singular_slots, vacant_rows;
+        const bool factored = factor.factorize(m, bcol_ptr, brow_idx, bvals, lu_opts,
+                                               &singular_slots, &vacant_rows);
+        ++diag.gmi_own_factorizations;
+        // A partially-repaired factorization does not represent the true B^-1;
+        // no cut is derived from the wrong inverse.
+        own_factor_ok = factored && factor.is_valid();
+        if (!own_factor_ok) ++diag.gmi_invalid_factor;
+        return own_factor_ok;
+    };
+    if (inverse_row == nullptr && !own_factor()) return {};
 
     // ---- per-column bookkeeping over the augmented [A | -I] space --------
     std::vector<char> is_basic(sz(nt), 0);
@@ -667,6 +806,13 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
     std::vector<CutRow> cuts;
     constexpr f64 kZeroTol = 1e-11;
     int cmir_attempts = 0;
+    // Provenance: a structural column's bound the derivation consumed is a
+    // global fact only when the root box implies it. A logical's bounds are
+    // its row's sides, which belong to the rows of `lp`.
+    const bool root_known = root_lo != nullptr && root_hi != nullptr;
+    const auto global_bound = [&](Index z, bool upper, f64 b) {
+        return z >= ns || root_implies_bound(root_lo, root_hi, z, upper, b);
+    };
 
     struct TableauCandidate {
         Index slot;
@@ -714,10 +860,10 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
             });
     }
     int tableau_trials = 0;
-    const auto gmi_started = std::chrono::steady_clock::now();
+    const auto gmi_started = sor::core::SolverClock::now();
     for (const auto& candidate : tableau_candidates) {
         if (opts.time_limit_s > 0.0 && (tableau_trials & 7) == 0 &&
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - gmi_started).count() >=
+            std::chrono::duration<double>(sor::core::SolverClock::now() - gmi_started).count() >=
                 opts.time_limit_s) {
             ++diag.time_stops;
             break;
@@ -735,26 +881,61 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
         if (basic_activity) ++diag.integer_activity_candidates;
 
         // y = B^-T e_slot: row `slot` of the tableau is y' A (structural)
-        // and -y (slack), computed with one CSR sweep below.
-        std::vector<f64> y(sz(m), 0.0);
-        y[sz(slot)] = 1.0;
-        factor.btran(y);
-
+        // and -y (slack), computed with one CSR sweep below. From the
+        // engine's factor when it supplies the row and the row passes its
+        // check (the tableau's basic columns form the unit vector e_slot),
+        // else from GMI's own factorization.
+        std::vector<f64> y;
         std::vector<f64> tab(sz(nt), 0.0);
-        for (Index i = 0; i < m; ++i)
-            for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
-                tab[sz(ci[sz(k)])] += y[sz(i)] * av[sz(k)];
-        for (Index i = 0; i < m; ++i) tab[sz(ns + i)] = -y[sz(i)];
+        const auto sweep = [&]() {
+            // Rows with y_i = 0 add exact zeros: skipping them leaves tab
+            // bit-identical and makes the sweep cost y's support, not nnz(A).
+            std::fill(tab.begin(), tab.end(), 0.0);
+            std::uint64_t swept = static_cast<std::uint64_t>(nt);
+            for (Index i = 0; i < m; ++i) {
+                if (y[sz(i)] == 0.0) continue;
+                swept += static_cast<std::uint64_t>(rp[sz(i) + 1] - rp[sz(i)]);
+                for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k)
+                    tab[sz(ci[sz(k)])] += y[sz(i)] * av[sz(k)];
+            }
+            for (Index i = 0; i < m; ++i) tab[sz(ns + i)] = -y[sz(i)];
+            core::work_add(swept, ::sor::core::WorkTag::Gmi);
+        };
+        bool have_row = false;
+        if (inverse_row != nullptr && (*inverse_row)(slot, y) && y.size() == sz(m)) {
+            sweep();
+            bool unit = true;
+            for (Index k = 0; k < m && unit; ++k) {
+                const f64 want = k == slot ? 1.0 : 0.0;
+                const f64 got = tab[sz(basis.basic[sz(k)])];
+                if (!(std::fabs(got - want) <= 1e-9)) unit = false;
+            }
+            if (unit) {
+                have_row = true;
+                ++diag.gmi_engine_rows;
+            } else {
+                ++diag.gmi_engine_rows_rejected;
+            }
+        }
+        if (!have_row) {
+            if (!own_factor()) break;
+            y.assign(sz(m), 0.0);
+            y[sz(slot)] = 1.0;
+            factor.btran(y);
+            sweep();
+        }
 
         CutRow gmi_cut;
         bool have_gmi = false;
         f64 gmi_eff = -1.0;
         // Outer-level `continue` below leaves this block (the condition is
         // false), so a refused GMI still falls through to the c-MIR attempt.
+        bool gmi_local = !root_known;
         do {
         std::vector<f64> struct_coef(sz(ns), 0.0);
         f64 rhs = 1.0;
         bool reject_free = false;
+        gmi_local = !root_known;
         for (Index j = 0; j < nt; ++j) {
             if (is_basic[sz(j)]) continue;
             const f64 alpha = tab[sz(j)];
@@ -768,6 +949,9 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
             const bool at_lower = (st == engines::NonbasicStatus::AtLower);
             const f64 gamma = at_lower ? alpha : -alpha;
             const f64 active_bound = at_lower ? lo[sz(j)] : hi[sz(j)];
+            // The term is z_j shifted onto active_bound (t >= 0): that bound
+            // is what the cut assumes about z_j.
+            if (!global_bound(j, !at_lower, active_bound)) gmi_local = true;
             // Complementing an integer variable about a fractional bound
             // makes the transformed variable nonintegral. Such a term must
             // use the continuous MIR coefficient, including for structural
@@ -792,23 +976,12 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
             } else {
                 coeff = (gamma >= 0.0) ? (gamma / f0) : (-gamma / (1.0 - f0));
             }
-            if (coeff <= kZeroTol) {
-                // A5: dropping this term silently is exact only when the
-                // coeff*bound contribution it would have added to rhs
-                // (lines below, for a kept term) is itself exactly 0. A
-                // rounded-to-~0 coefficient times a large or infinite bound
-                // is not negligible, and omitting it can produce a cut that
-                // excludes a feasible point. Refuse the candidate rather
-                // than risk that -- cheaper and safer than deriving the
-                // exact relaxation for every case here.
-                const f64 bound = at_lower ? lo[sz(j)] : hi[sz(j)];
-                if (bound != 0.0) {
-                    reject_free = true;
-                    ++diag.rejected_dropped_term_bound;
-                    break;
-                }
-                continue;
-            }
+            // coeff >= 0 multiplies t >= 0 in a >= cut, so no positive
+            // coefficient may be dropped here however small: the cut would
+            // claim more than the row gives wherever t is large. A tiny one
+            // is kept and leaves below, through the structural bound step,
+            // which moves its largest contribution into the right-hand side.
+            if (coeff == 0.0) continue;
 
             const f64 local = at_lower ? coeff : -coeff;
             if (at_lower) rhs += coeff * lo[sz(j)];
@@ -840,6 +1013,7 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
                     break;
                 }
                 rhs -= v * bound;
+                if (!global_bound(k, v > 0.0, bound)) gmi_local = true;
                 continue;
             }
             cols.push_back(k);
@@ -855,7 +1029,7 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
         if (max_abs / std::max(min_abs, 1e-300) > opts.dynamism_max &&
             opts.relax_small_terms &&
             relax_small_terms(cols, vals_out, rhs, true, lp.col_lo, lp.col_hi,
-                              opts.dynamism_max)) {
+                              opts.dynamism_max, root_lo, root_hi, &gmi_local)) {
             ++diag.dynamism_repaired;
             max_abs = 0.0;
             min_abs = std::numeric_limits<f64>::infinity();
@@ -888,6 +1062,9 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
                     vals_out = std::move(new_vals);
                     rhs = new_rhs;
                     ++diag.cmir_recovered;
+                    // The re-rounding substitutes onto lp's box and reports
+                    // no provenance: the cut stays where it was derived.
+                    gmi_local = true;
                 }
             }
             if (!recovered) {
@@ -911,6 +1088,7 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
         gmi_cut.vals = std::move(vals_out);
         gmi_cut.row_lo = rhs;
         gmi_cut.row_hi = model::kInf;
+        gmi_cut.used_local_bound = gmi_local;
         gmi_eff = violation / std::sqrt(gnorm2);
         have_gmi = true;
         } while (false);
@@ -962,6 +1140,15 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
                 v.integral = integral_z(j) && is_integral_bound(v.bound);
                 tv.push_back(v);
             }
+            // Every shifted term assumes its bound; a fixed one is a
+            // constant, which assumes both.
+            bool tc_local = !root_known;
+            for (const TabVar& v : tv) {
+                if (!global_bound(v.z, v.at_upper, v.bound)) tc_local = true;
+                if (v.fixed && !global_bound(v.z, !v.at_upper, v.at_upper ? lo[sz(v.z)]
+                                                                          : hi[sz(v.z)]))
+                    tc_local = true;
+            }
             std::vector<std::pair<Index, f64>> wz;
             f64 rz = 0.0;
             if (ok && tv.size() >= 2 &&
@@ -988,7 +1175,8 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
                     if (mx / mn > opts.dynamism_max)
                         good = opts.relax_small_terms &&
                                relax_small_terms(cc, vv, crhs, true, lp.col_lo,
-                                                 lp.col_hi, opts.dynamism_max);
+                                                 lp.col_hi, opts.dynamism_max,
+                                                 root_lo, root_hi, &tc_local);
                 }
                 if (good) {
                     f64 act = 0.0, n2 = 0.0;
@@ -1006,6 +1194,7 @@ std::vector<CutRow> separate_gomory_mi(const model::LpProblem& lp,
                         gmi_cut.vals = std::move(vv);
                         gmi_cut.row_lo = crhs;
                         gmi_cut.row_hi = model::kInf;
+                        gmi_cut.used_local_bound = tc_local;
                         gmi_eff = eff;
                         have_gmi = true;
                     }
@@ -1065,6 +1254,8 @@ f64 max_row_parallelism(const model::LpProblem& lp,
     for (const Index j : cut.cols)
         if (j < 0 || j >= n) return 0.0;
 
+    // Two dense scratch vectors per candidate: O(n + m) before any row.
+    core::work_add(static_cast<std::uint64_t>(n + lp.n_rows()) / 8 + cut.cols.size(), ::sor::core::WorkTag::Parallelism);
     std::vector<f64> dense(sz(n), 0.0);
     for (std::size_t k = 0; k < cut.cols.size(); ++k)
         dense[sz(cut.cols[k])] = cut.vals[k];
@@ -1100,6 +1291,7 @@ void apply_cuts_inplace(model::LpProblem& lp,
                         const std::vector<CutRow>& cuts,
                         const CutOptions& opts,
                         CutUndo* undo) {
+    core::WorkScope work_scope_(core::WorkCat::Separation);
     SOR_FN();
     if (undo != nullptr) {
         *undo = CutUndo{};
@@ -1107,15 +1299,6 @@ void apply_cuts_inplace(model::LpProblem& lp,
         undo->names_were_empty = lp.row_names.empty();
     }
     if (cuts.empty()) return;
-
-    std::vector<std::vector<Index>> col_rows(sz(lp.n_cols()));
-    {
-        const auto& rp0 = lp.A.pattern.row_ptr();
-        const auto& ci0 = lp.A.pattern.col_idx();
-        for (Index i = 0; i < lp.n_rows(); ++i)
-            for (core::Offset k = rp0[sz(i)]; k < rp0[sz(i) + 1]; ++k)
-                col_rows[sz(ci0[sz(k)])].push_back(i);
-    }
 
     const Index m0 = lp.n_rows();
     const Index n = lp.n_cols();
@@ -1155,8 +1338,10 @@ void apply_cuts_inplace(model::LpProblem& lp,
             if (j < 0 || j >= n) return false;
         return true;
     };
-    for (const auto& cut : cuts) {
-        if (!cut_cols_in_range(cut)) continue;
+    for (const auto& raw_cut : cuts) {
+        if (!cut_cols_in_range(raw_cut)) continue;
+        CutRow cut = raw_cut;
+        if (!compile_cut(cut, lp, opts)) continue;
         f64 cs = 0.0;
         const std::string key = row_signature(cut.cols, cut.vals, cs);
         const auto it = key.empty() ? shape_of.end() : shape_of.find(key);
@@ -1180,9 +1365,45 @@ void apply_cuts_inplace(model::LpProblem& lp,
                 row_signature(pending[q].cols, pending[q].vals, rsc);
             }
             if (rsc == 0.0) continue;
-            const f64 ratio = rsc / cs;
-            f64 lo = cut.row_lo * ratio, hi = cut.row_hi * ratio;
-            if (ratio < 0.0) std::swap(lo, hi);
+            // The signature compares rounded ratios, which is a candidate
+            // index, not a proof of proportionality: with N = 2^52 the rows
+            // (N+1, N) and (N, N-1) share a signature. Tightening a row with
+            // a non-proportional cut's side can cut off points both admit,
+            // so proportionality is checked exactly (r_k cs == c_k rsc), and
+            // the side is mapped exactly (s rsc / cs) and rounded outward.
+            {
+                const std::vector<f64>* rv = &rvals;
+                if (i >= m0) rv = &pending[static_cast<std::size_t>(i - m0)].vals;
+                bool proportional = rv->size() == cut.vals.size();
+                for (std::size_t k = 0; k < cut.vals.size() && proportional; ++k) {
+                    model::DyadicSum d;
+                    d.add_product((*rv)[k], cs);
+                    d.add_product(-cut.vals[k], rsc);
+                    proportional = d.is_zero();
+                }
+                if (!proportional) {
+                    pending.push_back(cut);
+                    continue;
+                }
+            }
+            const bool flip = (rsc < 0.0) != (cs < 0.0);
+            // Image of a cut side in the row's scale, rounded outward for
+            // the row side it bounds (upper: up, lower: down).
+            const auto image = [&](f64 side, bool bounds_upper) {
+                if (!std::isfinite(side))
+                    return bounds_upper ? model::kInf : -model::kInf;
+                model::DyadicSum v;
+                v.add_product(side, rsc);
+                return bounds_upper ? v.quotient_up(cs) : v.quotient_down(cs);
+            };
+            f64 lo, hi;
+            if (!flip) {
+                lo = image(cut.row_lo, false);
+                hi = image(cut.row_hi, true);
+            } else {
+                lo = image(cut.row_hi, false);
+                hi = image(cut.row_lo, true);
+            }
             if (i < m0) {
                 if (undo != nullptr) {
                     // First touch of this row in this round: save the bounds
@@ -1211,11 +1432,7 @@ void apply_cuts_inplace(model::LpProblem& lp,
             }
             continue;
         }
-        // Near-parallel to an existing row: not exactly proportional, so the
-        // exact merge above cannot fold it in, but close enough that adding it
-        // buys almost no new direction while contributing near-dependence.
-        if (max_row_parallelism(lp, col_rows, cut) > opts.parallel_to_row_max)
-            continue;
+        // Similar normals are a selection cost, never proof of dominance.
         pending.push_back(cut);
         if (!key.empty())
             shape_of.emplace(key, m0 + static_cast<Index>(pending.size()) - 1);

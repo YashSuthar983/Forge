@@ -1,4 +1,4 @@
-// SOR - formulation symmetry (WP-G), paper-complete:
+// SOR - formulation symmetry (WP-G), verified services:
 //   Reflection (Hojny arXiv:2405.08379) + Folding (van der Hulst arXiv:2603.12136).
 //
 // LAYER L5. Clean-room:
@@ -9,6 +9,8 @@
 //     (identical-parallel binary/integer + continuous equitable sum folds)
 //     with mandatory lift back to original space.
 #pragma once
+
+#include "sor/core/cancel.hpp"
 
 #include "sor/core/result.hpp"
 #include "sor/model/lp.hpp"
@@ -24,6 +26,7 @@ using core::f64;
 using core::Index;
 
 struct SymmetryOptions {
+    const core::CancelToken* cancel = nullptr;
     // Wall budget for symmetry detection, seconds. 0 = unlimited.
     // Unbudgeted this ran 25.3 s against a 1 s solver limit on atlanta-ip.
     double time_limit_s = 0.0;
@@ -37,11 +40,11 @@ struct SymmetryOptions {
     // Orbital fixing on binary orbits that are pairwise conflicting in `cg`
     // (AMO). Never applied to non-clique orbits - that would cut optima.
     bool orbital_fixing = true;
-    // Reflection-complete: signed SDG detection + orbitopal/lex SBCs +
+    // Verified reflection: signed SDG detection + orbitopal/lex SBCs +
     // reflection orbital fixing. Default OFF until SBCs are validated on
     // MIPLIB (enigma was falsely proved Infeasible with per-pair cuts).
     bool reflection = false;
-    // Folding-complete: CR dimension reduction + lift.
+    // Exact folding: CR dimension reduction + lift.
     bool folding = true;
     // Append static orbitopal / reflection half-space rows when valid.
     bool orbitopal_sbc = true;
@@ -63,7 +66,7 @@ enum class FoldKind : std::uint8_t {
 struct FoldGroup {
     Index representative = -1;
     std::vector<Index> members;  // includes representative; sorted
-    Index capacity = 0;          // upper on folded integer sum (= |members| * ub)
+    f64 capacity = 0.0;          // upper on folded sum, never a column index
     FoldKind kind = FoldKind::BinarySum;
     f64 member_lo = 0.0;
     f64 member_hi = 1.0;
@@ -131,9 +134,11 @@ std::uint64_t apply_orbital_fixing(const ConflictGraph& cg,
                                    std::vector<f64>& col_hi,
                                    f64 tol = 1e-9,
                                    double time_limit_s = 0.0,
-                                   std::uint64_t max_orbit_pairs = 0);
+                                   std::uint64_t max_orbit_pairs = 0,
+                                   PropTrail* trail = nullptr, int depth = 0,
+                                   const core::CancelToken* cancel = nullptr);
 
-// Reflection-complete handling: signed detection, orbitopal/lex SBCs,
+// Verified reflection handling: signed detection, orbitopal/lex SBCs,
 // reflection orbital fixing. May append rows to `lp`.
 std::uint64_t apply_reflection_symmetry(model::LpProblem& lp,
                                         std::vector<f64>& col_lo,
@@ -142,7 +147,7 @@ std::uint64_t apply_reflection_symmetry(model::LpProblem& lp,
                                         const SymmetryOptions& opts,
                                         SymmetryDiagnostics& diag);
 
-// Folding-complete: CR orbits → exact aggregates when safe (identical
+// Exact folding: CR orbits → exact aggregates when safe (identical
 // parallel binary/integer, continuous equitable sum). Mutates bounds.
 std::uint64_t apply_folding_symmetry(model::LpProblem& lp,
                                      std::vector<f64>& col_lo,

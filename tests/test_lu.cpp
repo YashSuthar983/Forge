@@ -5,6 +5,7 @@
 // number. So every check here is against a matrix multiply the test does itself,
 // never against the factorization's own view of things.
 #include "sor/la/lu.hpp"
+#include "sor/core/parallel.hpp"
 #include "sor/core/env_switches.hpp"
 
 #include "test_helpers.hpp"
@@ -1030,9 +1031,82 @@ void test_collective_ft_noop_when_nothing_pending() {
     check_solves(b, f, "collapse with nothing pending", 1e-9);
 }
 
+// Checkpoint copies share immutable factors but own updates and solve scratch.
+// Verify both sides against independently held matrices after every mutation.
+void test_checkpoint_copy_isolation() {
+    std::mt19937 rng(101);
+    ColMat original = random_basis(17, 0.15, rng);
+    BasisFactor parent;
+    CHECK(parent.factorize(original.m, original.col_ptr, original.row_idx, original.vals, LuOptions{}));
+    check_solves(original, parent, "parent before copy", 1e-9);
+    for (bool ft : {false, true}) {
+        BasisFactor child = parent;
+        ColMat changed = original;
+        const Index slot = 3;
+        std::vector<f64> entering(sz(original.m), 0);
+        for (Offset k = original.col_ptr[sz(slot)]; k < original.col_ptr[sz(slot)+1]; ++k)
+            entering[sz(original.row_idx[sz(k)])] = 2 * original.vals[sz(k)];
+        auto alpha = entering; child.ftran(alpha);
+        CHECK(ft ? child.update_ft(slot, alpha, LuOptions{}) : child.update(slot, alpha));
+        std::vector<Index> rows; std::vector<f64> values;
+        for (Index i = 0; i < original.m; ++i) if (entering[sz(i)] != 0) {
+            rows.push_back(i); values.push_back(entering[sz(i)]);
+        }
+        changed.set_col(slot, rows, values);
+        check_solves(changed, child, "mutated child", 1e-9);
+        check_solves(original, parent, "parent unchanged after update", 1e-9);
+        BasisFactor sibling = child;
+        CHECK(child.collapse_pending_into_ft(LuOptions{}));
+        check_solves(changed, sibling, "sibling unchanged after collapse", 1e-9);
+        CHECK(child.factorize(original.m, original.col_ptr, original.row_idx, original.vals, LuOptions{}));
+        check_solves(changed, sibling, "sibling unchanged after refactor", 1e-9);
+        check_solves(original, child, "refactored child", 1e-9);
+    }
+}
+
+void test_structural_factor_composition() {
+    ColMat old; old.m = 2; old.col_ptr = {0,2,4}; old.row_idx = {0,1,0,1}; old.vals = {2,1,1,3};
+    BasisFactor factor;
+    CHECK(factor.factorize(2, old.col_ptr, old.row_idx, old.vals, LuOptions{}));
+    factor.extend_logical_rows(2, {0,2,4}, {0,1,0,1}, {4,-2,1,5});
+    ColMat border; border.m = 4; border.col_ptr = {0,4,8,9,10};
+    border.row_idx = {0,1,2,3,0,1,2,3,2,3}; border.vals = {2,1,4,1,1,3,-2,5,-1,-1};
+    check_solves(border, factor, "bordered", 1e-10);
+    CHECK(factor.check_invariants());
+    BasisFactor sibling = factor;
+    std::vector<f64> entering{1,2,1,0}; auto alpha = entering;
+    factor.ftran(alpha); CHECK(factor.update(0, alpha, 1e-12));
+    border.set_col(0, {0,1,2,3}, entering);
+    check_solves(border, factor, "updated border", 1e-10);
+    CHECK_FTRAN_PAIR(factor, (std::vector<f64>{1,0,0,0}), (std::vector<f64>{0,1,2,3}), "border pair");
+    sor::core::ThreadPool pool(3);
+    std::vector<std::vector<f64>> rhs{{1,2,3,4},{2,0,1,0},{0,0,0,1}};
+    const auto inputs = rhs;
+    factor.solve_batch(rhs, &pool);
+    for (std::size_t q = 0; q < rhs.size(); ++q) CHECK(max_abs_diff(border.apply(rhs[q]), inputs[q]) < 1e-10);
+    // Drop a logical-basic row, permuting both equation and basis-slot order.
+    const std::vector<Index> rows{3,0,1}, slots{1,0,3};
+    factor.retain_logical_rows(rows, slots);
+    ColMat projected; projected.m = 3;
+    for (Index slot : slots) {
+        for (std::size_t r = 0; r < rows.size(); ++r)
+            for (Offset k = border.col_ptr[sz(slot)]; k < border.col_ptr[sz(slot)+1]; ++k)
+                if (border.row_idx[sz(k)] == rows[r]) { projected.row_idx.push_back(static_cast<Index>(r)); projected.vals.push_back(border.vals[sz(k)]); }
+        projected.col_ptr.push_back(static_cast<Offset>(projected.vals.size()));
+    }
+    check_solves(projected, factor, "projected updated border", 1e-10);
+    alpha = {1,0,2}; auto new_col = alpha; factor.ftran(alpha);
+    CHECK(factor.update(1, alpha, 1e-12)); projected.set_col(1,{0,1,2},new_col);
+    check_solves(projected, factor, "updated projection", 1e-10);
+    CHECK(factor.check_invariants());
+    check_solves(old, [&] { auto original = sibling; original.retain_logical_rows({0,1},{0,1}); return original; }(), "sibling parent unchanged", 1e-10);
+}
+
 }  // namespace
 
 int main() {
+    test_structural_factor_composition();
+    test_checkpoint_copy_isolation();
     test_identity_basis();
     test_random_solves();
     test_ftran_pair_fresh_factorization_and_zero_rhs();

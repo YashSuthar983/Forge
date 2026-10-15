@@ -252,9 +252,154 @@ void test_separator_families() {
     }
 }
 
+// Tree rows as a working set (TreeCutOptions::row_age_limit), driven hard:
+// separation at every node, rows purged as soon as one node LP leaves them
+// slack, a purge pass and a reinjection at every node. Every purge rewrites the
+// global rows under stored nodes' warm starts and trails, and deleted cuts
+// enter again; the answers must not move.
+LpProblem make_tree_milp(std::uint32_t seed) {
+    std::uint32_t state = seed * 2654435761u + 97u;
+    const Index n = 10 + static_cast<Index>(next(state) % 4);
+    const Index m = 4 + static_cast<Index>(next(state) % 3);
+    LpProblem p;
+    p.maximize = true;
+    p.name = "tree_" + std::to_string(seed);
+    p.c.resize(static_cast<std::size_t>(n));
+    p.col_lo.assign(static_cast<std::size_t>(n), 0.0);
+    p.col_hi.resize(static_cast<std::size_t>(n));
+    p.is_integer.assign(static_cast<std::size_t>(n), true);
+    for (Index j = 0; j < n; ++j) {
+        p.c[static_cast<std::size_t>(j)] = 3.0 + static_cast<double>(next(state) % 17);
+        p.col_hi[static_cast<std::size_t>(j)] = (next(state) % 4 == 0) ? 2.0 : 1.0;
+    }
+    std::vector<Index> rows, cols;
+    std::vector<double> vals;
+    p.row_lo.assign(static_cast<std::size_t>(m), -sor::model::kInf);
+    p.row_hi.resize(static_cast<std::size_t>(m));
+    for (Index i = 0; i < m; ++i) {
+        double sum = 0.0;
+        for (Index j = 0; j < n; ++j) {
+            if (next(state) % 3 == 0) continue;
+            const double a = 2.0 + static_cast<double>(next(state) % 19);
+            rows.push_back(i);
+            cols.push_back(j);
+            vals.push_back(a);
+            sum += a * p.col_hi[static_cast<std::size_t>(j)];
+        }
+        p.row_hi[static_cast<std::size_t>(i)] = std::floor(sum * (25 + next(state) % 20) / 100.0);
+    }
+    p.A = sor::sparse::from_triplets(m, n, rows, cols, vals);
+    p.validate();
+    return p;
+}
+
+void test_tree_row_working_set() {
+    std::uint64_t promoted = 0, purged = 0, remapped = 0, reentered = 0, reasons = 0, fitted = 0;
+    for (std::uint32_t seed = 1; seed <= 120; ++seed) {
+        const LpProblem lp = make_tree_milp(seed);
+        const OracleResult oracle = solve_oracle(lp);
+        CHECK(oracle.feasible);
+        if (!oracle.feasible) continue;
+        sor::search::BabOptions o;
+        o.para_bab.threads = 1;
+        o.structural_presolve.enabled = false;
+        o.gap_tol = o.abs_gap_tol = 1e-9;
+        o.heuristic_proof_gap = 0.0;   // keep separating once an incumbent is in
+        o.cut_reference_point = &oracle.x;
+        // Keep a real tree: root services and primal heuristics otherwise close
+        // these tiny models before purge/remap/reinject can run.
+        o.mip_presolve = o.probing = o.symmetry = false;
+        o.integer_row_rounding = false;
+        o.feasibility_jump = false;
+        o.fixprop = false;
+        o.sub_mip_lns = false;
+        o.balans.enabled = false;
+        o.kernel_pump.enabled = false;
+        o.mrens.enabled = false;
+        o.integer_dive = false;
+        o.rounding_heuristic = false;
+        o.face_vertices = false;
+        o.structural_presolve.binary_row_max_work = 0;
+        o.tree_cut.always_depth = 1000;
+        o.tree_cut.row_age_limit = 1;
+        o.tree_cut.purge_every_nodes = 1;
+        o.tree_cut.gcs_reinject_every_nodes = 1;
+        o.tree_cut.min_violation_nodes = 1;   // most churn: enter on one sighting
+        o.verify_tree_row_remap = true;
+        sor::search::BabDiagnostics diag;
+        auto raw = sor::search::solve_milp(lp, o, diag);
+        const auto result = sor::certify::finalize_result(
+            std::move(raw), sor::search::milp_evidence(diag, o));
+        if (result.status != Status::Optimal ||
+            std::fabs(result.objective - oracle.objective) > 1e-6)
+            std::cout << "FAIL working set: seed=" << seed << " oracle=" << oracle.objective
+                      << " solver=" << result.objective << " status=" << (int)result.status
+                      << '\n';
+        CHECK(result.status == Status::Optimal);
+        CHECK(std::fabs(result.objective - oracle.objective) <= 1e-6);
+        CHECK(diag.node_cuts_invalid_inserted == 0);
+        CHECK(diag.tree_row_remap_bad == 0);
+        promoted += diag.gcs_promoted;
+        purged += diag.tree_rows_purged;
+        remapped += diag.tree_row_bases_remapped;
+        reentered += diag.gcs_reinjected;
+        reasons += diag.tree_row_reasons_checked;
+        fitted += diag.tree_row_bases_fitted;
+        CHECK(diag.tree_row_bases_fit_failed == 0);
+        CHECK(diag.tree_row_remap_rejected == 0);
+    }
+    std::cout << "WORKING_SET promoted=" << promoted << " purged=" << purged
+              << " bases_remapped=" << remapped << " reinjected=" << reentered
+              << " row_reasons_checked=" << reasons << " fitted_by_lu=" << fitted << '\n';
+    CHECK(purged > 0);
+    CHECK(remapped > 0);
+    CHECK(reentered > 0);
+    CHECK(reasons > 0);
+    CHECK(fitted > 0);   // a binding row left and its node was solved from the fitted basis
+}
+
+// Parallel phases (persistent workers with shared propagators, session LPs,
+// reduced-cost fixing and pseudocost branching) must reach the oracle's
+// optimum. Phases are forced: no adaptive switch, no plunging.
+void test_parallel_workers_match_oracle() {
+    int compared = 0;
+    std::uint64_t expansions = 0;
+    for (std::uint32_t seed = 1; seed <= 80; ++seed) {
+        const LpProblem lp = make_tree_milp(seed);
+        const OracleResult oracle = solve_oracle(lp);
+        if (!oracle.feasible) continue;
+        sor::search::BabOptions o;
+        o.structural_presolve.binary_row_max_work = 0;  // Exercise persistent workers.
+        o.component_solve = false;
+        o.para_bab.threads = 4;
+        o.para_bab_cost.adaptive = false;
+        o.plunge_max_depth = 0;
+        o.structural_presolve.enabled = false;
+        o.cuts_enabled = false;
+        o.gap_tol = o.abs_gap_tol = 1e-9;
+        sor::search::BabDiagnostics diag;
+        auto raw = sor::search::solve_milp(lp, o, diag);
+        const auto result = sor::certify::finalize_result(
+            std::move(raw), sor::search::milp_evidence(diag, o));
+        CHECK(result.status == Status::Optimal);
+        CHECK(std::fabs(result.objective - oracle.objective) <= 1e-6);
+        if (result.status != Status::Optimal ||
+            std::fabs(result.objective - oracle.objective) > 1e-6)
+            std::cout << "FAIL parallel: seed=" << seed << " oracle=" << oracle.objective
+                      << " solver=" << result.objective << '\n';
+        expansions += diag.para_bab.parallel_expansions;
+        ++compared;
+    }
+    std::cout << "PARALLEL compared=" << compared << " expansions=" << expansions << '\n';
+    CHECK(compared > 50);
+    CHECK(expansions > 100);
+}
+
 } // namespace
 
 int main() {
+    test_parallel_workers_match_oracle();
+    test_tree_row_working_set();
     test_random_milps();
     test_separator_families();
     return sor::test::finish("test_milp_random_oracle");

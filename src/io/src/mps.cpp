@@ -7,6 +7,7 @@
 #include "sor/model/dyadic.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cmath>
 #include <cstdio>
@@ -30,6 +31,10 @@ enum class RowKind { Objective, LessEqual, GreaterEqual, Equal };
 std::string upper(std::string s) {
     for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     return s;
+}
+
+void apply_objsense_token(std::string token, bool& maximize) {
+    if (upper(token).rfind("MAX", 0) == 0) maximize = true;
 }
 
 // Whitespace-separated tokens, as `istream >> std::string` in the classic
@@ -87,6 +92,22 @@ std::vector<std::string> split_fixed(const std::string& line) {
 }
 
 f64 parse_num(const std::string& s, std::size_t line_no) {
+    // Fortran fixed-format MPS uses a D exponent ("1.0D-3"). Map D/d to E/e
+    // before parsing so legacy Netlib literals are not hard errors.
+    std::string normalized;
+    const std::string* src = &s;
+    for (std::size_t i = 1; i + 1 < s.size(); ++i) {
+        const char c = s[i];
+        if ((c == 'D' || c == 'd') &&
+            (std::isdigit(static_cast<unsigned char>(s[i - 1])) || s[i - 1] == '.') &&
+            (std::isdigit(static_cast<unsigned char>(s[i + 1])) ||
+             s[i + 1] == '+' || s[i + 1] == '-')) {
+            normalized = s;
+            normalized[i] = (c == 'D') ? 'E' : 'e';
+            src = &normalized;
+            break;
+        }
+    }
     // Fast path: a plain decimal that std::from_chars consumes entirely and
     // reads as a normal, nonzero, finite double. Both it and strtod round
     // correctly, so the value is the same; anything else (a '+' sign
@@ -94,8 +115,8 @@ f64 parse_num(const std::string& s, std::size_t line_no) {
     // out-of-range values, trailing text) takes the strtod path and its
     // exact behavior.
     {
-        const char* first = s.data();
-        const char* last = s.data() + s.size();
+        const char* first = src->data();
+        const char* last = src->data() + src->size();
         if (first != last && *first == '+' && last - first > 1 &&
             first[1] != '+' && first[1] != '-')
             ++first;
@@ -112,8 +133,8 @@ f64 parse_num(const std::string& s, std::size_t line_no) {
     // matrix coefficient, a cost, a lower bound of +inf).
     try {
         std::size_t used = 0;
-        const f64 v = std::stod(s, &used);
-        if (used != s.size() || std::isnan(v)) throw std::invalid_argument("nan or trailing");
+        const f64 v = std::stod(*src, &used);
+        if (used != src->size() || std::isnan(v)) throw std::invalid_argument("nan or trailing");
         return v;
     } catch (...) {
         throw std::runtime_error("MPS line " + std::to_string(line_no) +
@@ -145,8 +166,12 @@ struct Builder {
     bool has_obj_rhs = false;
     // A file may carry several RHS, RANGES and BOUNDS vectors, told apart by
     // set name; one model uses one of each. The first explicit name seen in a
-    // section is the one used. Lines without a name apply to it; lines naming
-    // another set are skipped and counted.
+    // section is the one used. Lines naming another set are skipped and counted.
+    //
+    // RHS/RANGES: once a named set is chosen, anonymous (no set-name) lines are
+    // also skipped -- otherwise a second vector written without names silently
+    // contaminates the first. BOUNDS still accept anonymous lines after a named
+    // set (IBM: "FR X" / "UP X 1" without a set name apply to the active set).
     struct SetChoice {
         std::string name;  // empty until a named line is seen
         std::size_t skipped = 0;
@@ -157,10 +182,18 @@ struct Builder {
             if (skipped++ == 0) first_skipped = n;
             return false;
         }
+        bool use_anonymous(bool allow_after_named) {
+            if (name.empty()) return true;
+            if (allow_after_named) return true;
+            if (skipped++ == 0) first_skipped = "(anonymous)";
+            return false;
+        }
     } rhs_set, range_set, bound_set;
     std::size_t repeated_rhs = 0, repeated_ranges = 0, repeated_bounds = 0;
+    std::size_t discarded_free_n = 0;
     std::vector<f64> col_lo, col_hi;
     std::vector<bool> lo_set, hi_set, integer_flag;
+    std::vector<model::DyadicSum> obj_exact;
 
     Index ensure_col(const std::string& n) {
         auto it = col_of.find(n);
@@ -169,6 +202,7 @@ struct Builder {
         col_of.emplace(n, j);
         col_names.push_back(n);
         obj.push_back(0.0);
+        obj_exact.emplace_back();
         col_lo.push_back(0.0);
         col_hi.push_back(kInf);
         lo_set.push_back(false);
@@ -243,10 +277,10 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
             if (f.empty()) continue;
             const std::string key = upper(f[0]);
             if      (key == "NAME")     { sec = Section::Name; if (f.size() > 1) name = f[1]; }
-            else if (key == "OBJSENSE") { sec = Section::ObjSense;
-                                          if (f.size() > 1 && upper(f[1]).rfind("MAX", 0) == 0)
-                                              maximize = true; }
-            else if (key == "OBJSENS")  { sec = Section::ObjSense; }
+            else if (key == "OBJSENSE" || key == "OBJSENS") {
+                sec = Section::ObjSense;
+                if (f.size() > 1) apply_objsense_token(f[1], maximize);
+            }
             else if (key == "ROWS")     { sec = Section::Rows; }
             else if (key == "COLUMNS")  { sec = Section::Columns; }
             else if (key == "RHS")      { sec = Section::Rhs; }
@@ -288,7 +322,7 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
 
         switch (sec) {
             case Section::ObjSense: {
-                if (upper(f[0]).rfind("MAX", 0) == 0) maximize = true;
+                apply_objsense_token(f[0], maximize);
                 break;
             }
             case Section::Rows: {
@@ -353,8 +387,13 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
                     const f64 v = parse_num(f[k + 1], line_no);
                     const Index slot = it->second;
                     if (b.row_kind[static_cast<std::size_t>(slot)] == RowKind::Objective) {
-                        if (slot == b.obj_slot) b.obj[static_cast<std::size_t>(j)] += v;
-                        // else: an extra free N row -- discarded.
+                        if (slot == b.obj_slot) {
+                            b.obj_exact[static_cast<std::size_t>(j)].add(v);
+                            b.obj[static_cast<std::size_t>(j)] =
+                                b.obj_exact[static_cast<std::size_t>(j)].nearest();
+                        } else {
+                            ++b.discarded_free_n;
+                        }
                     } else if (opt.small_matrix_value > 0.0 &&
                                std::fabs(v) <= opt.small_matrix_value) {
                         // Below the agreed threshold. The column still exists;
@@ -373,7 +412,11 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
             case Section::Rhs: {
                 // First token may be an RHS-set name, or may be omitted.
                 std::size_t k = (f.size() % 2 == 1) ? 1 : 0;
-                if (k == 1 && !b.rhs_set.use(f[0])) break;
+                if (k == 1) {
+                    if (!b.rhs_set.use(f[0])) break;
+                } else if (!b.rhs_set.use_anonymous(/*allow_after_named=*/false)) {
+                    break;
+                }
                 for (; k + 1 < f.size(); k += 2) {
                     auto it = b.row_of.find(f[k]);
                     if (it == b.row_of.end())
@@ -401,7 +444,11 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
             }
             case Section::Ranges: {
                 std::size_t k = (f.size() % 2 == 1) ? 1 : 0;
-                if (k == 1 && !b.range_set.use(f[0])) break;
+                if (k == 1) {
+                    if (!b.range_set.use(f[0])) break;
+                } else if (!b.range_set.use_anonymous(/*allow_after_named=*/false)) {
+                    break;
+                }
                 for (; k + 1 < f.size(); k += 2) {
                     auto it = b.row_of.find(f[k]);
                     if (it == b.row_of.end())
@@ -430,7 +477,11 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
                 std::size_t ci = 2, vi = 3;
                 if (f.size() == 2 ||
                     (!b.col_of.count(f[2]) && b.col_of.count(f[1]))) { ci = 1; vi = 2; }
-                if (ci == 2 && !b.bound_set.use(f[1])) break;
+                if (ci == 2) {
+                    if (!b.bound_set.use(f[1])) break;
+                } else if (!b.bound_set.use_anonymous(/*allow_after_named=*/true)) {
+                    break;
+                }
                 const auto cit = b.col_of.find(f[ci]);
                 if (cit == b.col_of.end())
                     throw std::runtime_error("MPS line " + std::to_string(line_no) +
@@ -584,6 +635,11 @@ model::LpProblem read_mps(std::istream& in, MpsReadReport& rep,
     report_sets("RHS", b.rhs_set);
     report_sets("RANGES", b.range_set);
     report_sets("BOUNDS", b.bound_set);
+    if (b.discarded_free_n > 0)
+        rep.warnings.push_back(
+            std::to_string(b.discarded_free_n) +
+            " coefficient(s) on extra free N row(s) discarded; only the first "
+            "N row is the objective");
     rep.repeated_entries = b.repeated_rhs + b.repeated_ranges + b.repeated_bounds;
     if (rep.repeated_entries > 0)
         rep.warnings.push_back(

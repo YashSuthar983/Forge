@@ -98,13 +98,24 @@ f64 LiftedSbModel::predict(const LiftedFeatureVec& x) const {
     return y;
 }
 
-void LiftedSbCollector::add(const LiftedFeatureVec& feats, f64 score) {
-    if (!(score >= 0.0) || !std::isfinite(score)) return;
-    if (samples.size() >= max_samples) return;
+bool LiftedSbCollector::add(const LiftedFeatureVec& feats, f64 score, std::uint64_t decision) {
+    if (!(score >= 0.0) || !std::isfinite(score)) return false;
+    if (max_samples == 0) return false;
+    if (samples.size() >= max_samples) {
+        // Evict the oldest decision as a whole (samples arrive in decision
+        // order), so no decision keeps a partial candidate set.
+        const std::uint64_t oldest = samples.front().decision;
+        std::size_t k = 0;
+        while (k < samples.size() && samples[k].decision == oldest) ++k;
+        if (k == samples.size()) k = samples.size() / 2;   // one huge decision
+        samples.erase(samples.begin(), samples.begin() + static_cast<std::ptrdiff_t>(k));
+    }
     LiftedSbSample s;
     s.feats = feats;
     s.score = score;
+    s.decision = decision;
     samples.push_back(s);
+    return true;
 }
 
 void LiftedBranchState::clear() {
@@ -115,18 +126,9 @@ void LiftedBranchState::clear() {
     seeded_from_file = false;
 }
 
-void LiftedBranchState::observe(const LiftedFeatureVec& feats, f64 sb_score) {
-    const std::size_t before = buffer.samples.size();
-    // Optional iterative lift: blend SB label with current expert preference so
-    // later δ iterations imitate an improved oracle (paper LLB_δ spirit).
-    f64 label = sb_score;
-    if (expert.loaded) {
-        const f64 pred = expert.predict(feats);
-        if (std::isfinite(pred))
-            label = 0.7 * sb_score + 0.3 * std::max(0.0, pred);
-    }
-    buffer.add(feats, label);
-    if (buffer.samples.size() > before) ++samples_since_fit;
+void LiftedBranchState::observe(const LiftedFeatureVec& feats, f64 sb_score,
+                                std::uint64_t decision) {
+    if (buffer.add(feats, sb_score, decision)) ++samples_since_fit;
 }
 
 LiftedSbModel fit_lifted_sb(const std::vector<LiftedSbSample>& samples,
@@ -194,20 +196,36 @@ LiftedSbModel fit_lifted_sb(const std::vector<LiftedSbSample>& samples,
         }
         model.loss = SparseSbLoss::Lasso;
     } else {
-        // Pairwise ranking on lifted features (imitation of lifted SB scores).
+        // Pairwise ranking within each decision: a pair says which of two
+        // candidates of the SAME node scored higher; scores of different
+        // nodes are not on one scale. All such pairs, or a uniform sample of
+        // them when there are more than `cap` (a chronological prefix let the
+        // first decisions dominate every fit).
         std::vector<std::pair<std::size_t, std::size_t>> pairs;
-        const int cap = 12000;
-        for (std::size_t i = 0; i < n && static_cast<int>(pairs.size()) < cap;
-             ++i) {
-            for (std::size_t j = i + 1; j < n; ++j) {
-                const f64 di = samples[i].score - samples[j].score;
-                if (std::fabs(di) < 1e-12) continue;
-                if (di > 0.0)
-                    pairs.emplace_back(i, j);
-                else
-                    pairs.emplace_back(j, i);
-                if (static_cast<int>(pairs.size()) >= cap) break;
-            }
+        const std::size_t cap = 12000;
+        std::uint64_t seen = 0;
+        std::uint64_t rng_state = 0x9e3779b97f4a7c15ull ^ static_cast<std::uint64_t>(n);
+        const auto next_rand = [&]() {
+            rng_state ^= rng_state << 13; rng_state ^= rng_state >> 7; rng_state ^= rng_state << 17;
+            return rng_state;
+        };
+        std::size_t g0 = 0;
+        while (g0 < n) {
+            std::size_t g1 = g0;
+            while (g1 < n && samples[g1].decision == samples[g0].decision) ++g1;
+            for (std::size_t i = g0; i < g1; ++i)
+                for (std::size_t j = i + 1; j < g1; ++j) {
+                    const f64 di = samples[i].score - samples[j].score;
+                    if (std::fabs(di) < 1e-12) continue;
+                    const auto pr = di > 0.0 ? std::make_pair(i, j) : std::make_pair(j, i);
+                    ++seen;
+                    if (pairs.size() < cap) pairs.push_back(pr);
+                    else {
+                        const std::uint64_t r = next_rand() % seen;   // reservoir
+                        if (r < cap) pairs[static_cast<std::size_t>(r)] = pr;
+                    }
+                }
+            g0 = g1;
         }
         const f64 lr = std::max(1e-4, opts.ranking_lr);
         const f64 l1 = std::max(0.0, opts.lasso_lambda);

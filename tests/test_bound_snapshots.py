@@ -25,9 +25,11 @@ class BoundSnapshotTests(unittest.TestCase):
             import resource
             signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
             resource.setrlimit(resource.RLIMIT_FSIZE, (4096, 4096))
-        # p0033 must finish its proof: a 0.1 s wall-clock budget made exit 0
-        # depend on machine load (ctest -j), not on snapshot I/O. Its budget is
-        # far above the ~0.4 s unloaded solve so the status is deterministic.
+        # Exercise snapshot I/O in one tree. Conditional decomposition owns
+        # separate child proof budgets and can legitimately return Feasible
+        # under load even after visiting all boundary contexts. That routing
+        # is covered by the component/oracle suites; it must not determine
+        # whether escaped paths and filesystem errors are tested here.
         # n5-3 only needs to reach the root snapshot phases; its short budget
         # keeps the file-size-limited run cheap and either status is valid.
         model = 'n5-3' if limited else 'p0033'
@@ -35,9 +37,15 @@ class BoundSnapshotTests(unittest.TestCase):
         model_path = ROOT / 'benchmarks/miplib-easy/mps' / (model + '.mps')
         if not model_path.is_file():
             self.skipTest(f'instance data not present: {model_path}')
+        command = [str(BINARY), str(model_path), '--engine', 'milp',
+                   '--time-limit', budget, '--bab-threads', '1',
+                   '--no-component-solve']
+        if limited:
+            # Exercise an oversized write directly. A decomposed or presolved
+            # child can have a small received box that fits under the limit.
+            command += ['--no-milp-presolve']
         result = subprocess.run(
-            [str(BINARY), str(model_path),
-             '--engine', 'milp', '--time-limit', budget, '--bab-threads', '1'],
+            command,
             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             preexec_fn=limit_files if limited else None, timeout=60)
         # The large model may exhaust the short solve budget with an

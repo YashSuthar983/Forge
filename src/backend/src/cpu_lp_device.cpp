@@ -222,6 +222,11 @@ public:
                                  shared_c, col_lo_, col_hi_, row_lo_, row_hi_, c_);
             batch_size_ = 1;
             batch_slots_.clear();
+            // Match batch>1: a fresh overlay does not inherit a previous
+            // slot's iterates/epoch. Callers that want a warm start must
+            // download/upload explicitly; silent retention across models
+            // sharing one device was a correctness hazard.
+            init_zero();
             bound_bytes = (col_lo_.size() + col_hi_.size() + row_lo_.size() +
                            row_hi_.size() + c_.size()) *
                           sizeof(f64);
@@ -385,6 +390,8 @@ public:
             // dual_step: Moreau prox of indicator of row box
             f64 dy2 = 0.0;
             f64 interaction = 0.0;
+            if (!(p.sigma > 0.0) || !std::isfinite(p.sigma))
+                throw std::invalid_argument("CpuLpDevice: sigma must be finite and positive");
             for (std::size_t i = 0; i < nr_; ++i) {
                 const f64 v = y_[i] + p.sigma * Ax_[i];
                 // Moreau: y = sigma (w - proj(w)), w = v / sigma. An unclamped
@@ -556,6 +563,11 @@ public:
         }
         k.epoch_dx_norm = std::sqrt(epoch_dx2);
         k.epoch_dy_norm = std::sqrt(epoch_dy2);
+        // The restart test compares this value against the one at the start
+        // of the epoch (sufficient / necessary decay), so it must be the
+        // current weighted fixed-point residual ||z - T(z)||_M, as the Vulkan
+        // device reports. A running epoch maximum cannot decay within an
+        // epoch, and the relative gap is not a residual of the same norm.
         k.restart_metric = std::sqrt(last_primal_weight_ * last_dx_ * last_dx_ +
                                      last_dy_ * last_dy_ / last_primal_weight_);
         k.operator_lhs = last_operator_lhs_;

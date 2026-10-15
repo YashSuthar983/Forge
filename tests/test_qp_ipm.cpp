@@ -105,6 +105,14 @@ int main() {
         CHECK(r1.proposed_status == core::Status::Optimal);
         CHECK(std::fabs(r1.x[0] - 0.6) < 1e-9 && std::fabs(r1.x[1] - 0.6) < 1e-9);
         CHECK(r1.termination_reason.find("polish") != std::string::npos);
+        // Not once the time limit has stopped the interior point: the polish
+        // is unbounded work (dfl001: 4.9 s past a 1.2 s budget).
+        o.time_limit_s = 1e-12;
+        engines::QpDiagnostics d2;
+        const auto r2 = engines::solve_qp_ipm(p, o, d2);
+        CHECK(r2.proposed_status != core::Status::Optimal);
+        CHECK(r2.termination_reason.find("polish") == std::string::npos);
+        CHECK(r2.termination_reason.find("time limit") != std::string::npos);
     }
     {
         // A bound that is NOT active at the optimum must not be fixed by a

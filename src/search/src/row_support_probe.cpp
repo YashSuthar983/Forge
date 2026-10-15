@@ -1,4 +1,6 @@
+#include "sor/search/domain_writer.hpp"
 #include "sor/search/row_support_probe.hpp"
+#include "sor/core/work_clock.hpp"
 
 #include "sor/search/conflict.hpp"
 #include "sor/search/prop_trail.hpp"
@@ -13,7 +15,7 @@
 namespace sor::search {
 namespace {
 
-using Clock = std::chrono::steady_clock;
+using Clock = sor::core::SolverClock;
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 constexpr f64 kInf = std::numeric_limits<f64>::infinity();
 
@@ -34,8 +36,8 @@ RowSupportProbeDiagnostics probe_row_supports(const model::LpProblem &lp, std::v
         return diag;
     };
     const auto out_of_time = [&]() {
-        return opts.time_limit_s > 0.0 &&
-               std::chrono::duration<double>(Clock::now() - t0).count() >= opts.time_limit_s;
+        return core::cancel_requested(opts.cancel) || (opts.time_limit_s > 0.0 &&
+               std::chrono::duration<double>(Clock::now() - t0).count() >= opts.time_limit_s);
     };
     const Index n = lp.n_cols();
     const Index m = lp.n_rows();
@@ -125,10 +127,9 @@ RowSupportProbeDiagnostics probe_row_supports(const model::LpProblem &lp, std::v
 
     const auto branch_budget = [&]() {
         const auto left = opts.max_total_row_visits - diag.row_visits;
-        // The event propagator reports the final popped-but-unprocessed row
-        // when it hits its cap. Reserve that charged visit too.
-        const auto charged = std::min(left, opts.max_row_visits_per_branch);
-        return charged > 0 ? charged - 1 : 0;
+        // The event propagator charges only processed rows. Reserving a
+        // fictional final pop turns a one-visit allowance into zero forever.
+        return std::min(left, opts.max_row_visits_per_branch);
     };
 
     // Alternate sparse conflict implications with row events under one
@@ -161,15 +162,13 @@ RowSupportProbeDiagnostics probe_row_supports(const model::LpProblem &lp, std::v
                         col_hi[sz(k)] < value - tol) return false;
                     bool moved = false;
                     if (col_lo[sz(k)] < value) {
-                        trail.push(k, BoundDir::Lower, value, col_lo[sz(k)],
-                                   ReasonKind::Conflict, -1, 1);
-                        col_lo[sz(k)] = value;
+                        write_domain_bound(col_lo, col_hi, k, BoundDir::Lower, value,
+                                           &trail, {ReasonKind::Implication, lit, 1});
                         moved = true;
                     }
                     if (col_hi[sz(k)] > value) {
-                        trail.push(k, BoundDir::Upper, value, col_hi[sz(k)],
-                                   ReasonKind::Conflict, -1, 1);
-                        col_hi[sz(k)] = value;
+                        write_domain_bound(col_lo, col_hi, k, BoundDir::Upper, value,
+                                           &trail, {ReasonKind::Implication, lit, 1});
                         moved = true;
                     }
                     if (moved) { pending.push_back(k); seeds.push_back(k); }
@@ -193,12 +192,12 @@ RowSupportProbeDiagnostics probe_row_supports(const model::LpProblem &lp, std::v
             const std::uint64_t row_budget = branch_budget();
             const auto pr = propagate_bounds_events(
                 lp, index, col_lo, col_hi, seeds, scratch, &trail, 1, tol,
-                row_budget);
+                row_budget, opts.cancel);
             diag.row_visits += static_cast<std::uint64_t>(pr.rounds);
             if (!pr.feasible) return false;
             seeds.clear();
             if (graph_exhausted || diag.row_visits >= opts.max_total_row_visits ||
-                static_cast<std::uint64_t>(pr.rounds) > row_budget) break;
+                !pr.converged) break;
             for (std::size_t t = before_rows; t < trail.size(); ++t) {
                 const Index k = trail.entries()[t].var;
                 if (graph->is_binary(k) && is_fixed(k)) pending.push_back(k);
@@ -310,12 +309,12 @@ RowSupportProbeDiagnostics probe_row_supports(const model::LpProblem &lp, std::v
                 const Index j = bins[sz(b)];
                 const f64 v = ((mask >> b) & 1u) ? 1.0 : 0.0;
                 if (v > col_lo[sz(j)]) {
-                    trail.push(j, BoundDir::Lower, v, col_lo[sz(j)], ReasonKind::Branch, -1, 1);
-                    col_lo[sz(j)] = v;
+                    write_domain_bound(col_lo, col_hi, j, BoundDir::Lower, v,
+                                       &trail, {ReasonKind::Branch, -1, 1});
                 }
                 if (v < col_hi[sz(j)]) {
-                    trail.push(j, BoundDir::Upper, v, col_hi[sz(j)], ReasonKind::Branch, -1, 1);
-                    col_hi[sz(j)] = v;
+                    write_domain_bound(col_lo, col_hi, j, BoundDir::Upper, v,
+                                       &trail, {ReasonKind::Branch, -1, 1});
                 }
             }
             if (!propagate_assignment(bins)) {
@@ -467,7 +466,7 @@ RowSupportProbeDiagnostics probe_row_supports(const model::LpProblem &lp, std::v
             break;
         }
         const PropagateResult gp = propagate_bounds_events(
-            lp, index, col_lo, col_hi, changed, scratch, nullptr, 0, tol, branch_budget());
+            lp, index, col_lo, col_hi, changed, scratch, nullptr, 0, tol, branch_budget(), opts.cancel);
         diag.row_visits += static_cast<std::uint64_t>(gp.rounds);
         if (!gp.feasible) {
             diag.infeasible = true;

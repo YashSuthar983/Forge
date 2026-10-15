@@ -1,10 +1,12 @@
-// WP-G: paper-complete Reflection (Hojny) + Folding (van der Hulst).
+// WP-G: verified Reflection (Hojny) + Folding (van der Hulst).
 #include "sor/certify/finalize.hpp"
 #include "sor/io/mps.hpp"
 #include "sor/search/bab.hpp"
 #include "sor/search/conflict.hpp"
 #include "sor/search/milp_policy.hpp"
 #include "sor/search/symmetry.hpp"
+#include "sor/search/symmetry_verify.hpp"
+#include "sor/search/symmetry_group.hpp"
 #include "sor/sparse/csr.hpp"
 
 #include "test_helpers.hpp"
@@ -202,7 +204,7 @@ void test_reflection_signed_sdg_and_sbc() {
 
     (void)sor::search::apply_reflection_symmetry(lp, lo, hi, nullptr, opts,
                                                  diag);
-    CHECK(diag.reflection_status.find("Reflection-complete") !=
+    CHECK(diag.reflection_status.find("Verified reflection") !=
           std::string::npos);
     CHECK(diag.reflection_pairs >= 1);
     // Feasible images must survive: no bogus per-pair x+y>=1 SBCs.
@@ -251,7 +253,7 @@ void test_reflection_self_fixes_unused() {
     sor::search::SymmetryDiagnostics diag;
     (void)sor::search::apply_reflection_symmetry(lp, lo, hi, nullptr, opts,
                                                  diag);
-    CHECK(diag.reflection_status.find("Reflection-complete") !=
+    CHECK(diag.reflection_status.find("Verified reflection") !=
           std::string::npos);
     CHECK_NEAR(hi[0], 0.0, 1e-9);
     CHECK(hi[1] >= 1.0 - 1e-9);
@@ -265,7 +267,7 @@ void test_reflection_global_preserves_optimum() {
     sor::search::SymmetryDiagnostics diag;
     (void)sor::search::apply_reflection_symmetry(lp, lo, hi, nullptr, opts,
                                                  diag);
-    CHECK(diag.reflection_status.find("Reflection-complete") !=
+    CHECK(diag.reflection_status.find("Verified reflection") !=
           std::string::npos);
     // Hojny (5) + packing orbitopal may keep only the lex-max representative;
     // at least one known optimum must survive.
@@ -291,7 +293,7 @@ void test_folding_parallel_and_lift() {
         sor::search::apply_folding_symmetry(lp, lo, hi, orbits, opts, diag);
     CHECK(ng >= 1);
     CHECK(diag.folding_applied);
-    CHECK(diag.folding_status.find("Folding-complete") != std::string::npos);
+    CHECK(diag.folding_status.find("Exact folding") != std::string::npos);
     CHECK_NEAR(hi[0], 3.0, 1e-9);
     CHECK_NEAR(hi[1], 0.0, 1e-9);
     CHECK_NEAR(hi[2], 0.0, 1e-9);
@@ -344,7 +346,7 @@ void test_packing_orbitopal_preserves_opt() {
     opts.folding = false;  // isolate orbitopal SBCs
     opts.reflection = true;
     const auto diag = sor::search::apply_symmetry(lp, nullptr, lo, hi, opts);
-    CHECK(diag.reflection_status.find("Reflection-complete") !=
+    CHECK(diag.reflection_status.find("Verified reflection") !=
           std::string::npos);
     // Known cardinality-1 lex-max optimum must remain feasible.
     std::vector<f64> e0 = {1.0, 0.0, 0.0};
@@ -361,7 +363,7 @@ void test_packing_fold_lift_matches_objective() {
     opts.orbital_fixing = false;
     const auto diag = sor::search::apply_symmetry(lp, nullptr, lo, hi, opts);
     CHECK(diag.folding_applied);
-    CHECK(diag.folding_status.find("Folding-complete") != std::string::npos);
+    CHECK(diag.folding_status.find("Exact folding") != std::string::npos);
     // Folded opt y=1 on rep.
     std::vector<f64> x = {1.0, 0.0, 0.0};
     const f64 fobj = lp.objective(x);
@@ -380,9 +382,9 @@ void test_assignment_never_cuts_permutation_optima() {
     opts.reflection = true;
     sor::search::SymmetryDiagnostics diag =
         sor::search::apply_symmetry(lp, nullptr, lo, hi, opts);
-    CHECK(diag.reflection_status.find("Reflection-complete") !=
+    CHECK(diag.reflection_status.find("Verified reflection") !=
           std::string::npos);
-    CHECK(diag.folding_status.find("Folding-complete") != std::string::npos);
+    CHECK(diag.folding_status.find("Exact folding") != std::string::npos);
     // Must NOT fold all four into one (columns are not identical-parallel).
     if (diag.folding_applied) {
         for (const auto& g : diag.folds)
@@ -412,9 +414,9 @@ void test_apply_symmetry_complete_status() {
     const auto d = sor::search::apply_symmetry(lp, &cg, lo, hi, opts);
     CHECK(d.reflection_status.find("stub") == std::string::npos);
     CHECK(d.folding_status.find("stub") == std::string::npos);
-    CHECK(d.reflection_status.find("Reflection-complete") != std::string::npos ||
+    CHECK(d.reflection_status.find("Verified reflection") != std::string::npos ||
           d.reflection_status == "disabled");
-    CHECK(d.folding_status.find("Folding-complete") != std::string::npos ||
+    CHECK(d.folding_status.find("Exact folding") != std::string::npos ||
           d.folding_status == "disabled");
     CHECK(d.folding_applied);
 }
@@ -513,7 +515,151 @@ void test_enigma_not_falsely_infeasible() {
 
 }  // namespace
 
+void test_reflection_checks_complete_rows_and_compatible_generators() {
+    SymmetryOptions opts;
+    opts.reflection = true;
+    opts.folding = false;
+    opts.orbital_fixing = false;
+    // Complementing only the two binaries does not preserve this equality:
+    // the untouched continuous coefficient cannot be implicitly negated.
+    auto mixed = reflection_global();
+    mixed.c.push_back(0); mixed.col_lo.push_back(0); mixed.col_hi.push_back(1);
+    mixed.is_integer.push_back(false);
+    mixed.A = from_triplets(1, 3, {0, 0, 0}, {0, 1, 2}, {1., 1., 1.});
+    auto lo = mixed.col_lo, hi = mixed.col_hi;
+    const auto md = sor::search::apply_symmetry(mixed, nullptr, lo, hi, opts);
+    CHECK(md.reflection_sbcs == 0);
+    CHECK_NEAR(mixed.max_row_violation({0., 0., 1.}), 0., 0.);
+    // Color refinement rounds these costs to the same tag; exact verification
+    // must reject the swap and preserve the uniquely better representative.
+    auto tiny = reflection_global(); tiny.c = {1e-10, 0.};
+    lo = tiny.col_lo; hi = tiny.col_hi;
+    const auto td = sor::search::apply_symmetry(tiny, nullptr, lo, hi, opts);
+    CHECK(td.orbitopal_sbcs == 0);
+    CHECK_NEAR(tiny.max_row_violation({0., 1.}), 0., 0.);
+    // Every vertex in C3 + C4 has the same refinement color, but they are not
+    // one freely permutable group. A total order across that cell loses every
+    // independent set of size three. Verified disjoint swap groups preserve one.
+    LpProblem graph;
+    graph.c.assign(7, -1); graph.col_lo.assign(7, 0); graph.col_hi.assign(7, 1);
+    graph.is_integer.assign(7, true); graph.row_lo.assign(7, -sor::model::kInf);
+    graph.row_hi.assign(7, 1);
+    graph.A = from_triplets(7, 7, {0,0,1,1,2,2,3,3,4,4,5,5,6,6},
+                           {0,1,1,2,2,0,3,4,4,5,5,6,6,3}, std::vector<f64>(14,1));
+    const auto original = graph;
+    lo = graph.col_lo; hi = graph.col_hi;
+    (void)sor::search::apply_symmetry(graph, nullptr, lo, hi, opts);
+    bool optimum_survives = false;
+    for (unsigned mask = 0; mask < 128; ++mask) {
+        std::vector<f64> x(7);
+        for (int j = 0; j < 7; ++j) x[j] = (mask >> j) & 1u;
+        if (original.objective(x) == -3 && original.max_row_violation(x) == 0 &&
+            graph.max_row_violation(x) == 0) optimum_survives = true;
+    }
+    CHECK(optimum_survives);
+}
+
+void test_fold_owns_live_integer_domains_and_wide_lift() {
+    auto lp = twin_amo();
+    lp.c = {1., 1.}; lp.is_integer = {true, true};
+    lp.col_lo = {.1, .1}; lp.col_hi = {4000000000.9, 4000000000.9};
+    lp.row_hi = {7000000000.};
+    auto lo = lp.col_lo, hi = lp.col_hi;
+    lo = {2.1, 2.1}; hi = {3000000000.9, 3000000000.9};
+    SymmetryOptions opts; opts.orbital_fixing = false;
+    sor::search::SymmetryDiagnostics diag;
+    CHECK(sor::search::apply_folding_symmetry(lp, lo, hi, {{{0,1}}}, opts, diag) == 1);
+    CHECK_NEAR(lo[0], 6., 0.); CHECK_NEAR(hi[0], 6000000000., 0.);
+    std::vector<f64> x{5000000000., 0.};
+    sor::search::lift_folded_solution(diag, x);
+    CHECK_NEAR(x[0] + x[1], 5000000000., 0.);
+    CHECK(x[0] >= 3 && x[1] >= 3 && x[0] <= 3000000000. && x[1] <= 3000000000.);
+    CHECK(x[0] == std::round(x[0]) && x[1] == std::round(x[1]));
+    // A current bound on only one member breaks the equal-domain transform.
+    lp = twin_amo(); lo = {0., 0.}; hi = {1., 0.};
+    diag = {};
+    CHECK(sor::search::apply_folding_symmetry(lp, lo, hi, {{{0,1}}}, opts, diag) == 0);
+    CHECK(hi[1] == 0);
+}
+
+// Cycle rotations require coupled column/row actions: no single vertex
+// swap is an automorphism of C5. Every group orbit's global lex maximum must
+// survive all leaders and their box propagation simultaneously.
+void test_general_verified_generators_and_common_leaders() {
+    using sor::search::VerifiedSymmetryGroup;
+    std::vector<Index> rows, cols; std::vector<f64> vals;
+    for (Index i = 0; i < 5; ++i) {
+        rows.push_back(i); cols.push_back(i); vals.push_back(1);
+        rows.push_back(i); cols.push_back((i+1)%5); vals.push_back(1);
+    }
+    LpProblem lp;
+    lp.A = from_triplets(5, 5, rows, cols, vals);
+    lp.row_lo.assign(5, -sor::model::kInf); lp.row_hi.assign(5, 1);
+    lp.c.assign(5, -1); lp.col_lo.assign(5, 0); lp.col_hi.assign(5, 1);
+    lp.is_integer.assign(5, true);
+    VerifiedSymmetryGroup group; group.build(lp, {{{0,1,2,3,4}}}, 0);
+    CHECK(!group.empty());
+    sor::search::SymmetryVerifier verifier(lp);
+    for (const auto& g : group.generators()) {
+        CHECK(verifier.verifies(g, std::vector<int>(5,1), std::vector<f64>(5,0)));
+        int moved = 0; for (Index j = 0; j < 5; ++j) moved += g[static_cast<std::size_t>(j)] != j;
+        CHECK(moved >= 4);
+    }
+    // Enumerate the retained group independently, then compare every box
+    // coloring's full stabilizer, including compositions of rejected generators.
+    std::vector<std::vector<Index>> elements{{0,1,2,3,4}};
+    for (std::size_t q = 0; q < elements.size(); ++q) for (const auto& g : group.generators()) {
+        std::vector<Index> h(5); for (Index j = 0; j < 5; ++j) h[j] = elements[q][g[j]];
+        if (std::find(elements.begin(),elements.end(),h) == elements.end()) elements.push_back(std::move(h));
+    }
+    for (int code = 0; code < 243; ++code) {
+        auto lo = lp.col_lo, hi = lp.col_hi; int v = code;
+        for (Index j = 0; j < 5; ++j) { int state = v%3; v/=3; if(state==1) hi[j]=0; if(state==2) lo[j]=1; }
+        bool expected[5][5]{}; for(Index j=0;j<5;++j) expected[j][j]=true;
+        for(const auto& g:elements) {
+            bool keeps=true; for(Index j=0;j<5;++j) keeps=keeps && lo[j]==lo[g[j]] && hi[j]==hi[g[j]];
+            if(keeps) for(Index j=0;j<5;++j) expected[j][g[j]]=true;
+        }
+        bool actual[5][5]{}; for(Index j=0;j<5;++j) actual[j][j]=true;
+        bool complete=false;
+        for(const auto& orbit:group.stabilizer_orbits(lo,hi,0,nullptr,&complete))
+            for(Index j:orbit.cols) for(Index k:orbit.cols) actual[j][k]=true;
+        CHECK(complete);
+        for(Index j=0;j<5;++j) for(Index k=0;k<5;++k) CHECK(actual[j][k]==expected[j][k]);
+    }
+    f64 retained_best = 0;
+    for (unsigned mask = 0; mask < 32; ++mask) {
+        std::vector<f64> x(5);
+        for (unsigned j = 0; j < 5; ++j) x[j] = (mask >> j) & 1;
+        if (lp.max_row_violation(x) != 0) continue;
+        std::vector<std::vector<f64>> orbit{x};
+        for (std::size_t q = 0; q < orbit.size(); ++q)
+            for (const auto& g : group.generators()) {
+                std::vector<f64> image(5);
+                for (unsigned j = 0; j < 5; ++j) image[j] = orbit[q][static_cast<std::size_t>(g[j])];
+                if (std::find(orbit.begin(), orbit.end(), image) == orbit.end()) orbit.push_back(image);
+            }
+        const auto& maximum = *std::max_element(orbit.begin(), orbit.end());
+        auto lo = maximum, hi = maximum;
+        std::uint64_t moves = 0;
+        CHECK(group.propagate(lo, hi, nullptr, 0, moves));
+        CHECK(lo == maximum && hi == maximum);
+        lo = lp.col_lo; hi = lp.col_hi; lo[0] = maximum[0]; hi[0] = maximum[0];
+        sor::search::PropTrail trail;
+        CHECK(group.propagate(lo, hi, &trail, 1, moves));
+        for (unsigned j = 0; j < 5; ++j) CHECK(lo[j] <= maximum[j] && hi[j] >= maximum[j]);
+        retained_best = std::min(retained_best, lp.objective(maximum));
+    }
+    CHECK_NEAR(retained_best, -2, 0);
+    auto lo = lp.col_lo, hi = lp.col_hi; hi[0] = 0;
+    for (const auto& cell : group.stabilizer_orbits(lo, hi))
+        CHECK(std::find(cell.cols.begin(), cell.cols.end(), 0) == cell.cols.end());
+}
+
 int main() {
+    test_general_verified_generators_and_common_leaders();
+    test_reflection_checks_complete_rows_and_compatible_generators();
+    test_fold_owns_live_integer_domains_and_wide_lift();
     test_folding_requires_exact_identity();
     test_color_refinement_finds_twin_orbit();
     test_asymmetric_not_orbited_together();

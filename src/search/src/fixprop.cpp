@@ -1,7 +1,10 @@
+#include "sor/search/domain_writer.hpp"
 // Fix-Propagate-Repair - see sor/search/fixprop.hpp for why this exists and
 // what it is implementing (Salvagnin, MPC 2024).
 
 #include "sor/search/fixprop.hpp"
+#include "heuristic_lp.hpp"
+#include "sor/core/work_clock.hpp"
 
 #include "sor/core/route_debug.hpp"
 #include "sor/engines/simplex.hpp"
@@ -17,7 +20,7 @@
 namespace sor::search {
 namespace {
 
-using Clock = std::chrono::steady_clock;
+using Clock = sor::core::SolverClock;
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 inline std::size_t sz(core::Offset i) { return static_cast<std::size_t>(i); }
 constexpr f64 kInf = model::kInf;
@@ -258,6 +261,7 @@ void Dive::bump_activities(Index j, f64 old_lo, f64 old_hi) {
     }
     diag_.work += static_cast<std::uint64_t>(col_ptr_[sz(j) + 1] -
                                              col_ptr_[sz(j)]);
+    core::work_add(3 * static_cast<std::uint64_t>(col_ptr_[sz(j) + 1] - col_ptr_[sz(j)]), ::sor::core::WorkTag::Fixprop);
 }
 
 // Derive bounds for every column of row i from the residual activity of the
@@ -273,6 +277,12 @@ bool Dive::tighten_row(Index i) {
     const auto& ci = lp_.A.pattern.col_idx();
     const auto& av = lp_.A.vals;
     diag_.work += static_cast<std::uint64_t>(rp[sz(i) + 1] - rp[sz(i)]);
+    // The dive's own propagation, charged like the shared one's process_row
+    // (propagate.cpp). Uncharged, a dive ran 12 s of wall time on
+    // drayage-100-23 while the work clock saw 0.24 s: a deterministic
+    // sub-MIP child then spent its whole life here and stopped on the wall
+    // floor without searching a node.
+    core::work_add(8 + 3 * static_cast<std::uint64_t>(rp[sz(i) + 1] - rp[sz(i)]), ::sor::core::WorkTag::Fixprop);
 
     for (core::Offset k = rp[sz(i)]; k < rp[sz(i) + 1]; ++k) {
         if ((k - rp[sz(i)]) % 1024 == 0 && abort_if_over_budget())
@@ -308,14 +318,12 @@ bool Dive::tighten_row(Index i) {
         if (new_lo > l + 1e-12 || new_hi < h - 1e-12) {
             const f64 old_l = l, old_h = h;
             if (new_lo > l + 1e-12) {
-                trail_.push(j, BoundDir::Lower, new_lo, l, ReasonKind::Row, i,
-                            cur_depth_);
-                lo_[sz(j)] = new_lo;
+                write_domain_bound(lo_, hi_, j, BoundDir::Lower, new_lo, &trail_,
+                                   {ReasonKind::Row, i, cur_depth_});
             }
             if (new_hi < h - 1e-12) {
-                trail_.push(j, BoundDir::Upper, new_hi, h, ReasonKind::Row, i,
-                            cur_depth_);
-                hi_[sz(j)] = new_hi;
+                write_domain_bound(lo_, hi_, j, BoundDir::Upper, new_hi, &trail_,
+                                   {ReasonKind::Row, i, cur_depth_});
             }
             bump_activities(j, old_l, old_h);
             if (aborted_) return false;
@@ -372,6 +380,7 @@ void Dive::compute_activities() {
         maxact_[sz(i)] = hi_sum;
     }
     diag_.work += static_cast<std::uint64_t>(lp_.nnz());
+    core::work_add(3 * static_cast<std::uint64_t>(lp_.nnz()), ::sor::core::WorkTag::Fixprop);
     queued_.assign(sz(m_), 0);
     queue_.clear();
 }
@@ -407,6 +416,7 @@ void Dive::shift_fixed(Index j, f64 new_value) {
     }
     diag_.work += static_cast<std::uint64_t>(col_ptr_[sz(j) + 1] -
                                              col_ptr_[sz(j)]);
+    core::work_add(3 * static_cast<std::uint64_t>(col_ptr_[sz(j) + 1] - col_ptr_[sz(j)]), ::sor::core::WorkTag::Fixprop);
 }
 
 // WalkSAT scores a flip by the DAMAGE it does only -- the rows it newly breaks
@@ -615,6 +625,7 @@ bool Dive::finish_bottom(std::vector<f64>& x_out) {
         fixed.col_hi[sz(j)] = v;
     }
     engines::SimplexOptions so;
+    heuristic_lp_options(so);
     so.method = engines::SimplexMethod::Auto;
     so.presolve = true;
     so.max_iterations = opts_.bottom_lp_iterations;
@@ -757,6 +768,7 @@ bool fix_and_propagate(const model::LpProblem& lp,
                        const FixPropOptions& opts,
                        std::vector<f64>& x_out,
                        FixPropDiagnostics& diag) {
+    core::WorkScope work_scope_(core::WorkCat::Heuristic);
     SOR_FN();
     SOR_ROUTE_PATH(1, "fixprop", "heuristic", "start");
     diag = FixPropDiagnostics{};

@@ -68,7 +68,7 @@ void test_refit_and_pick() {
         f.fill(0.0);
         f[0] = 0.05 * (1 + (i % 8));
         f[24] = 0.1 * f[0];  // constraint-lift channel
-        st.observe(f, 10.0 * f[0]);
+        st.observe(f, 10.0 * f[0], static_cast<std::uint64_t>(i / 4));   // 4 decisions of 4 candidates
     }
     CHECK(st.maybe_refit(opts));
     CHECK(st.ready());
@@ -117,6 +117,7 @@ void test_save_load_and_fit() {
 void test_bab_lifted_collects_and_refits() {
     auto lp = read_text(kFracBranch);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Latest;
     opts.branch_strategy = BranchStrategy::Lifted;
@@ -161,6 +162,7 @@ void test_bab_lifted_collects_and_refits() {
 void test_classical_ignores_lifted() {
     auto lp = read_text(kFracBranch);
     BabOptions opts;
+    opts.structural_presolve.binary_row_max_work = 0;  // Exercise the tree service, not the exact root oracle.
     opts.structural_presolve.enabled = false;  // component test: keep the model unreduced
     opts.policy = MilpPolicy::Classical;
     opts.branch_strategy = BranchStrategy::Lifted;
@@ -176,7 +178,46 @@ void test_classical_ignores_lifted() {
 
 }  // namespace
 
+// Ranking pairs stay within a decision. In every decision the candidate with
+// the larger feature scored higher, but the large-feature candidates sit at
+// decisions whose scores are on a scale 1000x smaller: pooled across
+// decisions, the order would invert.
+void test_ranking_is_per_decision() {
+    LiftedBranchOptions opts;
+    opts.loss = sor::search::SparseSbLoss::Ranking;
+    LiftedBranchState st;
+    for (int d = 0; d < 12; ++d) {
+        const bool small_scale = d % 2 == 1;
+        const double base = small_scale ? 0.6 : 0.1;
+        const double scale = small_scale ? 1.0 : 1000.0;
+        for (int c = 0; c < 3; ++c) {
+            LiftedFeatureVec f{};
+            f.fill(0.0);
+            f[0] = base + 0.05 * c;
+            st.observe(f, scale * (1.0 + c), static_cast<std::uint64_t>(d));
+        }
+    }
+    CHECK(st.maybe_refit(opts));
+    LiftedFeatureVec a{}, b{};
+    a.fill(0.0);
+    b.fill(0.0);
+    a[0] = 0.2;
+    b[0] = 0.7;
+    CHECK(st.expert.predict(b) > st.expert.predict(a));
+    // The collector keeps the newest decisions whole.
+    sor::search::LiftedSbCollector col;
+    col.max_samples = 6;
+    LiftedFeatureVec f{};
+    f.fill(0.0);
+    for (int d = 0; d < 5; ++d)
+        for (int c = 0; c < 2; ++c) col.add(f, 1.0 + c, static_cast<std::uint64_t>(d));
+    CHECK(col.samples.size() <= 6);
+    CHECK(col.samples.back().decision == 4);
+    CHECK(col.samples.front().decision >= 2);
+}
+
 int main() {
+    test_ranking_is_per_decision();
     test_refit_and_pick();
     test_save_load_and_fit();
     test_bab_lifted_collects_and_refits();

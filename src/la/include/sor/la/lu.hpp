@@ -19,8 +19,9 @@
 //   Phase B - Markowitz elimination on whatever is left (the "nucleus").
 //   Pivot (r,c) minimizes (rcount_r - 1) * (ccount_c - 1), subject to the
 //   threshold-pivoting stability test |a_rc| >= threshold * max_i |a_ic|.
-//   Columns are searched in increasing-count order with a bounded candidate
-//   list, so pivot search does not cost O(nnz) per pivot.
+//   Columns and rows are searched in increasing-count order with a bounded
+//   candidate list, so pivot search does not cost O(nnz) per pivot; a dense
+//   remainder goes to a blocked dense kernel. See lu_markowitz.hpp.
 //
 // BASIS UPDATE: two selectable representations (LuOptions-adjacent
 // UpdateMethod), both against the SAME L/U from factorize():
@@ -60,19 +61,34 @@ using core::f64;
 using core::Index;
 using core::Offset;
 
+// Absolute LU pivot floor (Markowitz acceptance). Must stay strictly below the
+// simplex eligibility pivot_tol (default 1e-7) so engines never build a basis
+// from pivots they would themselves reject in a ratio test.
+constexpr f64 kDefaultLuPivotTol = 1e-11;
+// Forrest-Tomlin update error compounds ~1 decade per this many row etas.
+// needs_refactor() refuses to fly past this floor even when the caller leaves
+// ft_update_limit disarmed.
+constexpr int kForrestTomlinHardUpdateFloor = 45;
+
 struct LuOptions {
     // Threshold pivoting: accept a Markowitz pivot only if its magnitude is at
     // least this fraction of the largest remaining magnitude in its column.
     // Lower preserves sparsity, higher preserves accuracy.
-    f64 markowitz_threshold = 0.1;
+    // Gurobi MarkowitzTol ≈ 0.0078; 0.03 is a measured compromise vs the
+    // old 0.1 (sparser factors, acceptable stability on Netlib).
+    f64 markowitz_threshold = 0.03;
 
     // Absolute floor. A candidate below this is not a pivot at any threshold;
     // the column is reported singular instead of producing a huge multiplier.
-    f64 pivot_tol = 1e-11;
+    // Must stay <= SimplexOptions::pivot_tol (eligibility floor); see
+    // engines::numerics and validate_simplex_numerics.
+    f64 pivot_tol = kDefaultLuPivotTol;
 
-    // Columns examined per Markowitz pivot search. Unbounded search is
-    // O(nnz) per pivot, which dominates everything on large bases.
-    int max_search_cols = 8;
+    // Rows and columns examined per Markowitz pivot search once a candidate
+    // exists (lu_markowitz.cpp; the search also stops when no unexamined
+    // entry can beat the best merit). Unbounded search is O(nnz) per pivot,
+    // which dominates everything on large bases.
+    int max_search_cols = 16;
 
     bool blocked_nucleus = true;
     Index dense_nucleus_limit = 512;
@@ -107,7 +123,14 @@ struct LuStats {
     Index  singular_count  = 0;
     f64    largest_multiplier = 0.0;
     f64    condition_estimate = 1.0;
+    // max |U| / max |B| (diagonal included): the factor's backward error
+    // grows with it. See factorize()'s stability redo.
+    f64    element_growth = 1.0;
     f64    effective_threshold = 0.0;
+    // Deterministic cost of producing this factor (the work units
+    // factorize() charges): what one refactorization costs, for the economy
+    // of carrying an updated factor instead (eta_work_since_factor()).
+    Offset factor_work     = 0;
 };
 
 // The exact Forrest-Tomlin spike, R_k...R_1 L^-1 a_q, in POSITION coordinates.
@@ -131,6 +154,27 @@ struct SpikeCapture {
     void clear() { pos.clear(); val.clear(); valid = false; }
 };
 
+// The Forrest-Tomlin row eta of a basis slot, e_p^T U^-1 in POSITION
+// coordinates, as BTRAN forms it on its way through: it is the state between
+// the U' solve and the row etas when the input is the unit vector of slot p.
+//
+// The dual simplex BTRANs exactly that unit vector for every leaving row (the
+// pivotal row rho = B^-T e_p), and update_ft() needs exactly this vector to
+// eliminate the leaving position. Capturing it here saves update_ft() its own
+// U' solve, which was most of an update's cost on bases with long U rows.
+// Entries are stored in ascending position order, the canonical row-eta order
+// update_ft() uses on its own path as well. `factor_gen` and `n_row_etas` pin
+// the U the capture describes; update_ft() ignores a capture of any other U.
+struct RowEtaCapture {
+    std::vector<core::Index> pos;   // position coordinates, ascending
+    std::vector<core::f64>   val;
+    core::Index pivot_pos = -1;     // position of the unit input slot
+    std::uint64_t factor_gen = 0;
+    core::Index n_row_etas = -1;
+    bool valid = false;
+    void clear() { pos.clear(); val.clear(); pivot_pos = -1; valid = false; }
+};
+
 // LU factors of one basis matrix, plus the eta file of subsequent updates.
 //
 // Convention: `B` is m x m; its column j is basis slot j (NOT a variable
@@ -150,6 +194,13 @@ struct DfsFrame {
 };
 
 struct SolveScratch {
+    SolveScratch() = default;
+    // Scratch is private to a solve, never a checkpoint's mathematical state.
+    // A copied factor lazily creates clean scratch at its own first solve.
+    SolveScratch(const SolveScratch&) {}
+    SolveScratch& operator=(const SolveScratch&) { *this = SolveScratch{}; return *this; }
+    SolveScratch(SolveScratch&&) noexcept = default;
+    SolveScratch& operator=(SolveScratch&&) noexcept = default;
     std::vector<f64> work_;        // primary solve scratch, size m
     std::vector<f64> pair_work_;   // second dense FTRAN RHS, size m
     std::vector<char> mark_;                // DFS marks, size n
@@ -204,9 +255,19 @@ struct SolveScratch {
     std::array<f64, 33> btran_density_{};
     // Solves whose final triangular solve took the reach-set path.
     std::uint64_t hypersparse_solves_ = 0;
+    // Total FTRAN/BTRAN attempts since factorize (for hypersparse hit rate).
+    std::uint64_t triangular_solves_ = 0;
     // Solve work since the factorization (see work_since_factor()).
     Offset work_since_factor_ = 0;
+    // The part of it the update file added: every solve crosses all of
+    // eta_nnz() on top of what the fresh L/U would cost.
+    Offset eta_work_since_factor_ = 0;
     std::uint64_t factor_gen = 0;
+    // A bordered factor reads its parent's mathematical state using this
+    // solve's private scratch. The shared parent is never solved through its
+    // ordinary mutable scratch, including in solve_batch and checkpoint copies.
+    std::unique_ptr<SolveScratch> border_scratch;
+    std::vector<f64> border_rhs;
 };
 
 // The factorization's elimination workspace (defined in lu.cpp), kept with
@@ -228,6 +289,19 @@ private:
 
 class BasisFactor {
 public:
+    // Install [[B,0],[D,-I]] without refactorizing B. D is CSR in old basis
+    // slot coordinates. Both rows and slots of B retain their exact scaling.
+    // Subsequent pivots use product-form updates across the entire border;
+    // an ordinary refactorization resumes the selected LU update method.
+    void extend_logical_rows(Index added, const std::vector<Offset>& row_ptr,
+                             const std::vector<Index>& slots,
+                             const std::vector<f64>& values);
+    bool is_bordered() const noexcept { return static_cast<bool>(border_parent_); }
+    // Retain a row/slot submatrix after removing logical-basic columns.
+    // Caller proves each omitted column is -e_i for an omitted row; without
+    // that premise, projecting an old inverse is not a factorization.
+    void retain_logical_rows(const std::vector<Index>& rows,
+                             const std::vector<Index>& slots);
     // Factorize the matrix given column-wise (col_ptr/row_idx/vals, length m
     // columns). Returns true if all m columns were pivoted.
     //
@@ -327,13 +401,18 @@ public:
     // SLOT positions at entry (the dual's rho is exactly e_leave). The eta
     // firing-set uses it as the input seed directly (skipping the O(m)
     // nonzero scan) and the post-eta permute becomes
-    // O(|seeds ∪ fired eta pivots|) via the cpos_ slot->pivot inverse. Callers
+    // O(|seeds ∪ fired eta pivots|) via the base_->cpos_ slot->pivot inverse. Callers
     // must satisfy the partial-write reset contract above (previous support
     // ∪ previous input seed slot). Same fallback and bit-identity
     // properties as the seeded FTRAN.
+    // `row_eta` (optional): when the declared seed is a single slot p whose
+    // entry is exactly 1 and no product-form eta is pending, receives
+    // e_p^T U^-1 for update_ft() (see RowEtaCapture); otherwise it is left
+    // invalid.
     bool btran_seeded_with_support(std::vector<f64>& d,
                                    const std::vector<Index>& seed_slots,
-                                   std::vector<Index>& support) const;
+                                   std::vector<Index>& support,
+                                   RowEtaCapture* row_eta = nullptr) const;
 
     // Record that basis slot p has been replaced by a column whose image under
     // the PRE-update basis is `alpha` (i.e. alpha = B^-1 a_q, the FTRAN result
@@ -351,17 +430,23 @@ public:
     // `alpha_support` is an optional over-approximation of alpha's nonzero
     // SLOT positions -- exactly what ftran_with_support() just returned to the
     // caller. Supplying it replaces a full scan of alpha (a random gather
-    // through piv_slot_, and on a hypersparse basis most of the update's cost)
+    // through base_->piv_slot_, and on a hypersparse basis most of the update's cost)
     // with a pass over the support alone. Duplicates and zeros are tolerated;
     // null means "scan everything", which is always correct but slower.
     // `spike` is the exact R...L^-1 a_q captured by the FTRAN that produced
     // `alpha`. When absent (or invalid) the spike is recomputed as U * alpha,
     // which is the historical behaviour and carries rounding residue into U;
     // see SpikeCapture.
+    // `row_eta` is the leaving slot's e_p^T U^-1 captured by the BTRAN that
+    // priced the pivotal row (see RowEtaCapture). When it describes this
+    // very U (same factorization, same update count) and this slot, the
+    // update takes it instead of solving U' e_p again; any other capture is
+    // ignored and the solve runs as before.
     bool update_ft(Index p, const std::vector<f64>& alpha,
                    const LuOptions& opts, f64 min_pivot = 1e-11,
                    const std::vector<Index>* alpha_support = nullptr,
-                   const SpikeCapture* spike = nullptr);
+                   const SpikeCapture* spike = nullptr,
+                   const RowEtaCapture* row_eta = nullptr);
 
     // Collective FT (Huangfu & Hall 2015 Phase 2): folds every PENDING product-form eta (from update(), not
     // update_ft()) into L/U via a sequence of update_ft() calls -- reusing
@@ -400,14 +485,22 @@ public:
     bool needs_refactor(int update_limit, f64 eta_nnz_ratio,
                         Index bump_width_max = 0, f64 work_ratio_max = 0.0,
                         f64 u_nnz_ratio = 0.0,
-                        int ft_update_limit = 0) const;
+                        int ft_update_limit = 0,
+                        // When >0 and enough solves have been observed since
+                        // the last factor, force a refactor if the recent
+                        // hypersparse hit rate drops below this fraction
+                        // (dense fallback dominating = etas too fat).
+                        f64 hypersparse_hit_floor = 0.0) const;
+    // Fraction of FTRAN/BTRAN calls that stayed hypersparse since factorize.
+    f64 hypersparse_hit_rate() const noexcept;
 
     Index dimension()  const noexcept { return m_; }
     // Pending updates in EITHER file: product-form etas plus Forrest-Tomlin row
     // etas. The refactorization triggers read this, so it has to see whichever
     // representation is live.
     Index n_updates()  const noexcept {
-        return static_cast<Index>(eta_p_.size() + r_pos_.size());
+        return static_cast<Index>(eta_p_.size() + r_pos_.size()) +
+               (border_parent_ ? border_parent_->n_updates() : 0);
     }
     // The two files separately. Diagnostics and tests need to tell them apart;
     // the refactorization policy deliberately does not.
@@ -420,36 +513,41 @@ public:
     // alpha's density.
     Offset u_nnz()     const noexcept { return u_live_nnz_; }
 
-    // Heap bytes this factorization holds, scratch included (a copy copies
-    // the scratch too). For memory budgets of cached factorizations; it counts
+    // Heap bytes reachable from this factor, private scratch included. Shared
+    // immutable parents are conservatively charged in full. It counts
     // vector capacities, not sizes, because capacity is what a copy allocates.
     std::size_t memory_bytes() const noexcept {
         std::size_t total = 0;
         const auto add = [&total](const auto& v) {
             total += v.capacity() * sizeof(typename std::decay_t<decltype(v)>::value_type);
         };
-        add(piv_row_); add(piv_slot_); add(piv_val_); add(rpos_); add(cpos_);
-        add(u_off_); add(u_len_); add(u_cap_); add(u_idx_); add(u_val_);
-        add(uord_); add(upos_);
-        add(u_cstart_); add(u_clen_); add(u_ccap_); add(u_crow_); add(u_cval_);
+        add(base_->piv_row_); add(base_->piv_slot_); add(base_->piv_val_); add(base_->rpos_); add(base_->cpos_);
+        add(base_->u_off_); add(base_->u_len_); add(base_->u_cap_); add(base_->u_idx_); add(base_->u_val_);
+        add(base_->uord_); add(base_->upos_); add(base_->u_dead_steps_);
+        add(base_->u_rmirror_); add(base_->u_cmirror_);
+        add(base_->u_cstart_); add(base_->u_clen_); add(base_->u_ccap_); add(base_->u_crow_); add(base_->u_cval_);
         add(r_pos_); add(r_start_); add(r_idx_); add(r_val_);
         add(ft_atilde_); add(ft_v_); add(ft_support_); add(ft_vsupport_);
-        add(ft_seed_); add(ft_stamp_); add(ft_move_idx_); add(ft_move_val_);
-        add(l_start_); add(l_idx_); add(l_val_); add(l_col_start_); add(l_col_row_); add(l_row_val_);
+        add(ft_seed_); add(ft_stamp_); add(ft_cstamp_);
+        add(base_->l_start_); add(base_->l_idx_); add(base_->l_val_); add(base_->l_col_start_); add(base_->l_col_row_); add(base_->l_row_val_);
         add(eta_p_); add(eta_start_); add(eta_idx_); add(eta_val_); add(eta_pivot_);
         for (const auto& r : rev_) total += r.capacity() * sizeof(Index);
         total += rev_.capacity() * sizeof(std::vector<Index>);
-        const auto add_scratch = [&add](const SolveScratch& sc) {
+        const auto add_scratch = [&add](const auto& self, const SolveScratch& sc) -> void {
             add(sc.work_); add(sc.pair_work_); add(sc.mark_); add(sc.dfs_stack_);
             add(sc.reach_); add(sc.order_); add(sc.seed_); add(sc.dfs_frames_);
             add(sc.sort_tmp_); add(sc.sort_bits_);
             add(sc.support_stamp_);
             add(sc.spike_stamp_); add(sc.fire_stamp_); add(sc.fire_input_seed_);
             add(sc.fire_heap_); add(sc.fire_touched_); add(sc.work_dirty_);
-            add(sc.row_eta_touched_);
+            add(sc.row_eta_touched_); add(sc.border_rhs);
+            if (sc.border_scratch) self(self, *sc.border_scratch);
         };
-        add_scratch(scratch_);
-        for (const auto& sc : worker_scratch_) add_scratch(sc);
+        add_scratch(add_scratch, scratch_);
+        for (const auto& sc : worker_scratch_) add_scratch(add_scratch, sc);
+        if (border_parent_) total += border_parent_->memory_bytes();
+        add(border_ptr_); add(border_slot_); add(border_value_);
+        add(retained_rows_); add(retained_slots_);
         return total;
     }
 
@@ -463,6 +561,11 @@ public:
     // individually fired yet -- this is the trigger that actually tracks
     // solve COST, where the other two track proxies for it.
     Offset work_since_factor() const noexcept { return scratch_.work_since_factor_; }
+    // Solve work the update file alone has added since the factorization
+    // (sum of eta_nnz() over the solves): once it exceeds stats().factor_work
+    // a refactorization has paid for itself (ski rental -- refactoring then
+    // keeps total cost within twice that of the best schedule in hindsight).
+    Offset eta_work_since_factor() const noexcept { return scratch_.eta_work_since_factor_; }
     bool  is_valid()   const noexcept { return valid_; }
     const LuStats& stats() const noexcept { return stats_; }
 
@@ -474,8 +577,8 @@ public:
     // invariant directly, so a test can call it after EVERY operation and fail
     // on the operation that actually broke something.
     //
-    // Checks: piv_row_/piv_slot_ are permutations and rpos_/cpos_ invert them;
-    // uord_/upos_ are mutual inverses; U is triangular with respect to the
+    // Checks: base_->piv_row_/base_->piv_slot_ are permutations and base_->rpos_/base_->cpos_ invert them;
+    // base_->uord_/base_->upos_ are mutual inverses; U is triangular with respect to the
     // elimination order; the row store and column store hold exactly the same
     // entries with the same values; no row or column repeats an index; every
     // segment stays inside its capacity and no two segments overlap; L is
@@ -514,7 +617,8 @@ private:
     // Record work_ between the row etas and the U solve -- the exact spike.
     void capture_spike(SolveScratch& sc, SpikeCapture& out, bool have_seed) const;
     bool btran_impl(SolveScratch& sc, std::vector<f64>& d, std::vector<Index>* support,
-                    const std::vector<Index>* seed_slots) const;
+                    const std::vector<Index>* seed_slots,
+                    RowEtaCapture* row_eta = nullptr) const;
 
     void build_col_patterns();
     // Size and clear a scratch for the current factorization.
@@ -524,22 +628,26 @@ private:
     // Row/column edits on U's two mirrored stores. Each pair keeps the other
     // consistent; callers use them so that no code outside these four has to
     // know about capacities, relocation or dead space.
-    void u_row_append(Index row, Index col, f64 val);
-    void u_col_append(Index col, Index row, f64 val);
-    void u_row_erase(Index row, Index col);    // no-op if absent
-    void u_col_erase(Index col, Index row);    // no-op if absent
+    void u_row_reserve(Index row, Index extra);
+    void u_col_reserve(Index col, Index extra);
+    void u_append(Index row, Index col, f64 val);   // to both stores, linked
+    void u_row_drop(Index row, Offset rs);          // row-store slot rs only
+    void u_col_drop(Index col, Offset cs);          // column-store slot cs only
 
-    // Move position `p` to the END of U's elimination order, shifting the
-    // positions after it one step earlier. Sets u_reordered_.
-    void u_order_move_to_back(Index p);
+    // Move position `p` to the END of U's elimination order: it takes a new
+    // step appended to base_->uord_, and its old step becomes a hole. Returns
+    // the number of live steps from its old place to the end (p included).
+    // Sets u_reordered_.
+    Index u_order_move_to_back(Index p);
 
     // Rebuild both U mirrors packed. Contents are preserved exactly; only the
     // storage layout changes, so no solve can observe it.
     void compact_u_storage();
+    void pack_u();
 
     // Sort a reach set into U's elimination order. While u_reordered_ is false
     // that is the index order and this is the plain sort the hypersparse
-    // kernels always did; afterwards it is a sort on upos_.
+    // kernels always did; afterwards it is a sort on base_->upos_.
 
     // Row etas, in position coordinates. `touched` (optional) collects the
     // positions each pass may have turned nonzero, which is what a seeded
@@ -548,6 +656,33 @@ private:
                               std::vector<Index>* touched) const;
     void apply_row_etas_btran(std::vector<f64>& v,
                               std::vector<Index>* touched) const;
+
+    struct BaseStorage {
+        std::vector<Index> piv_row_, piv_slot_, rpos_, cpos_;
+        std::vector<f64> piv_val_;
+        std::vector<Offset> u_off_, u_cstart_, l_start_, l_col_start_;
+        std::vector<Index> u_len_, u_cap_, u_idx_, uord_, upos_, u_clen_, u_ccap_, u_crow_, l_idx_, l_col_row_;
+        // Holes in uord_ (steps whose position moved to the back), oldest first.
+        std::vector<Index> u_dead_steps_;
+        // Twin links between U's stores, relative to the twin's segment:
+        // u_rmirror_[rs] is the offset inside its column's segment of the
+        // entry at row-store slot rs, u_cmirror_ the reverse.
+        std::vector<Index> u_rmirror_, u_cmirror_;
+        std::vector<f64> u_val_, u_cval_, l_val_, l_row_val_;
+    };
+    // Shared snapshots of the base LU. Product-form updates only append to
+    // the private eta journal. FT edits U and detaches before its first edit;
+    // refactorization replaces shared storage rather than copying it.
+    std::shared_ptr<BaseStorage> base_ = std::make_shared<BaseStorage>();
+    std::shared_ptr<const BasisFactor> border_parent_;
+    std::vector<Offset> border_ptr_;
+    std::vector<Index> border_slot_;
+    std::vector<f64> border_value_;
+    bool projected_ = false;
+    std::vector<Index> retained_rows_, retained_slots_;
+    bool solve_border(SolveScratch&, std::vector<f64>&,
+                      std::vector<Index>*, bool transpose) const;
+    void detach_base() { if (!base_.unique()) base_ = std::make_shared<BaseStorage>(*base_); }
 
     Index m_ = 0;
     bool valid_ = false;
@@ -558,40 +693,34 @@ private:
     mutable std::vector<SolveScratch> worker_scratch_;
     std::uint64_t factor_gen_ = 0;  // bumped by factorize()
 
-    // Pivot sequence. Pivot k sits at (piv_row_[k], piv_slot_[k]) with value
-    // piv_val_[k]. rpos_/cpos_ are the inverse maps, row/slot -> pivot order.
-    std::vector<Index> piv_row_, piv_slot_;
-    std::vector<f64>   piv_val_;
-    std::vector<Index> rpos_, cpos_;
+    // Pivot sequence. Pivot k sits at (base_->piv_row_[k], base_->piv_slot_[k]) with value
+    // base_->piv_val_[k]. base_->rpos_/base_->cpos_ are the inverse maps, row/slot -> pivot order.
     // Same inverses with -1 for unmapped positions, so the seeded solves can
     // detect a caller seed position that carries no pivot (vacant-row states
     // between a truncated factorization and its repair) and fall back to the
     // classic fully-scanning path.
 
     // U off-diagonals + diagonal storage. Row k lives at
-    // [u_off_[k], u_off_[k] + u_len_[k]) in u_idx_/u_val_, indices in pivot
+    // [base_->u_off_[k], base_->u_off_[k] + base_->u_len_[k]) in base_->u_idx_/base_->u_val_, indices in pivot
     // coordinates. The diagonal U_kk is the implied last entry: row k holds
-    // its OFF-diagonal columns only (piv_val_ carries the diagonal).
+    // its OFF-diagonal columns only (base_->piv_val_ carries the diagonal).
     //
-    // u_cap_[k] is the room reserved for row k, so update_ft() can APPEND to a
+    // base_->u_cap_[k] is the room reserved for row k, so update_ft() can APPEND to a
     // row in place. A row that outgrows its capacity is relocated to the end of
-    // u_idx_/u_val_ with fresh slack, leaving dead space behind; see
+    // base_->u_idx_/base_->u_val_ with fresh slack, leaving dead space behind; see
     // u_dead_nnz_.
-    std::vector<Offset> u_off_;
-    std::vector<Index>  u_len_;
-    std::vector<Index>  u_cap_;
-    std::vector<Index>  u_idx_;
-    std::vector<f64>    u_val_;
     Offset u_dead_nnz_ = 0;   // storage abandoned by row relocation
 
     // ---- Forrest-Tomlin state (unused while update_method is ProductForm) --
     //
     // U's ELIMINATION ORDER, decoupled from the position numbering. Position k
-    // still means "pivot row piv_row_[k], basis slot piv_slot_[k]" for all
+    // still means "pivot row base_->piv_row_[k], basis slot base_->piv_slot_[k]" for all
     // time; what an FT update changes is only WHEN position k is eliminated.
-    // uord_[t] is the position eliminated at step t and upos_ is its inverse,
-    // so U's triangularity condition is upos_[column] > upos_[row] rather than
-    // column > row.
+    // base_->uord_[t] is the position eliminated at step t and base_->upos_ is its inverse,
+    // so U's triangularity condition is base_->upos_[column] > base_->upos_[row] rather than
+    // column > row. Updates only append steps: a step whose position moved to
+    // the back holds -1 until the next factorization (base_->u_dead_steps_),
+    // so uord_ has n + (updates since the factorization) entries.
     //
     // This is what lets L stay untouched by an update, which is the whole point
     // of Forrest-Tomlin: L and U are two independent sequences of operations
@@ -601,17 +730,12 @@ private:
     // keeps its original index-order fast path while it is false. The
     // ProductForm path therefore runs exactly the code it ran before, with no
     // indirection added.
-    std::vector<Index> uord_, upos_;
     bool u_reordered_ = false;
 
     // U by COLUMN, with values. The reach-set DFS needs the pattern; the
     // update needs the values too, to form L^-1 a_q = U * alpha in O(nnz)
     // instead of searching each row for the column it wants. Same
     // offset/length/capacity discipline as the row store above.
-    std::vector<Offset> u_cstart_;
-    std::vector<Index>  u_clen_, u_ccap_;
-    std::vector<Index>  u_crow_;
-    std::vector<f64>    u_cval_;
     Offset u_cdead_nnz_ = 0;
 
     // Row-eta file R. Update t eliminated the sub-diagonal part of row
@@ -634,25 +758,22 @@ private:
     std::vector<f64>   ft_atilde_, ft_v_;
     std::vector<Index> ft_support_, ft_vsupport_, ft_seed_;
     std::vector<std::uint32_t> ft_stamp_;   // support membership, by generation
+    // Alpha columns already added this update (same generation).  Separate
+    // from ft_stamp_: a position is in atilde's support as soon as ANOTHER
+    // column's U entry lands on it, which says nothing about whether its own
+    // column has been added.
+    std::vector<std::uint32_t> ft_cstamp_;
     std::uint32_t ft_gen_ = 0;
-    std::vector<Index> ft_move_idx_;        // relocation staging (see u_row_append)
-    std::vector<f64>   ft_move_val_;
 
     // L multipliers, by pivot order, indices in pivot coordinates, strictly
     // greater than the pivot index. Unit diagonal is implicit. Frozen between
     // factorizations under product-form update() (which never touches it);
     // update_ft() rewrites pivot-steps [p_step, m) of both L and U in place.
-    std::vector<Offset> l_start_;
-    std::vector<Index>  l_idx_;
-    std::vector<f64>    l_val_;
 
     // L's column pattern for the reach-set DFS, compressed by counting sort.
     // Built once by build_col_patterns(); no update path touches L.
-    std::vector<Offset> l_col_start_;
-    std::vector<Index>  l_col_row_;
     // ...with values: L by rows, which turns L' w = v into a scatter that
     // skips zeros (sparse and dense alike) instead of a gather over all of L.
-    std::vector<f64>    l_row_val_;
 
     // Eta file: update k replaced basis slot eta_p_[k] with a column whose
     // image was eta_val_[eta_start_[k] .. eta_start_[k+1]).

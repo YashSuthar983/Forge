@@ -1,9 +1,11 @@
 #include "sor/certify/finalize.hpp"
 #include "sor/io/mps.hpp"
 #include "sor/engines/dual_simplex.hpp"
+#include "sor/engines/farkas.hpp"
 #include "test_helpers.hpp"
 #include "sor/model/exact.hpp"
 #include <random>
+#include <cmath>
 
 #include <sstream>
 #include <limits>
@@ -72,9 +74,240 @@ ENDATA
     CHECK(!b.finite);
 }
 
+void test_straddling_enclosure_is_decided_exactly() {
+    // Large |A'y| with near-cancellation against c leaves d ~ 0 but a wide
+    // absolute sum: the interval path forms [-e, e] on a column with no upper
+    // bound. Its exact reduced cost decides; a wrong-sign one is corrected by
+    // moving the multiplier, never charged as zero.
+    const auto lp = read(R"(NAME STRADDLE
+ROWS
+ N OBJ
+ E R1
+COLUMNS
+    X OBJ 1000000 R1 1000000
+RHS
+    RHS R1 1
+BOUNDS
+ LO BND X 0
+ENDATA
+)");
+    // Exact dual y = 1: d = 0, bound = 1 (the optimum).
+    auto b = certify::safe_lagrangian_lower_bound(lp, {1.0}, lp.col_lo, lp.col_hi);
+    CHECK(b.finite);
+    CHECK(b.value <= 1.0);
+    CHECK_NEAR(b.value, 1.0, 1e-6);
+    // Round-off dual: d_x ~ -1e-8 on [0, inf). The row implies x <= 1e-6,
+    // and the exact reduced cost is charged to that bound, not to zero.
+    b = certify::safe_lagrangian_lower_bound(lp, {1.0 + 1e-14}, lp.col_lo, lp.col_hi);
+    CHECK(b.finite);
+    CHECK(b.value <= 1.0);
+    CHECK(b.implied_bound_uses > 0);
+}
+
+void test_bound_never_exceeds_the_optimum() {
+    // min -x1 + x2  s.t.  x1 - x2 <= 1,  x >= 0: optimum -1 along x1 = 1 + x2.
+    // Only y = -1 has a finite Lagrangian: any other y leaves x1 or x2 a
+    // wrong-sign reduced cost on an infinite upper bound. Charging such a
+    // residual as zero because it is within the dual feasibility tolerance
+    // published -0.99999995 for y = -1 + 5e-8, above the optimum.
+    const auto lp = read(R"(NAME ABOVE
+ROWS
+ N OBJ
+ L R1
+COLUMNS
+    X1 OBJ -1 R1 1
+    X2 OBJ 1 R1 -1
+RHS
+    RHS R1 1
+ENDATA
+)");
+    const auto exact = certify::safe_lagrangian_lower_bound(lp, {-1.0}, lp.col_lo, lp.col_hi);
+    CHECK(exact.finite);
+    CHECK(exact.value <= -1.0);
+    CHECK(exact.value >= -1.0 - 1e-12);
+    std::vector<double> ys = {0.0, -0.5, -1.0 + 5e-8, -1.0 + 1e-8, -1.0 - 1e-8, -1.0 - 5e-8,
+                           -1.0 + 1e-15, -1.0 - 1e-15};
+    double y = -1.0;
+    for (int k = 0; k < 8; ++k) {
+        ys.push_back(y = std::nextafter(y, 0.0));
+    }
+    y = -1.0;
+    for (int k = 0; k < 8; ++k) {
+        ys.push_back(y = std::nextafter(y, -2.0));
+    }
+    for (const double yi : ys) {
+        const auto b = certify::safe_lagrangian_lower_bound(lp, {yi}, lp.col_lo, lp.col_hi);
+        CHECK(!b.finite || b.value <= -1.0);
+        const auto enc = certify::enclose_reduced_costs(lp, {yi}, lp.col_lo, lp.col_hi);
+        CHECK(!enc.finite || enc.bound <= -1.0);
+    }
+}
+
+// Rounded basis duals of a Netlib basis whose one-sided basic columns land an
+// ulp on the unchargeable side (blend: column 34, x >= 0, d = -4.9e-16):
+// inward_basis_duals must give multipliers with a finite rigorous bound that
+// closes the gap, and the dual engine must publish them.
+void test_inward_basis_duals_close_the_gap() {
+    io::MpsReadReport report;
+    const auto lp = io::read_mps_file(SOR_SOURCE_DIR "/benchmarks/netlib/mps/blend.mps", report);
+    engines::SimplexOptions opts;
+    opts.presolve = false;
+    engines::SimplexDiagnostics diag;
+    const auto raw = engines::solve_dual_simplex(lp, opts, diag);
+    CHECK(raw.proposed_status == core::Status::Optimal);
+    CHECK(raw.certificate_basis.size() == static_cast<std::size_t>(lp.n_rows()));
+    const auto pmin = model::minimization_form(lp);
+    std::vector<double> y;
+    CHECK(certify::inward_basis_duals(pmin, raw.certificate_basis, y));
+    const auto bound = certify::safe_lagrangian_lower_bound(pmin, y, pmin.col_lo, pmin.col_hi);
+    CHECK(bound.finite);
+    const double objective = pmin.objective(raw.x);
+    CHECK(std::fabs(objective - bound.value) <= 1e-9 * (1.0 + std::fabs(objective)));
+    // The engine's own terminal duals already went through the same repair.
+    CHECK(diag.inward_dual_corrections >= 1);
+    CHECK(diag.dual_bound_finite);
+    CHECK(diag.gap_rel <= opts.gap_tol);
+    const auto checked = certify::check_lp_point(lp, raw, 1e-7, 1e-7, 1e-9, true);
+    CHECK(std::isfinite(checked.gap_rel));
+    CHECK(checked.gap_rel <= 1e-9);
+    CHECK(certify::finalize_result(raw, checked).proof == core::ProofLevel::ProvedOptimalFP);
+}
+
+// The published Farkas ray must be the vector the check certified. x free,
+// x = 0 and x >= 1: the producer's ray (1 + 1e-9, -1) leaves A'y = 1e-9 on
+// the free column; the check repairs it to an exact certificate and used to
+// publish the producer's vector with residual 0 anyway.
+void test_published_farkas_ray_is_the_certified_one() {
+    const auto lp = read(R"(NAME RAYREP
+ROWS
+ N OBJ
+ E R0
+ G R1
+COLUMNS
+    X OBJ 0 R0 1 R1 1
+RHS
+    RHS R1 1
+BOUNDS
+ FR BND X
+ENDATA
+)");
+    core::RawResult raw;
+    raw.proposed_status = core::Status::Infeasible;
+    raw.proposed_level = core::ProofLevel::BoundOnly;
+    raw.x = {0.0};
+    raw.ray = {1.0 + 1e-9, -1.0};
+    core::ProofEvidence proposed;
+    proposed.claimed_level = core::ProofLevel::BoundOnly;
+    const auto r = certify::finalize_result(certify::check_lp_candidate(lp, raw, proposed));
+    CHECK(r.status == core::Status::Infeasible);
+    CHECK(r.ray_certified);
+    CHECK(r.ray.size() == 2);
+    if (r.ray.size() == 2) {
+        model::DyadicSum aty;   // the free column's A'y, exactly
+        aty.add_product(r.ray[0], 1.0);
+        aty.add_product(r.ray[1], 1.0);
+        CHECK(aty.is_zero());
+        CHECK(r.ray == r.dual_farkas_ray.multipliers);
+    }
+}
+
+// A closed gap proves the objective only near the feasible set. min x,
+// 1e-9 x >= 5e-9, x >= 0 has optimum 5; x = 0, y = 0 meets the absolute
+// 1e-7 row tolerance (violation 5e-9) and its bound 0 closes the gap, but
+// x is five units from the row. It was published as ProvedOptimalFP with
+// objective 0 (and sor_check said VERIFIED).
+void test_closed_gap_far_from_a_row_is_not_fp() {
+    const auto lp = read(R"(NAME TOL
+ROWS
+ N OBJ
+ G R1
+COLUMNS
+    X OBJ 1 R1 1e-9
+RHS
+    RHS R1 5e-9
+ENDATA
+)");
+    CHECK(lp.max_row_violation({0.0}) <= 1e-7);
+    CHECK(lp.max_row_distance({0.0}) >= 5.0);
+    CHECK(lp.max_row_distance({5.0}) == 0.0);
+    core::RawResult raw;
+    raw.x = {0.0};
+    raw.y = {0.0};
+    raw.objective = raw.dual_bound = 0.0;
+    raw.proposed_status = core::Status::Optimal;
+    raw.proposed_level = core::ProofLevel::ProvedOptimalFP;
+    const auto checked = certify::check_lp_point(lp, raw, 1e-7, 1e-7, 1e-9, true);
+    CHECK(checked.checker_passed);
+    CHECK(checked.gap_rel <= 1e-9);
+    const auto r = certify::finalize_result(raw, checked);
+    CHECK(r.proof != core::ProofLevel::ProvedOptimalFP);
+    CHECK(r.status != core::Status::Optimal);
+    // The solve itself (no presolve, which would turn the row into x >= 5).
+    engines::SimplexOptions opts;
+    opts.presolve = false;
+    for (bool dual : {false, true}) {
+        engines::SimplexDiagnostics diag;
+        auto solved = dual ? engines::solve_dual_simplex(lp, opts, diag)
+                           : engines::solve_simplex(lp, opts, diag);
+        const auto proposed = engines::simplex_evidence(diag, opts);
+        const auto final_ev = certify::check_lp_result(lp, solved, proposed);
+        const auto fr = certify::finalize_result(solved, final_ev);
+        CHECK(fr.proof != core::ProofLevel::ProvedOptimalFP || std::fabs(fr.objective - 5.0) <= 1e-6);
+    }
+}
+
+// Reduced-cost fixing must not turn rounding into bounds. min -x + z,
+// 2x + z <= 3, x, z >= 0 integer: the LP optimum has x = 1.5 basic with an
+// exact reduced cost of 0, z = 0 nonbasic with d_z = 1.5. A multiplier a few
+// ulps off the basis dual (as the inward duals leave a basic column, or as
+// rounding does) gives d_x ~ 2e-15 > 0, and room / d_x would bound x by
+// ~2.5e14: valid, informationless, and it inflated the outward margin of a
+// later GMI cut x <= 1 to x <= 422213 (test_cuts). Only z may be fixed.
+void test_reduced_cost_fixing_ignores_rounding_level_costs() {
+    auto lp = read(R"(NAME RCNOISE
+ROWS
+ N OBJ
+ L R1
+COLUMNS
+    MARK0000  'MARKER'                 'INTORG'
+    X OBJ -1 R1 2
+    Z OBJ 1 R1 1
+    MARK0001  'MARKER'                 'INTEND'
+RHS
+    RHS R1 3
+BOUNDS
+ PL BND X
+ PL BND Z
+ENDATA
+)");
+    CHECK(!std::isfinite(lp.col_hi[0]) && !std::isfinite(lp.col_hi[1]));
+    const std::vector<double> y = {-0.5 - 1e-15};
+    const double cutoff = -1.0;   // incumbent x = 1, z = 0
+    certify::SafeLpBound lb;
+    const auto exact = certify::safe_reduced_cost_tightenings(lp, y, lp.col_lo, lp.col_hi,
+                                                              cutoff, &lb);
+    CHECK(lb.finite);
+    bool z_fixed = false;
+    for (const auto& c : exact) {
+        CHECK(c.col != 0);            // no bound on x from d_x ~ 2e-15
+        if (c.col == 1 && c.upper && c.value == 0.0) z_fixed = true;
+    }
+    CHECK(z_fixed);
+    const auto interval = certify::interval_reduced_cost_tightenings(
+        lp, y, lp.col_lo, lp.col_hi, cutoff, nullptr);
+    CHECK(interval.finite);
+    z_fixed = false;
+    for (const auto& c : interval.changes) {
+        CHECK(c.col != 0);
+        if (c.col == 1 && c.upper && c.value == 0.0) z_fixed = true;
+    }
+    CHECK(z_fixed);
+}
+
 void test_small_cost_cannot_erase_unbounded_direction() {
     // The cost is inside the KKT tolerance, but its product with the
-    // unbounded upper box is still -infinity. A fake zero gap is unsound.
+    // unbounded box is still -infinity: no gap may be published for it, and
+    // charging it as zero (the removed "snap") would be unsound.
     const auto source = read(R"(NAME TINY
 ROWS
  N OBJ
@@ -459,15 +692,284 @@ void test_float_rays_skip_exact_repair_without_exact_proof() {
     }
 }
 
+// The interval fast path of safe_lagrangian_lower_bound must never exceed the
+// exactly evaluated Lagrangian of the same multipliers (the exact value comes
+// from the d_out route of safe_reduced_cost_tightenings), and must stay within
+// rounding of it. Random dense-ish LPs with mixed signs, magnitudes over many
+// orders, finite boxes and both row senses; multipliers perturbed so reduced
+// costs straddle zero.
+void test_interval_lagrangian_matches_exact() {
+    std::mt19937 rng(20261006u);
+    std::uniform_real_distribution<double> U(-1.0, 1.0);
+    int compared = 0;
+    for (int trial = 0; trial < 400; ++trial) {
+        const core::Index m = 2 + static_cast<core::Index>(rng() % 6);
+        const core::Index n = 2 + static_cast<core::Index>(rng() % 8);
+        model::LpProblem lp;
+        lp.maximize = (rng() & 1u) != 0;
+        lp.obj_offset = U(rng) * 10.0;
+        std::vector<core::Index> rows, cols;
+        std::vector<double> vals;
+        const double scale = std::pow(10.0, static_cast<double>(rng() % 7) - 3.0);
+        for (core::Index i = 0; i < m; ++i)
+            for (core::Index j = 0; j < n; ++j)
+                if (rng() % 3 != 0) {
+                    rows.push_back(i); cols.push_back(j);
+                    vals.push_back(U(rng) * scale * std::pow(10.0, static_cast<double>(rng() % 5) - 2.0));
+                }
+        lp.A = sparse::from_triplets(m, n, rows, cols, vals);
+        lp.c.resize(n); lp.col_lo.resize(n); lp.col_hi.resize(n);
+        for (core::Index j = 0; j < n; ++j) {
+            lp.c[j] = U(rng) * 5.0;
+            lp.col_lo[j] = -1.0 - 3.0 * std::fabs(U(rng));
+            lp.col_hi[j] = lp.col_lo[j] + 0.5 + 4.0 * std::fabs(U(rng));
+        }
+        lp.row_lo.resize(m); lp.row_hi.resize(m);
+        for (core::Index i = 0; i < m; ++i) {
+            lp.row_lo[i] = -2.0 + U(rng);
+            lp.row_hi[i] = (rng() % 4 == 0) ? model::kInf : lp.row_lo[i] + 3.0;
+        }
+        std::vector<double> y(m);
+        for (auto& v : y) v = U(rng) * std::pow(10.0, static_cast<double>(rng() % 5) - 2.0);
+        const auto fast = certify::safe_lagrangian_lower_bound(lp, y, lp.col_lo, lp.col_hi);
+        certify::SafeLpBound exact;
+        (void)certify::safe_reduced_cost_tightenings(lp, y, lp.col_lo, lp.col_hi,
+                                                     std::numeric_limits<double>::infinity(),
+                                                     &exact, nullptr);
+        CHECK(fast.finite == exact.finite);
+        if (!fast.finite || !exact.finite) continue;
+        ++compared;
+        CHECK(fast.value <= exact.value);
+        CHECK(exact.value - fast.value <= 1e-9 * (1.0 + std::fabs(exact.value)));
+    }
+    CHECK(compared > 300);
+}
+
+// interval_reduced_cost_tightenings may only be weaker than the exactly
+// evaluated rule (safe_reduced_cost_tightenings with the same multipliers):
+// for every column, its bound must contain the exact one. Integer columns
+// with integral boxes; the cutoff a random room above the exact Lagrangian,
+// so that both tight and loose fixings occur.
+void test_interval_rc_never_tighter_than_exact() {
+    std::mt19937 rng(20261008u);
+    std::uniform_real_distribution<double> U(-1.0, 1.0);
+    int fixed = 0, same = 0;
+    for (int trial = 0; trial < 400; ++trial) {
+        const core::Index m = 2 + static_cast<core::Index>(rng() % 6);
+        const core::Index n = 2 + static_cast<core::Index>(rng() % 8);
+        model::LpProblem lp;
+        lp.maximize = (rng() & 1u) != 0;
+        lp.obj_offset = U(rng) * 10.0;
+        std::vector<core::Index> rows, cols;
+        std::vector<double> vals;
+        for (core::Index i = 0; i < m; ++i)
+            for (core::Index j = 0; j < n; ++j)
+                if (rng() % 3 != 0) {
+                    rows.push_back(i); cols.push_back(j);
+                    vals.push_back(U(rng) * std::pow(10.0, static_cast<double>(rng() % 5) - 2.0));
+                }
+        lp.A = sparse::from_triplets(m, n, rows, cols, vals);
+        lp.c.resize(n); lp.col_lo.resize(n); lp.col_hi.resize(n);
+        lp.is_integer.assign(n, true);
+        for (core::Index j = 0; j < n; ++j) {
+            lp.c[j] = U(rng) * 5.0;
+            lp.col_lo[j] = -static_cast<double>(rng() % 4);
+            lp.col_hi[j] = lp.col_lo[j] + 1.0 + static_cast<double>(rng() % 6);
+        }
+        lp.row_lo.resize(m); lp.row_hi.resize(m);
+        for (core::Index i = 0; i < m; ++i) {
+            lp.row_lo[i] = -2.0 + U(rng);
+            lp.row_hi[i] = (rng() % 4 == 0) ? model::kInf : lp.row_lo[i] + 3.0;
+        }
+        std::vector<double> y(m);
+        for (auto& v : y) v = U(rng) * std::pow(10.0, static_cast<double>(rng() % 5) - 2.0);
+        certify::SafeLpBound exact_lb;
+        (void)certify::safe_reduced_cost_tightenings(lp, y, lp.col_lo, lp.col_hi,
+                                                     std::numeric_limits<double>::infinity(),
+                                                     &exact_lb, nullptr);
+        if (!exact_lb.finite) continue;
+        const double cutoff = exact_lb.value + std::fabs(U(rng)) * 6.0;
+        const auto exact = certify::safe_reduced_cost_tightenings(lp, y, lp.col_lo, lp.col_hi,
+                                                                  cutoff, nullptr, nullptr);
+        const auto fast = certify::interval_reduced_cost_tightenings(
+            lp, y, lp.col_lo, lp.col_hi, cutoff, nullptr);
+        if (!fast.finite) continue;
+        CHECK(fast.bound <= exact_lb.value);
+        for (const auto& f : fast.changes) {
+            ++fixed;
+            bool found = false;
+            for (const auto& e : exact) {
+                if (e.col != f.col || e.upper != f.upper) continue;
+                found = true;
+                // Valid: the interval bound keeps everything the exact one keeps.
+                CHECK(f.upper ? f.value >= e.value : f.value <= e.value);
+                if (f.value == e.value) ++same;
+            }
+            CHECK(found);   // the exact rule tightens wherever the interval one does
+        }
+    }
+    CHECK(fixed > 100);
+    CHECK(same * 10 >= fixed * 9);   // the enclosure is tight: nearly always the same bound
+}
+
+// check_dual_farkas_ray certifies by interval arithmetic when that decides
+// and exactly otherwise. Either way the verdict must be the exact rule's:
+// lower - upper > tol * (1 + max(|lower|, |upper|)) (rounded down against
+// rounded up), with lower = sum_j d_j b_j (d = A'y exactly, b the bound d_j's
+// sign needs) and upper = sum_i y_i side_i, evaluated here in rationals on
+// the multipliers the check returns. The rays are planted around the
+// threshold: separation a log-uniform multiple (0.1x .. 10x) of the
+// tolerance, coefficients across 1e-4 .. 1e4, so both verdicts and the
+// undecided-interval fallback are exercised.
+void test_farkas_check_matches_exact_rule() {
+    std::mt19937 rng(20261006u + 7u);
+    std::uniform_real_distribution<double> U(-1.0, 1.0);
+    const double tol = 1e-7;
+    int certified = 0, refused = 0;
+    for (int trial = 0; trial < 800; ++trial) {
+        const core::Index m = 1 + static_cast<core::Index>(rng() % 6);
+        const core::Index n = 1 + static_cast<core::Index>(rng() % 8);
+        std::vector<core::Index> rows, cols;
+        std::vector<double> vals;
+        for (core::Index i = 0; i < m; ++i)
+            for (core::Index j = 0; j < n; ++j)
+                if (rng() % 3 != 0) {
+                    rows.push_back(i); cols.push_back(j);
+                    vals.push_back(U(rng) * std::pow(10.0, static_cast<double>(rng() % 9) - 4.0));
+                }
+        model::LpProblem lp;
+        lp.A = sparse::from_triplets(m, n, rows, cols, vals);
+        lp.c.assign(static_cast<std::size_t>(n), 0.0);
+        lp.col_lo.resize(static_cast<std::size_t>(n));
+        lp.col_hi.resize(static_cast<std::size_t>(n));
+        for (core::Index j = 0; j < n; ++j) {
+            lp.col_lo[j] = -1.0 - 3.0 * std::fabs(U(rng));
+            lp.col_hi[j] = lp.col_lo[j] + 0.5 + 4.0 * std::fabs(U(rng));
+        }
+        std::vector<double> y(static_cast<std::size_t>(m));
+        for (auto& v : y) v = rng() % 5 == 0 ? 0.0 : U(rng);
+        core::Index pivot = -1;
+        for (core::Index i = 0; i < m; ++i) if (y[i] != 0.0) pivot = i;
+        if (pivot < 0) continue;
+        // lower for these multipliers, exactly.
+        const auto& rp = lp.A.pattern.row_ptr();
+        const auto& ci = lp.A.pattern.col_idx();
+        const auto exact_lower = [&](const std::vector<double>& yy) {
+            std::vector<model::Rational> d(static_cast<std::size_t>(n), 0);
+            for (core::Index i = 0; i < m; ++i)
+                for (auto k = rp[i]; k < rp[i + 1]; ++k)
+                    d[ci[k]] += model::Rational(yy[i]) * model::Rational(lp.A.vals[k]);
+            model::Rational lower = 0;
+            for (core::Index j = 0; j < n; ++j) {
+                if (d[j] > 0) lower += d[j] * model::Rational(lp.col_lo[j]);
+                else if (d[j] < 0) lower += d[j] * model::Rational(lp.col_hi[j]);
+            }
+            return lower;
+        };
+        const double lower = exact_lower(y).convert_to<double>();
+        // Sides: the one each multiplier's sign uses, the other open or not.
+        lp.row_lo.resize(static_cast<std::size_t>(m));
+        lp.row_hi.resize(static_cast<std::size_t>(m));
+        double upper_rest = 0.0;
+        for (core::Index i = 0; i < m; ++i) {
+            const double side = 3.0 * U(rng);
+            const double other = rng() % 2 ? model::kInf : 2.0 + std::fabs(U(rng));
+            if (y[i] >= 0.0) { lp.row_hi[i] = side; lp.row_lo[i] = side - other; }
+            else { lp.row_lo[i] = side; lp.row_hi[i] = side + other; }
+            if (i != pivot) upper_rest += y[i] * side;
+        }
+        const double factor = std::pow(10.0, 2.0 * std::fabs(U(rng)) - 1.0);
+        const double sign = rng() % 4 == 0 ? -1.0 : 1.0;   // some feasible-side rays
+        const double target_upper =
+            lower - sign * factor * tol * (1.0 + std::fabs(lower));
+        const double side = (target_upper - upper_rest) / y[pivot];
+        if (y[pivot] > 0.0) { lp.row_hi[pivot] = side; lp.row_lo[pivot] = -model::kInf; }
+        else { lp.row_lo[pivot] = side; lp.row_hi[pivot] = model::kInf; }
+
+        const auto got = certify::check_dual_farkas_ray(lp, y, tol);
+        // The exact rule on the multipliers the check settled on.
+        bool want = false;
+        if (got.multipliers.size() == y.size()) {
+            const auto& w = got.multipliers;
+            const model::Rational lo_exact = exact_lower(w);
+            model::Rational up_exact = 0;
+            for (core::Index i = 0; i < m; ++i) {
+                if (w[i] > 0.0) up_exact += model::Rational(w[i]) * model::Rational(lp.row_hi[i]);
+                else if (w[i] < 0.0) up_exact += model::Rational(w[i]) * model::Rational(lp.row_lo[i]);
+            }
+            const double contradiction = model::rounded_down(lo_exact - up_exact);
+            const model::Rational mag = boost::multiprecision::max(
+                boost::multiprecision::abs(lo_exact), boost::multiprecision::abs(up_exact));
+            const double sep = model::rounded_up(model::Rational(tol) * (1 + mag));
+            want = std::isfinite(contradiction) && contradiction > sep;
+        }
+        CHECK(got.certified == want);
+        // The engine's strict rule (no tolerance, declared bounds only) on
+        // the multipliers as given.
+        {
+            const model::Rational lo_exact = exact_lower(y);
+            model::Rational up_exact = 0;
+            for (core::Index i = 0; i < m; ++i) {
+                if (y[i] > 0.0) up_exact += model::Rational(y[i]) * model::Rational(lp.row_hi[i]);
+                else if (y[i] < 0.0) up_exact += model::Rational(y[i]) * model::Rational(lp.row_lo[i]);
+            }
+            CHECK((engines::farkas_violation(lp, y) == 0.0) == (lo_exact > up_exact));
+        }
+        if (got.certified) {
+            ++certified;
+            CHECK(got.max_sign_residual == 0.0);
+        } else {
+            ++refused;
+        }
+    }
+    CHECK(certified > 150);
+    CHECK(refused > 150);
+
+    // Cancellation below long double precision. Column x0's terms are
+    // 1, 3*2^-66, -1, -2^-65: exactly d0 = +2^-66, but summed in long double
+    // (1 + 3*2^-66 rounds to 1) it comes out -2^-65. With x0 in
+    // [-2e20, -1e20] the sign decides the bound: the exact rule charges d0 to
+    // the lower bound (-2.71) and refuses the ray against upper = -1.71;
+    // trusting the computed sign would charge it to the upper bound (+2.71)
+    // and certify. Against upper = -10 both verdicts certify.
+    {
+        const double t66 = std::ldexp(1.0, -66), t65 = std::ldexp(1.0, -65);
+        model::LpProblem lp;
+        lp.A = sparse::from_triplets(
+            4, 2, {0, 0, 1, 2, 3}, {0, 1, 0, 0, 0},
+            {1.0, 1.0, 3.0 * t66, -1.0, -t65});
+        lp.c.assign(2, 0.0);
+        lp.col_lo = {-2e20, 0.0};
+        lp.col_hi = {-1e20, 1.0};
+        lp.row_lo.assign(4, -model::kInf);
+        lp.row_hi = {-1.71, 0.0, 0.0, 0.0};
+        const std::vector<double> y(4, 1.0);
+        CHECK(!certify::check_dual_farkas_ray(lp, y, tol).certified);
+        CHECK(engines::farkas_violation(lp, y) == core::kPosInf);
+        lp.row_hi[0] = -10.0;
+        CHECK(certify::check_dual_farkas_ray(lp, y, tol).certified);
+        CHECK(engines::farkas_violation(lp, y) == 0.0);
+    }
+}
+
 int main() {
+    test_interval_rc_never_tighter_than_exact();
     test_float_rays_skip_exact_repair_without_exact_proof();
+    test_farkas_check_matches_exact_rule();
     test_presolved_terminal_witnesses();
     test_exact_terminal_rays();
     test_sparse_integer_basis_certificate();
     test_targeted_dual_certificate();    test_exact_dual_rational_reference();
     test_safe_lagrangian_bound();
+    test_interval_lagrangian_matches_exact();
     test_safe_bound_refuses_unbounded_direction();
+    test_straddling_enclosure_is_decided_exactly();
+    test_bound_never_exceeds_the_optimum();
+    test_inward_basis_duals_close_the_gap();
     test_small_cost_cannot_erase_unbounded_direction();
+    test_reduced_cost_fixing_ignores_rounding_level_costs();
+    test_closed_gap_far_from_a_row_is_not_fp();
+    test_published_farkas_ray_is_the_certified_one();
     test_checked_repair_preserves_sense_and_offset();
     const auto infeasible = read(R"(NAME INF
 ROWS
@@ -495,6 +997,7 @@ ENDATA
         ev.claimed_level = core::ProofLevel::BoundOnly;
         ev.dual_farkas_violation = dual.max_sign_residual;
         ev.dual_farkas_contradiction = dual.contradiction;
+        ev.dual_farkas_multipliers = dual.multipliers;
         const auto result = certify::finalize_result(std::move(raw), ev);
         CHECK(result.status == core::Status::Infeasible);
         CHECK(result.dual_farkas_ray.certified);

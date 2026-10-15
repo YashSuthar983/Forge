@@ -1361,7 +1361,7 @@ int main() {
         CHECK(normal.map.problem.n_cols() < 3);
         CHECK(!normal.map.stats.stopped_at_deadline);
 
-        opts.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+        opts.deadline = sor::core::SolverClock::now() - std::chrono::seconds(1);
         const auto late = sor::presolve::presolve(p, opts);
         CHECK(late.status == sor::presolve::PresolveStatus::Reduced);
         CHECK(late.map.stats.stopped_at_deadline);
@@ -1369,6 +1369,38 @@ int main() {
         CHECK(late.map.recovery_steps.empty());
         const auto x = postsolve(late.map, {1.0, 2.0, 1.0});
         CHECK(x.size() == 3 && x[0] == 1.0 && x[1] == 2.0 && x[2] == 1.0);
+    }
+
+    // Empty equality with nonzero residual after all columns fixed (H1).
+    // Kernel path: both structural columns fixed at 0 while 0 = 10.
+    {
+        LpProblem p;
+        p.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
+        p.c = {0.0, 0.0};
+        p.row_lo = p.row_hi = {10.0};
+        p.col_lo = {0.0, 0.0};
+        p.col_hi = {0.0, 0.0};
+        const auto out = sor::presolve::presolve(p, {});
+        CHECK(out.status == sor::presolve::PresolveStatus::Infeasible);
+    }
+    // Live path: last live coefficient of an equality is fixed away, leaving
+    // a violated empty equation. Implied bounds force the remaining column
+    // to a singleton point, then fix_column empties the row.
+    {
+        LpProblem p;
+        p.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
+        p.c = {0.0, 0.0};
+        p.row_lo = p.row_hi = {10.0};
+        p.col_lo = {0.0, 0.0};
+        p.col_hi = {4.0, 4.0};  // max activity 8 < 10
+        sor::presolve::PresolveOptions opts;
+        opts.live_reductions = true;
+        opts.implied_bounds = true;
+        opts.dominated_columns = false;
+        opts.parallel_rows = false;
+        opts.parallel_columns = false;
+        const auto out = sor::presolve::presolve(p, opts);
+        CHECK(out.status == sor::presolve::PresolveStatus::Infeasible);
     }
     return sor::test::finish("test_presolve");
 }

@@ -64,14 +64,16 @@ enum class ProofLevel {
     FeasibleOnly,            // primal point passes the checker, no bound
     FeasibleWithGap,         // both, gap > tolerance
     ProvedKKT,               // convex QP/NLP: KKT residuals within tolerance
-    ProvedGlobalEpsilon,     // nonconvex: relaxation bound within eps
+    ProvedGlobalFP,          // complete search; some relaxation bounds were
+                             // tolerance-optimal LP values (f64 tolerances)
+    ProvedGlobalEpsilon,     // complete search; every relaxation bound proved
     ProvedOptimalFP,         // basis optimal at f64 tolerances
     ProvedOptimalExact,      // re-verified in rational arithmetic
     ProvedOptimalCertified   // VIPR proof log accepted by sor_verify
 };
 
-// Public serial LP strategy.  `Simplex` retains the shipped default; `Auto`
-// is opt-in until the promotion gates in the LP execution plan are met.
+// Public LP strategy. `Auto` routes by model shape and races engines only for
+// large models (LpOptions::concurrent_*); every other value is that engine.
 enum class LpStrategy : std::uint8_t {
     Auto = 0,
     Simplex,
@@ -132,23 +134,64 @@ struct DualFarkasRay {
 // Solver-wide options intentionally contain only engine-neutral fields.  The
 // top-level dispatcher translates these into the existing explicit-engine
 // option records, keeping the L0 contract independent of L4 engine headers.
+// Tolerance regime for commercial-comparable vs integrity benchmarks.
+enum class LpTolerancePreset : std::uint8_t {
+    Verified = 0,  // 1e-7 / 1e-7 / 1e-9 + full certification (default)
+    Speed = 1,     // 1e-6 / 1e-6 / 1e-6 commercial-comparable
+};
+
 struct LpOptions {
+    // Most engines Auto may race on one model (1 = never race, the default).
+    // Arms, in order: the routed simplex (dual first, primal fallback), the
+    // barrier, the primal simplex; each is the full pipeline (presolve,
+    // postsolve, independent check) on one core. Explicit strategies never
+    // race. Off by default, measured on the MIPLIB-23 relaxations (100 s,
+    // three arms on three cores against the routed engine alone on one):
+    // the race solved neos-3402294-bobin (primal arm, 41 s; alone: no
+    // result) but lost three the routed engine solves -- the arms' memory
+    // adds up (neos-4722843-widden killed at 10.8 GB; alone 2.6 s) and they
+    // slow each other (neos-4763324-toguru alone 75 s, raced past 100 s;
+    // neos-631710 alone 48 s, raced only Feasible).
     int concurrent_solves = 1;
-    LpStrategy strategy = LpStrategy::Simplex;
+    // Auto races only models with at least this many nonzeros. Below it one
+    // engine on one core wins: on Netlib the three-arm race was 1.24x the
+    // plain dual simplex's wall time on three cores, never faster.
+    std::uint64_t concurrent_min_nonzeros = 200000;
+    // Same answer every run: Auto never races, it runs the routed engine.
+    bool concurrent_deterministic = false;
+    LpStrategy strategy = LpStrategy::Auto;
     std::uint64_t max_iterations = 0;  // 0 = engine default
     f64 time_limit_s = 0.0;            // 0 = unlimited
     f64 primal_feas_tol = 1e-7;
     f64 dual_feas_tol = 1e-7;
     f64 gap_tol = 1e-9;
+    LpTolerancePreset tolerance_preset = LpTolerancePreset::Verified;
     bool presolve = true;
     bool presolve_implied_slack = false;
     bool fo_polish = true;
     bool fo_certificates = true;
     bool fo_crossover = true;
+    bool use_pock_chambolle = true;
+    bool enable_sifting = false;
+    bool enable_network_simplex = false;
     LpAutoBudgetSplit auto_budget_split =
         LpAutoBudgetSplit::Fo60Crossover25Simplex15;
     std::string backend = "cpu";
 };
+
+inline void apply_lp_tolerance_preset(LpOptions& options,
+                                      LpTolerancePreset preset) {
+    options.tolerance_preset = preset;
+    if (preset == LpTolerancePreset::Speed) {
+        options.primal_feas_tol = 1e-6;
+        options.dual_feas_tol = 1e-6;
+        options.gap_tol = 1e-6;
+    } else {
+        options.primal_feas_tol = 1e-7;
+        options.dual_feas_tol = 1e-7;
+        options.gap_tol = 1e-9;
+    }
+}
 
 struct LpStructuralFeatures {
     Index rows = 0;
@@ -207,6 +250,14 @@ struct LpDiagnostics {
     f64 max_dual_violation = kPosInf;
     f64 gap_rel = kPosInf;
     std::string termination_reason;
+    // Concurrent race; populated when Auto raced. `iterations` and the
+    // stage counts are the winner's; this is every arm's work, the losers'
+    // partial runs included.
+    int concurrent_arm_count = 0;
+    int concurrent_winner_arm = -1;
+    std::string concurrent_winner_kind;
+    bool concurrent_deterministic = false;
+    std::uint64_t concurrent_all_arm_iterations = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -225,6 +276,14 @@ struct ProofEvidence {
     f64 max_primal_violation = kPosInf;
     f64 max_dual_violation   = kPosInf;
     f64 gap_rel              = kPosInf;
+    // Row violations in the units of x: max_i viol_i / (||a_i||_inf *
+    // (1 + max_{j in row i} |x_j|)), the point's relative distance from each
+    // row's feasible side. max_primal_violation is absolute, so a row with
+    // tiny coefficients (1e-9 x >= 5e-9) passes it with x five units away;
+    // the objective error follows the distance, not the absolute residual.
+    // ProvedOptimalFP needs it within primal_feas_tol; +inf until measured
+    // by the independent check.
+    f64 max_primal_distance  = kPosInf;
 
     f64 primal_feas_tol = 1e-7;
     f64 dual_feas_tol   = 1e-7;
@@ -247,6 +306,12 @@ struct ProofEvidence {
     f64 primal_ray_objective = kNaN;
     f64 dual_farkas_violation = kPosInf;
     f64 dual_farkas_contradiction = 0.0;
+    // The multipliers the independent check certified: normalised, with
+    // entries facing infinite row sides dropped and residuals on unbounded
+    // columns repaired (check_dual_farkas_ray). That repaired vector, not the
+    // producer's, is what the residual and contradiction above describe, so
+    // finalize_result publishes it; without it no dual ray is certified.
+    std::vector<f64> dual_farkas_multipliers;
 
     // The model's own data has a column or row with lower bound above upper
     // bound: infeasible with no certificate needed, and none exists in row
@@ -278,6 +343,16 @@ struct RawResult {
     // These are candidate witnesses, independently recomputed at acceptance.
     std::vector<Index> certificate_basis;
     std::vector<std::string> exact_dual;
+
+    // Rigorous enclosure of the minimization reduced costs d = c - A'y of
+    // the exported multipliers (sense applied), componentwise in
+    // [rc_lo, rc_hi], and the Lagrangian bound they give over the box the
+    // engine solved: every point of it has minimization objective >=
+    // rc_bound. Empty when not computed. The engine's residual check
+    // already sums A'y once; consumers (reduced-cost fixing) reuse it
+    // instead of a second O(nnz) pass.
+    std::vector<f64> rc_lo, rc_hi;
+    f64 rc_bound = kNaN;
 
     std::uint64_t iterations = 0;
     std::string engine;

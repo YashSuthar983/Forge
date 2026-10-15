@@ -165,11 +165,18 @@ void test_partial_is_not_optimal() {
 // each child's absolute gap is large; whatever is claimed Optimal must still
 // have a certified bound within the parent's own tolerance, and no reported
 // bound may pass the optimum.
+//
+// The optimum is the oracle's, not a solve's. With costs scaled by 1e5, a
+// solve's Optimal point may sit inside the feasibility tolerance and still be
+// worth 7e-4 less than the true optimum (seed 67: solver -7.0e-4, oracle 0;
+// the models have continuous columns), and an offset taken from it put "the
+// optimum" below bounds that were valid.
 void test_parent_gap_uses_parent_objective() {
     std::uint64_t optimal = 0;
     for (std::uint32_t seed = 1; seed <= 400; ++seed) {
         LpProblem a = as_minimize(make_random_milp(seed)), b = as_minimize(make_random_milp(seed + 500));
-        if (!solve_oracle(a).feasible || !solve_oracle(b).feasible) continue;
+        const auto oa = solve_oracle(a), ob = solve_oracle(b);
+        if (!oa.feasible || !ob.feasible) continue;
         for (auto* p : {&a, &b})
             for (auto& v : p->c) v *= 1e5;               // large child objectives
         auto lp = union_of({a, b}, 0, {});
@@ -177,12 +184,9 @@ void test_parent_gap_uses_parent_objective() {
         o.gap_tol = 1e-2;
         o.abs_gap_tol = 1e-6;
         // Make the parent objective small: cancel the components' optimum.
-        auto probe = options();
-        probe.component_solve = false;
-        BabDiagnostics pd;
-        auto pr = sor::search::solve_milp(lp, probe, pd);
-        if (pr.proposed_status != Status::Optimal) continue;
-        lp.obj_offset = -pr.objective + 1.0;
+        std::vector<double> x_opt = oa.x;
+        x_opt.insert(x_opt.end(), ob.x.begin(), ob.x.end());
+        lp.obj_offset += 1.0 - lp.objective(x_opt);
         BabDiagnostics d;
         auto raw = sor::search::solve_milp(lp, o, d);
         if (raw.proposed_status == Status::Optimal) {
@@ -198,7 +202,34 @@ void test_parent_gap_uses_parent_objective() {
 
 }  // namespace
 
+// Composition is exact (audit section 11). An isolated column fixed at 1
+// with cost M = 2^54, and two independent rows y1 + y2 = 1 (costs -1, -1)
+// and z1 + z2 = 1 (costs -M, -M): the optimum is M - 1 - M = -1. Summed in
+// binary64 in that order, M - 1 rounds to M and the total reads 0.
+void test_component_composition_is_exact() {
+    const double M = 0x1p54;
+    sor::model::LpProblem lp;
+    lp.c = {M, -1.0, -1.0, -M, -M};
+    lp.col_lo = {1.0, 0.0, 0.0, 0.0, 0.0};
+    lp.col_hi = {1.0, 1.0, 1.0, 1.0, 1.0};
+    lp.is_integer = {true, true, true, true, true};
+    lp.row_lo = {1.0, 1.0};
+    lp.row_hi = {1.0, 1.0};
+    lp.A = sor::sparse::from_triplets(2, 5, {0, 0, 1, 1}, {1, 2, 3, 4}, {1.0, 1.0, 1.0, 1.0});
+    lp.validate();
+    sor::search::BabOptions opts;
+    opts.time_limit_s = 10.0;
+    sor::search::BabDiagnostics diag;
+    auto raw = sor::search::solve_milp(lp, opts, diag);
+    CHECK(diag.component_count >= 2);
+    CHECK(raw.x.size() == 5);
+    CHECK(raw.objective == -1.0);
+    CHECK(raw.objective == lp.objective(raw.x) || raw.x.size() != 5);
+    CHECK(diag.dual_bound <= -1.0);
+}
+
 int main() {
+    test_component_composition_is_exact();
     test_parent_gap_uses_parent_objective();
     stress();
     test_partial_is_not_optimal();

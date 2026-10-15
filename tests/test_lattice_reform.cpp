@@ -436,7 +436,54 @@ void test_markshare_smoke() {
 
 }  // namespace
 
+// The mu box comes from a proved projection of the polytope itself, not a
+// temporary box (audit section 17). x + y = 0, integer x in [K, K+1],
+// y in [-K-1, -K], K = 2e7: (K, -K) is feasible, but its mu range lies
+// outside [-1e7, 1e7], and an empty boxed projection was reported as the
+// original's infeasibility.
+void test_projection_is_not_boxed() {
+    const double K = 2e7;
+    sor::model::LpProblem lp;
+    lp.c = {0.0, 0.0};
+    lp.col_lo = {K, -K - 1};
+    lp.col_hi = {K + 1, -K};
+    lp.is_integer = {true, true};
+    lp.row_lo = {0.0};
+    lp.row_hi = {0.0};
+    lp.A = sor::sparse::from_triplets(1, 2, {0, 0}, {0, 1}, {1.0, 1.0});
+    lp.validate();
+    BabOptions bab;
+    bab.time_limit_s = 10.0;
+    auto out = solve_milp_lattice(lp, bab, true);
+    CHECK(out.raw.proposed_status != Status::Infeasible);
+    CHECK(out.raw.x.size() == 2);
+    if (out.raw.x.size() == 2) CHECK(lp.max_row_violation(out.raw.x) == 0.0);
+}
+
+// Kernel extraction assumes full row rank (Aardal-Wolsey). Duplicate rows
+// x + y + z = 1 and 2x + 2y + 2z = 2 have rank 1: n - m = 1 kernel vector
+// cannot reach all three feasible vertices, so the reform must decline.
+void test_rank_deficient_rows_decline() {
+    sor::model::LpProblem lp;
+    lp.c = {1.0, 2.0, 3.0};
+    lp.col_lo = {0.0, 0.0, 0.0};
+    lp.col_hi = {1.0, 1.0, 1.0};
+    lp.is_integer = {true, true, true};
+    lp.row_lo = {1.0, 2.0};
+    lp.row_hi = {1.0, 2.0};
+    lp.A = sor::sparse::from_triplets(2, 3, {0, 0, 0, 1, 1, 1}, {0, 1, 2, 0, 1, 2},
+                                      {1.0, 1.0, 1.0, 2.0, 2.0, 2.0});
+    lp.validate();
+    CHECK(!try_lattice_reform(lp).has_value());
+    BabOptions bab;
+    auto out = solve_milp_lattice(lp, bab, true);
+    CHECK(out.raw.proposed_status == Status::Optimal);
+    CHECK(std::fabs(out.raw.objective - 1.0) <= 1e-9);
+}
+
 int main() {
+    test_projection_is_not_boxed();
+    test_rank_deficient_rows_decline();
     test_tiny_feasible();
     test_tiny_infeasible();
     test_paper_knapsack_kernel();

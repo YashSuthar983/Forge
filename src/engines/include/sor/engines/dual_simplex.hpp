@@ -97,16 +97,16 @@ core::RawResult solve_dual_simplex(const model::LpProblem& problem,
 // SIBLING REUSE IS THE CALLER'S JOB, not the engine's: BasisFactor::update()/
 // update_ft() mutate in place, so two sibling solves must not consume the
 // same carrier object. Copy it once per sibling before calling --
-// `FactorCarrier child = parent;` is a legitimate O(nnz(L)+nnz(U)) copy
-// (BasisFactor is default-copyable over std::vector) -- and pass each copy to
+// `FactorCarrier child = parent;` shares the immutable factored base and
+// copies the update journal and private scratch -- and pass each copy to
 // its own call. Time that copy in the caller; it is real cost and belongs
 // next to the do_factorize() it is meant to avoid, not hidden inside the
 // engine where a reader would miss it.
 //
 // Same identity-token discipline as DualEdgeWeightCarrier: the caller sets
 // `matrix` to a token stable for exactly as long as A itself is unchanged.
-// `matrix == nullptr` is never adopted; that is how a caller invalidates the
-// carrier after a row/column change without needing to know the internals.
+// An owned operator identity also permits transfer between sessions after an
+// exact scaled-matrix comparison. clear() invalidates both identity contracts.
 //
 // Dual-to-primal cleanup exports the primal engine's final factor. Original-
 // bound restoration can adopt it into warm dual and returns that final factor
@@ -120,6 +120,23 @@ struct FactorScalingIdentity {
     bool ruiz_power_of_two = false;
 };
 
+// An owned immutable operator, independent of a session's address/lifetime.
+// The augmented logical columns are always -I. Together with slot-ordered
+// basic indices this therefore identifies B exactly; hashes never prove it.
+struct FactorOperatorIdentity {
+    sparse::CsrMatrix matrix;
+};
+inline bool same_factor_operator(const std::shared_ptr<const FactorOperatorIdentity>& a,
+                                 const std::shared_ptr<const FactorOperatorIdentity>& b) {
+    if (!a || !b) return false;
+    if (a == b) return true;
+    return a->matrix.n_rows() == b->matrix.n_rows() &&
+           a->matrix.n_cols() == b->matrix.n_cols() &&
+           a->matrix.pattern.row_ptr() == b->matrix.pattern.row_ptr() &&
+           a->matrix.pattern.col_idx() == b->matrix.pattern.col_idx() &&
+           a->matrix.vals == b->matrix.vals;
+}
+
 struct FactorCarrier {
     const void* matrix = nullptr;
     core::Index rows = 0;
@@ -131,6 +148,7 @@ struct FactorCarrier {
     // The same original A can produce a different scaled B when preparation
     // options change. Shared across checkpoints; compared exactly on reuse.
     std::shared_ptr<const FactorScalingIdentity> scaling_identity;
+    std::shared_ptr<const FactorOperatorIdentity> operator_identity;
     std::vector<core::Index> basis;  // basis this factor was captured at
     la::BasisFactor factor;
     bool has_factor = false;
@@ -142,6 +160,7 @@ struct FactorCarrier {
         nnz = 0;
         session_identity.reset();
         scaling_identity.reset();
+        operator_identity.reset();
         basis.clear();
         has_factor = false;
     }
@@ -169,6 +188,10 @@ public:
     ~DualProbeSession();
     DualProbeSession(const DualProbeSession&) = delete;
     DualProbeSession& operator=(const DualProbeSession&) = delete;
+    // Snapshot the complete numerical continuation. Mutable iterate/pricing
+    // arrays and factor journals are private; immutable operator/base storage
+    // and the internally serialized pricing executor may be shared.
+    std::unique_ptr<DualProbeSession> fork() const;
 
     // `warm_weights` (optional): DSE weights valid for `warm` (e.g. the
     // parent node's final weights, since a child starts from its parent's
@@ -177,6 +200,8 @@ public:
     // matrix taken from THIS session at the same preparation (e.g. the
     // parent node's final factor). Copied in; adopted only if the engine
     // confirms session identity, scaling and basis element for element.
+    // Omitted external carriers continue this session's owned factor/weights
+    // when they match `warm`; a null warm basis starts a new solve instead.
     core::RawResult solve(const SimplexOptions& opts, SimplexDiagnostics& diag,
                           SimplexBasis* out_basis, const SimplexBasis* warm,
                           const std::vector<core::f64>* warm_weights = nullptr,
@@ -192,6 +217,30 @@ public:
     // tree whose matrix is unchanged: no re-preparation per node.
     void set_column_bounds(const std::vector<core::f64>& lo,
                            const std::vector<core::f64>& hi);
+    // Row-side edits change logical-column bounds, not the matrix. Preserve
+    // scaling, factor, weights and partition; the next solve repairs values.
+    void set_row_bounds(const std::vector<core::f64>& lo,
+                        const std::vector<core::f64>& hi);
+    // Append-only structural continuation. Exact prefix/objective/scaling
+    // identity is checked before mutation. On success `basis` receives new
+    // logical basics; the session keeps a bordered factor when its old basis
+    // matches. False denotes a different model or unrepresentable scaling.
+    bool extend_rows(const model::LpProblem&, const SimplexOptions&,
+                     SimplexBasis& basis);
+    // Delete mapped rows whose logical columns are basic in the retained
+    // factor. Other row deletions require basis rank repair and return false.
+    bool remove_rows(const model::LpProblem&, const std::vector<core::Index>& old_to_new,
+                     const SimplexOptions&);
+
+    // Row `slot` of the inverse of the final basis, in the unscaled model's
+    // row space: y = B^-T e_slot for B the basis matrix (columns of [A | -I],
+    // A the problem the session was built for) of `basic`, in that slot
+    // order. One btran on the final factor: the factor is of the scaled
+    // basis B_s = R B C_B, so y = c_B[slot] * R * B_s^-T e_slot (a logical's
+    // scale is 1 / its row's). False when the session holds no factor of
+    // `basic`. The caller checks what it needs (y^T B = e_slot^T).
+    bool basis_inverse_row(const std::vector<core::Index>& basic, core::Index slot,
+                           std::vector<core::f64>& y) const;
 
     // DSE weights at solve()'s final basis (empty when DSE was not the live
     // pricing at exit, or the solve ended early).
@@ -201,8 +250,17 @@ public:
     core::RawResult probe(core::Index j, core::f64 lo, core::f64 hi,
                           const SimplexOptions& opts, SimplexDiagnostics& diag,
                           const SimplexBasis& base);
+    // The same with several columns' bounds changed at once (a propagated
+    // child box): cols[k] gets [lo[k], hi[k]] for the solve and is restored.
+    core::RawResult probe_box(const std::vector<core::Index>& cols,
+                              const std::vector<core::f64>& lo,
+                              const std::vector<core::f64>& hi,
+                              const SimplexOptions& opts, SimplexDiagnostics& diag,
+                              const SimplexBasis& base);
 
 private:
+    struct Impl;
+    explicit DualProbeSession(std::unique_ptr<Impl>);
     // Only engine wrappers may transfer their own exact prepared model and
     // its numeric carriers. Arbitrary external factors cannot be retokened.
     DualProbeSession(SimplexPrepared&& prepared,
@@ -215,7 +273,6 @@ private:
         const SimplexOptions&, SimplexDiagnostics&, SimplexBasis*,
         const SimplexBasis*, DualEdgeWeightCarrier*, FactorCarrier*,
         std::unique_ptr<DualProbeSession>*);
-    struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 

@@ -1,22 +1,15 @@
-// SOR - MILP portfolio driver: build diversified arms, race them, exchange.
-//
-// The arm table is the whole point, and SOR was already sitting on it. Every
-// entry below is a feature that was implemented, measured, found NOT to win on
-// average, and switched off. That verdict is right for a serial solver and
-// exactly wrong for a parallel one: a configuration that wins on 30% of models
-// and loses on 70% is a bad default and an excellent portfolio arm, because
-// the portfolio pays only for the arm that wins and cancels the rest.
-//
-// See the earlier measurement notes for the evidence that this
-// architecture, not tree splitting, is what separates the fast open-source
-// parallel solvers from the slow ones.
+// SOR - MILP portfolio: diversified consumers of a finite CPU budget.
+// Racing can exchange incumbents and hedge algorithm choices, but each arm
+// consumes CPU/cache/memory bandwidth and can slow the other arms.
 
 #include "sor/search/bab.hpp"
 #include "sor/search/portfolio.hpp"
+#include "sor/certify/finalize.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <limits>
 #include <mutex>
 #include <cmath>
 #include <string>
@@ -38,8 +31,7 @@ struct ArmSpec {
 };
 
 // Arm 0 is the shipped default and must stay first: it is the arm the serial
-// solver would have run, so the portfolio can never be worse than "default
-// plus some cancelled threads" on wall time.
+// solver would have run. Its position is not a wall-time dominance guarantee.
 const ArmSpec kArms[] = {
     {"default", [](BabOptions&) {}},
 
@@ -59,7 +51,7 @@ const ArmSpec kArms[] = {
         o.lifted_cover_cuts = true;
         o.mir_cuts = true;
         o.zerohalf_cuts = true;
-        // o.flow_cover_cuts -- INVALID, see flowcover.cpp
+        // o.flow_cover_cuts -- exact, but unmeasured: opt-in only (flowcover.hpp)
     }},
 
     // Restart-heavy: same separators as default, different search shape.
@@ -130,12 +122,19 @@ struct ArmResult {
 // An arm may only END the race with a claim it can back. Same rule the LP
 // racer uses, and for the same reason: a race reports whoever finishes first,
 // so without this the fastest WRONG arm is the one that gets reported.
-bool terminal(const core::RawResult& raw, const BabDiagnostics& d) {
-    if (raw.proposed_status == core::Status::Optimal)
-        return d.globally_proved;
-    if (raw.proposed_status == core::Status::Infeasible)
-        return d.globally_proved && !d.used_foreign_cutoff;
-    return false;
+bool terminal(const core::RawResult& raw, const BabDiagnostics& d,
+              const BabOptions& options) {
+    if (raw.proposed_status != core::Status::Optimal &&
+        raw.proposed_status != core::Status::Infeasible &&
+        raw.proposed_status != core::Status::Unbounded) return false;
+    if (raw.proposed_status == core::Status::Infeasible && d.used_foreign_cutoff)
+        return false;
+    // A race must obey the same proof ladder as the caller, including LP-only
+    // and checked MILP recession exits. Raw status/one Boolean is insufficient.
+    const auto checked = certify::finalize_result(raw, milp_evidence(d, options));
+    return checked.status == core::Status::Optimal ||
+           checked.status == core::Status::Infeasible ||
+           checked.status == core::Status::Unbounded;
 }
 
 int rank_non_terminal(const core::RawResult& r) {
@@ -173,7 +172,10 @@ core::RawResult solve_milp_portfolio(const model::LpProblem& problem,
     }
 
     PortfolioPool pool(problem.maximize);
-    core::CancelToken token;
+    // The race owns cancellation of its losing arms, while the caller owns
+    // cancellation of the whole solve. Replacing the caller's token severed
+    // that ownership chain for every arm.
+    core::CancelToken token(base.cancel);
     std::mutex mu;
     std::condition_variable cv;
     std::size_t finished = 0;
@@ -185,6 +187,10 @@ core::RawResult solve_milp_portfolio(const model::LpProblem& problem,
     const auto run_arm = [&](std::size_t i) {
         BabOptions o = base;
         kArms[i].apply(o);
+        // The portfolio owns the requested workers. An arm may not quietly
+        // multiply that reservation with node workers or parallel pricing.
+        o.para_bab.threads = 1;
+        o.lp.pricing_threads = 1;
         o.cancel = &token;
         o.pool = popts.share_incumbents ? &pool : nullptr;
         // Arms must never re-enter the portfolio.
@@ -198,7 +204,7 @@ core::RawResult solve_milp_portfolio(const model::LpProblem& problem,
             arms[i].finished = true;
             ++finished;
             if (winner == static_cast<std::size_t>(n) &&
-                terminal(arms[i].raw, arms[i].diag)) {
+                terminal(arms[i].raw, arms[i].diag, o)) {
                 winner = i;
                 token.request_stop();
             }
@@ -301,9 +307,16 @@ core::RawResult solve_milp_portfolio(const model::LpProblem& problem,
             result.proposed_status = core::Status::Feasible;
     }
 
+    // The proof rests on one arm that exhausted its tree; with several, the
+    // most rigorous one (fewest bounds taken at f64 tolerances).
     bool cutoff_proved = false;
+    std::uint64_t proving_float_bounds = std::numeric_limits<std::uint64_t>::max();
     for (const auto& a : arms)
-        if (a.diag.proved_no_better_than_cutoff) cutoff_proved = true;
+        if (a.diag.proved_no_better_than_cutoff) {
+            cutoff_proved = true;
+            proving_float_bounds =
+                std::min(proving_float_bounds, a.diag.float_relaxation_bounds);
+        }
     if (cutoff_proved && !result.x.empty() && std::isfinite(result.objective) &&
         portfolio_point_is_feasible(problem, result.x, base.primal_feas_tol,
                                     base.int_tol) &&
@@ -313,16 +326,23 @@ core::RawResult solve_milp_portfolio(const model::LpProblem& problem,
         // The proving arm searched the entire space, so the pool's point is a
         // global optimum. out_diag carries the flag certify reads.
         result.proposed_status = core::Status::Optimal;
-        // The LEVEL matters as much as the status: finalize_result is the sole
-        // writer of Status::Optimal and will downgrade a claim whose evidence
-        // does not reach the ladder, which is exactly what it should do.
-        result.proposed_level = core::ProofLevel::ProvedGlobalEpsilon;
         out_diag_globally_proved = true;
     }
 
     out_diag = std::move(arms[report].diag);
-    if (out_diag_globally_proved) out_diag.globally_proved = true;
-    pdiag.workers_used = n;
+    if (out_diag_globally_proved) {
+        // The reported arm's own complete search, if it has one, is another
+        // proof of the same claim.
+        out_diag.float_relaxation_bounds = out_diag.globally_proved
+            ? std::min(out_diag.float_relaxation_bounds, proving_float_bounds)
+            : proving_float_bounds;
+        out_diag.globally_proved = true;
+        // The LEVEL matters as much as the status: finalize_result is the sole
+        // writer of Status::Optimal and will downgrade a claim whose evidence
+        // does not reach the ladder, which is exactly what it should do.
+        result.proposed_level = milp_global_proof(out_diag);
+    }
+    pdiag.workers_used = static_cast<int>(launched);
     pdiag.winner = arms[report].name;
     pdiag.log = std::move(log);
     pdiag.incumbent_exchanges = pool.incumbent_updates();
