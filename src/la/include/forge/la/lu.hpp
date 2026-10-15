@@ -528,7 +528,7 @@ public:
         add(base_->u_cstart_); add(base_->u_clen_); add(base_->u_ccap_); add(base_->u_crow_); add(base_->u_cval_);
         add(r_pos_); add(r_start_); add(r_idx_); add(r_val_);
         add(ft_atilde_); add(ft_v_); add(ft_support_); add(ft_vsupport_);
-        add(ft_seed_); add(ft_stamp_);
+        add(ft_seed_); add(ft_stamp_); add(ft_cstamp_);
         add(base_->l_start_); add(base_->l_idx_); add(base_->l_val_); add(base_->l_col_start_); add(base_->l_col_row_); add(base_->l_row_val_);
         add(eta_p_); add(eta_start_); add(eta_idx_); add(eta_val_); add(eta_pivot_);
         for (const auto& r : rev_) total += r.capacity() * sizeof(Index);
@@ -758,6 +758,11 @@ private:
     std::vector<f64>   ft_atilde_, ft_v_;
     std::vector<Index> ft_support_, ft_vsupport_, ft_seed_;
     std::vector<std::uint32_t> ft_stamp_;   // support membership, by generation
+    // Alpha columns already added this update (same generation).  Separate
+    // from ft_stamp_: a position is in atilde's support as soon as ANOTHER
+    // column's U entry lands on it, which says nothing about whether its own
+    // column has been added.
+    std::vector<std::uint32_t> ft_cstamp_;
     std::uint32_t ft_gen_ = 0;
 
     // L multipliers, by pivot order, indices in pivot coordinates, strictly

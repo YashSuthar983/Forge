@@ -21,9 +21,9 @@ namespace {
 inline std::size_t sz(Index i) { return static_cast<std::size_t>(i); }
 inline std::size_t so(Offset i) { return static_cast<std::size_t>(i); }
 
-// A descendant's update is formed in a dense buffer W and then scattered;
-// its columns are processed in chunks so that W stays below this many
-// entries however wide the update is.
+// A descendant's update is applied in windows of target columns sized so
+// that window x rows stays below this many entries (it bounds cmod_window's
+// buffer of multipliers, ncd per target column).
 constexpr Offset kWMax = Offset{1} << 21;
 // Columns per block of the in-panel LDL'.  A multiple of 4, so the 4-column
 // register blocking of the updates from earlier blocks never straddles a
@@ -81,79 +81,219 @@ inline void list_push(std::vector<Index>& head, std::vector<Index>& next, Index 
     } while (!h.compare_exchange_weak(old, d, std::memory_order_release, std::memory_order_relaxed));
 }
 
-// W(i, j) = sum_c L(i, c) D(c) L(j, c) over the columns of descendant d, for
-// d's rows b.. (m of them) against its target rows b .. b+kc, then
-// scattered (subtracted) into the panel X of the supernode starting at
-// column f.  The per-entry operation sequence depends only on (i, j) and d
-// -- never on which (b, kc) window it was computed in -- which is what lets
-// the target columns of one supernode be split between threads.
+// Four doubles as one value: one AVX operation in the avx2 clone, two SSE2
+// ones in the default clone.  Multiplies and adds stay separate operations
+// (-ffp-contract=off), so a lane computes exactly what the scalar
+// expression with the same operands and the same association computes.
+// Loads and stores are macros, not functions: a function returning v4d
+// would change the psABI between the two clones.
+typedef f64 v4d __attribute__((vector_size(32), aligned(8)));
+#define FORGE_VLD(dst, p) std::memcpy(&(dst), (p), sizeof(v4d))
+#define FORGE_VST(p, src) std::memcpy((p), &(src), sizeof(v4d))
+#define FORGE_VBC(x) (v4d{(x), (x), (x), (x)})
+
+// THE UPDATE KERNEL.  Both dense updates of the factorization are
+//     Y(i, j) -= sum_c A(i, c) t(c, j),   t(c, j) = D(c) L(j, c),
+// over a block of rows i and target columns j: cmod (a descendant's
+// columns into a supernode) and the in-panel update.  They run as a GEMM:
+// the rows of A are PACKED into micro-panels of kMr consecutive rows per
+// source column, t into panels of kNr target columns, and a kMr x kNr
+// register tile accumulates sum_c in plain order c = c0, c0+1, ... before
+// one subtraction into Y.  Measured on this machine (Zen 3, no FMA -- the
+// build forbids contraction): 51-53 GFLOP/s for the packed 8x6 tile with
+// its operands anywhere up to L3, against ~30 in L1 and 12 at a 4 KB
+// column stride for the unpacked 4-column groups this replaces, which read
+// four columns of a supernode panel per step and aliased in L1 whenever
+// the panel height was a multiple of 512.
+//
+// DETERMINISM.  Every entry's sum runs over the same source columns in the
+// same order for any split of rows or target columns between threads, so
+// the factor is still bit-identical at any thread count.
+constexpr int kMr = 8;   // rows per tile: two v4d
+constexpr int kNr = 6;   // target columns per tile
+
+// acc[j][v] = sum_c t[c*kNr + j] * a[c*kMr + 4v .. +3]
+[[gnu::always_inline]] inline void tile_8x6(const f64* a, const f64* t, Index nc, f64* out) {
+    v4d acc[kNr][2] = {};
+    for (Index c = 0; c < nc; ++c) {
+        v4d a0, a1;
+        FORGE_VLD(a0, a + static_cast<Offset>(c) * kMr);
+        FORGE_VLD(a1, a + static_cast<Offset>(c) * kMr + 4);
+        const f64* tc = t + static_cast<Offset>(c) * kNr;
+        for (int j = 0; j < kNr; ++j) {
+            const v4d tj = FORGE_VBC(tc[j]);
+            acc[j][0] = acc[j][0] + tj * a0;
+            acc[j][1] = acc[j][1] + tj * a1;
+        }
+    }
+    for (int j = 0; j < kNr; ++j) {
+        FORGE_VST(out + j * kMr, acc[j][0]);
+        FORGE_VST(out + j * kMr + 4, acc[j][1]);
+    }
+}
+
+// Rows [i0, i1) of the column-major block at S (column stride ld), columns
+// [0, nc), into micro-panels of kMr rows: panel q holds rows i0 + q*kMr ..,
+// source column c at [c*kMr, c*kMr + kMr); rows past i1 are zero.
+[[gnu::always_inline]] inline void pack_rows(const f64* S, Offset ld, Offset i0, Offset i1, Index nc, f64* out) {
+    for (Offset q0 = i0; q0 < i1; q0 += kMr) {
+        const Offset h = std::min<Offset>(kMr, i1 - q0);
+        f64* o = out + ((q0 - i0) / kMr) * static_cast<Offset>(nc) * kMr;
+        if (h == kMr) {
+            for (Index c = 0; c < nc; ++c) std::memcpy(o + static_cast<Offset>(c) * kMr, S + static_cast<Offset>(c) * ld + q0, kMr * sizeof(f64));
+        } else {
+            for (Index c = 0; c < nc; ++c) {
+                f64* oc = o + static_cast<Offset>(c) * kMr;
+                const f64* sc = S + static_cast<Offset>(c) * ld + q0;
+                for (Offset r = 0; r < kMr; ++r) oc[r] = r < h ? sc[r] : 0.0;
+            }
+        }
+    }
+}
+
+// W(i, j) = sum_c L(i, c) D(c) L(j, c) over the columns of descendant d,
+// for d's rows b.. (m of them) against its target rows b .. b+kc,
+// subtracted from the panel X of the supernode starting at column f
+// (row rel[r], column r - f).  Rows i < j are computed and dropped.
+// Only d's rows [ilo, ihi) (positions in rd, clipped to [b, Rd)) are
+// updated: a cooperative supernode gives each worker the rows that land in
+// its own band of target rows.
 FORGE_KERNEL void cmod_window(const f64* Xd, Offset Rd, const Index* rd, const f64* Dd, Index ncd, Offset b,
-                 Offset kc, f64* X, Offset R, Index f, const Index* rel, std::vector<f64>& w) {
-    const Offset m = Rd - b;
-    w.assign(so(m * kc), 0.0);
-    // Four source columns per pass over W: one load and store of W per four
-    // multiply-adds instead of per one, which is what bounds this loop (it
-    // is W traffic, not arithmetic).
-    Index c = 0;
-    for (; c + 4 <= ncd; c += 4) {
-        const f64* l0 = Xd + static_cast<Offset>(c) * Rd + b;
-        const f64* l1 = l0 + Rd;
-        const f64* l2 = l1 + Rd;
-        const f64* l3 = l2 + Rd;
-        const f64 d0 = Dd[c], d1 = Dd[c + 1], d2 = Dd[c + 2], d3 = Dd[c + 3];
-        for (Offset j = 0; j < kc; ++j) {
-            const f64 t0 = d0 * l0[j], t1 = d1 * l1[j], t2 = d2 * l2[j], t3 = d3 * l3[j];
-            f64* wj = w.data() + j * m;
-            for (Offset i = j; i < m; ++i)
-                wj[i] += t0 * l0[i] + t1 * l1[i] + t2 * l2[i] + t3 * l3[i];
-        }
-    }
-    for (; c < ncd; ++c) {
-        const f64* lc = Xd + static_cast<Offset>(c) * Rd + b;
-        const f64 dc = Dd[c];
-        for (Offset j = 0; j < kc; ++j) {
-            const f64 t = dc * lc[j];
-            if (t == 0.0) continue;
-            f64* wj = w.data() + j * m;
-            for (Offset i = j; i < m; ++i) wj[i] += t * lc[i];
-        }
-    }
+                 Offset kc, f64* X, Offset R, Index f, const Index* rel, std::vector<f64>& tbuf,
+                 std::vector<f64>& abuf, Offset ilo, Offset ihi) {
+    if (ncd == 0) return;
+    const Offset m = std::min(Rd, ihi) - b;
+    const Offset first = std::max<Offset>(0, ilo - b);
+    if (first >= m) return;
+    const f64* Xb = Xd + b;
     const Index* rr = rd + b;
-    for (Offset j = 0; j < kc; ++j) {
-        f64* col = X + static_cast<Offset>(rr[j] - f) * R;
-        const f64* wj = w.data() + j * m;
-        for (Offset i = j; i < m; ++i) col[rel[sz(rr[i])]] -= wj[i];
+    const Offset npan = (kc + kNr - 1) / kNr;
+    if (so(npan * kNr * ncd) > tbuf.size()) tbuf.resize(so(npan * kNr * ncd));
+    for (Offset p = 0; p < npan; ++p) {
+        f64* T = tbuf.data() + p * kNr * ncd;
+        for (Index c = 0; c < ncd; ++c) {
+            const f64* lc = Xb + static_cast<Offset>(c) * Rd;
+            for (int jj = 0; jj < kNr; ++jj) {
+                const Offset j = p * kNr + jj;
+                T[static_cast<Offset>(c) * kNr + jj] = j < kc ? Dd[c] * lc[j] : 0.0;
+            }
+        }
+    }
+    // Rows in blocks whose packed copy stays in L2 while every target panel
+    // sweeps it.
+    constexpr Offset kL2Bytes = Offset{192} << 10;
+    const Offset mcb = std::clamp<Offset>((kL2Bytes / std::max<Offset>(1, 8 * ncd)) / kMr * kMr, kMr, 1024);
+    if (so(((mcb + kMr - 1) / kMr) * kMr * ncd) > abuf.size()) abuf.resize(so(((mcb + kMr - 1) / kMr) * kMr * ncd));
+    f64 out[kMr * kNr];
+    for (Offset ib = first; ib < m; ib += mcb) {
+        const Offset ie = std::min(m, ib + mcb);
+        if (ie <= 0) break;
+        pack_rows(Xb, Rd, ib, ie, ncd, abuf.data());
+        for (Offset p = 0; p < npan; ++p) {
+            const Offset j0 = p * kNr;
+            if (j0 >= ie) break;   // every row of the block is above the panel
+            const Offset jn = std::min<Offset>(kNr, kc - j0);
+            const f64* T = tbuf.data() + p * kNr * ncd;
+            for (Offset i0 = ib; i0 < ie; i0 += kMr) {
+                if (i0 + kMr <= j0) continue;
+                tile_8x6(abuf.data() + ((i0 - ib) / kMr) * static_cast<Offset>(ncd) * kMr, T, ncd, out);
+                const Offset ih = std::min<Offset>(ie, i0 + kMr);
+                // A full tile below the diagonal whose rows land on kMr
+                // consecutive rows of the target (common: a descendant's
+                // structure is mostly a run of its ancestor's) is two vector
+                // subtractions per column instead of kMr indexed updates.
+                const Index r0t = rel[sz(rr[i0])];
+                const bool run = ih == i0 + kMr && i0 >= j0 + jn - 1 &&
+                                 rel[sz(rr[i0 + kMr - 1])] == r0t + kMr - 1 &&
+                                 rr[i0 + kMr - 1] == rr[i0] + kMr - 1;
+                for (Offset jj = 0; jj < jn; ++jj) {
+                    const Offset j = j0 + jj;
+                    f64* col = X + static_cast<Offset>(rr[j] - f) * R;
+                    if (run) {
+                        v4d y0, y1, w0, w1;
+                        FORGE_VLD(y0, col + r0t);
+                        FORGE_VLD(y1, col + r0t + 4);
+                        FORGE_VLD(w0, out + jj * kMr);
+                        FORGE_VLD(w1, out + jj * kMr + 4);
+                        y0 = y0 - w0;
+                        y1 = y1 - w1;
+                        FORGE_VST(col + r0t, y0);
+                        FORGE_VST(col + r0t + 4, y1);
+                        continue;
+                    }
+                    for (Offset i = std::max(i0, j); i < ih; ++i) col[rel[sz(rr[i])]] -= out[jj * kMr + (i - i0)];
+                }
+            }
+        }
+    }
+}
+
+// Rows [r0, r1) of panel column j, reduced by panel columns [c0, c1): the
+// reference sequence for a single target column (the diagonal block's
+// column-by-column steps), with no packing to amortise.
+inline void panel_column(f64* X, Offset R, const f64* D, Index c0, Index c1, Index j, Offset r0,
+                         Offset r1) {
+    f64* cj = X + static_cast<Offset>(j) * R;
+    Index c = c0;
+    for (; c + 4 <= c1; c += 4) {
+        const f64* l0 = X + static_cast<Offset>(c) * R;
+        const f64* l1 = l0 + R;
+        const f64* l2 = l1 + R;
+        const f64* l3 = l2 + R;
+        const f64 t0 = D[c] * l0[j], t1 = D[c + 1] * l1[j], t2 = D[c + 2] * l2[j], t3 = D[c + 3] * l3[j];
+        for (Offset i = r0; i < r1; ++i) cj[i] -= t0 * l0[i] + t1 * l1[i] + t2 * l2[i] + t3 * l3[i];
+    }
+    for (; c < c1; ++c) {
+        const f64* lc = X + static_cast<Offset>(c) * R;
+        const f64 t = D[c] * lc[j];
+        if (t == 0.0) continue;
+        for (Offset i = r0; i < r1; ++i) cj[i] -= t * lc[i];
     }
 }
 
 // Rows [r0, r1) of panel columns [ja, jb), each reduced by panel columns
-// [c0, c1) in groups of four, the tail one column at a time skipping zero
-// multipliers.  Entry (i, j) is touched only for i >= j.
+// [c0, c1); entry (i, j) only for i >= j.  Several target columns: the
+// packed kernel; a single one: panel_column.
 FORGE_KERNEL void panel_update(f64* X, Offset R, const f64* D, Index c0, Index c1, Index ja, Index jb,
                   Offset r0, Offset r1) {
-    for (Index j = ja; j < jb; ++j) {
-        f64* cj = X + static_cast<Offset>(j) * R;
-        const Offset i0 = std::max<Offset>(j, r0);
-        if (i0 >= r1) continue;
-        Index c = c0;
-        for (; c + 4 <= c1; c += 4) {
-            const f64* l0 = X + static_cast<Offset>(c) * R;
-            const f64* l1 = l0 + R;
-            const f64* l2 = l1 + R;
-            const f64* l3 = l2 + R;
-            const f64 t0 = D[c] * l0[j], t1 = D[c + 1] * l1[j], t2 = D[c + 2] * l2[j],
-                      t3 = D[c + 3] * l3[j];
-            for (Offset i = i0; i < r1; ++i)
-                cj[i] -= t0 * l0[i] + t1 * l1[i] + t2 * l2[i] + t3 * l3[i];
+    const Index nc = c1 - c0;
+    if (nc <= 0 || r0 >= r1 || ja >= jb) return;
+    if (jb - ja < 2) {
+        for (Index j = ja; j < jb; ++j) {
+            const Offset lo = std::max<Offset>(j, r0);
+            if (lo < r1) panel_column(X, R, D, c0, c1, j, lo, r1);
         }
-        for (; c < c1; ++c) {
-            const f64* lc = X + static_cast<Offset>(c) * R;
-            const f64 t = D[c] * lc[j];
-            if (t == 0.0) continue;
-            for (Offset i = i0; i < r1; ++i) cj[i] -= t * lc[i];
+        return;
+    }
+    thread_local std::vector<f64> abuf, tbuf;
+    const Offset rows = r1 - r0;
+    if (so(((rows + kMr - 1) / kMr) * kMr * nc) > abuf.size()) abuf.resize(so(((rows + kMr - 1) / kMr) * kMr * nc));
+    if (so(kNr * nc) > tbuf.size()) tbuf.resize(so(kNr * nc));
+    pack_rows(X + static_cast<Offset>(c0) * R, R, r0, r1, nc, abuf.data());
+    f64 out[kMr * kNr];
+    for (Index j0 = ja; j0 < jb; j0 += kNr) {
+        const Index jn = std::min<Index>(kNr, jb - j0);
+        if (j0 >= r1) break;
+        for (Index c = 0; c < nc; ++c) {
+            const f64* lc = X + static_cast<Offset>(c0 + c) * R;
+            for (int jj = 0; jj < kNr; ++jj)
+                tbuf[so(static_cast<Offset>(c) * kNr + jj)] = jj < jn ? D[c0 + c] * lc[j0 + jj] : 0.0;
+        }
+        for (Offset i0 = r0; i0 < r1; i0 += kMr) {
+            if (i0 + kMr <= j0) continue;
+            tile_8x6(abuf.data() + ((i0 - r0) / kMr) * static_cast<Offset>(nc) * kMr, tbuf.data(), nc, out);
+            const Offset ih = std::min<Offset>(r1, i0 + kMr);
+            for (Index jj = 0; jj < jn; ++jj) {
+                const Index j = j0 + jj;
+                f64* cj = X + static_cast<Offset>(j) * R;
+                for (Offset i = std::max<Offset>(i0, j); i < ih; ++i) cj[i] -= out[jj * kMr + (i - i0)];
+            }
         }
     }
 }
+#undef FORGE_VLD
+#undef FORGE_VST
+#undef FORGE_VBC
 
 // Column counts of L: row k of L is the union of the etree paths from each
 // i in column k of C up to k.
@@ -227,7 +367,45 @@ void Ldlt::analyze(const SymCsc& a, std::vector<Index> perm) {
     n_ = a.n;
     if (a.col_ptr.size() != sz(n_) + 1)
         throw std::invalid_argument("Ldlt::analyze: col_ptr length");
-    perm_ = perm.empty() ? amd_order(a) : std::move(perm);
+    interrupted_ = false;
+    over_cost_ = false;
+    fits_ = true;
+    factor_bytes_ = 0;
+    nx_ = 0;
+    sx_.clear();
+    sx_.shrink_to_fit();
+    const std::function<bool()>* stop = opt_.should_stop ? &opt_.should_stop : nullptr;
+    auto stopped = [&]() {
+        if (!stop || !(*stop)()) return false;
+        interrupted_ = true;
+        fits_ = false;
+        return true;
+    };
+    if (perm.empty()) {
+        AmdCaps caps;
+        caps.max_flops = opt_.max_flops;
+        // The supernodal storage holds at least nnz(L) values.
+        caps.max_nnz_l = static_cast<double>(opt_.max_factor_bytes) / static_cast<double>(sizeof(f64));
+        const bool capped = caps.max_flops > 0.0 || caps.max_nnz_l > 0.0;
+        perm_ = amd_order(a, stop, capped ? &caps : nullptr);
+        if (caps.exceeded) {
+            // A lower bound passed a cap: the factor cannot fit it.
+            fits_ = false;
+            over_cost_ = caps.max_flops > 0.0 && caps.flops_lb > caps.max_flops;
+            flops_ = caps.flops_lb;
+            nnz_l_ = static_cast<Offset>(caps.nnz_l_lb);
+            factor_bytes_ = static_cast<std::uint64_t>(caps.nnz_l_lb * sizeof(f64));
+            return;
+        }
+        if (perm_.empty() && n_ > 0) {
+            // The ordering was abandoned at the caller's deadline.
+            interrupted_ = true;
+            fits_ = false;
+            return;
+        }
+    } else {
+        perm_ = std::move(perm);
+    }
     if (perm_.size() != sz(n_)) throw std::invalid_argument("Ldlt::analyze: bad permutation");
     auto set_pinv = [&] {
         pinv_.assign(sz(n_), -1);
@@ -272,6 +450,7 @@ void Ldlt::analyze(const SymCsc& a, std::vector<Index> perm) {
         etree();
     }
 
+    if (stopped()) return;
     std::vector<Offset> count = column_counts(n_, cp_, ci_, parent_);
 
     // Fundamental supernodes: column j joins j-1's supernode when j is the
@@ -300,9 +479,16 @@ void Ldlt::analyze(const SymCsc& a, std::vector<Index> perm) {
         etree();
         count = column_counts(n_, cp_, ci_, parent_);
     }
+    if (stopped()) return;
     nnz_l_ = std::accumulate(count.begin(), count.end(), Offset{0});
     flops_ = 0.0;
     for (Offset c : count) flops_ += static_cast<f64>(c) * static_cast<f64>(c);
+    if (opt_.max_flops > 0.0 && flops_ > opt_.max_flops) {
+        fits_ = false;
+        over_cost_ = true;
+        factor_bytes_ = static_cast<std::uint64_t>(nnz_l_) * sizeof(f64);
+        return;
+    }
     build_structure(count);
     sched_workers_ = 0;
 }
@@ -517,26 +703,19 @@ void Ldlt::build_structure(const std::vector<Offset>& count) {
     }
 
     // The supernodal factor entries (dense trapezoids, diagonal blocks
-    // included) are the single largest allocation build_structure makes --
+    // included) are the single largest allocation the factorization makes --
     // on a pathological fill-in pattern (e.g. one dense row/column pulling
     // many others into its supernode's row set) this can ask for far more
     // than stored_l_ nonzeros of L alone would suggest, since sxp_.back()
-    // counts the full rows*cols trapezoid, not just the lower triangle. Turn
-    // a bare std::bad_alloc -- which carries no size -- into one a caller or
-    // a reader can act on.
-    try {
-        sx_.assign(so(sxp_.back()), 0.0);
-    } catch (const std::bad_alloc&) {
-        char msg[256];
-        std::snprintf(msg, sizeof msg,
-                       "Ldlt::build_structure: supernodal factor storage needs %.2f GB "
-                       "(%lld f64 entries; stored_l_=%lld nonzeros of L, %lld supernodes) "
-                       "-- allocation failed, fill-in exceeds available memory",
-                       static_cast<double>(so(sxp_.back())) * sizeof(f64) / 1e9,
-                       static_cast<long long>(sxp_.back()), static_cast<long long>(stored_l_),
-                       static_cast<long long>(ns_));
-        throw std::runtime_error(msg);
-    }
+    // counts the full rows*cols trapezoid, not just the lower triangle.  It
+    // is only sized here; factorize() allocates it on first use (see
+    // LdltOptions::max_factor_bytes).
+    nx_ = sxp_.back();
+    factor_bytes_ = static_cast<std::uint64_t>(nx_) * sizeof(f64);
+    fits_ = opt_.max_factor_bytes == 0 || factor_bytes_ <= opt_.max_factor_bytes;
+    sx_.clear();
+    sx_.shrink_to_fit();
+    if (!fits_) return;
     d_.assign(sz(n_), 0.0);
     head_.assign(sz(ns_), -1);
     next_.assign(sz(ns_), -1);
@@ -678,23 +857,56 @@ void Ldlt::factor_node(Index s, int w, int nw, Scratch& sc, FCtx& cx) {
     }
     sync();
 
-    // cmod(s, d), restricted to this worker's target columns.
+    // cmod(s, d).  Cooperatively, each worker owns a band [ra, rb) of the
+    // supernode's ROWS and applies every descendant's update to those rows
+    // only, for all target columns: each entry then receives its updates
+    // from one worker, in ascending d, exactly as in the serial loop.  (The
+    // bands were columns before; a descendant mostly reaches its ancestor's
+    // leading columns, so the first band took most of the updates and four
+    // workers ran no faster than one -- physiciansched3-3's normal
+    // equations: 5.1 s on 1 thread, 5.3 s on 4.)  Row r of the trapezoid
+    // takes updates for min(r + 1, nc) columns; bands split that evenly.
+    Offset ra = 0, rb = R;
+    if (nw > 1) {
+        const f64 ncf = static_cast<f64>(nc);
+        const f64 total = 0.5 * ncf * (ncf + 1.0) + ncf * static_cast<f64>(R - nc);
+        auto rows_for = [&](f64 area) -> Offset {
+            // Smallest r with area(rows < r) >= area.
+            const f64 tri = 0.5 * ncf * (ncf + 1.0);
+            if (area >= total) return R;
+            if (area <= tri) {
+                // r (r + 1) / 2 >= area
+                Offset r = static_cast<Offset>(std::ceil(0.5 * (std::sqrt(8.0 * area + 1.0) - 1.0)));
+                return std::clamp<Offset>(r, 0, nc);
+            }
+            return std::min<Offset>(R, nc + static_cast<Offset>(std::ceil((area - tri) / ncf)));
+        };
+        ra = w == 0 ? 0 : rows_for(total * w / nw);
+        rb = w == nw - 1 ? R : rows_for(total * (w + 1) / nw);
+        if (rb < ra) rb = ra;
+    }
     for (std::size_t t = 0; t < lst.ds.size(); ++t) {
         const Index d = lst.ds[t];
         const Offset Rd = srp_[sz(d) + 1] - srp_[sz(d)];
         const Index* rd = sri_.data() + srp_[sz(d)];
         const f64* Xd = sx_.data() + sxp_[sz(d)];
         const Index fd = sfirst_[sz(d)], ncd = sfirst_[sz(d) + 1] - fd;
-        Offset q0 = lst.dp1[t], q1 = lst.dp2[t];
+        const Offset q0 = lst.dp1[t], q1 = lst.dp2[t];
+        // d's rows from q0 on map into s's rows increasingly (both lists
+        // ascend), so this worker's band is one run of positions in rd.
+        Offset ilo = q0, ihi = Rd;
         if (nw > 1) {
-            const Offset a0 = q0, a1 = q1;
-            q0 = std::lower_bound(rd + a0, rd + a1, f + ca) - rd;
-            q1 = std::lower_bound(rd + a0, rd + a1, f + cb) - rd;
+            if (ra >= rb) continue;
+            ilo = std::lower_bound(rd + q0, rd + Rd, rows[ra]) - rd;
+            ihi = rb >= R ? Rd : std::lower_bound(rd + q0, rd + Rd, rows[rb]) - rd;
+            if (ilo >= ihi) continue;
         }
         for (Offset j0 = q0; j0 < q1;) {
             const Offset m = Rd - j0;
             const Offset kc = std::min(q1 - j0, std::max<Offset>(1, kWMax / m));
-            cmod_window(Xd, Rd, rd, d_.data() + fd, ncd, j0, kc, X, R, f, rel, sc.w);
+            if (ihi > j0)
+                cmod_window(Xd, Rd, rd, d_.data() + fd, ncd, j0, kc, X, R, f, rel, sc.tbuf, sc.abuf,
+                            ilo, ihi);
             j0 += kc;
         }
     }
@@ -761,8 +973,27 @@ void Ldlt::factor_node(Index s, int w, int nw, Scratch& sc, FCtx& cx) {
 }
 
 bool Ldlt::factorize(const SymCsc& a, const std::vector<std::int8_t>& sign, f64 reg) {
+    if (!fits_) throw std::logic_error("Ldlt::factorize: the analyzed factor exceeds max_factor_bytes");
     if (a.n != n_ || sign.size() != sz(n_))
         throw std::invalid_argument("Ldlt::factorize: size mismatch with analyze()");
+    if (static_cast<Offset>(sx_.size()) != nx_) {
+        // First numeric factorization of this analysis: the storage.  Turn a
+        // bare std::bad_alloc -- which carries no size -- into one a caller
+        // or a reader can act on.
+        try {
+            sx_.assign(so(nx_), 0.0);
+        } catch (const std::bad_alloc&) {
+            char msg[256];
+            std::snprintf(msg, sizeof msg,
+                          "Ldlt::factorize: supernodal factor storage needs %.2f GB "
+                          "(%lld f64 entries; stored_l_=%lld nonzeros of L, %lld supernodes) "
+                          "-- allocation failed, fill-in exceeds available memory",
+                          static_cast<double>(nx_) * sizeof(f64) / 1e9,
+                          static_cast<long long>(nx_), static_cast<long long>(stored_l_),
+                          static_cast<long long>(ns_));
+            throw std::runtime_error(msg);
+        }
+    }
     std::fill(cx_.begin(), cx_.end(), 0.0);
     for (std::size_t t = 0; t < a.vals.size(); ++t) cx_[so(map_[t])] += a.vals[t];
     n_reg_ = 0;
@@ -964,6 +1195,213 @@ void Ldlt::solve(std::vector<f64>& b) const {
     for (Index k = 0; k < n_; ++k) b[sz(perm_[sz(k)])] = x[k];
 }
 
+// solve() for a block of right-hand sides.  The block is held interleaved
+// (row i's kb values contiguous), so every entry of L read is applied to all
+// kb columns by one short vector loop; the traversal, the partition and the
+// order of the operations on each column are exactly solve()'s.
+void Ldlt::solve_many(f64* B, Index k) const {
+    if (k <= 0 || n_ == 0) return;
+    if (k == 1) {
+        xs_.resize(sz(n_));
+        std::vector<f64> b(B, B + n_);
+        solve(b);
+        std::copy(b.begin(), b.end(), B);
+        return;
+    }
+    core::ThreadPool& pool = core::global_pool();
+    int p = pool.size();
+    if (max_threads_ > 0) p = std::min(p, max_threads_);
+    if (core::ThreadPool::in_job()) p = 1;
+    ensure_scratch(p);
+    constexpr Index kBlk = 32;
+    auto par_for = [&](Offset ntask, const std::function<void(Offset, int)>& fn) {
+        if (p == 1 || ntask <= 1) {
+            for (Offset t = 0; t < ntask; ++t) fn(t, 0);
+        } else {
+            pool.parallel_for(ntask, fn);
+        }
+    };
+    struct Node {
+        Index f, nc;
+        Offset R;
+        const Index* rows;
+        const f64* X;
+    };
+    auto node = [&](Index s) {
+        const Index f = sfirst_[sz(s)];
+        return Node{f, sfirst_[sz(s) + 1] - f, srp_[sz(s) + 1] - srp_[sz(s)],
+                    sri_.data() + srp_[sz(s)], sx_.data() + sxp_[sz(s)]};
+    };
+    const Offset nroots = static_cast<Offset>(vroots_.size());
+    for (Index c0 = 0; c0 < k; c0 += kBlk) {
+        const Index kb = std::min(kBlk, k - c0);
+        const std::size_t K = sz(kb);
+        xm_.resize(sz(n_) * K);
+        mbuf_.resize(so(vbufp_.back()) * K);
+        f64* x = xm_.data();
+        for (Index i = 0; i < n_; ++i) {
+            const Index src = perm_[sz(i)];
+            for (Index r = 0; r < kb; ++r) x[sz(i) * K + sz(r)] = B[sz(c0 + r) * sz(n_) + sz(src)];
+        }
+        // x_dst -= l * x_src over the block.
+        auto sub = [K](f64* dst, const f64* src, f64 l) {
+            for (std::size_t r = 0; r < K; ++r) dst[r] -= l * src[r];
+        };
+        auto add = [K](f64* dst, const f64* src, f64 l) {
+            for (std::size_t r = 0; r < K; ++r) dst[r] += l * src[r];
+        };
+
+        // ---- forward, below the cut ----
+        par_for(nroots, [&](Offset t, int w) {
+            const Index r = vroots_[so(t)];
+            const Node nr = node(r);
+            Index* rel = scratch_[sz(w)].rel.data();
+            for (Offset i = nr.nc; i < nr.R; ++i) rel[sz(nr.rows[i])] = static_cast<Index>(i - nr.nc);
+            f64* buf = mbuf_.data() + so(vbufp_[so(t)]) * K;
+            std::fill(buf, buf + so(nr.R - nr.nc) * K, 0.0);
+            const Index col_end = nr.f + nr.nc;
+            for (Index s = sub_lo_[sz(r)]; s <= r; ++s) {
+                const Node q = node(s);
+                const Offset qs = std::lower_bound(q.rows + q.nc, q.rows + q.R, col_end) - q.rows;
+                for (Index j = 0; j < q.nc; ++j) {
+                    const f64* xj = x + sz(q.f + j) * K;
+                    const f64* lc = q.X + static_cast<Offset>(j) * q.R;
+                    Offset i = j + 1;
+                    for (; i < qs; ++i) sub(x + sz(q.rows[i]) * K, xj, lc[i]);
+                    for (; i < q.R; ++i) add(buf + sz(rel[sz(q.rows[i])]) * K, xj, lc[i]);
+                }
+            }
+        });
+        for (Offset t = 0; t < nroots; ++t) {
+            const Node nr = node(vroots_[so(t)]);
+            const f64* buf = mbuf_.data() + so(vbufp_[so(t)]) * K;
+            for (Offset i = nr.nc; i < nr.R; ++i) {
+                f64* d = x + sz(nr.rows[i]) * K;
+                const f64* b = buf + so(i - nr.nc) * K;
+                for (std::size_t c = 0; c < K; ++c) d[c] -= b[c];
+            }
+        }
+        // ---- forward, above the cut ----
+        for (const Index s : vtop_) {
+            const Node q = node(s);
+            if (p == 1 || (q.R - q.nc) * q.nc < kSolveCoop) {
+                for (Index j = 0; j < q.nc; ++j) {
+                    const f64* xj = x + sz(q.f + j) * K;
+                    const f64* lc = q.X + static_cast<Offset>(j) * q.R;
+                    for (Offset i = j + 1; i < q.R; ++i) sub(x + sz(q.rows[i]) * K, xj, lc[i]);
+                }
+                continue;
+            }
+            for (Index j = 0; j < q.nc; ++j) {
+                const f64* xj = x + sz(q.f + j) * K;
+                const f64* lc = q.X + static_cast<Offset>(j) * q.R;
+                for (Offset i = j + 1; i < q.nc; ++i) sub(x + sz(q.f + i) * K, xj, lc[i]);
+            }
+            const Offset nch = (q.R - q.nc + kRowChunk - 1) / kRowChunk;
+            par_for(nch, [&](Offset c, int) {
+                const Offset r0 = q.nc + c * kRowChunk, r1 = std::min(q.R, r0 + kRowChunk);
+                for (Index j = 0; j < q.nc; ++j) {
+                    const f64* xj = x + sz(q.f + j) * K;
+                    const f64* lc = q.X + static_cast<Offset>(j) * q.R;
+                    for (Offset i = r0; i < r1; ++i) sub(x + sz(q.rows[i]) * K, xj, lc[i]);
+                }
+            });
+        }
+
+        for (Index j = 0; j < n_; ++j) {
+            f64* xj = x + sz(j) * K;
+            const f64 d = d_[sz(j)];
+            for (std::size_t c = 0; c < K; ++c) xj[c] /= d;
+        }
+
+        // ---- backward ----
+        auto bwd_rect = [&](const Node& q, Index j, f64* acc) {
+            const f64* lc = q.X + static_cast<Offset>(j) * q.R;
+            for (Offset i = q.nc; i < q.R; ++i) sub(acc, x + sz(q.rows[i]) * K, lc[i]);
+        };
+        auto bwd_tri = [&](const Node& q, Index j, f64* acc) {
+            const f64* lc = q.X + static_cast<Offset>(j) * q.R;
+            for (Offset i = j + 1; i < q.nc; ++i) sub(acc, x + sz(q.f + i) * K, lc[i]);
+        };
+        auto bwd_node = [&](Index s) {
+            const Node q = node(s);
+            for (Index j = q.nc - 1; j >= 0; --j) {
+                f64* xj = x + sz(q.f + j) * K;
+                bwd_rect(q, j, xj);
+                bwd_tri(q, j, xj);
+            }
+        };
+        for (auto it = vtop_.rbegin(); it != vtop_.rend(); ++it) {
+            const Index s = *it;
+            const Node q = node(s);
+            if (p == 1 || (q.R - q.nc) * q.nc < kSolveCoop) {
+                bwd_node(s);
+                continue;
+            }
+            constexpr Index kColChunk = 8;
+            const Offset nch = (q.nc + kColChunk - 1) / kColChunk;
+            par_for(nch, [&](Offset c, int) {
+                const Index j0 = static_cast<Index>(c) * kColChunk, j1 = std::min<Index>(q.nc, j0 + kColChunk);
+                for (Index j = j0; j < j1; ++j) bwd_rect(q, j, x + sz(q.f + j) * K);
+            });
+            for (Index j = q.nc - 1; j >= 0; --j) bwd_tri(q, j, x + sz(q.f + j) * K);
+        }
+        par_for(nroots, [&](Offset t, int) {
+            const Index r = vroots_[so(t)];
+            for (Index s = r; s >= sub_lo_[sz(r)]; --s) bwd_node(s);
+        });
+
+        for (Index i = 0; i < n_; ++i) {
+            const Index dst = perm_[sz(i)];
+            for (Index r = 0; r < kb; ++r) B[sz(c0 + r) * sz(n_) + sz(dst)] = x[sz(i) * K + sz(r)];
+        }
+    }
+}
+
+void Ldlt::schedule_report(int workers) const {
+    // Incoming cmod work per target supernode: supernode d (ncd columns,
+    // row list rd) updates, for each target s its rows hit, the entries
+    // (rows of d in s) x (rows of d from s on), ncd multiply-adds each.
+    std::vector<f64> in(sz(ns_), 0.0), panel(sz(ns_), 0.0);
+    for (Index d = 0; d < ns_; ++d) {
+        const Index ncd = sfirst_[sz(d) + 1] - sfirst_[sz(d)];
+        const Offset Rd = srp_[sz(d) + 1] - srp_[sz(d)];
+        const Index* rd = sri_.data() + srp_[sz(d)];
+        for (Offset k = 0; k < ncd; ++k) {
+            const f64 bl = static_cast<f64>(Rd - k - 1);
+            panel[sz(d)] += 0.5 * bl * bl;
+        }
+        Offset p = ncd;
+        while (p < Rd) {
+            const Index s = sup_of_[sz(rd[p])];
+            Offset q = p;
+            while (q < Rd && sup_of_[sz(rd[q])] == s) ++q;
+            in[sz(s)] += static_cast<f64>(ncd) * static_cast<f64>(q - p) * static_cast<f64>(Rd - p);
+            p = q;
+        }
+    }
+    std::vector<Index> roots, top;
+    split_tree(subcost_, workers, kFactorRatio, roots, top);
+    std::vector<char> is_top(sz(ns_), 0);
+    for (Index s : top) is_top[sz(s)] = 1;
+    f64 total = 0.0, sub = 0.0, coop = 0.0, solo = 0.0, maxsub = 0.0;
+    std::size_t ncoop = 0, nsolo = 0;
+    for (Index s = 0; s < ns_; ++s) total += in[sz(s)] + panel[sz(s)];
+    for (Index r : roots) {
+        f64 w = 0.0;
+        for (Index s = sub_lo_[sz(r)]; s <= r; ++s) w += in[sz(s)] + panel[sz(s)];
+        sub += w;
+        maxsub = std::max(maxsub, w);
+    }
+    for (Index s : top) {
+        const f64 w = in[sz(s)] + panel[sz(s)];
+        if (scost_[sz(s)] < kCoopWork) { solo += w; ++nsolo; } else { coop += w; ++ncoop; }
+    }
+    std::fprintf(stderr, "schedule(%d): work %.3e | subtrees %zu: %.1f%% (largest %.1f%%) | top coop %zu: %.1f%% | "
+                 "top single-worker %zu: %.1f%%\n", workers, total, roots.size(), 100.0 * sub / total,
+                 100.0 * maxsub / total, ncoop, 100.0 * coop / total, nsolo, 100.0 * solo / total);
+}
+
 std::uint64_t Ldlt::fingerprint() const {
     std::uint64_t h = 1469598103934665603ULL;
     auto mix = [&](const std::vector<f64>& v) {
@@ -986,7 +1424,7 @@ std::size_t Ldlt::memory_bytes() const {
                     b(cx_) + b(map_) + b(sparent_) + b(sub_lo_) + b(schead_) + b(snext_) +
                     b(scost_) + b(subcost_) + b(froots_) + b(ftop_) + b(vroots_) + b(vtop_) +
                     b(vbufp_) + b(vbuf_) + b(xs_) + b(head_) + b(next_) + b(ptr_);
-    for (const auto& s : scratch_) t += b(s.rel) + b(s.w) + b(s.ds) + b(s.dp1) + b(s.dp2);
+    for (const auto& s : scratch_) t += b(s.rel) + b(s.tbuf) + b(s.abuf) + b(s.ds) + b(s.dp1) + b(s.dp2);
     return t;
 }
 

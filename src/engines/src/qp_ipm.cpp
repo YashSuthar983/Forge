@@ -59,6 +59,7 @@
 #include "forge/sparse/csr.hpp"
 
 #include "forge/core/parallel.hpp"
+#include "forge/core/process_memory.hpp"
 #include "ipm_core.hpp"
 #include "qp_common.hpp"
 
@@ -70,8 +71,12 @@
 #include <functional>
 #include <limits>
 #include <stdexcept>
+#include <new>
 #include <string>
 #include <vector>
+
+#include <sys/resource.h>
+#include <unistd.h>
 
 namespace forge::engines {
 namespace {
@@ -84,6 +89,12 @@ using qpc::sz;
 constexpr f64 kInf = std::numeric_limits<f64>::infinity();
 
 using ipmc::Core;
+
+// Thrown inside run_ipm when the time limit (or a race cancel) arrives
+// during the setup -- the normal-equation or augmented analysis, whose
+// ordering of a large system can outlast a limit on its own.  Caught at
+// the end of run_ipm: the run reports "time limit" like any other.
+struct DeadlineReached {};
 
 // Full symmetric Q x from the upper-triangle column lists.
 void q_mul(const Core& k, const std::vector<f64>& x, std::vector<f64>& out) {
@@ -101,84 +112,214 @@ struct Result {
     bool converged = false;
     f64 worst_solve_residual = 0.0;
     std::string reason;
+    bool stopped_on_time = false;
 };
 
-// Normal equations for the LP barrier (Q = 0).  Eliminating dx from the
-// regularised augmented system leaves the order-m SPD matrix
-//   M = A D A^T + G,  D_j = 1 / (T_j + rho),  G_i = delta (+ 1/T_i),
-// built here from the SPARSE columns only; the few dense columns are a
-// low-rank update applied with the Sherman-Morrison-Woodbury identity on top
-// of one Cholesky-type (LDL', positive pivots) factorisation of the sparse
-// part.  The sparsity pattern is analysed once; each Newton iteration only
-// reassembles M's values (column by column, in parallel) and refactorises.
+// Normal equations for the LP barrier (Q = 0).  The regularised augmented
+// system is
+//   [ -(T_x + rho)   A'  ] [dx]   [r1]
+//   [     A          G   ] [dy] = [r2],   G_i = delta (+ 1/T_w,i on an inequality row),
+// and either unknown can be eliminated.  Eliminating dx leaves the order-m
+// PRIMAL form
+//   M dy = r2 + A D r1,     M = A D A' + G,   D_j = 1 / (T_j + rho),
+//   dx = D (A' dy - r1);
+// eliminating dy instead leaves the order-n DUAL form
+//   N dx = A' H r2 - r1,    N = A' H A + (T_x + rho),   H = G^-1,
+//   dy = H (r2 - A dx).
+// Both are SPD and have the same shape, B S B' + diag(g) for B = A or A'.
+// Which is cheaper is a property of the model, not of the method: rmine15
+// has 358k rows and 42k columns, ex10 70k rows of 17 entries against 18k
+// columns of 66 -- their A D A' is dense (ex10: a 5 GB factor) while A' H A
+// is small.  The dual form's equality rows carry H = 1/delta, exactly as a
+// free column carries D = 1/rho in the primal form, and the same Krylov
+// refinement against the true system covers both.  The form is chosen by
+// the analysed factor cost (choose_form).
+//
+// The matrix is built from the SPARSE columns of B only; the few dense
+// ones are a low-rank update applied with the Sherman-Morrison-Woodbury
+// identity on top of one Cholesky-type (LDL', positive pivots)
+// factorisation of the sparse part.  The sparsity pattern is analysed
+// once; each Newton iteration only reassembles the values (column by
+// column, in parallel) and refactorises.
 struct NormalEq {
-    struct Col {
-        std::vector<core::Index> rows;   // ascending, duplicates merged
-        std::vector<f64> vals;
+    // A by column and by row, as views into flat CSC/CSR arrays (duplicate
+    // entries merged).  They used to be separate vectors -- on s100 (364k
+    // columns of ~5 entries) the products with A and A' that wrap every
+    // solve then cost more than the solve itself.  NormalEq is never copied
+    // or moved after build(), so the views stay valid.
+    template <class T> struct Span {
+        const T* p = nullptr;
+        std::size_t len = 0;
+        std::size_t size() const { return len; }
+        bool empty() const { return len == 0; }
+        const T& operator[](std::size_t i) const { return p[i]; }
+        const T* data() const { return p; }
+        const T* begin() const { return p; }
+        const T* end() const { return p + len; }
     };
-
-    core::Index n = 0, m = 0;
-    std::vector<Col> cols;                   // A by column
+    struct Col {
+        Span<core::Index> rows;   // ascending, duplicates merged
+        Span<f64> vals;
+    };
+    std::vector<core::Offset> ccp;           // A by column
+    std::vector<core::Index> crow;
+    std::vector<f64> cval;
     std::vector<core::Offset> rrp;           // A by row (same merged entries)
     std::vector<core::Index> rcj;
     std::vector<f64> rcv;
-    std::vector<core::Index> dense_of;       // columns taken out into the Schur update
+    std::vector<Col> acols, arows;
+
+    core::Index n = 0, m = 0;                // A is m x n
+    // The form: B = A (primal, system order m) or B = A' (dual, order n).
+    bool transposed = false;
+    core::Index P = 0, Q = 0;                // system order, columns of B
+    const std::vector<Col>* bcols = nullptr; // columns of B
+    const std::vector<Col>* brows = nullptr; // rows of B
+    std::vector<core::Index> dense_of;       // B columns taken out into the Schur update
     std::vector<std::uint8_t> is_dense;
-    int dense_candidates = 0;                // columns long enough to be considered
+    int dense_candidates = 0;                // B columns long enough to be considered
     bool schur = false;
-    bool ok = true;                          // false: M too large, stay augmented
+    // The system held as its full upper triangle (dense_mode): see build().
+    bool dense_mode = false;
+    bool ok = true;                          // false: no form fits, stay augmented
+    bool interrupted = false;                // the deadline ended the analysis
+    bool verbose = false;                    // per-trial analysis lines on stderr
 
     la::SymCsc M;
     std::vector<core::Offset> diag_slot;
     std::vector<std::int8_t> sign;
     la::Ldlt fac;
     int reg_pivots = 0;
+    double assemble_ms = 0.0, ldlt_ms = 0.0, schur_ms = 0.0;   // cumulative, for --verbose
+    f64 assemble_work = 0.0;                                     // multiply-adds per assembly
 
-    std::vector<f64> dscale;                 // 1/(T_j + rho), all columns
+    std::vector<f64> dscale;                 // per B column: D_j (primal) or H_i (dual)
+    std::vector<f64> gdiag;                  // per system row: G_i (primal) or T_j + rho (dual)
     std::vector<f64> sroot;                  // sqrt(dscale) of the dense columns
-    std::vector<f64> Y;                      // m * p, column-major, M^{-1} A_dense
-    std::vector<f64> schur_l;                // p * p row-major lower Cholesky of I + D^1/2 A'M^-1A D^1/2
-    std::vector<f64> bwork, zwork, wwork, colwork;
+    std::vector<f64> Y;                      // P * p, column-major, M^{-1} B_dense
+    std::vector<f64> schur_l;                // p * p row-major lower Cholesky of I + S^1/2 B'M^-1B S^1/2
+    std::vector<f64> bwork, zwork, wwork;
     std::vector<std::vector<f64>> wscratch;  // per-worker dense accumulator (assemble)
 
-    void build(const ipmc::Core& k) {
+    // Memory: the factor budget is what the machine has left, less the
+    // pattern and the Schur vectors, at the time of the analysis.  The old
+    // fixed 40% of physical memory ignored everything else the process and
+    // the machine held (a2864 and five other lpopt models were OOM-killed
+    // with the factor "within budget").
+    static std::uint64_t available_memory_bytes() {
+        std::uint64_t avail = 0;
+        if (std::FILE* fp = std::fopen("/proc/meminfo", "r")) {
+            char line[256];
+            while (std::fgets(line, sizeof line, fp)) {
+                unsigned long long kb = 0;
+                if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) { avail = kb * 1024ULL; break; }
+            }
+            std::fclose(fp);
+        }
+        if (avail == 0) {
+            const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
+            if (pages > 0 && page > 0)
+                avail = static_cast<std::uint64_t>(0.4 * static_cast<double>(pages) * static_cast<double>(page));
+        }
+        // An address-space limit (ulimit -v) binds before the machine does:
+        // what is left of it is the current virtual size subtracted from it.
+        struct rlimit rl {};
+        if (getrlimit(RLIMIT_AS, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
+            unsigned long long vm_pages = 0;
+            if (std::FILE* fp = std::fopen("/proc/self/statm", "r")) {
+                if (std::fscanf(fp, "%llu", &vm_pages) != 1) vm_pages = 0;
+                std::fclose(fp);
+            }
+            const long page = sysconf(_SC_PAGE_SIZE);
+            const std::uint64_t used = vm_pages * static_cast<std::uint64_t>(page > 0 ? page : 4096);
+            const std::uint64_t lim = static_cast<std::uint64_t>(rl.rlim_cur);
+            avail = std::min(avail, lim > used ? lim - used : 0);
+        }
+        return avail;
+    }
+    static void budget_factor(la::Ldlt& f, std::uint64_t reserved, const std::function<bool()>* stop) {
+        la::LdltOptions o = f.options();
+        // Three quarters of what is free, less what this system's own
+        // arrays take, leaves the iteration's vectors and the OS some room.
+        const std::uint64_t avail = available_memory_bytes();
+        const std::uint64_t usable = static_cast<std::uint64_t>(0.75 * static_cast<double>(avail));
+        o.max_factor_bytes = usable > reserved ? usable - reserved : 1;
+        if (stop) o.should_stop = *stop;
+        f.set_options(o);
+    }
+    static std::uint64_t pattern_bytes(std::size_t nnz) {
+        return static_cast<std::uint64_t>(nnz) * (sizeof(core::Index) + sizeof(f64));
+    }
+
+    static constexpr std::size_t kKeepPatternEntries = 20000000;
+
+    // One analysed candidate: a form and a dense split.
+    struct Candidate {
+        bool valid = false;
+        bool transposed = false;
+        std::vector<std::uint8_t> dense;      // per B column
+        std::vector<core::Index> dense_of;
+        la::SymCsc M;
+        std::vector<core::Offset> dslot;
+        la::Ldlt fac;
+        f64 cost = kInf;                       // per Newton iteration
+        f64 probe_lb = kInf;                   // flops (lower bound) of the first trial analysed
+        f64 probe_nnzl = 0.0;                  // and its nnz(L) (lower bound)
+        int candidates = 0;
+    };
+
+    // Both orientations of A, then the form.
+    void build(const ipmc::Core& k, const std::function<bool()>* stop = nullptr) {
         n = k.n;
         m = k.m;
-        cols.assign(sz(n), {});
-        dscale.assign(sz(n), 0.0);
-        const auto& rp = k.A.pattern.row_ptr();
-        const auto& ci = k.A.pattern.col_idx();
-        for (core::Index i = 0; i < m; ++i)
-            for (auto t = rp[sz(i)]; t < rp[sz(i) + 1]; ++t)
-                cols[sz(ci[sz(t)])].rows.push_back(i), cols[sz(ci[sz(t)])].vals.push_back(k.A.vals[sz(t)]);
-        for (core::Index j = 0; j < n; ++j) {
-            auto& c = cols[sz(j)];
-            const std::size_t knt = c.rows.size();
-            std::vector<std::size_t> ord(knt);
-            for (std::size_t e = 0; e < knt; ++e) ord[e] = e;
-            std::sort(ord.begin(), ord.end(), [&](std::size_t a, std::size_t b) {
-                return c.rows[a] < c.rows[b];
-            });
-            Col merged;
-            for (std::size_t t = 0; t < knt; ++t) {
-                const core::Index r = c.rows[ord[t]];
-                const f64 v = c.vals[ord[t]];
-                if (!merged.rows.empty() && merged.rows.back() == r) merged.vals.back() += v;
-                else { merged.rows.push_back(r); merged.vals.push_back(v); }
+        {
+            // Rows are visited in ascending order, so each column's entries
+            // arrive sorted and a duplicate (i, j) is the previous entry.
+            const auto& rp = k.A.pattern.row_ptr();
+            const auto& ci = k.A.pattern.col_idx();
+            std::vector<core::Offset> cnt(sz(n) + 1, 0);
+            for (core::Index i = 0; i < m; ++i)
+                for (auto t = rp[sz(i)]; t < rp[sz(i) + 1]; ++t) ++cnt[sz(ci[sz(t)]) + 1];
+            for (core::Index j = 0; j < n; ++j) cnt[sz(j) + 1] += cnt[sz(j)];
+            std::vector<core::Offset> cur(cnt.begin(), cnt.end() - 1);
+            std::vector<core::Index> rtmp(sz(cnt[sz(n)]));
+            std::vector<f64> vtmp(sz(cnt[sz(n)]));
+            for (core::Index i = 0; i < m; ++i)
+                for (auto t = rp[sz(i)]; t < rp[sz(i) + 1]; ++t) {
+                    const core::Index j = ci[sz(t)];
+                    const core::Offset at = cur[sz(j)];
+                    if (at > cnt[sz(j)] && rtmp[sz(at - 1)] == i) { vtmp[sz(at - 1)] += k.A.vals[sz(t)]; continue; }
+                    rtmp[sz(at)] = i;
+                    vtmp[sz(at)] = k.A.vals[sz(t)];
+                    ++cur[sz(j)];
+                }
+            ccp.assign(sz(n) + 1, 0);
+            for (core::Index j = 0; j < n; ++j) ccp[sz(j) + 1] = ccp[sz(j)] + (cur[sz(j)] - cnt[sz(j)]);
+            crow.resize(sz(ccp[sz(n)]));
+            cval.resize(sz(ccp[sz(n)]));
+            for (core::Index j = 0; j < n; ++j) {
+                const core::Offset len = cur[sz(j)] - cnt[sz(j)];
+                std::copy_n(rtmp.begin() + cnt[sz(j)], len, crow.begin() + ccp[sz(j)]);
+                std::copy_n(vtmp.begin() + cnt[sz(j)], len, cval.begin() + ccp[sz(j)]);
             }
-            c = std::move(merged);
+            acols.assign(sz(n), {});
+            for (core::Index j = 0; j < n; ++j) {
+                const auto len = static_cast<std::size_t>(ccp[sz(j) + 1] - ccp[sz(j)]);
+                acols[sz(j)].rows = {crow.data() + ccp[sz(j)], len};
+                acols[sz(j)].vals = {cval.data() + ccp[sz(j)], len};
+            }
         }
         // The same merged entries by row (columns ascending within a row).
         rrp.assign(sz(m) + 1, 0);
         for (core::Index j = 0; j < n; ++j)
-            for (core::Index r : cols[sz(j)].rows) ++rrp[sz(r) + 1];
+            for (core::Index r : acols[sz(j)].rows) ++rrp[sz(r) + 1];
         for (core::Index i = 0; i < m; ++i) rrp[sz(i) + 1] += rrp[sz(i)];
         rcj.assign(sz(rrp[sz(m)]), 0);
         rcv.assign(sz(rrp[sz(m)]), 0.0);
         {
             std::vector<core::Offset> cur(rrp.begin(), rrp.end() - 1);
             for (core::Index j = 0; j < n; ++j) {
-                const auto& c = cols[sz(j)];
+                const auto& c = acols[sz(j)];
                 for (std::size_t e = 0; e < c.rows.size(); ++e) {
                     const auto at = static_cast<std::size_t>(cur[sz(c.rows[e])]++);
                     rcj[at] = j;
@@ -186,88 +327,388 @@ struct NormalEq {
                 }
             }
         }
+        arows.assign(sz(m), {});
+        for (core::Index i = 0; i < m; ++i) {
+            const auto len = static_cast<std::size_t>(rrp[sz(i) + 1] - rrp[sz(i)]);
+            arows[sz(i)].rows = {rcj.data() + rrp[sz(i)], len};
+            arows[sz(i)].vals = {rcv.data() + rrp[sz(i)], len};
+        }
+        is_dense.clear();
+        ok = false;
+        interrupted = false;
+        if (m == 0) { set_form(false); ok = true; return; }
+        choose_form(stop);
+    }
 
-        // A column this long fills a dense patch of ADA^T.  The longest of
-        // them may be cheaper as a Schur update than inside the sparse
-        // factor, but each costs one solve with M per factorisation and m
-        // doubles of storage, so whether and how many is decided by trying:
-        // the pattern is analysed for a few split sizes and the cheapest per
-        // Newton iteration wins (pilot87's 178 columns of 64+ nonzeros: not
-        // split, 3x faster; fit2p's few thousand-nonzero columns: split).
+    void set_form(bool t) {
+        transposed = t;
+        P = t ? n : m;
+        Q = t ? m : n;
+        bcols = t ? &arows : &acols;
+        brows = t ? &acols : &arows;
+    }
+
+    // The split candidates of a form: B columns long enough to be taken
+    // out into the Schur update, longest first, and how many at most.
+    struct SplitPlan {
+        std::vector<core::Index> cand;
+        std::size_t cap = 0;      // most columns a trial splits
+        std::size_t p0 = 0;       // columns every trial splits (>= P/4 rows)
+    };
+    SplitPlan split_plan(bool t) const {
         constexpr core::Index kDenseNnz = 64;
         constexpr std::size_t kMaxSchur = 256;
-        constexpr std::size_t kMaxSchurStore = 30000000;   // m * p doubles
-        std::vector<core::Index> cand;
-        for (core::Index j = 0; j < n; ++j)
-            if (static_cast<core::Index>(cols[sz(j)].rows.size()) >= kDenseNnz) cand.push_back(j);
-        dense_candidates = static_cast<int>(cand.size());
-        std::stable_sort(cand.begin(), cand.end(), [&](core::Index a, core::Index b) {
+        constexpr std::size_t kMaxSchurStore = 30000000;   // P * p doubles
+        const auto& cols = t ? arows : acols;
+        const core::Index Pt = t ? n : m;
+        SplitPlan sp;
+        for (core::Index q = 0; q < static_cast<core::Index>(cols.size()); ++q)
+            if (static_cast<core::Index>(cols[sz(q)].rows.size()) >= kDenseNnz) sp.cand.push_back(q);
+        std::stable_sort(sp.cand.begin(), sp.cand.end(), [&](core::Index a, core::Index b) {
             return cols[sz(a)].rows.size() > cols[sz(b)].rows.size();
         });
+        sp.cap = std::min({sp.cand.size(), kMaxSchur,
+                           static_cast<std::size_t>(std::max<core::Index>(Pt / 2, 1)),
+                           std::max<std::size_t>(kMaxSchurStore / sz(std::max<core::Index>(Pt, 1)), 1)});
         // Columns over a quarter of the rows would make M dense: always split
         // (analysing that M only to reject it costs more than the solve).
-        std::vector<std::size_t> trials;
-        if (m > 0) {
-            const std::size_t cap = std::min({cand.size(), kMaxSchur,
-                                              static_cast<std::size_t>(std::max<core::Index>(m / 2, 1)),
-                                              std::max<std::size_t>(kMaxSchurStore / sz(m), 1)});
-            std::size_t p0 = 0;
-            while (p0 < cap && static_cast<core::Index>(cols[sz(cand[p0])].rows.size()) >= m / 4) ++p0;
-            trials.push_back(p0);
-            for (std::size_t t = std::max<std::size_t>(p0, 1) * 4; t < cap; t *= 4) trials.push_back(t);
-            if (cap > p0) trials.push_back(cap);
-        }
+        while (sp.p0 < sp.cap && static_cast<core::Index>(cols[sz(sp.cand[sp.p0])].rows.size()) >= Pt / 4) ++sp.p0;
+        return sp;
+    }
 
-        is_dense.assign(sz(n), 0);
-        if (m == 0) return;
-        f64 best_cost = kInf;
-        ok = false;
+    // Upper bound on the pattern of the form's sparse part when its longest
+    // columns are split off (as many as a trial may split): the cliques of
+    // the remaining columns of B.  Without the split, a few dense rows of A
+    // made the dual form look as dense as A'A (rmine15).
+    f64 clique_estimate(bool t) const {
+        const auto& cols = t ? arows : acols;
+        const SplitPlan sp = split_plan(t);
+        std::vector<std::uint8_t> out(cols.size(), 0);
+        for (std::size_t q = 0; q < sp.cap; ++q) out[sz(sp.cand[q])] = 1;
+        f64 e = 0.0;
+        for (std::size_t q = 0; q < cols.size(); ++q) {
+            if (out[q]) continue;
+            const f64 l = static_cast<f64>(cols[q].rows.size());
+            e += 0.5 * l * (l + 1.0);
+        }
+        const f64 p = static_cast<f64>(t ? n : m);
+        return std::min(e, 0.5 * p * (p + 1.0));
+    }
+
+    // Analyse the primal and the dual form -- the one whose pattern bound
+    // is smaller first, the other only when the first is expensive and the
+    // other's bound is not far larger -- and keep the cheaper per Newton
+    // iteration.  Each analysis holds symbolic structures only (the factor
+    // storage is allocated at the first factorisation), so comparing them
+    // costs no factor memory.
+    void choose_form(const std::function<bool()>* stop) {
+        // Branch and bound over (form, split).  The most-split trial of a
+        // form has the smallest pattern -- the quickest to order -- and,
+        // fill being monotone in the pattern, about the fewest multiply-adds
+        // that form can reach: its flops are a lower bound on the form's
+        // cost.  So: probe both forms at their most-split trial (smaller
+        // pattern bound first), then refine the split sizes only of a form
+        // whose bound is below the best cost found (pilot87: the dual
+        // form's probe bound 6.4e8 against the primal's analysed 1.5e8 ends
+        // it; fit2d: the dual probe is diagonal but pays 25 Schur columns,
+        // the primal's 25x25 system costs 5e3).  A second form whose
+        // pattern bound is large (> 1e7 entries) and far above both the
+        // first's bound and its factor is not probed (rmine15's primal);
+        // on a small model every probe takes milliseconds.
+        const f64 ep = clique_estimate(false), ed = clique_estimate(true);
+        const bool dual_first = ed < ep;
+        if (verbose)
+            std::fprintf(stderr, "ipm ne-forms pattern bound primal %.3e dual %.3e -> %s first\n",
+                         ep, ed, dual_first ? "dual" : "primal");
+        Candidate best;
+        f64 lb[2] = {kInf, kInf}, lbn[2] = {0.0, 0.0};
+        bool probed[2] = {false, false};
+        for (int round = 0; round < 2; ++round) {
+            const bool t = (round == 0) == dual_first;
+            if (round == 1) {
+                if (stop && (*stop)()) { interrupted = true; break; }
+                const f64 first = dual_first ? ed : ep, second = dual_first ? ep : ed;
+                constexpr f64 kSmallPattern = 1e7;
+                if (best.valid && second > kSmallPattern &&
+                    second > 4.0 * std::max(first, static_cast<f64>(best.fac.nnz_l()))) break;
+            }
+            Candidate c = analyse_form(t, stop, best.cost, TrialSet::Probe);
+            if (interrupted) break;
+            probed[t ? 1 : 0] = true;
+            lb[t ? 1 : 0] = c.probe_lb;
+            lbn[t ? 1 : 0] = c.probe_nnzl;
+            if (c.valid && c.cost < best.cost) best = std::move(c);
+        }
+        // Refine, the form with the smaller bound first.
+        for (int k = 0; k < 2 && !interrupted; ++k) {
+            const bool t = (k == 0) == (lb[1] < lb[0]);
+            if (!probed[t ? 1 : 0] || !(lb[t ? 1 : 0] < best.cost)) continue;
+            if (stop && (*stop)()) { interrupted = true; break; }
+            Candidate c = analyse_form(t, stop, best.cost, TrialSet::Rest, lb[t ? 1 : 0], lbn[t ? 1 : 0]);
+            if (interrupted) break;
+            if (c.valid && c.cost < best.cost) best = std::move(c);
+        }
+        if (!best.valid) return;
+        set_form(best.transposed);
+        is_dense = std::move(best.dense);
+        dense_of = std::move(best.dense_of);
+        dense_candidates = best.candidates;
+        M = std::move(best.M);
+        diag_slot = std::move(best.dslot);
+        if (M.n != P && P > 0) {
+            // Dropped during the trials (kKeepPatternEntries): rebuild it.
+            const bool rebuilt = pattern(is_dense, M, diag_slot);
+            if (!rebuilt) return;
+        }
+        fac = std::move(best.fac);
+        schur = !dense_of.empty();
+        ok = true;
+        // DENSE NORMAL EQUATIONS.  When the factor is mostly dense anyway,
+        // keep the system as its full upper triangle: every column -- the
+        // long ones included, so no Schur update -- is added as an outer
+        // product into the columns it reaches, reading each column of B
+        // once, the updates landing in one contiguous column at a time.
+        // The sparse assembly pulled a prefix of every column of B through
+        // each row of M (square41, m = 1754, L 90% dense: 8.9e8
+        // multiply-adds per assembly at 0.55 G/s, two thirds of the
+        // barrier), and the 256 split columns cost another 0.6 s per
+        // iteration in Schur solves.
+        constexpr f64 kDenseEntries = 2e7;
+        const f64 full = 0.5 * static_cast<f64>(P) * (static_cast<f64>(P) + 1.0);
+        if (full <= kDenseEntries && static_cast<f64>(fac.nnz_l()) >= 0.5 * full) {
+            la::SymCsc Md;
+            Md.n = P;
+            Md.col_ptr.assign(sz(P) + 1, 0);
+            Md.row_idx.resize(static_cast<std::size_t>(full));
+            std::vector<core::Offset> dslot(sz(P), 0);
+            for (core::Index q = 0; q < P; ++q) {
+                const core::Offset base = static_cast<core::Offset>(q) * (q + 1) / 2;
+                Md.col_ptr[sz(q) + 1] = base + q + 1;
+                for (core::Index r = 0; r <= q; ++r) Md.row_idx[sz(base + r)] = r;
+                dslot[sz(q)] = base + q;
+            }
+            la::Ldlt fd;
+            budget_factor(fd, pattern_bytes(Md.row_idx.size()), stop);
+            fd.analyze(Md);
+            if (fd.interrupted()) { interrupted = true; ok = false; return; }
+            if (fd.fits()) {
+                dense_mode = true;
+                schur = false;
+                dense_of.clear();
+                is_dense.assign(sz(Q), 0);
+                M = std::move(Md);
+                diag_slot = std::move(dslot);
+                fac = std::move(fd);
+            }
+        }
+        M.vals.assign(M.row_idx.size(), 0.0);
+        sign.assign(sz(P), 1);
+        assemble_work = 0.0;  // multiply-adds of one assembly
+        for (core::Index q = 0; q < Q; ++q)
+            if (!is_dense[sz(q)]) {
+                const f64 l = static_cast<f64>((*bcols)[sz(q)].rows.size());
+                assemble_work += 0.5 * l * (l + 1.0);
+            }
+    }
+
+    // A column this long fills a dense patch of B S B'.  The longest of
+    // them may be cheaper as a Schur update than inside the sparse factor,
+    // but each costs one solve with M per factorisation and P doubles of
+    // storage, so whether and how many is decided by trying: the pattern
+    // is analysed for a few split sizes and the cheapest per Newton
+    // iteration wins (pilot87's 178 columns of 64+ nonzeros: not split, 3x
+    // faster; fit2p's few thousand-nonzero columns: split).
+    enum class TrialSet { All, Probe, Rest };
+    // probe_flops / probe_nnzl (TrialSet::Rest): the probe's factor, a lower
+    // bound on every less-split trial's (their patterns contain the probe's).
+    Candidate analyse_form(bool t, const std::function<bool()>* stop, f64 cost_cap, TrialSet which = TrialSet::All,
+                           f64 probe_flops = 0.0, f64 probe_nnzl = 0.0) {
+        set_form(t);
+        Candidate best;
+        best.transposed = t;
+        const SplitPlan sp = split_plan(t);
+        const std::vector<core::Index>& cand = sp.cand;
+        best.candidates = static_cast<int>(cand.size());
+        // Split sizes p0, 4 p0, 16 p0, ..., cap -- analysed LARGEST first:
+        // the most-split pattern is the smallest and the quickest to order,
+        // and its cost then caps the others (an ordering is abandoned once
+        // its factor is provably costlier than the best in hand, AmdCaps).
+        std::vector<std::size_t> trials;
+        trials.push_back(sp.p0);
+        for (std::size_t tr = std::max<std::size_t>(sp.p0, 1) * 4; tr < sp.cap; tr *= 4) trials.push_back(tr);
+        if (sp.cap > sp.p0) trials.push_back(sp.cap);
+        std::reverse(trials.begin(), trials.end());
+        if (which == TrialSet::Probe) trials.resize(1);
+        else if (which == TrialSet::Rest) trials.erase(trials.begin());
         for (const std::size_t p : trials) {
-            std::vector<std::uint8_t> dense(sz(n), 0);
-            for (std::size_t t = 0; t < p; ++t) dense[sz(cand[t])] = 1;
+            if (stop && (*stop)()) { interrupted = true; return best; }
+            std::vector<std::uint8_t> dense(sz(Q), 0);
+            for (std::size_t q = 0; q < p; ++q) dense[sz(cand[q])] = 1;
+            // This trial's factor flops must stay under what would make it
+            // lose to the best candidate so far (its split's dense work is
+            // known before the analysis; the solve term is left out, so the
+            // cap only drops trials that cannot win).
+            // A less-split trial's pattern contains the probe's, so its
+            // nnz(L) and multiply-adds are at least the probe's: its split
+            // penalty is bounded below before any analysis, and a trial
+            // whose penalty plus the probe's multiply-adds already reaches
+            // the bound is not analysed (degen3's dual: 64 and 16 columns).
+            const f64 bound = std::min(cost_cap, best.cost);
+            const f64 flop_cap = std::isfinite(bound)
+                ? bound - static_cast<f64>(p) * (8.0 * probe_nnzl + 100.0 * static_cast<f64>(P)) : 0.0;
+            if (std::isfinite(bound) && flop_cap <= probe_flops) continue;
             la::SymCsc Mt;
             std::vector<core::Offset> dslot;
-            if (!pattern(dense, Mt, dslot)) continue;
+            bool formed = false;
+            try {
+                formed = pattern(dense, Mt, dslot, flop_cap);
+            } catch (const std::bad_alloc&) {
+                Mt = la::SymCsc{};
+                dslot.clear();
+            }
+            if (!formed) {
+                if (verbose)
+                    std::fprintf(stderr, "ipm ne-trial %s split=%zu dropped while forming its pattern (%zu entries)\n",
+                                 t ? "dual" : "primal", p, Mt.row_idx.size());
+                // Smaller splits only grow the pattern.
+                break;
+            }
+            // The ordering's own working memory (amd_order): the symmetric
+            // adjacency as one CSR of both triangles (8 bytes per entry of M)
+            // and the variable lists copied from it (8 more) while both
+            // exist; afterwards the quotient graph, whose variable, element
+            // and membership lists together never exceed twice the original
+            // adjacency, with growth slack -- 24 bytes per entry bounds it --
+            // plus ~160 bytes of per-vertex arrays.  The symbolic phases
+            // after it (permuted copies, row structure) take less.  It is
+            // held to the share of free memory the factor itself may take
+            // (budget_factor).  The earlier bound (32 bytes, half of what is
+            // free) was written for the vector-per-row ordering and skipped
+            // set-cover-model's only normal-equation candidate under a 5 GB
+            // address-space limit (1.4 GB "needed", 2.3 GB free): the run
+            // then fell back to ordering the 1.1M-node augmented system and
+            // spent the whole budget in it.
+            {
+                const std::uint64_t amd_bytes = 24ULL * Mt.row_idx.size() + 160ULL * sz(P);
+                const std::uint64_t avail = available_memory_bytes();
+                if (static_cast<double>(amd_bytes) > 0.75 * static_cast<double>(avail)) {
+                    if (verbose)
+                        std::fprintf(stderr, "ipm ne-trial %s split=%zu skipped: ordering needs ~%.1f GB, %.1f GB free\n",
+                                     t ? "dual" : "primal", p, static_cast<double>(amd_bytes) / 1e9,
+                                     static_cast<double>(avail) / 1e9);
+                    continue;
+                }
+            }
             la::Ldlt ft;
-            ft.analyze(Mt);
+            budget_factor(ft, pattern_bytes(Mt.row_idx.size()) + static_cast<std::uint64_t>(p) * sz(P) * sizeof(f64),
+                          stop);
+            {
+                la::LdltOptions o = ft.options();
+                o.max_flops = flop_cap;
+                ft.set_options(o);
+            }
+            const auto ta = Clock::now();
+            try {
+                ft.analyze(Mt);
+            } catch (const std::bad_alloc&) {
+                // A candidate whose analysis does not fit in memory is one
+                // that does not fit: the estimate above is a bound, not a
+                // guarantee, and an address-space limit makes the failure an
+                // exception rather than the OOM killer.
+                if (verbose)
+                    std::fprintf(stderr, "ipm ne-trial %s split=%zu: analysis out of memory, skipped\n",
+                                 t ? "dual" : "primal", p);
+                continue;
+            }
+            if (ft.interrupted()) { interrupted = true; return best; }
+            if (p == trials.front()) {
+                best.probe_lb = ft.flops();
+                best.probe_nnzl = static_cast<f64>(ft.nnz_l());
+            }
             // Factor multiply-adds, plus per split column one solve with M
             // (two passes over L, memory-bound: weighted x4) and the dense
             // work of applying the update ~100 times per iteration.
             const f64 cost = ft.flops() + static_cast<f64>(p) * (8.0 * static_cast<f64>(ft.nnz_l()) +
-                                                              100.0 * static_cast<f64>(m));
-            if (cost < best_cost) {
-                best_cost = cost;
-                ok = true;
-                is_dense = std::move(dense);
-                M = std::move(Mt);
-                diag_slot = std::move(dslot);
-                fac = std::move(ft);
-                dense_of.assign(cand.begin(), cand.begin() + static_cast<std::ptrdiff_t>(p));
-                std::sort(dense_of.begin(), dense_of.end());
-                schur = p > 0;
+                                                              100.0 * static_cast<f64>(P));
+            if (verbose)
+                std::fprintf(stderr, "ipm ne-trial %s split=%zu nnzM=%zu nnzL=%lld flops=%.3e cost=%.3e fits=%d%s analyse %.0f ms"
+                             " (memory GB: rss %.2f peak %.2f)\n",
+                             t ? "dual" : "primal", p, Mt.row_idx.size(), static_cast<long long>(ft.nnz_l()),
+                             ft.flops(), cost, static_cast<int>(ft.fits()),
+                             ft.fits() ? "" : ft.over_cost() ? " (over cost cap; bounds)" : " (over memory; bounds)",
+                             ms_since(ta), core::process_memory().rss_gb, core::process_memory().peak_gb);
+            if (!ft.fits()) {
+                // The remaining trials split fewer columns, so their patterns
+                // CONTAIN this one and their fill and multiply-adds are, for
+                // a minimum-fill ordering, no smaller; they save at most the
+                // split penalty.  When this factor's multiply-adds alone are
+                // already within 10% of the best cost, they cannot win by
+                // more than noise: stop (ex10's primal form: four more
+                // 3.4 s orderings; supportcase10's: three 72M-entry patterns).
+                if (ft.over_cost() && std::isfinite(bound) && ft.flops() >= 0.9 * bound) break;
+                continue;
+            }
+            // Ties go to the smaller split (fewer Schur columns).
+            if (cost < best.cost || (cost == best.cost && p < best.dense_of.size())) {
+                best.cost = cost;
+                best.valid = true;
+                best.dense = std::move(dense);
+                // A large pattern is not held while other trials run (it is
+                // rethe winner, deterministically): two of them at
+                // once were most of a2864's peak memory.
+                if (Mt.row_idx.size() <= kKeepPatternEntries) {
+                    best.M = std::move(Mt);
+                    best.dslot = std::move(dslot);
+                } else {
+                    best.M = la::SymCsc{};
+                    best.dslot.clear();
+                }
+                best.fac = std::move(ft);
+                best.dense_of.assign(cand.begin(), cand.begin() + static_cast<std::ptrdiff_t>(p));
+                std::sort(best.dense_of.begin(), best.dense_of.end());
             }
         }
-        if (!ok) return;
-        M.vals.assign(M.row_idx.size(), 0.0);
-        sign.assign(sz(m), 1);
+        return best;
+    }
+
+    // Frees the factor and the Schur vectors once the normal equations are
+    // abandoned for the augmented system, so the two factors are never held
+    // at once (the augmented one was budgeted before this one was allocated).
+    void release() {
+        fac = la::Ldlt{};
+        M = la::SymCsc{};
+        diag_slot = {};
+        Y = {};
+        wscratch = {};
+    }
+
+    // Cost of one Newton iteration with the chosen form (for the comparison
+    // with the augmented system).
+    f64 iteration_cost() const {
+        return fac.flops() + 4.0 * static_cast<f64>(dense_of.size()) * static_cast<f64>(fac.nnz_l());
     }
 
     // Pattern of the sparse part for a given dense set: column q of the upper
-    // triangle holds every r <= q sharing a sparse column with row q, plus
-    // the diagonal.  False when it would be too large to hold.
+    // triangle holds every r <= q sharing a sparse column of B with row q,
+    // plus the diagonal.  False when it would be too large to hold.
+    // flop_cap > 0: give up once the pattern alone proves the factor
+    // costlier -- L holds at least nnz(M) entries in at most P columns, so
+    // its multiply-adds sum c_j^2 >= nnz(M)^2 / P (Cauchy-Schwarz).
     bool pattern(const std::vector<std::uint8_t>& dense, la::SymCsc& Mo,
-                 std::vector<core::Offset>& dslot) const {
+                 std::vector<core::Offset>& dslot, f64 flop_cap = 0.0) const {
         constexpr std::size_t kMaxNnzM = 150000000;
-        Mo.n = m;
-        Mo.col_ptr.assign(sz(m) + 1, 0);
-        dslot.assign(sz(m), 0);
-        std::vector<core::Index> mark(sz(m), -1), tmp;
-        for (core::Index q = 0; q < m; ++q) {
+        const f64 nnz_cap = flop_cap > 0.0 ? std::sqrt(flop_cap * static_cast<f64>(P)) : kInf;
+        Mo.n = P;
+        Mo.col_ptr.assign(sz(P) + 1, 0);
+        dslot.assign(sz(P), 0);
+        std::vector<core::Index> mark(sz(P), -1), tmp;
+        for (core::Index q = 0; q < P; ++q) {
             tmp.clear();
-            for (auto t = rrp[sz(q)]; t < rrp[sz(q) + 1]; ++t) {
-                const core::Index j = rcj[sz(t)];
+            const auto& row = (*brows)[sz(q)];
+            for (std::size_t e = 0; e < row.rows.size(); ++e) {
+                const core::Index j = row.rows[e];
                 if (dense[sz(j)]) continue;
-                for (core::Index r : cols[sz(j)].rows) {
+                for (core::Index r : (*bcols)[sz(j)].rows) {
                     if (r > q) break;
                     if (mark[sz(r)] != q) { mark[sz(r)] = q; tmp.push_back(r); }
                 }
@@ -277,7 +718,9 @@ struct NormalEq {
             for (core::Index r : tmp) Mo.row_idx.push_back(r);
             Mo.col_ptr[sz(q) + 1] = static_cast<core::Offset>(Mo.row_idx.size());
             dslot[sz(q)] = Mo.col_ptr[sz(q) + 1] - 1;   // row == q is last
-            if (Mo.row_idx.size() > kMaxNnzM) return false;
+            // (L's counts are strictly below the diagonal: compare M's.)
+            if (Mo.row_idx.size() > kMaxNnzM ||
+                static_cast<f64>(Mo.row_idx.size()) - static_cast<f64>(q + 1) > nnz_cap) return false;
         }
         return true;
     }
@@ -286,16 +729,36 @@ struct NormalEq {
     // scaled by any regularisation boost.
     void assemble(const std::vector<f64>& tdiag, f64 rho, f64 dreg,
                   const std::vector<std::uint8_t>& fixed_w) {
-        for (core::Index j = 0; j < n; ++j) dscale[sz(j)] = 1.0 / (tdiag[sz(j)] + rho);
+        const auto ta0 = Clock::now();
+        struct Acc { double& a; Clock::time_point t; ~Acc() { a += ms_since(t); } } acc{assemble_ms, ta0};
+        dscale.resize(sz(Q));
+        gdiag.resize(sz(P));
+        // G_i = delta (+ 1/T_w on an inequality row): the primal form's
+        // diagonal, the dual form's column scale (inverted).
+        auto g_of = [&](core::Index i) {
+            f64 g = dreg;
+            const f64 tw = tdiag[sz(n + i)];
+            if (!fixed_w[sz(i)] && tw > 0.0) g += 1.0 / tw;
+            return g;
+        };
+        if (!transposed) {
+            for (core::Index j = 0; j < n; ++j) dscale[sz(j)] = 1.0 / (tdiag[sz(j)] + rho);
+            for (core::Index i = 0; i < m; ++i) gdiag[sz(i)] = g_of(i);
+        } else {
+            for (core::Index i = 0; i < m; ++i) dscale[sz(i)] = 1.0 / g_of(i);
+            for (core::Index j = 0; j < n; ++j) gdiag[sz(j)] = tdiag[sz(j)] + rho;
+        }
         if (m == 0) return;
-        // Column q of M reads only A and D, so columns are independent tasks;
+        if (dense_mode) { assemble_dense(); return; }
+        // Column q of M reads only B and S, so columns are independent tasks;
         // every entry is summed in the same order whatever the schedule.
         auto column = [&](core::Index q, std::vector<f64>& w) {
-            for (auto t = rrp[sz(q)]; t < rrp[sz(q) + 1]; ++t) {
-                const core::Index j = rcj[sz(t)];
+            const auto& row = (*brows)[sz(q)];
+            for (std::size_t t = 0; t < row.rows.size(); ++t) {
+                const core::Index j = row.rows[t];
                 if (is_dense[sz(j)]) continue;
-                const f64 coef = rcv[sz(t)] * dscale[sz(j)];
-                const auto& c = cols[sz(j)];
+                const f64 coef = row.vals[t] * dscale[sz(j)];
+                const auto& c = (*bcols)[sz(j)];
                 for (std::size_t e = 0; e < c.rows.size(); ++e) {
                     if (c.rows[e] > q) break;
                     w[sz(c.rows[e])] += coef * c.vals[e];
@@ -306,88 +769,171 @@ struct NormalEq {
                 M.vals[sz(p)] = w[r];
                 w[r] = 0.0;
             }
-            f64 g = dreg;
-            const f64 tw = tdiag[sz(n + q)];
-            if (!fixed_w[sz(q)] && tw > 0.0) g += 1.0 / tw;
-            M.vals[sz(diag_slot[sz(q)])] += g;
+            M.vals[sz(diag_slot[sz(q)])] += gdiag[sz(q)];
         };
         core::ThreadPool& pool = core::global_pool();
         constexpr core::Offset kChunk = 64;
-        const core::Offset nchunks = (m + kChunk - 1) / kChunk;
+        const core::Offset nchunks = (P + kChunk - 1) / kChunk;
         const int nw = std::max(1, pool.size());
         if (wscratch.size() != sz(nw)) wscratch.assign(sz(nw), {});
-        for (auto& w : wscratch) if (w.size() != sz(m)) w.assign(sz(m), 0.0);
+        for (auto& w : wscratch) if (w.size() != sz(P)) w.assign(sz(P), 0.0);
         auto body = [&](core::Offset chunk, int worker) {
             auto& w = wscratch[sz(worker)];
             const core::Index lo = static_cast<core::Index>(chunk * kChunk);
-            const core::Index hi = static_cast<core::Index>(std::min<core::Offset>(m, (chunk + 1) * kChunk));
+            const core::Index hi = static_cast<core::Index>(std::min<core::Offset>(P, (chunk + 1) * kChunk));
             for (core::Index q = lo; q < hi; ++q) column(q, w);
         };
-        if (nw == 1 || nchunks <= 1 || m < 512) {
+        if (nw == 1 || nchunks <= 1 || P < 512) {
             for (core::Offset c = 0; c < nchunks; ++c) body(c, 0);
         } else {
             pool.parallel_for(nchunks, body);
         }
     }
 
+    // Dense mode: column q of M (rows 0..q) at offset q(q+1)/2.  Column j of
+    // B adds s_j b_j b_j' -- for each of its rows q, the products with its
+    // rows r <= q into column q.  Columns of M are split into ranges of
+    // about equal triangle area, one per task; within a range the columns
+    // of B are taken in ascending order, so every entry is summed in the
+    // same order whatever the thread count.  (Tiling M into L2-sized blocks
+    // was measured slower: the cost is the indexed update itself, ~3 cycles,
+    // not the traffic to M.)
+    void assemble_dense() {
+        core::ThreadPool& pool = core::global_pool();
+        const int nw = std::max(1, pool.size());
+        const core::Offset ntask = nw == 1 || P < 512 ? 1 : 4 * static_cast<core::Offset>(nw);
+        std::vector<core::Index> cut(sz(ntask) + 1, P);
+        cut[0] = 0;
+        for (core::Offset t = 1; t < ntask; ++t)
+            cut[sz(t)] = static_cast<core::Index>(static_cast<f64>(P) *
+                                                  std::sqrt(static_cast<f64>(t) / static_cast<f64>(ntask)));
+        f64* V = M.vals.data();
+        auto body = [&](core::Offset t, int) {
+            const core::Index q0 = cut[sz(t)], q1 = cut[sz(t) + 1];
+            if (q0 >= q1) return;
+            std::fill(V + static_cast<core::Offset>(q0) * (q0 + 1) / 2,
+                      V + static_cast<core::Offset>(q1) * (q1 + 1) / 2, 0.0);
+            for (core::Index j = 0; j < Q; ++j) {
+                const auto& c = (*bcols)[sz(j)];
+                const core::Index* rows = c.rows.data();
+                const f64* vals = c.vals.data();
+                const std::size_t k = c.rows.size();
+                const std::size_t lo = static_cast<std::size_t>(std::lower_bound(rows, rows + k, q0) - rows);
+                const std::size_t hi = static_cast<std::size_t>(std::lower_bound(rows + lo, rows + k, q1) - rows);
+                const f64 dj = dscale[sz(j)];
+                for (std::size_t a = lo; a < hi; ++a) {
+                    const core::Index q = rows[a];
+                    f64* col = V + static_cast<core::Offset>(q) * (q + 1) / 2;
+                    const f64 coef = vals[a] * dj;
+                    for (std::size_t b = 0; b <= a; ++b) col[rows[b]] += coef * vals[b];
+                }
+            }
+            for (core::Index q = q0; q < q1; ++q) V[sz(diag_slot[sz(q)])] += gdiag[sz(q)];
+        };
+        if (ntask == 1) body(0, 0);
+        else pool.parallel_for(ntask, body);
+    }
+
     bool factorize() {
         reg_pivots = 0;
         if (m == 0) return true;
-        if (!fac.factorize(M, sign, 1e-12)) return false;
+        auto t = Clock::now();
+        const bool fok = fac.factorize(M, sign, 1e-12);
+        ldlt_ms += ms_since(t);
+        if (!fok) return false;
         reg_pivots = static_cast<int>(fac.regularized_pivots());
-        if (schur && !prepare_schur()) return false;
-        return true;
+        t = Clock::now();
+        const bool sok = !schur || prepare_schur();
+        schur_ms += ms_since(t);
+        return sok;
     }
 
     // K_reg [dx; dy] = rhs, in place.  rhs is length n+m.
+    std::uint64_t n_apply = 0;               // preconditioner applications (for --verbose)
+    double apply_ms = 0.0, msolve_ms = 0.0;
     void apply(std::vector<f64>& rhs) {
+        ++n_apply;
+        const auto tap = Clock::now();
+        struct Acc { double& a; Clock::time_point t; ~Acc() { a += ms_since(t); } } acc_{apply_ms, tap};
         if (m == 0) {
             for (core::Index j = 0; j < n; ++j) rhs[sz(j)] = -dscale[sz(j)] * rhs[sz(j)];
             return;
         }
-        bwork.assign(sz(m), 0.0);
-        for (core::Index i = 0; i < m; ++i) bwork[sz(i)] = rhs[sz(n + i)];
-        for (core::Index j = 0; j < n; ++j) {
-            const f64 t = dscale[sz(j)] * rhs[sz(j)];
-            const auto& c = cols[sz(j)];
-            for (std::size_t e = 0; e < c.rows.size(); ++e)
-                bwork[sz(c.rows[e])] += c.vals[e] * t;
+        if (!transposed) {
+            // M dy = r2 + A D r1;  dx = D (A' dy - r1).
+            bwork.assign(sz(m), 0.0);
+            for (core::Index i = 0; i < m; ++i) bwork[sz(i)] = rhs[sz(n + i)];
+            for (core::Index j = 0; j < n; ++j) {
+                const f64 t = dscale[sz(j)] * rhs[sz(j)];
+                const auto& c = acols[sz(j)];
+                for (std::size_t e = 0; e < c.rows.size(); ++e)
+                    bwork[sz(c.rows[e])] += c.vals[e] * t;
+            }
+            {
+                const auto tms = Clock::now();
+                solve_m(bwork);
+                msolve_ms += ms_since(tms);
+            }
+            for (core::Index j = 0; j < n; ++j) {
+                f64 atd = 0.0;
+                const auto& c = acols[sz(j)];
+                for (std::size_t e = 0; e < c.rows.size(); ++e) atd += c.vals[e] * bwork[sz(c.rows[e])];
+                rhs[sz(j)] = dscale[sz(j)] * (atd - rhs[sz(j)]);
+            }
+            for (core::Index i = 0; i < m; ++i) rhs[sz(n + i)] = bwork[sz(i)];
+            return;
         }
-        solve_m(bwork);
-        for (core::Index j = 0; j < n; ++j) {
-            f64 atd = 0.0;
-            const auto& c = cols[sz(j)];
-            for (std::size_t e = 0; e < c.rows.size(); ++e) atd += c.vals[e] * bwork[sz(c.rows[e])];
-            rhs[sz(j)] = dscale[sz(j)] * (atd - rhs[sz(j)]);
+        // N dx = A' H r2 - r1;  dy = H (r2 - A dx).
+        bwork.assign(sz(n), 0.0);
+        for (core::Index j = 0; j < n; ++j) bwork[sz(j)] = -rhs[sz(j)];
+        for (core::Index i = 0; i < m; ++i) {
+            const f64 t = dscale[sz(i)] * rhs[sz(n + i)];
+            const auto& r = arows[sz(i)];
+            for (std::size_t e = 0; e < r.rows.size(); ++e)
+                bwork[sz(r.rows[e])] += r.vals[e] * t;
         }
-        for (core::Index i = 0; i < m; ++i) rhs[sz(n + i)] = bwork[sz(i)];
+        {
+            const auto tms = Clock::now();
+            solve_m(bwork);
+            msolve_ms += ms_since(tms);
+        }
+        for (core::Index i = 0; i < m; ++i) {
+            f64 ax = 0.0;
+            const auto& r = arows[sz(i)];
+            for (std::size_t e = 0; e < r.rows.size(); ++e) ax += r.vals[e] * bwork[sz(r.rows[e])];
+            rhs[sz(n + i)] = dscale[sz(i)] * (rhs[sz(n + i)] - ax);
+        }
+        for (core::Index j = 0; j < n; ++j) rhs[sz(j)] = bwork[sz(j)];
     }
 
 private:
     static core::Index static_core_index(std::size_t n) { return static_cast<core::Index>(n); }
 
-    // Full matrix S = M + A_d D_d A_d^T.  With s = sqrt(D_d) and Y = M^-1 A_d,
-    //   S^-1 = M^-1 - Y s C^-1 s Y^T,   C = I + s A_d^T M^-1 A_d s,
+    // Full matrix S = M + B_d S_d B_d^T.  With s = sqrt(S_d) and Y = M^-1 B_d,
+    //   S^-1 = M^-1 - Y s C^-1 s Y^T,   C = I + s B_d^T M^-1 B_d s,
     // C symmetric with eigenvalues >= 1, so its Cholesky needs no pivoting
-    // however large D_d is (a free column carries D = 1/rho).
+    // however large S_d is (a free column carries D = 1/rho).
     bool prepare_schur() {
         const core::Index p = static_core_index(dense_of.size());
-        Y.assign(sz(m) * sz(p), 0.0);
+        Y.assign(sz(P) * sz(p), 0.0);
         schur_l.assign(sz(p) * sz(p), 0.0);
         sroot.assign(sz(p), 0.0);
+        // Y = M^-1 B_d, all p columns in one blocked solve: one solve with
+        // a large factor is a pass over L at memory speed, so p separate
+        // solves cost p passes (ex10, dual form: 128 columns, 3.8 s of a
+        // 7.2 s Newton step).
         for (core::Index k = 0; k < p; ++k) {
             sroot[sz(k)] = std::sqrt(dscale[sz(dense_of[sz(k)])]);
-            colwork.assign(sz(m), 0.0);
-            const auto& c = cols[sz(dense_of[sz(k)])];
-            for (std::size_t e = 0; e < c.rows.size(); ++e) colwork[sz(c.rows[e])] = c.vals[e];
-            fac.solve(colwork);
-            for (core::Index r = 0; r < m; ++r) Y[sz(r) + sz(k) * sz(m)] = colwork[sz(r)];
+            const auto& c = (*bcols)[sz(dense_of[sz(k)])];
+            f64* yk = Y.data() + sz(k) * sz(P);
+            for (std::size_t e = 0; e < c.rows.size(); ++e) yk[sz(c.rows[e])] = c.vals[e];
         }
+        fac.solve_many(Y.data(), p);
         for (core::Index i = 0; i < p; ++i) {
-            const auto& ci = cols[sz(dense_of[sz(i)])];
+            const auto& ci = (*bcols)[sz(dense_of[sz(i)])];
             for (core::Index k = 0; k < p; ++k) {
                 f64 s = 0.0;
-                const f64* yk = Y.data() + sz(k) * sz(m);
+                const f64* yk = Y.data() + sz(k) * sz(P);
                 for (std::size_t e = 0; e < ci.rows.size(); ++e)
                     s += ci.vals[e] * yk[sz(ci.rows[e])];
                 schur_l[sz(i) * sz(p) + sz(k)] = s * sroot[sz(i)] * sroot[sz(k)];
@@ -433,7 +979,7 @@ private:
         }
     }
 
-    // Overwrites b with S^{-1} b, S = M_sparse + A_d D_d A_d^T.
+    // Overwrites b with S^{-1} b, S = M_sparse + B_d S_d B_d^T.
     void solve_m(std::vector<f64>& b) {
         if (!schur) { fac.solve(b); return; }
         const core::Index p = static_core_index(dense_of.size());
@@ -441,7 +987,7 @@ private:
         fac.solve(zwork);
         wwork.assign(sz(p), 0.0);
         for (core::Index k = 0; k < p; ++k) {
-            const auto& c = cols[sz(dense_of[sz(k)])];
+            const auto& c = (*bcols)[sz(dense_of[sz(k)])];
             f64 s = 0.0;
             for (std::size_t e = 0; e < c.rows.size(); ++e) s += c.vals[e] * zwork[sz(c.rows[e])];
             wwork[sz(k)] = s * sroot[sz(k)];
@@ -450,8 +996,8 @@ private:
         b = zwork;
         for (core::Index k = 0; k < p; ++k) {
             const f64 wk = wwork[sz(k)] * sroot[sz(k)];
-            const f64* yk = Y.data() + sz(k) * sz(m);
-            for (core::Index r = 0; r < m; ++r) b[sz(r)] -= yk[sz(r)] * wk;
+            const f64* yk = Y.data() + sz(k) * sz(P);
+            for (core::Index r = 0; r < P; ++r) b[sz(r)] -= yk[sz(r)] * wk;
         }
     }
 };
@@ -471,18 +1017,36 @@ Result run_ipm(const Core& k, const QpOptions& opts, Clock::time_point t0,
     // what comes back when the run ends stalled or out of budget.
     f64 best_merit = kInf;
     std::vector<f64> best_z, best_y;
+    std::vector<f64> dist_hist, time_hist;   // per step: distance to the tolerances, ms (soft limit)
+    std::vector<f64> z, lam, nu, y;
+    f64 worst_solve_run = 0.0;          // max solve residual over the whole run (reported)
     for (const auto& col : k.qcol)
         for (const auto& e : col) has_q = has_q || e.second != 0.0;
     // A quadratic row makes the stationarity depend on x through J(x)'y and
     // the Hessian on y, so the equal-step argument below applies to it too.
     has_q = has_q || !k.quad.empty();
+    // The caller's deadline, polled by the setup's orderings as well as by
+    // the iteration.
+    const std::function<bool()> stop_fn = [&]() {
+        return (opts.time_limit_s > 0.0 && ms_since(t0) > opts.time_limit_s * 1000.0) ||
+               core::cancel_requested(opts.cancel);
+    };
     // Normal equations are the LP path.  A quadratic objective or a quadratic
     // row keeps the quasi-definite augmented factor.
     const bool lp = !has_q;
     bool use_ne = lp;
     NormalEq ne;
+    try {
+    if (opts.verbose) std::fprintf(stderr, "ipm setup: run_ipm entered at %.0f ms\n", ms_since(t0));
     if (lp) {
-        ne.build(k);
+        ne.verbose = opts.verbose;
+        ne.build(k, &stop_fn);
+        if (opts.verbose) {
+            const core::ProcessMemory pm = core::process_memory();
+            std::fprintf(stderr, "ipm setup: normal equations analysed at %.0f ms (memory GB: rss %.2f peak %.2f virtual %.2f)\n",
+                         ms_since(t0), pm.rss_gb, pm.peak_gb, pm.vm_gb);
+        }
+        if (ne.interrupted) throw DeadlineReached{};
         use_ne = ne.ok;
     }
     // Primal-dual regularisation as a PROXIMAL term (Friedlander & Orban,
@@ -520,7 +1084,10 @@ Result run_ipm(const Core& k, const QpOptions& opts, Clock::time_point t0,
         if (fixed_w[sz(i)]) { has_l[sz(n + i)] = 0; has_u[sz(n + i)] = 0; }
     }
 
-    std::vector<f64> z(sz(N), 0.0), lam(sz(N), 0.0), nu(sz(N), 0.0), y(sz(m), 0.0);
+    z.assign(sz(N), 0.0);
+    lam.assign(sz(N), 0.0);
+    nu.assign(sz(N), 0.0);
+    y.assign(sz(m), 0.0);
 
     // ---- quadratic rows: supports and scratch ------------------------------
     // Per quadratic row t: its support (sorted columns), each Hessian entry's
@@ -599,6 +1166,13 @@ Result run_ipm(const Core& k, const QpOptions& opts, Clock::time_point t0,
     std::vector<std::int8_t> sign;
     la::Ldlt fac;
     bool aug_built = false;
+    bool aug_fits = true;
+    const auto too_large = [&]() {
+        return std::runtime_error("interior point: no Newton-system factor fits in memory (" +
+                                  std::to_string(fac.factor_bytes() / 1000000) + " MB needed)");
+    };
+    f64 aug_flop_cap = 0.0;
+    std::function<void()> analyse_aug;
     auto build_aug = [&]() {
     if (aug_built) return;
     aug_built = true;
@@ -667,30 +1241,61 @@ Result run_ipm(const Core& k, const QpOptions& opts, Clock::time_point t0,
     }
     sign.assign(sz(N), 1);
     for (core::Index j = 0; j < n; ++j) sign[sz(j)] = -1;
+    analyse_aug();
+    };
+    // The analysis of K, capped at aug_flop_cap multiply-adds when the
+    // augmented system is only being compared with the normal equations.
+    analyse_aug = [&]() {
+    NormalEq::budget_factor(fac, NormalEq::pattern_bytes(K.row_idx.size()), &stop_fn);
+    {
+        la::LdltOptions o = fac.options();
+        o.max_flops = aug_flop_cap;
+        fac.set_options(o);
+    }
     fac.analyze(K);
+    if (fac.interrupted()) throw DeadlineReached{};
+    aug_fits = fac.fits();
     if (opts.verbose)
-        std::fprintf(stderr, "ipm kkt n=%lld nnzL=%lld supernodes=%lld flops=%.3e\n",
+        std::fprintf(stderr, "ipm kkt n=%lld nnzL=%lld supernodes=%lld flops=%.3e fits=%d (analysed at %.0f ms)\n",
                      static_cast<long long>(K.n), static_cast<long long>(fac.nnz_l()),
-                     static_cast<long long>(fac.supernodes()), fac.flops());
+                     static_cast<long long>(fac.supernodes()), fac.flops(), static_cast<int>(aug_fits),
+                     ms_since(t0));
     };
     if (!use_ne) {
         build_aug();
-    } else if (ne.fac.flops() > 2e9) {
-        // M's factor is big enough for the choice to matter: keep the
-        // augmented system when it is the cheaper one (dense ADA^T).
-        const f64 ne_cost = ne.fac.flops() + 4.0 * static_cast<f64>(ne.dense_of.size()) *
-                                                 static_cast<f64>(ne.fac.nnz_l());
+        if (!aug_fits) throw too_large();
+    } else if (ne.fac.flops() > 2e9 &&
+               ne.dense_candidates > static_cast<int>(ne.dense_of.size())) {
+        // The normal-equation factor is big enough for the choice to
+        // matter: keep the augmented system when it is the cheaper one.
+        // The augmented factor wins only below half the normal equations'
+        // cost, so its ordering is abandoned past that (AmdCaps).
+        //
+        // What the augmented ordering can do that neither normal-equation
+        // form does is keep LONG columns of B out of the fill: eliminating
+        // every column node first IS the primal form, every row node first
+        // the dual form, and both forms already take their long columns
+        // (>= kDenseNnz entries) out into a Schur update when that is
+        // cheaper.  So the comparison is only made when the chosen form
+        // still carries long columns in its sparse part.  Without that its
+        // ordering of the (n+m)-node system bought nothing and cost more
+        // than the solve's setup: scpm1 101 s (505k nodes; the 5000-row
+        // normal equations are dense, 1.3 s a factorization), s82 21 s.
+        const f64 ne_cost = ne.iteration_cost();
+        aug_flop_cap = 0.5 * ne_cost;
         build_aug();
-        use_ne = ne_cost <= 2.0 * fac.flops();
+        use_ne = !aug_fits || ne_cost <= 2.0 * fac.flops();
+        if (!use_ne) ne.release();
     }
     if (use_ne && opts.verbose) {
         std::fprintf(stderr,
-                     "ipm normal-eq m=%lld nnzM=%lld nnzL=%lld dense_cols=%d schur=%d flops=%.3e\n",
-                     static_cast<long long>(ne.m),
+                     "ipm normal-eq %s order=%lld nnzM=%lld nnzL=%lld dense_cols=%d schur=%d flops=%.3e%s\n",
+                     ne.transposed ? "dual-form (A'HA)" : "primal-form (ADA')",
+                     static_cast<long long>(ne.P),
                      static_cast<long long>(ne.m == 0 ? 0 : ne.M.row_idx.size()),
                      static_cast<long long>(ne.m == 0 ? 0 : ne.fac.nnz_l()),
                      ne.dense_candidates, static_cast<int>(ne.dense_of.size()),
-                     ne.m == 0 ? 0.0 : ne.fac.flops());
+                     ne.m == 0 ? 0.0 : ne.fac.flops(), ne.dense_mode ? " (dense M)" : "");
     }
 
     // Fill K's values for the current T.  Two diagonals are kept: the
@@ -778,8 +1383,8 @@ Result run_ipm(const Core& k, const QpOptions& opts, Clock::time_point t0,
                 out[sz(i)] += thread_out[sz(w)][sz(i)];
     };
     f64 fac_ms = 0.0, solve_ms = 0.0;   // reported under --verbose
+    int gz_tried = 0, gz_kept = 0;      // Gondzio correctors solved / kept
     f64 worst_solve_rel = 0.0;          // max ||K_true x - b|| / (1+||b||) this iteration
-    f64 worst_solve_run = 0.0;          // the same over the whole run (reported)
     // Solve K_true x = rhs with the REGULARISED factor as a preconditioner
     // (FGMRES; qp_krylov.cpp has why plain refinement was not enough).
     // A fixed 1e-12.  Tying it to mu (clamp(1e-4 mu, 1e-12, 1e-6), inexact
@@ -788,6 +1393,9 @@ Result run_ipm(const Core& k, const QpOptions& opts, Clock::time_point t0,
     // the 300-iteration limit at 6.6e-3.  Accuracy before speed.
     const f64 solve_tol = 1e-12;
     // Unregularised augmented product for Q = 0, without materialising K.
+    // (Refining against the REGULARISED system instead was measured: 43%
+    // fewer factor applications on Netlib, but s100 took 72 Newton steps
+    // instead of 62 for the same time, so the true system stays the target.)
     auto K_true_mul_lp = [&](const std::vector<f64>& v, std::vector<f64>& out) {
         out.assign(sz(N), 0.0);
         for (core::Index j = 0; j < n; ++j) out[sz(j)] = -tdiag[sz(j)] * v[sz(j)];
@@ -798,7 +1406,7 @@ Result run_ipm(const Core& k, const QpOptions& opts, Clock::time_point t0,
         }
         for (core::Index j = 0; j < n; ++j) {
             const f64 dx = v[sz(j)];
-            const auto& col = ne.cols[sz(j)];
+            const auto& col = ne.acols[sz(j)];
             for (std::size_t e = 0; e < col.rows.size(); ++e) {
                 const core::Index i = col.rows[e];
                 const f64 a = col.vals[e];
@@ -843,7 +1451,14 @@ Result run_ipm(const Core& k, const QpOptions& opts, Clock::time_point t0,
     constexpr f64 kNeSolveFail = 1e-6;
     auto fall_back_to_aug = [&](const char* why) {
         build_aug();
+        if (fac.over_cost()) {
+            // Analysed only for the comparison, and abandoned there.
+            aug_flop_cap = 0.0;
+            analyse_aug();
+        }
+        if (!aug_fits) throw too_large();
         use_ne = false;
+        ne.release();
         worst_solve_rel = 0.0;
         reg_boost = 1.0;
         if (opts.verbose)
@@ -987,6 +1602,7 @@ Result run_ipm(const Core& k, const QpOptions& opts, Clock::time_point t0,
         const f64 fac_at_it = fac_ms, sol_at_it = solve_ms;
         if (opts.time_limit_s > 0.0 && ms_since(t0) > opts.time_limit_s * 1000.0) {
             res.reason = "time limit";
+            res.stopped_on_time = true;
             break;
         }
         if (core::cancel_requested(opts.cancel)) {
@@ -1080,6 +1696,42 @@ Result run_ipm(const Core& k, const QpOptions& opts, Clock::time_point t0,
                 res.converged = true;
                 res.reason = "interior point: original-model relative KKT satisfied";
                 break;
+            }
+            // Past the soft limit: continue only while on course to finish.
+            // dist > 1 is how far the test above is from passing (as a
+            // factor); over the last kRateWin steps it shrank by rho per
+            // step, so about log(dist)/log(rho) more steps of the recent
+            // length remain.  Projected beyond the hard limit (with a 25%
+            // margin), or not shrinking at all, the run stops here: the
+            // point is then handed on as an unconverged one.
+            const f64 dist = std::max({orig_p / (kRelMargin * opts.feas_tol),
+                                       orig_d / (kRelMargin * opts.stationarity_tol), orig_c / opts.gap_tol});
+            dist_hist.push_back(std::isfinite(dist) ? dist : kInf);
+            time_hist.push_back(ms_since(t0));
+            if (opts.soft_time_limit_s > 0.0 && opts.time_limit_s > opts.soft_time_limit_s &&
+                time_hist.back() > opts.soft_time_limit_s * 1000.0) {
+                constexpr std::size_t kRateWin = 5;
+                bool on_course = false;
+                f64 projected_ms = kInf;
+                if (dist_hist.size() > kRateWin) {
+                    const std::size_t a = dist_hist.size() - 1 - kRateWin, b = dist_hist.size() - 1;
+                    const f64 d0 = dist_hist[a], d1 = dist_hist[b];
+                    if (std::isfinite(d0) && std::isfinite(d1) && d1 > 0.0 && d0 > d1) {
+                        const f64 log_rho = std::log(d0 / d1) / static_cast<f64>(kRateWin);
+                        const f64 steps = std::max(0.0, std::log(d1)) / log_rho;
+                        const f64 step_ms = (time_hist[b] - time_hist[a]) / static_cast<f64>(kRateWin);
+                        projected_ms = time_hist[b] + 1.25 * steps * step_ms;
+                        on_course = projected_ms <= opts.time_limit_s * 1000.0;
+                    }
+                }
+                if (opts.verbose)
+                    std::fprintf(stderr, "ipm past soft limit: distance %.2e, projected end %.0f ms of %.0f -> %s\n",
+                                 dist, projected_ms, opts.time_limit_s * 1000.0, on_course ? "continue" : "stop");
+                if (!on_course) {
+                    res.reason = "time limit (not on course to converge within the budget)";
+                    res.stopped_on_time = true;
+                    break;
+                }
             }
         }
 
@@ -1284,9 +1936,11 @@ Result run_ipm(const Core& k, const QpOptions& opts, Clock::time_point t0,
                 }
                 if (!any) break;
                 direction("gondzio");
+                ++gz_tried;
                 f64 nap = 1.0, nad = 1.0;
                 max_steps(nap, nad);
                 if (nap < bap + 0.05 && nad < bad + 0.05) break;
+                ++gz_kept;
                 bz = dz; blam = dlam; bnu = dnu; bdy = dy;
                 bap = nap; bad = nad;
             }
@@ -1370,10 +2024,10 @@ Result run_ipm(const Core& k, const QpOptions& opts, Clock::time_point t0,
             for (f64 v : rdw) rdn = std::max(rdn, std::fabs(v));
             if (nq > 0 && rpi >= 0) std::fprintf(stderr, "ipm   worst rp row %lld (core)\n", static_cast<long long>(rpi));
             const int nreg = use_ne ? ne.reg_pivots : static_cast<int>(fac.regularized_pivots());
-            std::fprintf(stderr, "ipm it=%d mu=%.3e |rp|=%.3e |rd|=%.3e sigma=%.2f ap=%.3f ad=%.3f reg=%d solve_res=%.1e iter %.0fms (factor %.0f, solves %.0f) total %.0fms\n",
+            std::fprintf(stderr, "ipm it=%d mu=%.3e |rp|=%.3e |rd|=%.3e sigma=%.2f ap=%.3f ad=%.3f reg=%d solve_res=%.1e iter %.0fms (factor %.0f, solves %.0f) total %.0fms rss %.2fGB\n",
                          it + 1, mu, rpn, rdn, sigma, ap, ad, nreg,
                          worst_solve_rel, ms_since(it_t0), fac_ms - fac_at_it, solve_ms - sol_at_it,
-                         ms_since(t0));
+                         ms_since(t0), core::process_memory().rss_gb);
             if (lp_rel)
                 std::fprintf(stderr, "ipm   original model: primal_rel=%.2e dual_rel=%.2e compl_rel=%.2e\n",
                              orig_p, orig_d, orig_c);
@@ -1381,6 +2035,23 @@ Result run_ipm(const Core& k, const QpOptions& opts, Clock::time_point t0,
         worst_solve_rel = 0.0;
         if (it + 1 == max_it) res.reason = "iteration limit";
     }
+    if (opts.verbose)
+        std::fprintf(stderr, "ipm gondzio correctors: %d solved, %d kept\n", gz_tried, gz_kept);
+    if (opts.verbose && use_ne)
+        std::fprintf(stderr, "ipm normal-eq time: assemble %.0f ms (%.2e madds each), ldlt %.0f ms, schur %.0f ms, solves %.0f ms (%llu M-solves)\n",
+                     ne.assemble_ms, ne.assemble_work, ne.ldlt_ms, ne.schur_ms, solve_ms,
+                     static_cast<unsigned long long>(ne.n_apply));
+    if (opts.verbose && use_ne)
+        std::fprintf(stderr, "ipm apply time %.0f ms of which M-solve %.0f ms\n", ne.apply_ms, ne.msolve_ms);
+    } catch (const DeadlineReached&) {
+        res.reason = core::cancel_requested(opts.cancel) ? "cancelled (concurrent race lost)"
+                                                         : "time limit";
+        res.stopped_on_time = !core::cancel_requested(opts.cancel);
+        res.converged = false;
+        if (opts.verbose) std::fprintf(stderr, "ipm setup stopped: %s\n", res.reason.c_str());
+    }
+    if (z.size() != sz(N)) z.assign(sz(N), 0.0);
+    if (y.size() != sz(m)) y.assign(sz(m), 0.0);
     // An LP run that ended without meeting a test (stalled, iteration or time
     // limit) returns its best point, not the last one.
     if (!res.converged && !best_z.empty()) {
@@ -1511,6 +2182,38 @@ core::RawResult solve_qp_ipm(const QpProblem& p, const QpOptions& opts, QpDiagno
         for (auto& col : k.qcol) for (auto& e : col) e.second *= omega;
     }
 
+    // Primal scaling (LP): x = beta x', beta the largest finite row bound
+    // (the column bounds when every row bound is zero), so that the iterate
+    // is O(1) whatever the model's units.  The objective is already O(1)
+    // (omega), the duals and c are unchanged by it, and only the bounds are
+    // divided.  The proximal terms and the fraction-to-boundary rule are
+    // absolute; on agg (x ~ 1e5) the rho*dx they leave held the dual residual
+    // at 5e-6 for 80 iterations, and Netlib-93 took 3622 Newton steps where
+    // the same iteration takes 1852 on the scaled iterate.  A QP keeps
+    // beta = 1: scaling x would scale Q by beta as well.
+    f64 beta = 1.0;
+    {
+        bool has_q = false;
+        for (const auto& col : k.qcol) has_q = has_q || !col.empty();
+        if (!has_q) {
+            f64 bmax = 0.0;
+            for (core::Index i = 0; i < k.m; ++i)
+                for (f64 v : {k.rl[sz(i)], k.ru[sz(i)]})
+                    if (std::isfinite(v)) bmax = std::max(bmax, std::fabs(v));
+            if (bmax == 0.0)
+                for (core::Index j = 0; j < k.n; ++j)
+                    for (f64 v : {k.l[sz(j)], k.u[sz(j)]})
+                        if (std::isfinite(v)) bmax = std::max(bmax, std::fabs(v));
+            if (bmax > 1.0 && std::isfinite(bmax)) beta = bmax;
+            if (beta != 1.0) {
+                for (f64& v : k.l) v /= beta;
+                for (f64& v : k.u) v /= beta;
+                for (f64& v : k.rl) v /= beta;
+                for (f64& v : k.ru) v /= beta;
+            }
+        }
+    }
+
     // Map a core iterate to ORIGINAL units, in PDHCG's dual sign (y_p = -y).
     const backend::LaneBounds ob{lp.col_lo, lp.col_hi, lp.row_lo, lp.row_hi};
     auto to_original = [&](const std::vector<f64>& xc, const std::vector<f64>& yc,
@@ -1518,7 +2221,7 @@ core::RawResult solve_qp_ipm(const QpProblem& p, const QpOptions& opts, QpDiagno
         xo.assign(sz(n0), 0.0);
         yo.assign(sz(m0), 0.0);
         for (core::Index j = 0; j < n0; ++j)
-            xo[sz(j)] = (is_fixed[sz(j)] ? xfix[sz(j)] : xc[sz(new_col[sz(j)])]) * sc.dc[sz(j)];
+            xo[sz(j)] = (is_fixed[sz(j)] ? xfix[sz(j)] : beta * xc[sz(new_col[sz(j)])]) * sc.dc[sz(j)];
         for (core::Index ii = 0; ii < k.m; ++ii) {
             const core::Index i = k.row_of[sz(ii)];
             yo[sz(i)] = -yc[sz(ii)] * sc.dr[sz(i)] / omega;
@@ -1538,7 +2241,14 @@ core::RawResult solve_qp_ipm(const QpProblem& p, const QpOptions& opts, QpDiagno
         primal_rel = last.primal_rel;
         dual_rel = last.dual_rel;
     };
-    const auto r = run_ipm(k, opts, t0, accept, orig_rel);
+    Result r;
+    try {
+        r = run_ipm(k, opts, t0, accept, orig_rel);
+    } catch (const std::runtime_error& e) {
+        // The Newton system cannot be factored within the memory budget:
+        // no point to report; the LP route falls back to the simplex.
+        return fail(core::Status::NumericalFailure, e.what());
+    }
     to_original(r.x, r.y, raw.x, raw.y);
     last = qpc::kkt_original(p, ob, raw.x, raw.y);
     bool ok = qpc::kkt_ok(last, opts);
@@ -1554,8 +2264,13 @@ core::RawResult solve_qp_ipm(const QpProblem& p, const QpOptions& opts, QpDiagno
     // another 4.9 s).
     const bool time_left = opts.time_limit_s <= 0.0 ||
         ms_since(t0) < opts.time_limit_s * 1000.0;
-    if (!ok && opts.polish && time_left && !core::cancel_requested(opts.cancel))
+    if (!ok && opts.polish && time_left && !core::cancel_requested(opts.cancel)) {
+        const auto tp0 = Clock::now();
         polished = ok = qpc::polish_scaled(p, ob, sc, ps, sb, opts, raw.x, raw.y, last);
+        if (opts.verbose)
+            std::fprintf(stderr, "ipm polish %s in %.0f ms\n", polished ? "accepted" : "rejected",
+                         ms_since(tp0));
+    }
     diag.iterations = static_cast<std::uint64_t>(r.iterations);
     diag.worst_solve_residual = r.worst_solve_residual;
     diag.primal_residual = last.primal;
@@ -1577,6 +2292,7 @@ core::RawResult solve_qp_ipm(const QpProblem& p, const QpOptions& opts, QpDiagno
                                             : r.reason)
                                 : "interior point stopped: " + r.reason;
     diag.termination_reason = raw.termination_reason;
+    diag.stopped_on_time = !ok && r.stopped_on_time;
     diag.total_ms = ms_since(t0);
     return raw;
 }

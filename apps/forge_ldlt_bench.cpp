@@ -122,6 +122,8 @@ int main(int argc, char** argv) {
                 100.0 * static_cast<double>(f.stored_l() - f.nnz_l()) / static_cast<double>(f.nnz_l()),
                 f.supernodes(), f.flops(), f.stored_flops(), static_cast<double>(f.memory_bytes()) / 1e6,
                 loadavg().c_str());
+    std::fflush(stdout);
+    for (int w : {2, 4, 8}) f.schedule_report(w);
 
     std::vector<double> xtrue(static_cast<std::size_t>(K.n));
     std::uint64_t s = 12345;

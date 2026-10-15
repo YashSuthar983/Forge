@@ -64,6 +64,12 @@ struct EnvSwitches {
     // Quadratic engines.
     bool fgmres_profile = false;                  // FORGE_FGMRES_PROFILE
     std::string dump_kkt;                         // FORGE_DUMP_KKT=<file>
+    // LP barrier route: write the interior point (x, y of the model the
+    // barrier saw, after presolve) / read one instead of running the IPM,
+    // so crossover can be studied without repeating a long barrier run.
+    std::string barrier_point_out;                // FORGE_BARRIER_POINT_OUT=<file>
+    std::string barrier_point_in;                 // FORGE_BARRIER_POINT_IN=<file>
+    int ipm_gondzio = -1;                         // FORGE_IPM_GONDZIO=<k> (LP barrier correctors; -1: default)
     int stall_window = 0;                         // FORGE_STALL_WINDOW (0: default)
     long resto_ms = 0;                            // FORGE_RESTO_MS (0: default)
 };

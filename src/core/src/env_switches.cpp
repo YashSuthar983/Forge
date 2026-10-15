@@ -78,7 +78,10 @@ EnvSwitches read_environment() {
     s.ref_trace = flag("FORGE_REF_TRACE");
     s.fgmres_profile = flag("FORGE_FGMRES_PROFILE");
     s.dump_kkt = text("FORGE_DUMP_KKT");
+    s.barrier_point_out = text("FORGE_BARRIER_POINT_OUT");
+    s.barrier_point_in = text("FORGE_BARRIER_POINT_IN");
     s.stall_window = static_cast<int>(number("FORGE_STALL_WINDOW"));
+    s.ipm_gondzio = number("FORGE_IPM_GONDZIO") > 0 ? static_cast<int>(number("FORGE_IPM_GONDZIO")) : -1;
     s.resto_ms = static_cast<long>(number("FORGE_RESTO_MS"));
     return s;
 }

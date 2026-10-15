@@ -7,9 +7,9 @@ called, or present in the solve path.
 
 ## Layout
 
-Modules are layers, and a module may only link strictly lower ones. The
-`add_subdirectory()` order in `CMakeLists.txt` **is** the layer order and is
-what enforces it:
+Modules are layered by the `add_subdirectory()` order in `CMakeLists.txt`.
+Most modules link only strictly lower ones; `forge_certify` is also linked from
+presolve/engines/search so those layers can call the proof gate:
 
 | | module | contents |
 |---|---|---|

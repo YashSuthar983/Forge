@@ -20,7 +20,7 @@ core::LpStructuralFeatures extract_lp_features(
 
 // Returns engine output plus optional evidence for the sole reportable gate,
 // certify::finalize_result().  The library default in LpOptions is Simplex;
-// Auto is explicit until its frozen-suite promotion gates pass.
+// the forge_solve CLI currently defaults --engine to auto (see apps/forge_solve.cpp).
 core::RawResult solve_lp(const model::LpProblem& problem,
                          const LpOptions& options,
                          LpDiagnostics& diagnostics,

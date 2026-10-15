@@ -1,5 +1,7 @@
 #include "forge/engines/lp.hpp"
 #include "forge/core/work_clock.hpp"
+#include "forge/core/env_switches.hpp"
+#include "forge/core/process_memory.hpp"
 
 #include "forge/backend/kernel_backend.hpp"
 #include "forge/backend/lp_device.hpp"
@@ -17,7 +19,9 @@
 #include <optional>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -204,11 +208,16 @@ bool route_uses_fo_presolve_probe(core::LpStrategy route) {
 }
 
 presolve::PresolveRecoveryOptions recovery_options(
-    const core::LpOptions& options) {
+    const core::LpOptions& options, bool exact_proof) {
     presolve::PresolveRecoveryOptions ropts;
     ropts.primal_feas_tol = options.primal_feas_tol;
     ropts.dual_feas_tol = options.dual_feas_tol;
     ropts.gap_tol = options.gap_tol;
+    // The exact (rational) repair of a lifted certificate is --exact-proof
+    // work, as on the simplex route (simplex.cpp recovery options).  Left at
+    // 0 -- "no time limit" -- every barrier lift ran it (greenbea: 2.2 s of
+    // p-adic solves after a 0.6 s barrier and a 37 ms crossover).
+    if (!exact_proof) ropts.certificate_time_limit_s = -1;
     return ropts;
 }
 
@@ -230,6 +239,7 @@ std::pair<core::RawResult, core::ProofEvidence> lift_reduced_candidate(
     const presolve::PresolveMap& pmap,
     core::RawResult raw,
     const core::LpOptions& options,
+    bool exact_proof,
     const core::ProofEvidence& producer_ev,
     const SimplexBasis* reduced_basis = nullptr,
     SimplexBasis* lifted_basis = nullptr) {
@@ -242,7 +252,7 @@ std::pair<core::RawResult, core::ProofEvidence> lift_reduced_candidate(
     reduced.has_basis = false;
     if (reduced_basis != nullptr)
         install_reduced_basis(reduced, *reduced_basis);
-    presolve::PresolveRecoveryOptions ropts = recovery_options(options);
+    presolve::PresolveRecoveryOptions ropts = recovery_options(options, exact_proof);
     if (raw.engine == "barrier" &&
         (reduced_basis == nullptr || reduced_basis->status.empty()))
         ropts.skip_bound_tightening_dual = true;
@@ -298,9 +308,66 @@ std::pair<core::RawResult, core::ProofEvidence> close_lifted_certificate(
     const SimplexOptions* simplex_policy, double time_limit_s,
     std::uint64_t iteration_limit, core::RawResult raw, core::ProofEvidence ev,
     const SimplexBasis& basis) {
+    // Without --exact-proof the contract is the KKT level, as on the simplex
+    // route (simplex_evidence claims ProvedOptimalFP only when its gap
+    // closes).  A reduced-model FP claim whose bound postsolve did not carry
+    // over still stands at that level when the ORIGINAL-model residuals pass;
+    // the exact closure below is the --exact-proof upgrade (dfl001: 0.85 s
+    // of p-adic repair after a 4-pivot crossover cleanup).
+    const bool exact = simplex_policy != nullptr && simplex_policy->exact_proof;
+    if (!exact && raw.proposed_status == core::Status::Optimal && ev.has_basis &&
+        ev.checker_passed && ev.max_primal_violation <= ev.primal_feas_tol &&
+        ev.max_dual_violation <= ev.dual_feas_tol && !proved_basis(raw, ev) &&
+        ev.claimed_level >= core::ProofLevel::ProvedOptimalFP) {
+        ev.claimed_level = core::ProofLevel::ProvedKKT;
+        return {std::move(raw), ev};
+    }
     if (proved_basis(raw, ev) || basis.status.empty() ||
         raw.proposed_status != core::Status::Optimal ||
         (options.time_limit_s > 0 && time_limit_s <= 0)) return {std::move(raw), ev};
+    // Multipliers beyond the precision of the arithmetic.  Every reduced
+    // cost c_j - (A'y)_j is a sum whose terms carry rounding of
+    // u * sum_i |a_ij| |y_i| (u = unit roundoff) however it is computed or
+    // repaired, so once that exceeds the dual tolerance the lifted dual --
+    // and the basis it is the dual of -- cannot be certified in binary64,
+    // and the repairs and the continuation below only spend the budget on
+    // it.  irish-electricity: the reduced optimum is proved, but its basis
+    // dual grows along a time chain of start-up/ramp rows, and the presolve
+    // lift, each step forced by its predecessors, continues the chain
+    // through ~70 removed periods to |y| = 1.9e33; the closure then ran
+    // 125-230 s and ended with no claim at all.  The lifted point itself is
+    // primal feasible, so it is returned as such, without the multipliers.
+    if (!ev.checker_passed && ev.max_dual_violation > options.dual_feas_tol &&
+        raw.y.size() == static_cast<std::size_t>(problem.n_rows())) {
+        const auto& rp = problem.A.pattern.row_ptr();
+        const auto& ci = problem.A.pattern.col_idx();
+        std::vector<f64> scale(static_cast<std::size_t>(problem.n_cols()), 0.0);
+        for (core::Index i = 0; i < problem.n_rows(); ++i) {
+            const f64 yi = std::fabs(raw.y[static_cast<std::size_t>(i)]);
+            for (core::Offset k = rp[static_cast<std::size_t>(i)]; k < rp[static_cast<std::size_t>(i) + 1]; ++k)
+                scale[static_cast<std::size_t>(ci[static_cast<std::size_t>(k)])] +=
+                    std::fabs(problem.A.vals[static_cast<std::size_t>(k)]) * yi;
+        }
+        f64 worst = 0.0;
+        for (const f64 v : scale) worst = std::max(worst, std::isfinite(v) ? v : core::kPosInf);
+        if (std::numeric_limits<f64>::epsilon() * worst > options.dual_feas_tol) {
+            core::RawResult feasible = raw;
+            feasible.y.clear();
+            feasible.dual_bound = std::numeric_limits<f64>::quiet_NaN();
+            feasible.certificate_basis.clear();
+            feasible.proposed_status = core::Status::Feasible;
+            char why[200];
+            std::snprintf(why, sizeof why,
+                          "lifted multipliers beyond binary64 precision (max_j sum_i |a_ij y_i| = %.2e); "
+                          "primal point returned without a dual", worst);
+            feasible.termination_reason = why;
+            core::ProofEvidence proposal = ev;
+            proposal.has_basis = false;
+            proposal.claimed_level = core::ProofLevel::FeasibleOnly;
+            auto checked = independently_checked(problem, feasible, proposal);
+            if (checked.checker_passed) return {std::move(feasible), checked};
+        }
+    }
     const auto started = Clock::now();
     SimplexOptions policy = simplex_policy ? *simplex_policy : SimplexOptions{};
     policy.presolve = false;
@@ -389,24 +456,40 @@ void install_budget_split(core::LpAutoBudgetSplit split,
 // independent LP checker and crossover decide what the point proves.
 core::RawResult solve_lp_barrier(const model::LpProblem& problem,
                                  const core::LpOptions& options, double time_limit_s,
+                                 double soft_time_limit_s,
                                  core::ProofEvidence& producer, bool verbose,
-                                 const core::CancelToken* cancel) {
+                                 const core::CancelToken* cancel,
+                                 bool* stopped_on_time = nullptr) {
     QpProblem qp;
     qp.linear = model::minimization_form(problem);
     qp.q_diag.assign(static_cast<std::size_t>(problem.n_cols()), 0.0);   // Q = 0, diagonal form
     const double sense = problem.maximize ? -1.0 : 1.0;
     QpOptions ipm;
     ipm.time_limit_s = time_limit_s;
+    ipm.soft_time_limit_s = soft_time_limit_s;
     if (options.max_iterations > 0) ipm.max_iterations = options.max_iterations;
     ipm.feas_tol = options.primal_feas_tol;
     ipm.stationarity_tol = options.dual_feas_tol;
     ipm.gap_tol = options.gap_tol;
     ipm.assume_psd = true;   // Q = 0
-    ipm.gondzio_correctors = 4;  // LP-tuned: more centrality corrections
+    // No Gondzio correctors for an LP.  Each is a full refined solve (two
+    // or more applications of the factor) kept only when it lengthens the
+    // step, and on LPs it saved ~8% of the Newton steps for 35-70% more
+    // solves -- measured slower on every class: Netlib-93 barrier time
+    // 15.4 s without vs 18.0 s with four, qap15 61 vs 71 s (27 vs 30 steps),
+    // s100 104 vs 132 s, square41 equal.  Mehrotra's corrector stays.
+    ipm.gondzio_correctors = 0;
+    if (core::env_switches().ipm_gondzio > 0) ipm.gondzio_correctors = core::env_switches().ipm_gondzio;
+    // The OSQP-style polish guesses an active set and factors it: work with
+    // no bound, and exactly what crossover does next with a guarantee
+    // (qap15: ~80 s of polish before a crossover that needs 12 s).  Polish
+    // only when no crossover follows.
+    ipm.polish = !options.fo_crossover;
     ipm.verbose = verbose;
     ipm.cancel = cancel;
     QpDiagnostics diag;
     core::RawResult raw = solve_qp_ipm(qp, ipm, diag);
+    if (stopped_on_time) *stopped_on_time = diag.stopped_on_time;
     raw.engine = "barrier";
     for (auto& y : raw.y) y = -sense * y;
     if (std::isfinite(raw.objective)) raw.objective = sense * raw.objective;
@@ -424,6 +507,40 @@ core::RawResult solve_lp_barrier(const model::LpProblem& problem,
     producer.primal_feas_tol = options.primal_feas_tol;
     producer.dual_feas_tol = options.dual_feas_tol;
     producer.gap_tol = options.gap_tol;
+    return raw;
+}
+
+// Developer hooks FORGE_BARRIER_POINT_OUT / _IN: x and y as hex floats
+// (exact), one header line "n m status".
+void write_barrier_point(const std::string& path, const core::RawResult& raw) {
+    std::FILE* f = std::fopen(path.c_str(), "w");
+    if (!f) return;
+    std::fprintf(f, "%zu %zu %d\n", raw.x.size(), raw.y.size(), static_cast<int>(raw.proposed_status));
+    for (const f64 v : raw.x) std::fprintf(f, "%a\n", v);
+    for (const f64 v : raw.y) std::fprintf(f, "%a\n", v);
+    std::fclose(f);
+}
+core::RawResult read_barrier_point(const std::string& path, const model::LpProblem& problem) {
+    core::RawResult raw;
+    raw.engine = "barrier";
+    raw.proposed_status = core::Status::NotSolved;
+    std::FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) throw std::runtime_error("FORGE_BARRIER_POINT_IN: cannot open " + path);
+    std::size_t nx = 0, ny = 0;
+    int st = 0;
+    if (std::fscanf(f, "%zu %zu %d", &nx, &ny, &st) != 3 ||
+        nx != static_cast<std::size_t>(problem.n_cols()) || ny != static_cast<std::size_t>(problem.n_rows())) {
+        std::fclose(f);
+        throw std::runtime_error("FORGE_BARRIER_POINT_IN: header does not match the presolved model");
+    }
+    raw.x.resize(nx);
+    raw.y.resize(ny);
+    for (auto& v : raw.x) if (std::fscanf(f, "%la", &v) != 1) v = 0.0;
+    for (auto& v : raw.y) if (std::fscanf(f, "%la", &v) != 1) v = 0.0;
+    std::fclose(f);
+    raw.proposed_status = static_cast<core::Status>(st);
+    raw.objective = 0.0;
+    for (std::size_t j = 0; j < nx; ++j) raw.objective += problem.c[j] * raw.x[j];
     return raw;
 }
 
@@ -520,6 +637,8 @@ core::RawResult solve_lp(const model::LpProblem& problem,
                          const PdhgOptions* pdhg_policy) {
     problem.validate(/*allow_empty_domains=*/true);
     model::validate_lp_policy(options.primal_feas_tol, options.dual_feas_tol, options.gap_tol, options.time_limit_s);
+    // --exact-proof reaches this function through the simplex policy.
+    const bool lp_exact_proof = simplex_policy != nullptr && simplex_policy->exact_proof;
     // A crossed bound is infeasible by the data alone, for every strategy;
     // the first-order engines cannot even represent it.
     if (const auto empty = problem.find_empty_domain(); empty.index >= 0) {
@@ -586,9 +705,18 @@ core::RawResult solve_lp(const model::LpProblem& problem,
         return raw;
     };
 
+    // --verbose timeline of the stages (seconds since the LP solve began).
+    const bool trace_stages = simplex_policy && simplex_policy->verbose;
+    auto stage_mark = [&](const char* what) {
+        if (!trace_stages) return;
+        const core::ProcessMemory pm = core::process_memory();
+        std::fprintf(stderr, "lp stage: %s at %.2f s (memory GB: rss %.2f peak %.2f virtual %.2f)\n", what,
+                     elapsed_seconds(start), pm.rss_gb, pm.peak_gb, pm.vm_gb);
+    };
     FoPresolveProbe fo_presolve;
     if (route_uses_fo_presolve_probe(route)) {
         fo_presolve = probe_fo_presolve(problem, options, diagnostics);
+        stage_mark("presolve done");
         if (auto terminal = presolve_terminal_raw(problem, fo_presolve.outcome, options)) {
             core::ProofEvidence ev;
             ev.primal_feas_tol = options.primal_feas_tol;
@@ -649,15 +777,25 @@ core::RawResult solve_lp(const model::LpProblem& problem,
 
     if (route == LpStrategy::Pdhg || route == LpStrategy::Barrier) {
         const bool barrier = route == LpStrategy::Barrier;
+        const double fo_frac = diagnostics.fo_budget_fraction > 0
+            ? diagnostics.fo_budget_fraction : 0.60;
+        const double cross_frac = diagnostics.crossover_budget_fraction > 0
+            ? diagnostics.crossover_budget_fraction : 0.25;
         // An interior point is a second-order method: it converges in tens
-        // of Newton steps or not at all, so it keeps the budget it needs and
-        // crossover takes what is left.
-        // Barrier with crossover: reserve crossover + 15% simplex budgets
-        // (Fo60Crossover25Simplex15 default). Plain FO PDHG keeps fo_budget.
+        // of Newton steps or not at all.  Its share fo_frac of the budget is
+        // therefore SOFT: past it the IPM continues while its convergence
+        // rate projects the end before fo_frac + cross_frac (the old
+        // crossover boundary), and crossover then takes everything left.
+        // physiciansched3-3 converged at 53% of 600 s; a fixed 60% stop
+        // hands crossover an unconverged point (compl_rel 10 there in an
+        // earlier build), which no crossover turns into a basis cheaply.
+        // Plain FO PDHG keeps its fo_budget share.
         const double stage_frac = !options.fo_crossover ? 1.0
-            : (barrier ? diagnostics.fo_budget_fraction
-                       : diagnostics.fo_budget_fraction);
+            : (barrier ? fo_frac + cross_frac : diagnostics.fo_budget_fraction);
         const double stage_time = remaining_seconds(options, start, stage_frac);
+        const double soft_time = barrier && options.fo_crossover
+            ? remaining_seconds(options, start, fo_frac) : 0.0;
+        bool ipm_stopped_on_time = false;
         if (options.time_limit_s > 0.0 && stage_time <= 0.0) {
             core::RawResult raw;
             raw.proposed_status = core::Status::Interrupted;
@@ -673,10 +811,20 @@ core::RawResult solve_lp(const model::LpProblem& problem,
         core::RawResult raw;
         core::ProofEvidence producer_ev;
         const auto fo_start = Clock::now();
-        if (barrier) {
-            raw = solve_lp_barrier(work_problem, options, stage_time, producer_ev,
+        if (barrier && !core::env_switches().barrier_point_in.empty()) {
+            // Developer hook (see env_switches.hpp): the point instead of the IPM.
+            raw = read_barrier_point(core::env_switches().barrier_point_in, work_problem);
+            producer_ev = core::ProofEvidence{};
+            producer_ev.primal_feas_tol = options.primal_feas_tol;
+            producer_ev.dual_feas_tol = options.dual_feas_tol;
+            producer_ev.gap_tol = options.gap_tol;
+        } else if (barrier) {
+            raw = solve_lp_barrier(work_problem, options, stage_time, soft_time, producer_ev,
                                    simplex_policy && simplex_policy->verbose,
-                                   simplex_policy ? simplex_policy->cancel : nullptr);
+                                   simplex_policy ? simplex_policy->cancel : nullptr,
+                                   &ipm_stopped_on_time);
+            if (!core::env_switches().barrier_point_out.empty())
+                write_barrier_point(core::env_switches().barrier_point_out, raw);
         } else {
             auto backend = backend::make_backend(options.backend);
             if (!backend) return unsupported(
@@ -697,6 +845,7 @@ core::RawResult solve_lp(const model::LpProblem& problem,
             producer_ev = pdhg_evidence(pdhg_diag, pdhg_options);
         }
         diagnostics.fo_elapsed_s = elapsed_seconds(fo_start);
+        stage_mark(barrier ? "barrier done" : "first-order stage done");
         auto checked = independently_checked(work_problem, raw, producer_ev);
         diagnostics.fo_iterations = raw.iterations;
         SimplexBasis crossed_basis;
@@ -705,12 +854,13 @@ core::RawResult solve_lp(const model::LpProblem& problem,
             // Passing only crossover_budget_fraction made cleanup_time hit 0
             // once barrier used more than that share of T, so crossover was
             // skipped with global time still remaining.
-            const double fo_frac = diagnostics.fo_budget_fraction > 0
-                ? diagnostics.fo_budget_fraction : 0.60;
-            const double cross_frac = diagnostics.crossover_budget_fraction > 0
-                ? diagnostics.crossover_budget_fraction : 0.25;
+            // A barrier point the IPM finished (converged or stalled at the
+            // floor) is where crossover is cheapest: it gets all the time
+            // left.  A point cut off by the budget keeps the old boundary,
+            // leaving the simplex reserve its share.
+            const bool ipm_done = barrier && !ipm_stopped_on_time;
             const double cleanup_time = remaining_seconds(
-                options, start, fo_frac + cross_frac);
+                options, start, ipm_done ? 1.0 : fo_frac + cross_frac);
             const auto remaining_iterations = options.max_iterations == 0 ? 0 :
                 options.max_iterations - std::min(options.max_iterations, raw.iterations);
             if ((options.time_limit_s <= 0 || cleanup_time > 0) &&
@@ -724,11 +874,13 @@ core::RawResult solve_lp(const model::LpProblem& problem,
                 cross.time_limit_s = cleanup_time;
                 cross.fo_budget_ended = raw.proposed_status == core::Status::Interrupted;
                 cross.interior_point_start = barrier;
+                cross.verbose = simplex_policy && simplex_policy->verbose;
                 CrossoverDiagnostics cd;
                 const auto cross_start = Clock::now();
                 auto crossed = crossover_to_simplex(work_problem, raw, cross, cd, &crossed_basis);
                 diagnostics.crossover_attempted = true;
                 diagnostics.crossover_elapsed_s = elapsed_seconds(cross_start);
+                stage_mark("crossover done");
                 diagnostics.crossover_iterations = crossed.iterations;
                 diagnostics.crossover_basis_valid = cd.validated_basis;
                 diagnostics.crossover_cold_fallback = cd.cold_fallback;
@@ -740,6 +892,13 @@ core::RawResult solve_lp(const model::LpProblem& problem,
                 policy.exact_proof = false;
                 const auto crossed_proposal = simplex_evidence(cd.simplex, policy);
                 const auto crossed_ev = independently_checked(work_problem, crossed, crossed_proposal);
+                if (cross.verbose)
+                    std::fprintf(stderr, "crossover result on the barrier's model: status %d proved %d, "
+                                 "primal viol %.2e dual viol %.2e gap %.2e (engine primal %.2e dual %.2e)\n",
+                                 static_cast<int>(crossed.proposed_status),
+                                 static_cast<int>(proved_basis(crossed, crossed_ev)),
+                                 crossed_ev.max_primal_violation, crossed_ev.max_dual_violation,
+                                 crossed_ev.gap_rel, cd.simplex.primal_residual, cd.simplex.dual_residual);
                 if (proved_basis(crossed, crossed_ev) || candidate_merit(crossed, crossed_ev) < candidate_merit(raw, checked)) {
                     raw = std::move(crossed);
                     producer_ev = crossed_proposal;
@@ -780,6 +939,7 @@ core::RawResult solve_lp(const model::LpProblem& problem,
                     presolve_map != nullptr ? &reserve_basis : nullptr);
                 diagnostics.simplex_elapsed_s = elapsed_seconds(reserve_start);
                 diagnostics.simplex_iterations = reserve_diag.iterations;
+                stage_mark("simplex reserve done");
                 const auto reserve_producer = simplex_evidence(reserve_diag, reserve);
                 const auto reserve_ev = independently_checked(work_problem, reserved, reserve_producer);
                 if (proved_basis(reserved, reserve_ev) || certified_terminal(reserved, reserve_ev) ||
@@ -793,9 +953,10 @@ core::RawResult solve_lp(const model::LpProblem& problem,
         }
         if (presolve_map != nullptr) {
             SimplexBasis lifted_basis;
-            auto lifted = lift_reduced_candidate(problem, *presolve_map, std::move(raw), options,
+            auto lifted = lift_reduced_candidate(problem, *presolve_map, std::move(raw), options, lp_exact_proof,
                 producer_ev, crossed_basis.status.empty() ? nullptr : &crossed_basis,
                 &lifted_basis);
+            stage_mark("postsolve lift done");
             if (!crossed_basis.status.empty()) {
                 const auto closure_start = Clock::now();
                 const auto iterations_used = diagnostics.fo_iterations + diagnostics.crossover_iterations;
@@ -877,7 +1038,7 @@ core::RawResult solve_lp(const model::LpProblem& problem,
                 work_problem, fo_raw, producer_ev);
         } else if (presolve_map != nullptr) {
             const auto lifted = lift_reduced_candidate(
-                problem, *presolve_map, std::move(fo_raw), options, producer_ev);
+                problem, *presolve_map, std::move(fo_raw), options, lp_exact_proof, producer_ev);
             fo_raw = std::move(lifted.first);
             fo_ev = lifted.second;
             fo_space = CandidateSpace{&problem};
@@ -904,7 +1065,7 @@ core::RawResult solve_lp(const model::LpProblem& problem,
         if (presolve_map != nullptr &&
             !fo_space.is_original(problem)) {
             const auto lifted = lift_reduced_candidate(
-                problem, *presolve_map, std::move(fo_raw), options, fo_ev);
+                problem, *presolve_map, std::move(fo_raw), options, lp_exact_proof, fo_ev);
             return finish(std::move(lifted.first), lifted.second);
         }
         return finish(std::move(fo_raw), fo_ev);
@@ -972,7 +1133,7 @@ core::RawResult solve_lp(const model::LpProblem& problem,
                 const SimplexBasis* basis_for_lift =
                     crossover_diag.validated_basis ? &crossover_basis : nullptr;
                 const auto lifted = lift_reduced_candidate(
-                    problem, *presolve_map, std::move(crossed), options,
+                    problem, *presolve_map, std::move(crossed), options, lp_exact_proof,
                     crossover_producer, basis_for_lift);
                 best_raw = std::move(lifted.first);
                 best_ev = lifted.second;
@@ -1021,11 +1182,11 @@ core::RawResult solve_lp(const model::LpProblem& problem,
         diagnostics.simplex_iterations = simplex_diag.iterations;
         auto candidate = presolve_map != nullptr
             ? lift_reduced_candidate(problem, *presolve_map, std::move(simplex_raw),
-                options, simplex_producer, simplex_basis.status.empty() ? nullptr : &simplex_basis)
+                options, lp_exact_proof, simplex_producer, simplex_basis.status.empty() ? nullptr : &simplex_basis)
             : std::make_pair(std::move(simplex_raw), simplex_ev_reduced);
         if (!best_space.is_original(problem) && presolve_map != nullptr) {
             auto lifted = lift_reduced_candidate(problem, *presolve_map,
-                std::move(best_raw), options, best_ev);
+                std::move(best_raw), options, lp_exact_proof, best_ev);
             best_raw = std::move(lifted.first);
             best_ev = lifted.second;
             best_space = CandidateSpace{&problem};
@@ -1042,7 +1203,7 @@ core::RawResult solve_lp(const model::LpProblem& problem,
     if (presolve_map != nullptr &&
         !best_space.is_original(problem)) {
         const auto lifted = lift_reduced_candidate(
-            problem, *presolve_map, std::move(best_raw), options, best_ev);
+            problem, *presolve_map, std::move(best_raw), options, lp_exact_proof, best_ev);
         return finish(std::move(lifted.first), lifted.second);
     }
     return finish(std::move(best_raw), best_ev);
